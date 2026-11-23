@@ -243,11 +243,12 @@ func explorerProfileQuery(q, mode, profile string) (map[string]any, error) {
 		payload["semantic_search"] = q
 		payload["indexes"] = []string{DefaultEmbeddingIndex}
 	case "graph":
-		payload["full_text_index"] = DefaultFullTextIndex
-		payload["full_text_search"] = map[string]any{"match": q, "field": "content"}
+		// Anchor graph traversal in the same native artifact stream as text
+		// search. URL-only source rows do not contain a copied content field.
+		payload["full_text_index"] = corpusTextIndex
+		payload["full_text_search"] = map[string]any{"match": q, "field": "text"}
 		payload["limit"] = 8
 		payload["graph_queries"] = map[string]any{"relations": map[string]any{"index": DefaultAutographIndex, "traverse": map[string]any{"start": map[string]any{"result_ref": "$query_results", "limit": 8}, "direction": "both", "max_depth": 1, "limit": 80, "include_paths": true, "include_documents": true, "fields": []string{"title", "original_url", "metadata"}}}}
-		return payload, nil
 	default:
 		return nil, fmt.Errorf("Unknown search mode")
 	}

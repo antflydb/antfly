@@ -70,7 +70,7 @@ func TestExplorerCollectionSearchBoundsScopeAndTiming(t *testing.T) {
 		}
 		if strings.Contains(r.URL.Path, "audio_table") {
 			raw, _ := json.Marshal(payload["hierarchy"])
-			if !strings.Contains(string(raw), "provenance.start_ms") || !strings.Contains(string(raw), "provenance.end_ms") {
+			if !strings.Contains(string(raw), "provenance.start_time_ms") || !strings.Contains(string(raw), "provenance.end_time_ms") {
 				t.Error("audio citations lost temporal evidence")
 			}
 		}

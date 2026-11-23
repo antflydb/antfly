@@ -50,6 +50,10 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	}
 }
 
+func TestLocalNativeGCSExecutionPolicy(t *testing.T) {
+	testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{OCR: true, PolicyRetry: true})
+}
+
 func TestLocalNativeGCSTranscription(t *testing.T) {
 	t.Run("openai", func(t *testing.T) {
 		testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{Profile: "transcription"})
@@ -84,8 +88,8 @@ func nativeImageFixture(t *testing.T, variant uint8, asJPEG ...bool) []byte {
 }
 
 type nativeCorpusSmokeOptions struct {
-	Profile                         string
-	OCR, HostedSTT, JPEG, FramedSTT bool
+	Profile                                      string
+	OCR, HostedSTT, JPEG, FramedSTT, PolicyRetry bool
 }
 
 func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions) {
@@ -381,13 +385,18 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 		if err := grepCmd([]string{"--state", root, "--url", endpoint, "--table", "gcs_e2e"}); err != nil {
 			t.Fatal(err)
 		}
+		config := nativeGrepConfigForProfile(endpoint, "gcs_e2e", mustNativeProfile(t, profile))
+		config["page_size"] = 1
+		if err := atomicCorpusJSON(filepath.Join(root, "grep.json"), config); err != nil {
+			t.Fatal(err)
+		}
 		before := reads.Load()
 		for _, stream := range []string{"extracted", "chunks"} {
 			args := []string{"--table-config", filepath.Join(root, "grep.json"), "--json"}
 			if stream == "chunks" {
 				args = append(args, "--artifact", stream)
 			}
-			pattern := "Native GCS extraction evidence"
+			pattern := "Native GCS extraction"
 			if pictures {
 				pattern = "A red vehicle"
 			}
@@ -405,14 +414,22 @@ func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions
 			if speech && !bytes.Contains(output, []byte("transcript_spans")) {
 				t.Fatalf("native grep %s lost transcript timing: %s", stream, output)
 			}
-			if !bytes.Contains(output, []byte("evidence"+extension)) {
-				t.Fatalf("native grep %s lost the original source identity: %s", stream, output)
+			for _, filename := range []string{"evidence" + extension, "appendix" + extension} {
+				if !bytes.Contains(output, []byte(filename)) {
+					t.Fatalf("native grep %s lost %s across one-record pages: %s", stream, filename, output)
+				}
 			}
 		}
 		if reads.Load() != before {
 			t.Fatal("native grep reacquired the original instead of consuming existing artifacts")
 		}
 		t.Log("native default extraction and explicit chunk grep passed without reacquisition")
+	}
+	if options.PolicyRetry {
+		testNativeExecutionPolicyRetry(t, ctx, client, tableURL, document, &ocrCalls)
+	}
+	if !pictures {
+		testNativeExplorerBrowser(t, ctx, client, tableURL, profile, provider.URL)
 	}
 	// Exercise owner-side policy failures and immutable-version rejection without
 	// contaminating the successfully qualified source inventory.

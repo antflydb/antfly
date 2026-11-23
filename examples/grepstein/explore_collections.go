@@ -90,7 +90,7 @@ func parseExplorerCollections(endpoint, table, raw string) ([]explorerCollection
 }
 func explorerProvenanceFields(profile string) []string {
 	if profile == "transcription" {
-		return []string{"provenance.start_ms", "provenance.end_ms", "provenance.speaker"}
+		return []string{"provenance.start_time_ms", "provenance.end_time_ms", "provenance.transcript_spans", "provenance.speaker"}
 	}
 	return []string{"provenance.page_number"}
 }
