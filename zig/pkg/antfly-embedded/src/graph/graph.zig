@@ -2563,6 +2563,10 @@ pub const GraphIndex = struct {
     fn publishCounters(self: *GraphIndex, counters: Stats) void {
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
+        self.publishCountersLocked(counters);
+    }
+
+    fn publishCountersLocked(self: *GraphIndex, counters: Stats) void {
         self.edge_count = counters.edge_count;
         self.node_count = counters.node_count;
         self.edge_generation = counters.edge_generation;
@@ -8552,9 +8556,15 @@ pub const GraphIndex = struct {
             forward.invalidateMirror();
             reverse.invalidateMirror();
         }
-        try forward.applyExternallyCommittedMutations(publication.forward_mutations);
-        try reverse.applyExternallyCommittedMutations(publication.reverse_mutations);
-        self.publishCounters(publication.counters);
+        var next_forward = try forward.prepareExternalMirror(publication.forward_mutations);
+        defer next_forward.deinit();
+        var next_reverse = try reverse.prepareExternalMirror(publication.reverse_mutations);
+        defer next_reverse.deinit();
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        next_forward.publish();
+        next_reverse.publish();
+        self.publishCountersLocked(publication.counters);
+        self.ownership_mutex.unlock();
     }
 
     /// The forward (outgoing-adjacency) store's `.native_catalog` scope --

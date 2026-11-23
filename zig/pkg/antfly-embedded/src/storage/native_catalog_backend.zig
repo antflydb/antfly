@@ -804,10 +804,32 @@ pub const Backend = struct {
         self.mirror_invalid.store(true, .release);
     }
 
-    pub fn applyExternallyCommittedMutations(self: *Backend, mutations: []const Mutation) !void {
-        if (mutations.len == 0) return;
-        // A failure below leaves the mirror behind a durable commit.
-        errdefer self.invalidateMirror();
+    pub const PreparedMirror = struct {
+        backend: *Backend,
+        replacement: ?*RcState = null,
+
+        pub fn deinit(self: *PreparedMirror) void {
+            if (self.replacement) |rc| {
+                lockBackend(self.backend);
+                releaseState(self.backend.allocator, rc);
+                self.backend.mutex.unlock();
+            }
+            self.replacement = null;
+        }
+
+        pub fn publish(self: *PreparedMirror) void {
+            const replacement = self.replacement orelse return;
+            lockBackend(self.backend);
+            const old = self.backend.state;
+            self.backend.state = replacement;
+            self.replacement = old;
+            self.backend.mutex.unlock();
+        }
+    };
+
+    /// The caller serializes mirror mutations from preparation through publication.
+    pub fn prepareExternalMirror(self: *Backend, mutations: []const Mutation) !PreparedMirror {
+        if (mutations.len == 0) return .{ .backend = self };
         lockBackend(self);
         var cloned = self.state.state.clone();
         self.mutex.unlock();
@@ -830,11 +852,14 @@ pub const Backend = struct {
         const new_rc = try self.allocator.create(RcState);
         new_rc.* = .{ .refs = 1, .state = cloned };
 
-        lockBackend(self);
-        const old = self.state;
-        self.state = new_rc;
-        releaseState(self.allocator, old);
-        self.mutex.unlock();
+        return .{ .backend = self, .replacement = new_rc };
+    }
+
+    pub fn applyExternallyCommittedMutations(self: *Backend, mutations: []const Mutation) !void {
+        errdefer self.invalidateMirror();
+        var prepared = try self.prepareExternalMirror(mutations);
+        defer prepared.deinit();
+        prepared.publish();
     }
 
     const NamespaceTxn = struct {
