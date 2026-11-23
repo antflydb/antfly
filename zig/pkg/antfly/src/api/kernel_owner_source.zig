@@ -8493,6 +8493,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (controls.native_published_restore) |published| {
             if (published.admission == null or controls.native_initialized == null or !controls.native_boot_observed) return error.InvalidSqlRelationPersistence;
         }
+        if (controls.native_adoption != null) {
+            const lifetime = raw_descriptor.sql_persistence orelse return error.InvalidSqlRelationPersistence;
+            if (controls.native_initialization or controls.native_initialized != null or controls.native_empty_host != null or
+                controls.native_uninitialized != null or controls.native_published_restore != null or controls.durable_catalog)
+                return error.InvalidSqlRelationPersistence;
+            // Binding-only recovery reopens the retained image using its
+            // signed lifetime and physical identity. Mutable discovery
+            // fields must never reach catalog projection or restore routing.
+            const binding: descriptor_contract.Descriptor = .{
+                .lsm_root_generation = raw_descriptor.lsm_root_generation,
+                .identity = raw_descriptor.identity,
+                .sql_persistence = lifetime,
+            };
+            return self.acquireProjectedDescriptorOnce(group_id, table_name, path, binding, &.{ .bytes = "" }, admission, residency, controls);
+        }
         var physical = self.acquireOwnerCatalog(group_id, raw_descriptor) catch |err|
             return if (err == error.CatalogProjectionBusy) error.StorageKernelOwnerTransitionRequired else err;
         defer physical.deinit();
@@ -8605,7 +8620,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
             if (entry.catalog_deferred and !entry.opened_for_historical_apply and !controls.allow_deferred_catalog and !controls.historical_raft_apply)
                 return error.StorageReadTemporarilyUnavailable;
-            const control_binding_changed = !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
+            const control_binding_changed = controls.native_adoption != null or
+                !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
                 !std.meta.eql(entry.sql_persistence, descriptor.sql_persistence) or
                 !std.mem.eql(u8, entry.initial_child_bootstrap_json, descriptor.initial_child_bootstrap_json) or
                 entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or
