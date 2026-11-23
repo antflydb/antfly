@@ -12734,6 +12734,9 @@ test "lsm async reuse ordinary probes own one copy without retaining blocks" {
         try std.testing.expectEqual(@as(usize, 0), lease.leased_values.items.len);
         for (0..run_store.count(&backend)) |i| cache.invalidatePath(run_store.at(&backend, i).path.?);
         try std.testing.expectEqualStrings("v", borrowed);
+        lease.releaseResults();
+        try std.testing.expectEqual(@as(usize, 0), lease.held_blocks.items.len);
+        try std.testing.expectEqualStrings("v", try lease.getLeased(&keys[0]));
     }
 }
 
