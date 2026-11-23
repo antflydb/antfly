@@ -56033,27 +56033,24 @@ const PreparedDenseRegionFixture = struct {
                 // general partitioned executable also owns a fallback backend.
                 var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, graph, &.{&cb}, .{}, false);
                 defer layout.deinit();
-                const private_pool = (try layout.createPool(a, graph, &.{&cb}, null)) orelse return error.MissingPhysicalPool;
-                defer private_pool.deinit();
-                private_pool.coverage_graph = graph;
-                private_pool.coverage_reachable = analysis.reachable;
-                private_pool.coverage_backend = cb;
-                private_pool.metal_frame_dispatch = true;
-                try private_pool.configureRoutes(bindings[1..parameter_count]);
-                const private = (try private_pool.prepareRoutes(&.{activation})) orelse return error.MissingPreparedRoutes;
+                const physical = @import("../execution/physical_buffers.zig");
+                var private_pool: ?*physical.Pool = (try layout.createPool(a, graph, &.{&cb}, null)) orelse return error.MissingPhysicalPool;
+                defer if (private_pool) |owner| owner.deinit();
+                private_pool.?.coverage_graph = graph;
+                private_pool.?.coverage_reachable = analysis.reachable;
+                private_pool.?.coverage_backend = cb;
+                private_pool.?.metal_frame_dispatch = true;
+                const private = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private_pool, .{ .slice = bindings[1..parameter_count] }, .{ .slice = &.{activation} })) orelse return error.MissingPreparedRoutes;
                 defer private.release();
+                try std.testing.expect(private_pool == null);
                 try std.testing.expectEqual(@as(usize, 1), private.pool.regions.len);
-                var private_claims = switch (try private.claimRegions(a, null, &.{activation})) {
-                    .ready => |owned| owned,
-                    else => return error.MissingPreparedRegionClaims,
-                };
-                defer private_claims.releaseUnsubmitted();
+                try std.testing.expectError(error.RegionExecutionProfileChanged, private.pool.acquirePrivateDecoderFrame(null, null));
                 const operation = @import("../execution/backend_operation.zig");
                 var scope: operation.Scope = .{};
                 defer scope.deinitChecked() catch unreachable;
                 try operation.enterInto(&cb, graph, null, .managed, &scope);
                 const cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = scope.token() };
-                const frame = (try private.pool.acquirePreparedWithRegionsAndOperation(null, null, &private_claims, graph, scope.token())) orelse return error.MissingPhysicalPool;
+                const frame = (try private.pool.acquirePrivateDecoderFrame(null, scope.token())) orelse return error.MissingPhysicalPool;
                 defer _ = frame.finishWithCleanup(cleanup) catch unreachable;
                 try frame.beginWithCleanup(cleanup);
                 try frame.beginProgramPreparation();

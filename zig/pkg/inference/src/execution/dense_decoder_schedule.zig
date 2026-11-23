@@ -824,7 +824,20 @@ pub const Schedule = struct {
         private_pool.?.metal_frame_dispatch = self.backend.kind() == .metal;
         self.selected = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private_pool, immutable, bindings)) orelse return error.UnsupportedDenseSchedule;
         errdefer self.selected.release();
-        if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.UnsupportedDenseSchedule;
+        if (self.selected.pool.payload_coverage != .complete) return error.UnsupportedDenseSchedule;
+        // The model advances a complete QKV as one step. Every installed
+        // region must match the exact contiguous authored step interval.
+        var step: usize = 0;
+        while (step < self.steps.len) {
+            const installed = self.selected.pool.regionForNode(self.steps[step]) orelse {
+                step += 1;
+                continue;
+            };
+            if (self.steps.len - step < 3 or installed.owner.entry_node != self.steps[step] or
+                installed.owner.vtable.dispatch_qkv_cache_row == null) return error.UnsupportedDenseSchedule;
+            validateQkvRegion(installed, self.steps[step..][0..3]) catch return error.UnsupportedDenseSchedule;
+            step += 3;
+        }
         // A ready authored plan owns its complete cold resource recipe before
         // admission, metadata sealing, or the first numerical Model scope.
         _ = try self.selected.storageRequirement();
@@ -839,16 +852,25 @@ pub const Schedule = struct {
     }
     pub fn enter(self: *Schedule, capability: ?@import("storage_admission.zig").Capability, current: Cleanup, host_inputs: []const @import("host_ingress.zig").Input) !void {
         if (self.frame != null) return error.DenseScheduleAlreadyEntered;
-        const frame = (try self.selected.pool.acquirePrepared(capability, null)) orelse return error.PreparedStorageUnavailable;
+        const operation = @import("backend_operation.zig");
+        var scope: operation.Scope = .{};
+        defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        var cleanup = current;
+        if (self.selected.pool.requiresManagedExecution()) {
+            try operation.enterInto(&self.backend, &self.graph, current.operation orelse self.backend.operationToken(), .managed, &scope);
+            cleanup.operation = scope.token() orelse return error.UnsupportedDenseSchedule;
+        }
+        const frame = (try self.selected.pool.acquirePrivateDecoderFrame(capability, cleanup.operation)) orelse return error.PreparedStorageUnavailable;
         self.frame = frame;
         errdefer {
-            _ = frame.finishWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            _ = frame.finishWithCleanup(cleanup) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             self.frame = null;
         }
-        try frame.beginWithCleanup(current);
+        try frame.beginWithCleanup(cleanup);
         try frame.beginProgramPreparation();
-        try self.bindHostInputs(host_inputs);
-        try frame.prepareProgramViews(&self.backend, &self.graph, self.values, current);
+        const bound = try frame.bindHostInputsWithOperation(host_inputs, null, if (cleanup.operation) |*token| token else null);
+        for (bound) |input| self.values[input.node_id] = input.value;
+        try frame.prepareProgramViews(&self.backend, &self.graph, self.values, cleanup);
         try self.borrowed.ensureTotalCapacity(self.allocator, self.graph.nodeCount());
         for (frame.native_program_views) |maybe| if (maybe) |value| self.borrowed.putAssumeCapacity(value, {});
         try frame.sealProgramStorage();
@@ -859,19 +881,22 @@ pub const Schedule = struct {
         if (frame.scope_backends != 0 or self.numerical_epoch != null) return error.DenseScheduleAlreadyEntered;
         if (current.operation != null or current.synchronous_outside_raw != null) return error.UnsupportedDenseScheduleCleanup;
         const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        const operation = if (self.selected.pool.requiresManagedExecution()) operation: {
+            const token = self.backend.operationToken() orelse return error.UnsupportedDenseSchedule;
+            try token.validate(.{ .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable }, .program = &self.graph, .mode = .managed });
+            var owner_epoch = (try token.retainCleanupEpoch()) orelse return error.MissingCurrentCleanupEpoch;
+            defer owner_epoch.release();
+            if (owner_epoch.record != epoch.record or owner_epoch.nonce != epoch.nonce) return error.BackendOperationCleanupChanged;
+            break :operation token;
+        } else null;
         var held = try epoch.retain();
         errdefer held.release();
         if (try held.isSealed()) return error.RetirementEpochSealed;
         self.numerical_epoch = held;
-        frame.beginWithCleanup(.{ .boundary = &self.numerical_epoch.? }) catch |err| {
+        frame.beginWithCleanup(.{ .boundary = &self.numerical_epoch.?, .operation = operation }) catch |err| {
             self.numerical_epoch = null;
             return err;
         };
-    }
-    pub fn bindHostInputs(self: *Schedule, inputs: []const @import("host_ingress.zig").Input) !void {
-        const frame = self.frame orelse return error.DenseScheduleNotEntered;
-        const bound = try frame.bindHostInputs(inputs);
-        for (bound) |input| self.values[input.node_id] = input.value;
     }
     pub fn beforeHostInputReuse(self: *Schedule) !void {
         const frame = self.frame orelse return error.DenseScheduleNotEntered;

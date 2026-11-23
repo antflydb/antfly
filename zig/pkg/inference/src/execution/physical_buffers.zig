@@ -186,6 +186,7 @@ pub const Pool = struct {
     native_frame_dispatch: bool = false,
     cuda_frame_dispatch: bool = false,
     metal_frame_dispatch: bool = false,
+    private_decoder_program: bool = false,
     /// Only a canonical single-partition projection head can qualify through its
     /// synchronous region. The root grants no primitive Frame credit.
     metal_projection_region_candidate: bool = false,
@@ -833,7 +834,7 @@ pub const Pool = struct {
         if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch != metal or self.metal_projection_region_candidate or
             (!native and !cuda and !metal) or self.backends.len != 1 or self.backends[0].vtable != backend.vtable or self.backends[0].ptr != backend.ptr or
             reachable.len != graph.nodeCount() or self.kernels.len != graph.nodeCount() or
-            self.frames.items.len != 0 or self.pending_frames != 0 or self.prepared_backings.load(.acquire) or
+            self.private_decoder_program or self.frames.items.len != 0 or self.pending_frames != 0 or self.prepared_backings.load(.acquire) or
             self.immutable_bindings != null or self.variant_cache != null or self.selection != null or self.route_owner != null or self.root_pool != null or
             self.region_owner != null or self.regions.len != 0 or self.region_by_node.len != 0 or self.region_runtime_last_use.len != 0 or
             self.region_policy != .select_regions or self.region_execution_profile != .unknown or self.managed_terminal_eligible or
@@ -849,7 +850,8 @@ pub const Pool = struct {
             try operation.enterInto(&backend, graph, null, .metadata, &metadata);
             if (metadata.token() == null) return null;
         }
-        const selected = (try finishPreparedVariant(self, inputs, .compatibility_regions, .unknown, metadata.token())) orelse return null;
+        const selected = (try finishPreparedVariant(self, inputs, if (metal) .select_regions else .compatibility_regions, .unknown, metadata.token())) orelse return null;
+        self.private_decoder_program = true;
         owner.* = null;
         return selected;
     }
@@ -1810,6 +1812,22 @@ pub const Pool = struct {
         }
     }
 
+    /// Private decoder regions pin their complete payload during selection.
+    /// No borrowed dispatch claim or mutable vendor setup survives admission.
+    pub fn acquirePrivateDecoderFrame(self: *Pool, capability: ?admission.Capability, operation: ?@import("backend_operation.zig").Borrowed) !?*Frame {
+        if (!self.private_decoder_program or self.payload_coverage != .complete) return error.UnsupportedDenseSchedule;
+        if (self.regions.len == 0) return self.acquirePrepared(capability, null);
+        const graph = self.coverage_graph orelse return error.UnsupportedDenseSchedule;
+        const backend = self.coverage_backend orelse return error.UnsupportedDenseSchedule;
+        const token = operation orelse return error.RegionExecutionProfileChanged;
+        try token.validate(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .program = graph, .mode = .managed });
+        for (self.regions) |installed| {
+            const owner = installed.owner;
+            if (owner.requirements.payload_claim_required or owner.vtable.claim_before_admission != null or owner.vtable.prepare_assigned != null) return error.UnsupportedDenseSchedule;
+        }
+        return self.acquireWithAdmissionForOperation(capability, .{ .graph = graph, .operation = token });
+    }
+
     pub fn acquirePrepared(self: *Pool, capability: ?admission.Capability, claim: ?*FrameClaim) !?*Frame {
         if (self.regions.len != 0) return error.PreparedRegionClaimRequired;
         if (claim) |prepared| return try prepared.consume(self, capability);
@@ -2364,7 +2382,8 @@ pub const Frame = struct {
         self.releaseHostInputs();
         self.releaseDeviceInputs();
         try self.advanceHostInputGeneration();
-        return (if (stable_packet) self.bindValidatedHostInputs(inputs, null, null) else self.bindHostInputs(inputs)) catch |err| {
+        const operation = if (self.scope_cleanup.operation) |*token| token else null;
+        return (if (stable_packet) self.bindValidatedHostInputs(inputs, null, operation) else self.bindHostInputsWithOperation(inputs, null, operation)) catch |err| {
             self.retired = true;
             return err;
         };
