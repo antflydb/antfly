@@ -20679,16 +20679,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
     const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
     const capture = arena.graph == null and !arena.disabled;
-    const capture_scope = if (capture) blk: {
-        const scope = try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
-        // Prove the lexical source bank is disjoint before any queued copies.
-        try SourceLinearTemporary.validateArenaCapture(self, &scope);
-        break :blk scope;
-    } else null;
-    const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
-    var out_owned = true;
-    defer if (out_owned) freeTensor(self, out);
-    var published_directly = false;
     // Collect only completed events, with no new stream/device wait.
     if (arena.timing_replay) |replay| if (arena.timing) |pair| {
         var ms: f32 = 0;
@@ -20699,6 +20689,19 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     };
     const capture_sample = arena.graph == null;
     const replay = arena.graph != null and arena.preferReplay();
+    // Establish scratch and input custody before allocating the result or
+    // submitting profiling events and copies.
+    var execution_scope = if (replay) null else try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
+    if (execution_scope) |*scope| {
+        if (capture) try SourceLinearTemporary.validateArenaCapture(self, scope);
+        if (!capture) for (inputs, spans) |ct, span| {
+            if (span.bytes != 0 and !scope.disjointBacking(tensorFromCt(ct).buffer.ptr, span.bytes)) return null;
+        };
+    }
+    const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
+    var out_owned = true;
+    defer if (out_owned) freeTensor(self, out);
+    var published_directly = false;
     const stable_inputs = replay or capture;
     const input_bank = if (stable_inputs) try audioBufferView(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
     defer arena.noteUse(&self.ctx);
@@ -20714,7 +20717,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     } else {
         // Eager execution borrows the same logical input spans from the caller.
         // Recording binds them to the cache's fixed addresses.
-        var scope = capture_scope orelse try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
+        const scope = &execution_scope.?;
         var stable: [20]CT = undefined;
         var count: usize = 0;
         defer for (stable[0..count]) |ct| freeTensor(self, ct);
@@ -20723,7 +20726,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             const source = if (capture) input_bank else input.buffer;
             const offset = if (capture) span.offset else 0;
             const buffer = try audioBufferView(source, offset, span.bytes);
-            if (!capture and span.bytes != 0 and !scope.disjointBacking(buffer.ptr, span.bytes)) return error.InvalidExecutionPlan;
             const borrowed = try createTensor(self, buffer, input.shape, input.elem_count);
             const view = tensorFromCt(borrowed);
             view.owns_buffer = false;
@@ -20741,7 +20743,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         };
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        self.execution_scope = &scope;
+        self.execution_scope = scope;
         const result = run(context, stable[0..count]) catch |err| {
             self.execution_scope = null;
             if (capture) {
@@ -60229,6 +60231,24 @@ test "public source audio linear recreates input bank through actual learning ca
         const expected: [4]f32 = @splat(@floatFromInt(value));
         try std.testing.expectEqualSlices(f32, &expected, held_values);
     }
+    // An eager call with a source in the arena backing must decline before
+    // the callback, leaving the already published results untouched.
+    for (&compute.embedding_gemma2_execution.arenas) |*arena| {
+        if (arena.kind != .audio or arena.graph == null) continue;
+        arena.replay_samples = 2;
+        arena.eager_samples = 0;
+        arena.timing_replay = null;
+        var alias: CudaTensor = .{
+            .buffer = try audioBufferView(arena.buffers[0], 0, @sizeOf([4]f32)),
+            .shape = @constCast(&[_]i64{ 2, 2 }),
+            .elem_count = 4,
+            .dtype = .f32,
+            .owns_buffer = false,
+            .owns_shape = false,
+        };
+        try std.testing.expect(try cb.audioExecution(0x303, &.{ &alias, identity }, &run, Run.call) == null);
+        break;
+    } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 5), run.calls);
     try std.testing.expectEqual(@as(u64, 5), compute.audio_arena_executes);
 }
