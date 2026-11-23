@@ -2339,7 +2339,6 @@ pub fn retainPreparedEmbeddingF32(runtime: *RawMetalDecodeRuntime, key: Embeddin
     return MetalTensor.deviceRetainedExternal(@ptrCast(runtime), handle, offset, bytes, &shape);
 }
 
-
 pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -4773,6 +4772,40 @@ pub fn decoderRuntimeLayerNormBuffersInto(self: anytype, input: MetalTensor, wei
     const runtime = self.raw_decode_runtime orelse return false;
     if (dim == 0 or input.elemCount() % dim != 0) return false;
     return antfly_metal_layer_norm_buffers(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), bias.deviceHandle(), bias.deviceByteOffset(), input.elemCount() / dim, dim, eps, output.deviceHandle(), output.deviceByteOffset()) == 0;
+}
+
+pub fn decoderRuntimeAddLayerNormSumBuffersInto(
+    self: anytype,
+    a: MetalTensor,
+    b: MetalTensor,
+    weight: MetalTensor,
+    bias: MetalTensor,
+    dim: usize,
+    eps: f32,
+    sum: MetalTensor,
+    output: MetalTensor,
+) !void {
+    const runtime = self.raw_decode_runtime orelse return error.UnsupportedOperation;
+    if (dim == 0 or a.elemCount() == 0 or a.elemCount() % dim != 0) return error.InvalidTensorShape;
+    const rc = antfly_metal_add_layer_norm_sum_buffers(
+        runtime,
+        a.deviceHandle(),
+        a.deviceByteOffset(),
+        b.deviceHandle(),
+        b.deviceByteOffset(),
+        weight.deviceHandle(),
+        weight.deviceByteOffset(),
+        bias.deviceHandle(),
+        bias.deviceByteOffset(),
+        a.elemCount() / dim,
+        dim,
+        eps,
+        sum.deviceHandle(),
+        sum.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) return error.MetalAssignedExecutionFailed;
 }
 
 pub fn decoderRuntimeApplyLayerNormDeviceInto(self: anytype, slot: usize, input: MetalTensor, dim: usize, eps: f32, output: MetalTensor) !bool {
@@ -21581,6 +21614,25 @@ pub extern fn termite_metal_decode_runtime_apply_layer_norm(
     output: [*c]f32,
 ) c_int;
 pub extern fn antfly_metal_layer_norm_buffers_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn antfly_metal_add_layer_norm_sum_buffers(
+    runtime: ?*RawMetalDecodeRuntime,
+    a: ?*anyopaque,
+    a_offset: usize,
+    b: ?*anyopaque,
+    b_offset: usize,
+    weight: ?*anyopaque,
+    weight_offset: usize,
+    bias: ?*anyopaque,
+    bias_offset: usize,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    sum: ?*anyopaque,
+    sum_offset: usize,
+    output: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+
 extern fn antfly_metal_layer_norm_buffers(
     runtime: ?*RawMetalDecodeRuntime,
     input_handle: ?*anyopaque,

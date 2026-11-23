@@ -926,6 +926,26 @@ pub const Schedule = struct {
         if (inputs.len != node.num_inputs) return error.DenseScheduleOrderChanged;
         return self.executeStep(node, inputs, attention);
     }
+    pub fn executeAddNorm(self: *Schedule, a: CT, b: CT, weight: CT, bias: CT, dim: usize, eps: f32) !?[2]CT {
+        if (self.backend.kind() != .metal) return null;
+        if (self.cursor >= self.steps.len or self.steps.len - self.cursor < 2) return error.DenseScheduleOrderChanged;
+        const add, const norm = self.steps[self.cursor..][0..2].*;
+        const add_op = (self.descriptors[add] orelse return error.DenseScheduleOrderChanged).operation;
+        const norm_op = (self.descriptors[norm] orelse return error.DenseScheduleOrderChanged).operation;
+        const node = self.graph.node(norm);
+        if (add_op != .binary or add_op.binary != .add or norm_op != .norm or norm_op.norm.kind != .layer or
+            norm_op.norm.dim != dim or norm_op.norm.eps != eps or node.num_inputs != 3 or node.inputs[0] != add)
+            return error.DenseScheduleOrderChanged;
+        if (self.values[node.inputs[1]] != weight or self.values[node.inputs[2]] != bias)
+            return error.PreparedKernelBindingChanged;
+        const frame = self.frame orelse return error.DenseScheduleNotEntered;
+        self.values[add] = frame.preparedOutputView(add) orelse return error.UnpreparedNativeProgramViews;
+        const outputs = try frame.executePreparedAddNorm(&self.backend, self.values, add, norm, .{ a, b });
+        self.cursor += 2;
+        if (self.cursor == self.steps.len) try frame.recordProgramCompletion();
+        return outputs;
+    }
+
     /// Consume a semantic projection group with one cursor contract. Validate
     /// all member operands before submitting the first numerical operation.
     fn validateQkv(self: *const Schedule, inputs: [3][]const CT) ![]const ml.graph.NodeId {

@@ -1905,7 +1905,12 @@ fn stepCrossRows(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT,
 }
 
 fn addNorm(cb: *const ComputeBackend, a: CT, b: CT, norm: Norm, dim: usize, profile: ?*StepProfile) !AddNormPair {
-    if (stepSchedule(profile) == null) {
+    if (stepSchedule(profile)) |schedule| {
+        if (try schedule.executeAddNorm(a, b, norm.w, norm.b, dim, 1e-5)) |fused| {
+            profile.?.fused_add_norm += 1;
+            return .{ .sum = fused[0], .normed = fused[1] };
+        }
+    } else {
         if (try cb.addLayerNormSum(a, b, norm.w, norm.b, dim, 1e-5)) |fused| {
             if (profile) |prof| prof.fused_add_norm += 1;
             return .{ .sum = fused.sum, .normed = fused.normed };

@@ -3514,7 +3514,29 @@ pub const Frame = struct {
         };
         return (try self.executeProgram(cb, values, id, rope_position, attention, true)) orelse error.IncompleteNativeProgram;
     }
+    pub fn executePreparedAddNorm(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, add: NodeId, norm: NodeId, inputs: [2]CT) ![2]CT {
+        if (!self.in_use or self.retired or self.scope_backends != 1 or cb.kind() != .metal)
+            return error.InvalidNativeProgramExecution;
+        const kernel = self.pool.kernels[add] orelse return error.MissingPreparedKernelRoute;
+        const selected = self.pool.backends[kernel.backend_index];
+        if (selected.ptr != cb.ptr or selected.vtable != cb.vtable) return error.PreparedKernelBindingChanged;
+        const lease = self.storages[kernel.output_allocation] orelse return error.PreparedStorageUnavailable;
+        const sum = self.native_program_views[add] orelse return error.UnpreparedNativeProgramViews;
+        if (values[add] != sum) return error.PreparedKernelBindingChanged;
+        const residual = kernels.ResidualAdd{ .inputs = inputs, .authority = try self.assignedOutput(add, lease) };
+        const output = (try self.executeProgramWithResidual(cb, values, norm, null, null, true, &residual)) orelse return error.IncompleteNativeProgram;
+        return .{ sum, output };
+    }
+
+    pub fn preparedOutputView(self: *const Frame, node: NodeId) ?CT {
+        if (node >= self.native_program_views.len) return null;
+        return self.native_program_views[node];
+    }
+
     fn executeProgram(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: ?*const ops.AttentionContext, cached: bool) !?CT {
+        return self.executeProgramWithResidual(cb, values, id, rope_position, attention, cached, null);
+    }
+    fn executeProgramWithResidual(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: ?*const ops.AttentionContext, cached: bool, residual: ?*const kernels.ResidualAdd) !?CT {
         if (self.pool.plan.slotForNode(id) == null) return error.InactivePhysicalNode;
         if (cached and self.pool.kernels[id] == null) return self.native_program_views[id] orelse error.IncompleteNativeProgram;
         if (!cached) if (try self.materializeLiteral(cb, id)) |literal| return literal;
@@ -3550,7 +3572,7 @@ pub const Frame = struct {
                 issued_inputs[position] = .{ .node = input_node, .lease_identity = @intFromPtr(owner), .authority = authority, .generation = self.host_input_generation };
             }
         };
-        const request = kernels.Invocation{ .attention = attention, .input_generation = self.host_input_generation, .assigned_inputs = if (issue_inputs) &issued_inputs else null, .prepared_route = selected_route, .descriptor = descriptor, .operator_plan = if (kernel.operator_plan) |*plan| plan else null, .inputs = inputs[0..descriptor.input_count] };
+        const request = kernels.Invocation{ .residual_add = residual, .attention = attention, .input_generation = self.host_input_generation, .assigned_inputs = if (issue_inputs) &issued_inputs else null, .prepared_route = selected_route, .descriptor = descriptor, .operator_plan = if (kernel.operator_plan) |*plan| plan else null, .inputs = inputs[0..descriptor.input_count] };
         // A cached canonical Native program already owns its output views and
         // exact resources. Its bound call below performs all current input,
         // source/policy, output-authority and alias checks before any write.

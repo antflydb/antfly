@@ -687,7 +687,13 @@ pub const AuxiliaryRequirements = struct {
     }
 };
 pub const AuxiliaryBinding = struct { role: AuxiliaryRole, tensor: CT };
+pub const ResidualAdd = struct {
+    inputs: [2]CT,
+    authority: @import("../execution/kernel_route.zig").AssignedOutput,
+};
+
 pub const Invocation = struct {
+    residual_add: ?*const ResidualAdd = null,
     /// Actual synchronous DecodeContext, never saved by a descriptor/route.
     attention: ?*const @import("../graph/backend_contracts.zig").AttentionContext = null,
     input_generation: u64 = 0,

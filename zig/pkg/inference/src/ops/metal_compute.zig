@@ -13529,6 +13529,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // synchronous encoding instead of retaining/materializing each through
         // the general CT adapters; the command/frame layer retains GPU resources.
         const input = PreparedCachedOperands.deviceInput(cached_operands, request.inputs[0], 0).?;
+        if (request.residual_add) |residual| {
+            if (descriptor.operation != .norm or descriptor.operation.norm.kind != .layer or cached_operands == null)
+                return error.PreparedKernelBindingChanged;
+            try self.validateProjectionOutput(input, residual.authority);
+            const weight = PreparedCachedOperands.deviceInput(cached_operands, request.inputs[1], 1).?;
+            const bias = PreparedCachedOperands.deviceInput(cached_operands, request.inputs[2], 2).?;
+            var sources: [2]MetalTensor = undefined;
+            for (residual.inputs, &sources) |value, *source| {
+                const buf = toBuf(value);
+                if (buf.integer_storage or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf))
+                    return error.InvalidTensorShape;
+                const tensor = buf.metal_tensor orelse return error.InvalidTensorShape;
+                if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != input.elemCount()) return error.InvalidTensorShape;
+                if (projectionRangesOverlap(tensor, input)) return error.InvalidAssignedAlias;
+                // The fused kernel finishes reading both operands into the
+                // separate sum before it writes normalization. The plan can
+                // reuse a dead operand's exact plane for that second output.
+                if (projectionRangesOverlap(tensor, out_tensor) and
+                    (tensor.deviceByteOffset() != out_tensor.deviceByteOffset() or tensor.deviceByteLen() != out_tensor.deviceByteLen()))
+                    return error.InvalidAssignedAlias;
+                source.* = tensor;
+            }
+            for ([_]MetalTensor{ weight, bias }) |parameter| {
+                if (projectionRangesOverlap(parameter, input)) return error.InvalidAssignedAlias;
+            }
+            const norm = descriptor.operation.norm;
+            const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+            defer self.endActivePlannedComputeScope(scope);
+            try metal_runtime.decoderRuntimeAddLayerNormSumBuffersInto(self.provider_impl, sources[0], sources[1], weight, bias, norm.dim, norm.eps, input, out_tensor);
+            if (toBuf(request.inputs[0]).metal_tensor) |*tensor| tensor.invalidateHostMirror();
+            if (out_buf.metal_tensor) |*tensor| tensor.invalidateHostMirror();
+            return true;
+        }
         const written: bool = switch (descriptor.operation) {
             .paged_attention => return false,
             .dense_attention_rows, .dense_attention_prefix => blk: {
@@ -56892,7 +56925,7 @@ test "Metal prepared typed gather and layer norm retain named cached operands" {
             private.?.coverage_reachable = analysis.reachable;
             private.?.coverage_backend = cb;
             private.?.metal_frame_dispatch = true;
-            const selected = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private, .{ .slice = &.{.{
+            const selected = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private, .{ .slice = &.{ .{
                 .node_id = table_node,
                 .value = .{ .tensor = .{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .value = source } },
             }, .{
@@ -56901,7 +56934,7 @@ test "Metal prepared typed gather and layer norm retain named cached operands" {
             }, .{
                 .node_id = beta_node,
                 .value = .{ .tensor = .{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .value = beta } },
-            }} }, .{ .slice = &.{.{
+            } } }, .{ .slice = &.{.{
                 .node_id = index_node,
                 .value = .{ .imported_host = .{ .logical = index_shape, .target = .metal, .owned_ingress = true } },
             }} })) orelse return error.MissingPreparedRoutes;
