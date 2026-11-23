@@ -1909,9 +1909,11 @@ pub const AntflyApiHandler = struct {
             .DELETE => .delete,
             else => return error.UnsupportedMethod,
         };
+        const target = try ctx.request.uri.requestPath(ctx.allocator);
+        defer ctx.allocator.free(target);
         var request: http_server_mod.ApiHttpServer.SessionForwardRequest = .{
             .method = method,
-            .target = ctx.request.uri.raw,
+            .target = target,
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
             .sql_fence = ctx.header("X-Antfly-SQL-Fence"),
@@ -1972,13 +1974,15 @@ pub const AntflyApiHandler = struct {
         }
         const completion = try requestCompletion(ctx);
         var forwarded = false;
+        const target = try ctx.request.uri.requestPath(ctx.allocator);
+        defer ctx.allocator.free(target);
         const request: http_common.HttpRequest = .{ .method = switch (ctx.request.method) {
             .GET => .GET,
             .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
             else => return error.UnsupportedMethod,
-        }, .uri = ctx.request.uri.raw, .headers = headers.items, .authorization = ctx.header("authorization"), .content_type = ctx.header("content-type"), .body = body };
+        }, .uri = target, .headers = headers.items, .authorization = ctx.header("authorization"), .content_type = ctx.header("content-type"), .body = body };
         const cancellation = requestCancellation(ctx);
         const control: http_server_mod.ApiHttpServer.SQLForwardControl = .{
             .deadline_ns = @import("../request_deadline.zig").platformDeadline(ctx),
@@ -23588,7 +23592,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         fn execute(raw: *anyopaque, a: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             const fixture: *@This() = @ptrCast(@alignCast(raw));
             fixture.forwards += 1;
-            try std.testing.expectEqualStrings("http://owner/db/v1/sql", req.uri);
+            try std.testing.expectEqualStrings("http://owner/db/v1/sql?trace=route%2Ftest", req.uri);
             try std.testing.expectEqualStrings("route-test", req.header("X-Antfly-SQL-Fence").?);
             try std.testing.expect(req.timeout_ms.? > 0 and req.timeout_ms.? <= 5000);
             try std.testing.expect(req.cancellation != null);
@@ -23679,7 +23683,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var handler: AntflyApiHandler = .{ .api_server = &api };
     const body = try std.fmt.allocPrint(alloc, "{{\"statement\":\"COMMIT\",\"session_id\":\"{s}\"}}", .{@import("sql_resource_routing.zig").encode(1, @splat(3))});
     defer alloc.free(body);
-    var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/sql");
+    var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/sql?trace=route%2Ftest");
     defer request.deinit();
     try request.headers.set("X-Antfly-SQL-Fence", "route-test");
     request.body = body;
