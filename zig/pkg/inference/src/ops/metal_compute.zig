@@ -27223,92 +27223,47 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const v_host = try hostSliceForBuf(v_buf);
         const bias_data = if (bias_buf) |buf| try hostSliceForBuf(buf) else null;
 
-        if (!attention.skip_kv_write and attention.kv_sequence_len == attention.query_sequence_len and attention.kv_position_offset == 0) {
-            if (attention.kv_cache) |kv| {
-                if (attention.kv_manager != null or attention.kv_storage != null) {
-                    if (attention.kv_storage) |storage| {
-                        try storage.writeLayerKvSuffix(
-                            kv.sequence_id,
-                            attention.layer_index,
-                            attention.kv_sequence_len,
-                            attention.query_sequence_len,
-                            k_host,
-                            v_host,
-                        );
-                    } else {
-                        const manager = attention.kv_manager.?;
-                        try manager.writeLayerKvSuffix(
-                            kv.sequence_id,
-                            attention.layer_index,
-                            attention.kv_sequence_len,
-                            attention.query_sequence_len,
-                            k_host,
-                            v_host,
-                        );
-                    }
-                    const source = try attentionKvSource(attention);
-                    _ = try self.updateBackendKvLayerCache(
-                        .{
-                            .source_ptr_id = source.ptr_id,
-                            .sequence_id = kv.sequence_id,
-                            .layer_index = attention.layer_index,
-                        },
-                        k_host,
-                        v_host,
-                        attention.query_sequence_len,
-                        attention.kv_sequence_len,
-                        attention.kv_position_offset,
-                        h_kv,
-                        attentionBlockSignature(attention),
-                    );
-                }
+        const complete_initial_write = !attention.skip_kv_write and attention.kv_sequence_len == attention.query_sequence_len and attention.kv_position_offset == 0;
+        if (complete_initial_write and stateful) {
+            const kv = attention.kv_cache.?;
+            if (attention.kv_storage) |storage| {
+                try storage.writeLayerKvSuffix(
+                    kv.sequence_id,
+                    attention.layer_index,
+                    attention.kv_sequence_len,
+                    attention.query_sequence_len,
+                    k_host,
+                    v_host,
+                );
+            } else {
+                const manager = attention.kv_manager.?;
+                try manager.writeLayerKvSuffix(
+                    kv.sequence_id,
+                    attention.layer_index,
+                    attention.kv_sequence_len,
+                    attention.query_sequence_len,
+                    k_host,
+                    v_host,
+                );
             }
-            var q_mt = try self.ownedMetalTensorFromCt(Q);
-            defer self.retireTemporaryWorkspaceValue(&q_mt);
-            var k_mt = try self.ownedMetalTensorFromCt(K);
-            defer self.retireTemporaryWorkspaceValue(&k_mt);
-            var v_mt = try self.ownedMetalTensorFromCt(V);
-            defer self.retireTemporaryWorkspaceValue(&v_mt);
-            var bias_mt: ?MetalTensor = null;
-            defer if (bias_mt) |*tensor| tensor.deinit();
-            if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
-            if (!disableRuntimeAttentionF32()) {
-                if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
-                    .q = q_mt,
-                    .k = k_mt,
-                    .v = v_mt,
-                    .bias = bias_mt,
-                    .attn_or_mask = attention.attn_or_mask,
-                    .q_len = attention.query_sequence_len,
-                    .kv_len = attention.kv_sequence_len,
-                    .num_heads = num_heads,
-                    .num_kv_heads = num_kv_heads,
-                    .head_dim = head_dim,
-                    .query_position_offset = query_position_offset,
-                    .kv_position_offset = attention.kv_position_offset,
-                    .sliding_window = attention.sliding_window,
-                    .total_sequence_len = attention.total_sequence_len,
-                })) |tensor| {
-                    return self.ctFromOwnedMetalTensor(tensor);
-                }
-            }
-            const output = try self.gqaAttentionHostFallback(
-                q_host,
+            const source = try attentionKvSource(attention);
+            _ = try self.updateBackendKvLayerCache(
+                .{
+                    .source_ptr_id = source.ptr_id,
+                    .sequence_id = kv.sequence_id,
+                    .layer_index = attention.layer_index,
+                },
                 k_host,
                 v_host,
-                bias_data,
-                attention,
-                batch,
-                num_heads,
-                num_kv_heads,
-                head_dim,
+                attention.query_sequence_len,
+                attention.kv_sequence_len,
+                attention.kv_position_offset,
+                h_kv,
+                attentionBlockSignature(attention),
             );
-            errdefer self.allocator.free(output);
-            const out_shape = [_]i32{ @intCast(batch * attention.query_sequence_len), @intCast(h_q) };
-            return denseBuf(self.allocator, output, true, &out_shape);
         }
 
-        if (attention.kv_cache == null or (attention.kv_manager == null and attention.kv_storage == null)) {
+        if (complete_initial_write or !stateful) {
             var q_mt = try self.ownedMetalTensorFromCt(Q);
             defer self.retireTemporaryWorkspaceValue(&q_mt);
             var k_mt = try self.ownedMetalTensorFromCt(K);
