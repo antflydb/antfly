@@ -11955,6 +11955,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn retainImmutableTensorOp(ctx: *anyopaque, value: CT) !?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const source = toBuf(value);
+        if (source.metal_tensor == null) {
+            // Retain the actual named model pin without uploading a copy.
+            _ = denseDecoderHeldWeight(ctx, self.data, value, null) catch return null;
+            source.weight_handle_refs = try std.math.add(usize, source.weight_handle_refs, 1);
+            return value;
+        }
         const dimensions = source.logical_shape orelse return null;
         if (dimensions.len > 8) return null;
         const shape = ml.graph.Shape.init(.f32, dimensions);
@@ -12065,6 +12071,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         output_slot: route.OutputSlot,
         slot: usize,
         key: DynamicLinearSlotKey,
+        host_sources: [2]?CT,
         payload: ?@import("../backends/prepared_slot_owner.zig").Owner.Pin,
         declaration: if (build_options.enable_metal) MetalNativeProvider.PrivateLinearPin else void,
 
@@ -12081,13 +12088,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         fn bindingKey(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding) ?DynamicLinearSlotKey {
             // Activation inputs may be planned, but the prepared immutable
             // weight/bias must be concrete source tensors, never guessed planes.
-            if (bindings.len != descriptor.input_count or bindings.len < 2 or bindings[1] != .tensor or (descriptor.operation.linear.bias and bindings[2] != .tensor)) return null;
+            if (descriptor.operation != .linear or bindings.len != descriptor.input_count or
+                bindings.len != (if (descriptor.operation.linear.bias) @as(usize, 3) else 2)) return null;
             for (bindings[1..]) |binding| {
+                if (binding != .tensor) return null;
                 const known = binding.tensor;
                 if (known.implementation.context != @as(*anyopaque, @ptrCast(compute)) or !acceptsPhysicalImplementation(known.implementation.table)) return null;
             }
             const linear = descriptor.operation.linear;
             return compute.assignedDenseLinearKey(linear, bindings[1].tensor.value, if (linear.bias) bindings[2].tensor.value else null);
+        }
+        fn directInputs(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding, facts: *[3]route.Binding, host_planes: *[2]@import("../execution/storage_ownership.zig").Plane) ?[]const route.Binding {
+            @memcpy(facts[0..bindings.len], bindings);
+            for (bindings[1..], 1..) |binding, index| {
+                const source = binding.tensor;
+                if (toBuf(source.value).metal_tensor != null) continue;
+                const plane = denseDecoderHeldWeight(compute, compute.data, source.value, null) catch return null;
+                const shape = descriptor.input_shapes[index];
+                if (!plane.descriptor.shape.eq(shape)) return null;
+                host_planes[index - 1] = plane;
+                // Direct checks the descriptor extent. The slot supplies device
+                // storage separately, and the source still reports host residency.
+                facts[index] = .{ .resident = .{ .implementation = source.implementation, .logical = shape, .planes = host_planes[index - 1 .. index] } };
+            }
+            return facts[0..bindings.len];
         }
         fn prepare(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable) !?route.Owned {
             return prepareWith(compute, request, table, supported);
@@ -12099,7 +12123,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (comptime !build_options.enable_metal) return null;
             const key = bindingKey(compute, request.descriptor, request.inputs) orelse return null;
             const slot = compute.assignedDenseLinearSlot(key) orelse return null;
-            var direct = (try @import("../execution/assigned_kernel_route.zig").prepare(.{ .ptr = compute, .vtable = table }, request, supported_fn)) orelse return null;
+            var facts: [3]route.Binding = undefined;
+            var host_planes: [2]@import("../execution/storage_ownership.zig").Plane = undefined;
+            var checked = request;
+            checked.inputs = directInputs(compute, request.descriptor, request.inputs, &facts, &host_planes) orelse return null;
+            var direct = (try @import("../execution/assigned_kernel_route.zig").prepare(.{ .ptr = compute, .vtable = table }, checked, supported_fn)) orelse return null;
             var committed = false;
             defer if (!committed) direct.deinit();
             const owner = try request.allocator.create(PreparedDenseLinear);
@@ -12126,15 +12154,32 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             };
             var output_slot = request.output;
             output_slot.writable_bytes = direct.requirements.primary_bytes;
-            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = output_slot, .slot = slot, .key = key, .payload = payload, .declaration = declaration };
+            var host_sources: [2]?CT = @splat(null);
+            for (checked.inputs[1..], request.inputs[1..], 0..) |fact, original, index| {
+                if (fact == .resident) host_sources[index] = original.tensor.value;
+            }
+            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = output_slot, .slot = slot, .key = key, .host_sources = host_sources, .payload = payload, .declaration = declaration };
             committed = true;
             return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .vtable = &vtable };
         }
         fn matches(raw: *anyopaque, request: route.Validate) bool {
             const self: *PreparedDenseLinear = @ptrCast(@alignCast(raw));
-            if (!self.pinValid() or !self.direct.vtable.matches(self.direct.context, request)) return false;
+            if (!self.pinValid()) return false;
             const key = bindingKey(self.compute, &self.descriptor, request.inputs) orelse return false;
-            return std.meta.eql(key, self.key);
+            if (!std.meta.eql(key, self.key)) return false;
+            var facts: [3]route.Binding = undefined;
+            var host_planes: [2]@import("../execution/storage_ownership.zig").Plane = undefined;
+            var checked = request;
+            checked.inputs = directInputs(self.compute, &self.descriptor, request.inputs, &facts, &host_planes) orelse return false;
+            return self.direct.vtable.matches(self.direct.context, checked);
+        }
+        fn pinnedInput(raw: *anyopaque, index: usize, binding: route.Binding) bool {
+            const self: *const PreparedDenseLinear = @ptrCast(@alignCast(raw));
+            if (index == 0 or index >= self.descriptor.input_count or binding != .tensor) return false;
+            const tensor = binding.tensor;
+            return tensor.implementation.context == @as(*anyopaque, @ptrCast(self.compute)) and
+                acceptsPhysicalImplementation(tensor.implementation.table) and
+                self.host_sources[index - 1] == tensor.value and self.pinValid();
         }
         fn pinValid(self: *const PreparedDenseLinear) bool {
             if (comptime !build_options.enable_metal) return false;
@@ -12168,7 +12213,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (self.payload) |pin| pin.release();
             self.allocator.destroy(self);
         }
-        const vtable: route.Owned.VTable = .{ .matches = matches, .validate = validate, .deinit = @This().deinit };
+        const vtable: route.Owned.VTable = .{ .pinned_input = pinnedInput, .matches = matches, .validate = validate, .deinit = @This().deinit };
     };
 
     /// One explicit operation and (for independently packed multirow heads)
@@ -12435,8 +12480,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         fn dispatch(raw: *anyopaque, invocation: region.Invocation) !region.Outcome {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            for (invocation.validation.inputs, invocation.inputs) |binding, value| {
+            for (invocation.validation.inputs, invocation.inputs, 0..) |binding, value, index| {
                 if (binding == .tensor and binding.tensor.value != value) return error.PreparedRegionBindingChanged;
+                // Each weight or bias was attested against the corresponding
+                // pinned linear by matches. The activation must still be a device view.
+                if (index != 0 and toBuf(value).metal_tensor == null and binding != .tensor) return error.PreparedRegionBindingChanged;
             }
             const input = try self.tensor(invocation.inputs[0]);
             var outputs: [3]MetalTensor = undefined;
@@ -12452,6 +12500,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
                 // All source/output aliases are refused BEFORE native entry.
                 for (invocation.inputs) |source| {
+                    if (toBuf(source).metal_tensor == null) continue;
                     const current = try self.tensor(source);
                     if (current.deviceHandle() == outputs[index].deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(current.deviceByteOffset()), current.deviceByteLen(), @intCast(outputs[index].deviceByteOffset()), outputs[index].deviceByteLen())) return error.InvalidAssignedAlias;
                 }
@@ -12481,6 +12530,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (scratch.deviceHandle() == output.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(scratch.deviceByteOffset()), self.scratch_bytes, @intCast(output.deviceByteOffset()), output.deviceByteLen())) return error.InvalidAssignedAlias;
                 }
                 for (invocation.inputs) |source| {
+                    if (toBuf(source).metal_tensor == null) continue;
                     const value = try self.tensor(source);
                     if (scratch.deviceHandle() == value.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(scratch.deviceByteOffset()), self.scratch_bytes, @intCast(value.deviceByteOffset()), value.deviceByteLen())) return error.InvalidAssignedAlias;
                 }
@@ -12513,7 +12563,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             for (self.linears[0..self.count]) |*linear| linear.deinit();
             self.allocator.destroy(self);
         }
-        const table: region.Owned.VTable = .{ .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = @This().deinit };
+        fn pinnedInput(raw: *anyopaque, index: usize, binding: route.Binding) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (index == 0 or index >= self.input_count) return false;
+            var operand_index: usize = 1;
+            for (self.linears[0..self.count]) |linear| {
+                const owner: *const PreparedDenseLinear = @ptrCast(@alignCast(linear.context));
+                const operands = owner.descriptor.input_count - 1;
+                if (index < operand_index + operands) return PreparedDenseLinear.pinnedInput(linear.context, index - operand_index + 1, binding);
+                operand_index += operands;
+            }
+            return false;
+        }
+        const table: region.Owned.VTable = .{ .pinned_input = pinnedInput, .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = @This().deinit };
     };
     const DenseRegionReadiness = struct {
         const region = @import("../execution/region_route.zig");
@@ -13115,7 +13177,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const buf = toBuf(input);
             const typed_index = typed_gather and index == 1;
             if (buf.integer_storage != typed_index or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf)) return false;
-            const tensor = buf.metal_tensor orelse return false;
+            const tensor = buf.metal_tensor orelse {
+                const prepared = request.prepared_route orelse return false;
+                if (descriptor.operation != .linear or index == 0 or prepared.vtable != &PreparedDenseLinear.vtable) return false;
+                const source = denseDecoderHeldWeight(ctx, self.data, input, null) catch return false;
+                if (!source.descriptor.shape.eq(descriptor.input_shapes[index])) return false;
+                continue;
+            };
             if (!tensor.isDevice() or tensor.dtype != (if (typed_index) hostInputMetalDType(descriptor.input_shapes[index].dtype).? else .f32) or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
             if (typed_gather) {
                 const shape = descriptor.input_shapes[index];
@@ -13178,7 +13246,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
             for (request.inputs) |source| {
-                const tensor = toBuf(source).metal_tensor.?;
+                const tensor = toBuf(source).metal_tensor orelse continue;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
             }
         }
@@ -55950,7 +56018,11 @@ const PreparedDenseRegionFixture = struct {
             const previous = compute.data.f32_weight_borrow;
             compute.data.f32_weight_borrow = .immutable_model_values;
             defer compute.data.f32_weight_borrow = previous;
-            const weight = try cb.getWeight("q");
+            const original = try cb.getWeight("q");
+            const weight = (blk: {
+                defer cb.free(original);
+                break :blk try cb.retainImmutableTensor(original, a);
+            }) orelse return error.MissingRetainedModelWeight;
             defer cb.free(weight);
             const services = @import("../execution/dense_decoder_backend.zig");
             const plane = try services.heldWeight(&cb, compute.data, weight, "q");
@@ -55988,7 +56060,16 @@ const PreparedDenseRegionFixture = struct {
             defer for (expected[0..produced]) |value| a.free(value);
             for ([_][]const u8{ "q", "k", "v" }, [_][]const u8{ "q.bias", "k.bias", "v.bias" }, 0..) |name, bias_name, index| {
                 if (index == count) break;
-                const weight = try cb.ensureDeviceResidentOwned(try cb.getWeight(name));
+                const weight = if (index == 0) host: {
+                    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+                    const previous = compute.data.f32_weight_borrow;
+                    compute.data.f32_weight_borrow = .immutable_model_values;
+                    defer compute.data.f32_weight_borrow = previous;
+                    const held = try cb.getWeight(name);
+                    errdefer cb.free(held);
+                    try std.testing.expect(MetalCompute.toBuf(held).metal_tensor == null);
+                    break :host held;
+                } else try cb.ensureDeviceResidentOwned(try cb.getWeight(name));
                 nodes[parameters] = builder.parameter(name, weight_shape) catch |err| {
                     cb.free(weight);
                     return err;

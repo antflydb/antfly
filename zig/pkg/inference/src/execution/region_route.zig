@@ -144,6 +144,8 @@ pub const Owned = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Exact external operand consumed exclusively through pinned provider slots.
+        pinned_input: ?*const fn (*anyopaque, usize, kernel.Binding) bool = null,
         /// Metadata-only. Includes input layout/storage/version and all static
         /// backend profile facts that selected the original tuned schedule.
         matches: *const fn (*anyopaque, Validate) bool,

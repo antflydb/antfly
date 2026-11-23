@@ -170,6 +170,8 @@ pub const Owned = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Exact immutable operand consumed through an already pinned provider slot.
+        pinned_input: ?*const fn (*anyopaque, usize, Binding) bool = null,
         host_input_constraint: ?*const fn (*anyopaque, usize) ?@import("host_ingress.zig").IndexBounds = null,
         /// Metadata only; run before admission when credit is requested, and
         /// again before any frame allocation/submission at dispatch. A mismatch

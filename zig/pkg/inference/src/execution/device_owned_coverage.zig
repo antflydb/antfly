@@ -205,6 +205,37 @@ fn operationDeclined(graph: *const ml.graph.Graph, id: usize, reason: []const u8
     return .{ .compatibility = .operation };
 }
 
+// Inspect every reachable use of an immutable input with no device plane.
+// A view, transfer, compatibility op, or non-pinned operand defeats coverage.
+fn pinnedInputsCovered(pool: *const physical.Pool, graph: *const ml.graph.Graph, reachable: []const bool, pending: *const std.DynamicBitSetUnmanaged) ?ml.graph.NodeId {
+    const immutable = pool.immutable_bindings.?;
+    const selected = &pool.selection.?;
+    for (reachable, 0..) |active, id| {
+        if (!active) continue;
+        const installed = pool.regionForNode(@intCast(id));
+        for (graph.nodes.items[id].getInputs(), 0..) |input, operand| {
+            if (input >= reachable.len or !pending.isSet(input)) continue;
+            const binding = immutable.find(input) orelse return input;
+            if (installed) |region| {
+                const owner = region.owner;
+                const check = owner.vtable.pinned_input orelse return input;
+                var found = false;
+                for (owner.input_nodes, 0..) |external, index| {
+                    if (external != input) continue;
+                    if (!check(owner.context, index, binding)) return input;
+                    found = true;
+                }
+                if (!found) return input;
+            } else {
+                const owner = selected.routes[id] orelse return input;
+                const check = owner.vtable.pinned_input orelse return input;
+                if (!check(owner.context, operand, binding)) return input;
+            }
+        }
+    }
+    return null;
+}
+
 pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: ?@import("backend_operation.zig").Borrowed) coverage.Coverage {
     const service = services(target) orelse return .{ .compatibility = .execution_path };
     const authority = metadata orelse return .{ .compatibility = .execution_path };
@@ -226,6 +257,8 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
     }
     if (pool.plan.transfers.len != 0) return .{ .compatibility = .transfer };
     for (pool.host_input_plans) |plan| if (plan.node >= reachable.len or !reachable[plan.node] or !ingress(pool, plan.node, plan.shape, target)) return .{ .compatibility = .input_representation };
+    var pinned_inputs: ?std.DynamicBitSetUnmanaged = null;
+    defer if (pinned_inputs) |*pending| pending.deinit(pool.allocator);
     var result = coverage.Complete{ .epoch = selected.epoch, .accounting_class = .device };
     for (reachable, 0..) |active, id| {
         if (!active) continue;
@@ -254,7 +287,11 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
                 } else {
                     const immutable = pool.immutable_bindings orelse return inputDeclined(graph, @intCast(id), null);
                     const binding = immutable.find(@intCast(id)) orelse return inputDeclined(graph, @intCast(id), null);
-                    if (!(service.input(target.ptr, binding, slot.desc.shape) catch false)) return inputDeclined(graph, @intCast(id), binding);
+                    if (!(service.input(target.ptr, binding, slot.desc.shape) catch false)) {
+                        if (target.kind() != .metal or binding != .tensor) return inputDeclined(graph, @intCast(id), binding);
+                        if (pinned_inputs == null) pinned_inputs = std.DynamicBitSetUnmanaged.initEmpty(pool.allocator, reachable.len) catch return inputDeclined(graph, @intCast(id), binding);
+                        pinned_inputs.?.set(id);
+                    }
                 }
             },
             .constant => {
@@ -300,6 +337,9 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
         }
         const slot = pool.plan.slotForNode(id) orelse return .{ .compatibility = .output_publication };
         if (!slot.roles.graph_output) return .{ .compatibility = .output_publication };
+    }
+    if (pinned_inputs) |*pending| {
+        if (pinnedInputsCovered(pool, graph, reachable, pending)) |node| return inputDeclined(graph, node, pool.immutable_bindings.?.find(node));
     }
     return .{ .complete = result };
 }
