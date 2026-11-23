@@ -13746,10 +13746,10 @@ pub const StagedExecution = struct {
         return .{ .ptr = self, .close_fn = closeFrontendCache };
     }
 
-    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, keys: []const u64, inputs: []const ops.CT, storage: *bool) anyerror!bool {
+    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, keys: []const u64, inputs: []const ops.CT, boundary: ops.AudioScratchBoundary) anyerror!bool {
         if (comptime !build_options.enable_metal) return false;
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
-        if (!self.active or self.cb.ptr != cb.ptr or self.cb.vtable != cb.vtable or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return false;
+        if (!self.active or self.cb.ptr != cb.ptr or self.cb.vtable != cb.vtable or (cb.decoderRuntimeHasActiveFrame() and !boundary.owns_active_frame) or cb.decoderRuntimeHasSubmittedFrame()) return false;
         const model = self.model_retention orelse return false;
         const pin = if (model.admission_domain) |*value| value else return false;
         const Metal = @import("../ops/metal_compute.zig").MetalCompute;
@@ -13769,12 +13769,15 @@ pub const StagedExecution = struct {
         }
         if (count == 0) return true;
 
+        if (boundary.quiesce) |quiesce| try quiesce(boundary.context.?);
+        if (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return false;
+
         // Audio reuse is provider-wide. Park the scope before releasing
         // the provider and reopen it after regaining custody.
-        const reopen_storage = storage.*;
+        const reopen_storage = boundary.storage.*;
         if (reopen_storage) {
             if (!try cb.audioStorage(false)) return error.AudioStorageScopeUnavailable;
-            storage.* = false;
+            boundary.storage.* = false;
         }
         try pause(self);
         var banks: [12]?Metal.FundedAudioBank = @splat(null);
@@ -13802,10 +13805,10 @@ pub const StagedExecution = struct {
             };
             try acquire(self);
             if (settlement) |err| return err;
-            if (reopen_storage) storage.* = try cb.audioStorage(true);
+            if (reopen_storage) boundary.storage.* = try cb.audioStorage(true);
             return true;
         };
-        if (reopen_storage) storage.* = try cb.audioStorage(true);
+        if (reopen_storage) boundary.storage.* = try cb.audioStorage(true);
         for (requests[0..count], banks[0..count]) |request, *value| if (value.*) |*bank| {
             if (try Metal.publishAudioScratch(cb, request, bank)) value.* = null;
         };
@@ -14830,7 +14833,7 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     var peer_live = true;
     defer if (peer_live) peer.release();
     const cold_yields = timings.stage_yields;
-    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, &storage));
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
     try std.testing.expectEqual(cold_yields + 1, timings.stage_yields);
     try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
     try std.testing.expectEqual(baseline.backend_weight_bytes, pin.controller().snapshot().backend_weight_bytes);
@@ -14841,7 +14844,7 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     peer.release();
     peer_live = false;
     const yields = timings.stage_yields;
-    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, &storage));
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
     try std.testing.expectEqual(yields + 1, timings.stage_yields);
     try std.testing.expect(storage);
     try std.testing.expectEqual(@as(usize, 8192), cache.backend_bytes);
@@ -14851,7 +14854,7 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
         try std.testing.expect(plan.prepared and plan.arena_charge != null and plan.storage.outputs[0] != null);
         try std.testing.expect(plan.chargedBackendBytes() >= 4096);
     }
-    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, &storage));
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, .{ .storage = &storage }));
     try std.testing.expectEqual(yields + 1, timings.stage_yields);
     try std.testing.expectEqual(before_warm, pin.controller().snapshot().backend_weight_bytes);
 }

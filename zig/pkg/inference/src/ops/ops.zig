@@ -1903,6 +1903,14 @@ pub const NativeWeightCacheControl = struct {
     ptr: *anyopaque,
     prepare: *const fn (*anyopaque, *const ComputeBackend, NativeWeightCachePreparation) anyerror!EmbeddingCacheScope,
 };
+/// Caller-owned work that must finish before the stage can lend its provider.
+pub const AudioScratchBoundary = struct {
+    storage: *bool,
+    owns_active_frame: bool = false,
+    context: ?*anyopaque = null,
+    quiesce: ?*const fn (*anyopaque) anyerror!void = null,
+};
+
 pub const EmbeddingStageControl = struct {
     ptr: *anyopaque,
     pause_fn: *const fn (*anyopaque) anyerror!void,
@@ -1921,7 +1929,7 @@ pub const EmbeddingStageControl = struct {
     video_consumer_fn: ?*const fn (*anyopaque, *const ComputeBackend) anyerror!EmbeddingCacheScope = null,
     image_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingImageCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
     vision_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingVisionCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
-    audio_scratch_fn: ?*const fn (*anyopaque, *const ComputeBackend, []const u64, []const CT, *bool) anyerror!bool = null,
+    audio_scratch_fn: ?*const fn (*anyopaque, *const ComputeBackend, []const u64, []const CT, AudioScratchBoundary) anyerror!bool = null,
     audio_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, @import("../execution/audio_schedule.zig").AudioRecipe, []const *CT) anyerror!EmbeddingCacheScope = null,
     /// A fenced ready-work boundary may keep its provider when uncontended.
     yield_ready_fn: ?*const fn (*anyopaque) anyerror!void = null,

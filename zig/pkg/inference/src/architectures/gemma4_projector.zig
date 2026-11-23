@@ -2202,24 +2202,45 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO");
     const frame_plan = if (grouped_frames) audio_schedule.audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else audio_schedule.AudioFramePlan{};
     var defer_audio_arena = false;
-    if (grouped_frames and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
+    if ((grouped_frames or !cohort) and cb.kind() == .metal and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
         if (cb.embedding_stage) |stage| if (stage.audio_scratch_fn) |prepare| {
-            // The completed subsampler's weight handles are scoped to the
-            // current compute owner, which the supplier may retire. Only
-            // independently owned activations and layer inputs cross here.
-            store.deinit();
+            const Boundary = struct {
+                cb: *const ComputeBackend,
+                store: *ProjectorWeights,
+                frame: *bool,
+
+                fn quiesce(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.frame.*) {
+                        try self.cb.decoderRuntimeSubmitAndWaitFrame();
+                        self.frame.* = false;
+                    }
+                    // The completed subsampler's weight handles belong to the
+                    // current compute owner. Only independent tensors cross.
+                    self.store.deinit();
+                }
+            };
+            var boundary = Boundary{ .cb = cb, .store = store, .frame = &frame_active };
+            const restart_frame = frame_active;
             var keys: [12]u64 = undefined;
             var count: usize = 0;
             var start: usize = 0;
             const recipe = audioCacheConfig(cfg);
+            const span = if (cohort) frame_plan.layers else cfg.block_count;
             while (start < cfg.block_count) {
-                const end = @min(cfg.block_count, start + frame_plan.layers);
+                const end = @min(cfg.block_count, start + span);
                 keys[count] = recipe.key(layer_inputs.segments, start, end);
                 count += 1;
                 start = end;
             }
             const values = audioExecutionInputs(hidden, &layer_inputs);
-            defer_audio_arena = try prepare(stage.ptr, cb, keys[0..count], &values, storage);
+            defer_audio_arena = try prepare(stage.ptr, cb, keys[0..count], &values, .{
+                .storage = storage,
+                .owns_active_frame = frame_active,
+                .context = &boundary,
+                .quiesce = Boundary.quiesce,
+            });
+            if (restart_frame and !frame_active) frame_active = try cb.decoderRuntimeBeginFrame();
         };
     }
     const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
@@ -2234,7 +2255,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         if (pipelined) _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
     }
 
-    const planned = if (cb.kind() == .metal and cohort) null else try tryAudioExecution(cb, allocator, store, cfg, hidden, &layer_inputs);
+    const planned = if (cb.kind() == .metal and cohort) null else try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, 0, cfg.block_count, defer_audio_arena);
     if (planned) |next| {
         cb.free(hidden);
         hidden = next;
@@ -4796,9 +4817,6 @@ fn runAudioLayers(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
         owned = true;
     }
     return state;
-}
-fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs) !?CT {
-    return tryAudioExecutionRange(cb, a, store, cfg, hidden, inputs, 0, 12, false);
 }
 fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize, defer_arena: bool) !?CT {
     if (!audioExecutionEligible(cb, store, cfg, inputs)) return null;
