@@ -33,7 +33,13 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
     if (descriptor.output_shape.dtype != .f32) return false;
     if (descriptor.output_shape.rank() == 0) return false;
     switch (descriptor.operation) {
-        .paged_attention, .dense_attention_prefix => return false,
+        .paged_attention => return false,
+        .dense_attention_prefix => |attention| {
+            if (!attention.all_keys_visible or !attention.valid(descriptor)) return false;
+            for (descriptor.input_shapes[0..3]) |shape| {
+                if (shape.numElements().? > std.math.maxInt(u32)) return false;
+            }
+        },
         .dense_attention_rows => |attention| {
             if (!attention.valid(descriptor)) return false;
             switch (attention.kind) {
@@ -11990,6 +11996,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .rms => !(self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) or
                     metal_runtime.antfly_metal_norm_clamp_ready(self.provider_impl.raw_decode_runtime) != 0,
             },
+            .dense_attention_prefix => |attention| blk: {
+                if (disableRuntimeAttentionF32()) break :blk false;
+                const runtime = self.provider_impl.raw_decode_runtime orelse break :blk false;
+                _ = metal_runtime.denseAttentionPrefixWorkspaceBytes(runtime, attention) catch break :blk false;
+                break :blk true;
+            },
             .dense_attention_rows => |attention| blk: {
                 if (disableRuntimeAttentionF32()) break :blk false;
                 const runtime = self.provider_impl.raw_decode_runtime orelse break :blk false;
@@ -12005,10 +12017,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
     fn assignedKernelWorkspaceOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) anyerror!ops.kernel_descriptor.WorkspaceRequirement {
-        if (descriptor.operation != .dense_attention_rows) return .{};
+        if (descriptor.operation != .dense_attention_rows and descriptor.operation != .dense_attention_prefix) return .{};
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.InvalidAttentionShape;
-        const bytes = try metal_runtime.denseAttentionWorkspaceBytes(runtime, descriptor.operation.dense_attention_rows);
+        const bytes = switch (descriptor.operation) {
+            .dense_attention_rows => |rows| try metal_runtime.denseAttentionWorkspaceBytes(runtime, rows),
+            .dense_attention_prefix => |prefix| try metal_runtime.denseAttentionPrefixWorkspaceBytes(runtime, prefix),
+            else => unreachable,
+        };
         // Metal scratch is a dedicated buffer bound at offset zero. The SDK
         // layout aligns the second plane internally, independent of the F32 view.
         return .{ .byte_size = bytes };
@@ -13003,8 +13019,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const descriptor = request.descriptor;
         if (!supportsAssignedDescriptor(descriptor)) return false;
         if (descriptor.operation == .add_mul_scalar and !metal_runtime.assignedAddMulScalarAvailable(self.provider_impl)) return false;
+        const dense_attention = descriptor.operation == .dense_attention_rows or descriptor.operation == .dense_attention_prefix;
+        var attention_geometry: ?ops.kernel_descriptor.DenseAttentionRows = null;
         var attention_workspace: ops.kernel_descriptor.WorkspaceRequirement = .{};
-        if (descriptor.operation == .dense_attention_rows) {
+        if (dense_attention) {
             if (request.auxiliaries.len != 0 or !directRouteSupported(ctx, descriptor)) return false;
             attention_workspace = try assignedKernelWorkspaceOp(ctx, descriptor);
             if (request.prepared_route) |route| {
@@ -13013,13 +13031,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     !direct.belongsToProgram(route, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(route.implementation.table)) }, directRouteSupported)) return false;
                 try direct.validateDescriptor(route, descriptor);
                 if (!std.meta.eql(route.requirements.workspace, attention_workspace)) return error.PreparedKernelBindingChanged;
-            } else if (attention_workspace.byte_size != 0) return false;
+            } else if (attention_workspace.byte_size != 0 or descriptor.operation == .dense_attention_prefix) return false;
             if (request.output != null and (request.workspace != null) != (attention_workspace.byte_size != 0))
                 return error.InvalidAssignedWorkspace;
             if (request.attention) |binding| {
                 if (binding.attn_or_mask != null or binding.attention_sink.hasMetadata()) return false;
                 if (binding.dense_attention_rows) |rows| if (rows.mask != null) return false;
             }
+            attention_geometry = switch (descriptor.operation) {
+                .dense_attention_rows => |rows| rows,
+                .dense_attention_prefix => |prefix| geometry: {
+                    const binding = (request.attention orelse return false).dense_attention_prefix orelse return false;
+                    if (binding.live_key_rows == 0 or binding.live_key_rows > prefix.max_key_rows or binding.mask != null)
+                        return error.InvalidAttentionShape;
+                    break :geometry .{
+                        .kind = .cross,
+                        .query_rows = 1,
+                        .key_rows = @intCast(binding.live_key_rows),
+                        .num_heads = prefix.num_heads,
+                        .head_dim = prefix.head_dim,
+                        .all_keys_visible = true,
+                    };
+                },
+                else => unreachable,
+            };
         }
         if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
         const typed_gather = descriptor.operation == .gather and descriptor.input_shapes[1].dtype != .f32;
@@ -13077,7 +13112,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
         const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
         if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
-        if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or descriptor.operation == .dense_attention_rows) {
+        if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
             for (request.inputs) |source| {
                 const tensor = toBuf(source).metal_tensor.?;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
@@ -13088,11 +13123,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // the general CT adapters; the command/frame layer retains GPU resources.
         const input = toBuf(request.inputs[0]).metal_tensor.?;
         const written: bool = switch (descriptor.operation) {
-            .paged_attention, .dense_attention_prefix => return false,
-            .dense_attention_rows => |geometry| blk: {
+            .paged_attention => return false,
+            .dense_attention_rows, .dense_attention_prefix => blk: {
                 try metal_runtime.decoderRuntimeDenseAttentionInto(
                     self.provider_impl.raw_decode_runtime.?,
-                    geometry,
+                    attention_geometry.?,
                     input,
                     toBuf(request.inputs[1]).metal_tensor.?,
                     toBuf(request.inputs[2]).metal_tensor.?,
@@ -55274,6 +55309,14 @@ test "Metal planned full prompt attention consumes assigned F16 KV staging" {
 }
 
 test "Metal planned cross attention binds split-K workspace for one and several queries" {
+    try qualifyPlannedMetalCrossAttention(false);
+}
+
+test "Metal planned live prefix reuses assigned workspace across attention schedules" {
+    try qualifyPlannedMetalCrossAttention(true);
+}
+
+fn qualifyPlannedMetalCrossAttention(comptime prefix: bool) !void {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -55282,7 +55325,7 @@ test "Metal planned cross attention binds split-K workspace for one and several 
     const cb = context.metal_hosted.compute.ownedComputeBackend();
     const functions = cb.vtable.kernels.?;
     const dim = 64;
-    const keys = 512;
+    const keys = if (prefix) 2304 else 512;
     const Shape = @import("ml").graph.Shape;
     const key_shape = Shape.init(.f32, &.{ keys, dim });
     const route = @import("../execution/kernel_route.zig");
@@ -55294,13 +55337,14 @@ test "Metal planned cross attention binds split-K workspace for one and several 
     for (zeros, 0..) |*value, index| value.* = @floatFromInt((index / dim + index % dim) % 11);
     const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(zeros, &.{ keys, dim }));
     defer cb.free(v);
-    for ([_]u32{ 1, 3 }) |rows| {
+    const query_sizes: []const u32 = if (prefix) &.{1} else &.{ 1, 3 };
+    for (query_sizes) |rows| {
         const query_shape = Shape.init(.f32, &.{ rows, dim });
         const queries: [3 * dim]f32 = @splat(0);
         const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(queries[0 .. rows * dim], &.{ rows, dim }));
         defer cb.free(q);
         const descriptor: ops.kernel_descriptor.Descriptor = .{
-            .operation = .{ .dense_attention_rows = .{ .kind = .cross, .query_rows = rows, .key_rows = keys, .num_heads = 1, .head_dim = dim, .all_keys_visible = true } },
+            .operation = if (prefix) .{ .dense_attention_prefix = .{ .max_key_rows = keys, .num_heads = 1, .head_dim = dim, .all_keys_visible = true } } else .{ .dense_attention_rows = .{ .kind = .cross, .query_rows = rows, .key_rows = keys, .num_heads = 1, .head_dim = dim, .all_keys_visible = true } },
             .input_count = 3,
             .input_shapes = .{ query_shape, key_shape, key_shape },
             .output_shape = query_shape,
@@ -55320,7 +55364,7 @@ test "Metal planned cross attention binds split-K workspace for one and several 
         })) orelse return error.MissingOwnedPreparedRoute;
         defer selected.deinit();
         const scratch_bytes = selected.requirements.workspace.byte_size;
-        try std.testing.expectEqual(@as(usize, rows) * 4 * 72 * @sizeOf(f32), scratch_bytes);
+        try std.testing.expectEqual(@as(usize, rows) * @as(usize, if (prefix) 16 else 4) * 72 * @sizeOf(f32), scratch_bytes);
         const lease = (try ops.physical_storage.Lease.create(a, cb, out_bytes)).?;
         defer lease.release();
         const scratch_lease = (try ops.physical_storage.Lease.create(a, cb, scratch_bytes)).?;
@@ -55330,25 +55374,44 @@ test "Metal planned cross attention binds split-K workspace for one and several 
         const scratch = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = scratch_lease, .shape = &.{@intCast(scratch_bytes / @sizeOf(f32))} })).?;
         defer cb.free(scratch);
         var invocation: ops.kernel_descriptor.Invocation = .{ .descriptor = &descriptor, .inputs = &.{ q, k, v }, .output = output, .prepared_route = &selected };
+        var attention: @import("../graph/backend_contracts.zig").AttentionContext = .{ .total_sequence_len = keys + 1, .query_sequence_len = 1, .kv_sequence_len = keys };
+        if (prefix) {
+            attention.dense_attention_prefix = .{ .live_key_rows = keys };
+            invocation.attention = &attention;
+        }
         try std.testing.expectError(error.InvalidAssignedWorkspace, functions.runAssignedKernel.?(cb.ptr, invocation));
         const ordinary_scratch = (try cb.allocUninitF32Shape(&.{@intCast(scratch_bytes / @sizeOf(f32))})).?;
         defer cb.free(ordinary_scratch);
         invocation.workspace = ordinary_scratch;
         try std.testing.expectError(error.InvalidAssignedWorkspace, functions.runAssignedKernel.?(cb.ptr, invocation));
         invocation.workspace = scratch;
-        try std.testing.expect(try functions.runAssignedKernel.?(cb.ptr, invocation));
-        const actual = try cb.toFloat32(output, a);
-        defer a.free(actual);
-        const reference = try cb.crossAttention(q, k, v, null, 1, rows, keys, 1, dim);
-        defer cb.free(reference);
-        const expected = try cb.toFloat32(reference, a);
-        defer a.free(expected);
-        try std.testing.expectEqualSlices(f32, expected, actual);
-        for (0..rows) |row| for (0..dim) |lane| {
-            var sum: f32 = 0;
-            for (0..keys) |key| sum += zeros[key * dim + lane];
-            try std.testing.expectApproxEqAbs(sum / keys, actual[row * dim + lane], 0.00001);
-        };
+        if (prefix) {
+            attention.dense_attention_prefix = .{ .live_key_rows = 0 };
+            try std.testing.expectError(error.InvalidAttentionShape, functions.runAssignedKernel.?(cb.ptr, invocation));
+            attention.dense_attention_prefix = .{ .live_key_rows = keys + 1 };
+            try std.testing.expectError(error.InvalidAttentionShape, functions.runAssignedKernel.?(cb.ptr, invocation));
+            attention.dense_attention_prefix = .{ .live_key_rows = 1, .mask = &.{1} };
+            try std.testing.expectError(error.InvalidAttentionShape, functions.runAssignedKernel.?(cb.ptr, invocation));
+        }
+        const live_sizes: []const usize = if (prefix) &.{ 63, 512, keys } else &.{keys};
+        for (live_sizes) |live| {
+            if (prefix) attention.dense_attention_prefix = .{ .live_key_rows = live };
+            try std.testing.expect(try functions.runAssignedKernel.?(cb.ptr, invocation));
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            if (!prefix) {
+                const reference = try cb.crossAttention(q, k, v, null, 1, rows, keys, 1, dim);
+                defer cb.free(reference);
+                const expected = try cb.toFloat32(reference, a);
+                defer a.free(expected);
+                try std.testing.expectEqualSlices(f32, expected, actual);
+            }
+            for (0..rows) |row| for (0..dim) |lane| {
+                var sum: f32 = 0;
+                for (0..live) |key| sum += zeros[key * dim + lane];
+                try std.testing.expectApproxEqAbs(sum / @as(f32, @floatFromInt(live)), actual[row * dim + lane], 0.0001);
+            };
+        }
     }
 }
 

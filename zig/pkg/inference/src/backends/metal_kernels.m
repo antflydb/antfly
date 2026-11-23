@@ -36974,7 +36974,11 @@ static void antfly_metal_bind_attention_key_mask(id<MTLComputeCommandEncoder> en
     }
 }
 
-enum { ANTFLY_METAL_ATTENTION_SPLIT_CHUNK = 128, ANTFLY_METAL_ATTENTION_SPLIT_WORDS = 72 };
+enum {
+    ANTFLY_METAL_ATTENTION_SPLIT_CHUNK = 128,
+    ANTFLY_METAL_ATTENTION_SPLIT_WORDS = 72,
+    ANTFLY_METAL_ATTENTION_SHORT_MAX_KEYS = 2048,
+};
 
 typedef struct {
     bool single_query;
@@ -36989,7 +36993,7 @@ static bool antfly_metal_select_short_attention_schedule(termite_metal_decode_ru
     size_t batch, size_t queries, size_t keys, size_t heads, size_t dim,
     antfly_metal_short_attention_schedule *schedule) {
     *schedule = (antfly_metal_short_attention_schedule){0};
-    if (!runtime->attention_1x_hd64_enabled || dim != 64u || keys > 2048u) return true;
+    if (!runtime->attention_1x_hd64_enabled || dim != 64u || keys > ANTFLY_METAL_ATTENTION_SHORT_MAX_KEYS) return true;
     schedule->single_query = queries == 1u && runtime->attention_f32_decode_1x_hd64_pipeline != nil;
     if (!runtime->attention_1x_split_enabled || keys < 256u) return true;
     schedule->split = schedule->single_query;
@@ -37004,9 +37008,12 @@ static bool antfly_metal_select_short_attention_schedule(termite_metal_decode_ru
 }
 
 int antfly_metal_cross_attention_workspace(termite_metal_decode_runtime *runtime,
-    size_t queries, size_t keys, size_t heads, size_t dim, size_t *bytes) {
+    size_t queries, size_t keys, size_t heads, size_t dim, bool live_prefix, size_t *bytes) {
     if (runtime == NULL || runtime->attention_f32_pipeline == nil || bytes == NULL ||
         queries == 0 || keys == 0 || heads == 0 || dim == 0) return -1;
+    // A prefix can enter the split schedule even when its full capacity
+    // would use generic attention. Fund the maximum eligible live extent.
+    if (live_prefix && keys > ANTFLY_METAL_ATTENTION_SHORT_MAX_KEYS) keys = ANTFLY_METAL_ATTENTION_SHORT_MAX_KEYS;
     antfly_metal_short_attention_schedule schedule;
     if (!antfly_metal_select_short_attention_schedule(runtime, 1, queries, keys, heads, dim, &schedule)) return -10;
     *bytes = schedule.partial_bytes;
@@ -37076,7 +37083,7 @@ static int antfly_metal_apply_attention_f32_device_batched(
         if (!antfly_metal_select_short_attention_schedule(runtime, batch, q_len, kv_len, num_heads, head_dim, &schedule)) return -10;
         id<MTLBuffer> split_partials = nil;
         if (planned_storage) {
-            if (key_mask != NULL || workspace_bytes != schedule.partial_bytes ||
+            if (key_mask != NULL || workspace_bytes < schedule.partial_bytes ||
                 (workspace_handle != NULL) != (workspace_bytes != 0)) return -10;
             if (workspace_handle != NULL) {
                 split_partials = (__bridge id<MTLBuffer>)workspace_handle;
