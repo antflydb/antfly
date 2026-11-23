@@ -221,7 +221,9 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
 /// Applying owners must handle history_control before considering row work.
 /// Ordinary callers retain the fail-closed decoder above.
 pub fn decodeForApply(alloc: std.mem.Allocator, payload: []const u8) !OwnedApplyEntry {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
+    var options = batch_api.internal_json_options;
+    options.duplicate_field_behavior = .@"error";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, options);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReplicatedBatch;
     if (parsed.value.object.contains("history_commit_time_ns") or parsed.value.object.contains("row_batch_json")) {
@@ -525,6 +527,10 @@ fn consumerTests() type {
             defer decoded.deinit(std.testing.allocator);
             try std.testing.expectEqual(timestamp_protocol_version, decoded.protocol_barrier_version.?);
             try std.testing.expectEqual(@as(usize, 0), decoded.batch.req.writes.len);
+
+            var applying = try decodeForApply(std.testing.allocator, encoded);
+            defer applying.deinit(std.testing.allocator);
+            try std.testing.expectEqual(timestamp_protocol_version, applying.batch.protocol_barrier_version.?);
 
             // Feature activation versions are persisted independently of the
             // latest advertised decoder version. Keep older barriers readable
