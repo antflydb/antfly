@@ -2676,7 +2676,7 @@ pub const Owner = struct {
                     }
                 }
                 current.lite_refresh_adoption_epoch = file.adoptionEpoch();
-                current.lite_runtime_sequence = @max(current.lite_runtime_sequence, file.committedSequence());
+                current.lite_runtime_sequence = @max(current.lite_runtime_sequence, probe.committedSequence());
                 return current;
             }
             if (self.maintenance_snapshot) |snapshot| {
@@ -2948,7 +2948,8 @@ pub const Owner = struct {
         // A slot another writer published without a fold is only visible
         // to a fresh open.
         if (probe.activeCheckpoint().page_count > file.activeCheckpoint().page_count) return false;
-        if (file.committedSequence() != probe.committedSequence()) return false;
+        const through = probe.committedSequence();
+        if (file.committedSequence() != through) return false;
         const io = file.runtime();
         const shared = redo.shared;
         // A reclaim past `since` may have dropped versions this must see.
@@ -2960,7 +2961,7 @@ pub const Owner = struct {
         if (shared.hasSiblingVersionsAfter(io, since, origin)) return false;
         const Root = native.OverlayRoot;
         {
-            const changed = shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.metadata), since, origin) catch |err| switch (err) {
+            const changed = shared.changedKeysBetweenAlloc(alloc, io, @backingInt(Root.metadata), since, through, origin) catch |err| switch (err) {
                 error.ReadSnapshotReclaimed => return false,
                 else => return err,
             };
@@ -2968,7 +2969,7 @@ pub const Owner = struct {
             for (changed) |key| if (!routineMetadataKey(key)) return false;
         }
         {
-            const changed = shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.documents), since, origin) catch |err| switch (err) {
+            const changed = shared.changedKeysBetweenAlloc(alloc, io, @backingInt(Root.documents), since, through, origin) catch |err| switch (err) {
                 error.ReadSnapshotReclaimed => return false,
                 else => return err,
             };
@@ -2983,7 +2984,7 @@ pub const Owner = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         var scopes = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(Catalog.Mutation)).empty;
-        const changed = shared.changedKeysAfterAlloc(scratch, io, @backingInt(Root.index), since, origin) catch |err| switch (err) {
+        const changed = shared.changedKeysBetweenAlloc(scratch, io, @backingInt(Root.index), since, through, origin) catch |err| switch (err) {
             error.ReadSnapshotReclaimed => return false,
             else => return err,
         };

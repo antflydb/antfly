@@ -15347,7 +15347,7 @@ pub const HBCIndex = struct {
     // pre-stage state; `abortStagedWrite` restores the in-memory routing
     // tree exactly; `installStagedWrite` (after the harvested mutations
     // are durable through a separate stand-in commit) publishes it.
-    test "insertWithMetadataStaged/deleteStaged: search sees old state during stage, abort restores, install publishes" {
+    fn testStagedWriterPublication() !void {
         const TestSink = struct {
             allocator: Allocator,
             entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
@@ -22203,6 +22203,10 @@ test "durable incomplete snapshot terminates when publication advances during tr
     try std.testing.expect(!hook_ctx.writer_failed.load(.acquire));
     try std.testing.expectEqual(@as(u64, 5), idx.stats().active_count);
     try std.testing.expect(!idx.generationRepairPending());
+}
+
+test "insertWithMetadataStaged/deleteStaged publishes durable local and peer state" {
+    try HBCIndex.testStagedWriterPublication();
 }
 
 test "aborted published transaction cannot leak staged topology through caches" {

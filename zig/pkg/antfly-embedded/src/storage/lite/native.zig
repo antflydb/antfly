@@ -4767,7 +4767,7 @@ const RedoCommitState = struct {
     writer: redo_log.Writer,
     /// Tags the overlay versions this instance's own commits append, so a
     /// runtime can tell them from every other writer's
-    /// (`SharedRedoOverlay.changedKeysAfterAlloc`). Never 0, which marks a
+    /// (`SharedRedoOverlay.changedKeysBetweenAlloc`). Never 0, which marks a
     /// replayed version.
     origin: u32 = 0,
     /// This transaction's accumulated logical mutations, encoded via

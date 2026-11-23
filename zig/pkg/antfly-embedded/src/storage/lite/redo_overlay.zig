@@ -1203,16 +1203,16 @@ pub const SharedRedoOverlay = struct {
         return false;
     }
 
-    /// The keys under `root` with a version newer than
-    /// `min_sequence_exclusive` that `own_origin` did not append: what other
-    /// writers changed since an instance last caught up. Complete only
+    /// The keys under `root` with a version in the captured sequence window
+    /// that `own_origin` did not append. Complete only
     /// while `reclaimedThrough() <= min_sequence_exclusive` (a reclaim drops
     /// versions at or below its floor). Keys only, each owned by the caller.
-    pub fn changedKeysAfterAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, min_sequence_exclusive: u64, own_origin: u32) ![][]u8 {
+    pub fn changedKeysBetweenAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, min_sequence_exclusive: u64, max_sequence_inclusive: u64, own_origin: u32) ![][]u8 {
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.reclaimed_through > min_sequence_exclusive) return error.ReadSnapshotReclaimed;
+        if (max_sequence_inclusive <= min_sequence_exclusive) return allocator.alloc([]u8, 0);
         var list = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
             for (list.items) |key| allocator.free(key);
@@ -1221,7 +1221,7 @@ pub const SharedRedoOverlay = struct {
         var seen = std.StringHashMapUnmanaged(void).empty;
         defer seen.deinit(allocator);
         for (&self.changes) |*history| {
-            for (history.after(min_sequence_exclusive)) |change| {
+            for (history.entries.items[history.end(min_sequence_exclusive)..history.end(max_sequence_inclusive)]) |change| {
                 if (change.root != root or (change.origin != 0 and change.origin == own_origin)) continue;
                 const slot = try seen.getOrPut(allocator, change.key);
                 if (slot.found_existing) continue;
@@ -2136,9 +2136,9 @@ test "redo overlay change scan refuses a reclaimed history" {
     try overlay.appendVersion(alloc, io, 2, "retired", 2, try owned_allocator.dupe(u8, "first"), false, 0, 0);
     try overlay.appendVersion(alloc, io, 2, "retained", 3, try owned_allocator.dupe(u8, "second"), false, 0, 0);
     overlay.reclaim(alloc, io, 2);
-    try std.testing.expectError(error.ReadSnapshotReclaimed, overlay.changedKeysAfterAlloc(alloc, io, 2, 1, 4));
+    try std.testing.expectError(error.ReadSnapshotReclaimed, overlay.changedKeysBetweenAlloc(alloc, io, 2, 1, std.math.maxInt(u64), 4));
 
-    const changed = try overlay.changedKeysAfterAlloc(alloc, io, 2, 2, 4);
+    const changed = try overlay.changedKeysBetweenAlloc(alloc, io, 2, 2, std.math.maxInt(u64), 4);
     defer alloc.free(changed);
     defer for (changed) |key| alloc.free(key);
     try std.testing.expectEqual(@as(usize, 1), changed.len);
@@ -2157,7 +2157,7 @@ test "redo overlay change index excludes rolled back versions and discarded suff
     overlay.discardUnsealedSuffix(io, 4);
     try std.testing.expect(!overlay.hasSiblingVersionsAfter(io, 2, 1));
 
-    const changed = try overlay.changedKeysAfterAlloc(a, io, 2, 1, 1);
+    const changed = try overlay.changedKeysBetweenAlloc(a, io, 2, 1, std.math.maxInt(u64), 1);
     defer a.free(changed);
     defer for (changed) |key| a.free(key);
     try std.testing.expectEqual(@as(usize, 1), changed.len);
@@ -2168,7 +2168,8 @@ test "redo overlay change index excludes rolled back versions and discarded suff
     const peer_record = "\x02\x04\x00peer\x00\x01\x00\x00\x00v";
     try overlay.decodeLogicalMutationsPayload(a, peer_record, 5);
     try overlay.decodeLogicalMutationsPayload(a, peer_record, 5);
-    const peer_changes = try overlay.changedKeysAfterAlloc(a, io, 2, 4, 1);
+    try overlay.appendVersionFrom(9, io, 2, "later", 7, try owned_allocator.dupe(u8, "later"), false, 0, 0);
+    const peer_changes = try overlay.changedKeysBetweenAlloc(a, io, 2, 4, 5, 1);
     defer a.free(peer_changes);
     defer for (peer_changes) |key| a.free(key);
     try std.testing.expectEqual(@as(usize, 1), peer_changes.len);
