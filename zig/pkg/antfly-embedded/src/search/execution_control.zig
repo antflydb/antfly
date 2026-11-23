@@ -16,10 +16,14 @@
 pub const ExecutionControl = struct {
     cancellation: ?@import("antfly_cancellation").CancellationToken = null,
     deadline_ns: ?u64 = null,
+    /// An executor-owned stop signal. Access-path selection continues to use
+    /// only the caller's cancellation and deadline policy.
+    worker_stop: ?*const @import("std").atomic.Value(bool) = null,
     pattern_programs: ?*@import("query.zig").PatternPrograms = null,
     pattern_cache: ?*@import("query.zig").PatternMembership = null,
 
     pub fn check(self: @This()) !void {
+        if (self.worker_stop) |signal| if (signal.load(.acquire)) return error.Cancelled;
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| {
             if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
