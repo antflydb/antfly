@@ -1037,6 +1037,7 @@ pub const PinnedRange = struct {
     backend: ?union(enum) { http: httpx.Client, s3: objectstore.S3.Client, file: LocalFile } = null,
     headers: []const HTTPHeader = &.{},
     file_io_lease: ?DownloadContext.BlockingLease = null,
+    metadata_only: bool = false,
 
     const LocalFile = struct {
         file: std.Io.File,
@@ -1059,11 +1060,21 @@ pub const PinnedRange = struct {
     }
 
     pub fn createWithLocalCache(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader, cache: ?*LocalVerificationCache) !*PinnedRange {
+        return createMode(alloc, context, uri, version, kind, length, security, credentials, headers, cache, false);
+    }
+
+    /// Resolve a declared identity for generation observation. A cold local
+    /// digest is a claim until an ordinary read opens and verifies the file.
+    pub fn createMetadataOnly(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, cache: ?*LocalVerificationCache) !*PinnedRange {
+        return createMode(alloc, context, uri, version, kind, length, security, credentials, &.{}, cache, true);
+    }
+
+    fn createMode(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader, cache: ?*LocalVerificationCache, metadata_only: bool) !*PinnedRange {
         try context.check();
         if (headers.len > 128) return error.InvalidSourceReference;
         const parsed = try validateReference(uri, version, kind, length);
         const self = try alloc.create(PinnedRange);
-        self.* = .{ .allocator = alloc, .context = context, .transport = .{ .backing = alloc, .limit = context.transport_memory_limit_bytes }, .security = security, .kind = kind, .length = length, .headers = headers };
+        self.* = .{ .allocator = alloc, .context = context, .transport = .{ .backing = alloc, .limit = context.transport_memory_limit_bytes }, .security = security, .kind = kind, .length = length, .headers = headers, .metadata_only = metadata_only };
         errdefer self.destroy();
         self.initBackend(uri, version, parsed, credentials, cache) catch |err| return transportError(&self.transport, err);
         return self;
@@ -1125,6 +1136,12 @@ pub const PinnedRange = struct {
             key_hash.update(self.identity);
             const key = key_hash.finalResult();
             const cached_digest = if (cache) |receipts| receipts.lookup(key, stat) else null;
+            if (self.metadata_only) {
+                if (cached_digest) |actual| if (!std.mem.eql(u8, &actual, version)) return error.SourceVersionChanged;
+                try local.check(context.io);
+                self.backend = .{ .file = local };
+                return;
+            }
             const digest = cached_digest orelse computed: {
                 const verification = if (cache) |receipts| try receipts.acquire(context, key) else null;
                 defer if (verification) |lease| lease.deinit();
@@ -1189,10 +1206,28 @@ pub const PinnedRange = struct {
         };
     }
     pub fn readAt(self: *PinnedRange, offset: u64, out: []u8) !usize {
-        return self.readAtInternal(offset, out) catch |err| transportError(&self.transport, err);
+        return self.readAtWithProgress(offset, out, null);
     }
-    fn readAtInternal(self: *PinnedRange, offset: u64, out: []u8) !usize {
+
+    /// Report a validated local prefix when a read fails.
+    pub fn readAtWithProgress(self: *PinnedRange, offset: u64, out: []u8, failed_prefix: ?*usize) !usize {
+        return self.readAtInternal(offset, out, failed_prefix) catch |err| transportError(&self.transport, err);
+    }
+
+    fn readLocalRange(self: *PinnedRange, local: *const LocalFile, offset: u64, out: []u8, done: *usize) anyerror!void {
+        while (done.* < out.len) {
+            try self.context.check();
+            const n = try local.file.readPositional(self.context.io, &.{out[done.*..]}, offset + done.*);
+            if (n == 0) return error.SourceVersionChanged;
+            done.* += n;
+        }
+        try local.check(self.context.io);
         try self.context.check();
+    }
+
+    fn readAtInternal(self: *PinnedRange, offset: u64, out: []u8, failed_prefix: ?*usize) !usize {
+        try self.context.check();
+        if (self.metadata_only) return error.InvalidSourceReference;
         if (offset > self.length or out.len == 0 or out.len > self.length - offset) return error.InvalidRemoteRange;
         if (out.len > maxDownloadSize(self.security)) return error.StreamTooLong;
         const ceiling = try DownloadCeiling.init(self.context, self.security);
@@ -1202,14 +1237,16 @@ pub const PinnedRange = struct {
                 try validateOpenFilePathSecurity(self.allocator, self.context.io, local.file, self.security);
                 try local.check(self.context.io);
                 var done: usize = 0;
-                while (done < out.len) {
-                    try self.context.check();
-                    const n = try local.file.readPositional(self.context.io, &.{out[done..]}, offset + done);
-                    if (n == 0) return error.SourceVersionChanged;
-                    done += n;
-                }
-                try local.check(self.context.io);
-                try self.context.check();
+                self.readLocalRange(local, offset, out, &done) catch |err| {
+                    if (failed_prefix) |prefix| {
+                        if (done != 0 and err != error.SourceVersionChanged) {
+                            if (local.check(self.context.io)) |_| {
+                                prefix.* = done;
+                            } else |_| {}
+                        }
+                    }
+                    return err;
+                };
             },
             .http => |*client| {
                 const headers = try self.allocator.alloc([2][]const u8, self.headers.len + 3);
@@ -2992,6 +3029,12 @@ test "local verification receipts avoid repeated full-file reads and invalidate 
     std.crypto.hash.sha2.Sha256.hash("0123456789", &hash, .{});
     const version = std.fmt.bytesToHex(hash, .lower);
     var cache: LocalVerificationCache = .{};
+    const observation = try PinnedRange.createMetadataOnly(a, .{ .io = io }, uri, &version, .file_sha256, 10, &security, null, &cache);
+    defer observation.destroy();
+    try observation.validate();
+    var probe: [1]u8 = undefined;
+    try std.testing.expectError(error.InvalidSourceReference, observation.readAt(0, &probe));
+    try std.testing.expectEqual(@as(u64, 0), cache.hashed_bytes.load(.monotonic));
     const cold = try PinnedRange.createWithLocalCache(a, .{ .io = io }, uri, &version, .file_sha256, 10, &security, null, &.{}, &cache);
     cold.destroy();
     // A warm continuation cannot allocate the 256 KiB streaming hash buffer.
@@ -3344,6 +3387,46 @@ test "local source cancellation during hashing releases verification and publish
     for (cache.flights) |flight| try std.testing.expectEqual(@as(usize, 0), flight.references);
     const range = try PinnedRange.createWithLocalCache(a, .{ .io = base }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
     defer range.destroy();
+}
+
+test "pinned local range reports a validated prefix after cancellation or a later I/O failure" {
+    const a = std.testing.allocator;
+    const base = std.testing.io;
+    var fixture = try LocalSourceFixture.init(a, "0123456789");
+    defer fixture.deinit();
+    const paths = [_][]u8{fixture.path};
+    const security = ContentSecurityConfig{ .allowed_paths = &paths };
+    var cache: LocalVerificationCache = .{};
+    const cold = try PinnedRange.createWithLocalCache(a, .{ .io = base }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
+    cold.destroy();
+    const Cancel = struct {
+        var fail_next_read = false;
+        var cancelled: std.atomic.Value(bool) = .init(false);
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            if (fail_next_read and offset != 0) return error.InputOutput;
+            const n = try std.testing.io.vtable.fileReadPositional(raw, file, &.{data[0][0..2]}, offset);
+            if (!fail_next_read) cancelled.store(true, .release);
+            return n;
+        }
+    };
+    Cancel.fail_next_read = false;
+    Cancel.cancelled.store(false, .release);
+    var table = base.vtable.*;
+    table.fileReadPositional = Cancel.read;
+    const observed = std.Io{ .userdata = base.userdata, .vtable = &table };
+    const range = try PinnedRange.createWithLocalCache(a, .{ .io = observed, .cancellation = CancellationToken.fromAtomic(&Cancel.cancelled) }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
+    defer range.destroy();
+    var bytes: [4]u8 = undefined;
+    var prefix: usize = 0;
+    try std.testing.expectError(error.Canceled, range.readAtWithProgress(0, &bytes, &prefix));
+    try std.testing.expectEqual(@as(usize, 2), prefix);
+    try std.testing.expectEqualStrings("01", bytes[0..prefix]);
+    Cancel.cancelled.store(false, .release);
+    Cancel.fail_next_read = true;
+    prefix = 0;
+    try std.testing.expectError(error.InputOutput, range.readAtWithProgress(0, &bytes, &prefix));
+    try std.testing.expectEqual(@as(usize, 2), prefix);
+    try std.testing.expectEqualStrings("01", bytes[0..prefix]);
 }
 
 test "warm local receipts bypass busy and saturated verification flights" {
