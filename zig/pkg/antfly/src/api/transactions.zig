@@ -2580,7 +2580,8 @@ pub const DurableSessionStore = struct {
         };
         defer receipt.deinitOwned();
         if (!std.meta.eql(receipt.connection_id, connection) or
-            !std.mem.eql(u8, receipt.principal orelse "", principal) or (receipt.terminal_commit == null and !receipt.terminal_abort)) return .{};
+            !std.mem.eql(u8, receipt.principal orelse "", principal) or receipt.external_preparation_prepared or
+            (receipt.terminal_commit == null and !receipt.terminal_abort)) return .{};
         return .{ .decision = .{ .disposition = sessionDisposition(receipt), .abort_acknowledgement = receipt.sql_abort_acknowledgement } };
     }
 
@@ -14535,7 +14536,7 @@ test "distributed txn external session purpose and delivery receipts survive col
         durable.fail_writes_for_test = true;
         try std.testing.expectError(error.InjectedSessionStoreFailure, writer.sealExternalExecutionPlan(a, txn_id, seal, &tables));
         try std.testing.expect((try writer.externalPreparationSeal(a, txn_id)) == null);
-        try std.testing.expect((try writer.getExecutionPlan(a, txn_id)) == null);
+        try std.testing.expect((try writer.getExecutionPlan(a, try writer.mutation(a, txn_id, 7))) == null);
         durable.fail_writes_for_test = false;
         var plan = (try writer.sealExternalExecutionPlan(a, txn_id, seal, &tables)).?;
         defer plan.deinit();
@@ -14543,7 +14544,7 @@ test "distributed txn external session purpose and delivery receipts survive col
         var retry = (try writer.sealExternalExecutionPlan(a, txn_id, seal, &.{.{ .table_name = "different" }})).?;
         defer retry.deinit();
         try std.testing.expectEqualStrings("docs", retry.value[0].table_name);
-        try std.testing.expectError(error.TransactionCommitSealed, writer.sealExecutionPlan(a, txn_id, &tables));
+        try std.testing.expectError(error.TransactionCommitSealed, writer.sealExecutionPlan(a, try writer.mutation(a, txn_id, 7), &tables));
         try std.testing.expect(!writer.removeBeforeExecution(a, txn_id));
         receipt = .{ .owner = try identity.owner(a), .txn_id = txn_id, .gid = "session-cut", .session = identity.session.?, .status = .pending };
         try std.testing.expectError(error.ExternalTransactionDecisionChanged, writer.recordExternalPreparationReceipt(a, txn_id, receipt));
@@ -14642,7 +14643,7 @@ test "distributed txn terminal decision version survives native LSM reopen faile
                 const now = nextTxnTimestamp();
                 var session: Session = .{ .txn_id = id, .owner_node_id = 7, .begin_timestamp = now, .last_touched_timestamp = now, .sync_level = .write, .commit_execution_started = true, .terminal_commit = .{ .status = .committed_visibility_pending, .repair_required = true, .commit_version = version } };
                 defer session.deinit(a);
-                try durable.save(session, null);
+                try durable.saveForTest(session, null);
             } else {
                 var sessions = SessionRegistry.init(&durable);
                 defer sessions.deinit(a);
@@ -14721,7 +14722,7 @@ test "distributed txn named delivery validates authority and survives every loca
                 }
                 try std.testing.expectError(error.TransactionCommitSealed, sessions.recordTerminalAbort(a, txn_id));
                 try std.testing.expectError(error.TransactionCommitSealed, sessions.recordTerminalCommit(a, txn_id, .committed, null, null));
-                var plan = (try sessions.getExecutionPlan(a, txn_id)).?;
+                var plan = (try sessions.getExecutionPlan(a, try sessions.mutation(a, txn_id, 7))).?;
                 defer plan.deinit();
                 try std.testing.expectEqualStrings("docs", plan.value[0].table_name);
                 durable.fail_writes_for_test = true;
@@ -14784,16 +14785,16 @@ test "distributed txn SQL sync choice seals atomically and survives cold retries
         if (phase == 0) {
             const info = try sessions.beginForPrincipal(a, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
             txn_id = info.txn_id;
-            try sessions.setSqlSettingRaw(a, txn_id, "alice", owner, setting_catalog.native_sync_name, "full_text", false);
+            try sessions.setSqlSettingRaw(a, try sessions.mutation(a, txn_id, 7), "alice", owner, setting_catalog.native_sync_name, "full_text", false);
             var stale = (try sessions.getSqlState(a, txn_id)).?;
             defer stale.deinit(a);
             // A SET may finish after HTTP attachment but before COMMIT takes
             // its execution lease. Sealing must use the current durable cut.
-            try sessions.setSqlSettingRaw(a, txn_id, "alice", owner, setting_catalog.native_sync_name, "full_index", true);
+            try sessions.setSqlSettingRaw(a, try sessions.mutation(a, txn_id, 7), "alice", owner, setting_catalog.native_sync_name, "full_index", true);
             try std.testing.expectEqualStrings("full_text", stale.setting_active.items[0].value.string);
             var request = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"k\":{\"value\":1}}}}}");
             defer request.deinit(a);
-            _ = (try sessions.stage(a, txn_id, &request)).?;
+            _ = (try sessions.stage(a, try sessions.mutation(a, txn_id, 7), &request)).?;
             durable.fail_writes_for_test = true;
             try std.testing.expectError(error.InjectedSessionStoreFailure, sessions.cloneCommitRequestWithSqlSyncLevel(a, txn_id, null, null));
             durable.fail_writes_for_test = false;
@@ -14814,7 +14815,7 @@ test "distributed txn SQL sync choice seals atomically and survives cold retries
             defer persisted.deinit(a);
             try std.testing.expectEqual(.full_index, persisted.sync_level);
             try std.testing.expect(persisted.commit_body_digest != null);
-            try std.testing.expectError(error.TransactionCommitSealed, sessions.setSqlSettingRaw(a, txn_id, "alice", owner, setting_catalog.native_sync_name, "write", true));
+            try std.testing.expectError(error.TransactionCommitSealed, sessions.setSqlSettingRaw(a, try sessions.mutation(a, txn_id, 7), "alice", owner, setting_catalog.native_sync_name, "write", true));
         }
     }
 }

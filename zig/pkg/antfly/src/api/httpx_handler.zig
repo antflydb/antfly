@@ -8896,7 +8896,7 @@ pub const AntflyApiHandler = struct {
             .committed_pending => .committed_pending,
             .committed_repair_required => .committed_repair_required,
             .aborted => null,
-            .active, .outcome_unknown => unreachable,
+            .active, .prepared, .outcome_unknown => unreachable,
         };
         if ((outcome == .committed_pending or outcome == .committed_repair_required) and ctx.header("X-Antfly-SQL-Fence") != null)
             self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransaction, .{ self.api_server, ctx.allocator, completion, id }) catch {
@@ -9109,7 +9109,7 @@ pub const AntflyApiHandler = struct {
             .principal_instance = try http_server_mod.sqlPrincipalInstance(self.api_server, identity),
             .statement_timeout_ms = login_timeout,
         };
-        try self.runDurableSQLRouting(ctx.io, createLocalSQLConnection, .{ &self.api_server.txn_sessions, store, connection, now_ms, operationContext(ctx, identity) }) catch |err| return sqlConnectionError(ctx, err);
+        self.runDurableSQLRouting(ctx.io, createLocalSQLConnection, .{ &self.api_server.txn_sessions, store, connection, now_ms, operationContext(ctx, identity) }) catch |err| return sqlConnectionError(ctx, err);
         var native: @import("sql/session/command_execution.zig").Native = .{ .server = self.api_server, .context = operationContext(ctx, identity) };
         var native_controller: ?@import("sql/session/command_execution.zig").Controller = null;
         // Cover errors through response construction as well as enrollment.
