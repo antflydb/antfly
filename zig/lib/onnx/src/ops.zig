@@ -2846,7 +2846,9 @@ fn convertLayerNorm(builder: *Builder, node: *const NodeProto, inputs: []const N
     const eps = getFloat(node.attributes, "epsilon", 1e-5);
     const axis_raw = getInt(node.attributes, "axis", -1);
     const in_shape = builder.graph.node(x).output_shape;
-    const axis: u8 = if (axis_raw < 0) @intCast(@as(i64, in_shape.rank()) + axis_raw) else @intCast(axis_raw);
+    const rank: i64 = in_shape.rank();
+    if (axis_raw < -rank or axis_raw >= rank) return error.InvalidAttribute;
+    const axis: u8 = @intCast(if (axis_raw < 0) rank + axis_raw else axis_raw);
 
     // Decomposed: (x - mean) / sqrt(var + eps) * scale + bias
     // Reduce over axes [axis, rank)
@@ -2868,8 +2870,10 @@ fn convertLayerNorm(builder: *Builder, node: *const NodeProto, inputs: []const N
     const scaled = try builder.mul(normed, scale);
     const decomposed = if (has_bias) try builder.add(scaled, inputs[2]) else scaled;
 
-    // Emit fused node
-    const last_dim: u32 = @intCast(in_shape.dim(in_shape.rank() - 1));
+    // The fused contract describes last-axis normalization only.
+    if (num_reduce != 1) return decomposed;
+    const last_dim = std.math.cast(u32, in_shape.dim(axis)) orelse return decomposed;
+    if (last_dim == 0) return decomposed;
     const fused = try builder.graph.addNode(.{
         .op = .{ .fused_layer_norm = .{ .dim = last_dim, .eps = eps } },
         .output_shape = in_shape,
@@ -6146,6 +6150,13 @@ test "convertNode LayerNormalization emits fused" {
     try std.testing.expect(g.node(result).op.isFused());
     // Check it's specifically fused_layer_norm
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .fused_layer_norm);
+
+    var axis = [_]AttributeProto{.{ .name = "axis", .i = 0 }};
+    const multi_axis = NodeProto{ .op_type = "LayerNormalization", .attributes = &axis };
+    const decomposed = try convertNode(allocator, &b, &multi_axis, &.{ x, scale, bias }, null);
+    try std.testing.expectEqual(.add, std.meta.activeTag(g.node(decomposed).op));
+    axis[0].i = -3;
+    try std.testing.expectError(error.InvalidAttribute, convertNode(allocator, &b, &multi_axis, &.{ x, scale, bias }, null));
 }
 
 test "convertNode SimplifiedLayerNormalization emits fused rms_norm" {
