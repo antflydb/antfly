@@ -23,7 +23,7 @@
 //! newest token is found and the token it replaced is not. One JSON line per
 //! configuration on stdout; exit status 1 if any configuration failed.
 //!
-//!   lite-mp-bench --dir DIR [--workers 8] [--seconds 10] [--slots 16]
+//!   lite-mp-bench --dir DIR [--workers 8] [--readers 0] [--seconds 10] [--slots 16]
 //!                 [--mode process|thread|both] [--indexed yes|no|both]
 //!                 [--index text|sparse|dense]
 //!
@@ -95,6 +95,7 @@ const IndexKind = enum { text, sparse, dense };
 const Config = struct {
     dir: []const u8 = "",
     workers: usize = 8,
+    readers: usize = 0,
     seconds: f64 = 10,
     slots: usize = 16,
     busy_timeout_ms: u64 = 10_000,
@@ -112,6 +113,9 @@ const WorkerResult = extern struct {
     other: u64 = 0,
     first_error: i32 = 0,
     elapsed_ns: u64 = 0,
+    reads: u64 = 0,
+    read_ns: u64 = 0,
+    read_max_ns: u64 = 0,
     /// Per slot: 1 + the sequence of the last acknowledged write (0: none).
     last: [max_slots]u64 = @splat(0),
 };
@@ -222,17 +226,54 @@ fn runWorker(path: [:0]const u8, cfg: Config, indexed: bool, worker: usize) Work
     return result;
 }
 
+fn runReader(path: [:0]const u8, cfg: Config, indexed: bool) WorkerResult {
+    var result: WorkerResult = .{};
+    const handle = openHandle(path, cfg.busy_timeout_ms) catch return .{ .other = 1, .first_error = -1 };
+    defer api.antfly_db_close(handle);
+    const query = if (!indexed) "{\"limit\":1}" else switch (cfg.index) {
+        .text => "{\"full_text_search\":{\"match\":{\"field\":\"text\",\"text\":\"seed\"}},\"limit\":16}",
+        .sparse => "{\"embeddings\":{\"vec\":{\"indices\":[0],\"values\":[1.0]}},\"indexes\":[\"vec\"],\"limit\":16}",
+        .dense => "{\"embeddings\":{\"vec\":[1,1,0,0,0,0,0,0]},\"indexes\":[\"vec\"],\"limit\":16}",
+    };
+    const deadline = nowNs() + @as(i128, @intFromFloat(cfg.seconds * std.time.ns_per_s));
+    while (nowNs() < deadline) {
+        var response: c.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&response);
+        const started = nowNs();
+        const code = api.antfly_db_search_json(handle, .fromSlice(query), &response);
+        const latency: u64 = @intCast(nowNs() - started);
+        if (code == .ok) {
+            result.reads += 1;
+            result.read_ns += latency;
+            result.read_max_ns = @max(result.read_max_ns, latency);
+        } else {
+            if (result.first_error == 0) result.first_error = @backingInt(code);
+            if (code == .busy) {
+                result.busy += 1;
+                continue;
+            }
+            result.other += 1;
+            break;
+        }
+    }
+    return result;
+}
+
+fn runWorkerOrReader(path: [:0]const u8, cfg: Config, indexed: bool, worker: usize) WorkerResult {
+    return if (worker < cfg.workers) runWorker(path, cfg, indexed, worker) else runReader(path, cfg, indexed);
+}
+
 fn runProcesses(path: [:0]const u8, cfg: Config, indexed: bool, results: []WorkerResult) !void {
-    var fds = try std.heap.page_allocator.alloc([2]std.c.fd_t, cfg.workers);
+    var fds = try std.heap.page_allocator.alloc([2]std.c.fd_t, results.len);
     defer std.heap.page_allocator.free(fds);
-    var pids = try std.heap.page_allocator.alloc(std.c.pid_t, cfg.workers);
+    var pids = try std.heap.page_allocator.alloc(std.c.pid_t, results.len);
     defer std.heap.page_allocator.free(pids);
-    for (0..cfg.workers) |worker| {
+    for (0..results.len) |worker| {
         if (std.c.pipe(&fds[worker]) != 0) return error.PipeFailed;
         const pid = std.c.fork();
         if (pid == 0) {
             _ = std.c.close(fds[worker][0]);
-            const result = runWorker(path, cfg, indexed, worker);
+            const result = runWorkerOrReader(path, cfg, indexed, worker);
             const bytes = std.mem.asBytes(&result);
             var written: usize = 0;
             while (written < bytes.len) {
@@ -246,7 +287,7 @@ fn runProcesses(path: [:0]const u8, cfg: Config, indexed: bool, results: []Worke
         pids[worker] = pid;
         _ = std.c.close(fds[worker][1]);
     }
-    for (0..cfg.workers) |worker| {
+    for (0..results.len) |worker| {
         const bytes = std.mem.asBytes(&results[worker]);
         var read: usize = 0;
         while (read < bytes.len) {
@@ -266,12 +307,12 @@ fn runProcesses(path: [:0]const u8, cfg: Config, indexed: bool, results: []Worke
 fn runThreads(path: [:0]const u8, cfg: Config, indexed: bool, results: []WorkerResult) !void {
     const Ctx = struct {
         fn run(p: [:0]const u8, k: Config, i: bool, worker: usize, out: *WorkerResult) void {
-            out.* = runWorker(p, k, i, worker);
+            out.* = runWorkerOrReader(p, k, i, worker);
         }
     };
-    var threads = try std.heap.page_allocator.alloc(std.Thread, cfg.workers);
+    var threads = try std.heap.page_allocator.alloc(std.Thread, results.len);
     defer std.heap.page_allocator.free(threads);
-    for (0..cfg.workers) |worker| threads[worker] = try std.Thread.spawn(.{}, Ctx.run, .{ path, cfg, indexed, worker, &results[worker] });
+    for (0..results.len) |worker| threads[worker] = try std.Thread.spawn(.{}, Ctx.run, .{ path, cfg, indexed, worker, &results[worker] });
     for (threads) |thread| thread.join();
 }
 
@@ -369,7 +410,7 @@ fn runConfig(cfg: Config, mode: Mode, indexed: bool, ordinal: usize) !bool {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/bench-{d}-{s}-{s}.aflite", .{ cfg.dir, ordinal, @tagName(mode), if (indexed) "indexed" else "plain" }, 0);
     try setup(path, cfg, indexed);
-    const results = try std.heap.page_allocator.alloc(WorkerResult, cfg.workers);
+    const results = try std.heap.page_allocator.alloc(WorkerResult, cfg.workers + cfg.readers);
     defer std.heap.page_allocator.free(results);
     @memset(results, .{});
     const started = nowNs();
@@ -381,17 +422,21 @@ fn runConfig(cfg: Config, mode: Mode, indexed: bool, ordinal: usize) !bool {
     var total: WorkerResult = .{};
     for (results) |result| {
         total.ok += result.ok;
+        total.reads += result.reads;
+        total.read_ns += result.read_ns;
+        total.read_max_ns = @max(total.read_max_ns, result.read_max_ns);
         total.busy += result.busy;
         total.stalled += result.stalled;
         total.other += result.other;
         if (total.first_error == 0) total.first_error = result.first_error;
     }
-    const v = try verify(path, cfg, indexed, results);
-    const passed = v.valid and v.missing == 0 and v.stale == 0 and v.searches_failed == 0 and total.stalled == 0 and total.other == 0 and total.busy == 0;
+    const v = try verify(path, cfg, indexed, results[0..cfg.workers]);
+    const read_mean_ns = if (total.reads == 0) 0 else total.read_ns / total.reads;
+    const passed = (cfg.readers == 0 or total.reads != 0) and v.valid and v.missing == 0 and v.stale == 0 and v.searches_failed == 0 and total.stalled == 0 and total.other == 0 and total.busy == 0;
     const first_error: [*:0]const u8 = if (total.first_error > 0) c.errorCodeName(total.first_error) else if (total.first_error < 0) "WORKER_FAILED" else "";
     std.debug.print(
-        "{{\"mode\":\"{s}\",\"index\":\"{s}\",\"indexed\":{},\"workers\":{d},\"seconds\":{d:.1},\"writes\":{d},\"writes_per_sec\":{d:.0},\"busy\":{d},\"stalled\":{d},\"other\":{d},\"first_error\":\"{s}\",\"valid\":{},\"missing\":{d},\"stale\":{d},\"search_failures\":{d},\"passed\":{}}}\n",
-        .{ @tagName(mode), @tagName(cfg.index), indexed, cfg.workers, elapsed_s, total.ok, @as(f64, @floatFromInt(total.ok)) / elapsed_s, total.busy, total.stalled, total.other, first_error, v.valid, v.missing, v.stale, v.searches_failed, passed },
+        "{{\"mode\":\"{s}\",\"index\":\"{s}\",\"indexed\":{},\"workers\":{d},\"readers\":{d},\"reads\":{d},\"read_mean_ns\":{d},\"read_max_ns\":{d},\"seconds\":{d:.1},\"writes\":{d},\"writes_per_sec\":{d:.0},\"busy\":{d},\"stalled\":{d},\"other\":{d},\"first_error\":\"{s}\",\"valid\":{},\"missing\":{d},\"stale\":{d},\"search_failures\":{d},\"passed\":{}}}\n",
+        .{ @tagName(mode), @tagName(cfg.index), indexed, cfg.workers, cfg.readers, total.reads, read_mean_ns, total.read_max_ns, elapsed_s, total.ok, @as(f64, @floatFromInt(total.ok)) / elapsed_s, total.busy, total.stalled, total.other, first_error, v.valid, v.missing, v.stale, v.searches_failed, passed },
     );
     return passed;
 }
@@ -407,6 +452,8 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.dir = value;
         } else if (std.mem.eql(u8, arg, "--workers")) {
             cfg.workers = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, arg, "--readers")) {
+            cfg.readers = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, arg, "--seconds")) {
             cfg.seconds = try std.fmt.parseFloat(f64, value);
         } else if (std.mem.eql(u8, arg, "--slots")) {
@@ -420,6 +467,7 @@ pub fn main(init: std.process.Init) !u8 {
         } else return error.UnknownArgument;
     }
     if (cfg.dir.len == 0 or cfg.workers == 0 or cfg.slots == 0 or cfg.slots > max_slots) return error.InvalidArguments;
+    _ = std.math.add(usize, cfg.workers, cfg.readers) catch return error.InvalidArguments;
     var all_passed = true;
     var ordinal: usize = 0;
     for (cfg.indexed) |indexed| for (cfg.modes) |mode| {
