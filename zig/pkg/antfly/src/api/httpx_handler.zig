@@ -1932,7 +1932,7 @@ pub const AntflyApiHandler = struct {
                 .cancellation = &cancellation,
             } };
             request.sql = &state;
-            const result = self.runSQLForwarding(ctx.io, preparation, http_server_mod.ApiHttpServer.forwardSessionOperation, .{ self.api_server, txn_id, request });
+            const result = self.runSQLForwarding(ctx.io, preparation, &state.control, http_server_mod.ApiHttpServer.forwardSessionOperation, .{ self.api_server, txn_id, request });
             if (state.needs_adoption and !cancellation.isCancelled()) {
                 const adopted = self.runDurableSQLRouting(ctx.io, http_server_mod.ApiHttpServer.adoptRoutedSQLSession, .{ self.api_server, txn_id }) catch |err| {
                     if (state.attempted) {
@@ -1941,7 +1941,7 @@ pub const AntflyApiHandler = struct {
                     }
                     return err;
                 };
-                if (adopted) return null;
+                if (adopted and !state.attempted) return null;
             }
             if (state.attempted) (try requestCompletion(ctx)).unknown = true;
             break :routed try result;
@@ -1984,11 +1984,11 @@ pub const AntflyApiHandler = struct {
             else => return error.UnsupportedMethod,
         }, .uri = target, .headers = headers.items, .authorization = ctx.header("authorization"), .content_type = ctx.header("content-type"), .body = body };
         const cancellation = requestCancellation(ctx);
-        const control: http_server_mod.ApiHttpServer.SQLForwardControl = .{
+        var control: http_server_mod.ApiHttpServer.SQLForwardControl = .{
             .deadline_ns = @import("../request_deadline.zig").platformDeadline(ctx),
             .cancellation = &cancellation,
         };
-        var response = self.runSQLForwarding(ctx.io, preparation, http_server_mod.ApiHttpServer.forwardSQLResourceToOwner, .{ self.api_server, owner, request, &forwarded, control }) catch |err| {
+        var response = self.runSQLForwarding(ctx.io, preparation, &control, http_server_mod.ApiHttpServer.forwardSQLResourceToOwner, .{ self.api_server, owner, request, &forwarded, &control }) catch |err| {
             if (forwarded) completion.unknown = true;
             if (!forwarded and err == error.SqlWriteCapacityUnavailable) return try sqlRoutingOverloadedResponse(ctx);
             if (err == error.SqlConnectionWrongOwner) return try rejectBeforeSQLExecution(ctx, try ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "08003", .message = "SQL resources must have the same issuing node" }));
@@ -6807,7 +6807,7 @@ pub const AntflyApiHandler = struct {
         prepared_mode: SQLPreparedMode = .statement,
         prepared_id: ?[]const u8 = null,
         prepared_response: ?[]const u8 = null,
-        prepared_response_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 16 << 20 },
+        prepared_response_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = http_server_mod.ApiHttpServer.max_sql_response_bytes },
         connection_owned: ?@import("sql_connections.zig").Owned = null,
         connection_session_hex: [32]u8 = undefined,
 
@@ -7145,7 +7145,6 @@ pub const AntflyApiHandler = struct {
                 self.prepared_response = response;
                 return;
             }
-            var legacy_replay: ?*transactions_api.DurableSessionStore = null;
             if (compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
                 if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
                     const id = distributed_txn.parseTxnIdHex(supplied) catch return error.SqlTransactionNotActive;
@@ -7154,8 +7153,7 @@ pub const AntflyApiHandler = struct {
                         _ = try self.reportCommitDecision(id, decision);
                         return;
                     }
-                    if (probe.payload == .unknown) legacy_replay = store;
-                    if (probe.payload == .terminal) {
+                    if (probe.payload != .none) {
                         var read = try self.adapter.server.acquireSqlExecution(false);
                         defer read.release();
                         if (try self.replayCommit(store, supplied, null, resource_principal)) return;
@@ -7171,9 +7169,6 @@ pub const AntflyApiHandler = struct {
                 return;
             };
             defer execution.release();
-            if (legacy_replay) |store| {
-                if (try self.replayCommit(store, self.adapter.session_id.?, null, resource_principal)) return;
-            }
             self.preparation.release();
             self.execution_entered = true;
             self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
@@ -7198,10 +7193,12 @@ pub const AntflyApiHandler = struct {
         return runSQLRoutingTask(io, network, task, args);
     }
 
-    fn runSQLForwarding(self: *AntflyApiHandler, network: std.Io, preparation: ?*http_server_mod.RequestAdmission.Lease, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
+    fn runSQLForwarding(self: *AntflyApiHandler, network: std.Io, preparation: ?*http_server_mod.RequestAdmission.Lease, control: *http_server_mod.ApiHttpServer.SQLForwardControl, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
         if (self.api_server.cfg.imported_runtime_io) |views| {
             const source = views.request_forward orelse return error.SqlWriteCapacityUnavailable;
             const Call = struct {
+                server: *ApiHttpServer,
+                control: *http_server_mod.ApiHttpServer.SQLForwardControl,
                 args: @TypeOf(args),
                 network: std.Io,
                 preparation: ?*http_server_mod.RequestAdmission.Lease,
@@ -7210,19 +7207,25 @@ pub const AntflyApiHandler = struct {
                 fn invoke(raw: *anyopaque, borrow: *const @import("kernel_abi.zig").native_abi.IoBorrow) callconv(.c) void {
                     const call: *@This() = @ptrCast(@alignCast(raw));
                     var receiver = borrow.receive() catch return;
+                    call.control.executor = call.server.sqlPeerExecutor(borrow.*) catch |err| {
+                        call.result = err;
+                        return;
+                    };
                     if (call.preparation) |held| held.release();
                     call.result = runSQLRoutingTask(receiver.io(), call.network, task, call.args);
                 }
             };
-            var call: Call = .{ .args = args, .network = network, .preparation = preparation };
+            var call: Call = .{ .server = self.api_server, .control = control, .args = args, .network = network, .preparation = preparation };
             if (!source.with_lane(source.context, &call, Call.invoke)) return error.SqlWriteCapacityUnavailable;
             return call.result;
         }
         const runtime = self.api_server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
         var lease = runtime.acquireDedicatedRequestForwardLane() catch return error.SqlWriteCapacityUnavailable;
         defer lease.release();
+        const io = lease.io();
+        control.executor = try self.api_server.sqlPeerExecutor(.init(&io));
         if (preparation) |held| held.release();
-        return runSQLRoutingTask(lease.io(), network, task, args);
+        return runSQLRoutingTask(io, network, task, args);
     }
 
     fn runSQLRoutingTask(io: std.Io, network: std.Io, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
@@ -7336,20 +7339,24 @@ pub const AntflyApiHandler = struct {
         const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
         const owner_node_id = self.api_server.localSessionNodeId();
         const principal = http_server_mod.transactionPrincipal(identity) orelse "";
-        @import("sql_connections.zig").create(store, &self.api_server.txn_sessions, .{
+        const cancellation = requestCancellation(ctx);
+        const connection: @import("sql_connection_record.zig").Record = .{
             .id = connection_id,
             .principal = principal,
             .owner_node_id = owner_node_id,
             .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms,
             .database = parsed.value.database,
             .namespace = parsed.value.namespace,
-        }, now_ms) catch |err| {
-            var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };
+        try self.runDurableSQLRouting(ctx.io, createLocalSQLConnection, .{ &self.api_server.txn_sessions, store, connection, now_ms, &cancellation });
         var owner_buffer: [20]u8 = undefined;
         const owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{owner_node_id});
         return ctx.status(200).json(.{ .connection_id = &connection_id, .owner_node_id = owner, .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms, .database = parsed.value.database, .namespace = parsed.value.namespace });
+    }
+
+    fn createLocalSQLConnection(registry: *transactions_api.SessionRegistry, store: *transactions_api.DurableSessionStore, connection: @import("sql_connection_record.zig").Record, now_ms: u64, cancellation: *const http_common.RequestCancellation) !void {
+        try cancellation.token().check();
+        try @import("sql_connections.zig").create(store, registry, connection, now_ms);
     }
 
     pub fn closeSQLConnection(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id_raw: []const u8) !httpx.Response {
@@ -7759,7 +7766,7 @@ pub const AntflyApiHandler = struct {
                 inline else => |kind| @field(sql_wire.SQLMutationOutcome, @tagName(kind)),
             } else null,
         };
-        var encoding_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 16 << 20 };
+        var encoding_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = ApiHttpServer.max_sql_response_bytes };
         const encoded = std.json.Stringify.valueAlloc(encoding_budget.allocator(), output, .{ .emit_null_optional_fields = false }) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             if (encoding_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL encoded result exceeds its 16 MiB memory budget" });
@@ -15856,6 +15863,45 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         }
     }
 
+    {
+        const begun = try server.txn_sessions.beginForPrincipal(alloc, .{ .sql = .{
+            .database = "default",
+            .namespace = "public",
+            .isolation = .read_committed,
+            .mode = .read_write,
+        } }, 0, "connection_alice");
+        var terminal = (try durable.load(begun.txn_id)).?;
+        defer terminal.deinit(alloc);
+        terminal.terminal_abort = true;
+        terminal.sql_abort_acknowledgement = .rollback;
+        terminal.commit_execution_started = true;
+        try durable.saveForTest(terminal, null);
+        const encoded = std.fmt.bytesToHex(begun.txn_id, .lower);
+        const key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ @import("../metadata/transaction_session_record.zig").session_prefix, &encoded });
+        defer alloc.free(key);
+        {
+            var txn = try native.beginWrite();
+            errdefer txn.abort();
+            const packed_record = try txn.get(key);
+            const legacy = try std.mem.concat(alloc, u8, &.{ "{ ", packed_record[1..] });
+            defer alloc.free(legacy);
+            try txn.put(key, legacy);
+            try txn.commit();
+        }
+        var held: usize = 0;
+        while (server.tryAcquireWrite()) held += 1;
+        defer for (0..held) |_| server.releaseWrite();
+        try std.testing.expect(held != 0);
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .session_id = &encoded }, .{});
+        defer alloc.free(body);
+        var replayed = try Route.call(alloc, &handler, alice_auth, .sql, null, body);
+        defer replayed.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), replayed.status);
+        var decision = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, replayed.body, .{});
+        defer decision.deinit();
+        try std.testing.expectEqualStrings("ROLLBACK", decision.value.command_tag);
+    }
+
     const prepare_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT current_setting('app.limit')", .connection_id = connection_id }, .{});
     defer alloc.free(prepare_body);
     var prepared_reply = try Route.call(alloc, &handler, alice_auth, .prepare, null, prepare_body);
@@ -15887,6 +15933,9 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     {
         server.cfg.imported_runtime_io = .{ .durable = std.Io.failing };
         defer server.cfg.imported_runtime_io = null;
+        var blocked_open = try Route.call(alloc, &handler, alice_auth, .open, null, "{}");
+        defer blocked_open.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), blocked_open.status);
         var overloaded = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
         defer overloaded.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 503), overloaded.status);
@@ -23624,6 +23673,59 @@ test "distributed SQL API control routes authenticate cancellation and share ter
     var response = try server.router.find(.POST, transport.result_path, &params).?.handler.invoke(&ctx);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 409), response.status.code);
+}
+
+test "httpx SQL connection routes preserve settings and retire prepared resources: adoption preserves ambiguous forwarding" {
+    const a = std.testing.allocator;
+    var storage = @import("antfly_local_sources").storage_mem_backend.Backend.init(a, .{});
+    defer storage.close();
+    var store = try storage.runtimeStore(a, .{ .name = "sql-forward-adoption" });
+    defer store.deinit();
+    var durable = transactions_api.DurableSessionStore.initRuntime(a, &store);
+    var pool = std.Io.Threaded.init(a, .{});
+    defer pool.deinit();
+    var transport_io = pool.io();
+    const Peer = struct {
+        server: *ApiHttpServer = undefined,
+        id: db_mod.types.TxnId = undefined,
+        expiry: u64 = undefined,
+        fn local(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, _: u64) !?[]u8 {
+            return try alloc.dupe(u8, "http://owner");
+        }
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const peer: *@This() = @ptrCast(@alignCast(raw));
+            req.delivery_tracker.?.markMayHaveBeenSent();
+            try std.testing.expect(try peer.server.txn_sessions.adoptIfLeaseExpired(std.testing.allocator, peer.id, 2, peer.expiry));
+            return error.ConnectionReset;
+        }
+    };
+    var peer: Peer = .{};
+    var server = ApiHttpServer.init(a, .{
+        .session_store = &durable,
+        .session_owner_lease_ttl_ns = std.time.ns_per_s,
+        .session_store_scope = .cluster_shared,
+        .imported_runtime_io = .{ .durable = std.testing.io, .request_forward = testRequestForwardSource(&transport_io) },
+        .session_router = .{ .ptr = &peer, .vtable = &.{ .local_node_id = Peer.local, .local_status = undefined, .node_base_uri = Peer.uri } },
+        .session_executor = .{ .ptr = &peer, .vtable = &.{ .execute = Peer.execute } },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const session = try server.txn_sessions.begin(a, .{}, 7);
+    peer.server = &server;
+    peer.id = session.txn_id;
+    peer.expiry = session.begin_timestamp + 2 * std.time.ns_per_s;
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    if (handler.forwardResolvedTransactionSession(&ctx, session.txn_id, "{}", .{ .resolved = 7 }, null)) |_| {
+        return error.TestExpectedAmbiguousTransportFailure;
+    } else |_| {}
+    try std.testing.expect((try AntflyApiHandler.requestCompletion(&ctx)).unknown);
+    try std.testing.expectEqual(@as(?u64, 2), try server.txn_sessions.getOwnerNodeId(a, session.txn_id));
 }
 
 test "httpx SQL connection routes preserve settings and retire prepared resources: routed commit preserves the owner receipt" {

@@ -644,7 +644,7 @@ test "API kernel forward lane reserves owning runtime capacity" {
     const runtime_mod = @import("antfly_local_sources").storage_background_runtime;
     var runtime = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .io_threaded,
-        .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.request_forward_workers_per_request },
+        .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.request_forward_workers_per_request + 1 },
     });
     defer runtime.deinit();
 

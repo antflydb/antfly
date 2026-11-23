@@ -7026,7 +7026,10 @@ pub const DataServer = struct {
         // Reuse the Raft host's transport unless the caller supplied one.
         if (api_server_cfg.session_router == null) api_server_cfg.session_router = self.dataReadGroupRouter();
         if (api_server_cfg.session_executor == null) {
-            if (self.data_raft) |raft| api_server_cfg.session_executor = raft.host.http_host.request_executor;
+            if (self.data_raft) |raft| {
+                api_server_cfg.session_executor = raft.host.http_host.request_executor;
+                if (raft.host.http_host.executor) |executor| api_server_cfg.configureDefaultSqlPeerTransport(executor.cfg);
+            }
         }
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHotStandbyPublicGateState();

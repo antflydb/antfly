@@ -5914,7 +5914,21 @@ pub const SessionRegistry = struct {
         defer alloc.free(page.ids);
         var removed: std.AutoHashMapUnmanaged(db_mod.types.TxnId, void) = .empty;
         defer removed.deinit(durable.alloc);
-        const consumed = try durable.maintainTaggedSqlPage(page.ids, cutoff_ns, &removed);
+        var batch = page.ids;
+        const consumed = retry: while (true) {
+            break :retry durable.maintainTaggedSqlPage(batch, cutoff_ns, &removed) catch |err| {
+                if (!isCorruptExpiredSession(err)) return err;
+                // The failed transaction aborted. Find a committable prefix
+                // or isolate one corrupt row without committing partial edits.
+                removed.clearRetainingCapacity();
+                if (batch.len == 1) {
+                    _ = skipCorruptExpiredSession(batch[0], err);
+                    break :retry 1;
+                }
+                batch = batch[0 .. batch.len / 2];
+                continue :retry;
+            };
+        };
         const next_after = if (consumed < page.ids.len) positions.items[consumed - 1] else page.next_after;
         var it = removed.keyIterator();
         while (it.next()) |id| self.evictDetachedSqlSession(id.*);
@@ -6004,14 +6018,17 @@ pub const SessionRegistry = struct {
         return removed_count;
     }
 
+    fn isCorruptExpiredSession(err: anyerror) bool {
+        return switch (err) {
+            error.InvalidTransactionSessionRecord, error.InvalidSqlConnection, error.SyntaxError, error.UnexpectedToken, error.UnexpectedEndOfInput => true,
+            else => false,
+        };
+    }
+
     fn skipCorruptExpiredSession(id: db_mod.types.TxnId, err: anyerror) bool {
-        switch (err) {
-            error.InvalidTransactionSessionRecord, error.InvalidSqlConnection, error.SyntaxError, error.UnexpectedToken, error.UnexpectedEndOfInput => {
-                std.log.warn("expired session record skipped txn_id={x} err={s}", .{ id, @errorName(err) });
-                return true;
-            },
-            else => return false,
-        }
+        if (!isCorruptExpiredSession(err)) return false;
+        std.log.warn("expired session record skipped txn_id={x} err={s}", .{ id, @errorName(err) });
+        return true;
     }
 
     pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
@@ -9941,6 +9958,48 @@ test "distributed txn backfills and expires tagged terminal sessions" {
     try std.testing.expectEqual(@as(usize, 0), try registry.cleanupExpiredTaggedSqlDecisions(a, std.math.maxInt(u64)));
     try registry.migrateLegacySqlAbortReceipts(a);
     try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpiredTaggedSqlDecisions(a, std.math.maxInt(u64)));
+}
+
+test "distributed txn tagged expiry advances past a corrupt completion directory" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "tagged-terminal-corrupt-dependency" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(a, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(a);
+    var ids: [3]db_mod.types.TxnId = undefined;
+    for (&ids, 0..) |*id, index| {
+        id.* = (try registry.begin(a, .{ .prepared_completion_only = true, .sql = .{
+            .database = "main",
+            .namespace = "public",
+            .isolation = .read_committed,
+            .mode = .read_write,
+        } }, 0)).txn_id;
+        var session = (try durable.load(id.*)).?;
+        defer session.deinit(a);
+        session.last_touched_timestamp = @intCast(index + 1);
+        session.terminal_abort = true;
+        session.commit_execution_started = true;
+        try durable.saveForTest(session, null);
+    }
+    const bad = try completionDirectoryKey(a, ids[1]);
+    defer a.free(bad);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(bad, "[");
+        try write.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpiredTaggedSqlDecisions(a, 4));
+    try std.testing.expectEqual(@as(usize, 0), try registry.cleanupExpiredTaggedSqlDecisions(a, 4));
+    try std.testing.expectEqual(@as(usize, 1), try registry.cleanupExpiredTaggedSqlDecisions(a, 4));
+    try std.testing.expect((try durable.load(ids[0])) == null);
+    var retained = (try durable.load(ids[1])).?;
+    defer retained.deinit(a);
+    try std.testing.expect(retained.terminal_abort);
+    try std.testing.expect((try durable.load(ids[2])) == null);
 }
 
 test "distributed txn migrates legacy detached SQL aborts out of live quota" {

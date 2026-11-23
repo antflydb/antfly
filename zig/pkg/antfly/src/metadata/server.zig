@@ -388,7 +388,10 @@ pub const MetadataServer = struct {
             // writes. An API caller need not inject a test-only executor to
             // make remote restore work. Explicit host overrides stay intact.
             if (api_server_cfg.session_router == null) api_server_cfg.session_router = metadataSessionRouter(svc);
-            if (api_server_cfg.session_executor == null) api_server_cfg.session_executor = svc.raft.host.http_host.request_executor;
+            if (api_server_cfg.session_executor == null) {
+                api_server_cfg.session_executor = svc.raft.host.http_host.request_executor;
+                if (svc.raft.host.http_host.executor) |executor| api_server_cfg.configureDefaultSqlPeerTransport(executor.cfg);
+            }
             api_server_cfg.restore_validation = .{ .status = public_api_http_server.StatusSource.fromMetadataHttpService(svc), .factory = @import("../api/restore_catalog.zig").ValidationPort.SourceFactory.hosted(public_read_source, public_write_source) };
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();

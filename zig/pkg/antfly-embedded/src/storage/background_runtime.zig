@@ -526,34 +526,42 @@ const LaneLeaseGate = struct {
     }
 
     fn tryAcquireBounded(self: *LaneLeaseGate, capacity: usize) ?usize {
+        return self.tryAcquireUnits(capacity, 1);
+    }
+
+    fn tryAcquireUnits(self: *LaneLeaseGate, capacity: usize, units: usize) ?usize {
         var observed = self.state.load(.acquire);
         while (true) {
             if (observed & closed_bit != 0) return null;
             const count = observed & count_mask;
-            if (count >= capacity) return null;
-            std.debug.assert(count < count_mask);
-            if (self.state.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
+            if (units > capacity -| count) return null;
+            std.debug.assert(count + units <= count_mask);
+            if (self.state.cmpxchgWeak(observed, observed + units, .acq_rel, .acquire)) |actual| {
                 observed = actual;
                 continue;
             }
-            return count + 1;
+            return count + units;
         }
     }
 
     fn release(self: *LaneLeaseGate, coordinator_io: ?Io) void {
+        self.releaseUnits(coordinator_io, 1);
+    }
+
+    fn releaseUnits(self: *LaneLeaseGate, coordinator_io: ?Io, units: usize) void {
         if (coordinator_io) |io| {
             // Hold the drain lock before publishing the last release. Otherwise
             // waitDrained could observe zero and destroy this gate/executor
             // before the releasing caller finished its notification.
             self.drain_mutex.lockUncancelable(io);
             defer self.drain_mutex.unlock(io);
-            const previous = self.state.fetchSub(1, .acq_rel);
-            std.debug.assert(previous & count_mask > 0);
-            if (previous & closed_bit != 0 and previous & count_mask == 1)
+            const previous = self.state.fetchSub(units, .acq_rel);
+            std.debug.assert(previous & count_mask >= units);
+            if (previous & closed_bit != 0 and previous & count_mask == units)
                 self.drained.broadcast(io);
         } else {
-            const previous = self.state.fetchSub(1, .acq_rel);
-            std.debug.assert(previous & count_mask > 0);
+            const previous = self.state.fetchSub(units, .acq_rel);
+            std.debug.assert(previous & count_mask >= units);
         }
     }
 
@@ -1362,6 +1370,7 @@ pub const BackendRuntime = struct {
     pub const RequestForwardLaneLease = struct {
         runtime: *BackendRuntime,
         borrowed_io: Io,
+        workers: usize,
         released: bool = false,
 
         pub fn io(self: *const @This()) Io {
@@ -1372,7 +1381,7 @@ pub const BackendRuntime = struct {
         pub fn release(self: *@This()) void {
             if (self.released) return;
             self.released = true;
-            self.runtime.request_forward_lane_gate.release(self.runtime.io());
+            self.runtime.request_forward_lane_gate.releaseUnits(self.runtime.io(), self.workers);
         }
     };
 
@@ -1382,14 +1391,17 @@ pub const BackendRuntime = struct {
         if (self.borrowed_receivers) |*borrowed| {
             if (borrowed.request_forward == null) return error.BackendRuntimeUnavailable;
         } else if (self.backend == .manual) return error.BackendRuntimeUnavailable;
-        return self.acquireRequestForwardLane();
+        return self.acquireRequestForwardWorkers(threaded_io_limits.request_forward_workers_per_request + 1);
     }
 
     pub fn acquireRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
-        const capacity = self.lane_limits.request_forward / threaded_io_limits.request_forward_workers_per_request;
-        _ = self.request_forward_lane_gate.tryAcquireBounded(capacity) orelse
+        return self.acquireRequestForwardWorkers(threaded_io_limits.request_forward_workers_per_request);
+    }
+
+    fn acquireRequestForwardWorkers(self: *BackendRuntime, workers: usize) !RequestForwardLaneLease {
+        _ = self.request_forward_lane_gate.tryAcquireUnits(self.lane_limits.request_forward, workers) orelse
             return error.RequestForwardCapacityUnavailable;
-        errdefer self.request_forward_lane_gate.release(self.io());
+        errdefer self.request_forward_lane_gate.releaseUnits(self.io(), workers);
         const forward_io = if (self.borrowed_receivers) |*borrowed|
             if (borrowed.request_forward) |*receiver| receiver.io() else borrowed.general.io()
         else if (comptime builtin.os.tag == .freestanding)
@@ -1408,12 +1420,12 @@ pub const BackendRuntime = struct {
             const sync_io = Io.Threaded.global_single_threaded.io();
             impl.mutex.lockUncancelable(sync_io);
             const remaining = @backingInt(impl.concurrent_limit) -| impl.busy_count;
-            const reserved = self.request_forward_lane_gate.active() * threaded_io_limits.request_forward_workers_per_request;
+            const reserved = self.request_forward_lane_gate.active();
             impl.mutex.unlock(sync_io);
             if (reserved > remaining) return error.RequestForwardCapacityUnavailable;
             break :blk self.threadedNetworkIo(impl);
         };
-        return .{ .runtime = self, .borrowed_io = forward_io };
+        return .{ .runtime = self, .borrowed_io = forward_io, .workers = workers };
     }
 
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {

@@ -1755,6 +1755,7 @@ pub const ApiHttpServerConfig = struct {
     /// every transaction. Null preserves standalone maintenance ownership.
     relational_maintenance_leadership: ?@import("group_work_ownership.zig").Source = null,
     session_executor: ?http_common.RequestExecutor = null,
+    sql_peer_transport_config: ?@import("../common/http/io_http_executor.zig").IoHttpExecutorConfig = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
     /// Keep session persistence independent of workflow stores. Metadata nodes
@@ -1846,6 +1847,15 @@ pub const ApiHttpServerConfig = struct {
         const issuer = self.trusted_principal_issuer orelse return null;
         if (secret.len == 0 or issuer.len == 0) return null;
         return .{ .secret = secret, .issuer = issuer };
+    }
+
+    pub fn configureDefaultSqlPeerTransport(self: *ApiHttpServerConfig, transport: @import("../common/http/std_http_executor.zig").StdHttpExecutorConfig) void {
+        self.sql_peer_transport_config = .{
+            .max_response_bytes = if (transport.resolve_before_connect) transport.max_response_bytes else ApiHttpServer.max_sql_response_bytes,
+            .connect_timeout_ms = transport.connect_timeout_ms,
+            .cache_resolved_addresses = transport.cache_resolved_addresses,
+            .keep_alive = true,
+        };
     }
 
     pub fn configureRemoteCatalogPublicationAuthority(self: *ApiHttpServerConfig) void {
@@ -4148,6 +4158,8 @@ pub const ApiHttpServer = struct {
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
     txn_sessions: transactions_api.SessionRegistry = .{},
+    sql_peer_transport_mutex: std.atomic.Mutex = .unlocked,
+    sql_peer_transport: ?*SqlPeerTransport = null,
     sql_observation_ack_backlog: std.atomic.Value(bool) = .init(false),
     last_sql_abort_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
@@ -5081,6 +5093,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        if (self.sql_peer_transport) |transport| {
+            transport.executor.deinit();
+            self.owner_alloc.destroy(transport);
+        }
         self.object_tables.deinit(self.owner_alloc);
         if (self.pgwire_listener) |listener| {
             listener.deinit();
@@ -14330,9 +14346,30 @@ pub const ApiHttpServer = struct {
         resolved: ?u64,
     };
 
+    pub const max_sql_response_bytes = 16 << 20;
     const sql_forward_max_timeout_ms: u32 = 10 * 60 * 1000;
 
+    const SqlPeerTransport = struct {
+        receiver: @import("antfly_runtime_abi").io_abi.Receiver,
+        executor: @import("../common/http/io_http_executor.zig").IoHttpExecutor,
+    };
+
+    pub fn sqlPeerExecutor(self: *ApiHttpServer, borrow: @import("antfly_runtime_abi").io_abi.Borrow) !http_common.RequestExecutor {
+        const config = self.cfg.sql_peer_transport_config orelse return self.cfg.session_executor orelse error.HttpExecutorUnavailable;
+        platform_sync.lockYielding(&self.sql_peer_transport_mutex);
+        defer self.sql_peer_transport_mutex.unlock();
+        if (self.sql_peer_transport == null) {
+            const transport = try self.owner_alloc.create(SqlPeerTransport);
+            errdefer self.owner_alloc.destroy(transport);
+            transport.receiver = try borrow.receive();
+            transport.executor = @import("../common/http/io_http_executor.zig").IoHttpExecutor.init(self.owner_alloc, transport.receiver.io(), config);
+            self.sql_peer_transport = transport;
+        }
+        return self.sql_peer_transport.?.executor.executor();
+    }
+
     pub const SQLForwardControl = struct {
+        executor: ?http_common.RequestExecutor = null,
         deadline_ns: ?u64,
         cancellation: *const http_common.RequestCancellation,
 
@@ -14437,10 +14474,10 @@ pub const ApiHttpServer = struct {
         return self.forwardSQLResourceToOwner(owner, request, forwarded, null);
     }
 
-    pub fn forwardSQLResourceToOwner(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest, forwarded: *bool, control: ?SQLForwardControl) !?contextual_operations.OwnedResponse {
+    pub fn forwardSQLResourceToOwner(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest, forwarded: *bool, control: ?*const SQLForwardControl) !?contextual_operations.OwnedResponse {
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
-        const executor = self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
+        const executor = (if (control) |value| value.executor else null) orelse self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
         const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return null;
         defer self.alloc.free(base);
         for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-SQL-Resource-Hop") and std.mem.eql(u8, header.value, "forwarded")) return error.SqlConnectionWrongOwner;
@@ -14497,7 +14534,7 @@ pub const ApiHttpServer = struct {
         // availability must not depend on the original execution owner's life.
         if (req.method == .GET and self.txn_sessions.durableMissIsAuthoritative()) return null;
         const router = self.cfg.session_router orelse return null;
-        const session_executor = self.cfg.session_executor orelse return null;
+        const session_executor = (if (sql) |state| state.control.executor else null) orelse self.cfg.session_executor orelse return null;
         const owner = switch (route) {
             .lookup => try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id),
             .resolved => |owner| owner,
@@ -14520,11 +14557,15 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(uri);
         var outgoing = req;
         outgoing.uri = uri;
+        var delivery: http_common.RequestDeliveryTracker = .{};
         if (sql) |state| {
             outgoing.timeout_ms = try state.control.timeoutMs();
             outgoing.cancellation = state.control.cancellation;
-            state.attempted = true;
+            outgoing.delivery_tracker = &delivery;
         }
+        defer if (sql) |state| {
+            state.attempted = outgoing.delivery_tracker != null and delivery.load() != .not_sent;
+        };
         return session_executor.execute(self.alloc, outgoing) catch |err| {
             if (sql) |state| {
                 state.needs_adoption = true;
@@ -63969,6 +64010,20 @@ test "SQL pgwire native CREATE preflight failure retires prepared owner" {
     try std.testing.expectEqual(@as(usize, 0), completion.outcomes.items.len);
 }
 
+test "SQL pgwire native HTTP resources forward on the reserved executor" {
+    const a = std.testing.allocator;
+    var pool = std.Io.Threaded.init(a, .{});
+    defer pool.deinit();
+    const lane = pool.io();
+    var server = ApiHttpServer.init(a, .{ .sql_peer_transport_config = .{} }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const first = try server.sqlPeerExecutor(.init(&lane));
+    const second = try server.sqlPeerExecutor(.init(&lane));
+    try std.testing.expectEqual(first.ptr, second.ptr);
+    var receiver = try first.clock_io.?.receive();
+    try std.testing.expectEqual(lane.userdata, receiver.io().userdata);
+}
+
 test "SQL pgwire native HTTP resources forward once with original authority and witness" {
     const a = std.testing.allocator;
     const Fixture = struct {
@@ -64031,12 +64086,12 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
         .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
         .cancellation = &cancellation,
     };
-    var capped = (try server.forwardSQLResourceToOwner(1, budgeted, &forwarded, control)).?;
+    var capped = (try server.forwardSQLResourceToOwner(1, budgeted, &forwarded, &control)).?;
     defer capped.deinit(a);
 
     budgeted.headers = &.{.{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = "invalid" }};
     forwarded = false;
-    try std.testing.expectError(error.InvalidExecutionBudget, server.forwardSQLResourceToOwner(1, budgeted, &forwarded, control));
+    try std.testing.expectError(error.InvalidExecutionBudget, server.forwardSQLResourceToOwner(1, budgeted, &forwarded, &control));
     try std.testing.expect(!forwarded);
     try std.testing.expectEqual(@as(usize, 3), fixture.calls);
     const own = @import("sql_resource_routing.zig").encode(2, @splat(4));
