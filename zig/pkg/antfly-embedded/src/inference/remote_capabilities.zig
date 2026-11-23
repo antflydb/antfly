@@ -35,6 +35,180 @@ const capability_cache_max_entries: usize = 64;
 const capability_cache_max_flights: usize = 16;
 const capability_discovery_timeout_ns: u64 = 30 * std.time.ns_per_s;
 const capability_activation_timeout_ns: u64 = 5 * 60 * std.time.ns_per_s;
+pub const discovery_shape_header = "X-Antfly-Inference-Discovery-Shape";
+
+/// Placement-only facts available before encoding an execution payload.
+/// The proxy derives the authoritative budget from the body at execution.
+pub const DiscoveryShape = struct {
+    items: usize,
+    media: bool = false,
+    modalities: work.Modalities = .{},
+    output_tokens: ?usize = null,
+    candidates: ?usize = null,
+
+    pub fn formatHeader(self: DiscoveryShape, buf: *[64]u8) ![]const u8 {
+        if (self.items == 0) return error.InvalidInferenceDiscoveryShape;
+        const mask: u8 = @bitCast(self.modalities);
+        // Version 1 can carry unknown media without accidentally claiming a
+        // text-only invocation. Use version 4 when exact text or a candidate
+        // limit must also survive the wire.
+        if (self.media and mask & ~@as(u8, 1) == 0 and (mask != 0 or self.candidates != null)) {
+            var stream: std.Io.Writer = .fixed(buf);
+            try stream.print("4:{d}:{d}:", .{ self.items, mask });
+            if (self.output_tokens) |tokens| try stream.print("{d}", .{tokens}) else try stream.writeByte('-');
+            try stream.writeByte(':');
+            if (self.candidates) |count| try stream.print("{d}", .{count}) else try stream.writeByte('-');
+            return stream.buffered();
+        }
+        if (self.candidates) |count| {
+            if (self.output_tokens) |tokens| return std.fmt.bufPrint(buf, "3:{d}:{d}:{d}:{d}", .{ self.items, mask, tokens, count });
+            return std.fmt.bufPrint(buf, "3:{d}:{d}:-:{d}", .{ self.items, mask, count });
+        }
+        if (mask != 0) {
+            if (self.output_tokens) |tokens|
+                return std.fmt.bufPrint(buf, "2:{d}:{d}:{d}", .{ self.items, mask, tokens });
+            return std.fmt.bufPrint(buf, "2:{d}:{d}:-", .{ self.items, mask });
+        }
+        if (self.output_tokens) |tokens| {
+            return std.fmt.bufPrint(buf, "1:{d}:{d}:{d}", .{ self.items, @intFromBool(self.media), tokens });
+        }
+        return std.fmt.bufPrint(buf, "1:{d}:{d}:-", .{ self.items, @intFromBool(self.media) });
+    }
+};
+
+pub const DiscoveryMediaCost = struct {
+    encoded: usize = 0,
+    framed: usize = 0,
+    pixels: u64 = 0,
+};
+
+pub const DiscoveryMediaGeometry = struct {
+    batch: DiscoveryMediaCost = .{},
+    first: DiscoveryMediaCost = .{},
+
+    /// Round upward to shared cache envelopes with at most eight steps per
+    /// power of two. Exact discovery remains available at tight limits.
+    pub fn roundedUp(self: DiscoveryMediaGeometry) DiscoveryMediaGeometry {
+        const Round = struct {
+            fn cost(value: DiscoveryMediaCost) DiscoveryMediaCost {
+                return .{ .encoded = roundDiscoveryUpperBound(value.encoded), .framed = roundDiscoveryUpperBound(value.framed), .pixels = roundDiscoveryUpperBound(value.pixels) };
+            }
+        };
+        return .{ .batch = Round.cost(self.batch), .first = Round.cost(self.first) };
+    }
+
+    pub fn fits(self: DiscoveryMediaGeometry, caps: work.InferenceCapabilities) bool {
+        const bytes = if (caps.framed_attachments) self.batch.framed else self.batch.encoded;
+        if (caps.batch.max_encoded_media_bytes) |limit| if (bytes > limit) return false;
+        if (caps.batch.max_decoded_pixels) |limit| if (self.batch.pixels > limit) return false;
+        return true;
+    }
+};
+
+pub fn roundDiscoveryUpperBound(value: anytype) @TypeOf(value) {
+    if (value < 8) return value;
+    const shift = @bitSizeOf(@TypeOf(value)) - 1 - @clz(value) - 3;
+    const mask = (@as(@TypeOf(value), 1) << @intCast(shift)) - 1;
+    if (value > std.math.maxInt(@TypeOf(value)) - mask) return std.math.maxInt(@TypeOf(value));
+    return (value + mask) & ~mask;
+}
+
+pub const discovery_media_header = "X-Antfly-Inference-Discovery-Media";
+pub const discovery_rounded_media_header = "X-Antfly-Inference-Discovery-Media-Rounded";
+
+/// Stack-owned headers for discovery. Pass the original selectors to execution.
+pub const DiscoveryHeaders = struct {
+    entries: [16][2][]const u8 = undefined,
+    value: [64]u8 = undefined,
+    media_value: [125]u8 = undefined,
+    reader_wire_value: [176]u8 = undefined,
+    reader_mime_value: [7]u8 = undefined,
+
+    pub fn withShape(self: *DiscoveryHeaders, base: []const [2][]const u8, shape: DiscoveryShape) ![]const [2][]const u8 {
+        if (base.len >= self.entries.len) return error.TooManyInferenceHeaders;
+        @memcpy(self.entries[0..base.len], base);
+        self.entries[base.len] = .{ discovery_shape_header, try shape.formatHeader(&self.value) };
+        return self.entries[0 .. base.len + 1];
+    }
+    pub fn withMediaGeometry(self: *DiscoveryHeaders, shaped: []const [2][]const u8, geometry: DiscoveryMediaGeometry) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        const batch = geometry.batch;
+        const first = geometry.first;
+        self.entries[shaped.len] = .{ discovery_media_header, try std.fmt.bufPrint(&self.media_value, "{d}:{d}:{d}:{d}:{d}:{d}", .{ batch.encoded, batch.framed, batch.pixels, first.encoded, first.framed, first.pixels }) };
+        return self.entries[0 .. shaped.len + 1];
+    }
+    pub fn withReaderWire(self: *DiscoveryHeaders, shaped: []const [2][]const u8, json_only: bool, batch: anytype, first: @TypeOf(batch), rounded: bool) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        const mode = if (json_only) "json" else "auto";
+        var costs = [8]usize{ batch.json_bytes, batch.framed_bytes, batch.metadata_bytes, batch.mime_bytes, first.json_bytes, first.framed_bytes, first.metadata_bytes, first.mime_bytes };
+        if (rounded) for (&costs, 0..) |*cost, index| {
+            if (index % 4 != 3) cost.* = roundDiscoveryUpperBound(cost.*);
+        };
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-Transport", try std.fmt.bufPrint(&self.reader_wire_value, "{s}:{d}:{d}:{d}:{d}:{d}:{d}:{d}:{d}", .{ mode, costs[0], costs[1], costs[2], costs[3], costs[4], costs[5], costs[6], costs[7] }) };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
+    pub fn withReaderMime(self: *DiscoveryHeaders, shaped: []const [2][]const u8, batch: u8, first: u8) ![]const [2][]const u8 {
+        if (batch == 0) return shaped;
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-MIME", try std.fmt.bufPrint(&self.reader_mime_value, "{d}:{d}", .{ batch, first }) };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
+    pub fn withReaderBatchContract(self: *DiscoveryHeaders, shaped: []const [2][]const u8) ![]const [2][]const u8 {
+        if (shaped.len >= self.entries.len or shaped.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[shaped.len] = .{ "X-Antfly-Inference-Discovery-Reader-Cardinality", "one_per_item" };
+        return self.entries[0 .. shaped.len + 1];
+    }
+
+    pub fn withRoundedMediaMarker(self: *DiscoveryHeaders, geometry: []const [2][]const u8) ![]const [2][]const u8 {
+        if (geometry.len >= self.entries.len or geometry.ptr != self.entries[0..].ptr) return error.TooManyInferenceHeaders;
+        self.entries[geometry.len] = .{ discovery_rounded_media_header, "true" };
+        return self.entries[0 .. geometry.len + 1];
+    }
+};
+
+/// Read only the data URI header. Full validation belongs to invocation
+/// admission, which already has to check sizes and encoding.
+pub fn inlineDiscoveryMime(uri: []const u8) ?[]const u8 {
+    if (!std.ascii.startsWithIgnoreCase(uri, "data:")) return null;
+    const body = uri["data:".len..];
+    const header = body[0..@min(body.len, 256)];
+    const end = std.mem.indexOfAny(u8, header, ";,") orelse return null;
+    return if (end == 0) null else body[0..end];
+}
+
+pub fn generationModalities(messages: anytype) work.Modalities {
+    var mask: u8 = 0;
+    for (messages) |message| {
+        const content = message.content orelse continue;
+        if (content == .text) {
+            mask |= 1;
+            continue;
+        }
+        for (content.parts) |part| {
+            const modalities: work.Modalities = switch (part) {
+                .text => .{ .text = true },
+                .image_url => .{ .image = true },
+                .media => |media| work.modalityForMimeType(if (media.mime_type.len != 0) media.mime_type else inlineDiscoveryMime(media.url orelse media.data) orelse "") orelse .{},
+            };
+            mask |= @bitCast(modalities);
+        }
+    }
+    return @bitCast(mask);
+}
+
+pub fn generationHasMedia(messages: anytype) bool {
+    for (messages) |message| {
+        if (message.content) |content| {
+            if (content == .parts) {
+                for (content.parts) |part| if (part != .text) return true;
+            }
+        }
+    }
+    return false;
+}
+
 pub const parent_request_id_header = "X-Antfly-Parent-Request-ID";
 pub const model_activation_header = "X-Antfly-Model-Activation";
 const capability_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
@@ -475,7 +649,7 @@ pub const Cache = struct {
                     err,
                 );
                 if (owner_context_error == null and completion.err != null and
-                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent))
+                    (err == error.RemoteCapabilityDiscoveryTransient or err == error.RemoteCapabilitySelectorAbsent or err == error.InferenceDiscoveryRequiresExactGeometry or err == error.InferenceDiscoveryRequiresJsonTransport or err == error.InferenceDiscoveryShapeRejected))
                 {
                     // A failed cold flight has no lease to defer. Remember its
                     // cooldown in the same bounded cache as positive entries.
@@ -1237,6 +1411,13 @@ fn parseExactWireCapabilities(object: std.json.ObjectMap, version: usize) !Exact
     };
 }
 
+fn optionalReaderWireLimit(value: std.json.Value, field: []const u8) !?usize {
+    const limit = value.object.get(field) orelse return null;
+    if (limit == .null) return null;
+    if (limit != .integer or limit.integer < 0) return error.InvalidInferenceCapabilities;
+    return std.math.cast(usize, limit.integer) orelse error.InvalidInferenceCapabilities;
+}
+
 pub fn parseModelCapabilities(
     alloc: std.mem.Allocator,
     payload: []const u8,
@@ -1277,6 +1458,13 @@ pub fn parseModelCapabilities(
     }
     if (@as(u8, @bitCast(modalities)) == 0) return null;
     const exact = if (resolved) |wire| wire.exact else null;
+    const declared_cardinality: ?work.ResultCardinality = if (exact) |value| value.result_cardinality else blk: {
+        const native = info.object.get("inference_capabilities") orelse break :blk null;
+        if (native != .object) break :blk null;
+        const cardinality = native.object.get("result_cardinality") orelse break :blk null;
+        if (cardinality != .string) break :blk null;
+        break :blk std.meta.stringToEnum(work.ResultCardinality, cardinality.string);
+    };
     var result = work.InferenceCapabilities{
         .task = task,
         .input_modalities = modalities,
@@ -1310,7 +1498,8 @@ pub fn parseModelCapabilities(
             .per_item_failures = false,
         },
         .output = if (exact) |value| value.output else outputForTask(task),
-        .result_cardinality = if (exact) |value| value.result_cardinality else resultCardinalityForTask(task),
+        .result_cardinality = declared_cardinality orelse resultCardinalityForTask(task),
+        .remote_result_cardinality_declared = declared_cardinality != null,
         .prompt_policy = if (exact) |value| value.prompt_policy else promptPolicyForTask(task),
         .task_limits = if (exact) |value| value.task_limits else .{},
         .image_transform = if (exact) |value| value.image_transform else null,
@@ -1325,6 +1514,21 @@ pub fn parseModelCapabilities(
         .numeric_responses_v1 = if (exact) |value| value.numeric_responses_v1 else false,
         .rerank_documents_v1 = if (exact) |value| value.rerank_documents_v1 else false,
     };
+    if (task == .read) {
+        if (info.object.get("inference_capabilities")) |native| if (native == .object) {
+            if (native.object.get("transport_limits")) |limits| if (limits == .object) {
+                if (limits.object.get("json")) |json| if (json == .object) {
+                    result.remote_json_max_request_bytes = try optionalReaderWireLimit(json, "max_request_bytes");
+                };
+                if (limits.object.get("framed_attachments")) |framed| if (framed == .object) {
+                    result.remote_framed_max_request_bytes = try optionalReaderWireLimit(framed, "max_request_bytes");
+                    result.remote_framed_max_attachments = try optionalReaderWireLimit(framed, "max_attachments");
+                    result.remote_framed_max_metadata_bytes = try optionalReaderWireLimit(framed, "max_metadata_bytes");
+                    result.remote_framed_max_mime_bytes = try optionalReaderWireLimit(framed, "max_mime_bytes");
+                };
+            };
+        };
+    }
     if (resolved == null) if (capability_values) |values| {
         for (values.items) |value| {
             if (value == .string) try result.batch.applyManifestCapability(value.string);
@@ -1358,6 +1562,19 @@ fn capabilityStaleResponse(response: httpx.Response) bool {
 }
 
 fn discoveryResponseError(response: httpx.Response) anyerror {
+    if (response.status.code == 404) {
+        if (response.headers.get(capability_selector_rejected_header)) |value| {
+            if (std.ascii.eqlIgnoreCase(value, "true")) return error.RemoteCapabilityDiscoveryRejected;
+        }
+    }
+    if (response.status.code == 413) {
+        if (response.headers.get("X-Antfly-Inference-Discovery-Error")) |reason| {
+            if (std.mem.eql(u8, reason, "items")) return error.InferenceDiscoveryTooManyItems;
+            if (std.mem.eql(u8, reason, "shape")) return error.InferenceDiscoveryShapeRejected;
+            if (std.mem.eql(u8, reason, "geometry")) return error.InferenceDiscoveryRequiresExactGeometry;
+            if (std.mem.eql(u8, reason, "json")) return error.InferenceDiscoveryRequiresJsonTransport;
+        }
+    }
     return discoveryStatusError(response.status.code, capabilityStaleResponse(response));
 }
 
@@ -1388,6 +1605,54 @@ pub fn discover(
     };
 }
 
+// An older Colony rejects only the shape version with this diagnostic.
+// Keep authority and route selectors identical on the conservative retry.
+fn legacyMediaDiscoveryHeaders(response: httpx.Response, headers: []const [2][]const u8, storage: *DiscoveryHeaders) !?[]const [2][]const u8 {
+    if (response.status.code != 400 or !std.mem.eql(u8, std.mem.trim(u8, response.body orelse "", " \t\r\n"), "invalid inference discovery shape or missing model selector")) return null;
+    if (headers.len > storage.entries.len) return null;
+    for (headers, 0..) |header, index| {
+        if (!std.ascii.eqlIgnoreCase(header[0], discovery_shape_header)) continue;
+        var fields = std.mem.splitScalar(u8, header[1], ':');
+        if (!std.mem.eql(u8, fields.next() orelse return null, "4")) return null;
+        const items = fields.next() orelse return null;
+        _ = fields.next() orelse return null;
+        const tokens = fields.next() orelse return null;
+        // Versions 1–3 cannot represent both unknown media and candidates.
+        if (!std.mem.eql(u8, fields.next() orelse return null, "-") or fields.next() != null) return null;
+        @memcpy(storage.entries[0..headers.len], headers);
+        storage.entries[index][1] = try std.fmt.bufPrint(&storage.value, "1:{s}:1:{s}", .{ items, tokens });
+        return storage.entries[0..headers.len];
+    }
+    return null;
+}
+
+fn validateLegacyMediaDescriptor(capabilities: ?work.InferenceCapabilities, headers: []const [2][]const u8) !void {
+    const caps = capabilities orelse return;
+    for (headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header[0], discovery_shape_header)) continue;
+        var fields = std.mem.splitScalar(u8, header[1], ':');
+        if (!std.mem.eql(u8, fields.next() orelse return error.InvalidInferenceDiscoveryShape, "4")) return error.InvalidInferenceDiscoveryShape;
+        _ = fields.next() orelse return error.InvalidInferenceDiscoveryShape;
+        const mask = std.fmt.parseInt(u8, fields.next() orelse return error.InvalidInferenceDiscoveryShape, 10) catch return error.InvalidInferenceDiscoveryShape;
+        const supported: u8 = @bitCast(caps.input_modalities);
+        if (supported & mask != mask or supported & ~@as(u8, 1) == 0)
+            return error.RemoteCapabilityDiscoveryTransient;
+        return;
+    }
+    return error.InvalidInferenceDiscoveryShape;
+}
+
+test "remote Antfly legacy media discovery still requires the original modalities" {
+    const a = std.testing.allocator;
+    const headers = &.{.{ discovery_shape_header, "4:1:1:0:-" }};
+    const image_only = try parseModelCapabilities(a, "{\"embedders\":{\"model\":{\"inputs\":[\"image\"]}}}", "model", .embed);
+    try std.testing.expect(image_only != null);
+    try std.testing.expectError(error.RemoteCapabilityDiscoveryTransient, validateLegacyMediaDescriptor(image_only, headers));
+    const multimodal = try parseModelCapabilities(a, "{\"embedders\":{\"model\":{\"inputs\":[\"text\",\"audio\"]}}}", "model", .embed);
+    try std.testing.expect(multimodal != null);
+    try validateLegacyMediaDescriptor(multimodal, headers);
+}
+
 fn discoverOnce(
     alloc: std.mem.Allocator,
     http: *httpx.Client,
@@ -1407,8 +1672,20 @@ fn discoverOnce(
         return error.RemoteCapabilityDiscoveryTransient;
     };
     defer response.deinit();
+    var fallback: DiscoveryHeaders = .{};
+    const legacy_headers = try legacyMediaDiscoveryHeaders(response, headers, &fallback);
+    if (legacy_headers) |legacy| {
+        const retry = http.get(url, .{ .follow_redirects = false, .headers = legacy, .max_response_size = capability_catalog_response_bytes }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.RemoteCapabilityDiscoveryTransient;
+        };
+        response.deinit();
+        response = retry;
+    }
     if (!response.ok()) return discoveryResponseError(response);
-    return try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
+    const caps = try parseModelCapabilities(alloc, response.body orelse return error.InvalidInferenceCapabilities, model, operation.task());
+    if (legacy_headers != null) try validateLegacyMediaDescriptor(caps, headers);
+    return caps;
 }
 
 fn discoverWithContext(
@@ -1563,21 +1840,41 @@ fn discoverWithContextOnce(
     const scoped_url = try scopedModelsUrlAlloc(alloc, inference_url, model, operation);
     defer alloc.free(scoped_url);
     const url = scoped_url;
-    var response = http.get(url, .{
+    var options: httpx.RequestOptions = .{
         .follow_redirects = false,
         .headers = headers,
         .timeout_ms = timeout_ms,
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .cancellation = httpx.CancellationToken.fromCallback(
             context.cancellation.ptr,
             context.cancellation.is_cancelled_fn,
         ),
         .max_response_size = capability_catalog_response_bytes,
-    }) catch |err| {
+    };
+    var response = http.get(url, options) catch |err| {
         try context.check(monotonicNowNs(io));
         if (err == error.OutOfMemory) return err;
         return error.RemoteCapabilityDiscoveryTransient;
     };
     defer response.deinit();
+    var fallback: DiscoveryHeaders = .{};
+    var effective_headers = headers;
+    const legacy_headers = try legacyMediaDiscoveryHeaders(response, headers, &fallback);
+    if (legacy_headers) |legacy| {
+        const retry_now = monotonicNowNs(io);
+        try context.check(retry_now);
+        if (retry_now >= effective_deadline) return error.Timeout;
+        options.headers = legacy;
+        options.timeout_ms = @max(1, (effective_deadline - retry_now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+        const retry = http.get(url, options) catch |err| {
+            try context.check(monotonicNowNs(io));
+            if (err == error.OutOfMemory) return err;
+            return error.RemoteCapabilityDiscoveryTransient;
+        };
+        response.deinit();
+        response = retry;
+        effective_headers = legacy;
+    }
     const activation_advertised = if (response.headers.get(model_activation_header)) |value|
         std.ascii.eqlIgnoreCase(value, "supported")
     else
@@ -1589,7 +1886,7 @@ fn discoverWithContextOnce(
         const failure = discoveryResponseError(response);
         if (failure == error.RemoteCapabilityDiscoveryTransient) recordDiscoveryRetryHint(alloc, io, response, context);
         if (allow_activation and activation_advertised and response.status.code == 503 and
-            try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context))
+            try loadMissingModelInstance(alloc, io, http, inference_url, model, operation, effective_headers, context))
             return discoverWithContextOnce(alloc, io, http, inference_url, model, operation, headers, context, false);
         if (!allow_activation and !context.passive_refresh and failure == error.RemoteCapabilityDiscoveryUnsupported)
             return error.RemoteCapabilitySelectorAbsent;
@@ -1597,6 +1894,7 @@ fn discoverWithContextOnce(
     }
     const body = response.body orelse return error.InvalidInferenceCapabilities;
     const capabilities = try parseModelCapabilities(alloc, body, model, operation.task());
+    if (legacy_headers != null) try validateLegacyMediaDescriptor(capabilities, headers);
     if (capabilities == null) {
         if (response.headers.get(capability_selector_rejected_header)) |value| {
             if (std.ascii.eqlIgnoreCase(value, "true")) return error.RemoteCapabilityDiscoveryRejected;
@@ -1609,7 +1907,7 @@ fn discoverWithContextOnce(
             try catalogListsExternalEmbedding(alloc, body, model))
             return .{ .value = null, .routing_token = null, .descriptor_revision = null };
         if (allow_activation and activation_advertised) {
-            const loaded = loadMissingModelInstance(alloc, io, http, inference_url, model, operation, headers, context) catch |err| {
+            const loaded = loadMissingModelInstance(alloc, io, http, inference_url, model, operation, effective_headers, context) catch |err| {
                 // Discovery already disproved the previous descriptor.
                 if (err == error.RemoteCapabilityDiscoveryTransient) return error.RemoteCapabilitySelectorAbsent;
                 return err;
@@ -2662,4 +2960,55 @@ test "remote Antfly dense output geometry is optional bounded metadata" {
     }) |shape| try std.testing.expectError(error.InvalidInferenceCapabilities, parseModelCapabilities(std.testing.allocator, prefix ++ shape ++ suffix, "model", .embed));
     const legacy = (try parseModelCapabilities(std.testing.allocator, "{\"embedders\":{\"model\":{\"inputs\":[\"text\"]}}}", "model", .embed)).?;
     try std.testing.expect(legacy.dense_output == null);
+}
+
+test "remote capability discovery forwards placement shape and separates cached leases" {
+    const Fixture = struct {
+        fn expectBatch(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("1:2:1:0", req.header(discovery_shape_header).?);
+            try std.testing.expectEqualStrings("write-heavy", req.header("X-Antfly-Inference-Workload-Type").?);
+        }
+        fn serve(server: *httpx.TestServer) !void {
+            try server.handleOne();
+        }
+    };
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = httpx.TestServer.start(allocator, io, &.{.{
+        .path = "/ai/v1/models",
+        .assert_request = Fixture.expectBatch,
+        .respond = .{ .body = "{\"embedders\":{\"model\":{\"inputs\":[\"image\"]}}}" },
+    }}) catch |err| switch (err) {
+        error.Unexpected => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    var http = httpx.Client.init(allocator, io);
+    defer http.deinit();
+    var cache = Cache.init(allocator, io);
+    defer cache.deinit();
+    var single_value: [64]u8 = undefined;
+    var batch_value: [64]u8 = undefined;
+    const single = try (DiscoveryShape{ .items = 1, .output_tokens = 0 }).formatHeader(&single_value);
+    const batch = try (DiscoveryShape{ .items = 2, .media = true, .output_tokens = 0 }).formatHeader(&batch_value);
+    const small_headers: []const [2][]const u8 = &.{
+        .{ "X-Antfly-Inference-Workload-Type", "write-heavy" },
+        .{ discovery_shape_header, single },
+    };
+    const batch_headers: []const [2][]const u8 = &.{
+        small_headers[0],
+        .{ discovery_shape_header, batch },
+    };
+    const key = try capabilityCacheKeyAlloc(allocator, server.baseUrl(), "model", .embed, small_headers);
+    defer allocator.free(key);
+    try cache.admitLocked(key, null, null, null, monotonicNowNs(io));
+    var handler = try io.concurrent(Fixture.serve, .{&server});
+    defer handler.cancel(io) catch {};
+    const lease = try cache.getOrDiscoverLease(&http, server.baseUrl(), "model", .embed, batch_headers);
+    try handler.await(io);
+    try std.testing.expect(lease.capabilities.?.input_modalities.image);
+    const small = try cache.getOrDiscoverLease(&http, server.baseUrl(), "model", .embed, small_headers);
+    try std.testing.expect(small.capabilities == null);
 }

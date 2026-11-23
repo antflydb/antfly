@@ -693,6 +693,7 @@ pub const Scenario = struct {
     const enrichment_operation = vopr.service_rate.Operation.named(name ++ ".serverless-enrichment", 70);
     const compaction_operation = vopr.service_rate.Operation.named(name ++ ".serverless-compaction", 80);
     const prune_operation = vopr.service_rate.Operation.named(name ++ ".serverless-prune", 90);
+    const wal_collection_operation = vopr.service_rate.Operation.named(name ++ ".serverless-wal-collection", 90);
     const query_cache_request_operation = vopr.service_rate.Operation.named(name ++ ".query-cache-request", 2);
     const query_cache_hit_copy_operation = vopr.service_rate.Operation.named(name ++ ".query-cache-hit-copy", 1);
     const query_cache_coalesced_wait_operation = vopr.service_rate.Operation.named(name ++ ".query-cache-coalesced-wait", 3);
@@ -716,6 +717,7 @@ pub const Scenario = struct {
         enrichment_operation,
         compaction_operation,
         prune_operation,
+        wal_collection_operation,
         query_cache_request_operation,
         query_cache_hit_copy_operation,
         query_cache_coalesced_wait_operation,
@@ -806,6 +808,7 @@ pub const Scenario = struct {
                 .enrichment_round => enrichment_operation,
                 .compaction_round => compaction_operation,
                 .prune_round => prune_operation,
+                .wal_collection => wal_collection_operation,
             };
             const charged = try self.port.charge(operation.id, units);
             self.accounting.record(was_healed, operation.base_cost_ns, units, charged);

@@ -87,6 +87,53 @@ pub const KvStorage = struct {
         self.vtable.setPoolId(self.ptr, id);
     }
 
+    /// Exact host encoded copies are available only for the complete canonical
+    /// host provider. Copied tables do not silently inherit this contract.
+    /// Infallible scalar publication after a checked complete payload copy.
+    /// Canonical metadata ownership keeps these IDs valid through the caller's
+    /// exclusive transaction; this grants no extra physical/refcount capacity.
+    pub fn copyCanonicalBlockPrefixMetadata(self: *KvStorage, source_id: block.KvBlockId, target_id: block.KvBlockId, tokens: usize) void {
+        std.debug.assert(self.hasCanonicalHostBlockOwnership() and source_id != target_id and tokens <= self.config.page_size_tokens);
+        const pool = hostPtr(self.ptr);
+        const source = pool.storage(source_id).?;
+        const target = pool.storageMut(target_id).?;
+        std.debug.assert(source.meta.refcount != 0 and target.meta.refcount == 1);
+        target.meta.tokens_written = @intCast(@min(tokens, source.meta.tokens_written));
+        target.meta.model_tag = source.meta.model_tag;
+        target.meta.priority = source.meta.priority;
+        target.meta.prefix_cacheable = false;
+    }
+
+    pub fn hasCanonicalHostBlockOwnership(self: *const KvStorage) bool {
+        return self.vtable == &host_owned_vtable or self.vtable == &host_borrowed_vtable;
+    }
+
+    pub fn supportsExactHostBlockCopy(self: *const KvStorage) bool {
+        return self.config.store_cpu_bytes and self.hasCanonicalHostBlockOwnership();
+    }
+
+    pub fn copyExactHostBlockPrefix(self: *KvStorage, source_id: block.KvBlockId, target_id: block.KvBlockId, tokens: usize) !void {
+        if (!self.supportsExactHostBlockCopy()) return error.SharedKvWriteUnsupported;
+        if (source_id == target_id or tokens > self.config.page_size_tokens) return error.InvalidKvShape;
+        const pool = hostPtr(self.ptr);
+        const source = pool.storage(source_id) orelse return error.InvalidBlockId;
+        const target = pool.storageMut(target_id) orelse return error.InvalidBlockId;
+        if (source.meta.refcount == 0 or target.meta.refcount != 1) return error.InvalidBlockRefcount;
+        const key_row = pool.bytesPerKeyTokenRow();
+        const value_row = pool.bytesPerValueTokenRow();
+        const key_layer = try std.math.mul(usize, pool.config.page_size_tokens, key_row);
+        const value_layer = try std.math.mul(usize, pool.config.page_size_tokens, value_row);
+        const key_bytes = try std.math.mul(usize, tokens, key_row);
+        const value_bytes = try std.math.mul(usize, tokens, value_row);
+        // Validate every byte span before changing an existing reserved page.
+        if (source.k_data.len != try std.math.mul(usize, self.config.num_layers_packed, key_layer) or target.k_data.len != source.k_data.len or source.v_data.len != try std.math.mul(usize, self.config.num_layers_packed, value_layer) or target.v_data.len != source.v_data.len) return error.InvalidKvShape;
+        for (0..self.config.num_layers_packed) |layer| {
+            @memcpy(target.k_data[layer * key_layer ..][0..key_bytes], source.k_data[layer * key_layer ..][0..key_bytes]);
+            @memcpy(target.v_data[layer * value_layer ..][0..value_bytes], source.v_data[layer * value_layer ..][0..value_bytes]);
+        }
+        self.copyCanonicalBlockPrefixMetadata(source_id, target_id, tokens);
+    }
+
     pub fn acquire(self: *KvStorage, allocator: std.mem.Allocator) !block.KvBlockId {
         return self.vtable.acquire(self.ptr, allocator);
     }
@@ -432,4 +479,37 @@ test "host storage hostPool escape hatch returns concrete pool" {
     const pool = storage.hostPool().?;
     try std.testing.expectEqual(storage.config.dtype, pool.config.dtype);
     try std.testing.expectEqual(storage.config.head_dim, pool.config.head_dim);
+}
+
+test "canonical host KV block copy preserves exact encoded prefixes for every layer and dtype" {
+    const a = std.testing.allocator;
+    for ([_]pool_mod.KvDType{ .f32, .f16, .bf16, .fp8, .int8, .int4 }) |dtype| {
+        var storage = try initHost(a, .{ .backend = .native, .dtype = dtype, .page_size_tokens = 2, .num_layers_packed = 2, .num_kv_heads = 1, .head_dim = 64 });
+        defer storage.deinit(a);
+        const source_id = try storage.acquire(a);
+        const target_id = try storage.acquire(a);
+        const pool = storage.hostPool().?;
+        const source = pool.storageMut(source_id).?;
+        for (source.k_data, 0..) |*byte, index| byte.* = @truncate(index *% 17 +% 3);
+        for (source.v_data, 0..) |*byte, index| byte.* = @truncate(index *% 31 +% 7);
+        source.meta.tokens_written = 2;
+        try storage.copyExactHostBlockPrefix(source_id, target_id, 1);
+        const target = pool.storage(target_id).?;
+        const key_row = storage.bytesPerKeyTokenRow();
+        const value_row = storage.bytesPerValueTokenRow();
+        for (0..2) |layer| {
+            try std.testing.expectEqualSlices(u8, source.k_data[layer * 2 * key_row ..][0..key_row], target.k_data[layer * 2 * key_row ..][0..key_row]);
+            try std.testing.expectEqualSlices(u8, source.v_data[layer * 2 * value_row ..][0..value_row], target.v_data[layer * 2 * value_row ..][0..value_row]);
+            for (target.k_data[(layer * 2 + 1) * key_row ..][0..key_row]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+            for (target.v_data[(layer * 2 + 1) * value_row ..][0..value_row]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+        }
+        try std.testing.expectEqual(@as(u16, 1), target.meta.tokens_written);
+        try std.testing.expectError(error.InvalidKvShape, storage.copyExactHostBlockPrefix(source_id, source_id, 1));
+        const original_table = storage.vtable;
+        var copied_table = original_table.*;
+        storage.vtable = &copied_table;
+        try std.testing.expect(!storage.supportsExactHostBlockCopy());
+        try std.testing.expectError(error.SharedKvWriteUnsupported, storage.copyExactHostBlockPrefix(source_id, target_id, 1));
+        storage.vtable = original_table;
+    }
 }

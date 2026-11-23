@@ -173,8 +173,20 @@ test "root identity rejects corruption" {
 test "root identity concurrent first opens publish one incarnation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/identity", .{tmp.sub_path});
-    defer std.testing.allocator.free(path);
+    // Resolve the fixture root through the already-open `tmp.dir` handle and
+    // join "identity" onto that absolute path, rather than building a
+    // cwd-relative string (".zig-cache/tmp/<sub_path>/identity"). A
+    // cwd-relative string here would race any other test in this binary that
+    // temporarily changes the process's current directory (the process cwd
+    // is shared across all threads/tests), landing a bare `identity`
+    // directory wherever cwd happened to be at call time instead of inside
+    // this test's own tmp dir -- the same cwd-escape bug class
+    // reader_epochs.zig's `Namespace.open` and artifact_source.zig's
+    // `openPublicationGuard` document fixing for themselves.
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const suffix = try std.fmt.bufPrint(root_buffer[root_len..], "/identity", .{});
+    const path = root_buffer[0 .. root_len + suffix.len];
     try fs_paths.createDirPathPortable(std.testing.io, path);
 
     const Worker = struct {

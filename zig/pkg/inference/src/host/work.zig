@@ -446,6 +446,17 @@ pub fn encodedImagePixels(content_type: []const u8, bytes: []const u8) !u64 {
     return info.pixels() catch return error.InferenceDecodedPixelsExceeded;
 }
 
+pub fn encodedImagePrefixPixels(content_type: []const u8, bytes: []const u8) !u64 {
+    const essence = mimeTypeEssence(content_type) catch return error.UnsupportedInferenceMimeType;
+    if (antfly_image.inferenceFormatForMimeEssence(essence) != .webp)
+        return encodedImagePixels(content_type, bytes);
+    const info = antfly_image.webp.probeDimensionsPrefix(bytes) catch return error.InvalidInferenceMedia;
+    const width = info.width orelse return error.InvalidInferenceMedia;
+    const height = info.height orelse return error.InvalidInferenceMedia;
+    if (width == 0 or height == 0) return error.InvalidInferenceMedia;
+    return @as(u64, width) * height;
+}
+
 test "inference capabilities measure physical image pixels and MIME" {
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
@@ -493,11 +504,13 @@ pub const TaskResourceLimits = struct {
 
 /// Inline value ownership allows plans to outlive discovery-cache entries.
 pub const RoutingToken = struct {
-    bytes: [128]u8 = undefined,
+    const max_len = 160;
+
+    bytes: [max_len]u8 = undefined,
     len: u8 = 0,
 
     pub fn init(value: []const u8) !RoutingToken {
-        if (value.len == 0 or value.len > 128)
+        if (value.len == 0 or value.len > max_len)
             return error.InvalidCapabilityRoutingToken;
         var result = RoutingToken{};
         @memcpy(result.bytes[0..value.len], value);
@@ -537,6 +550,9 @@ pub const CapabilityLease = struct {
     descriptor_revision: ?CapabilityRevision = null,
     /// Digest of URL, model, task and authorization/source headers at planning.
     scope_digest: ?[32]u8 = null,
+    /// Capacity placement was resolved for this many media items. The same
+    /// routing lease covers smaller media windows within the descriptor limits.
+    media_placement_items: ?usize = null,
 };
 
 /// Physical representation/ownership selected by the concrete executor, not
@@ -978,6 +994,15 @@ pub fn parseInlineDataUri(uri: []const u8) !?InlineDataUri {
     };
 }
 
+pub fn inlineImageDiscoveryPrefix(uri: []const u8, buffer: []u8) !?struct { mime_type: []const u8, bytes: []const u8 } {
+    const parsed = (data_uri.parse(uri) catch return error.InvalidDataURI) orelse return null;
+    if (!parsed.has_explicit_media_type or parsed.payload.len == 0) return error.InvalidDataURI;
+    return .{
+        .mime_type = parsed.media_type,
+        .bytes = parsed.decodePrefix(buffer) catch return error.InvalidDataURI,
+    };
+}
+
 pub const DecodedInlineDataUri = struct {
     mime_type: []u8,
     data: []u8,
@@ -1020,6 +1045,7 @@ pub const DenseEmbeddingOutput = struct {
 };
 
 pub const InferenceCapabilities = struct {
+    remote_result_cardinality_declared: bool = false,
     /// Stable model/tokenizer identity, available before loading weights.
     model_revision: ?[32]u8 = null,
     /// The HTTP embed executor enforces model_revision and acknowledges it
@@ -1061,6 +1087,11 @@ pub const InferenceCapabilities = struct {
     borrowed_rasters: bool = false,
     /// Physical local transport ceilings, distinct from model codec limits.
     attachment_payload_max_bytes: ?usize = null,
+    remote_json_max_request_bytes: ?usize = null,
+    remote_framed_max_request_bytes: ?usize = null,
+    remote_framed_max_attachments: ?usize = null,
+    remote_framed_max_metadata_bytes: ?usize = null,
+    remote_framed_max_mime_bytes: ?usize = null,
     attachment_metadata_max_bytes: ?usize = null,
     /// Complete linked-worker envelope, including metadata, framing and payload.
     /// Applies even to text-only invocations with no physical attachments.

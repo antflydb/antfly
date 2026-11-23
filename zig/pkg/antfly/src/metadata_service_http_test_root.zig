@@ -25,6 +25,7 @@ const http_routes = @import("metadata/http_routes.zig");
 const http_server = @import("metadata/http_server.zig");
 
 test {
+    _ = @import("metadata/schema_reader_wire.zig");
     _ = service;
     _ = @import("system_catalog/server_call.zig");
     _ = @import("metadata/relation_reconciliation_worker.zig");
@@ -58,6 +59,11 @@ test "selected owner readiness transition index discovery" {
 
 test "catalog projection cancellation and publication discovery" {
     _ = @import("metadata/catalog_projection_reader.zig");
+}
+
+test "metadata changefeed state transport discovery" {
+    _ = http_client;
+    _ = http_server;
 }
 
 test "index alias metadata HTTP discovery" {

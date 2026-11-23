@@ -94,14 +94,24 @@ pub fn Adapter(comptime native: type) type {
         table_name: []const u8,
         read_only: bool = false,
         outcome_transaction_id: ?types.TxnId = null,
+        /// WS3: threads the capi writer lane's `HandleGuard.
+        /// releaseWriterLaneBeforeWait` hook (see `capi/db.zig`'s
+        /// `writerLaneHookFromGuard`/`trackedBatchWithWriterLaneHook`) through
+        /// to the single-table `mutate` commit path below, so a SQL write's
+        /// connection-level locks (the path gate's lease and the per-connection
+        /// call-serializing mutex) drop across its durability wait too, instead
+        /// of being held for the whole fsync like every write export other than
+        /// SQL already avoids. `null` for callers with no `HandleGuard` in scope
+        /// (e.g. `executeEmbeddedSql`'s table-scoped path).
+        writer_lane_hook: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook = null,
         graph_parameters: []const std.json.Value = &.{},
 
         pub fn backend(self: *Self) catalog.Backend {
-            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
+            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .supports_expression_access_hints = self.transaction == null or !self.transaction.?.active, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
-            if (self.handle) |handle| return .{ .transaction = self.transaction, .handle = handle, .db = try @import("tables.zig").get(handle, name), .table_name = name, .read_only = self.read_only };
+            if (self.handle) |handle| return .{ .transaction = self.transaction, .handle = handle, .db = try @import("tables.zig").get(handle, name), .table_name = name, .read_only = self.read_only, .writer_lane_hook = self.writer_lane_hook };
             if (!std.mem.eql(u8, name, self.table_name)) return error.UndefinedTable;
             return self.*;
         }
@@ -190,6 +200,11 @@ pub fn Adapter(comptime native: type) type {
             if (schema.storage_mode != .relational) return error.UnsupportedSqlShape;
             var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
             if (!try dependencies.sql_schema_ddl.apply(a, &candidate, ddl_value)) return .{};
+            // The low-level schema CAS changes future validation, not existing
+            // row validity. Tightening needs staged validation/publication;
+            // this embedded adapter has no metadata-owned rewrite service.
+            if (ddl_value.schema_change.? == .set_nullability and !ddl_value.schema_change.?.set_nullability.nullable)
+                return error.SqlSchemaRewriteRequiresMetadataOwner;
             const validation = ddl_value.schema_change.? == .validate_constraint;
             const version = if (validation) schema.version else std.math.add(u32, schema.version, 1) catch return error.SqlProgramLimitExceeded;
             try candidate.object.put(a, "version", .{ .integer = version });
@@ -482,13 +497,450 @@ pub fn Adapter(comptime native: type) type {
             return output;
         }
 
-        fn commitCoordinated(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
+        /// A single-table, single-process coordinated commit against
+        /// `self.db` directly. `mutate` below (and `sql_session.zig`'s
+        /// `commit`) route a coordinated write here instead of
+        /// `sql_commit.zig`'s cross-database two-phase coordinator
+        /// whenever the write touches exactly one table on a Lite single-
+        /// file store, which needs no cross-database decision record (every
+        /// table there already shares one physical commit domain) --
+        /// saving the recovery-hint write/clear, the root's own
+        /// coordinator-role transaction, and the extra per-participant
+        /// recovery round trip (lite-single-commit-write-path.md §3.3c).
+        ///
+        /// `commitCoordinatedLocal` below is the common case: one native
+        /// commit, no begin record, no durable intent record. This falls
+        /// back to the durable three-commit begin/write/commit sequence
+        /// (`commitCoordinatedTwoPhase`) only for requests
+        /// `commitCoordinatedLocal`'s single native batch cannot express --
+        /// row policy, restore staging, graph writes, range guards,
+        /// explicit repair, or the activation/retirement/index-maintenance
+        /// commands -- none of which an ordinary autocommit SQL INSERT/
+        /// UPDATE/DELETE or ordinary multi-statement session COMMIT needs.
+        /// `allow_local_decision` is false only for an explicit multi-
+        /// statement session's COMMIT (`sql_session.zig`): on an unknown
+        /// outcome, that caller's contract exposes a `transaction_id` so a
+        /// client can resolve ambiguity later (`capi SQL outcome COMMIT
+        /// decision failing inside publication is unknown with a
+        /// receipt`), and `commitCoordinatedLocal` has none to give --
+        /// there is no begin record, so there is nothing to resolve
+        /// against. An ordinary autocommit write (`mutate`'s two callers)
+        /// has no such contract (see the passing `capi SQL outcome
+        /// autocommit ...` cases), so it always gets the fused path when
+        /// eligible. Giving the session-COMMIT path the same transaction-
+        /// id-bearing ambiguity resolution as the fused path is follow-up
+        /// work, not done here.
+        pub fn commitCoordinated(self: *Self, alloc: std.mem.Allocator, request: contract.TableCommitRequest, allow_local_decision: bool) !catalog.MutationOutcome {
+            if (allow_local_decision and eligibleForLocalDecision(request)) return self.commitCoordinatedLocal(alloc, request);
+            return self.commitCoordinatedTwoPhase(request);
+        }
+
+        fn eligibleForLocalDecision(request: contract.TableCommitRequest) bool {
+            return request.row_policy_principal_proof.len == 0 and
+                request.restore_staging_scope == null and
+                request.restore_staging_plan_id == null and
+                request.relational_activation == null and
+                request.relational_retirement == null and
+                request.relational_index_maintenance == null and
+                request.integrity.len == 0 and
+                request.graph_writes.len == 0 and
+                request.graph_deletes.len == 0 and
+                !request.normalized_graph_rows and
+                request.range_guards.len == 0 and
+                !request.relational_repair;
+        }
+
+        /// lite-single-commit-write-path.md §3.3c: the primary row(s) plus
+        /// their UNIQUE-constraint integrity-catalog claims, validated and
+        /// written in one native commit (`DB.batchLocalCoordinated`, with
+        /// `BatchExecutionOptions.integrity_authority = .local_decision`).
+        /// No FK command ever reaches here: `eligibleForLocalDecision`
+        /// only lets through requests `prepareWithRepairAdmission` already
+        /// routed to a single physical table, and a `.foreign` generation
+        /// command is refused deeper in by `prepareLocalIntegrityDecision`
+        /// as a defense-in-depth check, never relied on to route correctly.
+        /// lite-single-commit-write-path.md §7.6: resolves a `Reference`'s
+        /// `child_table`/`child_key` to a durable existence check, so
+        /// `prepareLocalIntegrityDecision`'s own RESTRICT check can tell a
+        /// dangling Reference (the fused coordinator's ride-along `.attach`
+        /// landed without its leader's child row -- a non-atomicity window,
+        /// not a correctness bug on its own) apart from a genuinely live
+        /// one. Constructed fresh per call; `handle`/`alloc` are borrowed
+        /// for exactly that call's duration.
+        const ChildExistenceChecker = struct {
+            handle: *@import("handles.zig").Handle,
+            alloc: std.mem.Allocator,
+
+            fn exists(ptr: *anyopaque, child_table: []const u8, child_key: []const u8) anyerror!bool {
+                const self: *ChildExistenceChecker = @ptrCast(@alignCast(ptr));
+                const child_db = @import("tables.zig").get(self.handle, child_table) catch |err| switch (err) {
+                    // The child table itself is gone (dropped): nothing it
+                    // could still reference survives either.
+                    error.UndefinedTable => return false,
+                    else => return err,
+                };
+                var found = (try child_db.lookup(self.alloc, child_key, .{})) orelse return false;
+                found.deinit(self.alloc);
+                return true;
+            }
+        };
+
+        fn commitCoordinatedLocal(self: *Self, alloc: std.mem.Allocator, request: contract.TableCommitRequest) !catalog.MutationOutcome {
+            const outcomes = dependencies.sql_errors;
+            const coordinator = @import("sql_commit.zig");
+            // No separate begin record on this path: both of
+            // `commitCoordinatedTwoPhase`'s pre-decision boundaries
+            // (`test_before_store`, before any participant is admitted;
+            // `test_after_prepare`, after every participant is prepared)
+            // collapse to "before the one native batch below" here, since
+            // validation and the write are the SAME apply-locked call.
+            if (comptime @import("builtin").is_test) if (coordinator.test_before_store) |hook| {
+                coordinator.test_before_store = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_prepare) |hook| {
+                coordinator.test_after_prepare = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
+            const writes = try alloc.alloc(types.BatchWrite, request.writes.len);
+            for (request.writes, writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+            const req: types.BatchRequest = .{
+                .writes = writes,
+                .deletes = request.deletes,
+                .predicates = request.predicates,
+                .schema_version = request.schema_version,
+                .relational_schema_version = request.relational_schema_version,
+                .relational_integrity_generation_set = request.relational_integrity_generation_set,
+                .integrity_commands = request.integrity_commands,
+            };
+            // lite-single-commit-write-path.md §3.3c: this path has no
+            // separate durable decision record to resolve an ambiguous
+            // outcome against (unlike `commitCoordinatedTwoPhase`'s own
+            // `TxnId`), so it reuses `outcome_receipts.zig`'s bounded
+            // writer-keyed scheme instead -- the marker is just one more
+            // key in the same native batch, exactly like the UNIQUE
+            // claims `prepareLocalIntegrityDecision` already writes
+            // there. `Writer.retire` nulls the writer's id the instant it
+            // retires (the next marker gets a fresh random one), so the
+            // retired 16-byte id is already a one-shot token: it can
+            // double as `transaction_id` with no new storage and no
+            // format change, resolved by comparing
+            // `apply_receipts.readOutcomeMarker(writer)` against the
+            // sequence this call used -- see `DB.getTransactionStatus`'s
+            // fallback for an id that is not a recognized two-phase
+            // `TxnId`.
+            const receipts = @import("outcome_receipts.zig");
+            const writer = receipts.activeWriter();
+            const named = if (!std.mem.eql(u8, self.table_name, "default")) self.table_name else null;
+            const marker = if (writer) |w| w.next(named) else null;
+
+            var child_checker: ChildExistenceChecker = undefined;
+            const child_exists: ?dependencies.storage_db_relational_integrity.ChildExistenceCheck = if (self.handle) |handle| blk: {
+                child_checker = .{ .handle = handle, .alloc = alloc };
+                break :blk .{ .ptr = &child_checker, .exists = ChildExistenceChecker.exists };
+            } else null;
+
+            var primary_committed = false;
+            self.db.batchLocalCoordinated(req, &primary_committed, marker, child_exists) catch |err| {
+                // `primary_committed` is authoritative here (and reset by
+                // `batchInternalPreparedOwned` itself if the group-commit
+                // ticket wait ultimately fails): there is no separate
+                // decision commit whose own publication can be uncertain
+                // independently of the primary write's, so (unlike
+                // `commitCoordinatedTwoPhase`) there is no
+                // `publicationUncertain` check to add here.
+                if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;
+                if (outcomes.isUnknownOutcome(err)) {
+                    if (writer) |w| if (marker) |m| {
+                        w.retire(m, if (named) |name| .{ .name = name, .id = self.db.core.identity_namespace.table_id } else null);
+                        self.outcome_transaction_id = m.writer;
+                        // `antfly_db_get_transaction_status`'s fallback
+                        // needs the exact sequence to disambiguate; kept
+                        // on the Owner, not `self.db`, since it must
+                        // survive this connection's own post-ambiguous-
+                        // commit reconciliation -- see `Owner.
+                        // last_ambiguous_fused_marker`'s doc comment.
+                        // `self.handle` here is the per-generation catalog
+                        // root (what `WriterLane.checkout`/`connection.
+                        // refresh` hand back), not the stable, client-
+                        // facing wrapper that owns `lite_connection` --
+                        // `lite_connection_context` is the root's own
+                        // back-reference to the `Connection` currently
+                        // attached to it (`Connection.attach`/`detach`),
+                        // which every lane-managed write holds attached
+                        // for exactly this duration. Not every backend has
+                        // a Lite connection (a directory/LSM handle does
+                        // not); only Lite's own fused path needs this.
+                        if (self.handle) |handle| if (handle.lite_connection_context) |connection| {
+                            connection.owner.last_ambiguous_fused_marker = m;
+                        };
+                    };
+                    return error.SqlMutationOutcomeUnknown;
+                }
+                if (err == error.VersionConflict) return error.SqlWriteConflict;
+                return outcomes.notApplied(err);
+            };
+            // Equivalent of `test_after_decision`: the write is durable;
+            // simulate a post-decision step failing without losing it.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_decision) |hook| {
+                coordinator.test_after_decision = null;
+                hook.run(hook.ptr) catch return .committed_pending;
+            };
+            return .committed;
+        }
+
+        /// lite-single-commit-write-path.md §7.5: the shape
+        /// `commitCoordinatedFusedMultiTable` can drive -- exactly one
+        /// participant table with real row writes/deletes (the leader,
+        /// e.g. an FK child insert's own row), every other participant
+        /// pure integrity bookkeeping (no row writes/deletes of its own,
+        /// e.g. a parent's `.attach`/`.detach` Reference) and otherwise
+        /// eligible for the same fast path `eligibleForLocalDecision`
+        /// already gates for the single-table case. Lock-order safety
+        /// (every follower's `table_id` must be smaller than the
+        /// leader's) is checked once the tables are resolved to their
+        /// `*DB`s in `commitCoordinatedFusedMultiTable` itself, since
+        /// this only has the request shape, not real table identities.
+        fn eligibleForFusedMultiTable(tables: []const contract.TableCommitRequest) ?usize {
+            if (tables.len < 2 or tables.len > 64) return null;
+            var leader_index: ?usize = null;
+            for (tables, 0..) |table, i| {
+                if (!eligibleForLocalDecision(table)) return null;
+                if (table.writes.len != 0 or table.deletes.len != 0) {
+                    if (leader_index != null) return null;
+                    leader_index = i;
+                } else if (table.integrity_commands.len == 0) {
+                    // A participant with no row writes and no integrity
+                    // work to decide has no reason to be here.
+                    return null;
+                }
+            }
+            return leader_index;
+        }
+
+        /// One key this coordinator wrote for a non-leader (follower)
+        /// participant, and the bytes to restore there if the leader's
+        /// own commit (or a later follower's own validation) ultimately
+        /// fails. `prior_value = null` means the key did not exist before
+        /// (revert deletes it); otherwise revert restores exactly these
+        /// bytes.
+        const FollowerRevertEntry = struct { key: []const u8, prior_value: ?[]const u8 };
+
+        /// lite-single-commit-write-path.md §7.5's FK multi-table
+        /// coordinator. `tables` is `integrity.prepareWithRepairAdmission`'s
+        /// already-computed per-table split (one `TableCommitRequest` per
+        /// physical table the write touches); `leader_index` names the one
+        /// table with real row writes/deletes, as established by
+        /// `eligibleForFusedMultiTable`.
+        ///
+        /// Lock discipline: every OTHER (follower) participant's
+        /// `core.apply_mutex` is locked here, directly, in ascending
+        /// `table_id` order, before anything else happens; the leader's
+        /// own lock is never touched directly here -- `commitCoordinatedLocal`
+        /// below acquires and releases it internally, exactly as the
+        /// single-table fast path already does. This is only safe because
+        /// every follower's `table_id` is smaller than the leader's
+        /// (checked immediately below, falling back to the general
+        /// two-phase coordinator otherwise): the sequence of lock
+        /// acquisitions this call makes -- every follower (ascending),
+        /// then the leader (internally, strictly last and strictly
+        /// larger) -- is itself in ascending `table_id` order, matching
+        /// what a concurrent operation on the same table pair (e.g. a
+        /// parent DELETE's own single-table `commitCoordinatedLocal` call,
+        /// or another insert in the opposite FK direction that this same
+        /// check routes through the two-phase coordinator instead) also
+        /// follows, so no inversion -- and so no deadlock -- is possible.
+        ///
+        /// A follower's validated integrity effects are written through a
+        /// ride-along commit (`durability = .ride_along`) against that
+        /// follower's OWN `core.store`. Every table of one Lite single-
+        /// file backend shares one underlying `docstore.Store`, so a
+        /// ride-along entry is swept into the very next foreground commit
+        /// on ANY table of that store -- here, the leader's own
+        /// `commitCoordinatedLocal` call immediately below, landing both
+        /// in the same one fsync (lite-single-commit-write-path.md
+        /// §3.2a/§7.2's existing ride-along pattern, not a new commit
+        /// primitive). If the leader's commit then fails -- or a LATER
+        /// follower's own validation fails, with an EARLIER follower
+        /// already written -- every follower write already staged is
+        /// undone with an explicit, synchronous (foreground) revert
+        /// restoring the prior bytes (or deleting a key that did not
+        /// exist before): that revert's own commit forces the sync that
+        /// sweeps up the earlier, still-undurable ride-along entry
+        /// together with its own undo, netting to "as if nothing
+        /// happened" durably. This costs one extra commit only on the
+        /// (expected to be rare) failure path; the success path stays at
+        /// the leader's one fsync.
+        fn commitCoordinatedFusedMultiTable(
+            self: *Self,
+            alloc: std.mem.Allocator,
+            tables: []const contract.TableCommitRequest,
+            leader_index: usize,
+        ) !catalog.MutationOutcome {
+            const outcomes = dependencies.sql_errors;
+            const handle = self.handle orelse return error.UnsupportedSqlExecution;
+            if (tables.len > 64) return error.SqlProgramLimitExceeded;
+            var dbs: [64]*DB = undefined;
+            for (tables, 0..) |table, i| dbs[i] = @import("tables.zig").get(handle, table.table_name) catch |err| return outcomes.notApplied(err);
+            const db_slice: []const *DB = dbs[0..tables.len];
+            const leader_id = db_slice[leader_index].core.identity_namespace.table_id;
+            for (db_slice, 0..) |db, i| {
+                if (i == leader_index) continue;
+                // Lock-ordering safety (see the doc comment above): a
+                // follower with an id larger than the leader's cannot be
+                // driven safely by this call. Fall back to the general
+                // coordinator instead of risking an inverted lock order.
+                if (db.core.identity_namespace.table_id >= leader_id) return error.FusedMultiTableIneligible;
+            }
+            var follower_order: [64]usize = undefined;
+            var follower_count: usize = 0;
+            for (tables, 0..) |_, i| {
+                if (i == leader_index) continue;
+                follower_order[follower_count] = i;
+                follower_count += 1;
+            }
+            const followers = follower_order[0..follower_count];
+            std.mem.sort(usize, followers, db_slice, struct {
+                fn less(ctx: []const *DB, a: usize, b: usize) bool {
+                    return ctx[a].core.identity_namespace.table_id < ctx[b].core.identity_namespace.table_id;
+                }
+            }.less);
+            var follower_reverts: [64][]const FollowerRevertEntry = undefined;
+            for (follower_reverts[0..follower_count]) |*entry| entry.* = &.{};
+            var locked_count: usize = 0;
+            // Always unlock every follower this call locked, in reverse
+            // (descending table_id) order -- on every return path.
+            defer {
+                var i = locked_count;
+                while (i != 0) {
+                    i -= 1;
+                    db_slice[followers[i]].core.unlockApplyExclusive();
+                }
+            }
+            for (followers) |idx| {
+                db_slice[idx].core.lockApplyExclusive();
+                locked_count += 1;
+            }
+            // Preparing and staging follower writes (block-scoped so this
+            // errdefer never fires for the leader call below): only on an
+            // error return FROM THIS LOOP, undo every follower write
+            // already staged, in reverse order, while every lock above is
+            // still held.
+            {
+                var prepared_through: usize = 0;
+                errdefer {
+                    var i = prepared_through;
+                    while (i != 0) {
+                        i -= 1;
+                        revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+                    }
+                }
+                for (followers, 0..) |idx, pos| {
+                    const table = tables[idx];
+                    if (table.integrity_commands.len == 0) {
+                        prepared_through = pos + 1;
+                        continue;
+                    }
+                    const schema_version = table.relational_schema_version orelse table.schema_version;
+                    // A follower in this coordinator only ever carries
+                    // `.attach`/`.detach`-shaped bookkeeping (the leader is
+                    // always the table with the real row write), never a
+                    // `.release`/RESTRICT command, so the self-healing
+                    // child-existence check (§7.6) has nothing to do here.
+                    const intents = db_slice[idx].prepareLocalIntegrityDecision(alloc, schema_version, table.relational_integrity_generation_set, table.integrity_commands, null) catch |err| {
+                        if (err == error.VersionConflict) return error.SqlWriteConflict;
+                        return outcomes.notApplied(err);
+                    };
+                    if (intents.len == 0) {
+                        prepared_through = pos + 1;
+                        continue;
+                    }
+                    const reverts = try alloc.alloc(FollowerRevertEntry, intents.len);
+                    var batch = try db_slice[idx].core.store.beginWriteBatchWithOptions(.{ .durability = .ride_along });
+                    errdefer batch.abort();
+                    for (intents, reverts) |intent, *revert| {
+                        const prior = batch.get(intent.key) catch |err| switch (err) {
+                            error.NotFound => null,
+                            else => return err,
+                        };
+                        revert.* = .{ .key = intent.key, .prior_value = if (prior) |p| try alloc.dupe(u8, p) else null };
+                        if (intent.value) |value| try batch.put(intent.key, value) else try batch.delete(intent.key);
+                    }
+                    try batch.commit();
+                    follower_reverts[pos] = reverts;
+                    prepared_through = pos + 1;
+                }
+            }
+            var leader_adapter = try self.selected(tables[leader_index].table_name);
+            defer self.outcome_transaction_id = leader_adapter.outcome_transaction_id;
+            return leader_adapter.commitCoordinatedLocal(alloc, tables[leader_index]) catch |err| {
+                // An ambiguous ("outcome unknown") failure here means the
+                // leader's own write MAY actually have become durable --
+                // reverting the follower in that case could durably erase
+                // a Reference whose child row is in fact live, trading a
+                // merely uncertain outcome for a definite, worse
+                // inconsistency (see the crash-sweep regression this
+                // fixes: `crash sweep: relational foreign-key child
+                // insert, child row and attach record are all-or-nothing`).
+                // Leave every follower write exactly as staged and
+                // propagate the same uncertainty outward instead; resolving
+                // it is this call's existing ambiguous-outcome contract,
+                // the same one `commitCoordinatedLocal` itself already has
+                // for its own single-table callers.
+                if (!outcomes.isUnknownOutcome(err)) {
+                    var i = follower_count;
+                    while (i != 0) {
+                        i -= 1;
+                        revertFollower(db_slice[followers[i]], follower_reverts[i]) catch {};
+                    }
+                }
+                return err;
+            };
+        }
+
+        /// Best-effort synchronous undo of `commitCoordinatedFusedMultiTable`'s
+        /// ride-along follower writes. Its own foreground (durable) commit
+        /// forces the sync that sweeps up the earlier, still-undurable
+        /// ride-along entries this reverts, together with their own undo,
+        /// in the SAME physical commit -- the net durable state is as if
+        /// those writes never happened, even though the original
+        /// ride-along commit already returned successfully.
+        fn revertFollower(db: *DB, reverts: []const FollowerRevertEntry) !void {
+            if (reverts.len == 0) return;
+            var batch = try db.core.store.beginWriteBatchWithOptions(.{});
+            errdefer batch.abort();
+            for (reverts) |revert| {
+                if (revert.prior_value) |value| try batch.put(revert.key, value) else try batch.delete(revert.key);
+            }
+            try batch.commit();
+        }
+
+        /// The durable three-commit path (begin, write the intents, resolve
+        /// them to real rows), kept for requests `commitCoordinatedLocal`
+        /// does not cover -- see `eligibleForLocalDecision`.
+        fn commitCoordinatedTwoPhase(self: *Self, request: contract.TableCommitRequest) !catalog.MutationOutcome {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
             const outcomes = dependencies.sql_errors;
-            const txn_id = self.db.beginTransaction(now) catch |err| return outcomes.notApplied(err);
+            const coordinator = @import("sql_commit.zig");
+            // Nothing committed yet: the equivalent of `sql_commit.zig`'s
+            // `test_before_store` boundary, fired before this write's own
+            // `beginTransaction` instead of before the cross-database
+            // coordinator's recovery-hint record (this path has none).
+            if (comptime @import("builtin").is_test) if (coordinator.test_before_store) |hook| {
+                coordinator.test_before_store = null;
+                hook.run(hook.ptr) catch |err| return outcomes.notApplied(err);
+            };
+            var txn_id: types.TxnId = undefined;
+            try io.randomSecure(&txn_id);
+            {
+                var raw_policy_lease = self.db.local_execution.row_policy_gate.enterRaw() catch |err| return outcomes.notApplied(err);
+                defer raw_policy_lease.release();
+                _ = self.db.beginProducerTransactionScoped(txn_id, now, now, &.{}, false, false, null, .ordinary) catch |err| return outcomes.notApplied(err);
+            }
             self.outcome_transaction_id = txn_id;
             self.db.writeTransaction(txn_id, .{
+                .completion_ordinary_producer = true,
                 .schema_version = request.schema_version,
                 .relational_schema_version = request.relational_schema_version,
                 .relational_integrity_generation_set = request.relational_integrity_generation_set,
@@ -505,10 +957,24 @@ pub fn Adapter(comptime native: type) type {
                 if (err == error.VersionConflict) return error.SqlWriteConflict;
                 return outcomes.notApplied(err);
             };
+            // Equivalent of `test_after_prepare`: every participant (here,
+            // the one table) is prepared; about to make the commit decision.
+            // Abandon exactly as the `writeTransaction` failure above does.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_prepare) |hook| {
+                coordinator.test_after_prepare = null;
+                hook.run(hook.ptr) catch |err| {
+                    self.db.abortTransaction(txn_id, now +| 1) catch {};
+                    self.outcome_transaction_id = null;
+                    return outcomes.notApplied(err);
+                };
+            };
             // Only durable status can classify a failure after commit starts.
             // Never abort/replay a possibly published mutation.
             self.db.commitTransaction(txn_id, now +| 1) catch |err| {
-                const status = self.db.getTransactionStatus(txn_id) catch return error.SqlMutationOutcomeUnknown;
+                const status = self.db.getTransactionStatus(txn_id) catch {
+                    if (self.handle) |handle| handle.sql_decision_uncertain = true;
+                    return error.SqlMutationOutcomeUnknown;
+                };
                 if (status == .committed) return switch (err) {
                     error.EnrichmentWorkerFailed => .committed_repair_required,
                     else => .committed_pending,
@@ -517,7 +983,44 @@ pub fn Adapter(comptime native: type) type {
                     self.outcome_transaction_id = null;
                     return error.SqlWriteConflict;
                 }
+                // `status == .pending`: durability is genuinely unknown only
+                // while the native checkpoint publication might still land
+                // (mirrors `sql_commit.zig`'s `commitLocked`). Otherwise the
+                // decision provably never became durable -- abort it so
+                // recovery can never commit it later, and report "not
+                // applied" instead of an unwarranted "unknown".
+                //
+                // Unlike `commitLocked`'s simple coordinator-decision commit,
+                // this commit also materializes the table's rows inline, and
+                // that path's own reconciliation can already have resolved
+                // (and cleared) `checkpoint_publication_uncertain` by the
+                // time it hands back an already-classified unknown-outcome
+                // error -- checking the flag at that point would wrongly see
+                // "resolved" and report "not applied" for a write whose
+                // recovery has not actually settled from this caller's
+                // perspective.
+                // Trust that classification first; fall back to the flag
+                // only for a plain error the lower layers never classified.
+                if (outcomes.isUnknownOutcome(err)) {
+                    if (self.handle) |handle| handle.sql_decision_uncertain = true;
+                    return error.SqlMutationOutcomeUnknown;
+                }
+                if (self.handle) |handle| {
+                    if (!coordinator.publicationUncertain(handle)) {
+                        self.db.abortTransaction(txn_id, now +| 2) catch {};
+                        self.outcome_transaction_id = null;
+                        return outcomes.notApplied(err);
+                    }
+                    handle.sql_decision_uncertain = true;
+                }
                 return error.SqlMutationOutcomeUnknown;
+            };
+            // Equivalent of `test_after_decision`: the decision is durable;
+            // simulate a post-decision step (participant resolution in the
+            // cross-database protocol) failing without losing the commit.
+            if (comptime @import("builtin").is_test) if (coordinator.test_after_decision) |hook| {
+                coordinator.test_after_decision = null;
+                hook.run(hook.ptr) catch return .committed_pending;
             };
             self.outcome_transaction_id = null;
             return .committed;
@@ -554,15 +1057,13 @@ pub fn Adapter(comptime native: type) type {
             const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
             var search_arena = std.heap.ArenaAllocator.init(alloc);
             defer search_arena.deinit();
-            const prepared = try search_arena.allocator().alloc(?native.public_api.query.OwnedQueryRequest, requests.len);
+            const prepared = try search_arena.allocator().alloc(?PreparedSearch, requests.len);
             @memset(prepared, null);
             defer for (prepared) |*request| if (request.*) |*owned| owned.deinit(search_arena.allocator());
             for (requests, prepared) |request, *out| if (request.request.search) |search| {
                 var selected_adapter = try self.selected(request.table.physical_name);
-                out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search);
-                // A durable SQL commit can precede derived publication. Drain
-                // the selected search owner's indexing before taking cohort
-                // fences, so ranking and row hydration describe the same cut.
+                if (selected_adapter.db.core.identity_namespace.table_id != request.table.id) return error.PreparedGenerationChanged;
+                out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search, request.table, request.request.fields);
                 try selected_adapter.db.waitForCurrentSyncLevel(.full_index);
             };
             var owners: [64]*DB = undefined;
@@ -575,6 +1076,7 @@ pub fn Adapter(comptime native: type) type {
                 } else &.{request.table};
                 for (dependencies_to_capture) |table| {
                     const selected_adapter = try self.selected(table.physical_name);
+                    if (selected_adapter.db.core.identity_namespace.table_id != table.id) return error.PreparedGenerationChanged;
                     const exists = for (owners[0..owner_count]) |db| {
                         if (db == selected_adapter.db) break true;
                     } else false;
@@ -603,7 +1105,7 @@ pub fn Adapter(comptime native: type) type {
                 // publication. Only the indexes used by each search are waited.
                 for (requests, prepared, 0..) |request, *search, i| if (search.*) |*owned| {
                     var selected_adapter = try self.selected(request.table.physical_name);
-                    search_sequences[i] = try selected_adapter.waitSearchIndexes(search_arena.allocator(), owned.req, visibility_deadline);
+                    search_sequences[i] = try selected_adapter.waitSearchIndexes(search_arena.allocator(), owned.query.req, visibility_deadline);
                 };
                 while (held != owner_count) {
                     errdefer {
@@ -635,7 +1137,7 @@ pub fn Adapter(comptime native: type) type {
                     cursor.* = try @import("sql_graph.zig").open(self, alloc, binding.*, request.request, owners[0..owner_count], fences[0..held]);
                 } else if (search.*) |*owned| {
                     var selected_adapter = try self.selected(request.table.physical_name);
-                    cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.req);
+                    cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.*);
                 } else cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
                 initialized += 1;
             }
@@ -663,7 +1165,17 @@ pub fn Adapter(comptime native: type) type {
             }
         };
 
-        fn prepareSearch(self: *Self, alloc: std.mem.Allocator, search: anytype) !native.public_api.query.OwnedQueryRequest {
+        const PreparedSearch = struct {
+            query: native.public_api.query.OwnedQueryRequest,
+            fields: []const []const u8,
+            highlights: bool,
+            fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                self.query.deinit(alloc);
+                alloc.free(self.fields);
+            }
+        };
+
+        fn prepareSearch(self: *Self, alloc: std.mem.Allocator, search: anytype, table: catalog.Table, projection: []const []const u8) !PreparedSearch {
             if (self.transaction) |session| if (session.active) {
                 for (session.entries.items) |entry| if (std.mem.eql(u8, entry.table.physical_name, self.table_name)) return error.SqlSearchUncommittedWrites;
             };
@@ -678,10 +1190,15 @@ pub fn Adapter(comptime native: type) type {
             var owned = native.public_api.query.parsePublicQueryRequest(alloc, .{ .ptr = &resolver, .vtable = &.{ .resolve_dense_query = SemanticResolver.resolveDense } }, self.table_name, canonical) catch |err| return if (native.public_api.query.isPublicQueryValidationError(err)) error.InvalidSqlParameters else err;
             errdefer owned.deinit(alloc);
             if (owned.req.limit == 0 or owned.req.limit > 10000) return error.SqlProgramLimitExceeded;
-            owned.req.include_stored = true;
-            owned.req.fields = &.{};
-            owned.req.include_all_fields = true;
-            return owned;
+            const logical_scan: catalog.Scan = .{ .fields = projection, .limit = owned.req.limit };
+            const fields = try dependencies.sql_search_cursor.storageFields(alloc, try logical_scan.physicalFields(alloc, table));
+            owned.req.include_stored = table.storage_mode == .document;
+            owned.req.fields = if (fields.len == 0) &.{"_id"} else fields;
+            owned.req.include_all_fields = logical_scan.needsDocument(table);
+            const highlights = for (projection) |field| {
+                if (std.mem.eql(u8, field, "_highlights")) break true;
+            } else false;
+            return .{ .query = owned, .fields = fields, .highlights = highlights };
         }
 
         pub fn waitSearchIndexes(self: *Self, alloc: std.mem.Allocator, req: types.SearchRequest, deadline_ns: u64) !u64 {
@@ -711,12 +1228,13 @@ pub fn Adapter(comptime native: type) type {
             return self.db.waitForCurrentIndexTargets(names.items, deadline_ns);
         }
 
-        const SearchCursor = struct {
+        const RelationalSearchCursor = struct {
             alloc: std.mem.Allocator,
             arena: std.heap.ArenaAllocator,
             result: types.SearchResult,
             reader: ?DB.RelationalRows.Reader,
             documents: ?DB.DocumentRows,
+            policy: ?@FieldType(DB.QueryReadLease, "row_policy_lease"),
             needs_document: bool,
             source_fields: []const []const u8,
             layout: *const catalog.Row.TypedLayout,
@@ -863,13 +1381,38 @@ pub fn Adapter(comptime native: type) type {
                 self.retireColumns();
                 if (self.reader) |*reader| reader.deinit();
                 if (self.documents) |*documents| documents.deinit();
+                if (self.policy) |*held| held.release();
                 self.result.deinit();
                 self.arena.deinit();
                 self.alloc.destroy(self);
             }
         };
 
-        fn openSearch(self: *Self, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, search: types.SearchRequest) !catalog.Cursor {
+        const SearchProvider = struct {
+            pub const Reader = DB.RelationalRows.Reader;
+            // lookupSqlRow's native projection contract owns every
+            // selected payload in the supplied page allocator.
+            pub const typed_page_owned = true;
+            pub const Result = types.SearchResult;
+            pub const Lease = @FieldType(DB.QueryReadLease, "row_policy_lease");
+            pub fn hasSource(hit: types.SearchHit) bool {
+                return hit.source_value != null or hit.stored_data != null or hit.column_source != null;
+            }
+            pub fn document(arena: *std.heap.ArenaAllocator, hit: types.SearchHit) !std.json.Value {
+                if (hit.source_value) |value| return value;
+                if (hit.column_source) |source| return source.value(arena);
+                if (hit.stored_data) |data| return std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), data, .{ .parse_numbers = false });
+                return error.InvalidSqlBackendResponse;
+            }
+            pub fn highlights(a: std.mem.Allocator, hit: types.SearchHit) !?std.json.Value {
+                const value = (try native.public_api.query.highlightsJsonValue(a, hit.highlights)) orelse return null;
+                const encoded = try std.json.Stringify.valueAlloc(a, value, .{});
+                return try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .parse_numbers = false });
+            }
+        };
+        const SearchCursor = dependencies.sql_search_cursor.Cursor(SearchProvider);
+
+        fn openSearch(self: *Self, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, prepared: PreparedSearch) !catalog.Cursor {
             // Capture ranking and the primary reader under one apply fence.
             // The reader owns its immutable snapshot after this lease releases;
             // paging never keeps the writer-excluding lease alive.
@@ -877,9 +1420,13 @@ pub fn Adapter(comptime native: type) type {
             defer lease.release();
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
             defer view.release();
-            if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
+            if (self.db.core.identity_namespace.table_id != table.id or view.version() != table.schema_version or
+                (view.storageMode() == .relational) != (table.storage_mode == .relational)) return error.PreparedGenerationChanged;
+            var search = prepared.query.req;
+            if (!prepared.highlights) search.highlight = null;
+            const document_root = table.storage_mode == .document and request.needsDocument(table);
             var ranked = search;
-            const delayed_hydration = search.query != .graph and search.graph_queries.len == 0 and
+            const delayed_hydration = !document_root and search.query != .graph and search.graph_queries.len == 0 and
                 search.graph_metric_queries.len == 0 and search.graph_metric_rerank == null and search.graph_query_transport == null and
                 search.hierarchy_children == null and search.highlight == null and !search.hasHitEvaluation() and search.return_mode == .parent and
                 !search.hierarchy_include_source and !search.hierarchy_include_unit and
@@ -889,7 +1436,12 @@ pub fn Adapter(comptime native: type) type {
             errdefer if (documents) |*reader| reader.deinit();
             var captured = try lease.search(alloc, ranked);
             errdefer captured.result.deinit();
-            const cursor = try alloc.create(SearchCursor);
+            if (document_root) {
+                var policy = lease.row_policy_lease.clone();
+                errdefer policy.release();
+                return (try SearchCursor.init(alloc, table, request.fields, captured.result, null, policy)).iface();
+            }
+            const cursor = try alloc.create(RelationalSearchCursor);
             errdefer alloc.destroy(cursor);
             var arena = std.heap.ArenaAllocator.init(alloc);
             errdefer arena.deinit();
@@ -900,8 +1452,10 @@ pub fn Adapter(comptime native: type) type {
                 if (!std.mem.eql(u8, field, "_id")) try output_names.put(a, try a.dupe(u8, field), {});
                 if (!std.mem.eql(u8, field, "_id") and !std.mem.eql(u8, field, "score") and !std.mem.eql(u8, field, "_highlights")) try fields.append(a, field);
             }
-            var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, fields.items, table.schema_version) else null;
+            var reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational) try lease.relationalRows(alloc, prepared.fields, table.schema_version) else null;
             errdefer if (reader) |*value| value.deinit();
+            var policy = if (reader == null) lease.row_policy_lease.clone() else null;
+            errdefer if (policy) |*held| held.release();
             const layout = try catalog.Row.TypedLayout.init(a, output_names.keys());
             const projection: dependencies.sql_document_row.Projection = if (reader == null) try dependencies.sql_document_row.Projection.initSearch(a, table, request.fields) else .{ .columns = &.{} };
             var source_fields: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -915,8 +1469,8 @@ pub fn Adapter(comptime native: type) type {
             };
             // Finish allocating before moving the arena: a later allocation
             // could add a chunk that the cursor's earlier copy would not own.
-            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .needs_document = needs_document, .source_fields = source_fields.keys(), .layout = layout, .projection = projection };
-            return .{ .ptr = cursor, .next = SearchCursor.next, .next_columns = if (reader == null) SearchCursor.nextColumns else null, .close = SearchCursor.close };
+            cursor.* = .{ .alloc = alloc, .arena = arena, .result = captured.result, .reader = reader, .documents = documents, .policy = policy, .needs_document = needs_document, .source_fields = source_fields.keys(), .layout = layout, .projection = projection };
+            return .{ .ptr = cursor, .next = RelationalSearchCursor.next, .next_columns = if (reader == null) RelationalSearchCursor.nextColumns else null, .close = RelationalSearchCursor.close };
         }
 
         fn resolveGraph(ptr: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
@@ -938,7 +1492,7 @@ pub fn Adapter(comptime native: type) type {
             if (schema.storage_mode == .document) {
                 return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .storage_mode = .document, .columns = try dependencies.sql_document_row.deriveColumns(alloc, parsed) };
             }
-            const columns = try alloc.alloc(catalog.Column, schema.relational_columns.len);
+            const columns = try catalog.relationalColumnsLeaky(alloc, schema);
             for (schema.relational_columns, columns) |column, *out| {
                 var generated = false;
                 if (parsed.generated_columns) |items| {
@@ -950,18 +1504,12 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .defaulted = catalog.hasColumnDefault(parsed, column.name), .element_type = column.sql_element_type, .numeric_modifier = column.numeric_modifier, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
-                    .string => .string,
-                    .integer => .integer,
-                    .number, .numeric => .number,
-                    .boolean => .boolean,
-                    .datetime => .datetime,
-                    .json => .json,
-                    .sql_array => .array,
-                    else => return error.UnsupportedSqlExecution,
-                }) };
+                out.generated = generated;
+                out.defaulted = out.defaulted or catalog.hasColumnDefault(parsed, column.name);
+                out.clock_defaulted = catalog.columnDefaultUsesClock(parsed, column.name);
+                out.type = dependencies.sql_document_row.relationalType(parsed, column.name, out.type);
             }
-            return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .columns = columns, .constraints = try catalog.Constraint.derive(alloc, parsed) };
+            return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .columns = columns, .index_definitions = try catalog.IndexDefinition.deriveLeaky(alloc, scratch.allocator(), parsed, schema), .constraints = try catalog.Constraint.derive(alloc, parsed) };
         }
 
         const Cursor = struct {
@@ -1019,13 +1567,14 @@ pub fn Adapter(comptime native: type) type {
             const from = request.primary_key orelse request.after orelse "";
             const to = if (request.primary_key) |key| try std.mem.concat(temporary, u8, &.{ key, "\x00" }) else "";
             if (table.storage_mode == .document) {
+                const fields = try request.physicalFields(temporary, table);
                 const session = try self.db.openDocumentReadSession(alloc, from, to, .{
-                    .sql_document_preimage = request.include_document,
+                    .sql_document_preimage = request.needsDocument(table),
                     .include_content_hashes = request.include_primary_digest,
                     .inclusive_from = request.primary_key != null,
                     .exclusive_to = true,
                     .limit = request.limit,
-                    .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version },
+                    .relational_query = .{ .page_bytes = 256 * 1024, .fields = fields, .conditions = conditions, .schema_version = table.schema_version },
                 });
                 errdefer session.deinit();
                 const cursor = try alloc.create(DocumentCursor);
@@ -1037,7 +1586,7 @@ pub fn Adapter(comptime native: type) type {
                 .inclusive_from = request.primary_key != null,
                 .exclusive_to = true,
                 .limit = request.limit,
-                .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order and self.transaction == null },
+                .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .expression_equalities = request.expression_equalities, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order and (self.transaction == null or !self.transaction.?.active) },
             });
             errdefer session.deinit();
             const projection = try dependencies.sql_document_row.Projection.init(alloc, table, request.fields);
@@ -1080,11 +1629,26 @@ pub fn Adapter(comptime native: type) type {
                 .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version },
             });
             defer session.deinit();
-            const normalized = try session.normalizeRows(alloc, writes);
+            var has_domains = false;
+            for (input) |mutation| has_domains = has_domains or mutation.domain_admission != null;
+            const normalized = if (has_domains) typed: {
+                const admissions = try alloc.alloc(?@import("../schema/domain_row.zig").Admission, writes.len);
+                var index: usize = 0;
+                for (input) |mutation| if (mutation.row != null) {
+                    admissions[index] = if (mutation.prepared_domain == null) mutation.domain_admission else null;
+                    index += 1;
+                };
+                const prepared_contract = try alloc.create(@import("../schema/domain_handoff.zig").Contract);
+                break :typed try session.normalizeDomainRows(alloc, writes, admissions, prepared_contract);
+            } else try session.normalizeRows(alloc, writes);
             return images.merge(alloc, input, normalized);
         }
 
-        fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, raw_mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const needs_domain_preparation = for (raw_mutations) |mutation| {
+                if (mutation.row != null and mutation.domain_admission != null and mutation.prepared_domain == null) break true;
+            } else false;
+            const mutations = if (needs_domain_preparation) try prepareMutations(ptr, alloc, table, raw_mutations) else raw_mutations;
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             var selected_adapter = try adapter_owner.selected(table.physical_name);
             const self = &selected_adapter;
@@ -1102,7 +1666,7 @@ pub fn Adapter(comptime native: type) type {
                 predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
                 if (mutation.predicate_only) continue;
                 if (mutation.row) |row| {
-                    try writes.append(temporary, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(temporary, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
+                    try writes.append(temporary, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(temporary, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields, .prepared_domain = mutation.prepared_domain });
                 } else try deletes.append(temporary, mutation.key);
             }
             const request: types.BatchRequest = .{ .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null };
@@ -1123,13 +1687,57 @@ pub fn Adapter(comptime native: type) type {
                     try commands.appendSlice(temporary, owner.guards);
                 };
                 const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
-                for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
-                const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
+                for (writes.items, input_writes) |write, *out| out.* = write;
+                const input: contract.TableCommitRequest = .{ .source_producer = .ordinary, .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
                 // Preparation only reads: any failure here is not applied.
                 prepared = integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
-                if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
+                // A Lite single-file database's "tables" are different
+                // identity namespaces inside the SAME physical native
+                // store (`tables.zig`'s `openTable` opens every table at
+                // `handle.embedded_path` when `owned_lite_backend != null`).
+                // A coordinated write that only ever touches one such table
+                // needs no cross-database two-phase decision: there is only
+                // one participant and one physical commit domain, so the
+                // single-store `commitCoordinated` path below already gives
+                // the same crash semantics without `sql_commit.zig`'s
+                // recovery-hint record, root coordinator-role transaction,
+                // and extra per-participant recovery round trip (lite-
+                // single-commit-write-path.md §3.3c). A write whose prepared
+                // plan spans more than one table (e.g. an FK child insert's
+                // own row plus the parent's `.attach` Reference bookkeeping)
+                // still stays on this store: `commitCoordinatedFusedMultiTable`
+                // below locks every participant table's `core.apply_mutex`
+                // in ascending `table_id` order and folds the non-leader
+                // participants' writes in as ride-along commits that share
+                // the leader's one foreground fsync (§7.5's FK coordinator).
+                // It only applies when exactly one table owns real row
+                // writes and every other participant is pure integrity
+                // bookkeeping with the leader's table_id the largest among
+                // them (the lock-ordering direction this call can safely
+                // drive without re-entering an already-locked table); any
+                // other shape -- or a plain multi-database handle -- still
+                // needs the general cross-database two-phase coordinator.
+                if (self.handle) |handle| {
+                    if (handle.owned_lite_backend != null and prepared.?.tables.len == 1 and std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) {
+                        return self.commitCoordinated(temporary, prepared.?.tables[0], true);
+                    }
+                    if (handle.owned_lite_backend != null) {
+                        if (eligibleForFusedMultiTable(prepared.?.tables)) |leader_index| {
+                            if (self.commitCoordinatedFusedMultiTable(temporary, prepared.?.tables, leader_index) catch |err| blk: {
+                                if (err == error.FusedMultiTableIneligible) break :blk null;
+                                return err;
+                            }) |outcome| return outcome;
+                            // Ineligible after all (e.g. an inverted
+                            // table_id order between leader and a
+                            // follower): fall through to the general
+                            // two-phase coordinator below, nothing was
+                            // written by the attempt above.
+                        }
+                    }
+                    return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
+                }
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
-                return self.commitCoordinated(prepared.?.tables[0]);
+                return self.commitCoordinated(temporary, prepared.?.tables[0], true);
             }
             // Classify by the batch's own state, not by error name: whether the
             // primary write became durable, and whether its publication was
@@ -1137,7 +1745,12 @@ pub fn Adapter(comptime native: type) type {
             var primary_committed = false;
             // Named tables commit to their own database, which holds the marker.
             const receipt_table: ?[]const u8 = if (self.handle != null) self.table_name else null;
-            @import("db.zig").trackedBatch(self.db, request, &primary_committed, receipt_table) catch |err| {
+            // WS3: thread the writer-lane hook through so a SQL write's
+            // connection-level locks release before this ticket's durability
+            // wait, exactly like the direct `antfly_db_batch`/`antfly_db_batch_json`
+            // writer exports already do (see the field comment on
+            // `writer_lane_hook` above).
+            @import("db.zig").trackedBatchWithWriterLaneHook(self.db, request, &primary_committed, receipt_table, self.writer_lane_hook) catch |err| {
                 // A confirmed primary write wins: later uncertainty in derived
                 // or control publication leaves it committed, not unknown.
                 if (primary_committed) return if (err == error.EnrichmentWorkerFailed) .committed_repair_required else .committed_pending;

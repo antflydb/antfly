@@ -58,9 +58,22 @@ pub const Bits = struct {
     }
 };
 
+pub fn retainedSize(header: u8, size: usize) !usize {
+    const kind = header & 31;
+    if (kind == 13 or kind == 15) return error.UnsupportedDynamicVideoConfig;
+    if (kind == 0 or kind >= 16) return error.UnsupportedVideoNal;
+    const retained = if (kind == 7 or kind == 8) size else @min(size, 128);
+    if (retained > std.math.maxInt(u16)) return error.ResourceLimitExceeded;
+    return retained;
+}
+
 /// Re-encode only each NAL's needed prefix. Original packet offsets/lengths
 /// remain authoritative; this buffer must never be submitted to a decoder.
 pub fn packet(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, maximum: usize) ![]u8 {
+    return packetReclaiming(a, reader, index, maximum, null);
+}
+
+pub fn packetReclaiming(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, maximum: usize, reclaimer: ?media.admission.Reclaimer) ![]u8 {
     const entry = reader.packets[index];
     if (entry.size > maximum) return error.ResourceLimitExceeded;
     const n = reader.track.nal_length_bytes;
@@ -75,20 +88,14 @@ pub fn packet(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, max
         // One bounded read normally covers length and complete header. Skip
         // the entropy tail using its declared length, without fetching it.
         const offset = try std.math.add(u64, entry.offset, cursor);
-        var lease = try reader.input.read(offset, @min(entry.size - cursor, @as(usize, n) + 128));
+        var lease = try reader.input.readReclaiming(offset, @min(entry.size - cursor, @as(usize, n) + 128), reclaimer);
         defer lease.deinit();
         var size: usize = 0;
         for (lease.bytes[0..n]) |byte| size = (size << 8) | byte;
         if (size == 0 or size > entry.size - cursor - n or lease.bytes[n] & 128 != 0) return error.MalformedVideoPacket;
-        const kind = lease.bytes[n] & 31;
-        if (kind == 13 or kind == 15) return error.UnsupportedDynamicVideoConfig;
-        if (kind == 0 or kind >= 16) return error.UnsupportedVideoNal;
+        const retained = try retainedSize(lease.bytes[n], size);
         count += 1;
         if (count > 4096) return error.ResourceLimitExceeded;
-        // Parameter sets need their complete bounded syntax; slice picture
-        // identity fits within 128 escaped bytes (bounded UE and POC fields).
-        const retained = if (kind == 7 or kind == 8) size else @min(size, 128);
-        if (retained > std.math.maxInt(u16)) return error.ResourceLimitExceeded;
         const old = out.items.len;
         const needed = try std.math.add(usize, old, @as(usize, n) + retained);
         if (needed > maximum) return error.ResourceLimitExceeded;
@@ -100,7 +107,7 @@ pub fn packet(a: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, max
         const available = @min(retained, lease.bytes.len - n);
         out.appendSliceAssumeCapacity(lease.bytes[n..][0..available]);
         if (available < retained) {
-            var tail = try reader.input.read(try std.math.add(u64, offset, n + available), retained - available);
+            var tail = try reader.input.readReclaiming(try std.math.add(u64, offset, n + available), retained - available, reclaimer);
             defer tail.deinit();
             out.appendSliceAssumeCapacity(tail.bytes);
         }

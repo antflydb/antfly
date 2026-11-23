@@ -95,7 +95,8 @@ pub const ReplayBatcher = union(enum) {
 const TextReplayAccumulator = struct {
     alloc: Allocator,
     target_kind: derived_types.DerivedTarget = .full_text,
-    pre_deletes: std.StringHashMapUnmanaged(void) = .empty,
+    /// Each deleted or overwritten key, with the sequence of its last record.
+    pre_deletes: std.StringHashMapUnmanaged(u64) = .empty,
     documents: std.StringHashMapUnmanaged(derived_types.DerivedDocument) = .empty,
     source_records: usize = 0,
     document_count: usize = 0,
@@ -131,17 +132,17 @@ const TextReplayAccumulator = struct {
     }
 
     fn appendBatch(self: *TextReplayAccumulator, batch: derived_types.DerivedBatch, sequence: u64) !void {
-        for (batch.deleted_keys) |key| try self.recordDelete(key);
-        for (batch.overwritten_doc_keys) |key| try self.recordDelete(key);
+        for (batch.deleted_keys) |key| try self.recordDelete(key, sequence);
+        for (batch.overwritten_doc_keys) |key| try self.recordDelete(key, sequence);
         for (batch.documents) |doc| {
             if (!documentHasAnyTargetKind(doc, .full_text)) continue;
-            try self.recordDocument(doc);
+            try self.recordDocument(doc, sequence);
         }
         self.source_records += 1;
         self.last_sequence = sequence;
     }
 
-    fn recordDelete(self: *TextReplayAccumulator, key: []const u8) !void {
+    fn recordDelete(self: *TextReplayAccumulator, key: []const u8, sequence: u64) !void {
         if (self.documents.fetchRemove(key)) |removed| {
             var removed_value = removed.value;
             deinitDerivedDocument(self.alloc, &removed_value);
@@ -149,11 +150,13 @@ const TextReplayAccumulator = struct {
         }
         const gop = try self.pre_deletes.getOrPut(self.alloc, key);
         if (!gop.found_existing) gop.key_ptr.* = try self.alloc.dupe(u8, key);
+        gop.value_ptr.* = sequence;
     }
 
-    fn recordDocument(self: *TextReplayAccumulator, doc: derived_types.DerivedDocument) !void {
+    fn recordDocument(self: *TextReplayAccumulator, doc: derived_types.DerivedDocument, sequence: u64) !void {
         var owned = try cloneDerivedDocument(self.alloc, doc);
         errdefer deinitDerivedDocument(self.alloc, &owned);
+        if (owned.sequence == 0) owned.sequence = sequence;
 
         const gop = try self.documents.getOrPut(self.alloc, doc.key);
         if (gop.found_existing) {
@@ -178,20 +181,33 @@ const TextReplayAccumulator = struct {
         const delete_count = self.pre_deletes.count();
         const doc_count = self.documents.count();
 
+        const Delete = struct { key: []const u8, sequence: u64 };
+        var deletes = try self.alloc.alloc(Delete, delete_count);
+        defer self.alloc.free(deletes);
         var overwritten_doc_keys = try self.alloc.alloc([]const u8, delete_count);
         errdefer self.alloc.free(overwritten_doc_keys);
+        var delete_sequences = try self.alloc.alloc(u64, delete_count);
+        errdefer self.alloc.free(delete_sequences);
         var documents = try self.alloc.alloc(derived_types.DerivedDocument, doc_count);
         errdefer self.alloc.free(documents);
 
         var delete_it = self.pre_deletes.iterator();
         var delete_index: usize = 0;
-        while (delete_it.next()) |entry| : (delete_index += 1) overwritten_doc_keys[delete_index] = entry.key_ptr.*;
+        while (delete_it.next()) |entry| : (delete_index += 1) deletes[delete_index] = .{ .key = entry.key_ptr.*, .sequence = entry.value_ptr.* };
+        if (delete_count > 1) std.mem.sortUnstable(Delete, deletes, {}, struct {
+            fn lessThan(_: void, a: Delete, b: Delete) bool {
+                return std.mem.lessThan(u8, a.key, b.key);
+            }
+        }.lessThan);
+        for (deletes, 0..) |entry, i| {
+            overwritten_doc_keys[i] = entry.key;
+            delete_sequences[i] = entry.sequence;
+        }
 
         var docs_it = self.documents.iterator();
         var doc_index: usize = 0;
         while (docs_it.next()) |entry| : (doc_index += 1) documents[doc_index] = entry.value_ptr.*;
 
-        if (delete_count > 1) std.mem.sortUnstable([]const u8, overwritten_doc_keys, {}, lessThanString);
         if (doc_count > 1) std.mem.sortUnstable(derived_types.DerivedDocument, documents, {}, lessThanDocument);
 
         self.pre_deletes.deinit(self.alloc);
@@ -208,6 +224,7 @@ const TextReplayAccumulator = struct {
             .sequence = sequence,
             .documents = documents,
             .overwritten_doc_keys = overwritten_doc_keys,
+            .delete_sequences = delete_sequences,
         };
     }
 };
@@ -1006,6 +1023,7 @@ fn cloneDerivedDocument(alloc: Allocator, doc: derived_types.DerivedDocument) !d
         .key = try alloc.dupe(u8, doc.key),
         .action = doc.action,
         .cleaned_value = if (doc.cleaned_value) |value| try alloc.dupe(u8, value) else null,
+        .sequence = doc.sequence,
         .targets = targets,
     };
 }

@@ -206,6 +206,22 @@ class MemoryStore:
 
 
 class ReleaseGCTests(unittest.TestCase):
+    def test_maintenance_completion_retires_matching_rc_but_keeps_stable(self) -> None:
+        store = MemoryStore()
+        store.add_release("v0.3.3-rc.1", 300)
+        stable = store.add_release("v0.3.3", 200)
+        store.add_completion("v0.3.3", stable, 200)
+        for key in (
+            f"{gc.COMPLETION_ROOT}{stable}.json",
+            f"{gc.CONTAINER_IDENTITY_ROOT}{stable}.json",
+        ):
+            document = json.loads(store.stored[key].body)
+            document["channel"] = "v0-3"
+            store.put(key, json.dumps(document).encode())
+        plan = gc.plan_gc(store, now=NOW)
+        self.assertEqual(plan["retained"]["v0.3.3"], "stable")
+        self.assertEqual(plan["expired"]["v0.3.3-rc.1"], "prerelease-grace-expired")
+
     def test_stable_and_shared_content_survive_expired_prereleases(self) -> None:
         store = MemoryStore()
         shared = "1" * 64

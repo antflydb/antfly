@@ -47,6 +47,8 @@ pub const CandidateScoreView = struct {
 };
 pub const Storage = struct {
     allocator: Allocator,
+    /// Optional provider outputs; retire their admissions before arena bytes.
+    outputs: []@import("../backends/tensor.zig").Tensor = &.{},
     arena: *std.heap.ArenaAllocator,
     pub fn init(allocator: Allocator) !Storage {
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -57,6 +59,7 @@ pub const Storage = struct {
         return self.arena.allocator();
     }
     pub fn deinit(self: *Storage) void {
+        for (self.outputs) |*output| output.deinit();
         self.arena.deinit();
         self.allocator.destroy(self.arena);
         self.* = undefined;

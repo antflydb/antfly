@@ -792,7 +792,19 @@ fn embeddings(
     errdefer cb.free(normed);
 
     // Multiply by attention mask (DeBERTa-v3 zeros out padding embeddings).
-    if (allAttentionMaskOnes(attention_mask, total)) return normed;
+    if (cb.kind() != .graph and allAttentionMaskOnes(attention_mask, total)) return normed;
+
+    if (cb.kind() == .graph) {
+        const typed = (try cb.fromConstantBytes(std.mem.sliceAsBytes(attention_mask[0..total]), .i64, &.{ @intCast(total), 1 })) orelse return error.UnsupportedTensorType;
+        defer cb.free(typed);
+        const linear = (try cb.tryConvertDType(typed, .f32)) orelse return error.UnsupportedTensorType;
+        defer cb.free(linear);
+        const broadcast = try cb.primBroadcastInDim(linear, &.{ @intCast(total), H }, &.{ 0, 1 }, &.{ @intCast(total), 1 });
+        defer cb.free(broadcast);
+        const masked = try cb.multiply(normed, broadcast);
+        cb.free(normed);
+        return masked;
+    }
 
     // Keep the normalized activations on the backend and only upload the mask.
     const mask_data = try allocator.alloc(f32, total * H);
@@ -808,24 +820,6 @@ fn embeddings(
     const masked = try cb.multiply(normed, mask_ct);
     cb.free(normed);
     return masked;
-}
-
-/// Build relative position embedding lookup for all (i,j) pairs in sequence.
-/// Returns a CT tensor of shape [seq_len, H] containing the rel_embeddings
-/// indexed by relative position buckets.
-fn buildRelativePositionEmb(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    config: Config,
-    seq_len: usize,
-) !CT {
-    const info = try buildRelativePositionEmbInfo(cb, allocator, config, seq_len);
-    if (info.full_to_unique) |ids| {
-        defer allocator.free(ids);
-        defer cb.free(info.embeddings);
-        return cb.embeddingLookup(info.embeddings, ids, info.full_count, config.hidden_size);
-    }
-    return info.embeddings;
 }
 
 fn buildRelativePositionEmbInfo(

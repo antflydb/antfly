@@ -222,7 +222,7 @@ Official downloads are Apple Silicon only and include a pinned, released Antfly 
 download Whisper Tiny, or use native Apple speech and cleanup on macOS 26+
 when the required assets and Apple Intelligence are ready. Automatic local presets
 prefer ready Apple speech and otherwise use Whisper; explicit transcriber choices
-are preserved. The bundled v0.3.0
+are preserved. The bundled v0.3.1
 runtime includes the Apple bridge. The app handles startup,
 authentication, model discovery, and shutdown. No separate server install is needed.
 Existing configurations keep their chosen external server. See [updates and
@@ -592,7 +592,7 @@ selected). This does not record microphone audio, paste text, or create history.
 Apple controls the download and does not expose percentage progress through this
 released runtime. Installation uses a separate cancellable HTTP session and an
 explicit `X-Antfly-Inference-Timeout-Ms: 1800000` budget supported by the pinned
-v0.3.0 engine. The setup request allows 30 minutes, with a short client grace period
+v0.3.1 engine. The setup request allows 30 minutes, with a short client grace period
 for the server's final response. Normal dictation keeps its existing shorter
 request budgets; this does not change inference defaults globally. Select another
 preset before setup to install/check its language separately. Regional equivalence
@@ -725,8 +725,8 @@ local test server, or provide the existing local engine credential through
 never put them in a command argument, settings file, or captured log. The probe
 creates no history and compares paced native recognition plus released cleanup with
 a recorded clip through the same server. The generation path is qualified against
-the pinned v0.3.0 release; the same synthetic request crashed rc.13 during local
-qualification and did not reproduce across repeated v0.3.0 runs.
+the pinned released runtime. v0.3.1 includes the Apple cleanup backend state
+initialization fix for the crash discovered in v0.3.0.
 
 Instruction-prefix prewarming inside Antfly’s Apple bridge is a separate runtime
 change, opt-in because short local samples showed no consistent gain. Its bounded,

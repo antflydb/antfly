@@ -11,6 +11,7 @@ from fix_generated_client import (
     SCOPED_MERGE,
     SCOPED_MERGE_HEADER,
     SQL_OPERATIONS,
+    WRITE_OPERATIONS,
     fix_generated_client,
 )
 
@@ -31,6 +32,20 @@ def write_generated_files(root: Path, signature_count: int) -> None:
             ]
         )
     )
+    for operation in WRITE_OPERATIONS:
+        path = root / f"api/data_operations/{operation}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "def parse(response) -> Error | TransactionWriteError:\n"
+            "    if response.status_code == 403:\n        return TransactionWriteError.from_dict(response.json())\n"
+            "    if response.status_code == 500:\n        return Error.from_dict(response.json())\n"
+            "    if response.status_code == 503:\n        return TransactionWriteError.from_dict(response.json())\n"
+            + (
+                "    if response.status_code == 409:\n        return TransactionSessionCommitResponse.from_dict(response.json())\n"
+                if operation in {"multi_batch_write", "commit_transaction", "commit_transaction_session"}
+                else ""
+            )
+        )
     path = root / SCOPED_MERGE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -87,8 +102,9 @@ def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:
     for relative in SQL_OPERATIONS:
         source = (tmp_path / relative).read_text()
         assert "from ....sql_transport import sql_request, sql_request_async" in source
-        assert "response = sql_request(client.get_httpx_client(),**kwargs)" in source
-        assert "response = await sql_request_async(client.get_async_httpx_client(),**kwargs)" in source
+        limit = " max_response_bytes=1 << 20," if relative.stem == "poll_sql_notifications" else ""
+        assert f"response = sql_request(client.get_httpx_client(),{limit}**kwargs)" in source
+        assert f"response = await sql_request_async(client.get_async_httpx_client(),{limit}**kwargs)" in source
     embed_source = (tmp_path / EMBED_REQUEST).read_text()
     assert embed_source.count("if isinstance(self.input_, list):") == 1
     assert "ordered content inputs cannot be mixed" in embed_source

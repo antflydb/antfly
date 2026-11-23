@@ -936,3 +936,51 @@ test {
     _ = @import("parser.zig");
     _ = @import("eval.zig");
 }
+
+test "canonical Qwen3 template renders original-source oracle prompts without raw-prompt fallback" {
+    // Immutable upstream template and independent Jinja2 3.1.6 output exercise
+    // reverse traversal, namespace writes, reasoning stripping and tool history.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var template = try Template.initHuggingFace(std.testing.allocator, @embedFile("testdata/qwen3_canonical_template.txt"));
+    defer template.deinit();
+    const fixture = try std.json.parseFromSlice(std.json.Value, arena, @embedFile("testdata/qwen3_render_cases.json"), .{});
+    for (fixture.value.object.get("cases").?.array.items) |case| {
+        var context = (try jsonToTemplateValue(arena, case)).map;
+        const actual = try template.render(arena, &context);
+        try std.testing.expectEqualStrings(case.object.get("expected").?.string, actual);
+    }
+}
+
+test "Qwen3 template operations match independent Unicode JSON and boolean identity fixtures" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try std.json.parseFromSlice(std.json.Value, arena, @embedFile("testdata/qwen3_render_cases.json"), .{});
+    for (fixture.value.object.get("operations").?.array.items) |case| {
+        var context = (try jsonToTemplateValue(arena, case)).map;
+        const actual = try render(arena, case.object.get("source").?.string, &context);
+        try std.testing.expectEqualStrings(case.object.get("expected").?.string, actual);
+    }
+}
+
+test "list slice steps preserve omitted reverse bounds and reject invalid steps" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var context = ValueMap{};
+    const cases = [_]struct { source: []const u8, expected: []const u8 }{
+        .{ .source = "{{ [0,1,2,3,4][::-1]|join(',') }}", .expected = "4,3,2,1,0" },
+        .{ .source = "{{ [0,1,2,3,4][4:0:-2]|join(',') }}", .expected = "4,2" },
+        .{ .source = "{{ [0,1,2,3,4][1::2]|join(',') }}", .expected = "1,3" },
+        .{ .source = "{{ [0,1,2,3,4][:-1:-1]|join(',') }}", .expected = "" },
+        .{ .source = "{{ [0,1,2,3,4][-99:99:2]|join(',') }}", .expected = "0,2,4" },
+        .{ .source = "{{ [0,1][99:-99:-9223372036854775807]|join(',') }}", .expected = "1" },
+        .{ .source = "{{ [][::-1]|join(',') }}", .expected = "" },
+        .{ .source = "{{ [0,1,2][1:]|join(',') }}", .expected = "1,2" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case.expected, try render(arena, case.source, &context));
+    try std.testing.expectError(error.InvalidArguments, render(arena, "{{ [0,1][::0] }}", &context));
+    try std.testing.expectError(error.InvalidArguments, render(arena, "{{ [0,1][::'bad'] }}", &context));
+}

@@ -32,6 +32,7 @@ pub const Frame = struct {
     decode_high_water: usize,
     /// Ordinal among this packet's native visible outputs, including skipped ones.
     output_index: usize = 0,
+    source_packet: ?usize = null,
     reservation: media.admission.Token = .{},
     pub fn deinit(self: *Frame) void {
         self.allocator.free(self.bytes);

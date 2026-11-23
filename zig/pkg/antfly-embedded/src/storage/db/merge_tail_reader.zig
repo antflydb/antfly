@@ -276,7 +276,7 @@ pub const Session = struct {
             const key = try owned.alloc(u8, effect.key_len);
             if (try view.readAt(effect.key_offset, key, &self.chunk_cache.?) != key.len) return error.RetainedEffectsCorrupt;
             if (previous.len != 0 and std.mem.order(u8, previous, key) != .lt) return error.RetainedEffectsCorrupt;
-            const is_integrity = @import("relational_integrity_contract.zig").isKey(key);
+            const is_integrity = @import("relational/integrity/contract.zig").isKey(key);
             const is_vector = @import("online_vector_artifacts.zig").isKey(key);
             const is_graph = @import("online_graph_artifacts.zig").isKey(key) or @import("group_source_transfer.zig").isKey(key);
             const is_artifact = is_vector or is_graph;
@@ -314,7 +314,7 @@ pub const Session = struct {
                 const raw = try owned.alloc(u8, raw_length);
                 if (try view.readAt(effect.value_offset, raw, &self.chunk_cache.?) != raw.len) return error.RetainedEffectsCorrupt;
                 if (internal.isRelationalRowKey(key)) {
-                    const version = try @import("relational_store.zig").rowSchemaVersion(raw);
+                    const version = try @import("relational/rows/store.zig").rowSchemaVersion(raw);
                     if (self.historical == null or self.historical.?.version() != version) {
                         if (self.historical) |*historical| historical.release();
                         self.historical = null;
@@ -328,8 +328,8 @@ pub const Session = struct {
                 break :blk raw;
             } else null;
             if (is_integrity) {
-                _ = @import("relational_integrity_contract.zig").parseKey(key) catch return error.RetainedEffectsCorrupt;
-                if (value) |raw| _ = @import("relational_integrity_contract.zig").validateTransferRecord(key, raw) catch return error.RetainedEffectsCorrupt;
+                _ = @import("relational/integrity/contract.zig").parseKey(key) catch return error.RetainedEffectsCorrupt;
+                if (value) |raw| _ = @import("relational/integrity/contract.zig").validateTransferRecord(key, raw) catch return error.RetainedEffectsCorrupt;
                 try integrity.append(owned, .{ .key = key, .value = value });
             } else if (is_artifact) {
                 if (@import("online_vector_artifacts.zig").isKey(key)) {
@@ -418,7 +418,7 @@ pub const Session = struct {
             // the check at this immutable read boundary before emitting rows.
             const timestamp = effect.timestamp;
             const value: ?[]const u8 = if (effect.value) |raw| if (internal.isRelationalRowKey(effect.key)) logical_value: {
-                const version = try @import("relational_store.zig").rowSchemaVersion(raw);
+                const version = try @import("relational/rows/store.zig").rowSchemaVersion(raw);
                 if (self.historical == null or self.historical.?.version() != version) {
                     if (self.historical) |*view| view.release();
                     self.historical = null;

@@ -124,6 +124,12 @@ pub const RequestDiagnostics = struct {
     }
 };
 
+pub const RowPolicyIntegrityRead = struct {
+    pub const Proof = struct { token: []const u8, database: []const u8 };
+    ptr: *anyopaque,
+    authorize: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?Proof,
+};
+
 pub const SQLCompletionOwner = struct {
     id: u64,
     schema_version: u32,
@@ -132,9 +138,26 @@ pub const SQLCompletionOwner = struct {
 };
 
 pub const RequestContext = struct {
+    pub fn checkCatalogIncarnation(self: RequestContext, epoch: ?@import("../system_catalog/relation_reconciliation.zig").Epoch) !void {
+        const expected = self.bound_catalog_incarnation orelse return;
+        if (epoch == null or !std.mem.eql(u8, &expected, &epoch.?.incarnation)) return error.CatalogGenerationChanged;
+    }
+
+    pub fn expectedMetadataIncarnation(self: RequestContext) ?[32]u8 {
+        return std.fmt.bytesToHex(self.bound_catalog_incarnation orelse return null, .lower);
+    }
+
+    pub fn checkMetadataIncarnation(self: RequestContext, actual: ?[32]u8) !void {
+        const expected = self.expectedMetadataIncarnation() orelse return;
+        if (actual == null or !std.mem.eql(u8, &expected, &actual.?)) return error.CatalogGenerationChanged;
+    }
+
     pub fn markSQLSubmission(self: RequestContext) void {
         if (self.sql_completion_submission) |observed| observed.* = true;
     }
+    /// Incarnation attested when a pgwire portal bound its physical targets.
+    bound_catalog_incarnation: ?[16]u8 = null,
+
     /// Borrowed native admission observer; never decoded from request JSON.
     /// Set only at the first possible durable submission (or existing job).
     sql_completion_submission: ?*bool = null,
@@ -146,6 +169,26 @@ pub const RequestContext = struct {
         prepare_metadata: ?*const fn (*anyopaque, SQLCompletionOwner) anyerror!void = null,
         reject_metadata: ?*const fn (*anyopaque, SQLCompletionOwner) anyerror!void = null,
     } = null,
+    /// Borrowed socket-bound SELinux signer. Never forwarded or decoded.
+    sql_selinux_ingress: ?@import("../system_catalog/security_labels.zig").KernelRelabel.Ingress = null,
+    /// Captured by the durable SQL command owner. Catalog adapters bind this
+    /// into their existing mutation identities before any forwarding.
+    sql_command_fence: ?*const @import("../storage/pessimistic_lock/authority.zig").CommandFence = null,
+    /// Session identity captured from the authenticated durable connection
+    /// under its command lease. Never parsed from public request JSON or
+    /// borrowed from a cached table owner. Native host epochs are per table.
+    sql_relation_owner: ?@import("../common/relation_persistence.zig").Owner = null,
+    /// Process-local body-bound signer for native range activation. Never decoded.
+    sql_relation_owner_minter: ?@import("../common/relation_owner_authority.zig").Minter = null,
+    /// Borrowed preparation broker; never serialized or invoked by Raft apply.
+    column_sequences: ?@import("../system_catalog/column_sequences.zig").Provider = null,
+    /// Live trigger coordinator; never accepted from public or replicated JSON.
+    table_triggers: ?@import("../sql/trigger_provider.zig").Provider = null,
+    /// Captured by the authenticated SQL transaction owner, never decoded
+    /// from public request JSON. Shared by normalization and FK cascades.
+    sql_transaction_micros: ?i64 = null,
+    /// Private coordinator capability; never serialized or accepted publicly.
+    row_policy_integrity_read: ?RowPolicyIntegrityRead = null,
     /// Native service admission only; never reconstructed from user input.
     native_service: ?@import("../common/service_ownership.zig").Owner = null,
     /// Granted only after administrator authentication by a trusted native
@@ -161,6 +204,12 @@ pub const RequestContext = struct {
     /// Internal body-bound authorization for fenced FK schema publication.
     /// Never accepted from public SQL or a client-provided catalog payload.
     fk_generation_publication_authority: bool = false,
+    /// Granted by authenticated, body-bound internal index-owner reads only.
+    /// Never reconstructed from a public SQL or serialized request payload.
+    index_publication_authority: bool = false,
+    /// Body-bound internal schema-validation owner reads. Never derived from
+    /// setting administrator/index-owner grants or serialized request fields.
+    schema_validation_authority: bool = false,
     /// Set only by the administrator-authorized relational recovery routes.
     relational_recovery: enum { none, repair, retry, retire } = .none,
     relational_retirement_target: ?[]const u8 = null,
@@ -189,6 +238,9 @@ pub const RequestContext = struct {
     /// reconstructed from `principal`. Only ApiHttpServer may interpret this
     /// opaque capability when minting a table-scoped RLS write proof.
     row_policy_credential: ?*const anyopaque = null,
+    /// Trusted synchronous policy signer. The provider handles only its
+    /// admitted physical table identities and cannot cross serialization.
+    row_policy_proof_provider: ?RowPolicyProofProvider = null,
     admission: ?*AdmissionReservation = null,
     /// Borrowed for the duration of the operation. This is deliberately
     /// request-scoped: std.Io tasks may resume on a different worker thread.
@@ -259,6 +311,12 @@ pub const RequestContext = struct {
         normalized.deadline_io = null;
         return normalized;
     }
+};
+
+pub const RowPolicyProofProvider = struct {
+    pub const Result = union(enum) { unhandled, handled: ?[]u8 };
+    ptr: *const anyopaque,
+    sign: *const fn (*const anyopaque, std.mem.Allocator, u64, []const u8, []const u8, ?u32, @import("../usermgr/row_policy_authority.zig").Purpose) anyerror!Result,
 };
 
 pub const TableReadAuthorization = TableWriteAuthorization;

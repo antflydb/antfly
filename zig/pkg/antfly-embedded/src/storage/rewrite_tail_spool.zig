@@ -17,7 +17,7 @@
 //! source generation. Its receipt is not target progress: only the shared
 //! restore page's replicated CAS can acknowledge transformed effects.
 const std = @import("std");
-const contract = @import("db/relational_rewrite_contract.zig");
+const contract = @import("db/relational/schema_change/rewrite_contract.zig");
 const staging = @import("db/restore_staging_contract.zig");
 const native = @import("db/native_backup.zig");
 const fs = @import("antfly_runtime_fs").fs_paths;

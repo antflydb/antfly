@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 const db_core = @import("core.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 const graph_exec = @import("query/graph_exec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const planning_stats = @import("planning_stats.zig");
@@ -82,7 +82,7 @@ pub fn resolveDenseIndexEstimate(
         .sparse = false,
         .doc_count = entry.index.stats().active_count,
         .dims = entry.dims,
-        .chunk_backed = entry.chunk_name != null,
+        .chunk_backed = entry.memberBacked(),
     };
 }
 
@@ -137,7 +137,7 @@ pub fn appendDenseQueryCost(
     dense: types.DenseKnnQuery,
 ) !void {
     const entry = core.denseIndex(index_name) orelse return error.IndexNotFound;
-    const chunk_backed = entry.chunk_name != null;
+    const chunk_backed = entry.memberBacked();
     const group_chunk_parents = query_search.shouldGroupChunkParents(req, chunk_backed);
     const effective_k: u64 = if (group_chunk_parents)
         entry.index.metadata.active_count

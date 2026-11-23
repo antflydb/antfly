@@ -208,20 +208,12 @@ pub const WebGpuPartitionExecutor = struct {
             return false;
         }
 
-        var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-        defer rt_map.deinit(allocator);
-        var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-        defer donated.deinit(allocator);
+        var runtime_input_index = try exec_ctx.runtimeInputIndex(allocator, options);
+        defer runtime_input_index.deinit(allocator);
+        const rt_map = runtime_input_index.values;
+        const donated = runtime_input_index.donated;
         var pair_second: ?CT = null;
         defer if (pair_second) |ct| cb.free(ct);
-        if (options.runtime_inputs) |inputs| {
-            for (inputs, 0..) |ri, idx| {
-                try rt_map.put(allocator, ri.node_id, ri.value);
-                if (options.donate) |donate| {
-                    if (idx < donate.len and donate[idx]) try donated.put(allocator, ri.node_id, {});
-                }
-            }
-        }
 
         for (node_ids) |node_id| {
             try exec_ctx.check();
@@ -442,11 +434,16 @@ fn executeCommandNode(
             const rhs = valueFor(values, inputs[1]) orelse return error.MissingValue;
             break :blk try cb.multiply(lhs, rhs);
         },
-        .fused_add_mul_scalar => blk: {
+        .fused_add_mul_scalar => |attrs| blk: {
             const lhs = valueFor(values, inputs[0]) orelse return error.MissingValue;
             const rhs = valueFor(values, inputs[1]) orelse return error.MissingValue;
             const scalar = valueFor(values, inputs[2]) orelse return error.MissingValue;
-            if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
+            if (attrs.scale_before_add) {
+                if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
+                const scaled = try cb.multiply(lhs, scalar);
+                defer cb.free(scaled);
+                break :blk try cb.add(scaled, rhs);
+            }
             const sum = try cb.add(lhs, rhs);
             errdefer cb.free(sum);
             const scaled = try cb.multiply(sum, scalar);

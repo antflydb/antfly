@@ -79,6 +79,7 @@ pub const Filter = union(enum) {
             .wildcard => |*f| f.control = control,
             .regexp => |*f| f.control = control,
             .term_range => |*f| f.control = control,
+            inline .range, .date_range, .bool_field => |*f| f.control = control,
             else => {},
         }
         return result;
@@ -121,6 +122,31 @@ pub const Filter = union(enum) {
             .bool_filter => |f| f.executeWithOffset(alloc, seg, doc_offset),
             .doc_num => |f| f.executeWithOffset(alloc, seg, doc_offset),
             else => self.execute(alloc, seg),
+        };
+    }
+
+    pub fn executeWithinScope(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry, offset: u32, scope: *const roaring.RoaringBitmap, control: ExecutionControl) FilterError!roaring.RoaringBitmap {
+        try control.check();
+        if (scope.cardinality() == 0) return roaring.RoaringBitmap.init(alloc);
+        return switch (self.withControl(control)) {
+            .match_all => scope.cloneExact(alloc),
+            .match_none => roaring.RoaringBitmap.init(alloc),
+            .bool_filter => |f| f.executeWithScope(alloc, seg, offset, scope),
+            .doc_num => |f| f.refine(alloc, seg, offset, scope),
+            .term => |f| f.executeWithScope(alloc, seg, scope, control),
+            .phrase => |f| f.executeWithScope(alloc, seg, scope, control),
+            .multi_phrase => |f| f.executeWithScope(alloc, seg, scope, control),
+            .prefix => |f| f.executeInternal(alloc, seg, false, null, scope),
+            .fuzzy => |f| f.executeInternal(alloc, seg, false, null, scope),
+            .regexp => |f| f.executeInternal(alloc, seg, false, null, scope),
+            .term_range => |f| f.executeWithScope(alloc, seg, scope),
+            .wildcard => |f| f.executeInternal(alloc, seg, false, null, scope),
+            inline .range, .date_range, .bool_field => |f| f.executeWithScope(alloc, seg, scope),
+            else => {
+                var rows = try self.withControl(control).executeWithOffset(alloc, seg, offset);
+                rows.andWith(scope);
+                return rows;
+            },
         };
     }
 
@@ -224,13 +250,15 @@ pub const ExactTermProbe = struct {
 /// missing terms are false and unsupported leaves decline before execution.
 pub const PredicateProbePlan = struct {
     const Boolean = struct { start: u8, must: u8, should: u8, excluded: u8, minimum: u32, control: ExecutionControl };
-    const Node = union(enum) { constant: bool, term: u8, doc_num: DocNumFilter, boolean: Boolean };
+    const Node = union(enum) { constant: bool, term: u8, range: u8, doc_num: DocNumFilter, boolean: Boolean };
     nodes: [128]Node = undefined,
     children: [128]u8 = undefined,
     terms: [32]Filter = undefined,
     node_count: usize = 0,
     child_count: usize = 0,
     term_count: usize = 0,
+    ranges: [16]RangeFilter = undefined,
+    range_count: usize = 0,
     has_batch_producer: bool = false,
     control: ExecutionControl = .{},
     pub fn compile(filter: Filter) !?PredicateProbePlan {
@@ -250,7 +278,7 @@ pub const PredicateProbePlan = struct {
         try self.control.check();
         return switch (self.nodes[index]) {
             .constant => |value| if (value) count else 0,
-            .term => count,
+            .term, .range => count,
             .doc_num => |filter| blk: {
                 if (filter.producer != null) break :blk count;
                 const end = @as(u64, offset) + count;
@@ -302,6 +330,13 @@ pub const PredicateProbePlan = struct {
                 self.term_count += 1;
                 break :value .{ .term = i };
             },
+            .range => |range| value: {
+                if (self.range_count == self.ranges.len) return error.UnsupportedPredicateProbe;
+                const i: u8 = @intCast(self.range_count);
+                self.ranges[i] = range;
+                self.range_count += 1;
+                break :value .{ .range = i };
+            },
             .doc_num => |filter_| value: {
                 if (filter_.producer) |producer| {
                     self.has_batch_producer = self.has_batch_producer or producer.contains_many != null;
@@ -344,19 +379,38 @@ pub const ExactPredicateProbe = struct {
     plan: *const PredicateProbePlan,
     terms: [32]?ExactTermProbe = @splat(null),
     opened: [32]bool = @splat(false),
+    range_readers: [16]?*typed_dv.TypedDocValuesReader = @splat(null),
+    ranges_opened: [16]bool = @splat(false),
+    range_lease: ?index_mod.IndexSnapshot.SegmentLease = null,
+    range_cache: ?*typed_dv.TypedDocValuesReader.PointCache = null,
+    range_cache_attempted: bool = false,
     snapshot: *const index_mod.IndexSnapshot,
     ordinal: usize,
     offset: u32,
     pub fn create(a: Allocator, plan: *const PredicateProbePlan, snapshot: *const index_mod.IndexSnapshot, ordinal: usize, offset: u32) !?*ExactPredicateProbe {
         var lease = try snapshot.leaseSegment(ordinal);
-        defer lease.deinit();
+        var transfer = false;
+        defer if (!transfer) lease.deinit();
         for (plan.terms[0..plan.term_count]) |term| if (try lease.entry.reader.getSection(term.term.field, .synonym) != null) return null;
         const self = try a.create(ExactPredicateProbe);
         self.* = .{ .a = a, .plan = plan, .snapshot = snapshot, .ordinal = ordinal, .offset = offset };
+        if (plan.range_count != 0) {
+            self.range_lease = lease;
+            transfer = true;
+        }
         return self;
     }
     pub fn destroy(self: *@This()) void {
         for (&self.terms) |*term| if (term.*) |*probe| probe.deinit();
+        if (self.range_cache) |cache| {
+            cache.deinit();
+            self.a.destroy(cache);
+        }
+        for (self.range_readers) |optional| if (optional) |reader| {
+            reader.deinit();
+            self.a.destroy(reader);
+        };
+        if (self.range_lease) |*lease| lease.deinit();
         self.a.destroy(self);
     }
     pub fn contains(self: *@This(), doc: u32) !bool {
@@ -377,7 +431,7 @@ pub const ExactPredicateProbe = struct {
         try self.plan.control.check();
         return switch (self.plan.nodes[index]) {
             .constant => |value| if (value) active else 0,
-            .term => blk: {
+            .term, .range => blk: {
                 var result: u64 = 0;
                 var remaining = active;
                 while (remaining != 0) {
@@ -466,6 +520,34 @@ pub const ExactPredicateProbe = struct {
                     self.opened[i] = true;
                 }
                 break :value if (self.terms[i]) |*term| try term.contains(doc) else false;
+            },
+            .range => |i| value: {
+                const range = self.plan.ranges[i];
+                try range.control.check();
+                if (!self.ranges_opened[i]) {
+                    if (try self.range_lease.?.entry.reader.typedDocValuesScoped(self.a, range.field)) |opened| {
+                        var reader = opened;
+                        errdefer reader.deinit();
+                        if (!self.range_cache_attempted) {
+                            self.range_cache_attempted = true;
+                            if (self.a.create(typed_dv.TypedDocValuesReader.PointCache)) |cache| {
+                                cache.* = .{ .allocator = self.a, .byte_budget = 64 * 1024 };
+                                self.range_cache = cache;
+                            } else |_| {}
+                        }
+                        if (self.range_cache) |cache| {
+                            reader.point_cache = cache;
+                            reader.owns_point_cache = false;
+                            reader.optional_point_cache = true;
+                        }
+                        const owned = try self.a.create(typed_dv.TypedDocValuesReader);
+                        owned.* = reader;
+                        self.range_readers[i] = owned;
+                    }
+                    self.ranges_opened[i] = true;
+                }
+                const reader = self.range_readers[i] orelse break :value false;
+                break :value try range.matchesDocument(reader, doc);
             },
             .doc_num => |filter_| value: {
                 const global = try std.math.add(u32, self.offset, doc);
@@ -794,6 +876,10 @@ pub const TermFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithScope(alloc, seg, null, .{});
+    }
+
+    fn executeWithScope(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: ?*const roaring.RoaringBitmap, control: ExecutionControl) FilterError!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -803,14 +889,7 @@ pub const TermFilter = struct {
 
         // Look up the primary term
         if ((try inv_reader.lookup(self.term))) |lookup_result| {
-            switch (lookup_result) {
-                .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
-                    defer bm.deinit();
-                    try result.orWith(&bm);
-                },
-                .one_hit => |h| try result.add(h.doc_num),
-            }
+            try addTermMembership(alloc, &result, lookup_result, scope, control);
         }
 
         // Synonym expansion: check if field has a synonym section
@@ -833,14 +912,7 @@ pub const TermFilter = struct {
                 for (terms) |syn_term| {
                     if (std.mem.eql(u8, syn_term, self.term)) continue; // skip primary
                     if ((try inv_reader.lookup(syn_term))) |syn_result| {
-                        switch (syn_result) {
-                            .postings => |p| {
-                                var bm = try p.docBitmap(alloc);
-                                defer bm.deinit();
-                                try result.orWith(&bm);
-                            },
-                            .one_hit => |h| try result.add(h.doc_num),
-                        }
+                        try addTermMembership(alloc, &result, syn_result, scope, control);
                     }
                 }
             }
@@ -872,13 +944,22 @@ pub const BoolFilter = struct {
     }
 
     pub fn executeWithOffset(self: BoolFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
+        return self.executeWithScope(alloc, seg, doc_offset, null);
+    }
+
+    fn executeWithScope(self: BoolFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32, scope: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
         var result: ?roaring.RoaringBitmap = null;
         errdefer if (result) |*r| r.deinit();
 
         // Process must clauses (AND)
         for (self.must) |clause| {
             try self.control.check();
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
+            var clause_bm = if (scope) |domain|
+                try clause.executeWithinScope(alloc, seg, doc_offset, if (result) |*rows| rows else domain, self.control)
+            else if (clause == .doc_num)
+                try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null)
+            else
+                try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
             if (result) |*r| {
                 r.andWith(&clause_bm);
                 clause_bm.deinit();
@@ -891,7 +972,7 @@ pub const BoolFilter = struct {
         if (self.should.len > 0) {
             const required_should: u32 = if (self.min_should_match == 0 and result == null) 1 else self.min_should_match;
             if (required_should > 0) {
-                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset, self.control);
+                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset, self.control, if (scope != null and result != null) &result.? else scope);
                 errdefer should_bm.deinit();
                 if (result) |*r| {
                     r.andWith(&should_bm);
@@ -910,7 +991,12 @@ pub const BoolFilter = struct {
         // Process must_not clauses (ANDNOT)
         for (self.must_not) |clause| {
             try self.control.check();
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
+            var clause_bm = if (scope != null)
+                try clause.executeWithinScope(alloc, seg, doc_offset, &result.?, self.control)
+            else if (clause == .doc_num)
+                try clause.doc_num.refine(alloc, seg, doc_offset, &result.?)
+            else
+                try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             result.?.andNotWith(&clause_bm);
         }
@@ -926,6 +1012,7 @@ fn executeShouldClauses(
     seg: *const index_mod.SegmentEntry,
     doc_offset: u32,
     control: ExecutionControl,
+    scope: ?*const roaring.RoaringBitmap,
 ) FilterError!roaring.RoaringBitmap {
     if (min_should_match > should.len) {
         return roaring.RoaringBitmap.init(alloc);
@@ -936,7 +1023,7 @@ fn executeShouldClauses(
         errdefer result.deinit();
         for (should) |clause| {
             try control.check();
-            var clause_bm = try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
+            var clause_bm = if (scope) |domain| try clause.executeWithinScope(alloc, seg, doc_offset, domain, control) else try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             try result.orWith(&clause_bm);
         }
@@ -948,7 +1035,7 @@ fn executeShouldClauses(
 
     for (should) |clause| {
         try control.check();
-        var clause_bm = try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
+        var clause_bm = if (scope) |domain| try clause.executeWithinScope(alloc, seg, doc_offset, domain, control) else try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
         defer clause_bm.deinit();
 
         var iter = clause_bm.iterator();
@@ -991,7 +1078,7 @@ pub const PrefixFilter = struct {
     };
 
     pub fn execute(self: PrefixFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        return self.executeInternal(alloc, seg, false, null);
+        return self.executeInternal(alloc, seg, false, null, null);
     }
 
     pub fn executeWithStats(
@@ -1001,7 +1088,7 @@ pub const PrefixFilter = struct {
         stats: *ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         stats.* = .{};
-        return self.executeInternal(alloc, seg, true, stats);
+        return self.executeInternal(alloc, seg, true, stats, null);
     }
 
     fn executeInternal(
@@ -1010,6 +1097,7 @@ pub const PrefixFilter = struct {
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
+        scope: ?*const roaring.RoaringBitmap,
     ) FilterError!roaring.RoaringBitmap {
         if (self.indexed_field) |indexed_field| {
             if (try seg.reader.invertedIndexScoped(alloc, indexed_field)) |opened| {
@@ -1019,14 +1107,7 @@ pub const PrefixFilter = struct {
                 errdefer exact.deinit();
                 if ((try indexed_reader.lookup(self.prefix))) |lookup| {
                     if (comptime collect_stats) stats.?.matching_terms = 1;
-                    switch (lookup) {
-                        .postings => |postings| {
-                            var matches = try postings.docBitmap(alloc);
-                            defer matches.deinit();
-                            try exact.orWith(&matches);
-                        },
-                        .one_hit => |hit| try exact.add(hit.doc_num),
-                    }
+                    try addTermMembership(alloc, &exact, lookup, scope, self.control);
                 }
                 return exact;
             }
@@ -1060,7 +1141,7 @@ pub const PrefixFilter = struct {
             }
             if (comptime collect_stats) stats.?.matching_terms += 1;
             try self.control.check();
-            try unionTermEntry(alloc, &result, entry, self.control);
+            if (try addPatternMembership(alloc, &result, entry, scope, self.control)) break;
         }
 
         return result;
@@ -1078,12 +1159,16 @@ pub const PhraseFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: PhraseFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithScope(alloc, seg, null, .{});
+    }
+
+    fn executeWithScope(self: PhraseFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: ?*const roaring.RoaringBitmap, control: ExecutionControl) FilterError!roaring.RoaringBitmap {
         if (self.terms.len == 0) return roaring.RoaringBitmap.init(alloc);
         if (self.terms.len == 1) {
             // Single-term phrase is just a term filter
             if (!self.auto_fuzzy and self.max_edits == 0) {
                 const tf = TermFilter{ .field = self.field, .term = self.terms[0] };
-                return tf.execute(alloc, seg);
+                return tf.executeWithScope(alloc, seg, scope, control);
             }
         }
 
@@ -1107,7 +1192,7 @@ pub const PhraseFilter = struct {
                 .max_edits = self.max_edits,
                 .auto_fuzzy = self.auto_fuzzy,
             };
-            return multi.execute(alloc, seg);
+            return multi.executeWithScope(alloc, seg, scope, control);
         }
 
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
@@ -1129,6 +1214,7 @@ pub const PhraseFilter = struct {
             };
             try lookups.append(alloc, lr);
 
+            if (scope != null) continue;
             switch (lr) {
                 .postings => |p| {
                     var bm = try p.docBitmap(alloc);
@@ -1152,7 +1238,7 @@ pub const PhraseFilter = struct {
             }
         }
 
-        const candidates = candidate_bm orelse return roaring.RoaringBitmap.init(alloc);
+        const candidates = scope orelse if (candidate_bm) |*bitmap| bitmap else return roaring.RoaringBitmap.init(alloc);
 
         // Step 2: Seek each term iterator in candidate order. Packed position
         // records for non-candidates are skipped without unpacking their
@@ -1181,9 +1267,12 @@ pub const PhraseFilter = struct {
         // adjacency/slop directly from the iterators' reusable buffers.
         var cand_iter = candidates.iterator();
         while (cand_iter.next()) |doc_id| {
+            try control.check();
             var aligned = true;
             for (states) |*state| {
-                state.current = try state.iter.advanceToWithPositions(doc_id);
+                if (state.current == null or state.current.?.doc_id < doc_id) {
+                    state.current = try state.iter.advanceToWithPositions(doc_id);
+                }
                 if (state.current == null or state.current.?.doc_id != doc_id) {
                     aligned = false;
                     break;
@@ -1244,6 +1333,32 @@ pub const AutomatonExecutionStats = struct {
 };
 
 /// Union the postings of one dictionary entry into `result`.
+fn addTermMembership(alloc: Allocator, result: *roaring.RoaringBitmap, lookup: inverted.LookupResult, scope: ?*const roaring.RoaringBitmap, control: ExecutionControl) FilterError!void {
+    if (scope) |domain| {
+        switch (lookup) {
+            .postings => |p| {
+                var postings = try p.iterator(alloc);
+                defer postings.deinit();
+                var docs = domain.iterator();
+                while (docs.next()) |doc| {
+                    try control.check();
+                    if (!result.contains(doc) and try postings.containsDoc(doc)) try result.add(doc);
+                }
+            },
+            .one_hit => |hit| if (domain.contains(hit.doc_num)) try result.add(hit.doc_num),
+        }
+        return;
+    }
+    switch (lookup) {
+        .postings => |p| {
+            var bitmap = try p.docBitmap(alloc);
+            defer bitmap.deinit();
+            try result.orWith(&bitmap);
+        },
+        .one_hit => |hit| try result.add(hit.doc_num),
+    }
+}
+
 fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry, control: ExecutionControl) FilterError!void {
     try control.check();
     switch (entry.result) {
@@ -1266,6 +1381,15 @@ fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inver
 
 /// Drain an automaton term iterator into `result`, optionally recording
 /// diagnostics. `accept` gets a final say on each automaton-accepted term.
+fn addPatternMembership(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry, scope: ?*const roaring.RoaringBitmap, control: ExecutionControl) FilterError!bool {
+    if (scope) |domain| {
+        try addTermMembership(alloc, result, entry.result, domain, control);
+        return result.cardinality() == domain.cardinality();
+    }
+    try unionTermEntry(alloc, result, entry, control);
+    return false;
+}
+
 fn collectAutomatonTerms(
     alloc: Allocator,
     term_iter: *inverted.ScopedInvertedIndexReader.Iterator,
@@ -1274,6 +1398,7 @@ fn collectAutomatonTerms(
     comptime accept: fn (@TypeOf(context), []const u8) bool,
     comptime collect_stats: bool,
     stats: ?*AutomatonExecutionStats,
+    scope: ?*const roaring.RoaringBitmap,
 ) FilterError!void {
     term_iter.setControl(context.control);
     while (true) {
@@ -1285,7 +1410,7 @@ fn collectAutomatonTerms(
         const entry = next_entry orelse break;
         if (!accept(context, entry.term)) continue;
         if (comptime collect_stats) stats.?.matching_terms += 1;
-        try unionTermEntry(alloc, result, entry, context.control);
+        if (try addPatternMembership(alloc, result, entry, scope, context.control)) break;
     }
     if (comptime collect_stats) stats.?.blocks_pruned = term_iter.blocksPruned();
 }
@@ -1302,7 +1427,7 @@ pub const FuzzyFilter = struct {
     pub const ExecutionStats = AutomatonExecutionStats;
 
     pub fn execute(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        return self.executeInternal(alloc, seg, false, null);
+        return self.executeInternal(alloc, seg, false, null, null);
     }
 
     pub fn executeWithStats(
@@ -1312,23 +1437,23 @@ pub const FuzzyFilter = struct {
         stats: *ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         stats.* = .{};
-        return self.executeInternal(alloc, seg, true, stats);
+        return self.executeInternal(alloc, seg, true, stats, null);
     }
 
     fn acceptTerm(self: FuzzyFilter, term: []const u8) bool {
         return fuzzyPrefixMatches(self.term, term, self.prefix_len);
     }
 
-    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats, scope: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
         const original_stats = if (stats) |value| value.* else null;
-        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+        return self.executeAttempt(alloc, seg, collect_stats, stats, scope) catch |err| switch (err) {
             error.PatternProgramBudgetExceeded => blk: {
                 // The failed attempt has released its reader, iterator and
                 // execution lease before the private traversal starts.
                 var fallback = self;
                 fallback.control.pattern_programs = null;
                 if (stats) |value| value.* = original_stats.?;
-                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats, scope) catch |failure| switch (failure) {
                     error.PatternProgramBudgetExceeded => unreachable,
                     else => return failure,
                 };
@@ -1343,6 +1468,7 @@ pub const FuzzyFilter = struct {
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
+        scope: ?*const roaring.RoaringBitmap,
     ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
@@ -1363,7 +1489,7 @@ pub const FuzzyFilter = struct {
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats, scope);
         if (lev.allocation_failed) {
             if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
                 return error.PatternProgramBudgetExceeded;
@@ -1406,7 +1532,7 @@ pub const RegexpFilter = struct {
     pub const ExecutionStats = AutomatonExecutionStats;
 
     pub fn execute(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        return self.executeInternal(alloc, seg, false, null);
+        return self.executeInternal(alloc, seg, false, null, null);
     }
 
     pub fn executeWithStats(
@@ -1416,23 +1542,23 @@ pub const RegexpFilter = struct {
         stats: *ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         stats.* = .{};
-        return self.executeInternal(alloc, seg, true, stats);
+        return self.executeInternal(alloc, seg, true, stats, null);
     }
 
     fn acceptTerm(_: RegexpFilter, _: []const u8) bool {
         return true;
     }
 
-    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats, scope: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
         const original_stats = if (stats) |value| value.* else null;
-        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+        return self.executeAttempt(alloc, seg, collect_stats, stats, scope) catch |err| switch (err) {
             error.PatternProgramBudgetExceeded => blk: {
                 // The failed attempt has released its reader, iterator and
                 // execution lease before the private traversal starts.
                 var fallback = self;
                 fallback.control.pattern_programs = null;
                 if (stats) |value| value.* = original_stats.?;
-                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats, scope) catch |failure| switch (failure) {
                     error.PatternProgramBudgetExceeded => unreachable,
                     else => return failure,
                 };
@@ -1447,6 +1573,7 @@ pub const RegexpFilter = struct {
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
+        scope: ?*const roaring.RoaringBitmap,
     ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
@@ -1472,7 +1599,7 @@ pub const RegexpFilter = struct {
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats, scope);
         if (regex.allocation_failed) {
             if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
                 return error.PatternProgramBudgetExceeded;
@@ -1495,6 +1622,10 @@ pub const TermRangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: TermRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithScope(alloc, seg, null);
+    }
+
+    fn executeWithScope(self: TermRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -1528,7 +1659,7 @@ pub const TermRangeFilter = struct {
                     if (std.mem.eql(u8, entry.term, m)) continue;
                 }
             }
-            try unionTermEntry(alloc, &result, entry, self.control);
+            if (try addPatternMembership(alloc, &result, entry, scope, self.control)) break;
         }
 
         return result;
@@ -1682,15 +1813,27 @@ pub const GeoShapeFilter = struct {
 /// Numeric range filter: matches documents with f64 typed doc values in a range.
 /// Default: [min, max) — inclusive min, exclusive max.
 pub const RangeFilter = struct {
+    pub const ExactBounds = struct {
+        min: ?typed_dv.NumericValue,
+        max: ?typed_dv.NumericValue,
+    };
+
     field: []const u8,
     min_val: ?f64 = null,
     max_val: ?f64 = null,
+    exact_bounds: ?ExactBounds = null,
+    require_numeric_column: bool = false,
     inclusive_min: bool = true,
     inclusive_max: bool = false,
     boost: f32 = 1.0,
+    control: ExecutionControl = .{},
 
     pub fn execute(self: RangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
+        try self.control.check();
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse {
+            if (self.require_numeric_column) return error.InvalidSegment;
+            return roaring.RoaringBitmap.init(alloc);
+        };
         defer reader.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
@@ -1698,25 +1841,77 @@ pub const RangeFilter = struct {
 
         switch (reader.value_type) {
             .u64_val, .i64_val, .f64_val, .numeric_val => {},
-            else => return result,
+            else => {
+                if (self.require_numeric_column) return error.InvalidSegment;
+                return result;
+            },
         }
         var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
         defer cursor.deinit();
-        while (try cursor.next()) |entry| {
+        var visited: usize = 0;
+        while (try cursor.next()) |entry| : (visited += 1) {
+            if ((visited & 1023) == 0) try self.control.check();
             if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
             const doc_id = entry.doc_id;
-            const numeric_value: ?f64 = switch (entry.value) {
-                .f64_val => |value| value,
-                .i64_val => |value| @floatFromInt(value),
-                .u64_val => |value| @floatFromInt(value),
-                .numeric_val => |value| typed_dv.numericValueAsF64(value),
-                else => null,
+            const value: typed_dv.NumericValue = switch (entry.value) {
+                inline .f64_val, .i64_val, .u64_val => |number, tag| @unionInit(typed_dv.NumericValue, @tagName(tag), number),
+                .numeric_val => |number| number,
+                else => continue,
             };
-            const value = numeric_value orelse continue;
-            if (self.matches(value)) try result.add(@intCast(doc_id));
+            if (self.matchesNumeric(value)) try result.add(@intCast(doc_id));
         }
 
         return result;
+    }
+
+    fn executeWithScope(self: RangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: *const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
+        var result = roaring.RoaringBitmap.init(alloc);
+        errdefer result.deinit();
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse {
+            if (self.require_numeric_column) return error.InvalidSegment;
+            return result;
+        };
+        defer reader.deinit();
+        if (scope.cardinality() > 1) reader.enableOptionalPointCache(64 * 1024);
+        var docs = scope.iterator();
+        while (docs.next()) |doc| {
+            try self.control.check();
+            if (try self.matchesDocument(&reader, doc)) try result.add(doc);
+        }
+        return result;
+    }
+
+    fn matchesDocument(self: RangeFilter, reader: *const typed_dv.TypedDocValuesReader, doc: u32) !bool {
+        const value: typed_dv.NumericValue = switch (reader.value_type) {
+            .f64_val => .{ .f64_val = (try reader.getF64(doc)) orelse return false },
+            .i64_val => .{ .i64_val = (try reader.getI64(doc)) orelse return false },
+            .u64_val => .{ .u64_val = (try reader.getU64(doc)) orelse return false },
+            .numeric_val => (try reader.getNumeric(doc)) orelse return false,
+            else => {
+                if (self.require_numeric_column) return error.InvalidSegment;
+                return false;
+            },
+        };
+        return self.matchesNumeric(value);
+    }
+
+    fn matchesNumeric(self: RangeFilter, value: typed_dv.NumericValue) bool {
+        return if (self.exact_bounds) |bounds|
+            self.matchesExact(value, bounds)
+        else
+            self.matches(typed_dv.numericValueAsF64(value));
+    }
+
+    fn matchesExact(self: RangeFilter, value: typed_dv.NumericValue, bounds: ExactBounds) bool {
+        if (bounds.min) |min| {
+            const order = typed_dv.compareNumericValues(value, min);
+            if (order == .lt or (order == .eq and !self.inclusive_min)) return false;
+        }
+        if (bounds.max) |max| {
+            const order = typed_dv.compareNumericValues(value, max);
+            if (order == .gt or (order == .eq and !self.inclusive_max)) return false;
+        }
+        return true;
     }
 
     fn matches(self: RangeFilter, value: f64) bool {
@@ -2077,6 +2272,14 @@ fn addGeoCellCandidatesToBitmap(
 
 /// Multi-phrase filter: like PhraseFilter but allows alternative terms at each position.
 /// e.g., [["hello","hi"], ["world","earth"]] matches "hello world" or "hi earth" etc.
+fn rememberPhraseTerm(alloc: Allocator, terms: *std.StringHashMapUnmanaged(void), term: []const u8) !bool {
+    if (terms.contains(term)) return false;
+    const owned = try alloc.dupe(u8, term);
+    errdefer alloc.free(owned);
+    try terms.put(alloc, owned, {});
+    return true;
+}
+
 pub const MultiPhraseFilter = struct {
     field: []const u8,
     term_alternatives: []const []const []const u8,
@@ -2085,6 +2288,10 @@ pub const MultiPhraseFilter = struct {
     auto_fuzzy: bool = false,
 
     pub fn execute(self: MultiPhraseFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithScope(alloc, seg, null, .{});
+    }
+
+    fn executeWithScope(self: MultiPhraseFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: ?*const roaring.RoaringBitmap, control: ExecutionControl) FilterError!roaring.RoaringBitmap {
         if (self.term_alternatives.len == 0) return roaring.RoaringBitmap.init(alloc);
 
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
@@ -2109,32 +2316,21 @@ pub const MultiPhraseFilter = struct {
             errdefer pos_bm.deinit();
             var any_found = false;
             var seen_terms: std.StringHashMapUnmanaged(void) = .empty;
-            var owned_seen_terms = std.ArrayListUnmanaged([]const u8).empty;
             defer {
-                for (owned_seen_terms.items) |owned_term| alloc.free(owned_term);
-                owned_seen_terms.deinit(alloc);
+                var keys = seen_terms.keyIterator();
+                while (keys.next()) |key| alloc.free(key.*);
                 seen_terms.deinit(alloc);
             }
 
             for (alternatives) |term| {
                 const fuzziness = if (self.auto_fuzzy) autoFuzziness(term) else self.max_edits;
                 if (fuzziness == 0) {
-                    if (seen_terms.contains(term)) continue;
-                    const owned_term = try alloc.dupe(u8, term);
-                    errdefer alloc.free(owned_term);
-                    try seen_terms.put(alloc, owned_term, {});
-                    try owned_seen_terms.append(alloc, owned_term);
+                    try control.check();
+                    if (!try rememberPhraseTerm(alloc, &seen_terms, term)) continue;
                     const lr = (try inv_reader.lookup(term)) orelse continue;
                     try position_lookups[pos_idx].append(alloc, lr);
                     any_found = true;
-                    switch (lr) {
-                        .postings => |p| {
-                            var bm = try p.docBitmap(alloc);
-                            defer bm.deinit();
-                            try pos_bm.orWith(&bm);
-                        },
-                        .one_hit => |h| try pos_bm.add(h.doc_num),
-                    }
+                    try addTermMembership(alloc, &pos_bm, lr, if (candidate_bm) |*existing| if (scope != null) existing else null else scope, control);
                     continue;
                 }
 
@@ -2144,22 +2340,12 @@ pub const MultiPhraseFilter = struct {
                     alloc.free(expanded_terms);
                 }
                 for (expanded_terms) |expanded_term| {
-                    if (seen_terms.contains(expanded_term)) continue;
-                    const owned_term = try alloc.dupe(u8, expanded_term);
-                    errdefer alloc.free(owned_term);
-                    try seen_terms.put(alloc, owned_term, {});
-                    try owned_seen_terms.append(alloc, owned_term);
+                    try control.check();
+                    if (!try rememberPhraseTerm(alloc, &seen_terms, expanded_term)) continue;
                     const lr = (try inv_reader.lookup(expanded_term)) orelse continue;
                     try position_lookups[pos_idx].append(alloc, lr);
                     any_found = true;
-                    switch (lr) {
-                        .postings => |p| {
-                            var bm = try p.docBitmap(alloc);
-                            defer bm.deinit();
-                            try pos_bm.orWith(&bm);
-                        },
-                        .one_hit => |h| try pos_bm.add(h.doc_num),
-                    }
+                    try addTermMembership(alloc, &pos_bm, lr, if (candidate_bm) |*existing| if (scope != null) existing else null else scope, control);
                 }
             }
 
@@ -2176,7 +2362,7 @@ pub const MultiPhraseFilter = struct {
             }
         }
 
-        const candidates = candidate_bm orelse return roaring.RoaringBitmap.init(alloc);
+        const candidates = if (candidate_bm) |*bitmap| bitmap else return roaring.RoaringBitmap.init(alloc);
 
         // Step 2: Build position maps for each lookup
         const all_position_maps = try alloc.alloc(std.ArrayListUnmanaged(std.AutoHashMapUnmanaged(u32, []const u32)), num_positions);
@@ -2192,19 +2378,31 @@ pub const MultiPhraseFilter = struct {
             alloc.free(all_position_maps);
         }
 
+        @memset(all_position_maps, .empty);
         for (all_position_maps, 0..) |*pos_maps, pos_idx| {
-            pos_maps.* = .empty;
             for (position_lookups[pos_idx].items) |lr| {
-                var pm: std.AutoHashMapUnmanaged(u32, []const u32) = .empty;
+                const pm = try pos_maps.addOne(alloc);
+                pm.* = .empty;
                 var post_iter = try lr.iterator(alloc);
                 defer post_iter.deinit();
-                while (try post_iter.next()) |hit| {
-                    if (candidates.contains(hit.doc_id)) {
-                        const pos_copy = try alloc.dupe(u32, hit.positions);
-                        try pm.put(alloc, hit.doc_id, pos_copy);
+                if (scope != null) {
+                    var docs = candidates.iterator();
+                    var current: ?inverted.PostingsIterator.Hit = null;
+                    while (docs.next()) |doc| {
+                        try control.check();
+                        if (current == null or current.?.doc_id < doc) current = try post_iter.advanceToWithPositions(doc);
+                        const hit = current orelse break;
+                        if (hit.doc_id != doc) continue;
+                        const copy = try alloc.dupe(u32, hit.positions);
+                        errdefer alloc.free(copy);
+                        try pm.put(alloc, doc, copy);
                     }
+                } else while (try post_iter.next()) |hit| {
+                    if (!candidates.contains(hit.doc_id)) continue;
+                    const copy = try alloc.dupe(u32, hit.positions);
+                    errdefer alloc.free(copy);
+                    try pm.put(alloc, hit.doc_id, copy);
                 }
-                try pos_maps.append(alloc, pm);
             }
         }
 
@@ -2330,37 +2528,45 @@ pub const DateRangeFilter = struct {
     inclusive_start: bool = true,
     inclusive_end: bool = false,
     boost: f32 = 1.0,
+    control: ExecutionControl = .{},
 
     pub fn execute(self: DateRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
-        defer reader.deinit();
+        return self.executeWithScope(alloc, seg, null);
+    }
 
+    fn executeWithScope(self: DateRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
+        try self.control.check();
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return result;
+        defer reader.deinit();
         if (reader.value_type != .u64_val and reader.value_type != .datetime_ns) return result;
-        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
-        defer cursor.deinit();
-        while (try cursor.next()) |entry| {
-            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
-            const doc_id = entry.doc_id;
-            const val: ?i128 = if (entry.value == .datetime_ns) entry.value.datetime_ns else entry.value.u64_val;
-            if (val) |v| {
-                const above_start = if (self.start_ns) |s|
-                    (if (self.inclusive_start) v >= s else v > s)
-                else
-                    true;
-                const below_end = if (self.end_ns) |e|
-                    (if (self.inclusive_end) v <= e else v < e)
-                else
-                    true;
-                if (above_start and below_end) {
-                    try result.add(@intCast(doc_id));
-                }
+        if (scope) |domain| {
+            if (domain.cardinality() > 1) reader.enableOptionalPointCache(64 * 1024);
+            var docs = domain.iterator();
+            while (docs.next()) |doc| {
+                try self.control.check();
+                const value = (try reader.getDateTimeNs(doc)) orelse continue;
+                if (self.matches(value)) try result.add(doc);
+            }
+        } else {
+            var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+            defer cursor.deinit();
+            var visited: usize = 0;
+            while (try cursor.next()) |entry| : (visited += 1) {
+                if (visited % 256 == 0) try self.control.check();
+                if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+                const value: i128 = if (entry.value == .datetime_ns) entry.value.datetime_ns else entry.value.u64_val;
+                if (self.matches(value)) try result.add(@intCast(entry.doc_id));
             }
         }
-
         return result;
+    }
+
+    fn matches(self: DateRangeFilter, value: i128) bool {
+        if (self.start_ns) |start| if (value < start or (!self.inclusive_start and value == start)) return false;
+        if (self.end_ns) |end| if (value > end or (!self.inclusive_end and value == end)) return false;
+        return true;
     }
 };
 
@@ -2380,7 +2586,7 @@ pub const WildcardFilter = struct {
     };
 
     pub fn execute(self: WildcardFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        return self.executeInternal(alloc, seg, false, null);
+        return self.executeInternal(alloc, seg, false, null, null);
     }
 
     pub fn executeWithStats(
@@ -2390,7 +2596,7 @@ pub const WildcardFilter = struct {
         stats: *ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         stats.* = .{};
-        return self.executeInternal(alloc, seg, true, stats);
+        return self.executeInternal(alloc, seg, true, stats, null);
     }
 
     fn executeInternal(
@@ -2399,6 +2605,7 @@ pub const WildcardFilter = struct {
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
+        scope: ?*const roaring.RoaringBitmap,
     ) FilterError!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
@@ -2421,7 +2628,7 @@ pub const WildcardFilter = struct {
             if (comptime collect_stats) stats.?.exact_lookup = true;
             if ((try inv_reader.lookup(literal_prefix))) |lookup| {
                 if (comptime collect_stats) stats.?.matching_terms = 1;
-                try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup }, self.control);
+                _ = try addPatternMembership(alloc, &result, .{ .term = literal_prefix, .result = lookup }, scope, self.control);
             }
             return result;
         }
@@ -2449,7 +2656,7 @@ pub const WildcardFilter = struct {
             if (!wildcardMatch(self.pattern, entry.term)) continue;
             if (comptime collect_stats) stats.?.matching_terms += 1;
             try self.control.check();
-            try unionTermEntry(alloc, &result, entry, self.control);
+            if (try addPatternMembership(alloc, &result, entry, scope, self.control)) break;
         }
 
         return result;
@@ -2599,28 +2806,37 @@ pub const DocNumFilter = struct {
 pub const BoolFieldFilter = struct {
     field: []const u8,
     value: bool,
+    control: ExecutionControl = .{},
 
     pub fn execute(self: BoolFieldFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
-        defer reader.deinit();
+        return self.executeWithScope(alloc, seg, null);
+    }
 
+    fn executeWithScope(self: BoolFieldFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, scope: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
+        try self.control.check();
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return result;
+        defer reader.deinit();
         if (reader.value_type != .bool_val) return result;
-        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
-        defer cursor.deinit();
-        while (try cursor.next()) |entry| {
-            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
-            const doc_id = entry.doc_id;
-            const val = @as(?@TypeOf(entry.value.bool_val), entry.value.bool_val);
-            if (val) |v| {
-                if (v == self.value) {
-                    try result.add(@intCast(doc_id));
-                }
+        if (scope) |domain| {
+            if (domain.cardinality() > 1) reader.enableOptionalPointCache(64 * 1024);
+            var docs = domain.iterator();
+            while (docs.next()) |doc| {
+                try self.control.check();
+                const value = (try reader.getBool(doc)) orelse continue;
+                if (value == self.value) try result.add(doc);
+            }
+        } else {
+            var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+            defer cursor.deinit();
+            var visited: usize = 0;
+            while (try cursor.next()) |entry| : (visited += 1) {
+                if (visited % 256 == 0) try self.control.check();
+                if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+                if (entry.value.bool_val == self.value) try result.add(@intCast(entry.doc_id));
             }
         }
-
         return result;
     }
 };
@@ -2678,7 +2894,10 @@ pub fn executeFilterBitmap(
 
     var doc_offset: u32 = 0;
     var has_result = false;
-    for (snap.segments, 0..) |_, segment_idx| {
+    for (snap.segments, 0..) |*physical, segment_idx| {
+        const next_offset = std.math.add(u32, doc_offset, physical.reader.doc_count) catch return error.CountOverflow;
+        defer doc_offset = next_offset;
+        if (physical.liveDocCount() == 0) continue;
         var segment_lease = try snap.leaseSegment(segment_idx);
         defer segment_lease.deinit();
         const seg = segment_lease.entry;
@@ -2690,8 +2909,6 @@ pub fn executeFilterBitmap(
             if (seg.shared.deleted) |d| local.andNotWith(&d);
         }
 
-        const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
-            return error.CountOverflow;
         var shifted = try local.addOffset(doc_offset);
         defer shifted.deinit();
         if (!has_result) {
@@ -2702,7 +2919,6 @@ pub fn executeFilterBitmap(
         } else {
             try result.orWith(&shifted);
         }
-        doc_offset = next_offset;
     }
     return result;
 }

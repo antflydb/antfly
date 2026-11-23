@@ -112,7 +112,7 @@ def write_output(path: Path | None, source: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--channel", required=True, choices=("stable", "next", "nightly")
+        "--channel", required=True, choices=tuple(load_policy()["channels"])
     )
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     parser.add_argument("--tag", required=True)

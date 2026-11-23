@@ -44,38 +44,49 @@ const Bits = struct {
         return try self.read(1) != 0;
     }
 };
-pub fn split(bytes: []const u8) !Parts {
-    if (bytes.len == 0) return error.InvalidVideoData;
-    var result: Parts = .{};
-    const marker = bytes[bytes.len - 1];
-    if (marker & 0xe0 != 0xc0) {
-        result.packets[0] = bytes;
-        result.len = 1;
-        return result;
-    }
+pub const Extents = struct {
+    sizes: [8]usize = undefined,
+    len: usize = 1,
+    pub const max_tail_bytes = 34;
+};
+
+/// A superframe index is fully described by the final 34 bytes.
+pub fn splitExtents(tail: []const u8, packet_size: usize) !Extents {
+    if (packet_size == 0 or tail.len < @min(packet_size, Extents.max_tail_bytes)) return error.InvalidVideoData;
+    var result: Extents = .{};
+    result.sizes[0] = packet_size;
+    const marker = tail[tail.len - 1];
+    if (marker & 0xe0 != 0xc0) return result;
     const count: usize = (marker & 7) + 1;
     const magnitude: usize = ((marker >> 3) & 3) + 1;
     const index_size = 2 + count * magnitude;
     // A marker-looking last payload byte without a matching index is payload.
-    if (index_size > bytes.len or bytes[bytes.len - index_size] != marker) {
-        result.packets[0] = bytes;
-        result.len = 1;
-        return result;
-    }
+    if (index_size > packet_size or tail[tail.len - index_size] != marker) return result;
     var offset: usize = 0;
-    var index = bytes.len - index_size + 1;
+    var index = tail.len - index_size + 1;
     for (0..count) |i| {
-        var packet_size: usize = 0;
+        var size_bytes: usize = 0;
         for (0..magnitude) |j| {
-            packet_size |= @as(usize, bytes[index]) << @intCast(j * 8);
+            size_bytes |= @as(usize, tail[index]) << @intCast(j * 8);
             index += 1;
         }
-        if (packet_size == 0 or packet_size > bytes.len - index_size -| offset) return error.InvalidVideoData;
-        result.packets[i] = bytes[offset..][0..packet_size];
-        offset += packet_size;
+        if (size_bytes == 0 or size_bytes > packet_size - index_size -| offset) return error.InvalidVideoData;
+        result.sizes[i] = size_bytes;
+        offset += size_bytes;
     }
-    if (offset != bytes.len - index_size) return error.InvalidVideoData;
+    if (offset != packet_size - index_size) return error.InvalidVideoData;
     result.len = count;
+    return result;
+}
+
+pub fn split(bytes: []const u8) !Parts {
+    const extents = try splitExtents(bytes, bytes.len);
+    var result = Parts{ .len = extents.len };
+    var offset: usize = 0;
+    for (result.packets[0..result.len], extents.sizes[0..extents.len]) |*part, size_bytes| {
+        part.* = bytes[offset..][0..size_bytes];
+        offset += size_bytes;
+    }
     return result;
 }
 const ColorInfo = struct { depth: u8 = 8, chroma: u8 = 1, signal: @import("frame.zig").Color = .{} };

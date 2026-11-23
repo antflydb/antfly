@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -25,6 +26,7 @@ import pytest
 import requests
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
+    AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
     EMBEDDINGGEMMA2_MODEL,
     INFERENCE_PUBLIC_API_ROOT,
@@ -886,6 +888,125 @@ def test_stateful_postgres_cdc_snapshot_and_streaming(stateful_api, pg_cdc_sourc
     )
 
 
+def test_stateful_postgres_cdc_emits_committed_destination_changefeed(pg_cdc_source):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    table = f"cdc_feed_{time.time_ns()}"
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            response = client.post(
+                f"{server.api_url}/tables/{table}",
+                json={
+                    "num_shards": 1,
+                    "replication_sources": [
+                        {
+                            "type": "postgres",
+                            "dsn": _pg_dsn(),
+                            "postgres_table": pg_cdc_source["table_name"],
+                            "key_template": "id",
+                            "slot_name": pg_cdc_source["slot_name"],
+                            "publication_name": pg_cdc_source["publication_name"],
+                        }
+                    ],
+                },
+                timeout=30,
+            )
+            assert response.status_code in (200, 201), response.text
+
+            def lookup(key):
+                reply = client.get(
+                    f"{server.api_url}{lookup_key_path(table, key)}", timeout=5
+                )
+                if reply.status_code == 404:
+                    return None
+                reply.raise_for_status()
+                return reply.json()
+
+            assert wait_until(
+                lambda: lookup("user-1"), timeout_s=30.0, interval_s=0.25
+            ), server.debug_logs()
+            feeds = f"{server.api_url}/changefeeds"
+            reply = client.post(
+                feeds,
+                headers={"Idempotency-Key": table},
+                json={"tables": [table], "start": "now", "include": "rows"},
+                timeout=30,
+            )
+            assert reply.status_code == 201, reply.text
+            created = reply.json()
+            feed = f"{feeds}/{created['id']}"
+            cursor = created["cursor"]
+            _run_psql(f"""
+                begin;
+                insert into {pg_cdc_source["table_name"]} (id, name, tier)
+                    values ('rolled-back', 'Uncommitted', 'silver');
+                rollback;
+                insert into {pg_cdc_source["table_name"]} (id, name, tier)
+                    values ('user-2', 'Outbound', 'silver');
+            """)
+            event = None
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                page = client.get(f"{feed}/events", params={"after": cursor}, timeout=5)
+                if page.status_code == 503 or (
+                    page.status_code == 409 and "changefeed_retry_required" in page.text
+                ):
+                    time.sleep(0.25)
+                    continue
+                page.raise_for_status()
+                latest = page.headers["Antfly-Changefeed-Cursor"]
+                body = page.json()
+                for item in body["events"]:
+                    name = (item.get("after") or {}).get("name")
+                    assert name != "Uncommitted"
+                    if name == "Outbound":
+                        event = item
+                        break
+                if event is not None:
+                    break
+                if latest != cursor:
+                    acknowledged = client.post(
+                        f"{feed}/ack", json={"cursor": latest}, timeout=5
+                    )
+                    acknowledged.raise_for_status()
+                    cursor = latest
+                time.sleep(0.25)
+            assert event is not None, server.debug_logs()
+            assert event["kind"] == "document_committed"
+            assert event["before"] is None
+            assert body["transaction"]["complete"] is True
+            assert event["transaction_id"] == body["transaction"]["transaction_id"]
+            assert lookup("user-2") is not None
+            assert lookup("rolled-back") is None
+
+            server.restart()
+            replay = client.get(f"{feed}/events", params={"after": cursor}, timeout=5)
+            replay.raise_for_status()
+            assert replay.headers["Antfly-Changefeed-Cursor"] == latest
+            assert replay.json() == body
+
+            ack = client.post(f"{feed}/ack", json={"cursor": latest}, timeout=5)
+            ack.raise_for_status()
+            assert ack.json()["cursor"] == latest
+
+            def close():
+                reply = client.delete(feed, timeout=5)
+                if reply.status_code == 503 or (
+                    reply.status_code == 409
+                    and "changefeed_retry_required" in reply.text
+                ):
+                    return False
+                assert reply.status_code == 204, reply.text
+                return True
+
+            assert wait_until(close, timeout_s=12.0, interval_s=0.25), (
+                server.debug_logs()
+            )
+    finally:
+        server.stop()
+
+
 def test_stateful_postgres_cdc_table_joins_with_foreign_lookup(
     stateful_api, pg_cdc_source
 ):
@@ -1294,6 +1415,9 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
             if int(status.get("table_id", 0)) == table_id
             and int(status.get("source_ordinal", -1)) == 0
             and status.get("stream_checkpoint")
+            and (
+                _is_standalone(stateful_api) or status.get("accepted_stream_checkpoint")
+            )
         ],
         timeout_s=30.0,
         interval_s=0.25,
@@ -1301,13 +1425,10 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
     statuses_before_restart = _metadata_replication_status_records(stateful_api)
     assert matching_before_restart, (
         f"unexpected replication statuses before restart: {statuses_before_restart!r}"
+        f"\n{_server_logs(stateful_api)}"
     )
     assert any(
-        status.get("phase") == "cutover_prepared" and status.get("prepared_checkpoint")
-        for status in matching_before_restart
-    ) or any(
-        status.get("phase") == "streaming" and status.get("prepared_checkpoint")
-        for status in matching_before_restart
+        status.get("prepared_checkpoint") for status in matching_before_restart
     ), f"missing cutover-prepared status before restart: {statuses_before_restart!r}"
     prepared_checkpoint_before_restart = next(
         (
@@ -1372,6 +1493,25 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
     # especially under load. Poll here instead of reading the status once,
     # the same way the pre-restart checks above poll for status records to
     # appear.
+    def stream_checkpoint_caught_up(status: dict[str, Any]) -> bool:
+        checkpoint = status.get("stream_checkpoint") or ""
+        if checkpoint == stream_checkpoint_before_restart:
+            return True
+        identity, _, lsn = checkpoint.rpartition(":")
+        original_identity, _, original_lsn = (
+            stream_checkpoint_before_restart.rpartition(":")
+        )
+        if not identity.startswith("pg1:") or identity != original_identity:
+            return False
+        try:
+            high, low = (int(part, 16) for part in lsn.split("/"))
+            original_high, original_low = (
+                int(part, 16) for part in original_lsn.split("/")
+            )
+        except ValueError:
+            return False
+        return (high, low) >= (original_high, original_low)
+
     def matching_statuses_caught_up() -> list[dict[str, Any]] | None:
         statuses = _metadata_replication_status_records(stateful_api)
         matching = [
@@ -1384,7 +1524,7 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
             return None
         if not any(
             status.get("prepared_checkpoint") == prepared_checkpoint_before_restart
-            and status.get("stream_checkpoint") == stream_checkpoint_before_restart
+            and stream_checkpoint_caught_up(status)
             for status in matching
         ):
             return None
@@ -1420,17 +1560,22 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         for status in matching_after_restart
     ), "restart changed the exact-cutover PostgreSQL resource identity"
     assert any(
-        status.get("stream_checkpoint") == stream_checkpoint_before_restart
-        for status in matching_after_restart
+        stream_checkpoint_caught_up(status) for status in matching_after_restart
     ), (
-        "stream_checkpoint did not persist across restart\n"
+        "stream_checkpoint regressed across restart\n"
         f"before={stream_checkpoint_before_restart!r} after={matching_after_restart!r}"
     )
-    status_after_restart = _metadata_status(stateful_api)
-    assert (
-        status_after_restart.get("projected_replication_source_statuses_streaming", 0)
-        >= 1
+
+    def projected_streaming_after_restart() -> dict[str, Any] | None:
+        status = _metadata_status(stateful_api)
+        if status.get("projected_replication_source_statuses_streaming", 0) >= 1:
+            return status
+        return None
+
+    status_after_restart = wait_until(
+        projected_streaming_after_restart, timeout_s=30.0, interval_s=0.25
     )
+    assert status_after_restart, _metadata_replication_status_records(stateful_api)
     assert (
         status_after_restart.get(
             "projected_replication_source_statuses_exact_cutover", 0
@@ -1726,6 +1871,44 @@ def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_coll
         == pg_cdc_source["slot_name"]
     ), "required exact cutover adopted or removed the caller's logical slot"
 
+    catalog_digest = physical_status["native_bootstrap_catalog_digest"]
+    assert any(catalog_digest) and catalog_digest != "\x00" * 32
+    bootstrap_checkpoint = physical_status["prepared_checkpoint"]
+    assert bootstrap_checkpoint
+    _run_psql(f"""
+        begin;
+        update {pg_cdc_source["table_name"]} set tier = 'platinum' where id = 'user-1';
+        insert into {pg_cdc_source["table_name"]} (id, name, tier)
+        values ('user-2', 'Bob', 'silver');
+        commit;
+        """)
+
+    def committed_stream_status():
+        for status in _metadata_replication_status_records(stateful_api):
+            if (
+                int(status.get("table_id", 0)) == table_id
+                and int(status.get("source_ordinal", -1)) == 0
+                and status.get("phase") == "streaming"
+                and status.get("stream_checkpoint")
+                and status["stream_checkpoint"] != bootstrap_checkpoint
+            ):
+                return status
+        return None
+
+    committed = wait_until(committed_stream_status, timeout_s=30.0, interval_s=0.25)
+    assert committed is not None, (
+        "post-cutover PostgreSQL transaction did not advance its committed checkpoint\n"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_server_logs(stateful_api)}"
+    )
+    assert committed["prepared_checkpoint"] == bootstrap_checkpoint
+    assert _lookup_doc_if(
+        stateful_api, table_name, "user-1", lambda doc: doc.get("tier") == "platinum"
+    )
+    assert _lookup_doc_if(
+        stateful_api, table_name, "user-2", lambda doc: doc.get("name") == "Bob"
+    )
+
     exact_required_status = _metadata_status(stateful_api)
     assert (
         exact_required_status.get(
@@ -1752,9 +1935,190 @@ def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_coll
         == 0
     )
 
+    # The first source has now closed legacy producer intake on the target.
+    # A second source must write its snapshot through its own scoped grant.
+    routed_table = f"cdc_routed_after_close_{time.time_ns()}"
+    _create_table_public(
+        stateful_api,
+        routed_table,
+        {
+            "num_shards": 1,
+            "replication_sources": [
+                {
+                    "type": "postgres",
+                    "dsn": _pg_dsn(),
+                    "postgres_table": pg_cdc_source["table_name"],
+                    "key_template": "id",
+                    "require_exact_cutover": True,
+                    "routes": [
+                        {
+                            "target_table": table_name,
+                            "key_template": "routed-{{id}}",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    routed_id = _metadata_table_id(stateful_api, routed_table)
+    assert routed_id is not None
 
+    def routed_status():
+        for status in _metadata_replication_status_records(stateful_api):
+            if (
+                int(status.get("table_id", 0)) == routed_id
+                and status.get("phase") == "streaming"
+            ):
+                return status
+        return None
+
+    routed = wait_until(routed_status, timeout_s=60.0, interval_s=0.25)
+    assert routed is not None, (
+        "routed source did not bootstrap after legacy intake closed\n"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_server_logs(stateful_api)}"
+    )
+    pg_cdc_source["cleanup_slot_names"].append(routed["slot_name"])
+    pg_cdc_source["cleanup_publication_names"].append(routed["publication_name"])
+    assert _lookup_doc_if(
+        stateful_api,
+        table_name,
+        "routed-user-1",
+        lambda doc: doc.get("tier") == "platinum",
+    )
+    assert _lookup_doc_if(
+        stateful_api, table_name, "routed-user-2", lambda doc: doc.get("name") == "Bob"
+    )
+
+    previous_routed_authority = routed["cutover_authority_id"]
+    metadata_name = next(
+        row["name"]
+        for row in _metadata_admin_snapshot_json(stateful_api)["tables"]
+        if int(row["table_id"]) == routed_id
+    )
+    _reseed_exact_cutover(stateful_api, metadata_name, 0)
+    routed_after_reseed = wait_until(
+        lambda: next(
+            (
+                status
+                for status in _metadata_replication_status_records(stateful_api)
+                if int(status.get("table_id", 0)) == routed_id
+                and status.get("phase") == "streaming"
+                and status.get("cutover_authority_id") != previous_routed_authority
+            ),
+            None,
+        ),
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert routed_after_reseed is not None, (
+        "routed source did not resume after reseed\n"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_server_logs(stateful_api)}"
+    )
+    pg_cdc_source["cleanup_slot_names"].append(routed_after_reseed["slot_name"])
+    pg_cdc_source["cleanup_publication_names"].append(
+        routed_after_reseed["publication_name"]
+    )
+    _run_psql(f"""
+        insert into {pg_cdc_source["table_name"]} (id, name, tier)
+        values ('user-3', 'Carol', 'bronze');
+        """)
+    assert wait_until(
+        lambda: _lookup_doc_if(
+            stateful_api,
+            table_name,
+            "routed-user-3",
+            lambda doc: doc.get("name") == "Carol",
+        ),
+        timeout_s=30.0,
+        interval_s=0.25,
+    )
+
+    managed_path = f"/tables/{table_name}/sources/managed"
+    managed = stateful_api._check(stateful_api._request("GET", managed_path))
+    appended = {
+        "type": "postgres",
+        "dsn": _pg_dsn(),
+        "postgres_table": pg_cdc_source["table_name"],
+        "key_template": "attached-{{id}}",
+        "require_exact_cutover": True,
+    }
+    stateful_api._check(
+        stateful_api._request(
+            "POST",
+            managed_path,
+            {
+                "table_id": table_id,
+                "expected_sources_hash": managed["sources_hash"],
+                "replication_sources": [
+                    *create_payload["replication_sources"],
+                    appended,
+                ],
+            },
+        )
+    )
+
+    def attached_status():
+        statuses = {
+            status["source_ordinal"]: status
+            for status in _metadata_replication_status_records(stateful_api)
+            if int(status.get("table_id", 0)) == table_id
+            and status.get("phase") == "streaming"
+        }
+        if 0 in statuses and 1 in statuses:
+            return statuses
+        return None
+
+    attached = wait_until(attached_status, timeout_s=60.0, interval_s=0.25)
+    assert attached is not None, (
+        "managed source append did not preserve and bootstrap both sources\n"
+        f"{_metadata_replication_statuses(stateful_api)}\n"
+        f"{_server_logs(stateful_api)}"
+    )
+    assert (
+        attached[0]["cutover_authority_id"] == physical_status["cutover_authority_id"]
+    )
+    assert attached[0]["prepared_checkpoint"] == bootstrap_checkpoint
+    pg_cdc_source["cleanup_slot_names"].append(attached[1]["slot_name"])
+    pg_cdc_source["cleanup_publication_names"].append(attached[1]["publication_name"])
+    assert _lookup_doc_if(
+        stateful_api,
+        table_name,
+        "attached-user-3",
+        lambda doc: doc.get("name") == "Carol",
+    )
+    managed_after = stateful_api._check(stateful_api._request("GET", managed_path))
+    second_progress = next(
+        progress
+        for progress in managed_after["progress"]
+        if progress["source_ordinal"] == 1
+    )
+    assert second_progress["accepted_stream_checkpoint"]
+    assert (
+        second_progress["accepted_stream_checkpoint"]
+        == second_progress["stream_checkpoint"]
+    )
+
+    _run_psql(f"""
+        insert into {pg_cdc_source["table_name"]} (id, name, tier)
+        values ('user-4', 'Dina', 'gold');
+        """)
+    for key in ("user-4", "attached-user-4", "routed-user-4"):
+        assert wait_until(
+            lambda: _lookup_doc_if(
+                stateful_api, table_name, key, lambda doc: doc.get("name") == "Dina"
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        ), f"source did not resume streaming to {key}"
+
+
+@pytest.mark.parametrize(
+    "require_exact", [True, False], ids=["protected", "handed-over"]
+)
 def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
-    stateful_api, pg_cdc_source
+    stateful_api, pg_cdc_source, require_exact
 ):
     _require_cluster(stateful_api, "uses the metadata reseed admin route")
     table_name = f"cdc_reseed_exact_cutover_docs_{time.time_ns()}"
@@ -1781,7 +2145,7 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
                     "key_template": "id",
                     "slot_name": pg_cdc_source["slot_name"],
                     "publication_name": pg_cdc_source["publication_name"],
-                    "require_exact_cutover": True,
+                    "require_exact_cutover": require_exact,
                     "on_delete": [{"op": "$delete_document"}],
                 }
             ],
@@ -1797,6 +2161,7 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
                     )
                     if status.get("cutover_mode") == "exported_snapshot"
                     and status.get("phase") == "streaming"
+                    and status.get("accepted_stream_checkpoint")
                 ),
                 None,
             ),
@@ -1842,6 +2207,9 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
         )
         assert table_detail["replication_sources"][0]["require_exact_cutover"] is True
 
+        if stateful_api._server is not None:
+            stateful_api.restart_server()
+
         snapshot_doc = wait_until(
             lambda: _lookup_doc_if(
                 stateful_api,
@@ -1876,7 +2244,8 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
         )
         assert reseeded_status is not None, (
             "reseeded exact cutover did not publish a replacement authority\n"
-            f"{_metadata_replication_statuses(stateful_api)}"
+            f"{_metadata_replication_statuses(stateful_api)}\n"
+            f"{_server_logs(stateful_api)}"
         )
         new_physical_slot_name = reseeded_status["slot_name"]
         new_physical_publication_name = reseeded_status["publication_name"]
@@ -1886,6 +2255,25 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
         assert new_physical_publication_name != new_publication_name
         assert "_af_" in new_physical_slot_name
         assert "_af_" in new_physical_publication_name
+        assert (
+            _psql_scalar_best_effort(
+                f"""select
+                    not exists (
+                        select from pg_replication_slots
+                        where slot_name = '{initial_slot_name}'
+                    ) and not exists (
+                        select from pg_publication
+                        where pubname = '{initial_publication_name}'
+                    ) and exists (
+                        select from pg_replication_slots
+                        where slot_name = '{pg_cdc_source["slot_name"]}'
+                    ) and exists (
+                        select from pg_publication
+                        where pubname = '{pg_cdc_source["publication_name"]}'
+                    );"""
+            )
+            == "t"
+        ), "reseed did not isolate provider resource cleanup to the retired authority"
 
         _run_psql(f"""
             insert into {pg_cdc_source["table_name"]} (id, name, tier)
@@ -1960,6 +2348,7 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
                 if int(status.get("table_id", 0)) == table_id
                 and int(status.get("source_ordinal", -1)) == 0
                 and status.get("phase") == "streaming"
+                and status.get("accepted_stream_checkpoint")
             ),
             None,
         ),
@@ -2234,3 +2623,1433 @@ def test_standalone_postgres_cdc_snapshot_completes_with_embeddings_index(
     _wait_until_absent(
         stateful_api, table_name, "user-2", timeout_s=30.0, interval_s=0.25
     )
+
+
+@pytest.mark.parametrize(
+    "deployment, extra_rows",
+    [
+        ("standalone", 0),
+        ("standalone", 16_384),
+        ("distributed", 0),
+        ("distributed-mixed", 0),
+        ("distributed-publication-failure", 0),
+    ],
+    ids=[
+        "standalone-single-row",
+        "standalone-multi-file",
+        "distributed-single-row",
+        "distributed-mixed-providers",
+        "distributed-publication-failure",
+    ],
+)
+def test_postgres_bootstraps_and_streams_to_writable_iceberg(
+    pg_cdc_source, tmp_path, deployment, extra_rows, request
+):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if deployment == "standalone":
+        config = tmp_path / "antfly.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "deployment_mode": "standalone",
+                    "storage": {
+                        "engine": "local",
+                        "local": {"base_dir": str(tmp_path / "native")},
+                    },
+                }
+            )
+        )
+        server = StandaloneAntflyServer(binary, "127.0.0.1", 0, config_path=config)
+    else:
+        from test_secrets import TableObjectStorage
+
+        artifacts = TableObjectStorage()
+        request.addfinalizer(artifacts.close)
+        config = {
+            "deployment_mode": "distributed",
+            "storage": {
+                "engine": "local",
+                "artifacts": {"connection": "cdc-artifacts", "bucket": "antfly"},
+            },
+            "connections": {
+                "cdc-artifacts": {
+                    "kind": "external_io",
+                    "capabilities": ["storage.primary"],
+                    "external_io": {
+                        "protocol": "s3",
+                        "endpoint": artifacts.endpoint,
+                        "use_ssl": False,
+                        "addressing_style": "path",
+                        "region": "us-east-1",
+                        "buckets": ["antfly"],
+                        "credentials": {
+                            "source": "static",
+                            "access_key_id": "fixture",
+                            "secret_access_key": "fixture",
+                        },
+                    },
+                }
+            },
+        }
+
+        def node_config(role):
+            return {
+                **config,
+                "storage": {
+                    **config["storage"],
+                    "local": {"base_dir": str(tmp_path / role)},
+                },
+            }
+
+        server = StatefulAntflyServer(
+            binary,
+            "127.0.0.1",
+            0,
+            auth_enabled=True,
+            metadata_config=node_config("metadata"),
+            data_config=node_config("data"),
+        )
+    table = "/tables/cdc_iceberg"
+    native_table = "cdc_native"
+    mixed = deployment == "distributed-mixed"
+    publication_failure = deployment == "distributed-publication-failure"
+    native_before = {"id": "native-row", "name": "Native", "tier": "before"}
+    native_after = {**native_before, "tier": "after"}
+    provider = pg_cdc_source["table_name"]
+    client = requests.Session()
+    if deployment != "standalone":
+        client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+
+    def call(method, path, body=None):
+        try:
+            reply = client.request(method, server.api_url + path, json=body, timeout=40)
+        except requests.RequestException as error:
+            pytest.fail(f"{method} {path} {error}\n{server.debug_logs()}")
+
+        assert reply.ok, (
+            f"{method} {path} {reply.status_code} {reply.text}\n{server.debug_logs()}"
+        )
+        return reply.json()
+
+    def committed(minimum):
+        properties = call("GET", table + "/lake/catalog")["metadata"]["properties"]
+        return (
+            properties
+            if int(properties.get("antfly.wal.coverage", 0)) >= minimum
+            else None
+        )
+
+    def rows():
+        return call(
+            "POST",
+            "/sql",
+            {
+                "statement": "SELECT id, name FROM cdc_iceberg WHERE id IN ('user-1', 'user-2')"
+            },
+        )["rows"]
+
+    def check_row_count():
+        result = call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM cdc_iceberg"})
+        assert int(result["rows"][0][0]) == extra_rows + 1
+
+    try:
+        _run_psql(f"alter table {provider} replica identity full")
+        if extra_rows:
+            _run_psql(f"""
+                insert into {provider} (id, name, tier)
+                select 'seed-' || id, 'Seed', 'gold'
+                from generate_series(1, {extra_rows}) as seed(id)
+            """)
+        call(
+            "POST",
+            table,
+            {
+                "storage": {"engine": "object"},
+                **(
+                    {"indexes": {"name_text": {"type": "full_text", "field": "name"}}}
+                    if publication_failure
+                    else {}
+                ),
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "row",
+                    "enforce_types": True,
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    name: {"type": "string"}
+                                    for name in ("id", "name", "tier")
+                                },
+                                "required": ["id", "name", "tier"],
+                                "additionalProperties": False,
+                            }
+                        },
+                    },
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "cdc-iceberg",
+                        "format": "iceberg",
+                        "uri": (tmp_path / "warehouse").as_uri(),
+                        "write_policy": "iceberg_writer",
+                        "catalog": {"type": "managed"},
+                        "row_identity": {"key_columns": ["id"]},
+                    },
+                },
+            },
+        )
+        call(
+            "POST",
+            table + "/lake/catalog",
+            {
+                "commit_id": "initialize",
+                "schema": {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [
+                        {"id": index, "name": name, "required": True, "type": "string"}
+                        for index, name in enumerate(("id", "name", "tier"), 1)
+                    ],
+                },
+            },
+        )
+        attached = call("GET", table + "/sources/managed")
+        assert attached["cdc_supported"], attached
+        destination = attached["destination_contract"]
+        assert destination["transaction_scope"] == "iceberg_table"
+        if deployment != "standalone":
+            assert destination["committed_history"] == "iceberg_committed_wal"
+            assert destination["outbound"]["document_committed"]
+            assert destination["outbound"]["snapshot_then_changes"]
+        call(
+            "POST",
+            table + "/sources/managed",
+            {
+                "table_id": attached["table_id"],
+                "expected_sources_hash": attached["sources_hash"],
+                "replication_sources": [
+                    {
+                        "type": "postgres",
+                        "dsn": _pg_dsn(),
+                        "postgres_table": provider,
+                        "key_template": "id",
+                        "slot_name": pg_cdc_source["slot_name"],
+                        "publication_name": pg_cdc_source["publication_name"],
+                    }
+                ],
+            },
+        )
+        initial = wait_until(lambda: committed(1), timeout_s=60, interval_s=0.5)
+        assert initial, server.debug_logs()
+        cut = initial["antfly.cdc.bootstrap-cut"]
+        assert cut == initial["antfly.cdc.checkpoint"]
+        assert rows() == [["user-1", "Alice"]]
+        check_row_count()
+
+        feed = None
+        filtered_feeds = []
+        if deployment != "standalone":
+            if mixed:
+                call("POST", f"/tables/{native_table}", {"num_shards": 1})
+                call(
+                    "POST",
+                    f"/tables/{native_table}/batch",
+                    {"inserts": {"native-row": native_before}},
+                )
+            feeds = f"{server.api_url}/changefeeds"
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": "postgres-iceberg-bootstrap"},
+                json={
+                    "tables": ["cdc_iceberg", native_table]
+                    if mixed
+                    else ["cdc_iceberg"],
+                    "start": "snapshot_then_changes",
+                    "include": "rows",
+                },
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            if deployment == "distributed":
+                # One of the filtered feeds advances past an invisible suffix
+                # in the same committed key-move transaction.
+                for key in ("user-1", "user-2"):
+                    filtered = _changefeed_call(
+                        client,
+                        "POST",
+                        feeds,
+                        headers={"Idempotency-Key": f"filtered-key-move-{key}"},
+                        json={
+                            "tables": ["cdc_iceberg"],
+                            "start": "now",
+                            "selectors": [
+                                {
+                                    "table": "cdc_iceberg",
+                                    "predicates": [{"field": "id", "value": key}],
+                                }
+                            ],
+                        },
+                    ).json()
+                    filtered_feeds.append(
+                        (f"{feeds}/{filtered['id']}", filtered["cursor"])
+                    )
+
+        if publication_failure:
+
+            def publication_progress():
+                return call("GET", table + "/sources/managed")["index_publication"]
+
+            def published_at(snapshot):
+                state = publication_progress()
+                return state if state["published_snapshot"] == str(snapshot) else None
+
+            initial_snapshot = call("GET", table + "/lake/catalog")["metadata"][
+                "current-snapshot-id"
+            ]
+            initial_publication = wait_until(
+                lambda: published_at(initial_snapshot), timeout_s=120, interval_s=0.5
+            )
+            assert initial_publication, server.debug_logs()
+            activation = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": "postgres-iceberg-activation"},
+                json={"tables": ["cdc_iceberg"], "events": ["publication_activated"]},
+            ).json()
+            activation_feed = f"{feeds}/{activation['id']}"
+            artifacts.reject_artifact_uploads.set()
+
+        server.pause(crash=True)
+        _run_psql(
+            f"update {provider} set id = 'user-2', name = 'Bob' where id = 'user-1'"
+        )
+        server.resume()
+        if mixed:
+            call(
+                "POST",
+                f"/tables/{native_table}/batch",
+                {"inserts": {"native-row": native_after}},
+            )
+        resumed = wait_until(lambda: committed(2), timeout_s=60, interval_s=0.5)
+        assert resumed, server.debug_logs()
+        assert resumed["antfly.cdc.bootstrap-cut"] == cut
+        assert resumed["antfly.cdc.checkpoint"] != cut
+        assert rows() == [["user-2", "Bob"]]
+        check_row_count()
+        for filtered_feed, cursor in filtered_feeds:
+            page = _changefeed_call(
+                client, "GET", f"{filtered_feed}/events", params={"after": cursor}
+            )
+            assert len(page.json()["events"]) == 1
+            assert page.json()["transaction"]["complete"]
+            replay = _changefeed_call(
+                client,
+                "GET",
+                f"{filtered_feed}/events",
+                params={"after": cursor, "limit": 1},
+            )
+            assert replay.content == page.content
+            assert (
+                replay.headers["Antfly-Changefeed-Cursor"]
+                == page.headers["Antfly-Changefeed-Cursor"]
+            )
+            _changefeed_call(client, "DELETE", filtered_feed)
+        if publication_failure:
+            saved_catalog = call("GET", table + "/lake/catalog")["metadata"]
+
+            def accepted_and_committed():
+                checkpoint = resumed["antfly.cdc.checkpoint"]
+                return next(
+                    (
+                        row
+                        for row in call("GET", table + "/sources/managed")["progress"]
+                        if row["stream_checkpoint"] == checkpoint
+                        and row.get("accepted_stream_checkpoint") == checkpoint
+                    ),
+                    None,
+                )
+
+            assert wait_until(accepted_and_committed, timeout_s=30.0, interval_s=0.5), (
+                server.debug_logs()
+            )
+
+            def failed_publication():
+                state = publication_progress()
+                return state if state["failed_generation"] is not None else None
+
+            failure = wait_until(failed_publication, timeout_s=120, interval_s=0.5)
+            assert failure, server.debug_logs()
+            assert (
+                failure["failed_generation"]
+                > initial_publication["published_generation"]
+            )
+            assert failure["published_snapshot"] == str(initial_snapshot)
+        if feed is not None:
+            # Read the original cut after the catalog has committed a newer snapshot.
+            cursor = created["cursor"]
+            expected = {"user-1": {"id": "user-1", "name": "Alice", "tier": "gold"}}
+            if mixed:
+                expected["native-row"] = native_before
+            snapshot_rows = {}
+            for _ in range(len(expected)):
+                bootstrap = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                body = bootstrap.json()
+                for event in body["events"]:
+                    row = event["after"]
+                    assert row["id"] not in snapshot_rows
+                    snapshot_rows[row["id"]] = row
+                cursor = bootstrap.headers["Antfly-Changefeed-Cursor"]
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if body["snapshot"]["complete"]:
+                    break
+            else:
+                pytest.fail("changefeed did not complete its pinned snapshot")
+            assert snapshot_rows == expected
+
+            expected_operations = (
+                {"insert", "delete", "update"} if mixed else {"insert", "delete"}
+            )
+            events = {}
+            transaction_pages = {}
+            for _ in range(len(expected_operations)):
+                params = {"after": cursor}
+                if mixed:
+                    params["limit"] = 1
+                page = _changefeed_call(client, "GET", f"{feed}/events", params=params)
+                replay = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                assert replay.content == page.content
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                assert replay.headers["Antfly-Changefeed-Cursor"] == cursor
+                body = page.json()
+                transaction = body["transaction"]
+                transaction_pages.setdefault(transaction["transaction_id"], []).append(
+                    transaction["complete"]
+                )
+                for event in body["events"]:
+                    assert event["operation"] not in events
+                    events[event["operation"]] = event
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if set(events) == expected_operations:
+                    break
+            assert set(events) == expected_operations
+            assert sorted(transaction_pages.values()) == (
+                [[False, True], [True]] if mixed else [[True]]
+            )
+            assert events["delete"]["before"] == {
+                "id": "user-1",
+                "name": "Alice",
+                "tier": "gold",
+            }
+            assert events["insert"]["after"] == {
+                "id": "user-2",
+                "name": "Bob",
+                "tier": "gold",
+            }
+            if mixed:
+                assert events["update"]["before"] == native_before
+                assert events["update"]["after"] == native_after
+            _changefeed_call(client, "DELETE", feed)
+        if publication_failure:
+            assert publication_progress()["published_snapshot"] == str(initial_snapshot)
+            heartbeat = _changefeed_call(
+                client,
+                "GET",
+                f"{activation_feed}/events",
+                params={"after": activation["cursor"]},
+            )
+            assert heartbeat.json()["events"] == []
+            activation_cursor = heartbeat.headers["Antfly-Changefeed-Cursor"]
+            _changefeed_call(
+                client,
+                "POST",
+                f"{activation_feed}/ack",
+                json={"cursor": activation_cursor},
+            )
+            # Recover from the durable catalog and feed state while the
+            # artifact store still rejects publication uploads.
+            server.pause(crash=True)
+            server.resume()
+            recovered_before_publication = _changefeed_call(
+                client, "GET", server.api_url + table + "/lake/catalog"
+            ).json()["metadata"]
+            assert (
+                recovered_before_publication["current-snapshot-id"]
+                == saved_catalog["current-snapshot-id"]
+            )
+            assert wait_until(accepted_and_committed, timeout_s=30, interval_s=0.5)
+            assert publication_progress()["published_snapshot"] == str(initial_snapshot)
+            still_waiting = _changefeed_call(
+                client,
+                "GET",
+                f"{activation_feed}/events",
+                params={"after": activation_cursor},
+            )
+            assert still_waiting.json()["events"] == []
+            activation_cursor = still_waiting.headers["Antfly-Changefeed-Cursor"]
+            _changefeed_call(
+                client,
+                "POST",
+                f"{activation_feed}/ack",
+                json={"cursor": activation_cursor},
+            )
+            artifacts.reject_artifact_uploads.clear()
+            recovery = wait_until(
+                lambda: published_at(saved_catalog["current-snapshot-id"]),
+                # A crash can leave a build attempt leased for five minutes.
+                # Give its successor time to acquire the fence and rebuild.
+                timeout_s=420,
+                interval_s=0.5,
+            )
+            assert recovery, server.debug_logs()
+
+            def activated_page():
+                nonlocal activation_cursor
+                response = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{activation_feed}/events",
+                    params={"after": activation_cursor},
+                )
+                if response.json()["events"]:
+                    return response
+                activation_cursor = response.headers["Antfly-Changefeed-Cursor"]
+                return None
+
+            activated = wait_until(activated_page, timeout_s=30, interval_s=0.5)
+            assert activated is not None, server.debug_logs()
+            events = activated.json()["events"]
+            assert len(events) == 1
+            assert events[0]["kind"] == "publication_activated"
+            assert int(events[0]["generation"]) == recovery["published_generation"]
+            _changefeed_call(client, "DELETE", activation_feed)
+            recovered_catalog = call("GET", table + "/lake/catalog")["metadata"]
+            assert (
+                recovered_catalog["current-snapshot-id"]
+                == saved_catalog["current-snapshot-id"]
+            )
+            assert (
+                recovered_catalog["properties"]["antfly.wal.coverage"]
+                == resumed["antfly.wal.coverage"]
+            )
+            assert (
+                recovered_catalog["properties"]["antfly.cdc.checkpoint"]
+                == resumed["antfly.cdc.checkpoint"]
+            )
+    finally:
+        client.close()
+        server.stop()
+
+
+def test_public_changefeed_bootstraps_multiple_partitions_and_replays():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    table = f"multi_partition_feed_{time.time_ns()}"
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            table_url = f"{server.api_url}/tables/{table}"
+            created_table = client.post(table_url, json={"num_shards": 3}, timeout=30)
+            assert created_table.status_code in (200, 201), created_table.text
+            seeds = {f"{letter}-seed": {"phase": "snapshot"} for letter in "amz"}
+
+            def write(rows):
+                reply = client.post(
+                    f"{table_url}/batch", json={"inserts": rows}, timeout=15
+                )
+                reply.raise_for_status()
+
+            write(seeds)
+            table_state = client.get(table_url, timeout=10)
+            table_state.raise_for_status()
+            assert len(table_state.json()["shards"]) == 3
+            feeds = f"{server.api_url}/changefeeds"
+            definition = {
+                "tables": [table],
+                "start": "snapshot_then_changes",
+                "include": "rows",
+            }
+            headers = {"Idempotency-Key": table}
+
+            def call(method, url, **options):
+                expires = time.monotonic() + 30
+                while True:
+                    reply = client.request(method, url, timeout=15, **options)
+                    retryable = reply.status_code == 503 or (
+                        reply.status_code == 409
+                        and "changefeed_retry_required" in reply.text
+                    )
+                    if not retryable or time.monotonic() >= expires:
+                        reply.raise_for_status()
+                        return reply
+                    time.sleep(0.2)
+
+            enrollment = call("POST", feeds, headers=headers, json=definition).json()
+            assert (
+                call("POST", feeds, headers=headers, json=definition).json()
+                == enrollment
+            )
+            feed = f"{feeds}/{enrollment['id']}"
+            cursor = enrollment["cursor"]
+            write({"post-cut": {"phase": "stream"}})
+            delivered = set()
+            for page_number in range(8):
+                reply = call(
+                    "GET", f"{feed}/events", params={"after": cursor, "limit": 1}
+                )
+                page = reply.json()
+                next_cursor = reply.headers["Antfly-Changefeed-Cursor"]
+                if page_number == 0:
+                    replay = call(
+                        "GET", f"{feed}/events", params={"after": cursor, "limit": 1}
+                    )
+                    assert replay.content == reply.content
+                    assert replay.headers["Antfly-Changefeed-Cursor"] == next_cursor
+                for event in page["events"]:
+                    assert event["kind"] == "document_snapshot"
+                    assert event["after"]["phase"] == "snapshot"
+                    key = event["key"]["value"]
+                    assert key not in delivered
+                    delivered.add(key)
+                call("POST", f"{feed}/ack", json={"cursor": next_cursor})
+                cursor = next_cursor
+                if page["snapshot"]["complete"]:
+                    break
+            else:
+                pytest.fail(server.debug_logs())
+            assert delivered == set(seeds)
+            for _ in range(8):
+                reply = call("GET", f"{feed}/events", params={"after": cursor})
+                events = reply.json()["events"]
+                if events:
+                    assert [
+                        (event["key"]["value"], event["after"]) for event in events
+                    ] == [("post-cut", {"phase": "stream"})]
+                    break
+                cursor = reply.headers["Antfly-Changefeed-Cursor"]
+                call("POST", f"{feed}/ack", json={"cursor": cursor})
+            else:
+                pytest.fail(server.debug_logs())
+            call("DELETE", feed)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_multiple_tables_use_independent_row_filters():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as admin, requests.Session() as reader:
+            admin.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            reader.auth = ("reader", "reader")
+            tables = {"feed_gold": "gold", "feed_silver": "silver"}
+            feeds = f"{server.api_url}/changefeeds"
+            grants = [
+                {"resource": table, "resource_type": "table", "type": "replicate"}
+                for table in tables
+            ]
+            expected = {}
+            for table, expected_tier in tables.items():
+                url = f"{server.api_url}/tables/{table}"
+                admin.post(url, json={"num_shards": 1}, timeout=30).raise_for_status()
+                status = admin.get(url, timeout=15)
+                status.raise_for_status()
+                expected[str(status.json()["table_id"])] = expected_tier
+                admin.post(
+                    f"{url}/batch",
+                    json={
+                        "inserts": {tier: {"tier": tier} for tier in tables.values()}
+                    },
+                    timeout=15,
+                ).raise_for_status()
+            users = f"{server.url}/auth/v1/users"
+            admin.post(
+                f"{users}/limited",
+                json={"password": "limited", "initial_policies": grants[:1]},
+                timeout=15,
+            ).raise_for_status()
+            admin.post(
+                f"{users}/reader",
+                json={"password": "reader", "initial_policies": grants},
+                timeout=15,
+            ).raise_for_status()
+            for table, tier in tables.items():
+                admin.put(
+                    f"{users}/reader/row-filters/{table}",
+                    json={"term": {"tier": tier}},
+                    timeout=15,
+                ).raise_for_status()
+
+            definition = {
+                "tables": list(tables),
+                "start": "snapshot_then_changes",
+                "include": "rows",
+            }
+            headers = {"Idempotency-Key": "multi-table-snapshot"}
+            assert (
+                reader.post(
+                    feeds,
+                    auth=("limited", "limited"),
+                    json=definition,
+                    headers=headers,
+                    timeout=15,
+                ).status_code
+                == 403
+            )
+
+            def call(method, url, **options):
+                deadline = time.monotonic() + 30
+                while True:
+                    reply = reader.request(method, url, timeout=15, **options)
+                    if (
+                        reply.status_code != 503
+                        and not (
+                            reply.status_code == 409
+                            and "changefeed_retry_required" in reply.text
+                        )
+                    ) or time.monotonic() >= deadline:
+                        reply.raise_for_status()
+                        return reply
+                    time.sleep(0.2)
+
+            enrollment = call("POST", feeds, json=definition, headers=headers).json()
+            definition["tables"].reverse()
+            assert (
+                call("POST", feeds, json=definition, headers=headers).json()
+                == enrollment
+            )
+            feed = f"{feeds}/{enrollment['id']}"
+            assert (
+                reader.get(feed, auth=("limited", "limited"), timeout=15).status_code
+                == 403
+            )
+            cursor = enrollment["cursor"]
+            seen = {}
+            for _ in range(6):
+                reply = call(
+                    "GET", f"{feed}/events", params={"after": cursor, "limit": 1}
+                )
+                page = reply.json()
+                cursor = reply.headers["Antfly-Changefeed-Cursor"]
+                for event in page["events"]:
+                    assert event["table_id"] not in seen
+                    seen[event["table_id"]] = event["after"]["tier"]
+                call("POST", f"{feed}/ack", json={"cursor": cursor})
+                if page["snapshot"]["complete"]:
+                    break
+            else:
+                pytest.fail(server.debug_logs())
+            assert seen == expected
+
+            admin.put(
+                f"{users}/reader/row-filters/feed_silver",
+                json={"term": {"tier": "gold"}},
+                timeout=15,
+            ).raise_for_status()
+            denied = reader.get(f"{feed}/events", params={"after": cursor}, timeout=15)
+            assert denied.status_code == 409, denied.text
+            assert "events" not in denied.json()
+            inspection = reader.get(feed, timeout=15)
+            assert inspection.status_code == 409, inspection.text
+            assert "unacknowledged_deliveries" not in inspection.json()
+    finally:
+        server.stop()
+
+
+def _changefeed_call(client, method, url, **options):
+    deadline = time.monotonic() + 30
+    while True:
+        reply = client.request(method, url, timeout=15, **options)
+        retryable = reply.status_code == 503 or (
+            reply.status_code == 409 and "changefeed_retry_required" in reply.text
+        )
+        if not retryable or time.monotonic() >= deadline:
+            reply.raise_for_status()
+            return reply
+        time.sleep(0.2)
+
+
+def test_public_changefeed_projects_exact_before_and_after_predicates():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            name = "changefeed_predicates"
+            feeds = f"{server.api_url}/changefeeds"
+            table = f"{server.api_url}/tables/{name}"
+
+            _changefeed_call(client, "POST", table, json={"num_shards": 1})
+            _changefeed_call(
+                client,
+                "POST",
+                f"{table}/batch",
+                json={
+                    "inserts": {
+                        key: {"eligible": eligible, "visible": "before", "hidden": key}
+                        for key, eligible in [
+                            ("enter", False),
+                            ("update", True),
+                            ("leave", True),
+                            ("delete", True),
+                        ]
+                    }
+                },
+            )
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": name},
+                json={
+                    "tables": [name],
+                    "selectors": [
+                        {
+                            "table": name,
+                            "fields": ["visible"],
+                            "predicates": [{"field": "eligible", "value": True}],
+                        }
+                    ],
+                    "include": "rows",
+                },
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            progress = _changefeed_call(client, "GET", feed).json()
+            assert progress["phase"] == "streaming"
+            assert progress["acknowledged_cursor"] == created["cursor"]
+            assert progress["unacknowledged_deliveries"] == 0
+            assert progress["oldest_unacknowledged_at"] is None
+            _changefeed_call(
+                client,
+                "POST",
+                f"{table}/batch",
+                json={
+                    "inserts": {
+                        key: {"eligible": eligible, "visible": "after", "hidden": key}
+                        for key, eligible in [
+                            ("enter", True),
+                            ("update", True),
+                            ("leave", False),
+                            ("excluded", False),
+                        ]
+                    },
+                    "deletes": ["delete"],
+                },
+            )
+            cursor = created["cursor"]
+            seen = {}
+            for _ in range(12):
+                page = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{feed}/events",
+                    params={"after": cursor, "limit": 1},
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                events = page.json()["events"]
+                if events and not seen:
+                    progress = _changefeed_call(client, "GET", feed).json()
+                    assert progress["unacknowledged_deliveries"] == 1
+                    assert progress["oldest_unacknowledged_at"] > 0
+                for event in events:
+                    key = event["key"]["value"]
+                    assert key not in seen
+                    seen[key] = (event["operation"], event["before"], event["after"])
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if len(seen) == 4:
+                    break
+            before = {"visible": "before"}
+            after = {"visible": "after"}
+            assert seen == {
+                "enter": ("enter", None, after),
+                "update": ("update", before, after),
+                "leave": ("leave", before, None),
+                "delete": ("delete", before, None),
+            }
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_bootstraps_and_streams_native_sql_rows():
+    from decimal import Decimal
+
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            feeds = f"{server.api_url}/changefeeds"
+            amount = "12345678901234567890.12345678"
+
+            def sql(statement):
+                reply = client.post(
+                    f"{server.api_url}/sql", json={"statement": statement}, timeout=40
+                )
+                assert reply.ok, reply.text
+
+            sql(
+                "CREATE TABLE cdc_rows (id BIGINT PRIMARY KEY, amount NUMERIC(38,8), label TEXT)"
+            )
+            sql(
+                f"INSERT INTO cdc_rows (id, amount, label) VALUES (1, {amount}, 'before')"
+            )
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": "cdc-sql-rows"},
+                json={
+                    "tables": ["cdc_rows"],
+                    "start": "snapshot_then_changes",
+                    "include": "rows",
+                },
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            sql("UPDATE cdc_rows SET label = 'after' WHERE id = 1")
+            cursor = created["cursor"]
+            observed = []
+            for _ in range(8):
+                page = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{feed}/events",
+                    params={"after": cursor, "limit": 1},
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                observed.extend(page.json(parse_float=Decimal)["events"])
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if len(observed) == 2:
+                    break
+            expected = {"id": 1, "amount": Decimal(amount), "label": "before"}
+            assert len(observed) == 2, server.debug_logs()
+            assert observed[0]["kind"] == "document_snapshot"
+            assert observed[0]["after"] == expected
+            assert observed[1]["kind"] == "document_committed"
+            assert observed[1]["before"] == expected
+            assert observed[1]["after"] == {**expected, "label": "after"}
+            assert observed[1]["key"] == observed[0]["key"]
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_retains_ttl_tombstone():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            name = "changefeed_ttl"
+            table = f"{server.api_url}/tables/{name}"
+            feeds = f"{server.api_url}/changefeeds"
+            _changefeed_call(
+                client,
+                "POST",
+                table,
+                json={
+                    "num_shards": 1,
+                    "schema": {"ttl": {"field": "expires_at", "duration": "1s"}},
+                },
+            )
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": name},
+                json={"tables": [name], "include": "rows"},
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            _changefeed_call(
+                client,
+                "POST",
+                f"{table}/batch",
+                json={
+                    "inserts": {
+                        "expiring": {
+                            "value": "history",
+                            "expires_at": "2000-01-01T00:00:00Z",
+                        }
+                    }
+                },
+            )
+            cursor = created["cursor"]
+            events = []
+            deadline = time.monotonic() + 60
+            while len(events) < 2 and time.monotonic() < deadline:
+                page = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                events.extend(page.json()["events"])
+                _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+                if not page.json()["events"]:
+                    time.sleep(0.2)
+            assert [event["operation"] for event in events] == ["insert", "delete"], (
+                server.debug_logs()
+            )
+            assert events[1]["before"]["value"] == "history"
+            assert events[1]["after"] is None
+            assert events[1]["key"] == events[0]["key"]
+            assert events[1]["event_id"] != events[0]["event_id"]
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_retains_direct_enrichment_transaction():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            tables = ["changefeed_direct_primary", "changefeed_direct_audit"]
+            feeds = f"{server.api_url}/changefeeds"
+            for name in tables:
+                _changefeed_call(
+                    client,
+                    "POST",
+                    f"{server.api_url}/tables/{name}",
+                    json={"num_shards": 1},
+                )
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": tables[0]},
+                json={"tables": tables, "include": "rows"},
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            reply = client.post(
+                f"{server.api_url}/batch",
+                timeout=30,
+                json={
+                    "commit_requires": "direct_enrichments",
+                    "tables": {
+                        name: {"inserts": {"row": {"value": name}}} for name in tables
+                    },
+                },
+            )
+            assert reply.ok, (reply.text, server.debug_logs())
+            committed = reply.json()
+            assert all(committed["tables"][name]["inserted"] == 1 for name in tables)
+            cursor = created["cursor"]
+            events = []
+            deadline = time.monotonic() + 30
+            while len(events) < 2 and time.monotonic() < deadline:
+                page = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                observed = page.json()["events"]
+                events.extend(observed)
+                if not observed:
+                    time.sleep(0.2)
+            assert sorted(event["after"]["value"] for event in events) == sorted(tables)
+            assert all(event["operation"] == "insert" for event in events)
+            _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_renew_retains_root_beyond_original_deadline():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            name = "changefeed_renewal"
+            table = f"{server.api_url}/tables/{name}"
+            feeds = f"{server.api_url}/changefeeds"
+            _changefeed_call(client, "POST", table, json={"num_shards": 1})
+            created = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": name},
+                json={"tables": [name], "include": "rows", "lease_seconds": 45},
+            ).json()
+            feed = f"{feeds}/{created['id']}"
+            expires_at = created["expires_at"] + 120
+            unauthenticated = requests.post(
+                f"{feed}/renew", json={"expires_at": expires_at}, timeout=15
+            )
+            assert unauthenticated.status_code == 403
+            for _ in range(2):
+                renewed = _changefeed_call(
+                    client, "POST", f"{feed}/renew", json={"expires_at": expires_at}
+                ).json()
+                assert renewed == {"expires_at": expires_at}
+            progress = _changefeed_call(client, "GET", feed).json()
+            assert progress["acknowledged_cursor"] == created["cursor"]
+            assert progress["expires_at"] == expires_at
+            time.sleep(max(0, created["expires_at"] + 1 - time.time()))
+            _changefeed_call(
+                client, "POST", f"{table}/batch", json={"inserts": {"after": {}}}
+            )
+            deadline = time.monotonic() + 15
+            cursor = created["cursor"]
+            while True:
+                page = _changefeed_call(
+                    client, "GET", f"{feed}/events", params={"after": cursor}
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                events = page.json()["events"]
+                if events or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.2)
+            assert [event["operation"] for event in events] == ["insert"]
+            _changefeed_call(client, "POST", f"{feed}/ack", json={"cursor": cursor})
+            _changefeed_call(client, "DELETE", feed)
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("start", ["now", "snapshot_then_changes"])
+def test_public_changefeed_expired_cut_requires_resynchronization(start):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            name = "expiry_test"
+            base = server.api_url
+            _changefeed_call(
+                client, "POST", f"{base}/tables/{name}", json={"num_shards": 1}
+            )
+
+            def subscribe(key, position, lease_seconds):
+                return _changefeed_call(
+                    client,
+                    "POST",
+                    f"{base}/changefeeds",
+                    headers={"Idempotency-Key": key},
+                    json={
+                        "tables": [name],
+                        "include": "rows",
+                        "start": position,
+                        "lease_seconds": lease_seconds,
+                    },
+                ).json()
+
+            active = subscribe("active", "now", 120)
+            lagging = subscribe("lagging", start, 15)
+            time.sleep(max(0, lagging["expires_at"] + 1 - time.time()))
+            server.restart()
+            expired = client.get(
+                f"{base}/changefeeds/{lagging['id']}/events",
+                params={"after": lagging["cursor"]},
+                timeout=15,
+            )
+            assert expired.status_code == 409, expired.text
+            assert expired.json()["error"] == "changefeed_resynchronization_required"
+
+            _changefeed_call(
+                client,
+                "POST",
+                f"{base}/tables/{name}/batch",
+                json={"inserts": {"still-live": {"value": "committed-after-expiry"}}},
+            )
+            path = f"{base}/changefeeds/{active['id']}"
+            cursor = active["cursor"]
+
+            def active_page():
+                nonlocal cursor
+                page = _changefeed_call(
+                    client, "GET", f"{path}/events", params={"after": cursor}
+                )
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+                return page.json()["events"]
+
+            events = wait_until(active_page, timeout_s=20, interval_s=0.2)
+            assert events and [event["key"]["value"] for event in events] == [
+                "still-live"
+            ]
+            _changefeed_call(client, "POST", f"{path}/ack", json={"cursor": cursor})
+            _changefeed_call(client, "DELETE", path)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_backpressure_isolated_until_acknowledgment():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            api = server.api_url
+            name = "bounded_feed"
+            _changefeed_call(
+                client, "POST", f"{api}/tables/{name}", json={"num_shards": 1}
+            )
+
+            def subscribe(key):
+                return _changefeed_call(
+                    client,
+                    "POST",
+                    f"{api}/changefeeds",
+                    headers={"Idempotency-Key": key},
+                    json={"tables": [name], "include": "rows"},
+                ).json()
+
+            stalled = subscribe("stalled")
+            active = subscribe("active")
+            stalled_path = f"{api}/changefeeds/{stalled['id']}"
+            active_path = f"{api}/changefeeds/{active['id']}"
+            window = _changefeed_call(client, "GET", stalled_path).json()[
+                "cursor_window"
+            ]
+            rows = {f"row-{i:03d}": {"value": i} for i in range(window + 1)}
+            _changefeed_call(
+                client, "POST", f"{api}/tables/{name}/batch", json={"inserts": rows}
+            )
+            cursor = stalled["cursor"]
+            stalled_keys = set()
+            for _ in range(window):
+                page = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{stalled_path}/events",
+                    params={"after": cursor, "limit": 1},
+                )
+                (event,) = page.json()["events"]
+                stalled_keys.add(event["key"]["value"])
+                cursor = page.headers["Antfly-Changefeed-Cursor"]
+
+            blocked = client.get(
+                f"{stalled_path}/events",
+                params={"after": cursor, "limit": 1},
+                timeout=15,
+            )
+            assert blocked.status_code == 429, blocked.text
+            assert blocked.json()["error"] == "changefeed_backpressure"
+
+            active_cursor = active["cursor"]
+            active_keys = set()
+            for _ in range(len(rows)):
+                page = _changefeed_call(
+                    client,
+                    "GET",
+                    f"{active_path}/events",
+                    params={"after": active_cursor},
+                )
+                keys = {event["key"]["value"] for event in page.json()["events"]}
+                assert keys and not (keys & active_keys)
+                active_keys.update(keys)
+                active_cursor = page.headers["Antfly-Changefeed-Cursor"]
+                _changefeed_call(
+                    client, "POST", f"{active_path}/ack", json={"cursor": active_cursor}
+                )
+                if active_keys == rows.keys():
+                    break
+            assert active_keys == rows.keys()
+
+            _changefeed_call(
+                client, "POST", f"{stalled_path}/ack", json={"cursor": cursor}
+            )
+            page = _changefeed_call(
+                client,
+                "GET",
+                f"{stalled_path}/events",
+                params={"after": cursor, "limit": 1},
+            )
+            (event,) = page.json()["events"]
+            assert {event["key"]["value"]} == rows.keys() - stalled_keys
+            assert page.json()["transaction"]["complete"]
+            for path in (active_path, stalled_path):
+                _changefeed_call(client, "DELETE", path)
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_closes_after_one_table_is_dropped():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            api = server.api_url
+            names = ["feed_retired_root", "feed_surviving_root"]
+            for name in names:
+                _changefeed_call(
+                    client, "POST", f"{api}/tables/{name}", json={"num_shards": 1}
+                )
+            feed = _changefeed_call(
+                client,
+                "POST",
+                f"{api}/changefeeds",
+                headers={"Idempotency-Key": "retire-dropped-root"},
+                json={"tables": names},
+            ).json()
+            retired = f"{api}/tables/{names[0]}"
+            _changefeed_call(client, "DELETE", retired)
+            assert wait_until(
+                lambda: client.get(retired, timeout=15).status_code == 404,
+                timeout_s=30,
+            )
+            path = f"{api}/changefeeds/{feed['id']}"
+            assert _changefeed_call(client, "DELETE", path).status_code == 204
+            assert _changefeed_call(client, "DELETE", path).status_code == 204
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_resets_stalled_lease_under_native_history_pressure():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            api = server.api_url
+            name = "feed_history_pressure"
+            table = f"{api}/tables/{name}"
+            feeds = f"{api}/changefeeds"
+            _changefeed_call(
+                client, "POST", table, json={"num_shards": 1, "indexes": {}}
+            )
+            stalled = _changefeed_call(
+                client,
+                "POST",
+                feeds,
+                headers={"Idempotency-Key": "stalled-pressure-probe"},
+                json={"tables": [name], "include": "keys_and_versions"},
+            ).json()
+            path = f"{feeds}/{stalled['id']}"
+            payload = "x" * (9 * 1024**2)
+
+            def write(index):
+                try:
+                    response = client.post(
+                        f"{table}/batch",
+                        json={"inserts": {f"row-{index}": {"payload": payload}}},
+                        timeout=60,
+                    )
+                except requests.RequestException as error:
+                    pytest.fail(f"Write {index} failed: {error}\n{server.debug_logs()}")
+                if response.status_code == 429:
+                    assert response.headers.get("Retry-After")
+                    return False
+                assert response.ok, (
+                    f"Write {index}: {response.text}\n{server.debug_logs()}"
+                )
+                return True
+
+            # Cross the soft 192 MiB watermark while staying below 256 MiB.
+            for index in range(22):
+                assert write(index)
+
+            def reset():
+                reply = client.get(path, timeout=15)
+                return (
+                    reply.status_code == 409
+                    and reply.json()["error"] == "changefeed_resynchronization_required"
+                )
+
+            assert wait_until(reset, timeout_s=60), "stalled feed remained active"
+            expired = client.get(
+                f"{path}/events", params={"after": stalled["cursor"]}, timeout=15
+            )
+            assert expired.status_code == 409
+            assert expired.json()["error"] == "changefeed_resynchronization_required"
+            # The public reset can precede physical retirement. The hard limit
+            # may backpressure these writes but must leave the server able to
+            # retire the lease and accept the same write.
+            for index in range(22, 31):
+                assert wait_until(lambda: write(index), timeout_s=60, interval_s=1), (
+                    f"Write {index} stayed backpressured\n{server.debug_logs()}"
+                )
+    finally:
+        server.stop()
+
+
+def test_public_changefeed_oversized_update_requires_narrower_projection():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            api = server.api_url
+            table = f"{api}/tables/feed_large_event"
+            feeds = f"{api}/changefeeds"
+            _changefeed_call(client, "POST", table, json={"num_shards": 1})
+
+            def write(label):
+                response = client.post(
+                    f"{table}/batch",
+                    json={
+                        "inserts": {
+                            "large": {"label": label, "payload": "x" * (9 * 1024**2)}
+                        }
+                    },
+                    timeout=60,
+                )
+                assert response.ok, response.text
+
+            def subscribe(key, fields=None):
+                definition = {
+                    "tables": ["feed_large_event"],
+                    "include": "rows",
+                    "start": "now",
+                }
+                if fields is not None:
+                    definition["selectors"] = [
+                        {"table": "feed_large_event", "fields": fields}
+                    ]
+                return _changefeed_call(
+                    client,
+                    "POST",
+                    feeds,
+                    headers={"Idempotency-Key": key},
+                    json=definition,
+                ).json()
+
+            write("before")
+            full = subscribe("large-full")
+            full_path = f"{feeds}/{full['id']}"
+            write("after")
+            rejected = client.get(
+                f"{full_path}/events",
+                params={"after": full["cursor"], "max_bytes": 16 * 1024**2},
+                timeout=60,
+            )
+            assert rejected.status_code == 409, rejected.text
+            assert rejected.json()["error"] == "changefeed_event_too_large"
+            assert "Antfly-Changefeed-Cursor" not in rejected.headers
+            _changefeed_call(client, "DELETE", full_path)
+
+            too_large_bootstrap = client.post(
+                feeds,
+                headers={"Idempotency-Key": "large-bootstrap"},
+                json={
+                    "tables": ["feed_large_event"],
+                    "start": "snapshot_then_changes",
+                },
+                timeout=30,
+            )
+            assert too_large_bootstrap.status_code == 409, too_large_bootstrap.text
+            assert (
+                too_large_bootstrap.json()["error"] == "changefeed_bootstrap_too_large"
+            )
+
+            narrowed = subscribe("large-narrowed", ["label"])
+            narrow_path = f"{feeds}/{narrowed['id']}"
+            write("next")
+            page = _changefeed_call(
+                client,
+                "GET",
+                f"{narrow_path}/events",
+                params={"after": narrowed["cursor"]},
+            )
+            (event,) = page.json()["events"]
+            assert event["before"] == {"label": "after"}
+            assert event["after"] == {"label": "next"}
+            _changefeed_call(client, "DELETE", narrow_path)
+    finally:
+        server.stop()

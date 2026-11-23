@@ -7600,6 +7600,121 @@ pub fn delete(self: anytype, vector_id: u64) !void {
     try finishPublishSearchStateIfSupported(self, publishing);
 }
 
+// ---------------------------------------------------------------------------
+// lite-single-commit-write-path.md §3.3a: a stage-only mode for one
+// insert/delete, so a caller (antfly-embedded's HBC adapter) can fold this
+// index's own namespace mutations into an externally-owned native
+// transaction instead of this library committing them itself. Computes the
+// SAME namespace mutations `insertWithMetadata`/`delete` would (this
+// index's in-memory routing tree -- `self.metadata.{root_node,
+// active_count, node_count}` -- and its write-path caches ARE mutated
+// already, exactly as the committing path leaves them), but defers
+// publishing them to this index's own readers: `published_snapshot_mu` (via
+// `beginPublishSearchStateIfSupported`) is held exclusive from `stage`
+// through the caller's own `installStagedWrite` or `abortStagedWrite` --
+// never released inside this file. Searches concurrent with the staged
+// window block on that lock exactly as they would across an ordinary
+// synchronous insert/delete; a second staged or ordinary write against the
+// same index serializes behind it the same way.
+//
+// Returns `error.StagedPublicationUnsupported` for every case this mode
+// cannot cover: the concrete `Index` type has no published-snapshot
+// mechanism at all (nothing to hold across the external commit), or its
+// backend cannot harvest pending mutations without committing (every
+// backend but Lite's `.native_catalog` -- see
+// `store.NamespaceWriteTxn.pendingMutations`). `published_snapshot_mu` is
+// already released again (and any in-memory mutation already undone) by
+// the time this returns that error, via the SAME errdefers the committing
+// `insertWithMetadata`/`delete` rely on; the caller simply falls back to
+// those.
+pub const StagedWrite = struct {
+    publishing: bool,
+    /// Owned (allocated via this index's own `self.alloc`): both the
+    /// struct array and the byte slices inside, deep-copied out of the
+    /// now-aborted transaction's own storage by `dupeOwnedPendingMutationsAlloc`.
+    mutations: []const store.PendingMutation,
+};
+
+fn freeStagedMutations(alloc: Allocator, mutations: []const store.PendingMutation) void {
+    for (mutations) |m| {
+        if (m.namespace) |n| alloc.free(n);
+        alloc.free(m.key);
+        if (!m.is_delete) alloc.free(m.value);
+    }
+    alloc.free(mutations);
+}
+
+fn dupeOwnedPendingMutationsAlloc(alloc: Allocator, items: []const store.PendingMutation) ![]store.PendingMutation {
+    // Deep copy: `items` borrows byte slices from the harvested
+    // transaction's own storage, invalid once that transaction is aborted.
+    const out = try alloc.alloc(store.PendingMutation, items.len);
+    var filled: usize = 0;
+    // The array is freed whole; only the first `filled` items own copies.
+    errdefer {
+        for (out[0..filled]) |m| {
+            if (m.namespace) |n| alloc.free(n);
+            alloc.free(m.key);
+            if (!m.is_delete) alloc.free(m.value);
+        }
+        alloc.free(out);
+    }
+    for (items, 0..) |m, i| {
+        // Each field's copy is freed if a later one for this same item
+        // fails; `filled` covers only fully copied items.
+        const namespace = if (m.namespace) |n| try alloc.dupe(u8, n) else null;
+        errdefer if (namespace) |n| alloc.free(n);
+        const key = try alloc.dupe(u8, m.key);
+        errdefer alloc.free(key);
+        const value = if (m.is_delete) "" else try alloc.dupe(u8, m.value);
+        out[i] = .{ .namespace = namespace, .key = key, .value = value, .is_delete = m.is_delete };
+        filled = i + 1;
+    }
+    return out;
+}
+
+/// Runs only after `staged.mutations` are already durable in an
+/// externally-owned commit. Publishes this index's in-memory metadata
+/// (already mutated since `insertWithMetadataStaged`/`deleteStaged`) to
+/// its own readers and releases `published_snapshot_mu`.
+pub fn installStagedWrite(self: anytype, staged: *StagedWrite) !void {
+    defer {
+        freeStagedMutations(self.alloc, staged.mutations);
+        staged.* = undefined;
+    }
+    try finishPublishSearchStateIfSupported(self, staged.publishing);
+}
+
+/// `staged.mutations` were never committed durably (the caller's own
+/// external commit never ran, or failed). Restores this index's in-memory
+/// metadata to exactly what it was before `insertWithMetadataStaged`/
+/// `deleteStaged` and releases `published_snapshot_mu`.
+pub fn abortStagedWrite(self: anytype, staged: *StagedWrite) void {
+    abortPublishSearchStateIfSupported(self, staged.publishing);
+    freeStagedMutations(self.alloc, staged.mutations);
+    staged.* = undefined;
+}
+
+/// Stage-only counterpart of `delete`; see the section doc comment above.
+pub fn deleteStaged(self: anytype, vector_id: u64) !StagedWrite {
+    const publishing = try beginPublishSearchStateIfSupported(self);
+    if (!publishing) return error.StagedPublicationUnsupported;
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
+    var txn = try self.beginRuntimeWriteTxn();
+    errdefer txn.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
+    try deleteTxn(self, &txn, vector_id);
+    try runAutoPostingMaintenanceTxn(self, &txn);
+    try self.flushMetadata(&txn);
+    const harvested = (try txn.pendingMutations()) orelse return error.StagedPublicationUnsupported;
+    defer self.alloc.free(harvested);
+    const owned = try dupeOwnedPendingMutationsAlloc(self.alloc, harvested);
+    // Owned here until the returned `StagedWrite` takes it.
+    errdefer freeStagedMutations(self.alloc, owned);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
+    txn.abort();
+    return .{ .publishing = publishing, .mutations = owned };
+}
+
 pub fn batchDelete(self: anytype, vector_ids: []const u64) !void {
     if (vector_ids.len == 0) return;
     if (vector_ids.len == 1) return delete(self, vector_ids[0]);
@@ -8403,6 +8518,40 @@ pub fn insertWithMetadata(
     try txn.commit();
     self.write_profile.insert_commit_ns += elapsed_fn_u64(commit_start);
     try finishPublishSearchStateIfSupported(self, publishing);
+}
+
+/// Stage-only counterpart of `insertWithMetadata`; see `StagedWrite`'s
+/// section doc comment (above `delete`) for the full contract. Covers
+/// insert, replacement (an existing `vector_id` reinserted with a new
+/// vector/metadata) and the resulting relocation, exactly as
+/// `insertWithMetadata` itself does.
+pub fn insertWithMetadataStaged(
+    self: anytype,
+    vector_id: u64,
+    vector_data: []const f32,
+    metadata_value: []const u8,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+) !StagedWrite {
+    const publishing = try beginPublishSearchStateIfSupported(self);
+    if (!publishing) return error.StagedPublicationUnsupported;
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
+    var txn = try self.beginRuntimeWriteTxn();
+    errdefer txn.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
+    const transformed_vector = try self.alloc.alloc(f32, self.config.dims);
+    defer self.alloc.free(transformed_vector);
+    try insertWithMetadataTxn(self, &txn, vector_id, vector_data, metadata_value, transformed_vector, now_fn_u64, elapsed_fn_u64);
+    try runAutoPostingMaintenanceTxn(self, &txn);
+    try self.flushMetadata(&txn);
+    const harvested = (try txn.pendingMutations()) orelse return error.StagedPublicationUnsupported;
+    defer self.alloc.free(harvested);
+    const owned = try dupeOwnedPendingMutationsAlloc(self.alloc, harvested);
+    // Owned here until the returned `StagedWrite` takes it.
+    errdefer freeStagedMutations(self.alloc, owned);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
+    txn.abort();
+    return .{ .publishing = publishing, .mutations = owned };
 }
 
 pub fn insertWithMetadataTxn(
@@ -13984,4 +14133,20 @@ test "e-means leaf split rejects unsupported configuration" {
     mock.config.kmeans_backend = .cpu;
     mock.config.split_algo = .hilbert;
     try std.testing.expectError(error.EmeansRequiresKmeansSplit, splitLeafVectorSetEmeans(&mock, &vectors, &ids));
+}
+
+test "staged mutation copies free every partial item when an allocation fails" {
+    const items = [_]store.PendingMutation{
+        .{ .namespace = "nodes", .key = "k1", .value = "v1" },
+        .{ .namespace = "vecs", .key = "k2", .value = "v2" },
+        .{ .namespace = null, .key = "k3", .is_delete = true },
+    };
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const alloc = failing.allocator();
+        if (dupeOwnedPendingMutationsAlloc(alloc, &items)) |owned| {
+            freeStagedMutations(alloc, owned);
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    }
 }

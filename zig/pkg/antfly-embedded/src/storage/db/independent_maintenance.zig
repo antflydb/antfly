@@ -20,12 +20,13 @@ const runtime_mod = @import("../background_runtime.zig");
 /// data preparation and publication fences; server upload policy is already
 /// supplied through its separate dispatcher.
 pub const Owner = struct {
-    pub const Work = enum { upload, baseline, producer, footprint, repair, column, index, authority };
+    pub const Work = enum { upload, baseline, producer, footprint, repair, column, index, authority, row_heap, replay_retirement };
     pub const Activity = struct {
         artifacts: bool = false,
         producers: bool = false,
         indexes: bool = false,
         columns: bool = false,
+        row_heap: bool = false,
         scan_pause_ns: ?u64 = null,
         background_checkpoint: bool = false,
     };
@@ -96,7 +97,7 @@ pub const Owner = struct {
         return self.delayMs(port.now(port.ptr), port.activity(port.ptr));
     }
     pub fn delayMs(self: *const Owner, now_ns: u64, activity: Activity) u64 {
-        const active = (now_ns >= self.repair_retry_after_ns and activity.artifacts) or activity.producers or activity.indexes or activity.columns;
+        const active = (now_ns >= self.repair_retry_after_ns and activity.artifacts) or activity.producers or activity.indexes or activity.columns or activity.row_heap;
         if (activity.background_checkpoint and activity.scan_pause_ns == null and !active) return 50;
         return std.math.divCeil(u64, activity.scan_pause_ns orelse if (active) active_poll_ns else idle_poll_ns, std.time.ns_per_ms) catch unreachable;
     }
@@ -109,6 +110,10 @@ pub const Owner = struct {
         _ = port.run(port.ptr, .authority) catch |err| switch (err) {
             error.NotLeader, error.ReadOnly, error.Canceled, error.WriterLocked, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.DocumentAuthorityCursorChanged, error.PortableRuntimeActivationPending => {},
             else => std.log.warn("document authority cache migration failed: {s}", .{@errorName(err)}),
+        };
+        _ = port.run(port.ptr, .row_heap) catch |err| switch (err) {
+            error.NotLeader, error.ReadOnly, error.Canceled, error.WriterLocked, error.StorageBusy, error.PortableRuntimeActivationPending => {},
+            else => std.log.warn("physical row collection failed: {s}", .{@errorName(err)}),
         };
         _ = port.run(port.ptr, .baseline) catch |err| blk: {
             port.failed(port.ptr, .baseline);
@@ -150,6 +155,14 @@ pub const Owner = struct {
             error.Canceled, error.PreparedGenerationChanged, error.IntentConflict, error.ResourceBudgetExceeded, error.PortableRuntimeActivationPending, error.IndexNotFound => {},
             else => std.log.warn("relational index maintenance failed: {s}", .{@errorName(err)}),
         };
+        // WS5: owner-only journal retirement, same cadence as every other
+        // background slice here. `error.NotLeader`/`error.ReadOnly` mean a
+        // non-owner (hosted: not the Raft leader; standalone: read-only)
+        // correctly skipped its turn, not a failure.
+        _ = port.run(port.ptr, .replay_retirement) catch |err| switch (err) {
+            error.NotLeader, error.ReadOnly, error.Canceled, error.RetirementRequiresOwner => {},
+            else => std.log.warn("replay journal retirement failed: {s}", .{@errorName(err)}),
+        };
     }
 };
 
@@ -159,6 +172,8 @@ test "independent maintenance cadence honors source pauses and due work" {
     try std.testing.expectEqual(@as(u64, 5000), owner.delayMs(10, .{ .artifacts = true }));
     try std.testing.expectEqual(@as(u64, 100), owner.delayMs(20, .{ .artifacts = true }));
     try std.testing.expectEqual(@as(u64, 100), owner.delayMs(10, .{ .producers = true }));
+    try std.testing.expectEqual(@as(u64, 100), owner.delayMs(10, .{ .row_heap = true }));
+    try std.testing.expectEqual(@as(u64, 5000), owner.delayMs(10, .{}));
     try std.testing.expectEqual(@as(u64, 50), owner.delayMs(10, .{ .background_checkpoint = true }));
     try std.testing.expectEqual(@as(u64, 2), owner.delayMs(20, .{ .artifacts = true, .scan_pause_ns = std.time.ns_per_ms + 1 }));
 }
@@ -192,7 +207,7 @@ test "independent maintenance gates all work and yields activation contention" {
     try std.testing.expectEqual(@as(usize, 0), fixture.calls.items.len);
     fixture.admitted = true;
     owner.run(port);
-    try std.testing.expectEqualSlices(Owner.Work, &.{ .upload, .authority, .baseline, .producer, .footprint, .repair }, fixture.calls.items);
+    try std.testing.expectEqualSlices(Owner.Work, &.{ .upload, .authority, .row_heap, .baseline, .producer, .footprint, .repair }, fixture.calls.items);
     try std.testing.expectEqual(@as(u64, 0), owner.repair_retry_after_ns);
 }
 

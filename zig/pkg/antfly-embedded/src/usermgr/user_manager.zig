@@ -80,17 +80,21 @@ pub const PermissionType = enum {
     write,
     curator,
     admin,
+    /// Explicit export authority, independent of ordinary reads and writes.
+    replicate,
 
     pub fn fromSlice(raw: []const u8) !PermissionType {
         if (std.mem.eql(u8, raw, "read")) return .read;
         if (std.mem.eql(u8, raw, "write")) return .write;
         if (std.mem.eql(u8, raw, "curator")) return .curator;
         if (std.mem.eql(u8, raw, "admin")) return .admin;
+        if (std.mem.eql(u8, raw, "replicate")) return .replicate;
         return error.InvalidPermissionType;
     }
 
     /// Curators can read the table and use its admitted curation service, but
-    /// cannot perform arbitrary writes or administer the table.
+    /// cannot perform arbitrary writes or administer the table. Replication
+    /// requires its own grant; its holders do not acquire SELECT authority.
     pub fn allows(self: PermissionType, required: PermissionType) bool {
         return self == .admin or self == required or (self == .curator and required == .read);
     }
@@ -292,6 +296,7 @@ pub const ApiKeyRecord = struct {
 
 pub const ValidatedApiKey = struct {
     username: []u8,
+    user_instance_id: [16]u8,
     permissions: []Permission,
     row_filter: []RowFilterEntry,
     metadata_json: []u8 = &.{},
@@ -440,7 +445,8 @@ pub const MemoryStore = struct {
             existing.metadata_json = if (user.metadata_json.len > 0) try self.alloc.dupe(u8, user.metadata_json) else &.{};
             return;
         }
-        try self.users.append(self.alloc, try user.clone(self.alloc));
+        try self.users.ensureUnusedCapacity(self.alloc, 1);
+        self.users.appendAssumeCapacity(try user.clone(self.alloc));
     }
 
     pub fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
@@ -482,7 +488,8 @@ pub const MemoryStore = struct {
             existing.* = try record.clone(self.alloc);
             return;
         }
-        try self.api_keys.append(self.alloc, try record.clone(self.alloc));
+        try self.api_keys.ensureUnusedCapacity(self.alloc, 1);
+        self.api_keys.appendAssumeCapacity(try record.clone(self.alloc));
     }
 
     pub fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
@@ -521,7 +528,15 @@ pub const UserManager = struct {
     // not a distributed revocation oracle: already admitted statements have
     // a bounded lease, while subsequent admissions pin the new graph.
     role_revision: u64 = 1,
+    // Local to this manager. Publish under the same lock as every credential
+    // or policy write, including a multi-step write that fails partway through.
+    authorization_revision: std.atomic.Value(u64) = .init(1),
     lifecycle_hook: ?AuthLifecycleHook = null,
+
+    fn finishAuthorizationWrite(self: *UserManager, io: std.Io) void {
+        _ = self.authorization_revision.fetchAdd(1, .release);
+        self.mutation_mutex.unlock(io);
+    }
 
     pub fn setLifecycleHook(self: *UserManager, hook: ?AuthLifecycleHook) void {
         self.lifecycle_hook = hook;
@@ -653,7 +668,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.createUserWithMetadataUnlocked(username, password, initial_policies, metadata_json);
     }
 
@@ -760,6 +775,15 @@ pub const UserManager = struct {
         return lease.getUser(username);
     }
 
+    /// Copy just the principal incarnation under the normal authority lock;
+    /// SQL setting capture does not need to clone passwords or metadata.
+    pub fn currentUserInstance(self: *UserManager, username: []const u8) ![16]u8 {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        self.mutation_mutex.lockUncancelable(receiver.io());
+        defer self.mutation_mutex.unlock(receiver.io());
+        return self.user_instances.get(username) orelse error.UserNotFound;
+    }
+
     fn cloneUserUnlocked(self: *UserManager, username: []const u8) !User {
         const password_hash = self.users.get(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
@@ -788,7 +812,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         const existing = self.users.getPtr(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
         const new_hash = try hashPassword(self.alloc, io, new_password);
@@ -810,7 +834,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         const instance_id = self.user_instances.get(username) orelse return error.UserNotFound;
         if (self.personal_grant_revoker) |revoker| {
             if (!revoker.revoke_fn(revoker.ptr, instance_id)) return error.PersonalGrantRevocationFailed;
@@ -869,7 +893,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.addPermissionToSubjectUnlocked(subject, permission);
     }
 
@@ -887,7 +911,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addPermissionToSubjectUnlocked(username, permission);
     }
@@ -901,7 +925,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         const removed = if (std.mem.eql(u8, resource_name, "*"))
             try self.enforcer.removeFilteredPolicy(0, &.{ username, resource_type.slice() })
@@ -925,7 +949,8 @@ pub const UserManager = struct {
         }
         for (rules) |rule| {
             if (rule.fields.len < 4) continue;
-            try out.append(self.alloc, try Permission.initOwned(
+            try out.ensureUnusedCapacity(self.alloc, 1);
+            out.appendAssumeCapacity(try Permission.initOwned(
                 self.alloc,
                 try ResourceType.fromSlice(rule.fields[1]),
                 rule.fields[2],
@@ -944,11 +969,20 @@ pub const UserManager = struct {
     /// One immutable live ACL snapshot for a complete graph operation. The
     /// caller separately intersects every check with its admitted ACL snapshot.
     pub fn permissionsCurrentlyAllowed(self: *UserManager, username: []const u8, credential: []const u8, checks: []const PermissionCheck) !bool {
+        return self.permissionsCurrentlyAllowedWithUserInstance(username, credential, checks, null);
+    }
+    /// Intersect an admitted identity with current permissions atomically. A
+    /// recreated username cannot inherit a prior identity's retained readers.
+    pub fn permissionsCurrentlyAllowedWithUserInstance(self: *UserManager, username: []const u8, credential: []const u8, checks: []const PermissionCheck, expected_instance: ?[16]u8) !bool {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
         defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return false;
+        if (expected_instance) |expected| {
+            const current = self.user_instances.get(username) orelse return false;
+            if (std.mem.allEqual(u8, &expected, 0) or !std.mem.eql(u8, &current, &expected)) return false;
+        }
         const permissions = if (std.mem.startsWith(u8, credential, "api-key:")) blk: {
             const id = credential["api-key:".len..];
             const record = self.api_keys.get(id) orelse return false;
@@ -1006,7 +1040,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.addRoleToSubjectUnlocked(subject, role);
     }
 
@@ -1020,7 +1054,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.addRoleToSubjectUnlocked(username, role);
     }
@@ -1029,7 +1063,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.removeRoleFromSubjectUnlocked(subject, role);
     }
 
@@ -1043,7 +1077,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.removeRoleFromSubjectUnlocked(username, role);
     }
@@ -1102,12 +1136,39 @@ pub const UserManager = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    /// Revision of the role authority, captured under the mutation mutex.
-    pub fn rowPolicyRoleRevision(self: *UserManager) u64 {
-        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
-        const io = receiver.io();
-        self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+    fn roleLess(_: void, left: []const u8, right: []const u8) bool {
+        return std.mem.lessThan(u8, left, right);
+    }
+
+    fn sortedRoleDigest(roles: []const []const u8) [32]u8 {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        for (roles) |role| {
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, role.len, .little);
+            hash.update(&size);
+            hash.update(role);
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+
+    pub fn roleDigest(alloc: Allocator, roles: []const []const u8) ![32]u8 {
+        if (std.sort.isSorted([]const u8, roles, {}, roleLess)) return sortedRoleDigest(roles);
+        const sorted = try alloc.dupe([]const u8, roles);
+        defer alloc.free(sorted);
+        std.mem.sort([]const u8, sorted, {}, roleLess);
+        return sortedRoleDigest(sorted);
+    }
+
+    pub fn validateRoleRevision(self: *UserManager, username: []const u8, admitted_roles: []const []const u8, previous: ?u64) !u64 {
+        var lease = try self.acquireSnapshotLease();
+        defer lease.release();
+        if (self.role_revision != previous) {
+            const roles = try self.getRolesForUser(username);
+            defer freeOwnedStrings(self.alloc, roles);
+            if (!std.meta.eql(try roleDigest(self.alloc, roles), try roleDigest(self.alloc, admitted_roles))) return error.Forbidden;
+        }
         return self.role_revision;
     }
 
@@ -1127,12 +1188,60 @@ pub const UserManager = struct {
         scope: @import("row_policy_authority.zig").Scope,
         now_seconds: i64,
     ) ![]u8 {
+        return self.signRowPolicyRolesImpl(alloc, authenticated_username, credential_principal, logical_table, permission_type, secret, issuer, scope, now_seconds, null, null);
+    }
+
+    /// Supplied only after the SQL owner has admitted an immutable view
+    /// binding. Both user incarnations and live grants are rechecked while
+    /// capturing roles; a deleted/recreated owner cannot inherit a view.
+    pub const ViewDelegation = struct {
+        pub const Intermediate = struct { principal: []const u8, instance: [16]u8, logical_view: []const u8 };
+        logical_view: []const u8,
+        owner: []const u8,
+        owner_instance: [16]u8,
+        caller_instance: [16]u8,
+        intermediate: []const Intermediate = &.{},
+        /// Invoker views must retain the caller's credential restrictions on
+        /// the base relation, even when its user has broader grants.
+        invoker: bool = false,
+    };
+
+    pub fn signRowPolicyViewRolesAuthorized(self: *UserManager, alloc: Allocator, caller: []const u8, credential: []const u8, logical_table: []const u8, delegation: ViewDelegation, secret: []const u8, issuer: []const u8, scope: @import("row_policy_authority.zig").Scope, now_seconds: i64) ![]u8 {
+        if (scope.access != .read) return error.Forbidden;
+        return self.signRowPolicyRolesImpl(alloc, caller, credential, logical_table, .read, secret, issuer, scope, now_seconds, delegation, null);
+    }
+
+    pub fn signBoundRowPolicyRoles(self: *UserManager, alloc: Allocator, authenticated_username: []const u8, credential_principal: []const u8, logical_table: []const u8, permission_type: PermissionType, secret: []const u8, issuer: []const u8, scope: @import("row_policy_authority.zig").Scope, now_seconds: i64, expected_roles: ?[32]u8) ![]u8 {
+        return self.signRowPolicyRolesImpl(alloc, authenticated_username, credential_principal, logical_table, permission_type, secret, issuer, scope, now_seconds, null, expected_roles);
+    }
+
+    fn signRowPolicyRolesImpl(
+        self: *UserManager,
+        alloc: Allocator,
+        authenticated_username: []const u8,
+        credential_principal: []const u8,
+        logical_table: []const u8,
+        permission_type: PermissionType,
+        secret: []const u8,
+        issuer: []const u8,
+        scope: @import("row_policy_authority.zig").Scope,
+        now_seconds: i64,
+        delegation: ?ViewDelegation,
+        expected_roles: ?[32]u8,
+    ) ![]u8 {
         const authority = @import("row_policy_authority.zig");
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
         defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(authenticated_username)) return error.Forbidden;
+        if (delegation) |value| {
+            if (value.intermediate.len > 63 or scope.access != .read or permission_type != .read or
+                !std.mem.eql(u8, &(self.user_instances.get(authenticated_username) orelse return error.Forbidden), &value.caller_instance) or
+                !std.mem.eql(u8, &(self.user_instances.get(value.owner) orelse return error.Forbidden), &value.owner_instance))
+                return error.Forbidden;
+            if (value.invoker and !std.mem.eql(u8, value.owner, authenticated_username)) return error.Forbidden;
+        }
         const current_permissions = if (std.mem.startsWith(u8, credential_principal, "basic:")) blk: {
             if (!std.mem.eql(u8, credential_principal["basic:".len..], authenticated_username)) return error.Forbidden;
             break :blk try self.getPermissionsForUser(authenticated_username);
@@ -1149,7 +1258,7 @@ pub const UserManager = struct {
         var allowed = false;
         for (current_permissions) |permission| {
             if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
-                catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                catalog_names.tableResourceMatches(permission.resource, if (delegation) |value| value.logical_view else logical_table) and
                 permission.type.allows(permission_type))
             {
                 allowed = true;
@@ -1157,19 +1266,91 @@ pub const UserManager = struct {
             }
         }
         if (!allowed) return error.Forbidden;
-        const roles = try self.getRolesForUser(authenticated_username);
+        if (scope.purpose.requiresWritePermission() and permission_type != .write) return error.Forbidden;
+        if (scope.purpose.requiresSelectPermission()) {
+            var read_allowed = false;
+            for (current_permissions) |permission| {
+                if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                    catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                    (permission.type == .read or permission.type == .admin))
+                {
+                    read_allowed = true;
+                    break;
+                }
+            }
+            if (!read_allowed) return error.Forbidden;
+        }
+        if (delegation) |value| {
+            if (value.invoker) {
+                var base_allowed = false;
+                for (current_permissions) |permission| {
+                    if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                        catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                        (permission.type == .read or permission.type == .admin))
+                    {
+                        base_allowed = true;
+                        break;
+                    }
+                }
+                if (!base_allowed) return error.Forbidden;
+            }
+            for (value.intermediate) |grant| {
+                if (!std.mem.eql(u8, &(self.user_instances.get(grant.principal) orelse return error.Forbidden), &grant.instance)) return error.Forbidden;
+                const permissions = try self.getPermissionsForUser(grant.principal);
+                defer {
+                    for (permissions) |*permission| permission.deinit(self.alloc);
+                    self.alloc.free(permissions);
+                }
+                var granted = false;
+                for (permissions) |permission| {
+                    if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                        catalog_names.tableResourceMatches(permission.resource, grant.logical_view) and
+                        (permission.type == .read or permission.type == .admin))
+                    {
+                        granted = true;
+                        break;
+                    }
+                }
+                if (!granted) return error.Forbidden;
+            }
+            const owner_permissions = try self.getPermissionsForUser(value.owner);
+            defer {
+                for (owner_permissions) |*permission| permission.deinit(self.alloc);
+                self.alloc.free(owner_permissions);
+            }
+            allowed = false;
+            for (owner_permissions) |permission| {
+                if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                    catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                    (permission.type == .admin or permission.type == .read))
+                {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) return error.Forbidden;
+        }
+        const roles = try self.getRolesForUser(if (delegation) |value| value.owner else authenticated_username);
         defer freeOwnedStrings(self.alloc, roles);
         const role_views = try alloc.alloc([]const u8, roles.len);
         defer alloc.free(role_views);
-        for (roles, 0..) |role, index| role_views[index] = role;
-        std.mem.sort([]const u8, role_views, {}, struct {
+        var role_count: usize = 0;
+        for (roles) |role| {
+            if (@import("../system_catalog/privileges.zig").reservedRoleAlias(role)) continue;
+            role_views[role_count] = role;
+            role_count += 1;
+        }
+        std.mem.sort([]const u8, role_views[0..role_count], {}, struct {
             fn less(_: void, left: []const u8, right: []const u8) bool {
                 return std.mem.order(u8, left, right) == .lt;
             }
         }.less);
+        if (expected_roles) |digest| if (!std.meta.eql(digest, sortedRoleDigest(role_views[0..role_count]))) return error.Forbidden;
         return authority.sign(alloc, secret, issuer, .{
             .principal = authenticated_username,
-            .roles = role_views,
+            .policy_principal = if (delegation) |value| (if (value.invoker) null else value.owner) else null,
+            .setting_principal = if (delegation != null and std.mem.startsWith(u8, credential_principal, "api-key:")) credential_principal else null,
+            .roles = role_views[0..role_count],
             .auth_revision = self.role_revision,
         }, scope, now_seconds);
     }
@@ -1198,7 +1379,8 @@ pub const UserManager = struct {
         }
         var it = subjects.iterator();
         while (it.next()) |entry| {
-            try out.append(self.alloc, try AuthSubjectEntry.initOwned(self.alloc, entry.key_ptr.*, entry.value_ptr.*));
+            try out.ensureUnusedCapacity(self.alloc, 1);
+            out.appendAssumeCapacity(try AuthSubjectEntry.initOwned(self.alloc, entry.key_ptr.*, entry.value_ptr.*));
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -1226,7 +1408,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.setSubjectRowFilterUnlocked(subject, table, filter_json);
     }
 
@@ -1242,7 +1424,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.setSubjectRowFilterUnlocked(username, table, filter_json);
     }
@@ -1251,7 +1433,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.removeSubjectRowFilterUnlocked(subject, table);
     }
 
@@ -1265,7 +1447,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.removeSubjectRowFilterUnlocked(username, table);
     }
@@ -1298,7 +1480,8 @@ pub const UserManager = struct {
         }
         for (rules) |rule| {
             if (rule.fields.len < 3) continue;
-            try out.append(self.alloc, try RowFilterEntry.initOwned(self.alloc, rule.fields[1], rule.fields[2]));
+            try out.ensureUnusedCapacity(self.alloc, 1);
+            out.appendAssumeCapacity(try RowFilterEntry.initOwned(self.alloc, rule.fields[1], rule.fields[2]));
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -1349,7 +1532,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         if (!self.users.contains(username)) return error.UserNotFound;
 
         for (permissions) |perm| {
@@ -1423,24 +1606,30 @@ pub const UserManager = struct {
         if (record.key.expires_at_ns) |expires_at_ns| {
             if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
         }
+        const user_instance = self.user_instances.get(record.key.username) orelse return error.UserNotFound;
         const owner_row_filter = try self.getRowFilters(record.key.username);
         defer {
             for (owner_row_filter) |*entry| entry.deinit(self.alloc);
             self.alloc.free(owner_row_filter);
         }
         const effective_permissions = try self.effectiveApiKeyPermissionsUnlocked(key_id);
-        errdefer {
+        var transferred = false;
+        errdefer if (!transferred) {
             for (effective_permissions) |*permission| permission.deinit(self.alloc);
             self.alloc.free(effective_permissions);
-        }
-
-        return .{
-            .username = try self.alloc.dupe(u8, record.key.username),
-            .permissions = effective_permissions,
-            .row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter),
-            .metadata_json = try self.alloc.dupe(u8, self.user_metadata.get(record.key.username) orelse "{}"),
-            .roles = try self.getRolesForUser(record.key.username),
         };
+        var result: ValidatedApiKey = .{
+            .username = try self.alloc.dupe(u8, record.key.username),
+            .user_instance_id = user_instance,
+            .permissions = effective_permissions,
+            .row_filter = &.{},
+        };
+        transferred = true;
+        errdefer result.deinit(self.alloc);
+        result.row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter);
+        result.metadata_json = try self.alloc.dupe(u8, self.user_metadata.get(record.key.username) orelse "{}");
+        result.roles = try self.getRolesForUser(record.key.username);
+        return result;
     }
 
     /// Resolve the current authority of an existing API-key identity without
@@ -1455,6 +1644,139 @@ pub const UserManager = struct {
         mutable.mutation_mutex.lockUncancelable(io);
         defer mutable.mutation_mutex.unlock(io);
         return try self.effectiveApiKeyPermissionsUnlocked(key_id);
+    }
+
+    /// Credential upper bound only, never SQL authority. The caller must
+    /// independently intersect these caps with its immutable catalog ACL cut.
+    /// Native REST permissions continue to use effectiveApiKeyPermissions.
+    pub fn sqlCredentialPermits(self: *UserManager, username: []const u8, instance: [16]u8, credential: []const u8, table: []const u8, required: u16) !bool {
+        var receiver = try self.io_borrow.receive();
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return self.sqlCredentialPermitsUnlocked(io, username, instance, credential, table, required);
+    }
+
+    /// Resolve a retained SQL credential by identity, including API keys
+    /// whose owner differs from the current SQL role.
+    pub fn sqlRetainedCredentialPermits(self: *UserManager, instance: [16]u8, credential: []const u8, table: []const u8, required: u16) !bool {
+        var receiver = try self.io_borrow.receive();
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        const username = if (std.mem.startsWith(u8, credential, "basic:"))
+            credential["basic:".len..]
+        else if (std.mem.startsWith(u8, credential, "api-key:"))
+            (self.api_keys.get(credential["api-key:".len..]) orelse return false).key.username
+        else
+            return false;
+        return self.sqlCredentialPermitsUnlocked(io, username, instance, credential, table, required);
+    }
+
+    /// Administrative SQL mutations obey the key's explicit resource caps,
+    /// independently of grant options supplied by the SQL catalog.
+    pub fn sqlCredentialCatalogPermits(self: *UserManager, username: []const u8, instance: [16]u8, credential: []const u8, resource_type: ResourceType, resource: []const u8) !bool {
+        var receiver = try self.io_borrow.receive();
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.sqlCredentialPermitsUnlocked(io, username, instance, credential, "", 0)) return false;
+        if (std.mem.startsWith(u8, credential, "basic:")) return true;
+        const record = self.api_keys.get(credential["api-key:".len..]) orelse return false;
+        if (record.key.permissions.len == 0) return true;
+        for (record.key.permissions) |permission| {
+            if (permission.resource_type != .@"*" and permission.resource_type != resource_type) continue;
+            const matches = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource) or (resource_type == .table and catalog_names.tableResourceMatches(permission.resource, resource));
+            if (matches and permission.type == .admin) return true;
+        }
+        return false;
+    }
+
+    fn sqlCredentialPermitsUnlocked(self: *const UserManager, io: std.Io, username: []const u8, instance: [16]u8, credential: []const u8, table: []const u8, required: u16) bool {
+        const sql = @import("../system_catalog/privileges.zig");
+        if (required & ~@as(u16, 255) != 0 or !self.users.contains(username)) return false;
+        const current = self.user_instances.get(username) orelse return false;
+        if (!std.mem.eql(u8, &current, &instance)) return false;
+        if (std.mem.startsWith(u8, credential, "basic:")) return std.mem.eql(u8, credential["basic:".len..], username);
+        if (!std.mem.startsWith(u8, credential, "api-key:")) return false;
+        const record = self.api_keys.get(credential["api-key:".len..]) orelse return false;
+        if (!std.mem.eql(u8, record.key.username, username)) return false;
+        if (record.key.expires_at_ns) |expires| if (nowNs(io) > expires) return false;
+        // An empty restriction inherits current user authority; SQL grants
+        // are an additional live authority, not a synthesized native grant.
+        if (record.key.permissions.len == 0) return true;
+        inline for (@typeInfo(sql.Privilege).@"enum".field_values[0..8]) |raw| {
+            const privilege: sql.Privilege = @fromBackingInt(raw);
+            if (required & sql.Access.bit(privilege) != 0) {
+                const needed: PermissionType = switch (privilege) {
+                    .select => .read,
+                    .insert, .update, .delete => .write,
+                    .truncate, .references, .trigger, .maintain => .admin,
+                    .membership => unreachable,
+                };
+                const permits = for (record.key.permissions) |permission| {
+                    if ((permission.resource_type == .table or permission.resource_type == .@"*") and catalog_names.tableResourceMatches(permission.resource, table) and permission.type.allows(needed)) break true;
+                } else false;
+                if (!permits) return false;
+            }
+        }
+        return true;
+    }
+
+    pub const SqlDelegation = struct {
+        principal_instance: [16]u8,
+        required: u16,
+        roles: []const @import("../system_catalog/privileges.zig").Role,
+    };
+
+    /// Internal admission from the SQL owner after validating a catalog ACL
+    /// cut. Rechecks credential incarnation and caps under the native lock;
+    /// only metadata-verified SQL UUIDs can mint reserved policy role aliases.
+    pub fn signRowPolicySqlRolesAuthorized(self: *UserManager, alloc: Allocator, username: []const u8, credential: []const u8, logical_table: []const u8, delegation: SqlDelegation, secret: []const u8, issuer: []const u8, scope: @import("row_policy_authority.zig").Scope, now_seconds: i64) ![]u8 {
+        const sql = @import("../system_catalog/privileges.zig");
+        const authority = @import("row_policy_authority.zig");
+        const mutation_mask = sql.Access.bit(.insert) | sql.Access.bit(.update) | sql.Access.bit(.delete);
+        if (delegation.required == 0 or delegation.roles.len > authority.maximum_roles) return error.RowPolicyAuthenticationRequired;
+        if ((scope.purpose.requiresWritePermission() or scope.access == .write) and delegation.required & mutation_mask == 0) return error.Forbidden;
+        if ((scope.purpose == .ordinary and scope.access == .read or scope.purpose.requiresSelectPermission()) and delegation.required & sql.Access.bit(.select) == 0) return error.Forbidden;
+        const snapshot = blk: {
+            var receiver = try self.io_borrow.receive();
+            const io = receiver.io();
+            self.mutation_mutex.lockUncancelable(io);
+            defer self.mutation_mutex.unlock(io);
+            if (!self.sqlCredentialPermitsUnlocked(io, username, delegation.principal_instance, credential, logical_table, delegation.required)) return error.Forbidden;
+            break :blk .{ .roles = try self.getRolesForUser(username), .revision = self.role_revision };
+        };
+        defer freeOwnedStrings(self.alloc, snapshot.roles);
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        const a = region.allocator();
+        var roles: std.ArrayList([]const u8) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (snapshot.roles) |role| {
+            if (sql.reservedRoleAlias(role)) continue;
+            if (!(try seen.getOrPut(a, role)).found_existing) try roles.append(a, role);
+        }
+        var sql_roles: std.ArrayList([]const u8) = .empty;
+        for (delegation.roles) |role| {
+            const alias = try sql.roleAlias(a, role);
+            if (!(try seen.getOrPut(a, alias)).found_existing) {
+                try roles.append(a, alias);
+                try sql_roles.append(a, alias[sql.role_alias_prefix.len..]);
+            }
+        }
+        if (roles.items.len > authority.maximum_roles) return error.RowPolicyAuthenticationRequired;
+        std.mem.sort([]const u8, roles.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
+        std.mem.sort([]const u8, sql_roles.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
+        return authority.sign(alloc, secret, issuer, .{ .principal = username, .roles = roles.items, .sql_roles = sql_roles.items, .auth_revision = snapshot.revision }, scope, now_seconds);
     }
 
     /// Recheck the restrictions attached to an already authenticated durable
@@ -1510,6 +1832,35 @@ pub const UserManager = struct {
         principal: []const u8,
         payload: []const u8,
     ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
+        return self.destinationGrantMacWithInstance(principal, payload, null);
+    }
+
+    /// Check the persisted user incarnation and credential under one lock.
+    /// Username reuse must not revive a long-lived capture/feed credential,
+    /// even if an operator reinstalls exactly the same password verifier.
+    pub fn destinationGrantMacForUserInstance(
+        self: *const UserManager,
+        principal: []const u8,
+        payload: []const u8,
+        expected_instance: [16]u8,
+    ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
+        if (std.mem.allEqual(u8, &expected_instance, 0)) return error.UserNotFound;
+        return self.destinationGrantMacWithInstance(principal, payload, expected_instance);
+    }
+
+    fn requireUserInstanceUnlocked(self: *const UserManager, username: []const u8, expected: ?[16]u8) !void {
+        if (expected) |instance| {
+            const current = self.user_instances.get(username) orelse return error.UserNotFound;
+            if (!std.mem.eql(u8, &current, &instance)) return error.UserNotFound;
+        }
+    }
+
+    fn destinationGrantMacWithInstance(
+        self: *const UserManager,
+        principal: []const u8,
+        payload: []const u8,
+        expected_instance: ?[16]u8,
+    ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         const mutable: *UserManager = @constCast(self);
@@ -1518,11 +1869,13 @@ pub const UserManager = struct {
         const key = if (std.mem.startsWith(u8, principal, "basic:")) blk: {
             const username = principal["basic:".len..];
             if (username.len == 0) return error.InvalidDestinationGrantPrincipal;
+            try self.requireUserInstanceUnlocked(username, expected_instance);
             break :blk self.users.get(username) orelse return error.UserNotFound;
         } else if (std.mem.startsWith(u8, principal, "api-key:")) blk: {
             const key_id = principal["api-key:".len..];
             if (key_id.len == 0) return error.InvalidDestinationGrantPrincipal;
             const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
+            try self.requireUserInstanceUnlocked(record.key.username, expected_instance);
             if (record.key.expires_at_ns) |expires_at_ns| {
                 if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
             }
@@ -1553,7 +1906,7 @@ pub const UserManager = struct {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        defer self.finishAuthorizationWrite(io);
         return try self.deleteApiKeyUnlocked(username, key_id);
     }
 
@@ -1715,12 +2068,10 @@ fn intersectPermissions(
                     break;
                 }
             }
-            if (!duplicate) try out.append(alloc, try Permission.initOwned(
-                alloc,
-                intersection.resource_type,
-                intersection.resource,
-                intersection.permission_type,
-            ));
+            if (!duplicate) {
+                try out.ensureUnusedCapacity(alloc, 1);
+                out.appendAssumeCapacity(try Permission.initOwned(alloc, intersection.resource_type, intersection.resource, intersection.permission_type));
+            }
         }
     }
     return try out.toOwnedSlice(alloc);
@@ -2118,6 +2469,84 @@ test "usermgr bootstrap retires legacy default credentials without silently reop
     try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
 }
 
+test "usermgr view delegation checks both live grants and user incarnations under one role capture" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(a);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policy_store.iface()));
+    defer manager.deinit();
+    var view_permission = [_]Permission{try Permission.initOwned(a, .table, "published", .read)};
+    defer view_permission[0].deinit(a);
+    var source_permission = [_]Permission{try Permission.initOwned(a, .table, "rows", .read)};
+    defer source_permission[0].deinit(a);
+    var caller = try manager.createUser("caller", "secret", &view_permission);
+    defer caller.deinit(a);
+    var owner = try manager.createUser("owner", "secret", &source_permission);
+    defer owner.deinit(a);
+    try manager.addRoleToSubject("owner", "role:reader");
+    const authority = @import("row_policy_authority.zig");
+    const scope: authority.Scope = .{ .table_id = 7, .table = "rows", .database = "main", .policy_generation = 2, .catalog_epoch = 3 };
+    const key = "1234567890abcdef1234567890abcdef";
+    const delegation: UserManager.ViewDelegation = .{
+        .logical_view = "published",
+        .owner = "owner",
+        .owner_instance = owner.instance_id,
+        .caller_instance = caller.instance_id,
+    };
+    const token = try manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", delegation, key, "cluster", scope, 100);
+    defer a.free(token);
+    var verified = try authority.verify(a, key, "cluster", scope, 100, token);
+    defer verified.deinit();
+    try std.testing.expectEqualStrings("caller", verified.value.principal);
+    try std.testing.expectEqualStrings("owner", verified.value.policy_principal.?);
+    try std.testing.expectEqualStrings("role:reader", verified.value.roles[0]);
+    // An owner view may delegate a view-only credential, including when the
+    // view owner and caller happen to be the same user. Invoker views may not.
+    try manager.addPermissionToUser("caller", source_permission[0]);
+    var limited = try manager.createApiKey("caller", "views-only", &view_permission, &.{}, null);
+    defer limited.deinit(a);
+    const credential = try std.fmt.allocPrint(a, "api-key:{s}", .{limited.key.key_id});
+    defer a.free(credential);
+    const delegated = try manager.signRowPolicyViewRolesAuthorized(a, "caller", credential, "rows", delegation, key, "cluster", scope, 100);
+    defer a.free(delegated);
+    var decoded = try authority.verify(a, key, "cluster", scope, 100, delegated);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(credential, decoded.value.setting_principal.?);
+    var invoker = delegation;
+    invoker.owner = "caller";
+    invoker.owner_instance = caller.instance_id;
+    invoker.invoker = true;
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", credential, "rows", invoker, key, "cluster", scope, 100));
+    const invoked = try manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", invoker, key, "cluster", scope, 100);
+    defer a.free(invoked);
+    var invocation = try authority.verify(a, key, "cluster", scope, 100, invoked);
+    defer invocation.deinit();
+    try std.testing.expect(invocation.value.policy_principal == null);
+    var nested = delegation;
+    nested.intermediate = &.{.{ .principal = "owner", .instance = owner.instance_id, .logical_view = "inner_view" }};
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", nested, key, "cluster", scope, 100));
+    var nested_permission = try Permission.initOwned(a, .table, "inner_view", .read);
+    defer nested_permission.deinit(a);
+    try manager.addPermissionToUser("owner", nested_permission);
+    const nested_token = try manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", nested, key, "cluster", scope, 100);
+    defer a.free(nested_token);
+    try manager.removePermissionFromUser("owner", "inner_view", .table);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", nested, key, "cluster", scope, 100));
+    var recreated = delegation;
+    recreated.owner_instance = @splat(0x7f);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", recreated, key, "cluster", scope, 100));
+    recreated = delegation;
+    recreated.caller_instance = @splat(0x7f);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", recreated, key, "cluster", scope, 100));
+    try manager.removePermissionFromUser("owner", "rows", .table);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", delegation, key, "cluster", scope, 100));
+    try manager.addPermissionToUser("owner", source_permission[0]);
+    try manager.removePermissionFromUser("caller", "published", .table);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyViewRolesAuthorized(a, "caller", "basic:caller", "rows", delegation, key, "cluster", scope, 100));
+}
+
 test "usermgr permissions and row filters mirror go semantics" {
     const alloc = std.testing.allocator;
 
@@ -2213,7 +2642,15 @@ test "usermgr roles inherit permissions and row filters" {
     const first_revision = pinned.value.auth_revision;
     try std.testing.expectEqual(@as(usize, 2), pinned.value.roles.len);
     pinned.deinit();
+    const revision_before = try manager.validateRoleRevision("alice", roles, null);
+    try manager.addRoleToSubject("unrelated", "group:auditors");
+    const revision_after = try manager.validateRoleRevision("alice", roles, revision_before);
+    try std.testing.expect(revision_after > revision_before);
     try manager.removeRoleFromSubject("role:tenant_reader", "group:eng");
+    try std.testing.expectError(error.Forbidden, manager.validateRoleRevision("alice", roles, revision_after));
+    const admitted_digest = try UserManager.roleDigest(alloc, roles);
+    try std.testing.expectError(error.Forbidden, manager.validateRoleRevision("alice", roles, null));
+    try std.testing.expectError(error.Forbidden, manager.signBoundRowPolicyRoles(alloc, "alice", "basic:alice", "docs", .read, role_key, "cluster-a", scope, 101, admitted_digest));
     const after_revocation = try manager.signRowPolicyRolesAuthorized(alloc, "alice", "basic:alice", "docs", .read, role_key, "cluster-a", scope, 101);
     defer alloc.free(after_revocation);
     var updated = try row_authority.verify(alloc, role_key, "cluster-a", scope, 101, after_revocation);
@@ -2323,6 +2760,7 @@ test "usermgr api keys validate and persist creator-scoped permissions" {
     var validated = try manager.validateApiKey(created.key.key_id, created.key_secret);
     defer validated.deinit(alloc);
     try std.testing.expectEqualStrings("alice", validated.username);
+    try std.testing.expectEqualDeep(user.instance_id, validated.user_instance_id);
     try std.testing.expectEqualStrings("{}", validated.metadata_json);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
     try std.testing.expectEqual(@as(usize, 3), validated.row_filter.len);
@@ -2478,6 +2916,121 @@ test "native memory curator permission is read-capable without arbitrary write o
     try std.testing.expect(permissionIntersection(curator, write) == null);
 }
 
+test "SQL privileges credential caps and policy aliases preserve native permissions revocation and incarnations" {
+    const a = std.testing.allocator;
+    const sql = @import("../system_catalog/privileges.zig");
+    const authority = @import("row_policy_authority.zig");
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var permissions = [_]Permission{
+        try Permission.initOwned(a, .table, "docs", .read),
+        try Permission.initOwned(a, .table, "docs", .write),
+    };
+    defer for (&permissions) |*permission| permission.deinit(a);
+    var user = try manager.createUser("alice", "secret", &permissions);
+    defer user.deinit(a);
+    var read_key = try manager.createApiKey("alice", "reader", permissions[0..1], &.{}, null);
+    defer read_key.deinit(a);
+    var inherited_key = try manager.createApiKey("alice", "inherited", &.{}, &.{}, null);
+    defer inherited_key.deinit(a);
+    var expired_key = try manager.createApiKey("alice", "expired", permissions[0..1], &.{}, 0);
+    defer expired_key.deinit(a);
+    const read_credential = try std.fmt.allocPrint(a, "api-key:{s}", .{read_key.key.key_id});
+    defer a.free(read_credential);
+    const inherited_credential = try std.fmt.allocPrint(a, "api-key:{s}", .{inherited_key.key.key_id});
+    defer a.free(inherited_credential);
+    const expired_credential = try std.fmt.allocPrint(a, "api-key:{s}", .{expired_key.key.key_id});
+    defer a.free(expired_credential);
+    try manager.removePermissionFromUser("alice", "docs", .table);
+    try std.testing.expect(!try manager.permissionCurrentlyAllowed("alice", .table, "docs", .read));
+    try std.testing.expect(try manager.sqlCredentialPermits("alice", user.instance_id, read_credential, "docs", sql.Access.bit(.select)));
+    try std.testing.expect(!try manager.sqlCredentialPermits("alice", user.instance_id, read_credential, "private", sql.Access.bit(.select)));
+    try std.testing.expect(!try manager.sqlCredentialPermits("alice", user.instance_id, read_credential, "docs", sql.Access.bit(.insert)));
+    try std.testing.expect(try manager.sqlCredentialPermits("alice", user.instance_id, inherited_credential, "docs", sql.Access.bit(.insert)));
+    try std.testing.expect(!try manager.sqlCredentialCatalogPermits("alice", user.instance_id, read_credential, .table, "docs"));
+    try std.testing.expect(!try manager.sqlCredentialCatalogPermits("alice", user.instance_id, read_credential, .user, "reader"));
+    try std.testing.expect(try manager.sqlCredentialCatalogPermits("alice", user.instance_id, inherited_credential, .user, "reader"));
+    try std.testing.expect(try manager.sqlCredentialCatalogPermits("alice", user.instance_id, "basic:alice", .namespace, "public"));
+    try std.testing.expect(!try manager.sqlCredentialPermits("alice", user.instance_id, expired_credential, "docs", sql.Access.bit(.select)));
+    const scope: authority.Scope = .{ .table_id = 901, .table = "table:901", .database = "main", .policy_generation = 7, .catalog_epoch = 9 };
+    const role: sql.Role = .{ .id = 3, .name = "reader", .instance = @splat(3), .creator = .bootstrap };
+    const fake: sql.Role = .{ .id = 4, .name = "fake", .instance = @splat(4), .creator = .bootstrap };
+    const role_alias = try sql.roleAlias(a, role);
+    defer a.free(role_alias);
+    const fake_alias = try sql.roleAlias(a, fake);
+    defer a.free(fake_alias);
+    try manager.addRoleToUser("alice", "tenant");
+    try manager.addRoleToUser("alice", fake_alias);
+    const delegation: UserManager.SqlDelegation = .{ .principal_instance = user.instance_id, .required = sql.Access.bit(.select), .roles = &.{role} };
+    const secret = "1234567890abcdef1234567890abcdef";
+    const signed = try manager.signRowPolicySqlRolesAuthorized(a, "alice", read_credential, "docs", delegation, secret, "cluster", scope, 100);
+    defer a.free(signed);
+    var verified = try authority.verify(a, secret, "cluster", scope, 100, signed);
+    defer verified.deinit();
+    try std.testing.expectEqual(@as(usize, 2), verified.value.roles.len);
+    for (verified.value.roles) |name| try std.testing.expect(!std.mem.eql(u8, name, fake_alias));
+    try std.testing.expect(std.mem.eql(u8, verified.value.roles[0], role_alias));
+    var mutation = delegation;
+    mutation.required = sql.Access.bit(.insert);
+    var normalization = scope;
+    normalization.purpose = .normalize;
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicySqlRolesAuthorized(a, "alice", read_credential, "docs", mutation, secret, "cluster", normalization, 100));
+    // Ordinary native proof minting also strips the reserved SQL namespace.
+    try manager.addPermissionToUser("alice", permissions[0]);
+    const native = try manager.signRowPolicyRolesAuthorized(a, "alice", "basic:alice", "docs", .read, secret, "cluster", scope, 100);
+    defer a.free(native);
+    var native_claims = try authority.verify(a, secret, "cluster", scope, 100, native);
+    defer native_claims.deinit();
+    try std.testing.expectEqual(@as(usize, 1), native_claims.value.roles.len);
+    try std.testing.expectEqualStrings("tenant", native_claims.value.roles[0]);
+    try std.testing.expect(try manager.sqlRetainedCredentialPermits(user.instance_id, read_credential, "docs", sql.Access.bit(.select)));
+    try std.testing.expect(!try manager.sqlRetainedCredentialPermits(user.instance_id, read_credential, "docs", sql.Access.bit(.insert)));
+    try std.testing.expect(!try manager.sqlRetainedCredentialPermits(user.instance_id, expired_credential, "", 0));
+    try manager.deleteApiKey("alice", read_key.key.key_id);
+    try std.testing.expect(!try manager.sqlRetainedCredentialPermits(user.instance_id, read_credential, "", 0));
+    try std.testing.expect(!try manager.sqlCredentialPermits("alice", user.instance_id, read_credential, "docs", sql.Access.bit(.select)));
+    try manager.deleteUser("alice");
+    var replacement = try manager.createUser("alice", "new-secret", &.{});
+    defer replacement.deinit(a);
+    try std.testing.expect(!try manager.sqlCredentialPermits("alice", user.instance_id, "basic:alice", "docs", sql.Access.bit(.select)));
+    try std.testing.expect(!try manager.sqlRetainedCredentialPermits(user.instance_id, "basic:alice", "", 0));
+}
+
+test "SQL privileges API key snapshots retain authenticated instances through allocation failures" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var permission = try Permission.initOwned(a, .table, "docs", .read);
+    defer permission.deinit(a);
+    var user = try manager.createUser("reader", "secret", &.{permission});
+    defer user.deinit(a);
+    try manager.addRoleToUser("reader", "staff");
+    try manager.setRowFilter("reader", "docs", "{\"term\":{\"tenant\":\"one\"}}");
+    var key = try manager.createApiKey("reader", "client", &.{permission}, &.{}, null);
+    defer key.deinit(a);
+    const Case = struct {
+        fn run(failing: Allocator, original: *UserManager, key_id: []const u8, secret: []const u8, instance: [16]u8) !void {
+            var borrowed = original.*;
+            borrowed.alloc = failing;
+            var validated = try borrowed.validateApiKey(key_id, secret);
+            defer validated.deinit(failing);
+            try std.testing.expectEqualDeep(instance, validated.user_instance_id);
+            try std.testing.expectEqualStrings("reader", validated.username);
+            try std.testing.expectEqual(@as(usize, 1), validated.roles.len);
+            try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Case.run, .{ &manager, key.key.key_id, key.key_secret, user.instance_id });
+}
+
 test "row filter scopes are conjunctive through api key layering" {
     const alloc = std.testing.allocator;
     const target = "\x00catalog:6:tenant5:calls6:events";
@@ -2580,4 +3133,66 @@ test "inherited row filters preserve large same-scope policy boundaries" {
     const combined = (try combinedRowFilterForTable(a, filters, "docs")).?;
     defer combined.deinit(a);
     try std.testing.expect(combined.composed);
+}
+
+test "usermgr replication privilege is independent of ordinary access and narrows API key grants" {
+    try std.testing.expectEqual(PermissionType.replicate, try PermissionType.fromSlice("replicate"));
+    for ([_]PermissionType{ .read, .write, .curator }) |permission| {
+        try std.testing.expect(!permission.allows(.replicate));
+        try std.testing.expect(!PermissionType.replicate.allows(permission));
+        const left: Permission = .{ .resource_type = .table, .resource = @constCast("docs"), .type = permission };
+        const right: Permission = .{ .resource_type = .table, .resource = @constCast("docs"), .type = .replicate };
+        try std.testing.expect(permissionIntersection(left, right) == null);
+        try std.testing.expect(permissionIntersection(right, left) == null);
+    }
+    try std.testing.expect(PermissionType.admin.allows(.replicate));
+    try std.testing.expect(!PermissionType.replicate.allows(.admin));
+    const admin: Permission = .{ .resource_type = .table, .resource = @constCast("*"), .type = .admin };
+    const replica: Permission = .{ .resource_type = .table, .resource = @constCast("docs"), .type = .replicate };
+    try std.testing.expectEqual(PermissionType.replicate, permissionIntersection(admin, replica).?.permission_type);
+    try std.testing.expectEqualStrings("docs", permissionIntersection(admin, replica).?.resource);
+}
+test "usermgr replication keys obey live role revocation persistence and layered row policy" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var read = [_]Permission{try Permission.initOwned(a, .table, "docs", .read)};
+    defer read[0].deinit(a);
+    var user = try manager.createUser("replicator", "secret", &read);
+    defer user.deinit(a);
+    var replication = [_]Permission{try Permission.initOwned(a, .table, "docs", .replicate)};
+    defer replication[0].deinit(a);
+    try std.testing.expectError(error.PrivilegeEscalation, manager.createApiKey("replicator", "cannot_export", &replication, &.{}, null));
+    try manager.addPermissionToSubject("role:replication", replication[0]);
+    try manager.addRoleToUser("replicator", "role:replication");
+    try manager.setSubjectRowFilter("role:replication", "docs", "{\"term\":{\"tenant\":\"a\"}}");
+    var filters = [_]RowFilterEntry{try RowFilterEntry.initOwned(a, "docs", "{\"term\":{\"team\":\"b\"}}")};
+    defer filters[0].deinit(a);
+    var key = try manager.createApiKey("replicator", "export", &replication, &filters, null);
+    defer key.deinit(a);
+    const credential = try std.fmt.allocPrint(a, "api-key:{s}", .{key.key.key_id});
+    defer a.free(credential);
+    const checks = [_]UserManager.PermissionCheck{.{ .resource_type = .table, .resource = "docs", .permission_type = .replicate }};
+    try std.testing.expect(try manager.permissionsCurrentlyAllowed("replicator", credential, &checks));
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("replicator", credential, &.{.{ .resource_type = .table, .resource = "docs", .permission_type = .read }}));
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("replicator", credential, &.{.{ .resource_type = .table, .resource = "other", .permission_type = .replicate }}));
+    manager.deinit();
+    manager = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    var validated = try manager.validateApiKey(key.key.key_id, key.key_secret);
+    defer validated.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
+    try std.testing.expectEqual(PermissionType.replicate, validated.permissions[0].type);
+    const filter = (try combinedRowFilterForTable(a, validated.row_filter, "docs")).?;
+    defer filter.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, filter.json, "tenant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter.json, "team") != null);
+    try manager.removeRoleFromUser("replicator", "role:replication");
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("replicator", credential, &checks));
+    var revoked = try manager.validateApiKey(key.key.key_id, key.key_secret);
+    defer revoked.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), revoked.permissions.len);
 }

@@ -21,6 +21,7 @@ const ComputeBackend = ops.ComputeBackend;
 const gpt_mod = @import("../models/gpt.zig");
 const gemma3_vision = @import("../architectures/gemma3_vision.zig");
 const gemma3_projector = @import("../architectures/gemma3_projector.zig");
+const decoder_prefill = @import("../execution/decoder_prefill.zig");
 
 pub const PreprocessorConfig = struct {
     image_size: u32 = 896,
@@ -178,9 +179,11 @@ pub fn expandPromptTokens(
 
     if (placeholder_count != image_count) return error.ImagePlaceholderCountMismatch;
 
+    const owned_tokens = try token_ids.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_tokens);
     return .{
         .allocator = allocator,
-        .token_ids = try token_ids.toOwnedSlice(allocator),
+        .token_ids = owned_tokens,
         .image_offsets = try image_offsets.toOwnedSlice(allocator),
     };
 }
@@ -217,26 +220,11 @@ pub fn preparePromptEmbeddings(
     const base_embeddings = try cb.embeddingLookup(embed_w, expanded.token_ids, expanded.token_ids.len, config.hidden_size);
     defer cb.free(base_embeddings);
 
-    const hidden_size: usize = config.hidden_size;
-    const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
-    defer allocator.free(prompt_embeddings);
-
-    const embedding_scale = config.tokenEmbeddingScale();
-    if (!std.math.approxEqAbs(f32, embedding_scale, 1.0, 1e-6)) {
-        for (prompt_embeddings) |*value| value.* *= embedding_scale;
-    }
-    const tokens_per_image: usize = config.mm_tokens_per_image;
-    for (expanded.image_offsets, 0..) |offset, image_idx| {
-        const dst = offset * hidden_size;
-        const src = image_idx * tokens_per_image * hidden_size;
-        @memcpy(
-            prompt_embeddings[dst..][0 .. tokens_per_image * hidden_size],
-            projected[src..][0 .. tokens_per_image * hidden_size],
-        );
-    }
-
-    const embedding_shape = [_]i32{ @intCast(expanded.token_ids.len), @intCast(hidden_size) };
-    const input_embeddings = try cb.fromFloat32Shape(prompt_embeddings, &embedding_shape);
+    const input_embeddings = try decoder_prefill.replaceEmbeddingRows(cb, allocator, base_embeddings, expanded.token_ids.len, config.hidden_size, config.tokenEmbeddingScale(), .{ .host_chunks = .{
+        .values = projected,
+        .offsets = expanded.image_offsets,
+        .rows_per_chunk = config.mm_tokens_per_image,
+    } });
     errdefer cb.free(input_embeddings);
     const attn_or_mask = try buildImageAttentionOrMask(allocator, expanded.token_ids.len, expanded.image_offsets, config.mm_tokens_per_image);
     return .{
@@ -256,87 +244,7 @@ pub fn prepareExpandedPromptEmbeddings(
     image_count: usize,
     images: []const []const u8,
 ) !PreparedPrompt {
-    if (image_count == 0 or images.len != image_count) return error.NoImages;
-
-    const pre_cfg = try loadPreprocessorConfig(allocator, model_dir);
-    if (pre_cfg.image_seq_length != config.mm_tokens_per_image) return error.ImageTokenLengthMismatch;
-
-    var token_ids = try allocator.alloc(i64, expanded_token_ids.len);
-    errdefer allocator.free(token_ids);
-    var image_offsets = try allocator.alloc(usize, image_count);
-    defer allocator.free(image_offsets);
-
-    var soft_token_count: usize = 0;
-    var image_idx: usize = 0;
-    var run_start: ?usize = null;
-    for (expanded_token_ids, 0..) |token_id, idx| {
-        token_ids[idx] = token_id;
-        if (token_id == config.image_token_index) {
-            soft_token_count += 1;
-            if (run_start == null) run_start = idx;
-        } else if (run_start) |start| {
-            if (idx - start != config.mm_tokens_per_image) return error.ImagePlaceholderCountMismatch;
-            if (image_idx >= image_count) return error.ImagePlaceholderCountMismatch;
-            image_offsets[image_idx] = start;
-            image_idx += 1;
-            run_start = null;
-        }
-    }
-    if (run_start) |start| {
-        if (expanded_token_ids.len - start != config.mm_tokens_per_image) return error.ImagePlaceholderCountMismatch;
-        if (image_idx >= image_count) return error.ImagePlaceholderCountMismatch;
-        image_offsets[image_idx] = start;
-        image_idx += 1;
-    }
-    if (soft_token_count != image_count * config.mm_tokens_per_image or image_idx != image_count) {
-        return error.ImagePlaceholderCountMismatch;
-    }
-
-    const pixels_per_image = 3 * pre_cfg.image_size * pre_cfg.image_size;
-    const pixel_values = try allocator.alloc(f32, images.len * pixels_per_image);
-    defer allocator.free(pixel_values);
-    for (images, 0..) |image_bytes, idx| {
-        const processed = try preprocessImage(allocator, image_bytes, pre_cfg);
-        defer allocator.free(processed);
-        @memcpy(pixel_values[idx * pixels_per_image ..][0..pixels_per_image], processed);
-    }
-
-    const projected = try gemma3_vision.encodeProjectedImageTokens(cb, allocator, config, pixel_values, images.len);
-    defer allocator.free(projected);
-
-    const embed_w = try getEmbeddingWeight(cb, config);
-    defer cb.free(embed_w);
-    const base_embeddings = try cb.embeddingLookup(embed_w, token_ids, token_ids.len, config.hidden_size);
-    defer cb.free(base_embeddings);
-
-    const hidden_size: usize = config.hidden_size;
-    const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
-    defer allocator.free(prompt_embeddings);
-
-    const embedding_scale = config.tokenEmbeddingScale();
-    if (!std.math.approxEqAbs(f32, embedding_scale, 1.0, 1e-6)) {
-        for (prompt_embeddings) |*value| value.* *= embedding_scale;
-    }
-    const tokens_per_image: usize = config.mm_tokens_per_image;
-    for (image_offsets, 0..) |offset, idx| {
-        const dst = offset * hidden_size;
-        const src = idx * tokens_per_image * hidden_size;
-        @memcpy(
-            prompt_embeddings[dst..][0 .. tokens_per_image * hidden_size],
-            projected[src..][0 .. tokens_per_image * hidden_size],
-        );
-    }
-
-    const embedding_shape = [_]i32{ @intCast(token_ids.len), @intCast(hidden_size) };
-    const input_embeddings = try cb.fromFloat32Shape(prompt_embeddings, &embedding_shape);
-    errdefer cb.free(input_embeddings);
-    const attn_or_mask = try buildImageAttentionOrMask(allocator, token_ids.len, image_offsets, config.mm_tokens_per_image);
-    return .{
-        .allocator = allocator,
-        .token_ids = token_ids,
-        .input_embeddings = input_embeddings,
-        .attn_or_mask = attn_or_mask,
-    };
+    return prepareExpandedPrompt(cb, allocator, model_dir, null, config, expanded_token_ids, image_count, images);
 }
 
 pub fn prepareExpandedPromptEmbeddingsWithProjector(
@@ -344,6 +252,19 @@ pub fn prepareExpandedPromptEmbeddingsWithProjector(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     projector_path: []const u8,
+    config: gpt_mod.Config,
+    expanded_token_ids: []const i32,
+    image_count: usize,
+    images: []const []const u8,
+) !PreparedPrompt {
+    return prepareExpandedPrompt(cb, allocator, model_dir, projector_path, config, expanded_token_ids, image_count, images);
+}
+
+fn prepareExpandedPrompt(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    projector_path: ?[]const u8,
     config: gpt_mod.Config,
     expanded_token_ids: []const i32,
     image_count: usize,
@@ -394,7 +315,10 @@ pub fn prepareExpandedPromptEmbeddingsWithProjector(
         @memcpy(pixel_values[idx * pixels_per_image ..][0..pixels_per_image], processed);
     }
 
-    const projected = try gemma3_projector.encodeProjectedImageTokens(cb, allocator, projector_path, config, pixel_values, images.len);
+    const projected = if (projector_path) |path|
+        try gemma3_projector.encodeProjectedImageTokens(cb, allocator, path, config, pixel_values, images.len)
+    else
+        try gemma3_vision.encodeProjectedImageTokens(cb, allocator, config, pixel_values, images.len);
     defer allocator.free(projected);
 
     const embed_w = try getEmbeddingWeight(cb, config);
@@ -402,26 +326,11 @@ pub fn prepareExpandedPromptEmbeddingsWithProjector(
     const base_embeddings = try cb.embeddingLookup(embed_w, token_ids, token_ids.len, config.hidden_size);
     defer cb.free(base_embeddings);
 
-    const hidden_size: usize = config.hidden_size;
-    const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
-    defer allocator.free(prompt_embeddings);
-
-    const embedding_scale = config.tokenEmbeddingScale();
-    if (!std.math.approxEqAbs(f32, embedding_scale, 1.0, 1e-6)) {
-        for (prompt_embeddings) |*value| value.* *= embedding_scale;
-    }
-    const tokens_per_image: usize = config.mm_tokens_per_image;
-    for (image_offsets, 0..) |offset, idx| {
-        const dst = offset * hidden_size;
-        const src = idx * tokens_per_image * hidden_size;
-        @memcpy(
-            prompt_embeddings[dst..][0 .. tokens_per_image * hidden_size],
-            projected[src..][0 .. tokens_per_image * hidden_size],
-        );
-    }
-
-    const embedding_shape = [_]i32{ @intCast(token_ids.len), @intCast(hidden_size) };
-    const input_embeddings = try cb.fromFloat32Shape(prompt_embeddings, &embedding_shape);
+    const input_embeddings = try decoder_prefill.replaceEmbeddingRows(cb, allocator, base_embeddings, token_ids.len, config.hidden_size, config.tokenEmbeddingScale(), .{ .host_chunks = .{
+        .values = projected,
+        .offsets = image_offsets,
+        .rows_per_chunk = config.mm_tokens_per_image,
+    } });
     errdefer cb.free(input_embeddings);
     const attn_or_mask = try buildImageAttentionOrMask(allocator, token_ids.len, image_offsets, config.mm_tokens_per_image);
     return .{
@@ -627,6 +536,28 @@ test "expand prompt tokens replaces image placeholder with boi soft tokens and e
     try std.testing.expectEqualSlices(i64, &.{ 1, 7, 42, 42, 42, 42, 8, 2 }, expanded.token_ids);
     try std.testing.expectEqual(@as(usize, 1), expanded.image_offsets.len);
     try std.testing.expectEqual(@as(usize, 2), expanded.image_offsets[0]);
+}
+
+test "expanded Gemma image prompt transfers both metadata arrays failure atomically" {
+    const Fixture = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const cfg = gpt_mod.Config{
+                .family = .gemma,
+                .hidden_size = 8,
+                .image_token_index = 42,
+                .boi_token_index = 7,
+                .eoi_token_index = 8,
+                .mm_tokens_per_image = 4,
+                .vision_image_size = 896,
+            };
+            var expanded = try expandPromptTokens(allocator, &.{ 1, 7, 2, 7, 3 }, cfg, 2);
+            defer expanded.deinit();
+            try std.testing.expectEqualSlices(i64, &.{ 1, 7, 42, 42, 42, 42, 8, 2, 7, 42, 42, 42, 42, 8, 3 }, expanded.token_ids);
+            try std.testing.expectEqualSlices(usize, &.{ 2, 9 }, expanded.image_offsets);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "expand prompt text matches hf-style image sequence framing" {

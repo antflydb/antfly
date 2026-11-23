@@ -27,6 +27,7 @@ pub fn project(a: A, bytes: []const u8, columns: ?[]const []const u8) ![]const u
     const ca = arena.allocator();
     var value = try std.json.parseFromSliceLeaky(V, ca, bytes, .{});
     if (value != .object) return error.InvalidTableSchema;
+    @import("tables.zig").removeBindingHistory(&value.object);
     _ = value.object.swapRemove("version");
     _ = value.object.swapRemove("base_source");
     _ = value.object.swapRemove("relational_indexes");
@@ -125,6 +126,17 @@ fn canonical(a: A, value: *V) anyerror!void {
         .array => |*arr| for (arr.items) |*child| try canonical(a, child),
         else => {},
     }
+}
+
+test "external lake dependency contracts ignore catalog binding history" {
+    const alloc = std.testing.allocator;
+    const plain = try project(alloc, "{}", null);
+    defer alloc.free(plain);
+    const stamped = try project(alloc,
+        \\{"version":2,"x-antfly-column-lineage":{"version":2,"start":1},"x-antfly-index-lifetimes":{"version":2,"births":{"ix":1}}}
+    , null);
+    defer alloc.free(stamped);
+    try std.testing.expectEqualStrings(plain, stamped);
 }
 
 test "external lake dependency contracts isolate unrelated columns and retain interpretation" {

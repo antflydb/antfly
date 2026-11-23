@@ -1,11 +1,18 @@
 {
   "artifacts": {
     "gliner25_boundary_attention_backward.cubin": "05a8a833d7bd4c778c2fba11a1058358b7e8d702a70af3d03ae72759d4731132",
+    "gliner25_boundary_attention_backward.sm120.cubin": "970bbcabc54d1eb27df0a3e602403b8ea01872979c7686414cf8801804db8b17",
     "gliner25_boundary_attention_backward.sm80.cubin": "c7383d2e8bff4bf978957e90a00da8f14909837e71e7a98db1e4125ab3bd6c51",
     "gliner25_boundary_attention_forward.cubin": "ee2118ca61311d70668f1ba0a63540d4e84c41e6b87a2b311db63d68e4fac61f",
+    "gliner25_boundary_attention_forward.sm120.cubin": "8edca6c66d1f8978aecc9a3e73a2598a4f1334aac01813083ce1606149a8c904",
     "gliner25_boundary_attention_forward.sm80.cubin": "37fb96ad2579196f328df613fd5d7b6a025efe9872531d4d5433f0e073653a5e"
   },
   "compiler": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Thu_Mar_19_11:12:51_PM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.78\nBuild cuda_13.2.r13.2/compiler.37668154_0",
+  "compiler_by_arch": {
+    "sm_120": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Fri_May_08_10:52:52_AM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.86\nBuild cuda_13.2.r13.2/compiler.37953736_0",
+    "sm_80": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Thu_Mar_19_11:12:51_PM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.78\nBuild cuda_13.2.r13.2/compiler.37668154_0",
+    "sm_89": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Thu_Mar_19_11:12:51_PM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.78\nBuild cuda_13.2.r13.2/compiler.37668154_0"
+  },
   "options": [
     "-std=c++17",
     "-O3",
@@ -13,8 +20,31 @@
     "--fmad=false"
   ],
   "profile": "gliner25_boundary_attention_native_d32_v1",
+  "profile_by_arch": {
+    "sm_120": "gliner25_boundary_attention_warp_d32_v2",
+    "sm_80": "gliner25_boundary_attention_native_d32_v1",
+    "sm_89": "gliner25_boundary_attention_native_d32_v1"
+  },
+  "source_files_by_arch": {
+    "sm_120": [
+      "gliner25_boundary_attention_forward_sm120.cu",
+      "gliner25_boundary_attention_backward_sm120.cu",
+      "gliner25_boundary_attention_sm120.cuh"
+    ],
+    "sm_80": [
+      "gliner25_boundary_attention_forward.cu",
+      "gliner25_boundary_attention_backward.cu"
+    ],
+    "sm_89": [
+      "gliner25_boundary_attention_forward.cu",
+      "gliner25_boundary_attention_backward.cu"
+    ]
+  },
   "source_sha256": {
     "gliner25_boundary_attention_backward.cu": "e41fa30c53775f019de2573dd9cd980edd0d4eca6bda493f43eb8a8b02bee0ff",
-    "gliner25_boundary_attention_forward.cu": "19958fc54e10103901085dd04a31df7b51418787487e98e4a6d060ec09972ea8"
+    "gliner25_boundary_attention_backward_sm120.cu": "98b1f2d8178d9d9df547867343ef2015be75bd4183e48f71476435e96e3113c8",
+    "gliner25_boundary_attention_forward.cu": "19958fc54e10103901085dd04a31df7b51418787487e98e4a6d060ec09972ea8",
+    "gliner25_boundary_attention_forward_sm120.cu": "66607292fe81e58121c5e408adc53ebc0c80e7874c814359082816867e1f9810",
+    "gliner25_boundary_attention_sm120.cuh": "7392505dd2618560a6160ee452f922950254aa3068f0ee250ee9b01b0c928c70"
   }
 }

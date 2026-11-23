@@ -116,6 +116,39 @@ pub fn compareNumericValues(a: NumericValue, b: NumericValue) std.math.Order {
     };
 }
 
+/// Integer spellings outside the typed domains remain available to legacy
+/// temporal comparisons. Never round them into a native exact range bound.
+pub fn exactNumericValueFromJson(value: std.json.Value) ?NumericValue {
+    return switch (value) {
+        .integer => |number| .{ .i64_val = number },
+        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else null,
+        .number_string => |text| blk: {
+            if (std.fmt.parseInt(i64, text, 10)) |number| break :blk .{ .i64_val = number } else |_| {}
+            if (std.fmt.parseUnsigned(u64, text, 10)) |number| break :blk .{ .u64_val = number } else |_| {}
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+/// Decode the finite numeric kinds accepted by typed numeric projections.
+pub fn numericValueFromJson(value: std.json.Value) ?NumericValue {
+    return switch (value) {
+        .integer => |number| .{ .i64_val = number },
+        .float => |number| if (std.math.isFinite(number)) .{ .f64_val = number } else null,
+        .number_string => |number| blk: {
+            if (std.mem.indexOfAny(u8, number, ".eE") == null) {
+                if (std.fmt.parseInt(i64, number, 10)) |parsed| break :blk .{ .i64_val = parsed } else |_| {}
+                if (std.fmt.parseUnsigned(u64, number, 10)) |parsed| break :blk .{ .u64_val = parsed } else |_| {}
+            }
+            const parsed = std.fmt.parseFloat(f64, number) catch return null;
+            if (!std.math.isFinite(parsed)) return null;
+            break :blk .{ .f64_val = parsed };
+        },
+        else => null,
+    };
+}
+
 pub fn numericValueAsF64(value: NumericValue) f64 {
     return switch (value) {
         .u64_val => |number| @floatFromInt(number),
@@ -656,6 +689,7 @@ pub const TypedDocValuesReader = struct {
     chunks_end: ?u64 = null,
     point_cache: ?*PointCache = null,
     owns_point_cache: bool = true,
+    optional_point_cache: bool = false,
     chunk_offsets: []const u8, // raw offset table bytes
     range: ?struct { view: @import("../segment_source.zig").View, max_chunk_bytes: usize } = null,
 
@@ -720,6 +754,12 @@ pub const TypedDocValuesReader = struct {
         const cache = try self.alloc.create(PointCache);
         cache.* = .{ .allocator = self.alloc, .byte_budget = byte_budget };
         self.point_cache = cache;
+    }
+
+    pub fn enableOptionalPointCache(self: *TypedDocValuesReader, byte_budget: usize) void {
+        if (self.point_cache != null) return;
+        self.enablePointCache(byte_budget) catch return;
+        self.optional_point_cache = true;
     }
 
     /// Owned results must be freed by the caller. Cached results borrow until
@@ -1306,7 +1346,15 @@ pub const TypedDocValuesReader = struct {
     /// Find which chunk contains a given doc_id by scanning chunk doc IDs.
     /// Returns (chunk_idx, position_within_chunk).
     pub fn findDoc(self: *const TypedDocValuesReader, doc_id: u32) !?FoundDoc {
-        if (self.point_cache) |cache| return cache.find(self, doc_id);
+        if (self.point_cache) |cache| if (!self.optional_point_cache or cache.byte_budget != 0) {
+            if (cache.find(self, doc_id)) |found| {
+                return found;
+            } else |err| {
+                if (!self.optional_point_cache or err != error.OutOfMemory) return err;
+                cache.deinit();
+                cache.* = .{ .allocator = self.alloc, .byte_budget = 0 };
+            }
+        };
         if (self.indexed) {
             const index = self.chunkForDoc(doc_id) orelse return null;
             var chunk = try self.decodeChunk(index);

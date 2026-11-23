@@ -824,7 +824,7 @@ const ProjectionFixture = struct {
     projection: @import("document_row.zig").Projection,
     layout: *const @import("catalog.zig").Row.TypedLayout,
     root: std.json.Value,
-    array: @import("array_value.zig").Value,
+    array: @import("array/value.zig").Value,
     output: []u8,
     replay: *spill.Sequential,
     counted: *CountingAllocator,
@@ -832,8 +832,8 @@ const ProjectionFixture = struct {
     // Frozen primitive preparation from before the canonical-copy shortcut.
     // Both paths retain the same admission proof, so the comparison isolates
     // reconstruction rather than also removing cached validation from baseline.
-    fn reconstructArray(a: std.mem.Allocator, input: @import("array_value.zig").Value) !@import("array_storage.zig").Prepared {
-        const arrays = @import("array_value.zig");
+    fn reconstructArray(a: std.mem.Allocator, input: @import("array/value.zig").Value) !@import("array/storage.zig").Prepared {
+        const arrays = @import("array/value.zig");
         std.debug.assert(input.element_type == .int64);
         var work: arrays.Budget = .{ .remaining = (arrays.Limits{}).work };
         try work.consume(0);
@@ -843,7 +843,7 @@ const ProjectionFixture = struct {
             try work.consume(1);
             non_null += @intFromBool(!value.flatCell(index).sql_null);
         }
-        const layout = @import("array_storage.zig").layout;
+        const layout = @import("array/storage.zig").layout;
         return .{ .value = value, .allocator = a, .jsonb = &.{}, .encoded_size = try layout.encodedSectionSize(value.element_type, value.dimensions.len, value.cardinality(), non_null), .compact = layout.usesCompact(value.element_type, value.cardinality(), non_null), .work = work };
     }
     fn measure(self: ProjectionFixture, case: ProjectionCase, direct: bool) !ProjectionStats {
@@ -894,7 +894,7 @@ const ProjectionFixture = struct {
                 for (0..64) |_| {
                     _ = try input.validate(.{});
                     var writer: std.Io.Writer = .fixed(self.output);
-                    try @import("array_binary.zig").encode(input, &writer, .{});
+                    try @import("array/binary.zig").encode(input, &writer, .{});
                     result.checksum += writer.end;
                 }
                 result.checksum +%= std.hash.Wyhash.hash(0, self.output);
@@ -902,7 +902,7 @@ const ProjectionFixture = struct {
             .array_wire => {
                 for (0..64) |_| {
                     var writer: std.Io.Writer = .fixed(self.output);
-                    if (direct) try @import("array_binary.zig").encode(self.array, &writer, .{}) else try @import("array_binary.zig").encodeGeneric(self.array, &writer, .{});
+                    if (direct) try @import("array/binary.zig").encode(self.array, &writer, .{}) else try @import("array/binary.zig").encodeGeneric(self.array, &writer, .{});
                     std.mem.doNotOptimizeAway(self.output.ptr);
                     result.checksum += writer.end;
                 }
@@ -913,7 +913,7 @@ const ProjectionFixture = struct {
                 const output = try budget.allocator().alloc(u8, input.stored.?.bytes.len);
                 defer budget.allocator().free(output);
                 for (0..64) |_| {
-                    var prepared = if (direct) try @import("array_storage.zig").Prepared.init(budget.allocator(), input, .{}) else try reconstructArray(budget.allocator(), input);
+                    var prepared = if (direct) try @import("array/storage.zig").Prepared.init(budget.allocator(), input, .{}) else try reconstructArray(budget.allocator(), input);
                     defer prepared.deinit();
                     try prepared.writeInto(output);
                     std.mem.doNotOptimizeAway(output.ptr);
@@ -967,12 +967,12 @@ test "native projection refinements benchmark" {
     const table: @import("catalog.zig").Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{.{ .name = "body", .path = "body", .type = .string }} };
     const projection = try @import("document_row.zig").Projection.initSearch(sa, table, &.{"body"});
     const layout = try @import("catalog.zig").Row.TypedLayout.init(sa, &.{"body"});
-    const arrays = @import("array_value.zig");
+    const arrays = @import("array/value.zig");
     const cells = try sa.alloc(Datum, 32768);
     for (cells, 0..) |*cell, i| cell.* = if (i % 7 == 0) .{} else Datum.json(.{ .integer = @intCast(i) });
     const array = try arrays.Value.init(.int64, &.{.{ .length = 32768 }}, cells, .{});
-    const storage = try @import("array_storage.zig").encodeAlloc(sa, array, .{});
-    const compact = try @import("array_storage.zig").borrowLeaky(sa, .int64, storage, .{});
+    const storage = try @import("array/storage.zig").encodeAlloc(sa, array, .{});
+    const compact = try @import("array/storage.zig").borrowLeaky(sa, .int64, storage, .{});
     const output = try sa.alloc(u8, compact.stored.?.validation.?.binary_wire_bytes);
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
@@ -1067,8 +1067,8 @@ test "native projection refinements benchmark streaming selected arrays" {
     const count = 8192;
     const cells = try f.alloc(Datum, count);
     for (cells, 0..) |*cell, i| cell.* = if (i % 17 == 0) .{} else Datum.json(.{ .integer = 9007199254740993 + @as(i64, @intCast(i)) });
-    const array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = count, .lower = -3 }}, cells, .{});
-    const input = try @import("array_wire.zig").encodeAlloc(f, array, .{});
+    const array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = count, .lower = -3 }}, cells, .{});
+    const input = try @import("array/wire.zig").encodeAlloc(f, array, .{});
     const Fixture = struct {
         fn measure(bytes: []const u8, direct: bool) !ProjectionStats {
             var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 64 << 20 };
@@ -1083,13 +1083,13 @@ test "native projection refinements benchmark streaming selected arrays" {
                 _ = scratch.reset(.free_all);
                 const begin = now();
                 const value = if (direct)
-                    (try @import("array_wire.zig").decodeBytesLeakyMeasured(output.allocator(), .int64, bytes, .{})).value
+                    (try @import("array/wire.zig").decodeBytesLeakyMeasured(output.allocator(), .int64, bytes, .{})).value
                 else blk: {
                     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), bytes, .{ .parse_numbers = false });
                     // Legacy document projection cloned the selected JSON
                     // subtree before its native cells could borrow payloads.
                     const owned = try @import("../storage/typed_json.zig").clone(output.allocator(), parsed);
-                    break :blk (try @import("array_wire.zig").decodeBorrowed(output.allocator(), .int64, owned, .{})).value;
+                    break :blk (try @import("array/wire.zig").decodeBorrowed(output.allocator(), .int64, owned, .{})).value;
                 };
                 elapsed += now() - begin;
                 for (0..value.cardinality()) |i| {
@@ -1132,13 +1132,13 @@ fn checkedBuilderMode(comptime checked: bool, cells: []const Datum) !BuilderMeas
     for (0..512) |_| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        var work: @import("array_value.zig").Budget = .{};
+        var work: @import("array/value.zig").Budget = .{};
         const started = cpuNow();
-        const Producer = if (checked) @import("array_compact.zig").CheckedBuilder else @import("array_compact.zig").Builder;
+        const Producer = if (checked) @import("array/compact.zig").CheckedBuilder else @import("array/compact.zig").Builder;
         var builder = try Producer.init(arena.allocator(), .int64, &.{.{ .length = @intCast(cells.len) }}, cells.len, cells.len, 0, .{});
         for (cells) |cell| {
             if (checked) try builder.appendChecked(cell, .int64, .{}, &work) else {
-                _ = try @import("array_value.zig").Value.initWithBudget(.int64, &.{.{ .length = 1 }}, &.{cell}, .{}, &work);
+                _ = try @import("array/value.zig").Value.initWithBudget(.int64, &.{.{ .length = 1 }}, &.{cell}, .{}, &work);
                 try builder.append(cell);
             }
         }

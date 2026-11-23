@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ctypes
 import enum
+import struct
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -111,6 +112,45 @@ def _coerce_value(value: Any) -> bytes:
     if isinstance(value, str):
         return value.encode("utf-8")
     return encode_json_input(value)
+
+
+_BATCH_WIRE_MAGIC = 0x41464257  # "AFBW"
+_BATCH_WIRE_VERSION = 1
+_BATCH_WIRE_SYNC_LEVEL_TAGS = {
+    "propose": 0,
+    "write": 1,
+    "full_text": 2,
+    "enrichments": 3,
+    "full_index": 4,
+}
+
+
+def encode_batch_wire(writes: Sequence[WriteLike], sync_level: str = "write") -> bytes:
+    """Build the binary payload `Database.batch_wire`/`antfly_db_batch_wire`
+    decodes: writes and deletes (split on each normalized write's `delete`
+    flag) plus a sync level, length-prefixed and little-endian, matching
+    `capi/batch_wire.zig` exactly. No JSON is produced or parsed, and the
+    server-side decode is zero-copy."""
+    try:
+        tag = _BATCH_WIRE_SYNC_LEVEL_TAGS[sync_level]
+    except KeyError:
+        raise ValueError(f"unknown sync level: {sync_level!r}") from None
+    normalized = [_normalize_write(w) for w in writes]
+    inserts = [w for w in normalized if not w.delete]
+    deletes = [w for w in normalized if w.delete]
+    parts = [struct.pack("<IHBBII", _BATCH_WIRE_MAGIC, _BATCH_WIRE_VERSION, tag, 0, len(inserts), len(deletes))]
+    for w in inserts:
+        key = w.key.encode("utf-8")
+        value = w.value if isinstance(w.value, bytes) else _coerce_value(w.value)
+        parts.append(struct.pack("<I", len(key)))
+        parts.append(key)
+        parts.append(struct.pack("<I", len(value)))
+        parts.append(value)
+    for w in deletes:
+        key = w.key.encode("utf-8")
+        parts.append(struct.pack("<I", len(key)))
+        parts.append(key)
+    return b"".join(parts)
 
 
 def _validate_txn_id(txn_id: TxnID) -> bytes:
@@ -439,6 +479,26 @@ class Database:
             errors.raise_for_outcome_code(
                 self._lib.antfly_db_batch_json(ctypes.c_void_p(handle), sl, ctypes.byref(out))
             )
+            data = _ffi.take_buffer(out)
+        finally:
+            self._release()
+        return decode_json_response(data, raw)
+
+    def batch_wire(self, payload: bytes, *, raw: bool = False) -> Any:
+        """Apply a batch encoded in the binary wire format `encode_batch_wire`
+        builds (writes, deletes, and a sync level; see `capi/batch_wire.zig`
+        and the public C header), with no per-field JSON parsing. Returns the
+        same JSON batch result as `batch_json`.
+
+        An OutcomeUnknownError carries the write's `outcome_receipt`."""
+        native_call = getattr(self._lib, "antfly_db_batch_wire", None)
+        if native_call is None:
+            raise errors.UnsupportedError(message="This native library does not expose the binary batch format")
+        handle = self._acquire()
+        try:
+            sl, _keep = _ffi.make_slice(bytes(payload))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_outcome_code(native_call(ctypes.c_void_p(handle), sl, ctypes.byref(out)))
             data = _ffi.take_buffer(out)
         finally:
             self._release()

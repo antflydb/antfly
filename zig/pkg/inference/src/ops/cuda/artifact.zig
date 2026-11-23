@@ -16,7 +16,9 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
+pub const contract = @import("driver_contract.zig");
 pub const mode = build_options.cuda_artifacts;
+pub const profile: contract.Profile = std.meta.stringToEnum(contract.Profile, mode) orelse @compileError("unknown CUDA artifact profile");
 pub const is_sm89 = std.mem.eql(u8, mode, "sm89");
 pub const is_fatbin = std.mem.eql(u8, mode, "fatbin");
 pub const format = if (is_sm89) "cubin" else if (is_fatbin) "fatbin" else "ptx";

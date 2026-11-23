@@ -28,16 +28,10 @@ case "$("$nvcc" --version)" in
   *) echo "Use CUDA 13.0 to reproduce the driver-13.0-compatible PTX image" >&2; exit 2 ;;
 esac
 mkdir -p "$output_dir"
-"$nvcc" -ptx -arch=compute_80 -O3 \
-  "$pkg_root/src/ops/cuda/prototypes/florence_fused.cu" \
-  -o "$output_dir/florence_fused.ptx"
-"${PYTHON:-python3}" - "$output_dir/florence_fused.ptx" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-p.write_bytes(p.read_bytes().rstrip(b"\n") + b"\n")
-PY
-cmp "$pkg_root/src/ops/cuda/florence_fused.ptx" "$output_dir/florence_fused.ptx"
+"${PYTHON:-python3}" "$pkg_root/scripts/regen_cuda_standalone.py" \
+  --root "$repo_root" --nvcc "$nvcc" --family encoder_decoder_f16 \
+  --report "$output_dir/native-image-identity.json"
+cp "$pkg_root/src/ops/cuda/florence_fused.ptx" "$output_dir/florence_fused.ptx"
 # Optional independent F64 regression under adversarial warp scheduling.
 # PyTorch is needed only for this qualification mode, never by the runtime.
 if [[ "${1:-}" == "--schedule-stress" ]]; then

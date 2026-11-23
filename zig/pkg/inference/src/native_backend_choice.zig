@@ -83,6 +83,33 @@ pub fn configureSessionPreference(session_manager: *backends.SessionManager, cho
     };
 }
 
+/// Direct task placement has no native seed/compiled partition distinction.
+/// Each stage owns its own manager snapshot so a primary requirement cannot
+/// override an explicitly placed decoder or other component.
+pub fn configureDirectSession(session_manager: *backends.SessionManager, choice: Choice) void {
+    if (choice == .auto) {
+        configureSessionPreference(session_manager, choice);
+        return;
+    }
+    const selected: backends.BackendType = switch (choice) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .xla => .pjrt,
+        .webgpu => .wasm,
+        .auto => unreachable,
+    };
+    session_manager.required_backend = selected;
+    session_manager.required_backend_invalid = false;
+    session_manager.preferred_backends = switch (selected) {
+        .native => &.{.native},
+        .metal => &.{.metal},
+        .cuda => &.{.cuda},
+        .pjrt => &.{.pjrt},
+        .wasm => &.{.wasm},
+    };
+}
+
 pub fn compiledPartitionBackend(choice: Choice) ?ops.BackendKind {
     return switch (choice) {
         .xla => .pjrt,
@@ -179,10 +206,11 @@ test "required backend gates compiled backend execution" {
     );
 
     manager.required_backend = .pjrt;
-    try std.testing.expectError(
-        error.RequiredBackendUnavailable,
-        validateRequiredCompiledBackend(&manager, .pjrt),
-    );
+    if (build_options.enable_pjrt) {
+        try validateRequiredCompiledBackend(&manager, .pjrt);
+    } else {
+        try std.testing.expectError(error.RequiredBackendUnavailable, validateRequiredCompiledBackend(&manager, .pjrt));
+    }
 
     manager.required_backend = null;
     manager.required_backend_invalid = true;
@@ -235,4 +263,17 @@ test "automatic native session selection retains safe fallback" {
     } else {
         try std.testing.expect(manager.preferred_backends.len > 0);
     }
+}
+
+test "task direct placement isolates primary and decoder requirements" {
+    var primary = backends.SessionManager.init(std.testing.allocator);
+    configureDirectSession(&primary, .xla);
+    var decoder = primary;
+    configureDirectSession(&decoder, .native);
+    var storage: [1]backends.BackendType = undefined;
+    const actual = try decoder.requiredBackendCandidates(&.{.pjrt}, &storage);
+    try std.testing.expectEqual(backends.BackendType.native, actual[0]);
+    try std.testing.expectEqual(@as(?backends.BackendType, .pjrt), primary.required_backend);
+    configureDirectSession(&decoder, .metal);
+    try std.testing.expectEqual(@as(?backends.BackendType, .metal), decoder.required_backend);
 }

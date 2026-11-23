@@ -38,6 +38,26 @@ pub fn forward(
     batch: usize,
     text_seq_len: usize,
 ) !ForwardOutput {
+    const result = try forwardTensor(cb, allocator, config, input_ids, attention_mask, token_type_ids, bbox, pixel_values, batch, text_seq_len);
+    defer cb.free(result.hidden);
+    return .{ .hidden = try cb.toFloat32(result.hidden, allocator), .seq_len = result.seq_len };
+}
+
+/// Same encoder operations and total sequence metadata; caller owns hidden.
+pub const TensorForwardOutput = struct { hidden: CT, seq_len: usize };
+
+pub fn forwardTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    token_type_ids: ?[]const i64,
+    bbox: []const i64,
+    pixel_values: ?[]const f32,
+    batch: usize,
+    text_seq_len: usize,
+) !TensorForwardOutput {
     const H = config.hidden_size;
     const total_text = batch * text_seq_len;
     const tp_world_size = tensorParallelWorldSize(cb);
@@ -87,9 +107,7 @@ pub fn forward(
         cb.free(hidden);
         hidden = next;
     }
-    const result = try cb.toFloat32(hidden, allocator);
-    cb.free(hidden);
-    return .{ .hidden = result, .seq_len = seq_len };
+    return .{ .hidden = hidden, .seq_len = seq_len };
 }
 
 const VisualEmbeddings = struct {

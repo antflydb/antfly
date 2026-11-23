@@ -22,14 +22,14 @@ const windows = @import("window_binding.zig");
 const Allocator = std.mem.Allocator;
 
 fn phaseCall(value: *const ast.Scalar) bool {
-    return value.* == .call and (value.call.window != null or value.call.within_group != null or aggregates.aggregateKind(value.call.name) != null);
+    return value.* == .call and (aggregates.collection(value.call) or value.call.window != null or value.call.within_group != null or aggregates.aggregateKind(value.call.name) != null);
 }
 
 fn ownAggregate(value: *const ast.Scalar) bool {
     return switch (value.*) {
         .call => |call| blk: {
             if (call.subquery != null) break :blk false;
-            if (call.window == null and (call.within_group != null or aggregates.aggregateKind(call.name) != null)) break :blk true;
+            if (call.window == null and (aggregates.collection(call) or call.within_group != null or aggregates.aggregateKind(call.name) != null)) break :blk true;
             for (call.args) |arg| if (ownAggregate(arg)) break :blk true;
             if (call.filter) |filter| if (ownAggregate(filter)) break :blk true;
             if (call.window) |window| {

@@ -58,6 +58,8 @@ var aggregate_host_materialized_unattributed_outputs: AtomicU64 = .init(0);
 var aggregate_device_resident_parameter_outputs: AtomicU64 = .init(0);
 var aggregate_boundary_output_materializations: AtomicU64 = .init(0);
 var aggregate_graph_output_owned_copies: AtomicU64 = .init(0);
+var aggregate_opaque_graph_output_copies: AtomicU64 = .init(0);
+var aggregate_planned_literal_output_copies: AtomicU64 = .init(0);
 var aggregate_metal_frame_chunk_boundaries: AtomicU64 = .init(0);
 var aggregate_metal_frame_chunk_promoted_values: AtomicU64 = .init(0);
 var aggregate_metal_frame_chunk_swept_values: AtomicU64 = .init(0);
@@ -96,6 +98,8 @@ pub fn record(stats: ExecutionStats) void {
     _ = aggregate_device_resident_parameter_outputs.fetchAdd(stats.device_resident_parameter_outputs, .monotonic);
     _ = aggregate_boundary_output_materializations.fetchAdd(stats.boundary_output_materializations, .monotonic);
     _ = aggregate_graph_output_owned_copies.fetchAdd(stats.graph_output_owned_copies, .monotonic);
+    _ = aggregate_opaque_graph_output_copies.fetchAdd(stats.opaque_graph_output_copies, .monotonic);
+    _ = aggregate_planned_literal_output_copies.fetchAdd(stats.planned_literal_output_copies, .monotonic);
     _ = aggregate_metal_frame_chunk_boundaries.fetchAdd(stats.metal_frame_chunk_boundaries, .monotonic);
     _ = aggregate_metal_frame_chunk_promoted_values.fetchAdd(stats.metal_frame_chunk_promoted_values, .monotonic);
     _ = aggregate_metal_frame_chunk_swept_values.fetchAdd(stats.metal_frame_chunk_swept_values, .monotonic);
@@ -136,6 +140,8 @@ pub fn snapshot() ExecutionStats {
         .device_resident_parameter_outputs = aggregate_device_resident_parameter_outputs.load(.monotonic),
         .boundary_output_materializations = aggregate_boundary_output_materializations.load(.monotonic),
         .graph_output_owned_copies = aggregate_graph_output_owned_copies.load(.monotonic),
+        .opaque_graph_output_copies = aggregate_opaque_graph_output_copies.load(.monotonic),
+        .planned_literal_output_copies = aggregate_planned_literal_output_copies.load(.monotonic),
         .metal_frame_chunk_boundaries = aggregate_metal_frame_chunk_boundaries.load(.monotonic),
         .metal_frame_chunk_promoted_values = aggregate_metal_frame_chunk_promoted_values.load(.monotonic),
         .metal_frame_chunk_swept_values = aggregate_metal_frame_chunk_swept_values.load(.monotonic),
@@ -188,6 +194,8 @@ pub fn reset() void {
     aggregate_device_resident_parameter_outputs.store(0, .monotonic);
     aggregate_boundary_output_materializations.store(0, .monotonic);
     aggregate_graph_output_owned_copies.store(0, .monotonic);
+    aggregate_opaque_graph_output_copies.store(0, .monotonic);
+    aggregate_planned_literal_output_copies.store(0, .monotonic);
     aggregate_metal_frame_chunk_boundaries.store(0, .monotonic);
     aggregate_metal_frame_chunk_promoted_values.store(0, .monotonic);
     aggregate_metal_frame_chunk_swept_values.store(0, .monotonic);
@@ -204,7 +212,7 @@ pub fn enabled() bool {
 
 pub fn print(stats: ExecutionStats) void {
     std.debug.print(
-        "graph_executor_stats: partitions={d} transfers={d} runtime_input_transfers={d} device_resident_transfers={d} commands={d} planned_commands={d} metadata_aliases={d} descriptor_materializations={d} constant_materializations={d} graph_regions={d} graph_region_ops={d} graph_region_fallbacks={d} fused_patterns={d} fused_nodes_elided={d} graph_output_elision_overrides={d} interpreter_fallbacks={d} device_outputs={d} host_outputs={d} boundary_materializations={d} graph_output_owned_copies={d}",
+        "graph_executor_stats: partitions={d} transfers={d} runtime_input_transfers={d} device_resident_transfers={d} commands={d} planned_commands={d} metadata_aliases={d} descriptor_materializations={d} constant_materializations={d} graph_regions={d} graph_region_ops={d} graph_region_fallbacks={d} fused_patterns={d} fused_nodes_elided={d} graph_output_elision_overrides={d} interpreter_fallbacks={d} device_outputs={d} host_outputs={d} boundary_materializations={d} graph_output_owned_copies={d} planned_literal_output_copies={d} opaque_graph_output_copies={d}",
         .{
             stats.partitions_executed,
             stats.cross_device_transfers,
@@ -226,6 +234,8 @@ pub fn print(stats: ExecutionStats) void {
             stats.host_materialized_outputs,
             stats.boundary_output_materializations,
             stats.graph_output_owned_copies,
+            stats.planned_literal_output_copies,
+            stats.opaque_graph_output_copies,
         },
     );
     std.debug.print(

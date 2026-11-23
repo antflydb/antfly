@@ -1,0 +1,458 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact CLUSTER and physical heap order",
+  "cases": [
+    {
+      "id": "sql-0078",
+      "source_entry_sha256": "6abb646ec11c093bbed547c4d0c229b5800043b4a806a75cb0d67a1330042fc0",
+      "sql": "CLUSTER usage_records USING usage_records_status_idx",
+      "setup": [
+        "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT,body TEXT)",
+        "CREATE INDEX usage_records_status_idx ON usage_records(status)",
+        "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000001','zulu','first'),('00000000-0000-0000-0000-000000000004',NULL,'fourth'),('00000000-0000-0000-0000-000000000003','mike','third'),('00000000-0000-0000-0000-000000000002','alpha','second')"
+      ],
+      "query": "SELECT id::text AS id,status,body FROM usage_records ORDER BY id",
+      "output": {
+        "columns": [
+          "id",
+          "status",
+          "body"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "zulu",
+            "first"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "alpha",
+            "second"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "mike",
+            "third"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000004",
+            null,
+            "fourth"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false
+          ]
+        ]
+      },
+      "command_tag": "CLUSTER",
+      "verbose_notice": false,
+      "physical_order": {
+        "columns": [
+          "id",
+          "status"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "alpha"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "mike"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "zulu"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000004",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "stable_table_and_index_identity": true,
+      "new_physical_generation": true,
+      "preferred_index": "usage_records_status_idx",
+      "after_writes": [
+        "UPDATE usage_records SET status='bravo',body='updated' WHERE id='00000000-0000-0000-0000-000000000001'",
+        "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000004'",
+        "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000005','delta','fifth')"
+      ],
+      "changed_output": {
+        "columns": [
+          "id",
+          "status",
+          "body"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "bravo",
+            "updated"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "alpha",
+            "second"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "mike",
+            "third"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "delta",
+            "fifth"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "preferred_recluster": "CLUSTER usage_records",
+      "reclustered_physical_order": {
+        "columns": [
+          "id",
+          "status"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "alpha"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "bravo"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "delta"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "mike"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "id": "sql-0079",
+      "source_entry_sha256": "ac7f7c2f6e05578423aec3345f9c77e6bb2e043bc79bae876a91bb020190ac30",
+      "sql": "CLUSTER VERBOSE usage_records USING usage_records_status_idx",
+      "setup": [
+        "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT,body TEXT)",
+        "CREATE INDEX usage_records_status_idx ON usage_records(status)",
+        "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000001','zulu','first'),('00000000-0000-0000-0000-000000000004',NULL,'fourth'),('00000000-0000-0000-0000-000000000003','mike','third'),('00000000-0000-0000-0000-000000000002','alpha','second')"
+      ],
+      "query": "SELECT id::text AS id,status,body FROM usage_records ORDER BY id",
+      "output": {
+        "columns": [
+          "id",
+          "status",
+          "body"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "zulu",
+            "first"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "alpha",
+            "second"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "mike",
+            "third"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000004",
+            null,
+            "fourth"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false
+          ]
+        ]
+      },
+      "command_tag": "CLUSTER",
+      "verbose_notice": true,
+      "physical_order": {
+        "columns": [
+          "id",
+          "status"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "alpha"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "mike"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "zulu"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000004",
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "stable_table_and_index_identity": true,
+      "new_physical_generation": true,
+      "preferred_index": "usage_records_status_idx",
+      "after_writes": [
+        "UPDATE usage_records SET status='bravo',body='updated' WHERE id='00000000-0000-0000-0000-000000000001'",
+        "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000004'",
+        "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000005','delta','fifth')"
+      ],
+      "changed_output": {
+        "columns": [
+          "id",
+          "status",
+          "body"
+        ],
+        "column_oids": [
+          25,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "bravo",
+            "updated"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "alpha",
+            "second"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "mike",
+            "third"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "delta",
+            "fifth"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "preferred_recluster": "CLUSTER usage_records",
+      "reclustered_physical_order": {
+        "columns": [
+          "id",
+          "status"
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "rows": [
+          [
+            "00000000-0000-0000-0000-000000000002",
+            "alpha"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000001",
+            "bravo"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000005",
+            "delta"
+          ],
+          [
+            "00000000-0000-0000-0000-000000000003",
+            "mike"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      }
+    }
+  ]
+}

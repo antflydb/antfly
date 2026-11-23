@@ -123,6 +123,23 @@ pub fn preprocessDecodedRectScaledWithResample(
     rescale_factor: f32,
     resample: Resample,
 ) ![]f32 {
+    var cache = PillowResizeCache{};
+    defer cache.deinit();
+    return preprocessWithResizeCache(allocator, img, target_width, target_height, mean, std_dev, rescale_factor, resample, &cache);
+}
+
+/// Reuse the two filter axes and horizontal scanlines across a sequence of images.
+pub fn preprocessWithResizeCache(
+    allocator: std.mem.Allocator,
+    img: ImageU8,
+    target_width: u32,
+    target_height: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+    resample: Resample,
+    cache: *PillowResizeCache,
+) ![]f32 {
     try img.validate();
 
     const tw: usize = target_width;
@@ -133,17 +150,7 @@ pub fn preprocessDecodedRectScaledWithResample(
     const result = try allocator.alloc(f32, result_len);
     errdefer allocator.free(result);
 
-    try preprocessDecodedRectScaledWithResampleInto(
-        allocator,
-        img,
-        result,
-        target_width,
-        target_height,
-        mean,
-        std_dev,
-        rescale_factor,
-        resample,
-    );
+    try preprocessRectInto(allocator, img, result, target_width, target_height, mean, std_dev, rescale_factor, resample, cache);
     return result;
 }
 
@@ -157,6 +164,23 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
     std_dev: [3]f32,
     rescale_factor: f32,
     resample: Resample,
+) !void {
+    var cache = PillowResizeCache{};
+    defer cache.deinit();
+    return preprocessRectInto(allocator, img, result, target_width, target_height, mean, std_dev, rescale_factor, resample, &cache);
+}
+
+fn preprocessRectInto(
+    allocator: std.mem.Allocator,
+    img: ImageU8,
+    result: []f32,
+    target_width: u32,
+    target_height: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+    resample: Resample,
+    cache: *PillowResizeCache,
 ) !void {
     try img.validate();
     var resolved_img = img;
@@ -194,6 +218,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
             std_dev,
             rescale_factor,
             resample,
+            cache,
         );
         return;
     }
@@ -632,6 +657,38 @@ pub const BicubicAxis = struct {
     }
 };
 
+/// Retained coefficient planes and construction-only f64 storage for the
+/// shared Pillow/Torchvision coefficient builder.
+pub const PillowBicubicAxisPlan = struct {
+    source_size: usize,
+    target_size: usize,
+    taps: usize,
+    retained_bytes: usize,
+    temporary_bytes: usize,
+};
+
+/// Compatibility planning bound covering both publication precisions. Callers
+/// with a resolved precision use planPillowBicubicAxisForPrecision instead.
+pub fn planPillowBicubicAxis(source_size: usize, target_size: usize) !PillowBicubicAxisPlan {
+    return planPillowBicubicAxisForPrecision(source_size, target_size, true);
+}
+
+/// Exact cold allocation payload for the same geometry and temporary layout
+/// selected by buildPillowBicubicAxis. Pillow reuses one coefficient row;
+/// Torchvision needs the whole axis before choosing a publication precision.
+pub fn planPillowBicubicAxisForPrecision(source_size: usize, target_size: usize, torchvision: bool) !PillowBicubicAxisPlan {
+    const geometry = try PillowAxisGeometry.init(source_size, target_size, if (torchvision) .torchvision_bicubic else .pillow_bicubic);
+    const layout = try geometry.layout();
+    const indices = try std.math.add(usize, target_size, try std.math.add(usize, target_size, 1));
+    return .{
+        .source_size = source_size,
+        .target_size = target_size,
+        .taps = layout.count,
+        .retained_bytes = try std.math.add(usize, try std.math.mul(usize, indices, @sizeOf(usize)), try std.math.mul(usize, layout.count, @sizeOf(i32))),
+        .temporary_bytes = try std.math.mul(usize, if (torchvision) layout.count else layout.max_taps, @sizeOf(f64)),
+    };
+}
+
 /// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
 /// widens the cubic support by the reduction factor and renormalizes the
 /// surviving in-bounds taps instead of clamping out-of-bounds samples.
@@ -816,9 +873,47 @@ fn pillowHorizontalRow(img: ImageU8, axis: BicubicAxis, horizontal: []u8, target
     }
 }
 
-/// Pillow resizes 8-bit images in two passes, materializing an 8-bit
-/// horizontal intermediate before the vertical pass. Preserving that
-/// quantization boundary is required for Transformers pixel parity.
+/// Owned by one sequential producer. Each frame rewrites the scratch rows.
+/// One geometry is retained, including the intermediate 8-bit rounding boundary.
+pub const PillowResizeCache = struct {
+    plan: ?Plan = null,
+
+    const Key = struct { width: usize, height: usize, target_width: usize, target_height: usize, resample: Resample };
+    const Plan = struct {
+        key: Key,
+        x: BicubicAxis,
+        y: BicubicAxis,
+        horizontal: []u8,
+        row_mask: usize,
+        vector_safe: bool,
+    };
+
+    pub fn deinit(self: *PillowResizeCache) void {
+        if (self.plan) |*p| {
+            p.x.allocator.free(p.horizontal);
+            p.x.deinit();
+            p.y.deinit();
+            self.plan = null;
+        }
+    }
+
+    fn get(self: *PillowResizeCache, allocator: std.mem.Allocator, key: Key) !*const Plan {
+        if (self.plan) |*p| if (std.meta.eql(p.key, key)) return p;
+        self.deinit();
+        var x = try buildPillowAxis(allocator, key.width, key.target_width, key.resample);
+        errdefer x.deinit();
+        var y = try buildPillowAxis(allocator, key.height, key.target_height, key.resample);
+        errdefer y.deinit();
+        var max_rows: usize = 1;
+        for (0..key.target_height) |i| max_rows = @max(max_rows, y.offsets[i + 1] - y.offsets[i]);
+        const rows = try std.math.ceilPowerOfTwo(usize, max_rows);
+        const row_bytes = try std.math.mul(usize, key.target_width, 3);
+        const horizontal = try allocator.alloc(u8, try std.math.mul(usize, rows, row_bytes));
+        self.plan = .{ .key = key, .x = x, .y = y, .horizontal = horizontal, .row_mask = rows - 1, .vector_safe = pillowHorizontalVectorSafe(x, key.target_width, true) };
+        return &self.plan.?;
+    }
+};
+
 fn preprocessDecodedRectPillowBicubic(
     allocator: std.mem.Allocator,
     img: ImageU8,
@@ -829,20 +924,15 @@ fn preprocessDecodedRectPillowBicubic(
     std_dev: [3]f32,
     rescale_factor: f32,
     resample: Resample,
+    cache: *PillowResizeCache,
 ) !void {
-    var horizontal_axis = try buildPillowAxis(allocator, img.width, target_width, resample);
-    defer horizontal_axis.deinit();
-    var vertical_axis = try buildPillowAxis(allocator, img.height, target_height, resample);
-    defer vertical_axis.deinit();
-
-    var max_rows: usize = 1;
-    for (0..target_height) |y| max_rows = @max(max_rows, vertical_axis.offsets[y + 1] - vertical_axis.offsets[y]);
-    const ring_rows = try std.math.ceilPowerOfTwo(usize, max_rows);
-    const row_mask = ring_rows - 1;
-    const row_bytes = try std.math.mul(usize, target_width, 3);
-    const horizontal = try allocator.alloc(u8, try std.math.mul(usize, ring_rows, row_bytes));
-    defer allocator.free(horizontal);
-    const horizontal_vector_safe = pillowHorizontalVectorSafe(horizontal_axis, target_width, true);
+    const plan = try cache.get(allocator, .{ .width = img.width, .height = img.height, .target_width = target_width, .target_height = target_height, .resample = resample });
+    const horizontal_axis = plan.x;
+    const vertical_axis = plan.y;
+    const horizontal = plan.horizontal;
+    const row_mask = plan.row_mask;
+    const row_bytes = target_width * 3;
+    const horizontal_vector_safe = plan.vector_safe;
     var computed_through: usize = 0;
 
     const Vec = @Vector(8, i32);
@@ -1304,6 +1394,31 @@ test "Pillow horizontal unsafe coefficients retain wide scalar accumulation" {
     try pillowHorizontal(image, axis, &vector, 1, true);
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0 }, &scalar);
     try std.testing.expectEqualSlices(u8, &scalar, &vector);
+}
+
+test "Pillow bicubic cold geometry accounts exact retained and temporary coefficient payloads" {
+    inline for (.{ .{ 7, 13 }, .{ 100, 48 }, .{ 4096, 96 }, .{ 48, 48 } }) |shape| {
+        const conservative = try planPillowBicubicAxis(shape[0], shape[1]);
+        inline for (.{ false, true }) |torchvision| {
+            const plan = try planPillowBicubicAxisForPrecision(shape[0], shape[1], torchvision);
+            var axis = try buildPillowBicubicAxis(std.testing.allocator, shape[0], shape[1], torchvision);
+            defer axis.deinit();
+            try std.testing.expectEqual(plan.taps, axis.weights.len);
+            try std.testing.expectEqual(plan.retained_bytes, axis.starts.len * @sizeOf(usize) + axis.offsets.len * @sizeOf(usize) + axis.weights.len * @sizeOf(i32));
+            try std.testing.expectEqual(conservative.taps, plan.taps);
+            try std.testing.expect(plan.temporary_bytes <= conservative.temporary_bytes);
+            // The exact plan must fund the real builder, including alignment
+            // gaps; the builder's temporary is released before returning.
+            const storage = try std.testing.allocator.alloc(u8, plan.retained_bytes + plan.temporary_bytes + 4 * @alignOf(f64));
+            defer std.testing.allocator.free(storage);
+            var bounded = std.heap.FixedBufferAllocator.init(storage);
+            var admitted = try buildPillowBicubicAxis(bounded.allocator(), shape[0], shape[1], torchvision);
+            defer admitted.deinit();
+            try std.testing.expectEqualSlices(i32, axis.weights, admitted.weights);
+        }
+    }
+    try std.testing.expectError(error.InvalidImageDimensions, planPillowBicubicAxis(0, 1));
+    try std.testing.expectError(error.InvalidImageDimensions, planPillowBicubicAxis(1, 0));
 }
 
 test "model resampling matches pinned Pillow pixels including boundaries and reduction" {

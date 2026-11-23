@@ -1003,6 +1003,15 @@ fn runMicrokernelCheck(allocator: std.mem.Allocator, check: CheckCase) !CheckRes
 // f16 KV, single contiguous block, no sinks, softcap 0 — exercising GQA and the
 // causal + sliding-window masks against a self-contained CPU oracle.
 
+const compatibility_decode_check_source = blk: {
+    @setEvalBranchQuota(50_000_000);
+    var buffer: [1 << 17]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const rendered = @import("graph/quant_kernel_metal_renderer.zig").renderCompatibilityAttention(fixed.allocator(), "antfly_compat_decode_1x_check", .decode_1x) catch @compileError("compatibility decode source");
+    const bytes: [rendered.len]u8 = rendered[0..rendered.len].*;
+    break :blk "#include <metal_stdlib>\nusing namespace metal;\n" ++ bytes;
+};
+
 const AttentionShape = struct {
     kv_tokens: usize,
     num_heads: usize,
@@ -1011,6 +1020,7 @@ const AttentionShape = struct {
     /// Position of the (single) decode query. Set to `kv_tokens - 1` so the
     /// query is causally after every KV token (the real decode invariant).
     query_position_offset: usize,
+    kv_position_offset: usize = 0,
     /// 0 = full causal attention; W>0 masks KV tokens older than W (iSWA).
     sliding_window: usize,
 };
@@ -1023,6 +1033,12 @@ const attention_shapes = [_]AttentionShape{
     .{ .kv_tokens = 32, .num_heads = 4, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 31, .sliding_window = 8 },
     .{ .kv_tokens = 64, .num_heads = 8, .num_kv_heads = 8, .head_dim = 128, .query_position_offset = 63, .sliding_window = 0 },
     .{ .kv_tokens = 48, .num_heads = 4, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 47, .sliding_window = 16 },
+    // Entirely future and entirely expired windows must have zero mass.
+    .{ .kv_tokens = 33, .num_heads = 4, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 0, .kv_position_offset = 32, .sliding_window = 0 },
+    .{ .kv_tokens = 257, .num_heads = 4, .num_kv_heads = 1, .head_dim = 128, .query_position_offset = 1024, .sliding_window = 8 },
+    .{ .kv_tokens = 1, .num_heads = 2, .num_kv_heads = 1, .head_dim = 64, .query_position_offset = 1024, .sliding_window = 8 },
+    // A ragged 257-token score fold stresses shared max/sum storage reuse.
+    .{ .kv_tokens = 257, .num_heads = 4, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 256, .sliding_window = 0 },
 };
 
 const AttentionCheckCase = struct {
@@ -1049,7 +1065,7 @@ fn isDecodeAttentionArtifact(comptime artifact: quant_kernel_compiler.GeneratedA
 }
 
 fn attentionRuntimeCheckCount() comptime_int {
-    var count: comptime_int = 0;
+    var count: comptime_int = attention_shapes.len;
     for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
         if (isDecodeAttentionArtifact(artifact)) count += attention_shapes.len;
     }
@@ -1065,6 +1081,17 @@ fn buildAttentionRuntimeChecks() [attention_runtime_check_count]AttentionCheckCa
             checks[index] = attentionRuntimeCheck(artifact, shape);
             index += 1;
         }
+    }
+    inline for (attention_shapes) |shape| {
+        checks[index] = .{
+            .name = std.fmt.comptimePrint("compat_decode_kv{d}_hd{d}_qo{d}_ko{d}_sw{d}", .{ shape.kv_tokens, shape.head_dim, shape.query_position_offset, shape.kv_position_offset, shape.sliding_window }),
+            .source = compatibility_decode_check_source,
+            .kernel_name = "antfly_compat_decode_1x_check",
+            .threads_per_threadgroup = 256,
+            .tolerance = 2e-2,
+            .shape = shape,
+        };
+        index += 1;
     }
     return checks;
 }
@@ -1131,7 +1158,7 @@ fn referenceGqaAttention1x(
 
         var best: f32 = neg_inf;
         for (0..kv) |ki| {
-            const key_pos = ki; // kv_position_offset = 0
+            const key_pos = shape.kv_position_offset + ki;
             var allowed = key_pos <= query_pos;
             if (shape.sliding_window != 0 and allowed) allowed = (query_pos - key_pos) < shape.sliding_window;
             if (!allowed) {
@@ -1226,7 +1253,7 @@ fn runAttentionCheck(allocator: std.mem.Allocator, check: AttentionCheckCase) !C
         @intCast(nkv),
         @intCast(hd),
         @intCast(shape.query_position_offset),
-        0, // kv_position_offset
+        @intCast(shape.kv_position_offset), // absolute KV position
         @intCast(shape.sliding_window),
         @intCast(kv), // page_size (single block spans all kv tokens)
         0, // contiguous_base_token
@@ -2622,7 +2649,7 @@ test "quant kernel metal runtime attention checks cover generated decode attenti
     };
     // The decode harness covers only the decode-1x route; flash-prefill is covered
     // by the separate flash harness (different grid / threads / shmem).
-    try std.testing.expectEqual(decode_artifacts * attention_shapes.len, attention_runtime_checks.len);
+    try std.testing.expectEqual((decode_artifacts + 1) * attention_shapes.len, attention_runtime_checks.len);
     inline for (quant_kernel_compiler.first_generated_attention_artifacts) |artifact| {
         if (comptime isDecodeAttentionArtifact(artifact)) {
             var match_count: usize = 0;
@@ -2630,11 +2657,10 @@ test "quant kernel metal runtime attention checks cover generated decode attenti
                 if (!std.mem.eql(u8, artifact.kernel_id, check.kernel_name)) continue;
                 match_count += 1;
                 // NT must match the schedule (and the hand-written dispatch); the
-                // shape must be GQA-valid and never all-masked (query after all KV).
+                // shape must be GQA-valid; all-masked rows deliberately cover zero mass.
                 try std.testing.expectEqual(@as(u32, 256), check.threads_per_threadgroup);
                 try std.testing.expect(check.shape.num_kv_heads > 0);
                 try std.testing.expectEqual(@as(usize, 0), check.shape.num_heads % check.shape.num_kv_heads);
-                try std.testing.expect(check.shape.query_position_offset + 1 >= check.shape.kv_tokens);
                 try std.testing.expectEqualStrings(
                     quant_kernel_compiler.generatedSourceForArtifact(artifact) orelse return error.MissingGeneratedSource,
                     check.source,
@@ -2643,6 +2669,11 @@ test "quant kernel metal runtime attention checks cover generated decode attenti
             try std.testing.expectEqual(attention_shapes.len, match_count);
         }
     }
+    var compatibility_count: usize = 0;
+    for (attention_runtime_checks) |check| {
+        if (std.mem.eql(u8, check.kernel_name, "antfly_compat_decode_1x_check")) compatibility_count += 1;
+    }
+    try std.testing.expectEqual(attention_shapes.len, compatibility_count);
 }
 
 test "quant kernel metal runtime flash prefill checks cover the generated flash artifact" {

@@ -27,19 +27,54 @@ pub const recipe_version = model_config.recipe_version;
 pub const max_tokens = model_config.max_tokens;
 pub const output_dim: usize = 768;
 pub const Config = model_config.Config;
+
+/// Actual registered text RMS schema shared by cold Source declaration and
+/// receiving preparation. Generic backend maps never select a model recipe.
+pub fn textRmsMetadataEntries(layers: usize) !u32 {
+    const per_layer: usize = @backingInt(ops.EmbeddingModelWeight.final_norm);
+    const first_global = ops.EmbeddingModelWeight.final_norm.index(0);
+    if (layers == 0 or layers != first_global / per_layer) return error.UnsupportedEmbeddingGemma2Geometry;
+    return @intCast(ops.EmbeddingModelWeight.ple_norm.index(0) + 1);
+}
+
+/// Registered projection schema, plus distinct source slices used by the
+/// existing packed/unpacked PLE schedules. This is a metadata capacity bound,
+/// not SDK allocation credit or another numerical schedule.
+pub const TextProjectionMetadata = struct {
+    linear_entries: u32,
+    zero_widths: [5]usize,
+};
+pub fn textProjectionMetadata(cfg: Config) !TextProjectionMetadata {
+    _ = try textRmsMetadataEntries(cfg.num_hidden_layers);
+    const expected = Config{};
+    if (cfg.hidden_size != expected.hidden_size or cfg.embedding_dim != expected.embedding_dim or cfg.intermediate_size != expected.intermediate_size or cfg.per_layer_input_dim != expected.per_layer_input_dim or cfg.num_attention_heads != expected.num_attention_heads) return error.UnsupportedEmbeddingGemma2Geometry;
+    // Nine named projection roles per layer; <=one disjoint PLE slice per
+    // layer, the full PLE matrix, and the final embedding projection.
+    const named = @backingInt(ops.EmbeddingModelProjection.packed_qkv);
+    const entries = try std.math.add(usize, try std.math.mul(usize, cfg.num_hidden_layers, named + 1), 2);
+    return .{ .linear_entries = @intCast(entries), .zero_widths = .{
+        cfg.hidden_size,
+        cfg.embedding_dim,
+        cfg.num_attention_heads * cfg.headDim(0),
+        cfg.intermediate_size,
+        cfg.num_hidden_layers * cfg.per_layer_input_dim,
+    } };
+}
+
 pub const isModel = model_config.isModel;
 pub const parseConfig = model_config.parseConfig;
 
-pub fn validateWeights(allocator: std.mem.Allocator, store: anytype, cfg: Config) !void {
-    if (store.kind() != .safetensors) return error.UnsupportedEmbeddingGemma2Precision;
+/// Synchronous exact text checkpoint schema. Validation and cold metadata
+/// declaration consume this SAME inventory; no second list of weight names.
+pub fn visitTextWeights(cfg: Config, context: anytype, comptime visit: anytype) !void {
     const global = .{
         .{ "language_model.embed_tokens.weight", .{ cfg.vocab_size, cfg.hidden_size } },
         .{ "language_model.embedding_projection.weight", .{ cfg.embedding_dim, cfg.hidden_size } },
         .{ "language_model.ple.per_layer_model_projection.weight", .{ cfg.num_hidden_layers * cfg.per_layer_input_dim, cfg.hidden_size } },
     };
-    inline for (global) |entry| try requireWeight(allocator, store, entry[0], &.{ @intCast(entry[1][0]), @intCast(entry[1][1]) });
-    try requireWeight(allocator, store, "language_model.norm.weight", &.{@intCast(cfg.hidden_size)});
-    try requireWeight(allocator, store, "language_model.ple.per_layer_projection_norm.weight", &.{@intCast(cfg.per_layer_input_dim)});
+    inline for (global) |entry| try visit(context, entry[0], &.{ @intCast(entry[1][0]), @intCast(entry[1][1]) });
+    try visit(context, "language_model.norm.weight", &.{@intCast(cfg.hidden_size)});
+    try visit(context, "language_model.ple.per_layer_projection_norm.weight", &.{@intCast(cfg.per_layer_input_dim)});
     for (0..cfg.num_hidden_layers) |layer| {
         var buf: [192]u8 = undefined;
         const d = cfg.headDim(layer);
@@ -56,14 +91,54 @@ pub fn validateWeights(allocator: std.mem.Allocator, store: anytype, cfg: Config
         };
         inline for (matrices) |entry| {
             const name = try std.fmt.bufPrint(&buf, "language_model.layers.{d}.{s}", .{ layer, entry[0] });
-            try requireWeight(allocator, store, name, &.{ @intCast(entry[1]), @intCast(entry[2]) });
+            try visit(context, name, &.{ @intCast(entry[1]), @intCast(entry[2]) });
         }
         for ([_][]const u8{ "input_layernorm.weight", "post_attention_layernorm.weight", "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight", "ple_block.post_per_layer_input_norm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight", "layer_scalar" }) |suffix| {
             const name = try std.fmt.bufPrint(&buf, "language_model.layers.{d}.{s}", .{ layer, suffix });
             const dim = if (std.mem.eql(u8, suffix, "layer_scalar")) 1 else if (std.mem.indexOf(u8, suffix, "self_attn.") != null) d else cfg.hidden_size;
-            try requireWeight(allocator, store, name, &.{@intCast(dim)});
+            try visit(context, name, &.{@intCast(dim)});
         }
     }
+}
+
+pub const TextWeightMetadata = struct {
+    entries: u32 = 0,
+    name_bytes: usize = 0,
+    shape_axes: usize = 0,
+    vector_entries: u32 = 0,
+    vector_elements: usize = 0,
+    slice_views: u32 = 0,
+};
+pub fn textWeightMetadata(cfg: Config) !TextWeightMetadata {
+    _ = try textProjectionMetadata(cfg);
+    const Counter = struct {
+        fn visit(out: *TextWeightMetadata, name: []const u8, shape: []const i64) !void {
+            out.entries = try std.math.add(u32, out.entries, 1);
+            out.name_bytes = try std.math.add(usize, out.name_bytes, name.len);
+            out.shape_axes = try std.math.add(usize, out.shape_axes, shape.len);
+            if (shape.len == 1) {
+                const width: usize = std.math.cast(usize, shape[0]) orelse return error.UnsupportedEmbeddingGemma2Geometry;
+                out.vector_entries = try std.math.add(u32, out.vector_entries, 1);
+                out.vector_elements = try std.math.add(usize, out.vector_elements, width);
+            }
+        }
+    };
+    var result = TextWeightMetadata{ .slice_views = @intCast(cfg.num_hidden_layers) };
+    try visitTextWeights(cfg, &result, Counter.visit);
+    return result;
+}
+
+pub fn validateWeights(allocator: std.mem.Allocator, store: anytype, cfg: Config) !void {
+    if (store.kind() != .safetensors) return error.UnsupportedEmbeddingGemma2Precision;
+    const Validator = struct {
+        allocator: std.mem.Allocator,
+        store: @TypeOf(store),
+        fn visit(self: *const @This(), name: []const u8, shape: []const i64) !void {
+            try requireWeight(self.allocator, self.store, name, shape);
+        }
+    };
+    const validator = Validator{ .allocator = allocator, .store = store };
+    try visitTextWeights(cfg, &validator, Validator.visit);
     if (cfg.vision) {
         try requireWeight(allocator, store, "vision_tower.patch_embedder.input_proj.weight", &.{ 768, 768 });
         try requireWeight(allocator, store, "vision_tower.patch_embedder.position_embedding_table", &.{ 2, 10240, 768 });
@@ -474,7 +549,7 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     const offsets = try allocator.alloc(usize, if (fused) 0 else batch);
     defer allocator.free(offsets);
     @memset(offsets, 0);
-    const grouped = (cb.kind() == .native or cb.kind() == .metal) and cb.vtable.segmentAttentionGrouped != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_GROUPED_ATTENTION");
+    const grouped = (cb.kind() == .native or cb.kind() == .metal or cb.kind() == .graph) and cb.vtable.segmentAttentionGrouped != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_GROUPED_ATTENTION");
     const identity = grouped and row_identity;
     const gathered_heads = if (grouped) kv else heads;
     const ids = try allocator.alloc(i64, if (fused) 0 else vis.gather.len * gathered_heads);
@@ -757,7 +832,9 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer cb.free(pp);
     var po: ?CT = try linear(cb, layer, "ple_block.per_layer_projection.weight", pp, rows, cfg.per_layer_input_dim, h);
     defer if (po) |value| cb.free(value);
-    const scale: f32 = cached: {
+    const graph_scale = if (cb.kind() == .graph) try weight(cb, layer, "layer_scalar") else null;
+    defer if (graph_scale) |scalar| cb.free(scalar);
+    const scale: f32 = if (graph_scale != null) 1 else cached: {
         if (cb.vtable.embeddingModelScalar) |get| if (get(cb.ptr, layer)) |value| break :cached value;
         const scalar = try weight(cb, layer, "layer_scalar");
         defer cb.free(scalar);
@@ -766,7 +843,11 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
         if (value.len != 1 or !std.math.isFinite(value[0])) return error.InvalidEmbeddingGemma2Weight;
         break :cached value[0];
     };
-    const result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, scale);
+    const normalized_result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, scale);
+    const result = if (graph_scale) |scalar| product: {
+        defer cb.free(normalized_result);
+        break :product try cb.multiply(normalized_result, scalar);
+    } else normalized_result;
     errdefer cb.free(result);
     ple_region.deinit();
     if (comptime @import("build_options").enable_metal) {
@@ -824,20 +905,53 @@ fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, 
     return result;
 }
 
-pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
-    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
-    if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
+pub fn validateTextInputs(cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !usize {
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (ids.len != rows or mask.len != rows) return error.InvalidInputShape;
     for (ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidTokenId;
+    return rows;
+}
+
+fn tokenEmbeddingScale(dtype: ops.GraphDType, hidden: usize) f32 {
+    const scale = @sqrt(@as(f32, @floatFromInt(hidden)));
+    // The checkpoint's embedding normalizer is materialized in the embedding
+    // dtype. Keep this distinct from the F32 scale in the PLE projection.
+    return switch (dtype) {
+        .bf16 => @import("antfly_tile").fexpr.roundBf16Value(scale),
+        .f16 => @floatCast(@as(f16, @floatCast(scale))),
+        else => scale,
+    };
+}
+
+test "token embedding normalizer retains its scalar storage precision" {
+    try std.testing.expectEqual(@as(f32, 22.625), tokenEmbeddingScale(.bf16, 512));
+    try std.testing.expectEqual(@as(f32, 22.625), tokenEmbeddingScale(.f16, 512));
+    try std.testing.expectEqual(@sqrt(@as(f32, 512)), tokenEmbeddingScale(.f32, 512));
+}
+
+pub fn textEmbeddings(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
+    _ = allocator;
+    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm and cb.kind() != .graph) return error.UnsupportedEmbeddingGemma2Backend;
+    if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
+    const rows = try validateTextInputs(cfg, ids, mask, batch, seq);
     const ew = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(ew);
     const raw = try cb.embeddingLookup(ew, ids, rows, cfg.hidden_size);
     defer cb.free(raw);
-    const embeddings = try scaled(cb, raw, @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))));
+    return scaled(cb, raw, tokenEmbeddingScale(cb.arithmetic_publication_dtype, cfg.hidden_size));
+}
+
+pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
+    const embeddings = try textEmbeddings(cb, allocator, cfg, ids, mask, batch, seq);
     defer cb.free(embeddings);
     return forwardEmbeddingsCT(cb, allocator, cfg, embeddings, mask, batch, seq);
+}
+
+pub fn forwardPooledCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
+    const embeddings = try textEmbeddings(cb, allocator, cfg, ids, mask, batch, seq);
+    defer cb.free(embeddings);
+    return forwardPooledEmbeddingsCT(cb, allocator, cfg, embeddings, mask, batch, seq, dimensions);
 }
 
 /// Already scaled hard-token embeddings with unscaled projected media tokens.
@@ -1137,7 +1251,7 @@ pub fn compactVisibility(a: std.mem.Allocator, original: Visibility) !Visibility
 const CompactRun = struct { visibility: Visibility, output: CompactOutput };
 
 fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: ?usize, compact: ?CompactRun) !CT {
-    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
+    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm and cb.kind() != .graph) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
@@ -1219,7 +1333,10 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
         @min(cfg.num_hidden_layers, @max(@as(usize, 1), (16 * 1024 * 1024) / (rows * cfg.per_layer_input_dim * @sizeOf(f32))))
     else
         1;
-    const whole_packed = cb.kind() == .metal and packPerLayerInputs(cfg, rows);
+    // The reduced-precision source publishes the whole projection bank before
+    // scaling and normalization. Preserve that GEMM geometry during capture.
+    const rounded_capture = cb.kind() == .graph and (cb.arithmetic_publication_dtype == .bf16 or cb.arithmetic_publication_dtype == .f16);
+    const whole_packed = rounded_capture or (cb.kind() == .metal and packPerLayerInputs(cfg, rows));
     var packed_first: usize = 0;
     var packed_ple: ?CT = if (whole_packed and cfg.num_hidden_layers <= frame_batch.slices.len)
         try packedPerLayerInputs(cb, cfg, embeddings, pw, rows, shared_frame)
@@ -1322,6 +1439,15 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
 }
 
 fn poolCompactProjectNormalize(cb: *const ComputeBackend, cfg: Config, normalized: CT, projection: CT, offsets: []const usize, dimensions: usize) !CT {
+    if (cb.arithmetic_publication_dtype == .bf16 or cb.arithmetic_publication_dtype == .f16) {
+        const projected = try cb.linearNoBias(normalized, projection, offsets[offsets.len - 1], cfg.hidden_size, cfg.embedding_dim);
+        defer cb.free(projected);
+        const mean = cb.vtable.maskedMeanSegments orelse return error.EmbeddingGemma2OperationUnavailable;
+        const pooled = (try mean(cb.ptr, projected, offsets, cfg.embedding_dim)) orelse return error.EmbeddingGemma2OperationUnavailable;
+        defer cb.free(pooled);
+        const normalize = cb.vtable.maskedMeanBatch orelse return error.EmbeddingGemma2OperationUnavailable;
+        return (try normalize(cb.ptr, pooled, null, offsets.len - 1, 1, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
+    }
     const pooled = (try cb.vtable.maskedMeanSegments.?(cb.ptr, normalized, offsets, cfg.hidden_size)) orelse return error.EmbeddingGemma2OperationUnavailable;
     defer cb.free(pooled);
     const projected = try cb.linearNoBias(pooled, projection, offsets.len - 1, cfg.hidden_size, cfg.embedding_dim);
@@ -1329,9 +1455,18 @@ fn poolCompactProjectNormalize(cb: *const ComputeBackend, cfg: Config, normalize
     return (try cb.vtable.maskedMeanBatch.?(cb.ptr, projected, null, offsets.len - 1, 1, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
 }
 
-/// Mean commutes only with the final linear projection, never with token RMSNorm.
+/// Mean can precede an unrounded final projection; reduced publications and
+/// token RMSNorm retain their original token order.
 fn poolProjectNormalize(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, normalized: CT, projection: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
-    if (cb.kind() == .metal) {
+    // Per-token publication rounding breaks the linear/mean interchange.
+    // Preserve the token projection before the F32 pooling and normalization.
+    if (cb.arithmetic_publication_dtype == .bf16 or cb.arithmetic_publication_dtype == .f16) {
+        const projected = try cb.linearNoBias(normalized, projection, batch * seq, cfg.hidden_size, cfg.embedding_dim);
+        defer cb.free(projected);
+        const pool = cb.vtable.maskedMeanBatch orelse return error.EmbeddingGemma2OperationUnavailable;
+        return (try pool(cb.ptr, projected, mask, batch, seq, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
+    }
+    if (cb.kind() == .metal or cb.kind() == .graph) {
         if (cb.vtable.maskedMeanBatch) |pool| {
             if (try pool(cb.ptr, normalized, mask, batch, seq, cfg.hidden_size, cfg.hidden_size, false)) |pooled| {
                 defer cb.free(pooled);
@@ -1987,4 +2122,121 @@ fn checkGroupedRangeTiles(cb: ComputeBackend, reference: ComputeBackend) !void {
 }
 test "embeddinggemma2 Metal disjoint grouped GEMM tiles preserve holes empty queries and window tails" {
     try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkGroupedRangeTiles);
+}
+
+test "EmbeddingGemma2 text metadata counts actual indexed RMS roles before backend work" {
+    try std.testing.expectEqual(@as(u32, 170), try textRmsMetadataEntries(24));
+    try std.testing.expectError(error.UnsupportedEmbeddingGemma2Geometry, textRmsMetadataEntries(0));
+    try std.testing.expectError(error.UnsupportedEmbeddingGemma2Geometry, textRmsMetadataEntries(23));
+}
+
+test "Gemma projection metadata enumerates actual registered and packed PLE widths" {
+    const cfg = Config{};
+    const declaration = try textProjectionMetadata(cfg);
+    try std.testing.expectEqual(@as(u32, 242), declaration.linear_entries);
+    try std.testing.expectEqualSlices(usize, &.{ 512, 768, 1024, 2048, 12288 }, &declaration.zero_widths);
+    // Every selected Metal PLE schedule uses the full projection or single
+    // layer slices for this validated checkpoint, including frame overrides.
+    for (1..max_tokens + 1) |rows| {
+        const selected_width = if (packPerLayerInputs(cfg, rows)) cfg.num_hidden_layers * cfg.per_layer_input_dim else metalLayerGroup(cfg, rows) * cfg.per_layer_input_dim;
+        try std.testing.expect(std.mem.indexOfScalar(usize, &declaration.zero_widths, selected_width) != null);
+    }
+    for (0..cfg.num_hidden_layers) |layer| {
+        try std.testing.expect(std.mem.indexOfScalar(usize, &declaration.zero_widths, cfg.num_attention_heads * cfg.headDim(layer)) != null);
+        try std.testing.expect(std.mem.indexOfScalar(usize, &declaration.zero_widths, cfg.kvHeads(layer) * cfg.headDim(layer)) != null);
+    }
+    var wrong = cfg;
+    wrong.hidden_size += 1;
+    try std.testing.expectError(error.UnsupportedEmbeddingGemma2Geometry, textProjectionMetadata(wrong));
+}
+
+test "Gemma text metadata and validation share the full exact registered checkpoint inventory" {
+    const declaration = try textWeightMetadata(.{});
+    try std.testing.expectEqual(@as(u32, 413), declaration.entries);
+    try std.testing.expectEqual(@as(usize, 632), declaration.shape_axes);
+    try std.testing.expectEqual(@as(u32, 194), declaration.vector_entries);
+    try std.testing.expectEqual(@as(usize, 76824), declaration.vector_elements);
+    try std.testing.expectEqual(@as(u32, 24), declaration.slice_views);
+    const Store = struct {
+        names: std.StringHashMap(void),
+        bytes: usize = 0,
+        fn visit(self: *@This(), name: []const u8, _: []const i64) !void {
+            try std.testing.expect(!self.names.contains(name));
+            const owned = try self.names.allocator.dupe(u8, name);
+            errdefer self.names.allocator.free(owned);
+            try self.names.put(owned, {});
+            self.bytes += name.len;
+        }
+    };
+    var inventory = Store{ .names = std.StringHashMap(void).init(std.testing.allocator) };
+    defer {
+        var names = inventory.names.keyIterator();
+        while (names.next()) |name| std.testing.allocator.free(name.*);
+        inventory.names.deinit();
+    }
+    try visitTextWeights(.{}, &inventory, Store.visit);
+    try std.testing.expectEqual(declaration.entries, inventory.names.count());
+    try std.testing.expectEqual(declaration.name_bytes, inventory.bytes);
+}
+
+test "projected pooling preserves per-token reduced-precision publication" {
+    const native = @import("../ops/native_compute.zig");
+    const round = @import("antfly_tile").fexpr.roundBf16Value;
+    const Rounded = struct {
+        fn pool(ctx: *anyopaque, input: CT, mask: ?[]const i64, batch: usize, sequence: usize, width: usize, dimensions: usize, normalize: bool) anyerror!?CT {
+            const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+            if (!normalize) return error.ExpectedNormalization;
+            const cb = compute.computeBackend();
+            const values = try cb.toFloat32(input, compute.allocator);
+            defer compute.allocator.free(values);
+            const output = try compute.allocator.alloc(f32, batch * dimensions);
+            defer compute.allocator.free(output);
+            try @import("embedding_gemma2_reference.zig").maskedMeanL2(output, values, mask orelse return error.ExpectedMask, batch, sequence, width);
+            return cb.fromFloat32Shape(output, &.{ @intCast(batch), @intCast(dimensions) });
+        }
+        fn linear(ctx: *anyopaque, x: CT, w: CT, rows: usize, input: usize, output: usize) anyerror!CT {
+            const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+            const cb = compute.computeBackend();
+            const result = try cb.linearNoBias(x, w, rows, input, output);
+            defer cb.free(result);
+            const values = try cb.toFloat32(result, compute.allocator);
+            defer compute.allocator.free(values);
+            for (values) |*value| value.* = @import("antfly_tile").fexpr.roundBf16Value(value.*);
+            return cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(output) });
+        }
+    };
+    const a = std.testing.allocator;
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var table = cb.vtable.*;
+    table.linearNoBias = Rounded.linear;
+    table.maskedMeanBatch = Rounded.pool;
+    cb.vtable = &table;
+    cb.arithmetic_publication_dtype = .bf16;
+    const x = [_]f32{ 1.015625, 0.88671875, 1.046875, -0.3984375 };
+    const w = [_]f32{ 0.3515625, 0.9765625, 0.232421875, -0.359375 };
+    const input = try cb.fromFloat32Shape(&x, &.{ 2, 2 });
+    defer cb.free(input);
+    const projection_weight = try cb.fromFloat32Shape(&w, &.{ 2, 2 });
+    defer cb.free(projection_weight);
+    for ([_][2]i64{ .{ 1, 1 }, .{ 1, 0 } }) |mask| {
+        var expected: [2]f32 = @splat(0);
+        var count: f32 = 0;
+        for (mask, 0..) |active, row| {
+            if (active == 0) continue;
+            count += 1;
+            for (0..2) |col| expected[col] += round(x[2 * row] * w[2 * col] + x[2 * row + 1] * w[2 * col + 1]);
+        }
+        for (&expected) |*value| value.* /= count;
+        const inv = 1 / @sqrt(expected[0] * expected[0] + expected[1] * expected[1]);
+        for (&expected) |*value| value.* *= inv;
+        const result = try poolProjectNormalize(&cb, a, .{ .hidden_size = 2, .embedding_dim = 2 }, input, projection_weight, &mask, 1, 2, 2);
+        defer cb.free(result);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
 }

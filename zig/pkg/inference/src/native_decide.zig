@@ -25,13 +25,14 @@ const file = @import("util/c_file.zig");
 const backend_choice = @import("native_backend_choice.zig");
 
 pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract: bool) !void {
-    const usage = "usage: antfly inference {s} <models-dir> --request <json-file> [--request <json-file> ...] [--backend native|metal|auto] [--repeat N]\n";
+    const usage = "usage: antfly inference {s} <models-dir> --request <json-file> [--request <json-file> ...] [--backend native|metal|cuda|xla|auto] [--repeat N]\n" ++ @import("execution/pjrt_options.zig").usage ++ "\n";
     if (args.len < 3) {
         std.debug.print(usage, .{if (extract) "extract" else "decisions"});
         return error.InvalidArguments;
     }
     var backend: backend_choice.Choice = .auto;
     var repeat: usize = 1;
+    var pjrt: @import("execution/pjrt_options.zig").Options = .{};
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(a);
     var i: usize = 1;
@@ -40,7 +41,9 @@ pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract:
             std.debug.print(usage, .{if (extract) "extract" else "decisions"});
             return error.InvalidArguments;
         }
-        if (std.mem.eql(u8, args[i], "--request")) {
+        if (try pjrt.parse(args[i], args[i + 1])) {
+            continue;
+        } else if (std.mem.eql(u8, args[i], "--request")) {
             try paths.append(a, args[i + 1]);
         } else if (std.mem.eql(u8, args[i], "--backend")) {
             backend = backend_choice.parse(args[i + 1]) orelse return error.InvalidBackend;
@@ -57,6 +60,7 @@ pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract:
         return error.InvalidArguments;
     }
     try backend_choice.validate(backend);
+    try pjrt.validateTask(.extraction);
     const requests = try a.alloc([]u8, paths.items.len);
     var loaded: usize = 0;
     defer {
@@ -67,11 +71,25 @@ pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract:
         request.* = try file.readFileMax(a, path, 16 * 1024 * 1024);
         loaded += 1;
     }
-    var node = try Node.init(a, .{ .models_dir = args[0], .allow_unknown_models = true, .process_termination_available = true });
+    const provider_options = try pjrt.sessionOptions();
+    var node = try Node.init(a, .{
+        .models_dir = args[0],
+        .allow_unknown_models = true,
+        .process_termination_available = true,
+        .pjrt_memory_policy = provider_options.memory_policy,
+        .pjrt_precision = provider_options.precision,
+        .pjrt_gemm = provider_options.gemm,
+        .pjrt_extraction_batch_size = pjrt.extraction_batch_size,
+    });
     defer node.deinit();
     try node.attachIo(io);
-    backend_choice.configureSessionPreference(&node.session_manager, backend);
-    backend_choice.configureSessionPreference(&node.model_manager.session_manager, backend);
+    backend_choice.configureDirectSession(&node.session_manager, backend);
+    backend_choice.configureDirectSession(&node.model_manager.session_manager, backend);
+    if (backend == .xla) {
+        try pjrt.configure(&node.session_manager);
+        try pjrt.configure(&node.model_manager.session_manager);
+    }
+    try pjrt.validateTaskPlacement(node.session_manager.required_backend == .pjrt);
     var buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buffer);
     const timings = try a.alloc(u64, requests.len * repeat);

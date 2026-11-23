@@ -26,20 +26,24 @@ FIXTURE = os.path.abspath(sys.argv.pop(1))
 
 
 class SupervisorTests(unittest.TestCase):
-    def start(self, mode="blocked", index=1, cancel=False):
+    def start(self, mode="blocked", index=1, cancel=False, capture_errors=False, worker=False):
         env = os.environ.copy()
         for key in tuple(env):
             if key.startswith("ANTFLY_INFERENCE_SUPERVIS"):
                 del env[key]
         env.update(FIXTURE_MODE=mode, FIXTURE_COMMAND_INDEX=str(index))
+        if worker:
+            env.update(ANTFLY_INFERENCE_SUPERVISED_WORKER="1",
+                       ANTFLY_INFERENCE_SUPERVISOR_LIFELINE="stdin-v1")
         if cancel:
             env["FIXTURE_CANCEL_PARENT"] = "1"
         args = [FIXTURE] + (["inference"] if index == 2 else []) + ["run"]
         proc = subprocess.Popen(
             args,
             env=env,
+            stdin=subprocess.PIPE if worker else None,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE if capture_errors else subprocess.DEVNULL,
             bufsize=0,
             start_new_session=True,
         )
@@ -66,15 +70,73 @@ class SupervisorTests(unittest.TestCase):
 
     def test_parent_death_during_blocked_startup(self):
         for index in (1, 2):
-            for sig in (signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(index=index):
+                proc = self.start(index=index)
+                self.worker(proc)
+                proc.send_signal(signal.SIGKILL)
+                # communicate also waits for worker-owned stdout to close;
+                # an orphan in native startup makes this time out.
+                proc.communicate(timeout=5)
+                self.assertEqual(proc.returncode, -signal.SIGKILL)
+
+    def test_worker_lifeline_eof_is_clean_and_data_is_failure(self):
+        for payload, expected in ((b"", 0), (b"x", 1)):
+            with self.subTest(payload=payload):
+                proc = self.start(worker=True)
+                self.worker(proc)
+                proc.communicate(input=payload, timeout=5)
+                self.assertEqual(proc.returncode, expected)
+
+    def test_operator_stop_during_blocked_startup(self):
+        for index in (1, 2):
+            for sig in (signal.SIGINT, signal.SIGTERM):
                 with self.subTest(index=index, signal=sig):
                     proc = self.start(index=index)
-                    self.worker(proc)
+                    pid = self.worker(proc)
                     proc.send_signal(sig)
-                    # communicate also waits for worker-owned stdout to close;
-                    # an orphan in native startup makes this time out.
-                    proc.communicate(timeout=5)
-                    self.assertEqual(proc.returncode, -sig)
+                    output, _ = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 0)
+                    self.assertNotIn(b"worker ", output, "operator stop restarted a worker")
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+
+    def test_process_group_operator_signal_does_not_restart(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=sig):
+                proc = self.start()
+                pid = self.worker(proc)
+                os.killpg(proc.pid, sig)
+                output, _ = proc.communicate(timeout=5)
+                self.assertEqual(proc.returncode, 0)
+                self.assertNotIn(b"worker ", output)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+    def test_repeated_operator_signals_close_lifeline_once(self):
+        proc = self.start()
+        pid = self.worker(proc)
+        proc.send_signal(signal.SIGTERM)
+        proc.send_signal(signal.SIGINT)
+        output, _ = proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn(b"worker ", output)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_operator_stop_interrupts_restart_backoff(self):
+        proc = self.start("restart", capture_errors=True)
+        # Six completed workers reach the existing 3.2s backoff. Observe the
+        # actual log boundary rather than guessing with a wall-clock sleep.
+        for _ in range(6):
+            self.worker(proc)
+        while True:
+            self.assertTrue(select.select([proc.stderr], [], [], 5)[0])
+            if b"delay_ms=3200" in proc.stderr.readline():
+                break
+        proc.send_signal(signal.SIGTERM)
+        output, _ = proc.communicate(timeout=2)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn(b"worker ", output)
 
     def test_clean_exit_and_configuration_failure_do_not_restart(self):
         for mode, successful in (("clean", True), ("fail", False)):

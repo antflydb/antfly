@@ -21,7 +21,7 @@ const source = @import("online_source.zig");
 const pages = @import("merge_page_contract.zig");
 const tail = @import("merge_tail_reader.zig");
 const types = @import("types.zig");
-const topology = @import("relational_integrity_topology.zig");
+const topology = @import("relational/integrity/topology.zig");
 
 /// One bounded retained frame and one prepared fragment per owner. Offset
 /// recovery advances at most 128 physical effects per request. No cache mutex
@@ -114,7 +114,7 @@ fn rewriteTailJson(db: *DB, alloc: Allocator, scope: source.Scope, after: u64, o
         cache.session = try db.beginMergeTailRead(scope, after);
         cache.scope = scope;
     }
-    const Chunk = @import("relational_rewrite_contract.zig").TailChunk;
+    const Chunk = @import("relational/schema_change/rewrite_contract.zig").TailChunk;
     if (cache.session == null) return std.json.Stringify.valueAlloc(alloc, @as(?Chunk, null), .{});
     const session = &cache.session.?;
     const total = session.frameTotal();
@@ -155,15 +155,15 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
         var view = view_value;
         defer view.release();
         if (view.hasCoordinatedConstraints()) {
-            var compiled = try @import("relational_integrity_catalog.zig").decode(alloc, catalog);
+            var compiled = try @import("relational/integrity/catalog.zig").decode(alloc, catalog);
             defer compiled.deinit();
-            const activation = @import("relational_integrity_activation.zig");
+            const activation = @import("relational/integrity/activation.zig");
             integrity_binding = .{ .catalog_digest = digest, .generation_set = activation.generationSet(compiled) };
             integrity_ready = (try activation.status(&txn, compiled)).state == .enforced;
         }
     }
     var eligible = table_facts.mode_initialized and
-        integrity_ready and !try @import("relational_integrity_retirement.zig").active(&txn) and
+        integrity_ready and !try @import("relational/integrity/retirement.zig").active(&txn) and
         try rowDerivedTransferIndexesAssumeApply(db, alloc, request.scope.authority == .raft);
     var artifact_preview = db.artifactInventoryCommand(alloc) catch |err| switch (err) {
         error.OnlineMergeArtifactTailsUnsupported => null,
@@ -225,7 +225,7 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         generation_handoff = try @import("empty_generation_handoff.zig").summaryAlloc(manifest_arena.allocator(), &read, db.core.identity_namespace);
-        break :manifest try @import("relational_rewrite_manifest.zig").read(manifest_arena.allocator(), &read, cancellation);
+        break :manifest try @import("relational/schema_change/rewrite_manifest.zig").read(manifest_arena.allocator(), &read, cancellation);
     } else &.{};
     return std.json.Stringify.valueAlloc(alloc, wire.AdmissionFacts{
         .authority = request.scope.authority,
@@ -254,7 +254,7 @@ test "relational index system online admission facts are unbound read only and r
     try db.setSchemaJson(alloc, "{}");
     try db.updateRange(.{ .start = "m", .end = "z" });
     // Ordinary document owners need no coordinated integrity catalog.
-    try db.core.store.delete(@import("relational_integrity_catalog.zig").key);
+    try db.core.store.delete(@import("relational/integrity/catalog.zig").key);
     try db.addIndex(.{ .name = "text_before_admit", .kind = .full_text, .config_json = "{}" });
     const request: wire.Request = .{ .scope = .{
         .fence = .{ .admission_epoch = 0, .attempt = 0, .transition_id = 7, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = db.core.identity_namespace, .catalog_digest = @splat(0) },
@@ -286,7 +286,8 @@ test "relational index system online admission facts are unbound read only and r
     inconsistent.storage_mode = .relational;
     try db.core.store.put(table.key, &inconsistent.encode());
     try std.testing.expectError(error.IntegrityCatalogChanged, Fetch.run(&db, request));
-    try db.core.store.put(table.key, &db.core.table_catalog.encode());
+    const encoded_catalog = try db.core.table_catalog.encodeDurable();
+    try db.core.store.put(table.key, encoded_catalog.slice());
     var invalid = request;
     invalid.scope.consumer_epoch = 1;
     try std.testing.expectError(error.InvalidOnlineSourceCommand, Fetch.run(&db, invalid));
@@ -792,19 +793,19 @@ pub fn requireAdmissibleSourceAtCommitAssumeApply(db: *DB, alloc: Allocator) !vo
         else => return err,
     };
     const table_facts = try table.Catalog.decode(table_bytes);
-    if (!table_facts.mode_initialized or try @import("relational_integrity_retirement.zig").active(&txn))
+    if (!table_facts.mode_initialized or try @import("relational/integrity/retirement.zig").active(&txn))
         return error.OnlineSourceScopeChanged;
     if (db.core.acquireSchemaView()) |view_value| {
         var view = view_value;
         defer view.release();
         if (view.hasCoordinatedConstraints()) {
-            const catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
+            const catalog = txn.get(@import("relational/integrity/catalog.zig").key) catch |err| switch (err) {
                 error.NotFound => return error.IntegrityCatalogChanged,
                 else => return err,
             };
-            var compiled = try @import("relational_integrity_catalog.zig").decode(alloc, catalog);
+            var compiled = try @import("relational/integrity/catalog.zig").decode(alloc, catalog);
             defer compiled.deinit();
-            if ((try @import("relational_integrity_activation.zig").status(&txn, compiled)).state != .enforced)
+            if ((try @import("relational/integrity/activation.zig").status(&txn, compiled)).state != .enforced)
                 return error.IntegrityCatalogChanged;
         }
     } else if (table_facts.storage_mode == .relational) return error.IntegrityCatalogChanged;
@@ -1059,6 +1060,25 @@ test "relational index system rewrite admission owns complete immutable historic
     }
     var db = try DB.open(alloc, path, options);
     defer db.close();
+    // Schema validation state is deliberately opaque to the history reader.
+    // Its lexical schema_v prefix must not become a phantom layout version.
+    const job = @import("relational/schema_change/nullability_job.zig");
+    try db.core.store.put(job.key, "retained owner job");
+    try db.core.store.put(job.inputs_key, "retained owner inputs");
+    try db.core.store.put(job.cursor_key, "retained owner cursor");
+    const history = try @import("../schema.zig").loadSchemaHistory(db.core.store, alloc);
+    defer @import("../schema.zig").freeSchemaHistory(alloc, history);
+    try std.testing.expectEqual(@as(usize, 3), history.len);
+    const copied_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copied-history", .{tmp.sub_path});
+    defer alloc.free(copied_path);
+    var copied = try DB.open(alloc, copied_path, options);
+    defer copied.close();
+    try @import("../schema.zig").copySchemas(db.core.store, copied.core.store, alloc);
+    try std.testing.expectError(error.NotFound, copied.core.store.get(alloc, job.key));
+    try std.testing.expectError(error.NotFound, copied.core.store.get(alloc, job.inputs_key));
+    const copied_history = try @import("../schema.zig").loadSchemaHistory(copied.core.store, alloc);
+    defer @import("../schema.zig").freeSchemaHistory(alloc, copied_history);
+    try std.testing.expectEqual(@as(usize, 3), copied_history.len);
     const before = db.core.store.lastReplaySequence(0);
     const json = try executeJson(&db, alloc, request, .none);
     defer alloc.free(json);
@@ -1080,7 +1100,7 @@ test "relational index system rewrite admission owns complete immutable historic
     try db.core.store.put(alias, v1);
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeJson(&db, alloc, request, .none));
     try db.core.store.delete(alias);
-    const oversized = try alloc.alloc(u8, @import("relational_rewrite_contract.zig").max_schema_bytes + 1);
+    const oversized = try alloc.alloc(u8, @import("relational/schema_change/rewrite_contract.zig").max_schema_bytes + 1);
     defer alloc.free(oversized);
     @memset(oversized, ' ');
     try db.core.store.put(old_key, oversized);

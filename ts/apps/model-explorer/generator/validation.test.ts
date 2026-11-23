@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ModelSpec, SourceLink } from "../lib/schema/index.ts";
-import { extractOpKinds, parseSchedules } from "./extract.ts";
+import { extractKernelInventory, extractOpKinds, generatedRegionSpans, parseSchedules } from "./extract.ts";
 import { validateFrame } from "./frames.ts";
 import { verifySourcePath } from "./lib.ts";
 import { buildMergeContext, validateSpec } from "./merge.ts";
@@ -144,4 +144,17 @@ test("schedule extraction fails instead of silently dropping unsupported rows", 
     /unsupported schedule/
   );
   assert.throws(() => parseSchedules(table(`${row},\n${row}`)), /duplicate ID/);
+});
+
+test("kernel inventory includes native ABI declarations and Tile-owned regions", () => {
+  const inventory = extractKernelInventory();
+  assert.equal(inventory.find((entry) => entry.name === "termite_q4_0_linear_1x_reduce")?.name, "termite_q4_0_linear_1x_reduce");
+  assert.equal(inventory.find((entry) => entry.name === "antfly_tile_whisper_logits_partials")?.generated, true);
+});
+
+test("source ownership spans reject mixed generators and malformed boundaries", () => {
+  assert.equal(generatedRegionSpans("// tile-codegen:begin a\nbody\n// tile-codegen:end a\n").length, 1);
+  assert.throws(() => generatedRegionSpans("// tile-codegen:begin a\n// quant-kernel-codegen:begin b\n"), /overlapping/);
+  assert.throws(() => generatedRegionSpans("// tile-codegen:end a\n"), /unpaired/);
+  assert.throws(() => generatedRegionSpans("// tile-codegen:begin a\n"), /unclosed/);
 });

@@ -326,6 +326,70 @@ func TestLiteCAPIProvisionsDefaultFullTextIndex(t *testing.T) {
 	}
 }
 
+func TestLiteCAPIBatchWire(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "go-batch-wire.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:    OpenModeWriter,
+		Profile: ProfileNative,
+		NoSync:  true,
+	})
+	if err != nil {
+		t.Fatalf("create Lite database: %v", err)
+	}
+	defer db.Close()
+
+	payload, err := EncodeBatchWire([]WriteIntent{
+		{Key: "doc:wire-a", Value: []byte(`{"title":"go batch wire a"}`)},
+		{Key: "doc:wire-b", Value: []byte(`{"title":"go batch wire b"}`)},
+	}, SyncWrite)
+	if err != nil {
+		t.Fatalf("encode batch wire: %v", err)
+	}
+	result, err := db.BatchWire(payload)
+	if err != nil {
+		t.Fatalf("batch wire: %v", err)
+	}
+	if !bytes.Contains(result, []byte(`"inserted":2`)) {
+		t.Fatalf("batch wire result %q did not report 2 inserted", result)
+	}
+
+	lookup, err := db.LookupJSON("doc:wire-a")
+	if err != nil {
+		t.Fatalf("lookup doc:wire-a: %v", err)
+	}
+	if !bytes.Contains(lookup, []byte("go batch wire a")) {
+		t.Fatalf("lookup JSON %q did not contain the binary-batch-written document", lookup)
+	}
+
+	// A write and a delete in the same wire batch, matching BatchJSON's
+	// combined inserts+deletes shape.
+	deletePayload, err := EncodeBatchWire([]WriteIntent{
+		{Key: "doc:wire-c", Value: []byte(`{"title":"go batch wire c"}`)},
+		{Key: "doc:wire-a", Delete: true},
+	}, SyncWrite)
+	if err != nil {
+		t.Fatalf("encode batch wire delete: %v", err)
+	}
+	result, err = db.BatchWire(deletePayload)
+	if err != nil {
+		t.Fatalf("batch wire delete: %v", err)
+	}
+	if !bytes.Contains(result, []byte(`"inserted":1`)) || !bytes.Contains(result, []byte(`"deleted":1`)) {
+		t.Fatalf("batch wire result %q did not report 1 inserted and 1 deleted", result)
+	}
+	if _, err := db.LookupJSON("doc:wire-a"); err == nil {
+		t.Fatalf("doc:wire-a should have been deleted by the wire batch")
+	}
+
+	// A malformed wire buffer (bad magic) must be rejected, not silently
+	// misinterpreted, just as a malformed JSON batch is.
+	badPayload := append([]byte{}, payload...)
+	badPayload[0] ^= 0xff
+	if _, err := db.BatchWire(badPayload); err == nil {
+		t.Fatalf("batch wire with corrupted magic should have failed")
+	}
+}
+
 func TestLiteCAPI(t *testing.T) {
 	if got := ABIVersion(); got != SupportedABIVersion {
 		t.Fatalf("ABI version = %d, want %d", got, SupportedABIVersion)

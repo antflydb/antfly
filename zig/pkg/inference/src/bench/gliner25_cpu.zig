@@ -262,10 +262,7 @@ pub fn main(init: std.process.Init) !void {
         var it = store.resident_weights.iterator();
         while (it.next()) |entry| {
             const name = try a.dupe(u8, entry.key_ptr.*);
-            backend.insertWeightFromLoaded(name, entry.value_ptr) catch |err| {
-                a.free(name);
-                return err;
-            };
+            try backend.insertWeightFromLoaded(name, entry.value_ptr);
             if (options.precision == .fp16 and !options.attention_only)
                 try backend.prepareGlinerBoundaryF16Mirror(name, &entry.value_ptr.tensor);
         }
@@ -295,7 +292,7 @@ pub fn main(init: std.process.Init) !void {
             break;
         };
         const i = case_index orelse return error.UnknownBenchmarkCase;
-        if (comptime on_cuda) try inference.native_compute.cuda.gliner25_api.synchronizeAndDrainDeferredDeviceFrees(&backend);
+        if (comptime on_cuda) try inference.native_compute.cuda.resident_structured_api.synchronizeAndDrainDeferredDeviceFrees(&backend);
         const stats_before = cb.trainingRuntimeStats();
         const attention_us_before = if (on_cuda) backend.snapshotStats().prefill_profile_attention_us else 0;
         const matrix_us_before = if (on_cuda) backend.snapshotStats().prefill_profile_f16_linear_us else 0;
@@ -310,7 +307,7 @@ pub fn main(init: std.process.Init) !void {
         };
         defer if (case.texts == null) a.free(texts);
         var result = try extractTexts(a, &cb, &config, tokenizer.tokenizer(), texts, schemas[i], cmd.op == .validate, options.timeout_ms, options.max_text_words, options.max_sequence_tokens);
-        if (comptime on_cuda) try inference.native_compute.cuda.gliner25_api.synchronizeAndDrainDeferredDeviceFrees(&backend);
+        if (comptime on_cuda) try inference.native_compute.cuda.resident_structured_api.synchronizeAndDrainDeferredDeviceFrees(&backend);
         const elapsed = (try nowNs()) - started;
         if (comptime on_cuda) {
             inference.native_compute.cuda.drainCudaProfile(&backend);

@@ -40,6 +40,8 @@ pub const MapperDoc = struct {
     /// serializing the logical tree back to JSON.
     source_bytes: usize = 0,
     doc_ordinal: ?u32 = null,
+    /// This copy's version (lite-full-text-storage.md), when indexed under one.
+    doc_version: ?u64 = null,
     /// Relational scans can supply the already-decoded logical tree alongside
     /// the materialized source bytes, avoiding a whole-document JSON reparse.
     root: ?std.json.Value = null,
@@ -343,6 +345,74 @@ pub const PreparedRelationalProjection = struct {
     }
 };
 
+/// Request-owned document producers run before the serialized apply section.
+/// The raw tree is retained for extraction; only the final logical JSON crosses
+/// storage and replay boundaries. Input writes and captured readers are untouched.
+pub const PreparedDocumentBatch = struct {
+    arena: std.heap.ArenaAllocator,
+    writes: []const types.BatchWrite,
+    roots: []const ?std.json.Value,
+
+    pub fn init(a: Allocator, input: []const types.BatchWrite, validator: schema_api.CompiledTableValidator, preserve: bool) !PreparedDocumentBatch {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const writes = try owned.alloc(types.BatchWrite, input.len);
+        const roots = try owned.alloc(?std.json.Value, input.len);
+        for (input, writes, roots) |write, *out, *root| {
+            out.* = write;
+            root.* = null;
+            const domain_prepared = write.prepared_domain != null;
+            if (write.prepared_domain) |contract| {
+                try validator.requirePreparedDomain(contract.*);
+                const frozen = try owned.create(@import("../../schema/domain_handoff.zig").Contract);
+                frozen.* = contract.*;
+                out.prepared_domain = frozen;
+            }
+            if (write.key.len != 0 and (write.key[0] == 0 or write.key[0] == 1)) {
+                if (write.json_null_fields.len != 0 or domain_prepared) return error.InvalidBatchRequest;
+                continue;
+            }
+            _ = scratch.reset(.retain_capacity);
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, owned, write.value, .{ .parse_numbers = false });
+            if (preserve) {
+                if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
+                // Document constraints govern new writes, as on ordinary
+                // document restore. Historical bytes remain unchanged; only
+                // immutable producer results are verified, never repaired.
+                if (validator.execution.expressions) |program| try program.verifyJson(scratch.allocator(), value);
+                root.* = value;
+                continue;
+            }
+            // These commands do not replace the base document. A constant
+            // producer must never turn an embeddings/edges-only command into
+            // a destructive primary-row replacement. Preserved restore rows
+            // still require complete, verified generated values.
+            if (!preserve and value == .object and
+                (value.object.contains("_edges") or value.object.contains("_embeddings")) and !hasNonSpecialFields(value))
+            {
+                if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
+                root.* = value;
+                continue;
+            }
+            const prepared = try validator.prepareTypedValueWithNulls(owned, scratch.allocator(), &value, write.json_null_fields, preserve or domain_prepared);
+            defer prepared.deinit(owned);
+            // Document bytes encode SQL NULL by absence and JSON null by a
+            // present member, so typed transport markers end at this boundary.
+            out.json_null_fields = &.{};
+            out.value = try std.json.Stringify.valueAlloc(owned, value, .{});
+            root.* = value;
+        }
+        return .{ .arena = arena, .writes = writes, .roots = roots };
+    }
+    pub fn deinit(self: *PreparedDocumentBatch) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Fully owned output of the relational write preparation boundary. One JSON
 /// parse supplies validation, special-field extraction, the semantic digest,
 /// and the physical base row.
@@ -469,7 +539,7 @@ pub const PreparedRelationalWrite = struct {
         json_null_fields: []const []const u8,
     ) !PreparedRelationalWrite {
         var intent_digest: ?document_content_hash.Digest = null;
-        var parsed = if (durable_row) |bytes| blk: {
+        const parsed = if (durable_row) |bytes| blk: {
             if (try relationalRowSchemaVersion(bytes) != table_schema.version) return error.InvalidTxnRecord;
             intent_digest = try relational_row_codec.rowSemanticHash(bytes);
             _ = try relational_row_codec.ordinalRowViewTrusted(bytes, table_schema, physical_layout);
@@ -485,6 +555,19 @@ pub const PreparedRelationalWrite = struct {
             error.OutOfMemory => return err,
             else => return error.InvalidBatchRequest,
         };
+        return finishParsed(alloc, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, durable_row, preserve_logical_values, json_null_fields, parsed, intent_digest, false);
+    }
+
+    /// Consume a request-owned parsed candidate without serializing or parsing
+    /// it again after BEFORE triggers. The same root drives validation, index
+    /// extraction, semantic hashing and the physical row. Ownership transfers
+    /// on both success and failure.
+    pub fn initParsedTyped(alloc: Allocator, scratch: Allocator, retain_text_root: bool, key: []const u8, original_json: []const u8, validator: ?schema_api.CompiledTableValidator, table_schema: runtime_schema.TableSchema, physical_layout: *const relational_row_codec.PhysicalLayout, json_null_fields: []const []const u8, preserve: bool, owned: std.json.Parsed(std.json.Value)) !PreparedRelationalWrite {
+        return finishParsed(alloc, scratch, retain_text_root, key, original_json, validator, table_schema, physical_layout, null, preserve, json_null_fields, owned, null, true);
+    }
+
+    fn finishParsed(alloc: Allocator, scratch: Allocator, retain_text_root: bool, key: []const u8, document_json: []const u8, validator: ?schema_api.CompiledTableValidator, table_schema: runtime_schema.TableSchema, physical_layout: *const relational_row_codec.PhysicalLayout, durable_row: ?[]const u8, preserve_logical_values: bool, json_null_fields: []const []const u8, owned: std.json.Parsed(std.json.Value), intent_digest: ?document_content_hash.Digest, force_logical_source: bool) !PreparedRelationalWrite {
+        var parsed = owned;
         errdefer parsed.deinit();
         var effective_json_null_fields = std.ArrayListUnmanaged([]const u8).empty;
         defer effective_json_null_fields.deinit(scratch);
@@ -498,11 +581,6 @@ pub const PreparedRelationalWrite = struct {
                 if (!column.is_json or column.json_kind != .any) return error.InvalidBatchRequest;
                 const datum = parsed.value.object.get(name) orelse return error.InvalidBatchRequest;
                 if (datum != .null or (try seen.getOrPut(scratch, name)).found_existing) return error.InvalidBatchRequest;
-                // Generated fields are output-only. Their expression result
-                // owns its null semantics, regardless of submitted metadata.
-                if (!preserve_logical_values) if (validator) |compiled| if (compiled.execution.expressions) |expressions| {
-                    if (expressions.generated_columns[ordinal]) continue;
-                };
                 try effective_json_null_fields.append(scratch, name);
             }
         }
@@ -511,12 +589,11 @@ pub const PreparedRelationalWrite = struct {
             // schema boundary as CHECKs, extraction, indexes and logical hash.
             // Durable intents have already crossed it and must never evaluate
             // the current expression plan again during replay.
-            if (effective_json_null_fields.items.len != 0)
-                try compiled.prepareTypedValue(parsed.arena.allocator(), scratch, &parsed.value, effective_json_null_fields.items, preserve_logical_values)
-            else if (preserve_logical_values)
-                try compiled.validateValue(scratch, &parsed.value)
-            else
-                try compiled.prepareValue(parsed.arena.allocator(), scratch, &parsed.value);
+            const prepared = try compiled.prepareTypedValueWithNulls(parsed.arena.allocator(), scratch, &parsed.value, effective_json_null_fields.items, preserve_logical_values);
+            // The result belongs to the parsed row region and remains alive
+            // through extraction, physical encoding and semantic hashing.
+            effective_json_null_fields.clearRetainingCapacity();
+            try effective_json_null_fields.appendSlice(scratch, prepared.fields);
         };
 
         var extracted = extractWriteFromParsedPrepared(
@@ -580,7 +657,8 @@ pub const PreparedRelationalWrite = struct {
             effective_json_null_fields.items,
         );
         errdefer alloc.free(prepared_row.bytes);
-        if (validator) |compiled| if (compiled.execution.expressions) |expressions| if (expressions.bindings.len != 0) {
+        const generated = if (validator) |compiled| if (compiled.execution.expressions) |expressions| expressions.bindings.len != 0 else false else false;
+        if (force_logical_source or generated) {
             // Original API JSON predates defaults/generated evaluation. Lazy
             // JSON consumers (including deferred text publication) must render
             // the typed authority, never index that obsolete input snapshot.
@@ -591,7 +669,7 @@ pub const PreparedRelationalWrite = struct {
             extracted.cleaned_value = null;
             extracted.cleaned_value_owned = false;
             extracted.logical_source = source;
-        };
+        }
         return .{
             .parsed = parsed,
             .extracted = extracted,
@@ -966,6 +1044,12 @@ pub const TextProjectionBatchBuilder = struct {
     selected_field: ?[]const u8 = null,
     store_source_columns: bool = false,
     text_docs: std.ArrayListUnmanaged(introducer_mod.TextDocument) = .empty,
+    numeric_coverage_terminals: std.StringHashMapUnmanaged(*NumericCoverageNode) = .empty,
+    numeric_coverage_emitted: std.ArrayListUnmanaged(*NumericCoverageNode) = .empty,
+    numeric_coverage_root: NumericCoverageNode = .{},
+    omitted_text_sources: OmittedTextSources = .empty,
+    numeric_coverage_fields: ?[]const []const u8 = null,
+    numeric_witness_segment_bytes: usize = 0,
 
     pub fn init(
         arena: Allocator,
@@ -1035,18 +1119,32 @@ pub const TextProjectionBatchBuilder = struct {
         else if (self.schema == null and doc.schema_less_fast_projection)
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }
         else
-            try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers);
+            try extractTextFieldsFromValue(self.arena, extraction_root, self.text_analysis, self.schema, self.observed_field_analyzers, &self.omitted_text_sources);
         if (!retain_empty and extracted.fields.len == 0 and !extracted.recursive_typed_fields and extracted.infer_type_dynamic_paths.len == 0 and !extractedHasTypedFields(extracted)) return;
 
         const order = if (!has_selected_field) try mappedIndexSortProjection(self.arena, extraction_root, self.schema, extracted.typed_fields) else IndexSortProjection{};
+        const had_numeric_schema = self.numeric_coverage_fields != null;
+        const has_numeric_source = !has_selected_field and doc.root == .object and self.schema != null;
+        const rejections = if (has_numeric_source)
+            try self.numericCoverageRejections(doc.root.object, extracted.typed_fields orelse &.{})
+        else
+            &.{};
+        const shared = self.numeric_coverage_fields orelse &.{};
+        const complete_numeric_fields = if (has_numeric_source) shared else &.{};
+        const new_shared_count = if (had_numeric_schema) 0 else shared.len;
         try self.text_docs.append(self.arena, .{
             .index_sort_values = order.values,
+            .complete_numeric_fields = complete_numeric_fields,
+            .numeric_coverage_rejections = rejections,
+            .numeric_coverage_bytes = new_shared_count * @sizeOf([]const u8) + rejections.len * @sizeOf(introducer_mod.NumericCoverageRejection),
+            .numeric_witness_segment_bytes = if (complete_numeric_fields.len == 0) 0 else self.numeric_witness_segment_bytes,
             .index_sort_projection_valid = order.valid and !has_selected_field,
             .id = doc.key,
             .stored_data = if (self.store_source_columns) "" else doc.stored_data,
             .stored_source = doc.typed_source,
             .stored_source_bytes = if (self.store_source_columns and doc.typed_source != null) try @import("../typed_json.zig").encodedSize(doc.typed_source.?) else 0,
             .doc_ordinal = doc.doc_ordinal,
+            .doc_version = doc.doc_version,
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
@@ -1058,6 +1156,63 @@ pub const TextProjectionBatchBuilder = struct {
             .typed_fields = if (has_selected_field) &.{} else extracted.typed_fields orelse if (doc.typed_source == null) &.{} else null,
             .typed_source = if (has_selected_field) null else if (extracted.typed_fields == null) doc.typed_source else null,
         });
+    }
+
+    fn numericCoverageRejections(
+        self: *TextProjectionBatchBuilder,
+        root: std.json.ObjectMap,
+        projected: []const introducer_mod.TypedFieldValue,
+    ) ![]const introducer_mod.NumericCoverageRejection {
+        const alloc = self.arena;
+        if (self.numeric_coverage_fields == null) {
+            var eligible: std.ArrayList([]const u8) = .empty;
+            for (self.schema.?.exact_fields) |field| {
+                if (!runtime_schema.supportsNumericRangeCoverage(field)) continue;
+                try eligible.append(alloc, field.field);
+                var node = &self.numeric_coverage_root;
+                var components = std.mem.splitScalar(u8, field.field, '.');
+                while (components.next()) |part| {
+                    const child = try node.children.getOrPut(alloc, part);
+                    if (!child.found_existing) {
+                        const end = if (components.index) |next| next - 1 else field.field.len;
+                        const created = try alloc.create(NumericCoverageNode);
+                        created.* = .{ .path = field.field[0..end] };
+                        child.value_ptr.* = created;
+                    }
+                    node = child.value_ptr.*;
+                }
+                node.terminal = true;
+                try self.numeric_coverage_terminals.put(alloc, field.field, node);
+            }
+            const names = try eligible.toOwnedSlice(alloc);
+            self.numeric_coverage_fields = names;
+            self.numeric_witness_segment_bytes = segment_mod.estimateNumericRangeWitnessBytes(names);
+        }
+        if (self.numeric_coverage_fields.?.len == 0) return &.{};
+
+        const emitted = &self.numeric_coverage_emitted;
+        defer {
+            for (emitted.items) |node| node.observed = null;
+            emitted.clearRetainingCapacity();
+        }
+        for (projected) |typed| {
+            const node = self.numeric_coverage_terminals.get(typed.field_name) orelse continue;
+            const duplicate = node.observed != null;
+            if (!duplicate) try emitted.append(alloc, node);
+            const numeric: ?typed_dv.NumericValue = if (duplicate or typed.conflicted or typed.value != .numeric_val)
+                null
+            else
+                typed.value.numeric_val;
+            node.observed = @as(??typed_dv.NumericValue, numeric);
+        }
+
+        var rejected: std.ArrayList(introducer_mod.NumericCoverageRejection) = .empty;
+        try self.numeric_coverage_root.rejectIncomplete(alloc, root, &rejected);
+        // A projected value with no matching source path cannot prove absence.
+        for (emitted.items) |node| {
+            if (node.observed != null) try rejected.append(alloc, .{ .path = node.path, .kind = .field });
+        }
+        return rejected.toOwnedSlice(alloc);
     }
 
     /// Borrow only under a retained column lease. Otherwise promote source
@@ -1136,6 +1291,7 @@ pub const TextProjectionSourceDoc = struct {
     stored_data: []const u8,
     typed_source: ?std.json.Value,
     doc_ordinal: ?u32 = null,
+    doc_version: ?u64 = null,
     schema_less_text_fields: []const introducer_mod.TextField = &.{},
     schema_less_fast_projection: bool = false,
 };
@@ -1315,7 +1471,7 @@ pub fn buildTextProjectionSourceBatchWithOptions(
     defer source_docs.deinit(arena);
 
     for (docs) |doc| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, doc.root, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, doc.doc_version, doc.root, opts);
     }
 
     return .{
@@ -1339,7 +1495,7 @@ pub fn buildTextProjectionSourceBatchFromWritesWithOptions(
     defer source_docs.deinit(arena);
 
     for (writes) |write| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, null, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, null, null, opts);
     }
 
     return .{
@@ -1353,6 +1509,7 @@ fn appendTextProjectionSourceDoc(
     key: []const u8,
     value: []const u8,
     doc_ordinal: ?u32,
+    doc_version: ?u64,
     prepared_root: ?std.json.Value,
     opts: TextProjectionOptions,
 ) !void {
@@ -1364,6 +1521,7 @@ fn appendTextProjectionSourceDoc(
             .stored_data = stored_projection.stored_data,
             .typed_source = stored_projection.typed_source,
             .doc_ordinal = doc_ordinal,
+            .doc_version = doc_version,
         });
         return;
     }
@@ -1374,13 +1532,16 @@ fn appendTextProjectionSourceDoc(
             .stored_data = if (opts.retain_stored_data) value else "",
             .typed_source = null,
             .doc_ordinal = doc_ordinal,
+            .doc_version = doc_version,
             .schema_less_text_fields = try extractStringFieldsNoSchemaRaw(arena, value, opts),
             .schema_less_fast_projection = true,
         });
         return;
     }
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{});
+    // Preserve decimal tokens so a rounded projection cannot attest exact
+    // source equality merely because the source parser rounded it too.
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, value, .{ .parse_numbers = false });
     const root = parsed.value;
     const stored_projection = try fullTextStoredProjection(arena, root, value, opts);
     try source_docs.append(arena, .{
@@ -1389,6 +1550,7 @@ fn appendTextProjectionSourceDoc(
         .stored_data = stored_projection.stored_data,
         .typed_source = stored_projection.typed_source,
         .doc_ordinal = doc_ordinal,
+        .doc_version = doc_version,
     });
 }
 
@@ -1529,6 +1691,7 @@ pub fn splitProjectionDocsEnd(docs: []const introducer_mod.TextDocument, start: 
 
 fn estimateProjectedTextDocBytes(doc: introducer_mod.TextDocument) usize {
     var total: usize = 64 + doc.id.len + @max(doc.stored_data.len, @as(usize, @intCast(doc.stored_source_bytes)));
+    total +|= doc.numericCoverageInputBytes();
     for (doc.text_fields) |field| {
         total +|= 16 + field.field_name.len + field.text.len;
     }
@@ -2713,9 +2876,27 @@ fn canUseOpaqueJsonFastPath(data: []const u8) bool {
     return true;
 }
 
-fn validateJsonDocumentNoAlloc(alloc: Allocator, data: []const u8) !void {
+/// Streaming structural validation for unconstrained native JSON rows.
+/// Ordinary nesting uses stack storage independent of document width. Deep
+/// values retain the caller's bounded allocator and existing accepted domain.
+pub fn validateJsonDocumentNoAlloc(alloc: Allocator, data: []const u8) !void {
+    var nesting: [2 * std.atomic.cache_line]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&nesting);
+    validateJsonDocumentStreaming(fixed.allocator(), data) catch |err| switch (err) {
+        error.OutOfMemory => return validateJsonDocumentStreaming(alloc, data),
+        else => return err,
+    };
+}
+
+fn validateJsonDocumentStreaming(alloc: Allocator, data: []const u8) !void {
     var scanner = std.json.Scanner.initCompleteInput(alloc, data);
     defer scanner.deinit();
+    // skipValue requires a value token; closing delimiters and an empty
+    // payload are ordinary malformed input rather than unreachable states.
+    switch (try scanner.peekNextTokenType()) {
+        .object_end, .array_end, .end_of_document => return error.SyntaxError,
+        else => {},
+    }
     try scanner.skipValue();
     if (try scanner.next() != .end_of_document) return error.SyntaxError;
 }
@@ -2729,7 +2910,7 @@ fn extractTextFields(
 ) !ExtractedTextFields {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
     defer parsed.deinit();
-    return try extractTextFieldsFromValue(alloc, parsed.value, text_analysis, schema, observed_field_analyzers);
+    return try extractTextFieldsFromValue(alloc, parsed.value, text_analysis, schema, observed_field_analyzers, null);
 }
 
 fn extractTextFieldsFromValue(
@@ -2738,6 +2919,7 @@ fn extractTextFieldsFromValue(
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
+    omitted_sources: ?*OmittedTextSources,
 ) !ExtractedTextFields {
     if (root != .object) return .{ .fields = &.{} };
 
@@ -2767,7 +2949,7 @@ fn extractTextFieldsFromValue(
             null;
 
         if (document_schema) |resolved| {
-            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers, false);
+            try appendSchemaTextFields(alloc, &fields, root, runtime, resolved, text_analysis, observed_field_analyzers, false, omitted_sources);
         }
         try appendDynamicSchemaTextFields(alloc, &fields, &typed_fields, root, runtime, document_schema, text_analysis, observed_field_analyzers);
         try appendSchemaTypedDocValueFields(alloc, &typed_fields, root, runtime);
@@ -2797,7 +2979,7 @@ pub fn highlightTextFieldsFromValue(
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
 ) ![]const HighlightTextField {
-    return highlightTextFieldsFromValueWithSelectedField(alloc, root, text_analysis, schema, null);
+    return highlightTextFieldsFromValueWithSelectedField(alloc, root, text_analysis, schema, null, null);
 }
 
 /// Keep highlight provenance identical to TextProjectionBatchBuilder, including
@@ -2809,7 +2991,7 @@ pub fn highlightTextFieldsFromValueWithSelectedField(
     schema: ?runtime_schema.TableSchema,
     selected_field: ?[]const u8,
 ) ![]const HighlightTextField {
-    const extracted = if (selected_field) |field| try extractSelectedTextField(alloc, root, field) else try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
+    const extracted = if (selected_field) |field| try extractSelectedTextField(alloc, root, field) else try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null, null);
     var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
     for (extracted.fields) |field| {
         try fields.append(alloc, .{
@@ -2856,12 +3038,38 @@ pub fn compileHighlightRouting(alloc: Allocator, text_analysis: introducer_mod.T
     const documents = try alloc.alloc(HighlightDocumentRoutes, table.full_text_documents.len);
     for (table.full_text_documents, documents) |document, *out| {
         var fields: std.ArrayListUnmanaged(introducer_mod.TextField) = .empty;
-        try appendSchemaTextFields(alloc, &fields, .{ .object = .empty }, table, document, text_analysis, null, true);
+        try appendSchemaTextFields(alloc, &fields, .{ .object = .empty }, table, document, text_analysis, null, true, null);
         const routes = try alloc.alloc(HighlightTextRoute, fields.items.len);
         for (fields.items, routes) |field, *route| route.* = .{ .source_field = field.source_field orelse field.field_name, .indexed_field = field.field_name, .analyzer = introducer_mod.effectiveTextFieldAnalyzer(field, text_analysis) };
         out.* = .{ .fields = routes };
     }
     return documents;
+}
+
+const OmittedTextSources = std.StringHashMapUnmanaged([]const []const u8);
+
+fn omittedTextSourcesAlloc(
+    alloc: Allocator,
+    exact_fields: []const runtime_schema.ExactField,
+    document: runtime_schema.FullTextDocument,
+) ![]const []const u8 {
+    var declared: std.StringHashMapUnmanaged(void) = .empty;
+    defer declared.deinit(alloc);
+    for (document.declared_paths) |path| try declared.put(alloc, path, {});
+    var emitted: std.StringHashMapUnmanaged(void) = .empty;
+    defer emitted.deinit(alloc);
+    for (document.fields) |field| {
+        if (std.mem.eql(u8, field.path, field.emitted_name)) try emitted.put(alloc, field.path, {});
+    }
+    var sources: std.ArrayList([]const u8) = .empty;
+    errdefer sources.deinit(alloc);
+    for (exact_fields) |field| {
+        if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
+        if (!declared.contains(field.source_field) or emitted.contains(field.source_field) or
+            runtime_schema.pathFallsUnderAnyPrefix(document.unindexed_paths, field.source_field)) continue;
+        try sources.append(alloc, field.source_field);
+    }
+    return sources.toOwnedSlice(alloc);
 }
 
 fn appendSchemaTextFields(
@@ -2873,6 +3081,7 @@ fn appendSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
     metadata_only: bool,
+    omitted_sources: ?*OmittedTextSources,
 ) !void {
     var physical_schema = schema;
     if (document_schema.physical_exact_fields) |rules| physical_schema.exact_fields = rules;
@@ -2917,22 +3126,20 @@ fn appendSchemaTextFields(
             }
         }
     }
-    // A disabled root can still declare separately indexed named subfields.
-    // Its source remains available even though the root emits no postings.
-    for (physical_schema.exact_fields) |field| {
-        if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
-        if (!runtime_schema.containsPath(document_schema.declared_paths, field.source_field) or
-            runtime_schema.pathFallsUnderAnyPrefix(document_schema.unindexed_paths, field.source_field)) continue;
-        // Current ASCH contains the source and the loop above handled it.
-        // Keep this path for epochs emitted by the short-lived omitted-source
-        // producer, without indexing another document type's declarations.
-        if (for (document_schema.fields) |declared| {
-            if (std.mem.eql(u8, declared.path, field.source_field) and std.mem.eql(u8, declared.path, declared.emitted_name)) break true;
-        } else false) continue;
+    // Compatibility for the omitted-source schema producer.
+    const sources = if (omitted_sources) |cache| cached: {
+        if (cache.get(document_schema.name)) |paths| break :cached paths;
+        const paths = try omittedTextSourcesAlloc(alloc, physical_schema.exact_fields, document_schema);
+        errdefer alloc.free(paths);
+        try cache.put(alloc, document_schema.name, paths);
+        break :cached paths;
+    } else try omittedTextSourcesAlloc(alloc, physical_schema.exact_fields, document_schema);
+    defer if (omitted_sources == null) alloc.free(sources);
+    for (sources) |path| {
         var values: std.ArrayListUnmanaged([]const u8) = .empty;
         defer values.deinit(alloc);
-        if (metadata_only) try values.append(alloc, "") else try collectFieldValues(alloc, &values, root, field.source_field);
-        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, field.source_field, text, physical_schema, text_analysis, observed_field_analyzers);
+        if (metadata_only) try values.append(alloc, "") else try collectFieldValues(alloc, &values, root, path);
+        for (values.items) |text| try appendMappedSubfieldTextFields(alloc, fields, path, text, physical_schema, text_analysis, observed_field_analyzers);
     }
 }
 
@@ -3111,6 +3318,71 @@ fn mappedTypedDocValueFieldAlloc(
     };
 }
 
+const NumericCoverageNode = struct {
+    path: []const u8 = "",
+    terminal: bool = false,
+    observed: ??typed_dv.NumericValue = null,
+    children: std.StringHashMapUnmanaged(*NumericCoverageNode) = .empty,
+
+    fn rejectIncomplete(
+        self: *const NumericCoverageNode,
+        alloc: Allocator,
+        object: std.json.ObjectMap,
+        rejected: *std.ArrayList(introducer_mod.NumericCoverageRejection),
+    ) Allocator.Error!void {
+        for (object.keys(), object.values()) |key, value| {
+            if (self.children.get(key)) |child| {
+                if (child.terminal) {
+                    const observed = child.observed;
+                    child.observed = null;
+                    if (!numericSourceMatchesProjection(value, observed)) {
+                        const equivalent = if (observed orelse null) |emitted|
+                            if (typed_dv.numericValueFromJson(value)) |source|
+                                typed_dv.numericValueAsF64(emitted) == typed_dv.numericValueAsF64(source)
+                            else
+                                false
+                        else
+                            false;
+                        try rejected.append(alloc, .{ .path = child.path, .kind = if (equivalent) .exact_source else .field });
+                    }
+                }
+                if (child.children.count() == 0 or value == .null) continue;
+                if (value == .object)
+                    try child.rejectIncomplete(alloc, value.object, rejected)
+                else
+                    try rejected.append(alloc, .{ .path = child.path, .kind = .descendants });
+            } else if (std.mem.indexOfScalar(u8, key, '.') != null) {
+                // Literal dotted keys can alias the column beneath this object.
+                var node = self;
+                var components = std.mem.splitScalar(u8, key, '.');
+                while (components.next()) |part| {
+                    node = node.children.get(part) orelse break;
+                } else {
+                    try rejected.append(alloc, .{ .path = node.path, .kind = .subtree });
+                }
+            }
+        }
+    }
+};
+
+fn numericSourceMatchesProjection(raw: std.json.Value, observed: ??typed_dv.NumericValue) bool {
+    if (raw == .null) return observed == null;
+    const emitted = (observed orelse return false) orelse return false;
+    if (typed_dv.exactNumericValueFromJson(raw)) |expected| {
+        return typed_dv.compareNumericValues(emitted, expected) == .eq;
+    }
+    if (raw != .number_string or std.mem.indexOfAny(u8, raw.number_string, ".eE") == null) return false;
+    // Compare the preserved decimal token with the exact binary value.
+    // A rounded projection cannot certify the source for standard ranges.
+    var work: @import("../../sql/json_order.zig").Budget = .{};
+    const projected: std.json.Value = switch (emitted) {
+        .f64_val => |v| .{ .float = v },
+        .i64_val => |v| .{ .integer = v },
+        .u64_val => return false,
+    };
+    return (@import("../../sql/json_order.zig").compare(raw, projected, &work, 0) catch return false) == .eq;
+}
+
 const IndexSortProjection = struct { values: []const introducer_mod.NamedSortValue = &.{}, valid: bool = true };
 /// Bind virtual fields to their actual source before certifying semantic NULLs.
 fn mappedIndexSortProjection(a: Allocator, root: std.json.Value, maybe_schema: ?runtime_schema.TableSchema, projected: ?[]const introducer_mod.TypedFieldValue) !IndexSortProjection {
@@ -3176,20 +3448,7 @@ pub fn typedDocValueForMappedFieldAlloc(
             .string => |text| .{ .bytes_val = try alloc.dupe(u8, text) },
             else => null,
         },
-        .numeric => switch (value) {
-            .integer => |number| .{ .numeric_val = .{ .i64_val = number } },
-            .float => |number| if (std.math.isFinite(number)) .{ .numeric_val = .{ .f64_val = number } } else null,
-            .number_string => |number| blk: {
-                if (std.mem.indexOfAny(u8, number, ".eE") == null) {
-                    if (std.fmt.parseInt(i64, number, 10)) |parsed| break :blk .{ .numeric_val = .{ .i64_val = parsed } } else |_| {}
-                    if (std.fmt.parseUnsigned(u64, number, 10)) |parsed| break :blk .{ .numeric_val = .{ .u64_val = parsed } } else |_| {}
-                }
-                const parsed = std.fmt.parseFloat(f64, number) catch return null;
-                if (!std.math.isFinite(parsed)) return null;
-                break :blk .{ .numeric_val = .{ .f64_val = parsed } };
-            },
-            else => null,
-        },
+        .numeric => if (typed_dv.numericValueFromJson(value)) |number| .{ .numeric_val = number } else null,
         .datetime => if (if (value == .string) @import("../../datetime.zig").parseDateTimeToSignedNs(value.string) else @import("../../datetime.zig").rangeNanoseconds(value)) |ns| .{ .datetime_ns = ns } else null,
         .boolean => switch (value) {
             .bool => |boolean| .{ .bool_val = boolean },
@@ -4513,6 +4772,13 @@ pub fn buildRelationalRowValueForSchemaFromParsedAlloc(
     return prepared.bytes;
 }
 
+/// Size the immutable producer row with the same codec used by prepare.
+pub fn frozenRelationalRowSize(a: Allocator, root: std.json.Value, table: runtime_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout, json_null_fields: []const []const u8) !usize {
+    const encoded = try buildRelationalRowValueFromParsedInternal(a, a, root, table, layout, layout.required_ordinals, json_null_fields);
+    defer a.free(encoded.bytes);
+    return encoded.bytes.len;
+}
+
 const PreparedEncodedRow = struct {
     bytes: []u8,
     semantic_hash: document_content_hash.Digest,
@@ -4567,8 +4833,10 @@ fn buildRelationalRowValueFromParsedInternal(
             output_alloc: Allocator,
             ordinal: usize,
             column: runtime_schema.RelationalColumn,
+            enum_view: ?*const @import("../../common/sql_enum_value.zig").View,
             found: std.json.Value,
             json_literal_null: bool,
+            preserve_json_display: bool,
             owned_buffers: *std.ArrayListUnmanaged([]u8),
         ) !relational_row_codec.Cell {
             const value_type = relationalValueType(column.column_type);
@@ -4581,7 +4849,9 @@ fn buildRelationalRowValueFromParsedInternal(
                     .is_json = column.is_json,
                     .is_dense_vector = column.column_type == .dense_vector,
                     .is_numeric = column.column_type == .numeric,
+                    .enum_record = if (enum_view) |view| &view.record else null,
                     .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
+                    .sql_range_kind = @import("../../sql/range/value.zig").kindFromType(column.column_type),
                     .is_null = true,
                     .value = relationalZeroValue(value_type),
                 };
@@ -4594,23 +4864,35 @@ fn buildRelationalRowValueFromParsedInternal(
                 .none => return error.InvalidBatchRequest,
             };
 
-            const value = if (column.column_type == .sql_array) blk: {
+            const value = if (column.column_type == .enumeration) blk: {
+                if (found != .string) return error.SqlInvalidTextRepresentation;
+                const view = enum_view orelse return error.InvalidSchema;
+                break :blk typed_dv.TypedValue{ .i64_val = (try view.input(found.string)).symbol };
+            } else if (@import("../../sql/range/value.zig").kindFromType(column.column_type)) |kind| blk: {
+                const encoded = try @import("../../sql/range/storage.zig").encodeJsonAlloc(output_alloc, kind, found);
+                errdefer output_alloc.free(encoded);
+                try owned_buffers.append(output_alloc, encoded);
+                break :blk typed_dv.TypedValue{ .bytes_val = encoded };
+            } else if (column.column_type == .sql_array) blk: {
                 const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
-                var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(output_alloc, kind, found, column.numeric_modifier, .{});
+                var decoded = try @import("../../sql/array/wire.zig").decodeBorrowedWithModifier(output_alloc, kind, found, column.numeric_modifier, .{});
                 defer decoded.deinit();
-                const encoded = try @import("../../sql/array_storage.zig").encodeAlloc(output_alloc, decoded.value, .{});
+                const encoded = try @import("../../sql/array/storage.zig").encodeAlloc(output_alloc, decoded.value, .{});
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
             } else if (column.column_type == .numeric) blk: {
                 if (column.sql_element_type != .numeric) return error.InvalidBatchRequest;
-                var context: @import("../../sql/numeric_value.zig").Context = .{ .alloc = output_alloc };
-                const encoded = try @import("../../sql/numeric_storage.zig").encodeJsonWithModifier(&context, found, column.numeric_modifier);
+                var context: @import("../../sql/numeric/value.zig").Context = .{ .alloc = output_alloc };
+                const encoded = try @import("../../sql/numeric/storage.zig").encodeJsonWithModifier(&context, found, column.numeric_modifier);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
             } else if (column.is_json) blk: {
-                const encoded = try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
+                const encoded = if (preserve_json_display)
+                    try document_content_hash.canonicalJsonStorageValueAlloc(output_alloc, found)
+                else
+                    try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
@@ -4624,7 +4906,9 @@ fn buildRelationalRowValueFromParsedInternal(
                 .is_json = column.is_json,
                 .is_dense_vector = column.column_type == .dense_vector,
                 .is_numeric = column.column_type == .numeric,
+                .enum_record = if (enum_view) |view| &view.record else null,
                 .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
+                .sql_range_kind = @import("../../sql/range/value.zig").kindFromType(column.column_type),
                 .value = value,
             };
         }
@@ -4647,10 +4931,12 @@ fn buildRelationalRowValueFromParsedInternal(
                 scratch,
                 ordinal,
                 columns[ordinal],
+                layout.enumView(ordinal),
                 found,
                 for (json_null_fields) |name| {
                     if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
                 } else false,
+                table_schema.requires_jsonb_display,
                 &owned,
             ));
         }
@@ -4677,7 +4963,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 return std.mem.lessThan(u8, schema_columns[lhs.ordinal].name, schema_columns[rhs.ordinal].name);
             }
         }.lessThan);
-        const digest = try document_content_hash.hashRelationalSparseCellsCanonical(cells.items, table_schema);
+        const digest = try document_content_hash.hashRelationalSparseCellsCanonicalWithLayout(scratch, cells.items, table_schema, physical_layout);
         std.mem.sort(relational_row_codec.Cell, cells.items, {}, ordinalSort);
         break :blk digest;
     } else blk: {
@@ -4706,11 +4992,13 @@ fn buildRelationalRowValueFromParsedInternal(
             }
             target += 1;
         }
-        const digest = try document_content_hash.hashRelationalIndexedCellsCanonical(
+        const digest = try document_content_hash.hashRelationalIndexedCellsCanonicalWithLayout(
+            scratch,
             cells.items,
             table_schema,
             physical_layout.hash_ordinals,
             positions,
+            physical_layout,
         );
         break :blk digest;
     };
@@ -4751,11 +5039,11 @@ pub fn validateRelationalRowValueForSchema(value: []const u8, table_schema: runt
 fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.ValueType {
     return switch (column_type) {
         .datetime => .u64_val,
-        .integer => .i64_val,
+        .integer, .enumeration => .i64_val,
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => .bytes_val,
     };
 }
 
@@ -4781,7 +5069,7 @@ fn relationalTypedValueAlloc(
     return switch (column_type) {
         // SQL arrays require the complete immutable column descriptor and are
         // prepared by makeCell, never inferred from this coarse type alone.
-        .sql_array, .numeric => error.InvalidBatchRequest,
+        .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange, .enumeration => error.InvalidBatchRequest,
         .string, .blob, .geoshape => switch (value) {
             .string => |text| .{ .bytes_val = text },
             else => null,
@@ -6736,9 +7024,9 @@ test "relational index system SQL array preparation roundtrips PostgreSQL fixtur
             defer a.free(rendered);
         }
     };
-    const arrays = @import("../../sql/array_value.zig");
-    const wire = @import("../../sql/array_wire.zig");
-    const storage = @import("../../sql/array_storage.zig");
+    const arrays = @import("../../sql/array/value.zig");
+    const wire = @import("../../sql/array/wire.zig");
+    const storage = @import("../../sql/array/storage.zig");
     const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
     const fixture = try std.json.parseFromSlice(Fixture, alloc, @embedFile("../../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
@@ -6746,7 +7034,7 @@ test "relational index system SQL array preparation roundtrips PostgreSQL fixtur
         const pg = try alloc.alloc(u8, entry.binary.len / 2);
         defer alloc.free(pg);
         _ = try std.fmt.hexToBytes(pg, entry.binary);
-        var original = try @import("../../sql/array_binary.zig").decode(alloc, entry.element_type, pg, .{});
+        var original = try @import("../../sql/array/binary.zig").decode(alloc, entry.element_type, pg, .{});
         defer original.deinit();
         const envelope = try wire.encodeAlloc(alloc, original.value, .{});
         defer alloc.free(envelope);
@@ -6880,7 +7168,7 @@ test "relational index system NUMERIC modifiers round before row hash and strict
             const digest = try document_content_hash.hashRelationalParsedValue(alloc, row.parsedValue(), schema);
             try std.testing.expectEqualSlices(u8, &row.semantic_hash, &digest);
             const cell = (try relational_row_codec.findCellByOrdinalWithLayout(row.packed_row, schema, physical, 0)).?;
-            const numeric = @import("../../sql/numeric_storage.zig");
+            const numeric = @import("../../sql/numeric/storage.zig");
             const value = try numeric.jsonValueAlloc(alloc, cell.value.bytes_val);
             defer alloc.free(value.number_string);
             try std.testing.expectEqualStrings("12.35", value.number_string);
@@ -6917,7 +7205,7 @@ test "relational index system NUMERIC array modifiers round before hashing and s
             const view = try @import("../../common/sql_array_layout.zig").View.open(.numeric, cell.value.bytes_val, .{});
             try std.testing.expectEqual(@as(usize, 3), view.count);
             try std.testing.expect((try view.cell(1)).sql_null);
-            const value = try @import("../../sql/numeric_storage.zig").jsonValueAlloc(alloc, (try view.cell(0)).bytes);
+            const value = try @import("../../sql/numeric/storage.zig").jsonValueAlloc(alloc, (try view.cell(0)).bytes);
             defer alloc.free(value.number_string);
             try std.testing.expectEqualStrings("12.35", value.number_string);
             const rendered = try relational_row_codec.reconstructDocumentAlloc(alloc, &.{cell});
@@ -6967,8 +7255,8 @@ test "relational index system NUMERIC scalar rows hash logical identity and unwi
     try Run.run(a, schema, &layout);
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ schema, &layout });
-    var ctx: @import("../../sql/numeric_value.zig").Context = .{ .alloc = a };
-    try std.testing.expectError(error.InvalidBatchRequest, @import("../../sql/numeric_storage.zig").fromJson(&ctx, .{ .float = 1.25 }));
+    var ctx: @import("../../sql/numeric/value.zig").Context = .{ .alloc = a };
+    try std.testing.expectError(error.InvalidBatchRequest, @import("../../sql/numeric/storage.zig").fromJson(&ctx, .{ .float = 1.25 }));
 }
 
 test "relational index system SQL float4 preparation hashes and indexes canonical logical values" {
@@ -7432,4 +7720,31 @@ test "external lake bounded window profiles native source column inputs keep typ
     try std.testing.expect(doc.stored_source_bytes > payload.len and bytes >= payload.len);
     try std.testing.expect(introducer_mod.estimateTextDocumentSegmentBytes(doc) >= payload.len);
     try std.testing.expect((try introducer_mod.estimateTextDocumentBuildMemoryBytes(a, doc)) >= payload.len);
+}
+
+test "trigger prepared DOM owns one row authority for encoding hashing and deferred text" {
+    const Fault = struct {
+        fn run(a: Allocator) !void {
+            const table: runtime_schema.TableSchema = .{ .version = 7, .storage_mode = .relational, .relational_columns = &.{.{ .name = "amount", .path = "amount", .column_type = .integer, .required = true }} };
+            var layout = try relational_row_codec.PhysicalLayout.init(a, table);
+            defer layout.deinit();
+            var candidate = try std.json.parseFromSlice(std.json.Value, a, "{\"amount\":1}", .{ .parse_numbers = false });
+            candidate.value.object.getPtr("amount").?.* = .{ .integer = 42 };
+            // initParsedTyped consumes candidate on errors as well as success.
+            var prepared = try PreparedRelationalWrite.initParsedTyped(a, a, false, "row", "{\"amount\":1}", null, table, &layout, &.{}, true, candidate);
+            defer prepared.deinit(a);
+            var expected = try PreparedRelationalWrite.init(a, "row", "{\"amount\":42}", null, table, &layout);
+            defer expected.deinit(a);
+            try prepared.finalizeMetadata(0);
+            try expected.finalizeMetadata(0);
+            try std.testing.expectEqualSlices(u8, expected.packed_row, prepared.packed_row);
+            try std.testing.expectEqualSlices(u8, &expected.semantic_hash, &prepared.semantic_hash);
+            const logical = (try prepared.extracted.logicalJson()).?;
+            var observed = try std.json.parseFromSlice(std.json.Value, a, logical, .{});
+            defer observed.deinit();
+            try std.testing.expectEqual(@as(i64, 42), observed.value.object.get("amount").?.integer);
+        }
+    };
+    try Fault.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fault.run, .{});
 }

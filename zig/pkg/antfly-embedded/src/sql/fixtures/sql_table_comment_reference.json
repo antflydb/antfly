@@ -1,0 +1,27 @@
+{
+  "format": 1,
+  "id": "sql-0142",
+  "steps": [
+    {
+      "sql": "COMMENT ON TABLE usage_records IS 'metered usage rows';",
+      "description": "metered usage rows"
+    },
+    {
+      "sql": "COMMENT ON TABLE usage_records IS 'a ''quoted'' \u03a9'",
+      "description": "a 'quoted' \u03a9"
+    },
+    {
+      "sql": "COMMENT ON TABLE usage_records IS NULL",
+      "description": null
+    },
+    {
+      "sql": "COMMENT ON TABLE usage_records IS ''",
+      "description": null
+    },
+    {
+      "sql": "COMMENT ON TABLE usage_records IS 'metered usage rows';",
+      "description": "metered usage rows"
+    }
+  ],
+  "denied_sqlstate": "42501"
+}

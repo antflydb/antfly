@@ -19,6 +19,7 @@ const Params = @import("ops.zig").Gemma4AudioLocalAttentionParams;
 /// Chunk-local relative attention. Workers own disjoint output rows and score
 /// scratch; no allocation occurs after launch. Generic SIMD works on every CPU.
 pub fn forward(a: std.mem.Allocator, io: ?std.Io, p: Params, q: []const f32, k: []const f32, v: []const f32, rel: []const f32, scales: []const f32, valid: []const f32) ![]f32 {
+    if (p.arithmetic != .combined_f32 or p.publication != .f32) return error.UnsupportedLocalRelativeAttentionArithmetic;
     if (p.heads == 0 or p.head_dim == 0 or p.chunk == 0 or p.context_left <= @intFromBool(p.exclude_farthest_key) or p.logit_cap <= 0 or
         p.heads * p.head_dim != p.hidden or q.len != p.rows * p.hidden or k.len != q.len or v.len != q.len or
         rel.len != p.context_left * p.hidden or scales.len != p.head_dim or valid.len != p.rows) return error.InvalidTensorShape;

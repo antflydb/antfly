@@ -69,6 +69,7 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
         error.InvalidCreateTableRequest,
         error.InvalidTableStorageSettings,
         error.ObjectTablePlacementUnsupported,
+        error.ExternalTableReplicationSourcesUnsupported,
         error.RelationalStorageUnavailable,
         error.VectorStoreRequiresLocalSingleShardTable,
         error.ImmutableTableStorageSettings,
@@ -97,7 +98,7 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
     if (body.len == 0) return .{ .indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json) };
-    if (try @import("relational_index_mutation.zig").normalizeCreateTableBody(alloc, body)) |normalized| {
+    if (try @import("relational_index/mutation.zig").normalizeCreateTableBody(alloc, body)) |normalized| {
         defer alloc.free(normalized);
         return parseCreateTableRequest(alloc, normalized);
     }
@@ -115,6 +116,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         .object => |object| object,
         else => return error.InvalidCreateTableRequest,
     };
+    if (raw_root.get("sql_persistence") != null) return error.InvalidCreateTableRequest;
     if (raw_root.get("enrichments") != null or raw_root.get("artifact_enrichments") != null) {
         return error.TableEnrichmentsRequireArtifactEndpoint;
     }
@@ -317,6 +319,7 @@ pub fn normalizeTableDefinitionIndexesValueAlloc(alloc: std.mem.Allocator, value
 }
 
 pub fn encodeCreateTableRequest(alloc: std.mem.Allocator, req: tables_api.CreateTableRequest) ![]u8 {
+    if (req.sql_persistence != null) return error.InvalidCreateTableRequest;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
 
@@ -424,6 +427,9 @@ pub fn schemaUpdateRequestErrorMessage(err: anyerror, body: []const u8) []const 
 }
 
 pub fn createTableRequestErrorMessage(err: anyerror, body: []const u8) []const u8 {
+    if (err == error.ExternalTableReplicationSourcesUnsupported) {
+        return tables_api.external_table_replication_sources_error_message;
+    }
     if (err == error.CreateTableShardCountOutOfRange) {
         return tables_api.table_initial_ranges_error_message;
     }
@@ -444,7 +450,7 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
 
     // Typed literal binding must see the caller's exact numeric token. Keep
     // artifact validation's established numeric representation unchanged.
-    const relational = try @import("relational_index_mutation.zig").isRelational(alloc, body);
+    const relational = try @import("relational_index/mutation.zig").isRelational(alloc, body);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = !relational });
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -2696,4 +2702,15 @@ test "PDF embedding input public contract rejects sparse consumers" {
     const text = try std.mem.replaceOwned(u8, a, pdf, "pdf_page_images", "text");
     defer a.free(text);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, text);
+}
+
+test "create table rejects replication sources for an external binding with default storage" {
+    const a = std.testing.allocator;
+    const schema = "{\"schema\":{\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"uri\":\"s3://lake/events\",\"table_id\":\"events\",\"write_policy\":\"read_only\"}}";
+    const sources = ",\"replication_sources\":[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"events\"}]}";
+    try std.testing.expectError(error.ExternalTableReplicationSourcesUnsupported, parseCreateTableRequest(a, schema ++ sources));
+    var external = try parseCreateTableRequest(a, schema ++ ",\"replication_sources\":[]}");
+    defer external.deinit(a);
+    var native = try parseCreateTableRequest(a, "{" ++ sources[1..]);
+    defer native.deinit(a);
 }

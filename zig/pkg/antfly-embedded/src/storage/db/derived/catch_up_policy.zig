@@ -33,6 +33,19 @@ const dense_replay_default_window_bytes: u64 = 64 * 1024 * 1024;
 const dense_replay_max_window_bytes: u64 = 256 * 1024 * 1024;
 const recoverable_retry_min_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const recoverable_retry_max_delay_ns: u64 = 250 * std.time.ns_per_ms;
+/// Cap on consecutive failures at one retry site before giving up. A
+/// genuinely transient fault -- a momentary disk hiccup, or an ambiguous
+/// commit outcome `NativeFile.reconcilePublicationUncertainty` resolves on
+/// the very next attempt -- clears within a handful of retries. Every
+/// attempt up to this cap already re-entered the write path (which
+/// transparently reconciles an ambiguous publication before trying again,
+/// see `isTransientIoError`'s own doc comment), so a failure that still has
+/// not cleared after this many tries will not clear on attempt N+1 either:
+/// retrying forever just turns a real, permanent fault into an unbounded
+/// hang instead of a surfaced failure. 30 attempts spans a few seconds of
+/// backoff (the delay caps at 250ms well before then), generous for a
+/// genuine transient blip and far short of "forever."
+const recoverable_retry_max_attempts: u8 = 30;
 
 /// Bounded backoff for transient derived-worker failures. The worker owns this
 /// state so a persistently unavailable dependency yields without poisoning the
@@ -53,6 +66,14 @@ pub const RecoverableRetryBackoff = struct {
     pub fn shouldLog(self: @This()) bool {
         return self.failures == 1 or std.math.isPowerOfTwo(self.failures);
     }
+
+    /// True once this retry site has failed enough consecutive times that
+    /// continuing to retry can no longer be justified as "giving a
+    /// transient fault a chance to clear." The caller must stop retrying
+    /// and surface the error instead (never loop forever).
+    pub fn exhausted(self: @This()) bool {
+        return self.failures >= recoverable_retry_max_attempts;
+    }
 };
 
 pub const RecoverableRetryStats = struct {
@@ -62,6 +83,7 @@ pub const RecoverableRetryStats = struct {
     replay_document_not_visible: u64 = 0,
     artifact_repair_required: u64 = 0,
     not_found: u64 = 0,
+    transient_io: u64 = 0,
 };
 
 pub const RecoverableRetryCounters = struct {
@@ -71,6 +93,7 @@ pub const RecoverableRetryCounters = struct {
     replay_document_not_visible: @import("antfly_platform").atomic.Value(u64) = .init(0),
     artifact_repair_required: @import("antfly_platform").atomic.Value(u64) = .init(0),
     not_found: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    transient_io: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
@@ -92,6 +115,12 @@ pub const RecoverableRetryCounters = struct {
             error.ReplayDocumentNotVisible => _ = self.replay_document_not_visible.fetchAdd(1, .monotonic),
             error.ArtifactRepairRequired => _ = self.artifact_repair_required.fetchAdd(1, .monotonic),
             error.NotFound => _ = self.not_found.fetchAdd(1, .monotonic),
+            error.InputOutput,
+            error.NoSpaceLeft,
+            error.DiskQuota,
+            error.OutcomeUnknown,
+            error.OutcomeReconciliationRequired,
+            => _ = self.transient_io.fetchAdd(1, .monotonic),
             else => {},
         }
     }
@@ -104,6 +133,7 @@ pub const RecoverableRetryCounters = struct {
             .replay_document_not_visible = self.replay_document_not_visible.load(.monotonic),
             .artifact_repair_required = self.artifact_repair_required.load(.monotonic),
             .not_found = self.not_found.load(.monotonic),
+            .transient_io = self.transient_io.load(.monotonic),
         };
     }
 };
@@ -128,6 +158,27 @@ pub fn isRecoverableAdmissionError(err: anyerror) bool {
         error.TextMergeBackpressureTimeout,
         error.TextMergeBackpressureUnavailable,
         error.TextMergeRuntimeShutdown,
+        => true,
+        else => false,
+    };
+}
+
+/// A transient write/sync/publish I/O failure (a disk momentarily full or
+/// erroring, or a checkpoint publish left with an unknown outcome by one).
+/// None of these invalidate the replay record being applied: the owner
+/// either reconciles the uncertain publication in-process on its next
+/// attempt (`NativeFile.reconcilePublicationUncertainty`, reached through
+/// `beginTransaction`) or simply redoes a commit that never durably landed.
+/// Backing off and retrying -- never poisoning the worker's `last_error_name`
+/// latch -- is what lets catch-up resume once the underlying I/O recovers
+/// instead of leaving an index in `IndexRebuilding` forever.
+pub fn isTransientIoError(err: anyerror) bool {
+    return switch (err) {
+        error.InputOutput,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.OutcomeUnknown,
+        error.OutcomeReconciliationRequired,
         => true,
         else => false,
     };

@@ -151,7 +151,7 @@ pub fn recoverDurableOutbox(
             switch (kind) {
                 .batch, .restore_batch => noteReplicationMirrorFailure(mirror, "batch mutation recovery", err),
                 .replay, .primary_effect => noteReplicationMirrorFailure(mirror, "derived effect recovery", err),
-                .schema, .row_policy => noteReplicationMirrorFailure(mirror, "metadata mutation recovery", err),
+                .schema, .row_policy, .metadata_control => noteReplicationMirrorFailure(mirror, "metadata mutation recovery", err),
             }
             return err;
         };

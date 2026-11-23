@@ -19,6 +19,8 @@ class DatabaseCatalogRecord:
         database_id (int): Stable database catalog identifier. Example: 22.
         name (str): Database name. Example: tenant_ops.
         settings_json (str): JSON-encoded database settings owned by the catalog. Example: {}.
+        description (None | str | Unset): SQL COMMENT annotation. NULL or an empty string removes the annotation without
+            changing the object's identity or data schema.
         tablespace_name (None | str | Unset): Optional durable tablespace binding inherited by new namespace/table
             placement policy. Example: fastspace.
     """
@@ -26,6 +28,7 @@ class DatabaseCatalogRecord:
     database_id: int
     name: str
     settings_json: str
+    description: None | str | Unset = UNSET
     tablespace_name: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -35,6 +38,12 @@ class DatabaseCatalogRecord:
         name = self.name
 
         settings_json = self.settings_json
+
+        description: None | str | Unset
+        if isinstance(self.description, Unset):
+            description = UNSET
+        else:
+            description = self.description
 
         tablespace_name: None | str | Unset
         if isinstance(self.tablespace_name, Unset):
@@ -51,6 +60,8 @@ class DatabaseCatalogRecord:
                 "settings_json": settings_json,
             }
         )
+        if description is not UNSET:
+            field_dict["description"] = description
         if tablespace_name is not UNSET:
             field_dict["tablespace_name"] = tablespace_name
 
@@ -65,6 +76,15 @@ class DatabaseCatalogRecord:
 
         settings_json = d.pop("settings_json")
 
+        def _parse_description(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        description = _parse_description(d.pop("description", UNSET))
+
         def _parse_tablespace_name(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -78,6 +98,7 @@ class DatabaseCatalogRecord:
             database_id=database_id,
             name=name,
             settings_json=settings_json,
+            description=description,
             tablespace_name=tablespace_name,
         )
 

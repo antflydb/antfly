@@ -852,6 +852,7 @@ pub const DecisionProvider = struct {
     validate_fn: *const fn (*anyopaque, []const u8, Json, []const u8) anyerror!void,
     evaluate_batch_fn: *const fn (*anyopaque, std.mem.Allocator, []const Request) anyerror![]const Json,
     capabilities_fn: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!Capabilities = null,
+    validate_request_fn: ?*const fn (*anyopaque, Request, []const u8) anyerror!Capabilities = null,
     checkpoint_fn: ?*const fn (*anyopaque) anyerror!void = null,
     pub fn withSourceTable(self: @This(), table: []const u8) @This() {
         var scoped = self;
@@ -867,13 +868,19 @@ pub const DecisionProvider = struct {
     fn requestSourceTable(self: @This(), request: Request) []const u8 {
         return if (self.source_table.len > 0) self.source_table else request.source_table;
     }
+    fn requestCapabilities(self: @This(), request: Request) !Capabilities {
+        const table = self.requestSourceTable(request);
+        if (self.validate_request_fn) |f| return f(self.ptr, request, table);
+        if (self.capabilities_fn) |f| return f(self.ptr, request.decider, table);
+        return .{ .max_levels = 64 };
+    }
     pub fn validateRequests(self: @This(), a: std.mem.Allocator, requests: []const Request) !void {
         try self.checkpoint();
         for (requests) |request| {
-            const table = self.requestSourceTable(request);
-            try self.validate_fn(self.ptr, request.decider, request.questions, table);
+            if (self.validate_request_fn == null)
+                try self.validate_fn(self.ptr, request.decider, request.questions, self.requestSourceTable(request));
             try request.input.validate();
-            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider, self.requestSourceTable(request)) else Capabilities{ .max_levels = 64 };
+            const caps = try self.requestCapabilities(request);
             if (!caps.messages) _ = try request.input.requireText();
             if (!caps.images and request.input.imageCount() != 0) return error.UnsupportedInferenceFeature;
             try request.input.checkLimit(a, caps.max_input_bytes);

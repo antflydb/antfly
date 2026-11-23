@@ -23,6 +23,7 @@ uv run --no-project --with requests --with pytest --with 'psycopg[binary]==3.3.6
 
 import argparse
 import os
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -82,6 +83,415 @@ def exercise_cached_setting_plans(server, password):
     print("SQL and driver cached settings survive catalog changes: PASS", flush=True)
 
 
+def exercise_bound_portals(server, password):
+    """Commit DDL after the client receives BindComplete and before Execute."""
+    import socket
+    import struct
+
+    import psycopg
+    import requests
+
+    def message(tag, data=b""):
+        return tag + struct.pack("!I", 4 + len(data)) + data
+
+    def receive(reader):
+        tag = reader.read(1)
+        size = struct.unpack("!I", reader.read(4))[0]
+        assert 4 <= size <= 65536, size
+        data = reader.read(size - 4)
+        assert len(data) == size - 4
+        return tag, data
+
+    url = f"postgres://admin:{password}@127.0.0.1:{server.pgwire_port}/default"
+    with (
+        psycopg.connect(url, autocommit=True, sslmode="disable") as session,
+        psycopg.connect(url, autocommit=True) as migrator,
+        socket.fromfd(
+            session.pgconn.socket, socket.AF_INET, socket.SOCK_STREAM
+        ) as wire,
+        wire.makefile("rb") as reader,
+    ):
+        wire.settimeout(10)
+        create = "CREATE TABLE portal_target (id TEXT, n BIGINT)"
+        insert = "INSERT INTO portal_target (id, n) VALUES ('a', 0)"
+        migrator.execute(create)
+        migrator.execute(insert)
+
+        def parse(name, sql):
+            body = name.encode() + b"\0" + sql.encode() + bytes(3)
+            wire.sendall(message(b"P", body) + message(b"H"))
+            frame = receive(reader)
+            assert frame == (b"1", b""), (sql, frame)
+
+        def bind(name):
+            body = b"portal\0" + name.encode() + bytes(7)
+            wire.sendall(message(b"B", body) + message(b"H"))
+            frame = receive(reader)
+            assert frame == (b"2", b""), (name, frame)
+
+        def execute(expected_error=None):
+            wire.sendall(message(b"E", b"portal\0" + bytes(4)) + message(b"S"))
+            errors = []
+            while True:
+                tag, data = receive(reader)
+                if tag == b"E":
+                    errors.append(data.split(b"\0"))
+                if tag == b"Z":
+                    break
+            if expected_error:
+                assert len(errors) == 1 and expected_error in errors[0], errors
+            else:
+                assert not errors, errors
+
+        for name, query in (
+            ("constant", "SELECT 1"),
+            ("derived", "WITH c AS (SELECT 1 AS n) SELECT n FROM c"),
+        ):
+            parse(name, query)
+            bind(name)
+            execute()
+
+        parse("update", "UPDATE portal_target SET n = 9 WHERE id = 'a'")
+        for migration in ("alter", "noop", "replace", "reuse"):
+            bind("update")
+            if migration == "alter":
+                migrator.execute("ALTER TABLE portal_target ADD COLUMN note TEXT")
+            if migration == "noop":
+                response = requests.patch(
+                    server.api_url + "/tables/portal_target/schema",
+                    auth=("admin", password),
+                    json={},
+                    timeout=10,
+                )
+                response.raise_for_status()
+            if migration == "replace":
+                migrator.execute("DROP TABLE portal_target")
+                migrator.execute(create)
+                migrator.execute(insert)
+            execute(b"C40001" if migration == "replace" else None)
+            assert migrator.execute("SELECT n FROM portal_target").fetchone() == (
+                0 if migration == "replace" else 9,
+            )
+
+        parse("drop", "DROP TABLE portal_target")
+        bind("drop")
+        migrator.execute("DROP TABLE portal_target")
+        migrator.execute(create)
+        migrator.execute(insert)
+        execute(b"C40001")
+        assert migrator.execute("SELECT n FROM portal_target").fetchone() == (0,)
+
+        parse("conditional", "DROP TABLE IF EXISTS portal_absent")
+        bind("conditional")
+        migrator.execute("CREATE TABLE portal_absent (n BIGINT)")
+        execute(b"C40001")
+        assert migrator.execute("SELECT COUNT(*) FROM portal_absent").fetchone() == (0,)
+
+        parse("truncate", "TRUNCATE TABLE portal_target, portal_absent")
+        bind("truncate")
+        migrator.execute("DROP TABLE portal_absent")
+        migrator.execute("CREATE TABLE portal_absent (n BIGINT)")
+        execute(b"C40001")
+        assert migrator.execute("SELECT n FROM portal_target").fetchone() == (0,)
+
+        parse("policy", "DROP POLICY IF EXISTS portal_policy ON portal_target")
+        bind("policy")
+        policy = "CREATE POLICY portal_policy ON portal_target USING (n >= 0)"
+        migrator.execute(policy)
+        execute(b"C40001")
+        bind("policy")
+        migrator.execute("DROP POLICY portal_policy ON portal_target")
+        migrator.execute(policy)
+        execute(b"C40001")
+        migrator.execute("DROP POLICY portal_policy ON portal_target")
+
+        migrator.execute("ALTER TABLE portal_target ADD COLUMN scratch TEXT")
+        parse("column", "ALTER TABLE portal_target DROP COLUMN scratch")
+        bind("column")
+        migrator.execute("ALTER TABLE portal_target DROP COLUMN scratch")
+        migrator.execute("ALTER TABLE portal_target ADD COLUMN scratch BIGINT")
+        execute(b"C40001")
+        assert migrator.execute("SELECT scratch FROM portal_target").fetchone() == (
+            None,
+        )
+
+        for name, statement in (
+            ("update_rebind", "UPDATE portal_target SET scratch = 42"),
+            (
+                "policy_rebind",
+                "CREATE POLICY scratch_policy ON portal_target USING (scratch >= 0)",
+            ),
+            ("index_rebind", "CREATE INDEX scratch_idx ON portal_target (scratch)"),
+            (
+                "check_rebind",
+                "ALTER TABLE portal_target ADD CONSTRAINT scratch_check CHECK (scratch >= 0)",
+            ),
+        ):
+            parse(name, statement)
+            bind(name)
+            migrator.execute("ALTER TABLE portal_target DROP COLUMN scratch")
+            migrator.execute("ALTER TABLE portal_target ADD COLUMN scratch BIGINT")
+            execute(b"C40001")
+
+        constraint = (
+            "ALTER TABLE portal_target ADD CONSTRAINT nonnegative CHECK (n >= 0)"
+        )
+        drop_constraint = "ALTER TABLE portal_target DROP CONSTRAINT nonnegative"
+        migrator.execute(constraint)
+        parse("constraint", drop_constraint)
+        bind("constraint")
+        migrator.execute(drop_constraint)
+        migrator.execute(constraint)
+        execute(b"C40001")
+        migrator.execute(drop_constraint)
+
+        migrator.execute("CREATE TABLE fk_destination (id TEXT PRIMARY KEY)")
+        parse(
+            "fk",
+            "ALTER TABLE portal_target ADD CONSTRAINT bound_fk FOREIGN KEY (id) REFERENCES fk_destination(id)",
+        )
+        bind("fk")
+        migrator.execute("ALTER TABLE fk_destination RENAME TO fk_original")
+        migrator.execute("CREATE TABLE fk_destination (id TEXT PRIMARY KEY)")
+        execute(b"C40001")
+
+        parse(
+            "create_fk",
+            "CREATE TABLE bound_child (a TEXT REFERENCES fk_original(id), "
+            "b TEXT REFERENCES fk_destination(id))",
+        )
+        bind("create_fk")
+        migrator.execute("ALTER TABLE fk_destination RENAME TO fk_replaced")
+        migrator.execute("CREATE TABLE fk_destination (id TEXT PRIMARY KEY)")
+        execute(b"C40001")
+        # The failed portal must leave the child name available.
+        migrator.execute("CREATE TABLE bound_child (id TEXT)")
+        migrator.execute("DROP TABLE bound_child")
+
+        migrator.execute("CREATE SCHEMA portal_namespace")
+        for name, definition_sql in (
+            ("plain", "id TEXT"),
+            ("self_fk", "id TEXT PRIMARY KEY, p TEXT REFERENCES created_here(id)"),
+        ):
+            parse(
+                name, f"CREATE TABLE portal_namespace.created_here ({definition_sql})"
+            )
+            bind(name)
+            migrator.execute("DROP SCHEMA portal_namespace")
+            migrator.execute("CREATE SCHEMA portal_namespace")
+            execute(b"C40001")
+        migrator.execute("DROP SCHEMA portal_namespace")
+
+        migrator.execute("CREATE DATABASE bound_placement")
+        parse("new_schema", "CREATE SCHEMA bound_placement.created_here")
+        bind("new_schema")
+        migrator.execute("DROP DATABASE bound_placement")
+        migrator.execute("CREATE DATABASE bound_placement")
+        execute(b"C40001")
+        space = "CREATE TABLESPACE portal_space LOCATION 's3://bucket/path'"
+        migrator.execute(space)
+        parse("placement", "ALTER DATABASE bound_placement SET TABLESPACE portal_space")
+        bind("placement")
+        migrator.execute("DROP TABLESPACE portal_space")
+        migrator.execute(space)
+        execute(b"C40001")
+        parse(
+            "create_placement",
+            "CREATE TABLE bound_child (id TEXT) TABLESPACE portal_space",
+        )
+        bind("create_placement")
+        migrator.execute("DROP TABLESPACE portal_space")
+        migrator.execute(space)
+        execute(b"C40001")
+        # Removing it also proves that the replacement never acquired either object.
+        migrator.execute("DROP TABLESPACE portal_space")
+
+        create_index = "CREATE INDEX portal_n ON portal_target (n)"
+        migrator.execute(create_index)
+        parse("index", "DROP INDEX portal_n")
+        bind("index")
+        migrator.execute("ALTER TABLE portal_target ADD COLUMN unrelated TEXT")
+        execute()
+        migrator.execute(create_index)
+        bind("index")
+        migrator.execute("DROP INDEX portal_n")
+        migrator.execute(create_index)
+        execute(b"C40001")
+        migrator.execute("DROP INDEX portal_n")
+
+        # A fresh Bind acquires the new identity and unrelated DDL is compatible.
+        bind("drop")
+        migrator.execute("CREATE TABLE graph_other (id TEXT, n BIGINT)")
+        execute()
+        migrator.execute(create)
+
+        graph_url = server.api_url + "/graphs/portal_graph"
+
+        def definition(table):
+            return {"labels": [{"name": "D", "table": table}], "relationships": []}
+
+        with requests.Session() as http:
+            http.auth = ("admin", password)
+            created = http.post(graph_url, json=definition("portal_target"), timeout=10)
+            created.raise_for_status()
+            parse(
+                "graph",
+                "SELECT q.n FROM GRAPH_TABLE(portal_graph MATCH(n IS D) "
+                "COLUMNS(n.n AS n)) q",
+            )
+            bind("graph")
+            changed = http.put(
+                graph_url,
+                json={
+                    "expected_revision": "1",
+                    "definition": definition("graph_other"),
+                },
+                timeout=10,
+            )
+            changed.raise_for_status()
+            execute(b"C40001")
+            bind("graph")
+            execute()
+
+        migrator.execute("INSERT INTO graph_other (id, n) VALUES ('g', 42)")
+        graph_password = secrets.token_hex(16)
+        requests.post(
+            server.url + "/auth/v1/users/portal_reader",
+            auth=("admin", password),
+            json={
+                "password": graph_password,
+                "initial_policies": [
+                    {
+                        "resource_type": "graph",
+                        "resource": "portal_graph",
+                        "type": "read",
+                    },
+                    {
+                        "resource_type": "table",
+                        "resource": "graph_other",
+                        "type": "read",
+                    },
+                    {"resource_type": "namespace", "resource": "*", "type": "read"},
+                ],
+            },
+            timeout=10,
+        ).raise_for_status()
+        query = "SELECT q.n FROM GRAPH_TABLE(portal_graph MATCH(n IS D) COLUMNS(n.n AS n)) q"
+        with (
+            psycopg.connect(
+                url, user="portal_reader", password=graph_password, autocommit=True
+            ) as scoped,
+            psycopg.ClientCursor(scoped) as sql,
+        ):
+            assert scoped.execute(query, prepare=True).fetchall() == [(42,)]
+            sql.execute("BEGIN")
+            sql.execute("DECLARE held CURSOR WITH HOLD FOR " + query)
+            sql.execute("COMMIT")
+            assert sql.execute("FETCH ALL FROM held").fetchall() == [(42,)]
+
+    print("Bound DML, DDL and graph identity across catalog changes: PASS", flush=True)
+
+
+def exercise_cached_search_path(server, password):
+    import psycopg
+    import requests
+
+    url = f"postgres://admin:{password}@127.0.0.1:{server.pgwire_port}/default"
+    with (
+        psycopg.connect(url, autocommit=True) as conn,
+        psycopg.ClientCursor(conn) as sql,
+    ):
+        for schema, column, value in (
+            ("path_first", "n", 1),
+            ("path_second", "n", 2),
+            ("path_renamed", "renamed", 3),
+        ):
+            sql.execute(f"CREATE SCHEMA {schema}")
+            sql.execute(f"CREATE TABLE {schema}.cached_path (id TEXT, {column} BIGINT)")
+            sql.execute(
+                f"INSERT INTO {schema}.cached_path (id, {column}) VALUES ('a', {value})"
+            )
+
+        query = "SELECT * FROM cached_path"
+        sql.execute("SET search_path TO path_first")
+        sql.execute("PREPARE path_plan AS " + query)
+        for schema, value in (("path_first", 1), ("path_second", 2)):
+            sql.execute(f"SET search_path TO {schema}")
+            sql.execute("EXECUTE path_plan")
+            assert sql.fetchone() == ("a", value)
+            assert conn.execute(query, prepare=True).fetchone() == ("a", value)
+
+        sql.execute("SET search_path TO path_renamed")
+        for execute in (
+            lambda: sql.execute("EXECUTE path_plan"),
+            lambda: conn.execute(query, prepare=True),
+        ):
+            try:
+                execute()
+            except psycopg.Error as exc:
+                assert exc.sqlstate == "0A000", exc
+            else:
+                raise AssertionError("cached result accepted a changed column label")
+
+        sql.execute("CREATE TABLE path_second.only_here (n BIGINT)")
+        sql.execute("SET search_path TO path_first, path_second")
+        conn.execute("ALTER TABLE only_here ADD COLUMN k TEXT", prepare=True)
+        sql.execute("SELECT k FROM path_second.only_here")
+        conn.execute("DROP TABLE IF EXISTS only_here", prepare=True)
+        try:
+            sql.execute("SELECT k FROM path_second.only_here")
+        except psycopg.errors.UndefinedTable:
+            pass
+        else:
+            raise AssertionError("DROP TABLE skipped the second search_path entry")
+
+        sql.execute("CREATE TABLE path_second.scoped_ddl (n BIGINT)")
+        scoped_password = secrets.token_hex(16)
+        response = requests.post(
+            server.url + "/auth/v1/users/path_editor",
+            auth=("admin", password),
+            json={
+                "password": scoped_password,
+                "initial_policies": [
+                    {"resource_type": "namespace", "resource": "*", "type": "read"},
+                    {
+                        "resource_type": "table",
+                        "type": "admin",
+                        "table_target": {
+                            "database": "default",
+                            "namespace": "path_second",
+                            "table": "scoped_ddl",
+                        },
+                    },
+                ],
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        with psycopg.connect(
+            url, user="path_editor", password=scoped_password, autocommit=True
+        ) as scoped:
+            scoped.execute("SET search_path TO path_first, path_second")
+            scoped.execute(
+                "ALTER TABLE scoped_ddl ADD COLUMN allowed TEXT", prepare=True
+            )
+            sql.execute("CREATE TABLE path_first.scoped_ddl (n BIGINT)")
+            try:
+                scoped.execute(
+                    "ALTER TABLE scoped_ddl ADD COLUMN denied TEXT", prepare=True
+                )
+            except psycopg.errors.InsufficientPrivilege:
+                pass
+            else:
+                raise AssertionError(
+                    "unqualified ALTER skipped its unauthorized shadowing table"
+                )
+    print(
+        "SQL and wire statements follow search_path and preserve column labels: PASS",
+        flush=True,
+    )
+
+
 def run_clients(url, drivers, http_url=None):
     env = {**os.environ, "ANTFLY_PGWIRE_URL": url}
     if http_url:
@@ -135,29 +545,39 @@ def main():
         run_clients(args.url, args.drivers, args.http_url)
         return
     sys.path.insert(0, str(ROOT / "zig" / "e2e" / "antfly"))
+    import psycopg
     from conftest import AUTH_BOOTSTRAP_PASSWORD, StandaloneAntflyServer
 
+    startup_ddl = iter(
+        (
+            "CREATE TABLE ready_immediately (id TEXT PRIMARY KEY)",
+            "CREATE INDEX ready_after_restart ON ready_immediately(id)",
+        )
+    )
+
+    def first_ddl(server):
+        with psycopg.connect(
+            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
+            autocommit=True,
+        ) as conn:
+            conn.execute(next(startup_ddl))
+
+    # Policy definitions use the standalone owner's signed install authority.
+    os.environ["ANTFLY_TRUSTED_PRINCIPAL_SECRET"] = secrets.token_urlsafe(32)
+    os.environ["ANTFLY_TRUSTED_PRINCIPAL_ISSUER"] = "pgwire-driver-conformance"
     server = StandaloneAntflyServer(
-        str(args.binary.resolve()), "127.0.0.1", 0, pgwire=True
+        str(args.binary.resolve()),
+        "127.0.0.1",
+        0,
+        pgwire=True,
+        on_first_ready=first_ddl,
     )
     failed = False
     try:
-        # First SQL immediately after the fixture observes HTTP readiness: no
-        # publication retry loop may hide a cold-start readiness regression.
-        import psycopg
-
-        with psycopg.connect(
-            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
-            autocommit=True,
-        ) as conn:
-            conn.execute("CREATE TABLE ready_immediately (id TEXT PRIMARY KEY)")
         server.restart()
-        with psycopg.connect(
-            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
-            autocommit=True,
-        ) as conn:
-            conn.execute("CREATE INDEX ready_after_restart ON ready_immediately(id)")
         print("cold-start and restart DDL without retries: PASS", flush=True)
+        exercise_bound_portals(server, AUTH_BOOTSTRAP_PASSWORD)
+        exercise_cached_search_path(server, AUTH_BOOTSTRAP_PASSWORD)
         exercise_cached_setting_plans(server, AUTH_BOOTSTRAP_PASSWORD)
         run_clients(
             f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",

@@ -39,7 +39,7 @@ fn check(buffer: Buffer, bytes: usize) !void {
 pub fn run(ctx: *Context, lt: *Lt, kernels: *Kernels, workspace: Buffer, output: Buffer, temporary: [4]Buffer, inputs: [8]Buffer, input_native: bool, output_mirror: Buffer, rows: usize, hidden: usize, intermediate: usize, eps: f32, exact: bool) !void {
     _ = try runWithReference(ctx, lt, kernels, workspace, output, temporary, inputs, input_native, output_mirror, rows, hidden, intermediate, eps, exact, null, .{}, null);
 }
-pub fn runWithReference(ctx: *Context, lt: *Lt, kernels: *Kernels, workspace: Buffer, output: Buffer, temporary: [4]Buffer, inputs: [8]Buffer, input_native: bool, output_mirror: Buffer, rows: usize, hidden: usize, intermediate: usize, eps: f32, exact: bool, reference: ?*@import("gliner25_bf16_full.zig").Module, first_bias_bf16: Buffer, classic: ?*@import("libraries.zig").CublasF32) !bool {
+pub fn runWithReference(ctx: *Context, lt: *Lt, kernels: *Kernels, workspace: Buffer, output: Buffer, temporary: [4]Buffer, inputs: [8]Buffer, input_native: bool, output_mirror: Buffer, rows: usize, hidden: usize, intermediate: usize, eps: f32, exact: bool, reference: ?*@import("gliner25_bf16_full.zig").Module, first_bias_bf16: Buffer, classic: ?*@import("libraries.zig").Cublas) !bool {
     const biased_dot = if (reference) |ref| ref.flags & 2097152 != 0 else false;
     const float_dot = if (reference) |ref| ref.flags & 131072 != 0 and !biased_dot else false;
     const p = planWithFloatDot(rows, hidden, intermediate, float_dot) orelse return error.InvalidCudaState;
@@ -63,7 +63,7 @@ pub fn runWithReference(ctx: *Context, lt: *Lt, kernels: *Kernels, workspace: Bu
     if (separate_bias) {
         const blas = classic orelse return error.UnsupportedCublasBf16;
         try blas.bindWorkspace(ctx.stream, @ptrFromInt(workspace.ptr), workspace.len);
-        try blas.linearBf16(ctx.stream, @ptrFromInt(temporary[3].ptr), @ptrFromInt(temporary[2].ptr), @ptrFromInt(inputs[4].ptr), rows, intermediate, hidden);
+        try blas.linearBf16WithBoundWorkspace(ctx.stream, @ptrFromInt(temporary[3].ptr), @ptrFromInt(temporary[2].ptr), @ptrFromInt(inputs[4].ptr), rows, intermediate, hidden);
     } else _ = try lt.matmulBf16WeightBiasF32OutWithTuning(ctx, temporary[3], temporary[2], inputs[4], inputs[5], workspace, rows, intermediate, hidden, .{});
     if (reference) |ref| {
         if (separate_bias) try ref.normDotBias(ctx, output, output_mirror, .{ temporary[3], inputs[5], inputs[1], inputs[6], inputs[7] }, rows, hidden, eps) else try ref.norm(ctx, output, output_mirror, .{ temporary[3], inputs[1], inputs[6], inputs[7] }, rows, hidden, eps);
@@ -102,7 +102,7 @@ test "GLiNER BF16 FFN CPU oracle includes bias GELU residual and norm" {
     defer kernels.unload(&ctx);
     var lt = try Lt.openWithAllocator(a, &ctx);
     defer lt.deinit();
-    var classic = try @import("libraries.zig").CublasF32.init(ctx.stream);
+    var classic = try @import("libraries.zig").Cublas.init(ctx.stream);
     defer classic.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

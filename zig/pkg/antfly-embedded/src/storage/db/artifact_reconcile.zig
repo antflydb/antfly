@@ -114,11 +114,15 @@ pub fn step(db: anytype, command: inventory.Command, context: @import("artifact_
     for (producers) |producer| {
         var public = try indexes.enrichmentToPublic(alloc, producer);
         defer public.deinit(alloc);
-        const wanted_bytes = try std.json.Stringify.valueAlloc(alloc, public, .{});
+        var semantic_public = public;
+        semantic_public.execution = null;
+        const wanted_bytes = try std.json.Stringify.valueAlloc(alloc, semantic_public, .{});
         defer alloc.free(wanted_bytes);
         const present = for (current_enrichments) |existing| {
             if (!std.mem.eql(u8, existing.name, public.name)) continue;
-            const actual_bytes = try std.json.Stringify.valueAlloc(alloc, existing, .{});
+            var semantic_existing = existing;
+            semantic_existing.execution = null;
+            const actual_bytes = try std.json.Stringify.valueAlloc(alloc, semantic_existing, .{});
             defer alloc.free(actual_bytes);
             break std.mem.eql(u8, wanted_bytes, actual_bytes);
         } else false;

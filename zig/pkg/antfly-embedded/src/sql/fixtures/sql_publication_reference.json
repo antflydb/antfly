@@ -1,0 +1,131 @@
+{
+  "entries": [
+    {
+      "id": "sql-0114",
+      "sql": "CREATE PUBLICATION usage_pub FOR TABLE usage_records",
+      "command_tag": "CREATE PUBLICATION",
+      "publications": [
+        {
+          "name": "usage_pub",
+          "all_tables": false,
+          "insert": true,
+          "update": true,
+          "delete": true,
+          "truncate": true,
+          "tables": [
+            "usage_records"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0115",
+      "sql": "CREATE PUBLICATION usage_pub_all FOR ALL TABLES",
+      "command_tag": "CREATE PUBLICATION",
+      "publications": [
+        {
+          "name": "usage_pub",
+          "all_tables": false,
+          "insert": true,
+          "update": true,
+          "delete": true,
+          "truncate": true,
+          "tables": [
+            "usage_records"
+          ]
+        },
+        {
+          "name": "usage_pub_all",
+          "all_tables": true,
+          "insert": true,
+          "update": true,
+          "delete": true,
+          "truncate": true,
+          "tables": [
+            "usage_events",
+            "usage_records"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0116",
+      "sql": "ALTER PUBLICATION usage_pub ADD TABLE usage_events",
+      "command_tag": "ALTER PUBLICATION",
+      "publications": [
+        {
+          "name": "usage_pub",
+          "all_tables": false,
+          "insert": true,
+          "update": true,
+          "delete": true,
+          "truncate": true,
+          "tables": [
+            "usage_events",
+            "usage_records"
+          ]
+        },
+        {
+          "name": "usage_pub_all",
+          "all_tables": true,
+          "insert": true,
+          "update": true,
+          "delete": true,
+          "truncate": true,
+          "tables": [
+            "usage_events",
+            "usage_records"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0117",
+      "sql": "DROP PUBLICATION usage_pub",
+      "command_tag": "DROP PUBLICATION",
+      "publications": [
+        {
+          "name": "usage_pub_all",
+          "all_tables": true,
+          "insert": true,
+          "update": true,
+          "delete": true,
+          "truncate": true,
+          "tables": [
+            "usage_events",
+            "usage_records"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0118",
+      "sql": "DROP PUBLICATION IF EXISTS usage_pub",
+      "command_tag": "DROP PUBLICATION",
+      "publications": [
+        {
+          "name": "usage_pub_all",
+          "all_tables": true,
+          "insert": true,
+          "update": true,
+          "delete": true,
+          "truncate": true,
+          "tables": [
+            "usage_events",
+            "usage_records"
+          ]
+        }
+      ]
+    }
+  ],
+  "future_create": "CREATE TABLE usage_future (id integer PRIMARY KEY, payload text)",
+  "future_insert": "INSERT INTO usage_future (id, payload) VALUES (3, 'captured-future')",
+  "future_tables": [
+    "usage_events",
+    "usage_future",
+    "usage_records"
+  ],
+  "future_preserves_publication_identity": true,
+  "alter_preserves_identity": true,
+  "recreation_uses_new_identity": true
+}

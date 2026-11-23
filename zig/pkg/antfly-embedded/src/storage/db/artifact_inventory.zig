@@ -134,13 +134,18 @@ pub const Catalogs = struct {
     pub fn jsonStringify(self: Catalogs, stream: anytype) @TypeOf(stream.*).Error!void {
         // AIDX contains arbitrary generation/count bytes, not UTF-8. Catalog
         // control messages are bounded and occur once per schema/copy epoch.
-        try @import("relational_integrity_json.zig").write(self, stream);
+        try @import("relational/integrity/json.zig").write(self, stream);
     }
 
     /// Compatibility is about definitions, not owner-local physical generation
     /// numbers or catalog insertion order. Exact `digest` still binds all bytes.
     pub fn semanticDigest(self: Catalogs, alloc: std.mem.Allocator) ![32]u8 {
         return @import("artifact_semantics.zig").digest(alloc, self.indexes, self.enrichments, self.resolvers);
+    }
+
+    pub fn matchesSemanticDigest(self: Catalogs, alloc: std.mem.Allocator, expected: [32]u8) !bool {
+        if (std.meta.eql(expected, try self.semanticDigest(alloc))) return true;
+        return std.meta.eql(expected, try @import("artifact_semantics.zig").legacyDigest(alloc, self.indexes, self.enrichments, self.resolvers));
     }
 
     pub fn digest(self: Catalogs) [32]u8 {
@@ -176,8 +181,7 @@ pub const Command = struct {
             return error.InvalidArtifactCatalogCommand;
         {
             const semantic = self.binding.semantic_digest;
-            const actual = self.catalogs.semanticDigest(std.heap.page_allocator) catch return error.InvalidArtifactCatalogCommand;
-            if (!std.mem.eql(u8, &semantic, &actual)) return error.InvalidArtifactCatalogCommand;
+            if (!(self.catalogs.matchesSemanticDigest(std.heap.page_allocator, semantic) catch return error.InvalidArtifactCatalogCommand)) return error.InvalidArtifactCatalogCommand;
         }
     }
 };
@@ -242,11 +246,10 @@ pub fn validateRequest(req: anytype) !void {
     try command.validate();
     const empty: @TypeOf(req) = .{};
     inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |reflected_name, field_type| {
-        if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, reflected_name, "artifact_catalog") and !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "online_source") and !std.mem.eql(u8, reflected_name, "merge_checkpoint") and !std.mem.eql(u8, reflected_name, "merge_replication")) {
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (@field(req, reflected_name).len != 0) return error.InvalidArtifactCatalogCommand;
-            } else if (!std.meta.eql(@field(req, reflected_name), @field(empty, reflected_name))) return error.InvalidArtifactCatalogCommand;
+            } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(reflected_name, @field(req, reflected_name), @field(empty, reflected_name))) return error.InvalidArtifactCatalogCommand;
         }
     }
     if (req.online_source) |source| if (source != .admit or req.merge_checkpoint != null or req.merge_replication != null or !std.meta.eql(source.admit.artifact_catalog, @as(?Binding, command.binding))) return error.InvalidArtifactCatalogCommand;
@@ -404,7 +407,12 @@ pub fn requireReady(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, e
 
 pub fn requireCompatibleReady(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, expected: Binding) !void {
     const observed = try status(alloc, txn, namespace);
-    if (!observed.ready or observed.ordered == null or !observed.ordered.?.compatible(expected)) return error.ArtifactCatalogDrift;
+    if (!observed.ready or observed.ordered == null or !expected.valid() or !observed.ordered.?.valid() or observed.ordered.?.effect_protocol != expected.effect_protocol) return error.ArtifactCatalogDrift;
+    if (observed.ordered.?.compatible(expected)) return;
+    // An existing ordered command may carry the pre-policy digest. Validate
+    // against its exact current catalogs rather than accepting an arbitrary
+    // mismatched digest or rewriting immutable proof bytes.
+    if (!(try (try catalogs(txn)).matchesSemanticDigest(alloc, expected.semantic_digest))) return error.ArtifactCatalogDrift;
 }
 
 /// A new owner must establish its own ordering. Copying a source's seal into a

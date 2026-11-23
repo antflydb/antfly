@@ -524,8 +524,7 @@ pub fn step(a: std.mem.Allocator, program: *Program, trainer: *controller.Traine
     var bound = true;
     defer if (bound) binding.deinit();
     const combined = try std.mem.concat(scratch, interpreter.RuntimeInput, &.{ binding.inputs, try bindFrozen(scratch, &program.graph, program.frozen), runtime });
-    const backward_inputs = try scratch.alloc(interpreter.RuntimeInput, combined.len);
-    for (combined, backward_inputs) |input, *dst| dst.* = .{ .node_id = program.gradients.id_map[input.node_id], .value = input.value };
+    const backward_inputs = try interpreter.remapRuntimeInputs(scratch, &.{combined}, program.gradients.id_map, program.gradients.graph.nodeCount());
     var pending = LossInput{
         .a = a,
         .scratch = scratch,

@@ -221,7 +221,7 @@ pub const Instruction = struct {
                     (backward and !self.inputs[2].eq(layout.outputShape())) or
                     !self.output.eq(if (backward) layout.qkvShape() else layout.outputShape()))
                     return error.InvalidResidentProgramShape;
-                const attention = @import("modernbert_training_attention.zig");
+                const attention = @import("range_attention_reference.zig");
                 geometry.scratch_bytes = try attention.scratchBytes(attrs, backward);
                 // The control's retained host copy is validated per call.
                 geometry.host_metadata_bytes = geometry.input_elements[1] * 4;

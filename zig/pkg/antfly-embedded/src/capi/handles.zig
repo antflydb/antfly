@@ -45,12 +45,23 @@ pub const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     db_live: bool = true,
+    /// Private boot recovery handles expose native control observations only.
+    storage_owner_lifetime_recovery: bool = false,
     io_lifetime_lease: bool = false,
     /// Public Lite connections borrow a persistent compatible storage owner.
     lite_connection: ?*@import("lite_connection.zig").Connection = null,
     /// Active connection context while its private SQL state is attached.
     lite_connection_context: ?*@import("lite_connection.zig").Connection = null,
     lease_snapshot: bool = false,
+    /// The root file's `NativeFile.adoptionEpoch()` when the Lite owner last
+    /// decided this root was current. A later adoption (a writer's begin,
+    /// a lease-time commit) can make the file match a fresh probe while this
+    /// root's in-memory runtime still reflects the older state.
+    lite_refresh_adoption_epoch: u64 = 0,
+    /// The root file's committed sequence its loaded runtime (indexes cache
+    /// their content in memory) is known to reflect. Another process's index
+    /// change past it forces a reopen, even after the file adopted it.
+    lite_runtime_sequence: u64 = 0,
     selected_table_name: ?[]u8 = null,
     selected_table_id: u64 = 0,
     // Table handles borrow a DB and enter their owning database's fence.
@@ -118,10 +129,15 @@ pub const Handle = struct {
     storage_owner_managed_config: local_write.OwnerManagedConfig = .{},
     storage_owner_target_observer: kernel_owner_abi.TargetObserver = .{},
     storage_owner_table_name: ?[]u8 = null,
+    sql_preparation_secret: ?[]u8 = null,
+    sql_preparation_issuer: ?[]u8 = null,
     row_policy_authority_secret: ?[]u8 = null,
     row_policy_authority_issuer: ?[]u8 = null,
     storage_owner_group_id: u64 = 0,
     storage_owner_root_generation: u64 = 0,
+    /// One bounded committed schema preparation per physical owner. Its
+    /// registry pin must be drained on the control lane before owner close.
+    storage_owner_schema_preparing: std.atomic.Value(bool) = .init(false),
     storage_owner_context: ?*anyopaque = null,
     storage_owner_transaction_recovery: ?*anyopaque = null,
     storage_owner_runtime_hooks: ?*anyopaque = null,
@@ -141,6 +157,20 @@ pub const Handle = struct {
     query_producer_mutex: std.Io.Mutex = .init,
     /// Protected by the native path gate; pins provider and extractor lifetime.
     query_borrows: usize = 0,
+    /// WS3 writer lane: how many in-flight lane members (`WriterLane.
+    /// checkout` through the matching unpin in `HandleGuard.
+    /// leaveWithRegistry`, spanning that call's own durability wait) are
+    /// pinning this generation. Atomic, unlike `query_borrows`: lane
+    /// members pin/unpin without holding `connection.gate.mutex`
+    /// (the whole point of the lane), so concurrent same-Store writers
+    /// can touch this from different threads with no other lock in
+    /// common. `Owner.collectRetired` must never close a generation while
+    /// this is nonzero -- a writer still mid-flight on it, specifically
+    /// because another concurrent writer's own lane checkout triggered a
+    /// refresh/replacement, must never see its own backend torn out from
+    /// under it (observed empirically as a `metadata_pool`/
+    /// `source_certificates` crash before this field existed).
+    lane_pins: std.atomic.Value(usize) = .init(0),
     /// Borrowers executing against this root's immutable catalog and indexes.
     /// The path gate protects this count; refresh must replace rather than
     /// mutate a root while any such borrower remains.
@@ -170,6 +200,7 @@ pub const Handle = struct {
     }
 
     pub fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
+        if (self.storage_owner_lifetime_recovery) return error.SqlRelationRecoveryIncomplete;
         const hook = self.readable_lease_hook orelse return;
         try hook.featureReads().prepareSearch(hook.group_id, req);
     }
@@ -195,6 +226,7 @@ pub const Handle = struct {
     }
 
     pub fn prepareLookupRequest(self: *Handle, key: []const u8, opts: db_mod.types.LookupOptions) !void {
+        if (self.storage_owner_lifetime_recovery) return error.SqlRelationRecoveryIncomplete;
         const hook = self.readable_lease_hook orelse return;
         try hook.featureReads().prepareLookup(hook.group_id, key, opts);
     }
@@ -205,6 +237,7 @@ pub const Handle = struct {
         to_key: []const u8,
         opts: db_mod.types.ScanOptions,
     ) !void {
+        if (self.storage_owner_lifetime_recovery) return error.SqlRelationRecoveryIncomplete;
         const hook = self.readable_lease_hook orelse return;
         try hook.featureReads().prepareScan(hook.group_id, from_key, to_key, opts);
     }
@@ -316,6 +349,11 @@ pub fn closeHandle(handle: *Handle) void {
     if (handle.owned_lite_runtime) |*runtime| runtime.deinit();
     if (handle.storage_owner_path) |path| handle.alloc.free(path);
     if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
+    if (handle.sql_preparation_secret) |secret| {
+        @memset(secret, 0);
+        handle.alloc.free(secret);
+    }
+    if (handle.sql_preparation_issuer) |issuer| handle.alloc.free(issuer);
     if (handle.row_policy_authority_secret) |secret| {
         @memset(secret, 0);
         handle.alloc.free(secret);

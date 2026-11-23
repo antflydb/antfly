@@ -174,7 +174,7 @@ def main():
                         co = core[offset * width :]
                         go = gold[offset * width :]
                         gpu.launch(
-                            "lighton_conv",
+                            "antfly_gdn_causal_conv",
                             ((channels + 127) // 128, 1),
                             128,
                             *map(pointer, (xx, cw, h, nh, cv)),

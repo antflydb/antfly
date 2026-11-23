@@ -33,6 +33,7 @@ INFERENCE_SPEC = ROOT / "specs/openapi/inference/api.yaml"
 GATEWAY_SPEC = ROOT / "specs/openapi/inference/gateway.yaml"
 EXTENSIONS_SPEC = ROOT / "specs/openapi/extensions/api.yaml"
 MEMORY_SPEC = ROOT / "specs/openapi/memory/api.yaml"
+CHANGEFEED_SPEC = ROOT / "specs/openapi/antfly/changefeeds.yaml"
 OUTPUT = ROOT / "openapi.yaml"
 
 
@@ -271,6 +272,7 @@ def join_specs() -> dict:
     )
     extensions = load_yaml(EXTENSIONS_SPEC)
     memory = load_yaml(MEMORY_SPEC)
+    changefeeds = load_yaml(CHANGEFEED_SPEC)
     # Vendor adapters preserve actual usage when available. The native runtime
     # keeps its own stronger usage contract; the public gateway may omit it.
     for name in (
@@ -301,10 +303,11 @@ def join_specs() -> dict:
         )
     for path, item in extensions.get("paths", {}).items():
         paths[extension_public_path(path)] = copy.deepcopy(item)
-    for path, item in memory.get("paths", {}).items():
-        if path in paths:
-            raise RuntimeError(f"duplicate memory path: {path}")
-        paths[path] = copy.deepcopy(item)
+    for spec in (memory, changefeeds):
+        for path, item in spec.get("paths", {}).items():
+            if path in paths:
+                raise RuntimeError(f"duplicate public path: {path}")
+            paths[path] = copy.deepcopy(item)
 
     tags = []
     seen_tags = set()
@@ -313,6 +316,7 @@ def join_specs() -> dict:
         + inference.get("tags", [])
         + extensions.get("tags", [])
         + memory.get("tags", [])
+        + changefeeds.get("tags", [])
     ):
         name = item.get("name") if isinstance(item, dict) else None
         if not name or name in seen_tags:
@@ -339,7 +343,10 @@ def join_specs() -> dict:
         "components": merge_component_sections(
             merge_components(antfly, inference, inference_schema_names),
             merge_component_sections(
-                extensions.get("components", {}), memory.get("components", {})
+                extensions.get("components", {}),
+                merge_component_sections(
+                    memory.get("components", {}), changefeeds.get("components", {})
+                ),
             ),
         ),
         "x-tagGroups": [
@@ -351,6 +358,7 @@ def join_specs() -> dict:
                     "data_operations",
                     "query_operations",
                     "index_management",
+                    "changefeeds",
                 ],
             },
             {

@@ -451,9 +451,9 @@ pub const Scenario = struct {
 
     pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
         world.state.cleanup();
-        const allocation_status = world.state.fixture_allocator.deinit();
-        if (allocation_status != .ok) std.debug.print("media runtime leaked allocations in mode={s}\n", .{@tagName(world.state.mode.?)});
-        std.debug.assert(allocation_status == .ok);
+        const leaked_allocations = world.state.fixture_allocator.deinit();
+        if (leaked_allocations != 0) std.debug.print("media runtime leaked {d} allocations in mode={s}\n", .{ leaked_allocations, @tagName(world.state.mode.?) });
+        std.debug.assert(leaked_allocations == 0);
         allocator.destroy(world.state);
         world.* = undefined;
     }

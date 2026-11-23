@@ -17,6 +17,7 @@
 //! Publication metadata invalidates the index; only the selected receipt's
 //! artifacts are revalidated on the execution path. No model weights are read.
 const std = @import("std");
+const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const registry = @import("registry.zig");
 const catalog_publication = @import("catalog_publication.zig");
 pub const ResolvedModel = @import("model_selection.zig").ResolvedModel;
@@ -74,6 +75,11 @@ pub const Inventory = struct {
     generation: catalog_publication.Generation = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, models_dir: []const u8) !Inventory {
+        return initWithControl(allocator, io, models_dir, .{});
+    }
+
+    fn initWithControl(allocator: std.mem.Allocator, io: std.Io, models_dir: []const u8, control: ExecutionControl) !Inventory {
+        try control.check();
         var temporary = std.heap.ArenaAllocator.init(allocator);
         defer temporary.deinit();
         var source = registry.ModelRegistry.init(temporary.allocator(), models_dir);
@@ -89,6 +95,7 @@ pub const Inventory = struct {
         roots[0] = result.models_dir;
         for (tasks, roots[1..]) |task, *root| root.* = try std.fs.path.join(a, &.{ models_dir, task });
         for (roots) |root| {
+            try control.check();
             try watchPath(&paths, a, io, root);
             var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
                 error.FileNotFound, error.NotDir => continue,
@@ -97,6 +104,7 @@ pub const Inventory = struct {
             defer dir.close(io);
             var iterator = dir.iterate();
             while (try iterator.next(io)) |entry| {
+                try control.check();
                 if (entry.name.len == 0 or entry.name[0] == '.') continue;
                 if (entry.kind != .directory and entry.kind != .sym_link and entry.kind != .unknown) continue;
                 const child = try std.fs.path.join(a, &.{ root, entry.name });
@@ -109,6 +117,7 @@ pub const Inventory = struct {
                 defer owner.close(io);
                 var candidates = owner.iterate();
                 while (try candidates.next(io)) |candidate| {
+                    try control.check();
                     if (candidate.name.len == 0 or candidate.name[0] == '.') continue;
                     if (candidate.kind != .directory and candidate.kind != .sym_link and candidate.kind != .unknown) continue;
                     // Incomplete managed directories are absent from discovery,
@@ -119,7 +128,7 @@ pub const Inventory = struct {
                 }
             }
         }
-        const found = try source.discoverInstallations(io);
+        const found = try source.discoverInstallationsWithControl(io, control);
         for (found) |entry| {
             try watchInstallation(&paths, a, io, entry.path);
         }
@@ -127,6 +136,7 @@ pub const Inventory = struct {
         const entries = try a.alloc(registry.ModelEntry, found.len);
         const names = try a.alloc([]const []const u8, found.len);
         for (found, entries, names) |entry, *out, *selectors| {
+            try control.check();
             var candidate = std.heap.ArenaAllocator.init(allocator);
             defer candidate.deinit();
             const managed = try registry.managedModelSelectorsAlloc(candidate.allocator(), io, entry.path);
@@ -142,7 +152,7 @@ pub const Inventory = struct {
         }
         result.discovered = entries;
         result.names = names;
-        try result.buildOwners();
+        try result.buildOwners(control);
         const watches = try a.alloc(Watch, paths.count());
         var iterator = paths.iterator();
         var i: usize = 0;
@@ -152,10 +162,14 @@ pub const Inventory = struct {
     }
 
     pub fn loadStable(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !Inventory {
+        return loadStableWithControl(allocator, io, root, .{});
+    }
+
+    pub fn loadStableWithControl(allocator: std.mem.Allocator, io: std.Io, root: []const u8, control: ExecutionControl) !Inventory {
         for (0..3) |_| {
-            var inventory = try init(allocator, io, root);
+            var inventory = try initWithControl(allocator, io, root, control);
             errdefer inventory.deinit();
-            if (!try inventory.changed(io)) return inventory;
+            if (!try inventory.changed(io, control)) return inventory;
             inventory.deinit();
         }
         return error.ModelInventoryChanged;
@@ -166,7 +180,7 @@ pub const Inventory = struct {
         self.* = undefined;
     }
 
-    fn buildOwners(self: *Inventory) !void {
+    fn buildOwners(self: *Inventory, control: ExecutionControl) !void {
         const a = self.arena.allocator();
         for (tasks, &self.owners) |task, *owners| {
             const aliases = scopes(task);
@@ -174,6 +188,7 @@ pub const Inventory = struct {
             for (physical) |scope| {
                 var local = std.StringHashMapUnmanaged(Owner).empty;
                 for (self.discovered, self.names) |entry, selectors| {
+                    try control.check();
                     if (!registry.modelInTaskScope(self.models_dir, entry.path, scope)) continue;
                     for (selectors) |selector| {
                         const bare = std.mem.indexOfAny(u8, selector, ":@") == null;
@@ -213,16 +228,23 @@ pub const Inventory = struct {
         return selected;
     }
 
-    fn changed(self: *const Inventory, io: std.Io) !bool {
+    fn changed(self: *const Inventory, io: std.Io, control: ExecutionControl) !bool {
         const current = try catalog_publication.read(self.arena.child_allocator, io, self.models_dir);
         if (!std.meta.eql(self.generation, current)) return true;
         if (current.kind != .legacy) return false;
-        for (self.watches) |watch| if (!std.meta.eql(watch.stamp, try stamp(io, watch.path))) return true;
+        for (self.watches) |watch| {
+            try control.check();
+            if (!std.meta.eql(watch.stamp, try stamp(io, watch.path))) return true;
+        }
         return false;
     }
 
     pub fn requireCurrentGeneration(self: *const Inventory, io: std.Io) !void {
-        if (try self.changed(io)) return error.ModelArtifactsChanging;
+        return self.requireCurrentGenerationWithControl(io, .{});
+    }
+
+    pub fn requireCurrentGenerationWithControl(self: *const Inventory, io: std.Io, control: ExecutionControl) !void {
+        if (try self.changed(io, control)) return error.ModelArtifactsChanging;
     }
 
     fn clone(self: *const Inventory, allocator: std.mem.Allocator) !Inventory {
@@ -247,7 +269,7 @@ pub const Inventory = struct {
         const watches = try a.alloc(Watch, self.watches.len);
         for (self.watches, watches) |watch, *owned| owned.* = .{ .path = try a.dupe(u8, watch.path), .stamp = watch.stamp };
         copy.watches = watches;
-        try copy.buildOwners();
+        try copy.buildOwners(.{});
         return copy;
     }
 };
@@ -267,11 +289,15 @@ pub const Cache = struct {
         epoch: usize,
         rebuilt_at: std.Io.Timestamp,
     };
-    const Lease = struct {
+    pub const Lease = struct {
         cache: *Cache,
         slot: *Slot,
         io: std.Io,
-        fn release(self: Lease) void {
+        pub fn inventory(self: Lease) *const Inventory {
+            return &self.slot.inventory;
+        }
+
+        pub fn release(self: Lease) void {
             self.cache.mutex.lockUncancelable(self.io);
             self.slot.refs -= 1;
             const destroy = self.slot.refs == 0;
@@ -302,10 +328,11 @@ pub const Cache = struct {
         slot.refs += 1;
         return .{ .cache = self, .slot = slot, .io = io };
     }
-    fn acquire(self: *Cache, io: std.Io, root: []const u8, catalog_backstop: bool) !Lease {
+    fn acquire(self: *Cache, io: std.Io, root: []const u8, catalog_backstop: bool, control: ExecutionControl) !Lease {
+        try control.check();
         if (try self.retain(io)) |lease| {
             errdefer lease.release();
-            const unchanged = std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io);
+            const unchanged = std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io, control);
             if (unchanged) {
                 const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
                 if ((!catalog_backstop and lease.slot.inventory.generation.kind != .legacy) or age < 5 * std.time.ns_per_s) return lease;
@@ -313,22 +340,22 @@ pub const Cache = struct {
                 // publications are unchanged and execution revalidates its
                 // selected receipt, so readers can retain this generation.
                 if (!self.refresh_mutex.tryLock()) return lease;
-            } else try self.refresh_mutex.lock(io);
+            } else try self.lockRefresh(io, control);
             lease.release();
-        } else try self.refresh_mutex.lock(io);
+        } else try self.lockRefresh(io, control);
         defer self.refresh_mutex.unlock(io);
 
         // Coalesce queued discovery/lookup refreshes after the first publishes.
         if (try self.retain(io)) |lease| {
             errdefer lease.release();
             const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
-            if (((!catalog_backstop and lease.slot.inventory.generation.kind != .legacy) or age < 5 * std.time.ns_per_s) and std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io)) return lease;
+            if (((!catalog_backstop and lease.slot.inventory.generation.kind != .legacy) or age < 5 * std.time.ns_per_s) and std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io, control)) return lease;
             lease.release();
         }
         self.mutex.lockUncancelable(io);
         const epoch = self.epoch;
         self.mutex.unlock(io);
-        var next = try Inventory.loadStable(self.allocator, io, root);
+        var next = try Inventory.loadStableWithControl(self.allocator, io, root, control);
         errdefer next.deinit();
         const slot = try self.allocator.create(Slot);
         errdefer self.allocator.destroy(slot);
@@ -346,6 +373,19 @@ pub const Cache = struct {
         return .{ .cache = self, .slot = slot, .io = io };
     }
 
+    fn lockRefresh(self: *Cache, io: std.Io, control: ExecutionControl) !void {
+        if (control.deadline_ns == null and control.cancellation == null and control.check_fn == null)
+            return self.refresh_mutex.lock(io);
+        while (!self.refresh_mutex.tryLock()) {
+            try control.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    pub fn borrowInventory(self: *Cache, io: std.Io, root: []const u8, control: ExecutionControl) !Lease {
+        return self.acquire(io, root, true, control);
+    }
+
     pub fn invalidate(self: *Cache, io: std.Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -353,7 +393,7 @@ pub const Cache = struct {
     }
 
     pub fn snapshot(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8) !Inventory {
-        const lease = try self.acquire(io, root, true);
+        const lease = try self.acquire(io, root, true, .{});
         defer lease.release();
         return lease.slot.inventory.clone(allocator);
     }
@@ -367,7 +407,7 @@ pub const Cache = struct {
         // imports. Existing coordinated pinned hits never scan other models.
         var retried_catalog = false;
         const lookup = blk: while (true) {
-            const lease = try self.acquire(io, root, retried_catalog);
+            const lease = try self.acquire(io, root, retried_catalog, .{});
             defer lease.release();
             const selected = (try lease.slot.inventory.lookup(requested, task)) orelse {
                 if (!std.meta.eql(lease.slot.inventory.generation, try catalog_publication.read(allocator, io, root))) return error.ModelArtifactsChanging;

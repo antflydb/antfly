@@ -40,6 +40,7 @@ const recovery_mod = @import("lsm_backend/recovery.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const cache_mod = @import("lsm_backend/cache.zig");
 const wal_mod = @import("lsm_backend/wal.zig");
+const wal_trace = @import("write_amplification_trace.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
@@ -1510,6 +1511,8 @@ pub const Backend = struct {
         ) !wal_mod.AppendResult {
             self.reset_proven = false;
             errdefer self.invalidatePrimary();
+            const wal_trace_scope = wal_trace.scope(.lsm_backend_wal);
+            defer wal_trace_scope.end();
             const result = try wal_mod.appendStateWithOptionsResult(
                 storage,
                 allocator,
@@ -1660,6 +1663,7 @@ pub const Backend = struct {
     root_writer_lock: ?storage_io.NativePathLock = null,
     wal_operation_lock_file: ?storage_io.NativePathLockFile = null,
     storage_owner: ?*storage_io.NativeStorage = null,
+    native_storage_owner_transferred: bool = false,
     storage: ?storage_io.Storage = null,
     manifest_backing: ?[]u8 = null,
     recovered_manifest: ?@import("lsm_backend/manifest_replay.zig").RecoveryState = null,
@@ -2357,13 +2361,19 @@ pub const Backend = struct {
     pub fn pinNativeCheckpoint(self: *Backend) !NativeCheckpoint {
         const root_dir = self.root_dir orelse return error.Unsupported;
         const storage = self.storage orelse return error.Unsupported;
-        if (self.options.backend.read_only) return error.ReadOnly;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
-        try self.flushCheckpointCutLocked();
-        if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
-            try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
+        if (self.options.backend.read_only) {
+            // An installed immutable checkpoint has no journal suffix. A
+            // read-only recovery that replayed writes cannot export its run
+            // set alone without silently losing the recovered memtables.
+            if (self.mutable.entryCount() != 0 or self.activeImmutableMemtableCount() != 0) return error.ReadOnly;
+        } else {
+            try self.flushCheckpointCutLocked();
+            if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
+                try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
+            }
         }
         // Export only the pinned generation, not a live edit stream or its
         // obsolete-file history. Restores need no journal suffix or old SSTs.
@@ -2808,6 +2818,16 @@ pub const Backend = struct {
     pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
         const owner = self.storage_owner orelse return null;
         return try owner.acquireLease();
+    }
+
+    /// Move destruction responsibility to a successor while the LSM still
+    /// borrows the runtime during its shutdown. The successor must outlive
+    /// shutdown and close the transferred owner with the page allocator.
+    pub fn transferNativeStorageOwnership(self: *Backend) ?*storage_io.NativeStorage {
+        const owner = self.storage_owner orelse return null;
+        std.debug.assert(!self.native_storage_owner_transferred);
+        self.native_storage_owner_transferred = true;
+        return owner;
     }
 
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
@@ -6248,7 +6268,10 @@ pub const Backend = struct {
     }
 
     pub fn checkpointWalAfterDurableBoundary(self: *Backend) !void {
-        if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
+        // A no-WAL owner still needs a manifested immutable boundary for
+        // clean shutdown and physical capture. Only WAL retirement below is
+        // conditional on WAL ownership; flushing user values is not.
+        if (self.root_dir == null or self.options.backend.read_only) return;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
@@ -11981,6 +12004,32 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
             try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
             try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+        }
+
+        test "lsm backend no WAL durable boundary survives cold reopen without destructor flush" {
+            var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const root_dir = "/lsm-no-wal-durable-boundary";
+            const options: Options = .{ .flush_threshold = 1024, .wal_enabled = false, .storage = storage.storage() };
+            var first = try Backend.open(std.testing.allocator, root_dir, options);
+            var first_open = true;
+            defer if (first_open) first.close();
+            {
+                var txn = try first.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
+                try txn.commit();
+            }
+            try std.testing.expectEqual(@as(usize, 1), first.mutable.entryCount());
+            try std.testing.expectEqual(@as(u64, 0), first.snapshotMaintenanceStats().wal_retained_bytes);
+            try first.checkpointWalAfterDurableBoundary();
+            try std.testing.expectEqual(@as(usize, 0), first.mutable.entryCount());
+            first.abandonAfterCrash();
+            first_open = false;
+            var second = try Backend.open(std.testing.allocator, root_dir, options);
+            defer second.close();
+            try std.testing.expectEqualStrings("alpha", try second.getMergedWithMutable(&second.mutable, .{ .name = "docs" }, "doc:a"));
+            try std.testing.expectEqual(@as(u64, 0), second.snapshotMaintenanceStats().wal_retained_bytes);
         }
 
         test "lsm backend accounts in-memory recovery state in the resource manager and releases it on close" {

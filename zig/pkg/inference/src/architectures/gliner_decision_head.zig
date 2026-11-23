@@ -72,24 +72,7 @@ pub fn forwardCt(
     if (marker_positions.len != rows or marker_mask.len != rows)
         return error.InvalidInputShape;
 
-    const row_ids = try allocator.alloc(u32, rows);
-    defer allocator.free(row_ids);
-    const fallback_ids = try allocator.alloc(i64, rows);
-    defer allocator.free(fallback_ids);
-    for (marker_positions, marker_mask, row_ids, fallback_ids, 0..) |position, mask, *row_id, *fallback, index| {
-        if (mask != 0 and mask != 1) return error.InvalidGlinerDecisionMarkerMask;
-        if (mask == 1 and (position < 0 or position >= seq_len))
-            return error.InvalidGlinerDecisionMarkerPosition;
-        const local: usize = if (mask == 1) @intCast(position) else 0;
-        const global = try std.math.add(usize, try checkedMul(index / labels, seq_len), local);
-        row_id.* = std.math.cast(u32, global) orelse return error.InvalidInputShape;
-        fallback.* = @intCast(global);
-    }
-
-    const gathered = if (try cb.takeRows(hidden, row_ids, rows, hidden_size)) |value|
-        value
-    else
-        try cb.embeddingLookup(hidden, fallback_ids, rows, hidden_size);
+    const gathered = try gatherMarkers(cb, allocator, hidden, marker_positions, marker_mask, batch, seq_len, labels, hidden_size);
     defer cb.free(gathered);
 
     const hidden2 = try checkedMul(hidden_size, 2);
@@ -115,6 +98,29 @@ pub fn forwardCt(
         .batch = batch,
         .labels = labels,
     };
+}
+
+fn gatherMarkers(cb: *const ComputeBackend, allocator: std.mem.Allocator, hidden: CT, marker_positions: []const i64, marker_mask: []const i64, batch: usize, seq_len: usize, labels: usize, hidden_size: usize) !CT {
+    if (cb.kind() == .graph) return @import("../execution/indexed_rows.zig").gatherBatchLocal(cb, allocator, hidden, marker_positions, marker_mask, batch, seq_len, labels, hidden_size);
+    const rows = try checkedMul(batch, labels);
+    const row_ids = try allocator.alloc(u32, rows);
+    defer allocator.free(row_ids);
+    const fallback_ids = try allocator.alloc(i64, rows);
+    defer allocator.free(fallback_ids);
+    for (marker_positions, marker_mask, row_ids, fallback_ids, 0..) |position, mask, *row_id, *fallback, index| {
+        if (mask != 0 and mask != 1) return error.InvalidGlinerDecisionMarkerMask;
+        if (mask == 1 and (position < 0 or position >= seq_len))
+            return error.InvalidGlinerDecisionMarkerPosition;
+        const local: usize = if (mask == 1) @intCast(position) else 0;
+        const global = try std.math.add(usize, try checkedMul(index / labels, seq_len), local);
+        row_id.* = std.math.cast(u32, global) orelse return error.InvalidInputShape;
+        fallback.* = @intCast(global);
+    }
+
+    return if (try cb.takeRows(hidden, row_ids, rows, hidden_size)) |value|
+        value
+    else
+        try cb.embeddingLookup(hidden, fallback_ids, rows, hidden_size);
 }
 
 const Fixture = struct {

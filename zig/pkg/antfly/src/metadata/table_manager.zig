@@ -22,12 +22,78 @@ pub const artifact_sources_protocol_version: u16 = 4;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
-pub const relational_topology_protocol_version: u16 = 2;
+/// Version 2 is the deployed coordinated-integrity contract. Version 3 also
+/// executes captured query output, global row ordinals and sealed completion.
+pub const coordinated_integrity_protocol_version: u16 = 2;
+pub const query_population_protocol_version: u16 = 3;
+pub const materialized_view_protocol_version: u16 = 4;
+/// Raw graph reads fail closed under RLS; retained SQL graph cuts reauthorize
+/// each traversed node. Publication requires every data owner to attest this.
+pub const graph_row_policy_protocol_version: u16 = 5;
+/// Native-local TEMP/UNLOGGED owners and authenticated boot recovery.
+/// Artifact-backed restoration has an independent, stricter admission floor.
+pub const native_relation_protocol_version: u16 = 6;
+/// Atomic graph attachments in prepared primary-row intents.
+pub const graph_transaction_protocol_version: u16 = 7;
+comptime {
+    // Store registration and status producers publish this exact constant.
+    // A build cannot advertise semantic7 with the historical batch33 decoder.
+    const batch = @import("../common/data_raft_protocol.zig");
+    if (!batch.graphCapabilityCoupled(relational_topology_protocol_version, batch.batch_protocol_version))
+        @compileError("semantic data7 requires serving Raft batch34");
+}
+/// Artifact-backed native restoration requires independently qualified image
+/// repair and replay after owner loss. A decoder ceiling is not readiness.
+pub const native_nonempty_restore_protocol_version: u16 = 10;
+/// Paired schema/policy install requires the batch35 decoder at every owner.
+pub const coupled_schema_policy_protocol_version: u16 = 8;
+
+/// Query populations and proven empty images need only the native owner lane.
+/// Artifact-backed images (including rewrites) additionally need durable repair.
+pub fn nativeRestoreRequiredProtocolVersion(target: anytype) u16 {
+    if (target.table.sql_persistence == null) return 0;
+    if (!target.empty_generation and (target.rewrite != null or target.source_artifacts.len != 0))
+        return native_nonempty_restore_protocol_version;
+    return native_relation_protocol_version;
+}
+/// Stored requirements can be decoded before a serving binary advertises a
+/// new capability. This ceiling grants neither placement nor native opens.
+pub const maximum_decodable_relational_topology_floor_version: u16 = native_nonempty_restore_protocol_version;
+
+/// Main's privacy read/write fences compose with the already qualified SQL
+/// native/graph/coupled profile. This does not admit future artifact repair.
+pub const privacy_protocol_version: u16 = 9;
+pub const relational_topology_protocol_version: u16 = privacy_protocol_version;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("antfly_local_sources").common_group_ids;
 const topology_records = @import("antfly_local_sources").common_topology_records;
 const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
 const dense_native_storage_phase = @import("antfly_local_sources").common_dense_native_storage_phase;
+pub const SchemaReaderCapabilities = @import("antfly_local_sources").common_schema_readers.ReaderCapabilities;
+pub const SchemaReaderFloor = @import("antfly_local_sources").common_schema_readers.ReaderFloor;
+
+pub fn requireSchemaReaderAtFloor(floor: SchemaReaderFloor, incoming: StoreRecord) !void {
+    if (!floor.valid()) return error.InvalidSchemaReaderRequirements;
+    if (!incoming.schema_reader.validForReporter(incoming.reporter_incarnation)) return error.InvalidStoreReporterFence;
+    if (storeServesTableData(incoming.role) and !floor.admits(incoming.schema_reader, incoming.reporter_incarnation))
+        return error.SchemaReaderUpgradeRequired;
+}
+
+test "system catalog schema reader admission covers custom data roles without conflating metadata roles" {
+    const floor: SchemaReaderFloor = .{ .semantic_version = 30, .encoding_version = 31 };
+    var record: StoreRecord = .{ .store_id = 1, .node_id = 1, .role = "ssd", .reporter_incarnation = 7 };
+    try requireSchemaReaderAtFloor(.{}, record);
+    try std.testing.expectError(error.SchemaReaderUpgradeRequired, requireSchemaReaderAtFloor(floor, record));
+    record.role = "metadata";
+    try requireSchemaReaderAtFloor(floor, record);
+    record.role = "ssd";
+    record.schema_reader = SchemaReaderCapabilities.current;
+    try requireSchemaReaderAtFloor(floor, record);
+    record.reporter_incarnation = 0;
+    try std.testing.expectError(error.InvalidStoreReporterFence, requireSchemaReaderAtFloor(floor, record));
+    record.role = "metadata";
+    try std.testing.expectError(error.InvalidSchemaReaderRequirements, requireSchemaReaderAtFloor(.{ .semantic_version = 30 }, record));
+}
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
@@ -69,7 +135,9 @@ pub fn privacyPolicyInstallationMatches(a: std.mem.Allocator, before: TableRecor
 }
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+    return std.meta.eql(lhs.sql_persistence, rhs.sql_persistence) and std.mem.eql(u8, lhs.sql_native_indexes_json, rhs.sql_native_indexes_json) and lhs.sql_materialized_view_id == rhs.sql_materialized_view_id and std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
+        (if (lhs.full_text_read_index) |name| if (rhs.full_text_read_index) |other| std.mem.eql(u8, name, other) else false else rhs.full_text_read_index == null) and
+        @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.engine == rhs.storage.engine and
         lhs.object_storage_generation == rhs.object_storage_generation and
         std.mem.eql(u8, &lhs.object_storage_identity, &rhs.object_storage_identity) and
@@ -128,6 +196,17 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    if (table.sql_persistence) |descriptor| {
+        hashTableDefinitionPart(&hasher, "sql-relation-persistence-v1");
+        hasher.update(&descriptor.fingerprintUnchecked());
+    }
+    if (table.schema_reader_requirements) |requirements| {
+        hashTableDefinitionPart(&hasher, "schema-reader-requirements-v1");
+        var versions: [8]u8 = undefined;
+        std.mem.writeInt(u32, versions[0..4], requirements.semantic_version, .little);
+        std.mem.writeInt(u32, versions[4..8], requirements.encoding_version, .little);
+        hasher.update(&versions);
+    }
     if (table.storage_migration) |migration| {
         hashTableDefinitionPart(&hasher, "vector-migration-v1");
         hashTableDefinitionPart(&hasher, migration.request.job_id);
@@ -473,9 +552,11 @@ pub const node_lifecycle_finalizing = "finalizing";
 /// native backup generation without discarding validated generated indexes.
 /// Persisting this per store lets metadata fence restore placement during a
 /// rolling data-plane upgrade instead of relying on the metadata codec level.
-// Version 2 accepts nonempty admission witnesses in staged plan range records.
-// Empty witnesses retain the v1 canonical wire representation and plan digest.
-pub const native_generation_restore_protocol_version: u16 = 2;
+/// Version 2 decodes restore admission witnesses. Version 3 additionally owns
+/// validated-scope finalization and rejects live transaction debt.
+pub const native_generation_restore_protocol_version: u16 = 3;
+/// Published HBC image restoration still requires only its original decoder.
+pub const native_generation_restore_base_protocol_version: u16 = 1;
 
 pub fn nodeLifecycleActive(lifecycle: []const u8) bool {
     return std.mem.eql(u8, lifecycle, node_lifecycle_active);
@@ -492,6 +573,10 @@ pub const NodeRecord = struct {
 };
 
 pub const StoreRecord = struct {
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyReaderReport(self, writer);
+    }
+
     store_id: u64,
     node_id: u64,
     /// Random non-zero process incarnation established by store registration.
@@ -513,6 +598,9 @@ pub const StoreRecord = struct {
     native_generation_restore_version: u16 = 0,
     dense_native_storage_protocol_version: u16 = 0,
     relational_topology_protocol_version: u16 = 0,
+    /// Schema interpretation/ASCH decoding, independent of data-Raft support.
+    /// Missing capabilities remain unknown during a rolling upgrade.
+    schema_reader: SchemaReaderCapabilities = .{},
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -859,7 +947,12 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 pub const store_runtime_reference_header = "X-Antfly-Store-Runtime-Reference";
 
 pub const StoreStatusReport = struct {
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyReaderReport(self, writer);
+    }
+
     relational_topology_protocol_version: u16 = 0,
+    schema_reader: SchemaReaderCapabilities = .{},
     store_id: u64,
     /// Internal heartbeat endpoint only: retain committed runtime observations
     /// for this exact reporter incarnation and status generation.
@@ -890,6 +983,23 @@ pub const StoreStatusReport = struct {
     group_statuses: []GroupStatusReport = &.{},
     runtime_statuses: []RuntimeGroupStatusReport = &.{},
 };
+
+fn stringifyReaderReport(record: anytype, writer: anytype) !void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(record)).@"struct".field_names) |name| {
+        // Keep legacy JSON envelopes byte-for-byte unchanged when unknown.
+        if (comptime std.mem.eql(u8, name, "schema_reader")) {
+            if (record.schema_reader.known()) {
+                try writer.objectField(name);
+                try writer.write(@field(record, name));
+            }
+        } else {
+            try writer.objectField(name);
+            try writer.write(@field(record, name));
+        }
+    }
+    try writer.endObject();
+}
 
 /// Generation zero is valid before the first snapshot, but a generation can
 /// never exist without the process incarnation that gives it meaning.
@@ -1096,6 +1206,8 @@ pub const RuntimeGroupStatusReport = struct {
     /// storage-owner observation as index and identity facts. Zero is unknown
     /// for older runtime-status wire profiles, not proof of an empty schema.
     schema_epoch: u32 = 0,
+    /// Same-root durable owner observation; null is an unknown legacy fact.
+    source_authority: ?@import("antfly_local_sources").storage_source_authority.State = null,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -1370,6 +1482,8 @@ pub const ReplicationSourceStatusRecord = struct {
     snapshot_offset: u64 = 0,
     prepared_checkpoint: []const u8 = "",
     stream_checkpoint: []const u8 = "",
+    /// Durable destination acceptance, projected from the scoped actor or recorded after Iceberg WAL admission.
+    accepted_stream_checkpoint: ?[]const u8 = null,
     last_error: []const u8 = "",
     failure_class: []const u8 = "",
     lag_records: u64 = 0,
@@ -1399,6 +1513,39 @@ pub const ReplicationSourceStatusRecord = struct {
     retired_slot_name: []const u8 = "",
     retired_publication_name: []const u8 = "",
     updated_at_ms: u64 = 0,
+    /// Published before the page can reach the destination transaction path.
+    pending_snapshot_page: ?SnapshotPage = null,
+    snapshot_cleanup_job: []const u8 = "",
+    snapshot_page_attempt: u32 = 0,
+    native_bootstrap_catalog_digest: [32]u8 = @splat(0),
+    pub const SnapshotPage = struct {
+        end_offset: u64,
+        checkpoint: []const u8,
+        payload_digest: [32]u8,
+        final: bool = false,
+        managed_dispatch: bool = false,
+        recovery_job: []const u8 = "",
+
+        pub fn eql(left: ?SnapshotPage, right: ?SnapshotPage) bool {
+            const a = left orelse return right == null;
+            const b = right orelse return false;
+            return a.end_offset == b.end_offset and a.final == b.final and a.managed_dispatch == b.managed_dispatch and std.mem.eql(u8, a.checkpoint, b.checkpoint) and
+                std.mem.eql(u8, &a.payload_digest, &b.payload_digest) and
+                std.mem.eql(u8, a.recovery_job, b.recovery_job);
+        }
+    };
+};
+
+pub const CapturedNativeSnapshotPage = struct {
+    page: ReplicationSourceStatusRecord.SnapshotPage,
+    rows: []const u8,
+    sealed: bool = false,
+
+    pub fn deinit(self: CapturedNativeSnapshotPage, a: std.mem.Allocator) void {
+        a.free(self.page.checkpoint);
+        a.free(self.page.recovery_job);
+        a.free(self.rows);
+    }
 };
 
 pub const ShuffleJoinLeaseRecord = struct {
@@ -2307,6 +2454,11 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
     const restore_location = try alloc.dupe(u8, "");
     errdefer alloc.free(restore_location);
     return .{
+        .sql_persistence = record.sql_persistence,
+        .storage = record.storage,
+        .object_storage_generation = record.object_storage_generation,
+        .object_storage_identity = record.object_storage_identity,
+        .routing_storage_binding = @import("antfly_local_sources").common_topology_records.tableStorageBinding(record),
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -2320,6 +2472,14 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
         .desired_replica_count = 0,
         .min_ranges = 0,
     };
+}
+
+/// Re-cloning a compact wire snapshot must not manufacture a complete binding
+/// from fields omitted by an older producer. Preserve an absent proof as absent.
+pub fn cloneCompactRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    var result = try cloneRoutingTable(alloc, record);
+    result.routing_storage_binding = record.routing_storage_binding;
+    return result;
 }
 
 pub const freeTable = @import("antfly_local_sources").metadata_local_catalog.freeTable;
@@ -2428,12 +2588,33 @@ test "routing clones exclude operational and schema payloads" {
     const table = try cloneRoutingTable(std.testing.allocator, .{
         .table_id = 7,
         .name = "docs",
+        .storage = .{ .engine = .object },
+        .object_storage_generation = 5,
+        .object_storage_identity = @splat(6),
         .schema_json = "large schema",
         .indexes_json = "large indexes",
         .restore_location = "s3://private/restore",
     });
     defer freeTable(std.testing.allocator, table);
     try std.testing.expectEqualStrings("docs", table.name);
+    try std.testing.expectEqual(.object, table.storage.engine);
+    try std.testing.expectEqual(@as(u64, 5), table.object_storage_generation);
+    try std.testing.expectEqual(@as([32]u8, @splat(6)), table.object_storage_identity);
+    try std.testing.expect(table.routing_storage_binding != null);
+    const compact = try cloneCompactRoutingTable(std.testing.allocator, table);
+    defer freeTable(std.testing.allocator, compact);
+    try std.testing.expectEqual(table.routing_storage_binding, compact.routing_storage_binding);
+    var legacy = table;
+    legacy.routing_storage_binding = null;
+    const legacy_compact = try cloneCompactRoutingTable(std.testing.allocator, legacy);
+    defer freeTable(std.testing.allocator, legacy_compact);
+    try std.testing.expect(legacy_compact.routing_storage_binding == null);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, table, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "s3://private/restore") == null);
+    const ordinary = try std.json.Stringify.valueAlloc(std.testing.allocator, TableRecord{ .table_id = 7, .name = "docs" }, .{});
+    defer std.testing.allocator.free(ordinary);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary, "routing_storage_binding") == null);
     try std.testing.expectEqual(@as(usize, 0), table.schema_json.len);
     try std.testing.expectEqual(@as(usize, 0), table.indexes_json.len);
     try std.testing.expectEqual(@as(usize, 0), table.restore_location.len);
@@ -2520,6 +2701,8 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
     errdefer alloc.free(prepared_checkpoint);
     const stream_checkpoint = try alloc.dupe(u8, record.stream_checkpoint);
     errdefer alloc.free(stream_checkpoint);
+    const accepted_stream_checkpoint = if (record.accepted_stream_checkpoint) |checkpoint_value| try alloc.dupe(u8, checkpoint_value) else null;
+    errdefer if (accepted_stream_checkpoint) |checkpoint_value| alloc.free(checkpoint_value);
     const last_error = try alloc.dupe(u8, record.last_error);
     errdefer alloc.free(last_error);
     const failure_class = try alloc.dupe(u8, record.failure_class);
@@ -2528,6 +2711,20 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
     errdefer alloc.free(retired_slot_name);
     const retired_publication_name = try alloc.dupe(u8, record.retired_publication_name);
     errdefer alloc.free(retired_publication_name);
+    const cleanup = try alloc.dupe(u8, record.snapshot_cleanup_job);
+    errdefer alloc.free(cleanup);
+    const pending = if (record.pending_snapshot_page) |page| blk: {
+        const checkpoint_copy = try alloc.dupe(u8, page.checkpoint);
+        errdefer alloc.free(checkpoint_copy);
+        break :blk ReplicationSourceStatusRecord.SnapshotPage{
+            .end_offset = page.end_offset,
+            .payload_digest = page.payload_digest,
+            .final = page.final,
+            .managed_dispatch = page.managed_dispatch,
+            .checkpoint = checkpoint_copy,
+            .recovery_job = try alloc.dupe(u8, page.recovery_job),
+        };
+    } else null;
     return .{
         .table_id = record.table_id,
         .source_ordinal = record.source_ordinal,
@@ -2541,6 +2738,7 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .snapshot_offset = record.snapshot_offset,
         .prepared_checkpoint = prepared_checkpoint,
         .stream_checkpoint = stream_checkpoint,
+        .accepted_stream_checkpoint = accepted_stream_checkpoint,
         .last_error = last_error,
         .failure_class = failure_class,
         .lag_records = record.lag_records,
@@ -2556,11 +2754,20 @@ pub fn cloneReplicationSourceStatus(alloc: std.mem.Allocator, record: Replicatio
         .retired_cutover_authority_id = record.retired_cutover_authority_id,
         .retired_slot_name = retired_slot_name,
         .retired_publication_name = retired_publication_name,
+        .native_bootstrap_catalog_digest = record.native_bootstrap_catalog_digest,
+        .snapshot_page_attempt = record.snapshot_page_attempt,
+        .snapshot_cleanup_job = cleanup,
+        .pending_snapshot_page = pending,
         .updated_at_ms = record.updated_at_ms,
     };
 }
 
 pub fn freeReplicationSourceStatus(alloc: std.mem.Allocator, record: ReplicationSourceStatusRecord) void {
+    if (record.pending_snapshot_page) |page| {
+        alloc.free(page.checkpoint);
+        alloc.free(page.recovery_job);
+    }
+    alloc.free(record.snapshot_cleanup_job);
     alloc.free(record.source_kind);
     alloc.free(record.external_table);
     alloc.free(record.cutover_mode);
@@ -2570,6 +2777,7 @@ pub fn freeReplicationSourceStatus(alloc: std.mem.Allocator, record: Replication
     alloc.free(record.checkpoint);
     alloc.free(record.prepared_checkpoint);
     alloc.free(record.stream_checkpoint);
+    if (record.accepted_stream_checkpoint) |checkpoint| alloc.free(checkpoint);
     alloc.free(record.last_error);
     alloc.free(record.failure_class);
     alloc.free(record.retired_slot_name);
@@ -2623,6 +2831,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .native_generation_restore_version = record.native_generation_restore_version,
         .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
         .relational_topology_protocol_version = record.relational_topology_protocol_version,
+        .schema_reader = record.schema_reader,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -2766,6 +2975,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .target_observation_revision = record.target_observation_revision,
         .target_observation_complete = record.target_observation_complete,
         .schema_epoch = record.schema_epoch,
+        .source_authority = record.source_authority,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,
@@ -3630,6 +3840,28 @@ test "source vector migration catalog fences configurations topology and stale p
     complete.storage_migration = null;
     try manager.publishVectorMigrationTable(published, complete);
     try std.testing.expectError(error.UnsupportedVectorMigrationDirection, manager.publishVectorMigrationTable(complete, before));
+}
+
+test "native restore capability distinguishes artifact replay from populations and empty images" {
+    const Target = struct {
+        table: struct { sql_persistence: ?u8 = null } = .{},
+        empty_generation: bool = false,
+        rewrite: ?u8 = null,
+        source_artifacts: []const u8 = &.{},
+    };
+    var target: Target = .{};
+    try std.testing.expectEqual(@as(u16, 0), nativeRestoreRequiredProtocolVersion(target));
+    target.table.sql_persistence = 1;
+    try std.testing.expectEqual(native_relation_protocol_version, nativeRestoreRequiredProtocolVersion(target));
+    target.source_artifacts = &.{1};
+    try std.testing.expectEqual(native_nonempty_restore_protocol_version, nativeRestoreRequiredProtocolVersion(target));
+    target.empty_generation = true;
+    try std.testing.expectEqual(native_relation_protocol_version, nativeRestoreRequiredProtocolVersion(target));
+    target.empty_generation = false;
+    target.source_artifacts = &.{};
+    target.rewrite = 1;
+    try std.testing.expectEqual(native_nonempty_restore_protocol_version, nativeRestoreRequiredProtocolVersion(target));
+    try std.testing.expect(relational_topology_protocol_version < native_nonempty_restore_protocol_version);
 }
 
 test "privacy policy installation acknowledgement survives progress but never acknowledges a different version" {

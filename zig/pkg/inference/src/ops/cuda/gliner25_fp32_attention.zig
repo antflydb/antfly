@@ -17,7 +17,7 @@
 const std = @import("std");
 const Buffer = @import("buffer.zig").DeviceBuffer;
 const Context = @import("context.zig").CudaContext;
-const Blas = @import("libraries.zig").CublasF32;
+const Blas = @import("libraries.zig").Cublas;
 const Kernels = @import("kernels.zig").KernelModule;
 pub const workspace_limit = 32 * 1024 * 1024;
 const vendor_workspace_bytes = 4 * 1024 * 1024;

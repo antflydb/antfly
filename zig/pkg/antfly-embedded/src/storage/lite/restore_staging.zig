@@ -132,6 +132,18 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
     try options.cancellation.check();
     var source = try openInputFile(io, input_path);
     defer source.close(io);
+    // §8.7 row 4 (lite-single-commit-write-path.md's shared-lock-region
+    // migration) does not reach this lock: it excludes a concurrent
+    // *backup writer still streaming bytes* into `input_path`, proven by
+    // the matching test ("...rejects same-size native source changes
+    // since admission" and the "busy.afb" case below), not a Lite
+    // writer's commit. At this point the format of `input_path` is not
+    // even known yet (the magic-byte check is further down) -- it may be
+    // a `.afb` bundle or a portable backup that was never a Lite database
+    // at all, so there is no `shared_lock_region.zig` region for it to
+    // join; the thing excluded against never opens one either (a backup
+    // writer streams this file with a plain kernel lock of its own, not
+    // through `inode_lock.zig`/`PathWriterLock`). Stays a kernel lock.
     if (!try source.tryLock(io, .shared)) return error.WriterLocked;
     defer source.unlock(io);
     try checkInputLimit(io, source, options.max_input_bytes);
@@ -437,26 +449,36 @@ fn stageAfliteRestoreBackupWithOptions(
     var source = try openInputFile(io, path);
     defer source.close(io);
     try checkInputLimit(io, source, options.max_input_bytes);
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
-    defer lite.close();
+    // A live writer's fold can reclaim overlay versions between this
+    // read-only open and its first read; the read then reports
+    // `error.ReadSnapshotReclaimed` rather than export a snapshot with
+    // committed documents missing. Reopen at the current checkpoint and
+    // export again.
+    const max_attempts = 8;
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        var lite = try LiteDb.open(allocator, path, .query_readonly);
+        defer lite.close();
 
-    const scratch = try temporaryPortablePath(allocator, io);
-    defer allocator.free(scratch);
-    defer std.Io.Dir.cwd().deleteFile(io, scratch) catch {};
-    var output = try fs_paths.createFilePortable(io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
-    defer output.close(io);
-    var buffer: [64 * 1024]u8 = undefined;
-    var writer = output.writer(io, &buffer);
-    var limited = LimitedWriter.init(&writer.interface, options.max_prepared_bytes);
-    portable_backup.exportPortableToWriter(allocator, lite.db.core.store, &limited.interface) catch |err| {
-        if (limited.exceeded) return error.BackupExpansionLimitExceeded;
-        return err;
-    };
-    try writer.end();
-    try output.sync(io);
-    // Read metadata from the exported snapshot, not a separate live DB read.
-    // Both metadata and records must describe the same pinned read transaction.
-    return stagePortableFile(allocator, io, output, scratch, table_name, backup_id, location_uri, options.max_prepared_bytes, options.max_prepared_bytes);
+        const scratch = try temporaryPortablePath(allocator, io);
+        defer allocator.free(scratch);
+        defer std.Io.Dir.cwd().deleteFile(io, scratch) catch {};
+        var output = try fs_paths.createFilePortable(io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        defer output.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = output.writer(io, &buffer);
+        var limited = LimitedWriter.init(&writer.interface, options.max_prepared_bytes);
+        portable_backup.exportPortableToWriter(allocator, lite.db.core.store, &limited.interface) catch |err| {
+            if (limited.exceeded) return error.BackupExpansionLimitExceeded;
+            if (err == error.ReadSnapshotReclaimed and attempt < max_attempts) continue;
+            return err;
+        };
+        try writer.end();
+        try output.sync(io);
+        // Read metadata from the exported snapshot, not a separate live DB read.
+        // Both metadata and records must describe the same pinned read transaction.
+        return stagePortableFile(allocator, io, output, scratch, table_name, backup_id, location_uri, options.max_prepared_bytes, options.max_prepared_bytes);
+    }
 }
 
 fn temporaryPortablePath(allocator: Allocator, io: std.Io) ![]u8 {
@@ -534,6 +556,12 @@ fn stageAfbRestoreBackupWithOptions(
     defer source.close(io);
     // Pin the source before reading any admission metadata. Native extraction
     // rereads the manifest and must consume the inventory checked below.
+    // Stays a kernel lock, not a region pin -- same reasoning as
+    // `inspectInput`'s own identical lock above: `path` is a `.afb`
+    // backup archive (not yet known whether native or portable), never a
+    // live Lite database with a `shared_lock_region.zig` region of its
+    // own, and what this excludes against (a backup writer mid-stream)
+    // never opens one either.
     if (!try source.tryLock(io, .shared)) return error.WriterLocked;
     defer source.unlock(io);
     try checkInputLimit(io, source, options.max_input_bytes);
@@ -1150,6 +1178,53 @@ test "lite portable generation scavenging reaps stale data and lease-only crashe
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, stale_lock, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, lease_only_lock, .{}));
     try std.Io.Dir.cwd().access(io, active_lock, .{});
+}
+
+test "lite portable restore stages and publishes beside a symlink target" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "destination", .default_dir);
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var long_basename: [237]u8 = @splat('a');
+    @memcpy(long_basename[230..], ".aflite");
+    const destination = try std.fs.path.join(allocator, &.{ root, "destination", &long_basename });
+    defer allocator.free(destination);
+    const alias = try std.fs.path.join(allocator, &.{ root, "alias.aflite" });
+    defer allocator.free(alias);
+    {
+        var target = try LiteDb.create(allocator, destination, true);
+        target.close();
+    }
+    try std.Io.Dir.cwd().symLink(io, destination, alias, .{});
+    var target = try LiteDb.open(allocator, alias, .writer);
+    defer target.close();
+    const Populate = struct {
+        fn run(expected_parent: []const u8, _: Allocator, prepared: *LiteDb) !void {
+            const path = prepared.backend.native_docstore.?.file.path;
+            try std.testing.expectEqualStrings(expected_parent, std.fs.path.dirname(path).?);
+        }
+    };
+    try @import("portable_restore.zig").importPreparedIntoLiteDb(
+        allocator,
+        &target.db,
+        &target.backend,
+        connection.embeddedRootIdentity(),
+        std.fs.path.dirname(destination).?,
+        Populate.run,
+    );
+    const resolved = try std.Io.Dir.realPathFileAbsoluteAlloc(io, alias, allocator);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(destination, resolved);
+    var directory = try tmp.dir.openDir(io, "destination", .{ .iterate = true });
+    defer directory.close(io);
+    var entries = directory.iterateAssumeFirstIteration();
+    while (try entries.next(io)) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, entry.name, ".portable-restore-") == null);
+    }
 }
 
 test "lite portable restore enforces staging budget and preserves target" {
@@ -2628,7 +2703,7 @@ test "backup preflight relational rows use archived schema for active media fiel
     defer @import("../schema.zig").freeSchema(a, runtime);
     const encoded = try @import("../schema.zig").serializeSchema(a, runtime);
     defer a.free(encoded);
-    const row = try @import("../db/relational_store.zig").encodeValueForSchemaAlloc(a, "{\"media\":\"http://[0:0:0:0:0:0:0:1]:8888/source\"}", runtime);
+    const row = try @import("../db/relational/rows/store.zig").encodeValueForSchemaAlloc(a, "{\"media\":\"http://[0:0:0:0:0:0:0:1]:8888/source\"}", runtime);
     defer a.free(row);
     const key = try internal_keys.relationalRowKeyAlloc(a, "row:late");
     defer a.free(key);

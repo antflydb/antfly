@@ -111,6 +111,13 @@ pub fn validatePacket(bytes: []const u8, length_bytes: u3) !void {
 pub fn validatePortablePacket(bytes: []const u8, length_bytes: u3) !void {
     return validatePacketPolicy(bytes, length_bytes, true);
 }
+pub fn checkedNalType(header: u8, dynamic: bool) !u8 {
+    if (header & 128 != 0) return error.MalformedVideoPacket;
+    const kind = header & 31;
+    if ((kind == 7 or kind == 8) and !dynamic or kind == 13 or kind == 15) return error.UnsupportedDynamicVideoConfig;
+    if (kind == 0 or kind >= 16) return error.UnsupportedVideoNal;
+    return kind;
+}
 fn validatePacketPolicy(bytes: []const u8, length_bytes: u3, dynamic: bool) !void {
     if (length_bytes != 1 and length_bytes != 2 and length_bytes != 4) return error.MalformedVideoPacket;
     var cursor: usize = 0;
@@ -120,10 +127,8 @@ fn validatePacketPolicy(bytes: []const u8, length_bytes: u3, dynamic: bool) !voi
         var size: u32 = 0;
         for (bytes[cursor..][0..length_bytes]) |byte| size = (size << 8) | byte;
         cursor += length_bytes;
-        if (size == 0 or size > bytes.len - cursor or bytes[cursor] & 128 != 0) return error.MalformedVideoPacket;
-        const kind = bytes[cursor] & 31;
-        if ((kind == 7 or kind == 8) and !dynamic or kind == 13 or kind == 15) return error.UnsupportedDynamicVideoConfig;
-        if (kind == 0 or kind >= 16) return error.UnsupportedVideoNal;
+        if (size == 0 or size > bytes.len - cursor) return error.MalformedVideoPacket;
+        _ = try checkedNalType(bytes[cursor], dynamic);
         count += 1;
         if (count > 4096) return error.ResourceLimitExceeded;
         cursor += size;

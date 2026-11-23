@@ -38,7 +38,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, io: 
     if (configs != .object) return error.InvalidTableIndexMetadata;
     var units: std.ArrayList(builds.Unit) = .empty;
     var requests: std.ArrayList(Request) = .empty;
-    var schemas = @import("sql_schema_cache.zig").Cache.init(a);
+    var schemas = @import("sql/execution/schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, out, table.schema_json, table.table_id, table.name);
     var it = configs.object.iterator();
