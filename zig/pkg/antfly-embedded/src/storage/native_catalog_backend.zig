@@ -415,6 +415,36 @@ pub const Backend = struct {
         };
     }
 
+    /// Fork the durable mirror for ordered preparation. The immutable tree
+    /// nodes are shared with the serving backend until a write changes them.
+    /// Only the host transaction may submit mutations to disk.
+    pub fn forkWriterView(self: *Backend) !Backend {
+        const scope = try self.allocator.dupe(u8, self.scope);
+        errdefer self.allocator.free(scope);
+        const rc = try self.allocator.create(RcState);
+        errdefer self.allocator.destroy(rc);
+        lockBackend(self);
+        defer self.mutex.unlock();
+        if (self.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
+        rc.* = .{ .refs = 1, .state = self.state.state.clone() };
+        const PrivateSink = struct {
+            fn submit(_: *anyopaque, _: []const u8, _: []const Mutation, _: bool) anyerror!void {
+                return error.WriterViewCannotCommit;
+            }
+        };
+        var sink = self.sink;
+        sink.submit = PrivateSink.submit;
+        sink.submitDeferred = null;
+        sink.deleteScope = null;
+        return .{
+            .allocator = self.allocator,
+            .sink = sink,
+            .scope = scope,
+            .open_options = self.open_options,
+            .state = rc,
+        };
+    }
+
     fn loadTree(allocator: Allocator, sink: Sink, scope: []const u8) !ordered.Tree {
         var tree: ordered.Tree = .empty;
         errdefer tree.release(allocator);
@@ -769,10 +799,9 @@ pub const Backend = struct {
         // A failure below leaves the mirror behind a durable commit.
         errdefer self.invalidateMirror();
         lockBackend(self);
-        const current = self.state;
+        var cloned = self.state.state.clone();
         self.mutex.unlock();
 
-        var cloned = current.state.clone();
         errdefer cloned.deinit(self.allocator);
         for (mutations) |m| {
             if ((self.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
@@ -1829,4 +1858,26 @@ test "native catalog backend beginBatchWithOptions on the NamespaceStore surface
     }
     try std.testing.expectEqual(@as(usize, 0), test_sink.durable_submit_calls);
     try std.testing.expectEqual(@as(usize, 1), test_sink.non_durable_submit_calls);
+}
+
+test "native catalog writer view isolates queued mutations from the serving root" {
+    const a = std.testing.allocator;
+    var backing = TestSink{ .allocator = a };
+    defer backing.deinit();
+    var serving = try Backend.init(a, .{ .sink = backing.sink(), .scope = "index" });
+    defer serving.close();
+    var writer = try serving.forkWriterView();
+    defer writer.close();
+
+    try writer.applyExternallyCommittedMutations(&.{.{ .namespace = null, .key = "key", .value = "queued" }});
+    var next = try writer.beginWrite();
+    defer next.abort();
+    try std.testing.expectEqualStrings("queued", try next.get(.{}, "key"));
+    try next.put(.{}, "key", "second");
+    try std.testing.expectError(error.WriterViewCannotCommit, next.commit());
+
+    var query = try serving.beginRead();
+    defer query.abort();
+    try std.testing.expectError(error.NotFound, query.get(.{}, "key"));
+    try std.testing.expectEqual(@as(usize, 0), backing.entries.items.len);
 }
