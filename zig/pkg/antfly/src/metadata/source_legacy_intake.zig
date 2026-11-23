@@ -109,20 +109,48 @@ pub fn indexTransition(txn: anytype, group: u64, before: control.State, after: c
 }
 
 pub fn rebuild(a: std.mem.Allocator, txn: anytype, group: u64) !void {
-    var buffer: [256]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&buffer, "\x00\x00__metadata__:source_control:{d}:state:", .{group});
-    var cursor = try txn.openCursor();
-    defer cursor.close();
-    var row = try cursor.seekAtOrAfter(prefix);
-    while (row) |entry| : (row = try cursor.next()) {
-        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-        var parsed = try control.parse(a, entry.value);
-        defer parsed.deinit();
-        if (parsed.value.scope) |scope| {
-            var expected: [256]u8 = undefined;
-            if (!std.mem.eql(u8, entry.key, try control.keyForGroup(&expected, group, scope.table_id, scope.source_id)))
-                return error.InvalidSourceControl;
+    var prefix_buffer: [256]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buffer, "\x00\x00__metadata__:source_control:{d}:state:", .{group});
+    var resume_buffer: [257]u8 = undefined;
+    var seek_key: []const u8 = prefix;
+    const Candidate = struct { scope: control.Scope, recoverable: bool };
+    var page: [128]Candidate = undefined;
+    while (true) {
+        var count: usize = 0;
+        const exhausted = scan: {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(seek_key);
+            var scanned: usize = 0;
+            while (row) |entry| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break :scan true;
+                if (entry.key.len >= resume_buffer.len) return error.InvalidSourceControl;
+                var parsed = try control.parse(a, entry.value);
+                defer parsed.deinit();
+                if (parsed.value.scope) |scope| {
+                    var expected: [256]u8 = undefined;
+                    if (!std.mem.eql(u8, entry.key, try control.keyForGroup(&expected, group, scope.table_id, scope.source_id)))
+                        return error.InvalidSourceControl;
+                    page[count] = .{ .scope = scope, .recoverable = live(parsed.value) };
+                    count += 1;
+                }
+                scanned += 1;
+                if (scanned == page.len) {
+                    @memcpy(resume_buffer[0..entry.key.len], entry.key);
+                    resume_buffer[entry.key.len] = 0;
+                    seek_key = resume_buffer[0 .. entry.key.len + 1];
+                    break :scan false;
+                }
+            }
+            break :scan true;
+        };
+        // Writes can invalidate the backend cursor. Finish each read page
+        // before staging any derived rows in the same projection transaction.
+        for (page[0..count]) |entry| {
+            try writeIndex(txn, group, entry.scope, .legacy_gate, false, true);
+            try writeIndex(txn, group, entry.scope, .legacy_gate, true, true);
+            if (entry.recoverable) try writeIndex(txn, group, entry.scope, .recovery, false, true);
         }
-        try indexTransition(txn, group, .{}, parsed.value);
+        if (exhausted) return;
     }
 }
