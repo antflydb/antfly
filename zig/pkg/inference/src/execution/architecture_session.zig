@@ -13366,6 +13366,7 @@ pub const StagedExecution = struct {
     control: Control,
     active: bool = true,
     scheduling_enabled: bool = true,
+    prepare_metal_audio_scratch: bool = false,
     permit: *RunPermit,
     owns_initial_permit: bool = false,
     // A separately partitioned final bank never becomes phase/supplement
@@ -13745,7 +13746,7 @@ pub const StagedExecution = struct {
         return .{ .ptr = self, .close_fn = closeFrontendCache };
     }
 
-    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, keys: []const u64, inputs: []const ops.CT) anyerror!bool {
+    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, keys: []const u64, inputs: []const ops.CT, storage: *bool) anyerror!bool {
         if (comptime !build_options.enable_metal) return false;
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
         if (!self.active or self.cb.ptr != cb.ptr or self.cb.vtable != cb.vtable or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return false;
@@ -13768,6 +13769,13 @@ pub const StagedExecution = struct {
         }
         if (count == 0) return true;
 
+        // Audio reuse is provider-wide. Park the scope before releasing
+        // the provider and reopen it after regaining custody.
+        const reopen_storage = storage.*;
+        if (reopen_storage) {
+            if (!try cb.audioStorage(false)) return error.AudioStorageScopeUnavailable;
+            storage.* = false;
+        }
         try pause(self);
         var banks: [12]?Metal.FundedAudioBank = @splat(null);
         defer for (&banks) |*value| {
@@ -13794,8 +13802,10 @@ pub const StagedExecution = struct {
             };
             try acquire(self);
             if (settlement) |err| return err;
+            if (reopen_storage) storage.* = try cb.audioStorage(true);
             return true;
         };
+        if (reopen_storage) storage.* = try cb.audioStorage(true);
         for (requests[0..count], banks[0..count]) |request, *value| if (value.*) |*bank| {
             if (try Metal.publishAudioScratch(cb, request, bank)) value.* = null;
         };
@@ -13980,8 +13990,9 @@ pub const StagedExecution = struct {
         // Cache supplier boundaries depend on actual owner custody, not the
         // optional cooperative-scheduling policy. Disabled scheduling keeps
         // every former scheduling callback inert while cache preparation works.
-        if (!schedule and (self.cb.kind() != .cuda or self.gate == null)) return;
-        self.hook = .{ .ptr = self, .pause_fn = if (schedule) pause else noScheduledYield, .resume_fn = if (schedule) acquire else noScheduledYield, .yield_ready_fn = if (schedule) yieldReady else noScheduledYield, .cleanup_fn = if (schedule) cleanup else noScheduledCleanup, .workspace_fn = if (schedule and self.video_phases) workspace else null, .copy_fn = if (schedule and self.timings != null) copied else null, .image_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) imageCache else null else null, .vision_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) visionCache else null else null, .cache_inputs_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheInputs else null else null, .cache_handoff_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheHandoff else null else null, .audio_scratch_fn = if (comptime build_options.enable_metal) if (schedule and self.session.backend() == .metal) metalAudioScratch else null else null, .audio_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) audioCache else null else null, .video_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoCache else null else null, .video_consumer_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoConsumer else null else null };
+        const metal_audio = build_options.enable_metal and self.cb.kind() == .metal and self.gate != null and (schedule or self.prepare_metal_audio_scratch);
+        if (!schedule and !metal_audio and (self.cb.kind() != .cuda or self.gate == null)) return;
+        self.hook = .{ .ptr = self, .pause_fn = if (schedule) pause else noScheduledYield, .resume_fn = if (schedule) acquire else noScheduledYield, .yield_ready_fn = if (schedule) yieldReady else noScheduledYield, .cleanup_fn = if (schedule) cleanup else noScheduledCleanup, .workspace_fn = if (schedule and self.video_phases) workspace else null, .copy_fn = if (schedule and self.timings != null) copied else null, .image_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) imageCache else null else null, .vision_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) visionCache else null else null, .cache_inputs_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheInputs else null else null, .cache_handoff_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheHandoff else null else null, .audio_scratch_fn = if (metal_audio) metalAudioScratch else null, .audio_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) audioCache else null else null, .video_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoCache else null else null, .video_consumer_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoConsumer else null else null };
         self.cb.embedding_stage = &self.hook;
     }
     fn nativeWeightCache(raw: *anyopaque, cb: *const ComputeBackend, request: ops.NativeWeightCachePreparation) !ops.EmbeddingCacheScope {
@@ -14789,6 +14800,11 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     const Metal = @import("../ops/metal_compute.zig").MetalCompute;
     const compute: *Metal = @ptrCast(@alignCast(cb.ptr));
     compute.require_f32_linears = true;
+    var storage = try cb.audioStorage(true);
+    try std.testing.expect(storage);
+    defer if (storage) {
+        _ = cb.audioStorage(false) catch unreachable;
+    };
     const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 }));
     defer cb.free(input);
     const audio = @import("audio_schedule.zig");
@@ -14814,7 +14830,7 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     var peer_live = true;
     defer if (peer_live) peer.release();
     const cold_yields = timings.stage_yields;
-    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}));
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, &storage));
     try std.testing.expectEqual(cold_yields + 1, timings.stage_yields);
     try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
     try std.testing.expectEqual(baseline.backend_weight_bytes, pin.controller().snapshot().backend_weight_bytes);
@@ -14825,8 +14841,9 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
     peer.release();
     peer_live = false;
     const yields = timings.stage_yields;
-    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}));
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, &storage));
     try std.testing.expectEqual(yields + 1, timings.stage_yields);
+    try std.testing.expect(storage);
     try std.testing.expectEqual(@as(usize, 8192), cache.backend_bytes);
     const before_warm = pin.controller().snapshot().backend_weight_bytes;
     for (compute.provider_impl.audio_schedules[0..keys.len]) |entry| {
@@ -14834,7 +14851,7 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
         try std.testing.expect(plan.prepared and plan.arena_charge != null and plan.storage.outputs[0] != null);
         try std.testing.expect(plan.chargedBackendBytes() >= 4096);
     }
-    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}));
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}, &storage));
     try std.testing.expectEqual(yields + 1, timings.stage_yields);
     try std.testing.expectEqual(before_warm, pin.controller().snapshot().backend_weight_bytes);
 }

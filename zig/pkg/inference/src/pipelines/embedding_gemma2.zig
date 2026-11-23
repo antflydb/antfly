@@ -3190,7 +3190,7 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         if (options.timings) |t| t.max_prepared_audio = @max(t.max_prepared_audio, slot.clips.len + if (options.prepare_ahead) next_count else 0);
         if (slot.retained > 0) {
             var execution_waiter = Scheduler.Waiter{};
-            const staged = audioUsesStagedExecution(session.backend());
+            const staged = audioUsesStagedExecution(session, lock);
             if (!staged) try enterModel(session, lock, control, &execution_waiter);
             defer if (!staged) leaveModel(lock, &execution_waiter);
             try consumePreparedAudios(out, slot, tokenizer, cfg, options, vectors[offset..][0..slot.consumed], token_counts[offset..][0..slot.consumed], &observation, if (next_count > 0 and options.prepare_ahead) &slots[next] else null, lock);
@@ -3214,10 +3214,12 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     return .{ .vectors = vectors, .input_tokens = token_counts, .execution = observation.execution(observation.native_items + observation.serial_items) };
 }
 
-// Native media getters need the same actual Model/B cache loan as CUDA;
-// ordinary Metal keeps its original provider and numerical lane.
-fn audioUsesStagedExecution(backend: @import("../backends/backends.zig").BackendType) bool {
-    return backend == .native or backend == .cuda;
+fn audioUsesStagedExecution(session: Session, lock: ?*std.atomic.Mutex) bool {
+    return switch (session.backend()) {
+        .native, .cuda => true,
+        .metal => lock != null and session.model_lifetime != null and session.run_admission != null,
+        else => false,
+    };
 }
 
 fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparation.zig").Wave, tokenizer: Tokenizer, cfg: encoder.Config, options: Options, vectors: [][]f32, token_counts: []usize, observation: *BatchExecution.Observation, future: ?*@import("audio_preparation.zig").Wave, lock: ?*std.atomic.Mutex) !void {
@@ -3241,11 +3243,12 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     };
     defer permit.deinit();
     const staged_cuda = slot.session.backend() == .cuda;
-    const staged = audioUsesStagedExecution(slot.session.backend());
+    const staged = audioUsesStagedExecution(slot.session, lock);
+    const idle_backend = if (slot.session.backend() == .metal) request.workspace_bytes else 0;
     var execution_waiter = Scheduler.Waiter{};
     var stage_counters = StageLane.Counters{};
     defer collectStageCounters(options.timings, stage_counters);
-    var lane = StageLane{ .execution_lane = options.execution_lane, .execution_lane_interactive = options.execution_lane_interactive, .session = slot.session, .gate = lock, .waiter = &execution_waiter, .cb = undefined, .control = slot.control, .permit = &permit, .idle_backend = 0, .scheduling_enabled = false, .active = false, .timings = if (options.timings != null) &stage_counters else null };
+    var lane = StageLane{ .execution_lane = options.execution_lane, .execution_lane_interactive = options.execution_lane_interactive, .session = slot.session, .gate = lock, .waiter = &execution_waiter, .cb = undefined, .control = slot.control, .permit = &permit, .idle_backend = idle_backend, .scheduling_enabled = false, .prepare_metal_audio_scratch = true, .active = false, .timings = if (options.timings != null) &stage_counters else null };
     defer lane.deinit();
     var unstaged: ?compute_provider.ManagedComputeBackend = null;
     defer if (unstaged) |*managed| managed.deinit();

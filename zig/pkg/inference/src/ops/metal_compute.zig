@@ -23507,7 +23507,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (!old.disabled and p.audio_schedule_clock - old.stamp < 8) return null;
                 // A pending frame can retain the plan backing after an eviction.
                 // Keep its charge until the provider reaches a quiescent boundary.
-                if (old.storage.backend_bytes != 0 and
+                if (old.chargedBackendBytes() != 0 and
                     (metal_runtime.hasActiveFrame(p.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(p.raw_decode_runtime))) return null;
             }
 
@@ -23570,7 +23570,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .bound_scratch_bytes = plan.input_workspace_bytes,
                 .charged_backend_bytes = plan.chargedBackendBytes(),
             });
-            if (stats) std.debug.print("metal_audio_schedule replay={} replays={d} encode_ns={d} encoders={d} arena_bytes={d} input_workspace_bytes={d} backend_bytes={d}\n", .{ replay, plan.replays, elapsed, metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count -| before_encoders, plan.arena_size, plan.input_workspace_bytes, plan.chargedBackendBytes() });
+            if (stats) std.debug.print("metal_audio_schedule replay={} replays={d} encode_ns={d} encoders={d} arena_bytes={d} input_workspace_bytes={d} backend_bytes={d} funded_arena={}\n", .{ replay, plan.replays, elapsed, metal_runtime.runtimeMemorySnapshot(p.raw_decode_runtime).compute_encoder_count -| before_encoders, plan.arena_size, plan.input_workspace_bytes, plan.chargedBackendBytes(), plan.arena_charge != null });
             return out;
         }
         if (p.audio_schedule_clock < plan.retry_after) return try run(context, inputs);

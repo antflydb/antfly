@@ -1679,7 +1679,7 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
     if (prepared.len == 0 or prepared.len > 4) return error.InvalidInputShape;
     var cache_scope = try beginAudioCache(cb, embeddingGemma2AudioConfig(), prepared);
     defer cache_scope.close();
-    const storage = try cb.audioStorage(true);
+    var storage = try cb.audioStorage(true);
     defer if (storage) {
         _ = cb.audioStorage(false) catch false;
     };
@@ -1694,7 +1694,7 @@ pub fn encodePreparedEmbeddingGemma2AudioBatchResident(cb: *const ComputeBackend
     const lengths = try a.alloc(usize, prepared.len);
     errdefer a.free(lengths);
     // The outer storage lease also covers feature preparation; the cohort borrows it.
-    const result = try encodeAudioFeatureCohortResidentWithinStorage(cb, a, &weights, try audioConfigForBackend(cb, embeddingGemma2AudioConfig()), pointers[0..count], lengths);
+    const result = try encodeAudioFeatureCohortResidentWithinStorage(cb, a, &weights, try audioConfigForBackend(cb, embeddingGemma2AudioConfig()), pointers[0..count], lengths, &storage);
     return .{ .allocator = a, .backend = cb, .embeddings = result.embeddings, .tokens_per_image = lengths, .hidden_size = 512, .batches_executed = 1, .max_batch_executed = count };
 }
 
@@ -2145,16 +2145,16 @@ fn encodeAudioFeaturesResident(cb: *const ComputeBackend, allocator: std.mem.All
 fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, declared_cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize) !ResidentEncodedAudio {
     const cfg = try audioConfigForBackend(cb, declared_cfg);
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
-    const storage = try cb.audioStorage(true);
+    var storage = try cb.audioStorage(true);
     defer if (storage) {
         _ = cb.audioStorage(false) catch false;
     };
-    return encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths);
+    return encodeAudioFeatureCohortResidentWithinStorage(cb, allocator, store, cfg, features_list, lengths, &storage);
 }
 
 // Only the owning wrapper above and the prepared-batch lexical storage owner
 // call this helper. It borrows their bank and never begins or retires storage.
-fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize) !ResidentEncodedAudio {
+fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize, storage: *bool) !ResidentEncodedAudio {
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
     const features = features_list[0];
     const cohort = features_list.len > 1;
@@ -2204,6 +2204,10 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     var defer_audio_arena = false;
     if (grouped_frames and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
         if (cb.embedding_stage) |stage| if (stage.audio_scratch_fn) |prepare| {
+            // The completed subsampler's weight handles are scoped to the
+            // current compute owner, which the supplier may retire. Only
+            // independently owned activations and layer inputs cross here.
+            store.deinit();
             var keys: [12]u64 = undefined;
             var count: usize = 0;
             var start: usize = 0;
@@ -2215,7 +2219,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
                 start = end;
             }
             const values = audioExecutionInputs(hidden, &layer_inputs);
-            defer_audio_arena = try prepare(stage.ptr, cb, keys[0..count], &values);
+            defer_audio_arena = try prepare(stage.ptr, cb, keys[0..count], &values, storage);
         };
     }
     const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
