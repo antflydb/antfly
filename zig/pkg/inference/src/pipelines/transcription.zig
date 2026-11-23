@@ -100,7 +100,7 @@ pub const TimedSegment = struct {
 pub const Timing = struct {
     mel_ns: u64 = 0,
     encoder_ns: u64 = 0,
-    /// Decoder prompt pass (all forced tokens at once).
+    /// Initial decoder prompt pass and any remaining forced-prompt steps.
     prefill_ns: u64 = 0,
     /// Generated tokens after the prompt.
     decode_ns: u64 = 0,
@@ -707,6 +707,9 @@ pub const TranscriptionPipeline = struct {
                     .suppress = suppress_scratch.items,
                 };
             }
+            // The initial prompt can already include every forced token. Its
+            // forward pass fills KV and predicts the first free token together.
+            const prefill_step = decoder_position == 0 or generated_position < prompt_end;
             var decoder_row = try decoder_runtime.step(dec_ids[0..dec_len], decoder_position, stats_request, self.batch_dispatch);
             decoder_position = dec_len;
             defer decoder_row.deinit();
@@ -714,7 +717,7 @@ pub const TranscriptionPipeline = struct {
             const last_logits = decoder_row.logits;
             const vocab_size = last_logits.len;
             const step_ns = platform.time.monotonicNs() -| step_started;
-            if (generated_position >= prompt_end) {
+            if (!prefill_step) {
                 timing.decode_ns += step_ns;
                 timing.decode_steps += 1;
             } else timing.prefill_ns += step_ns;
