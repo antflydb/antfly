@@ -3438,7 +3438,7 @@ pub const Adapter = struct {
         var context = self.context;
         context.setting_admin = true;
         const routing_source = self.server.catalogSource();
-        const deadline = routing_source.deadlineFrom(.{ .deadline_ns = input.opts.execution_deadline_ns, .io = input.opts.execution_io });
+        const deadline = routing_source.deadlineFrom(.{ .deadline_ns = input.opts.execution_deadline_ns });
         var routing = (try table_catalog.authoritativeTableRoutingSnapshot(scratch, routing_source, input.table, deadline)) orelse return null;
         defer routing.deinit(scratch);
         if (routing.table_id != table_id or routing.ranges.len == 0 or routing.ranges.len > 256) return error.CatalogGenerationChanged;
