@@ -1052,10 +1052,10 @@ const MainStoreOwner = union(enum) {
         };
     }
 
-    fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner) !bool {
+    fn runLsmMaintenanceStepBestEffort(self: *MainStoreOwner, due_only: bool) !bool {
         return switch (self.*) {
             .mem => false,
-            .lsm => |*handle| try handle.backend.runMaintenanceStepBestEffort(),
+            .lsm => |*handle| try handle.backend.runReadyMaintenanceStepBestEffort(due_only),
         };
     }
 
@@ -1955,6 +1955,15 @@ pub const PersistentIndex = struct {
         };
     }
 
+    pub fn readyLsmMaintenanceScoreBestEffort(self: *PersistentIndex, due_only: bool) u64 {
+        if (!self.storage_mu.tryLock()) return 0;
+        defer self.unlockStorage();
+        return switch (self.main_store_owner) {
+            .mem => 0,
+            .lsm => |handle| handle.backend.readyMaintenanceScoreBestEffort(due_only),
+        };
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *PersistentIndex) void {
         switch (self.main_store_owner) {
             .mem => {},
@@ -2102,10 +2111,10 @@ pub const PersistentIndex = struct {
         return try self.main_store_owner.runLsmMaintenanceStep();
     }
 
-    pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex) !bool {
-        self.lockStorage();
+    pub fn runLsmMaintenanceStepBestEffort(self: *PersistentIndex, due_only: bool) !bool {
+        if (!self.storage_mu.tryLock()) return false;
         defer self.unlockStorage();
-        return try self.main_store_owner.runLsmMaintenanceStepBestEffort();
+        return try self.main_store_owner.runLsmMaintenanceStepBestEffort(due_only);
     }
 
     /// Index a pre-built segment (WAL-protected, durable after return).

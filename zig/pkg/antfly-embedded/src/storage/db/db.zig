@@ -7088,25 +7088,24 @@ pub const DB = struct {
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runLsmMaintenanceStepBestEffort", .{self});
-        var replication_mutation = self.acquireReplicationMutationShared();
+        // Use the same debt and due-work signals as the admitted path. Idle
+        // polls must not advance the replay revision seen by hybrid readers.
+        const primary = &self.core.primary_store_owner;
+        if (!self.source_pin_cleanup.due(monotonicTimeNs()) and
+            !primary.hasReadyLsmMaintenanceWorkBestEffort() and
+            !self.core.index_manager.hasReadyLsmMaintenanceWorkBestEffort()) return false;
+
+        var replication_mutation = if (self.replicationMutationBarrier()) |barrier|
+            barrier.tryAcquireShared() orelse return false
+        else
+            null;
         defer if (replication_mutation) |*lease| lease.release();
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        var snapshot_replay = self.core.snapshot_replay_admission.tryAcquireMutation() orelse return false;
         defer snapshot_replay.release();
         if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
-        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
-        if (primary_reclaim_due) {
-            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
-        }
-
-        const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
-        if (primary_score > 0) {
-            if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
-        }
+        if (try primary.runReadyLsmMaintenanceStepBestEffort()) return true;
         if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
-        if (primary_score > 0) {
-            self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
-        }
         return try self.runSourcePinCleanupStep();
     }
 
@@ -7155,17 +7154,17 @@ pub const DB = struct {
 
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runPrimaryLsmMaintenanceStepBestEffort", .{self});
-        var replication_mutation = self.acquireReplicationMutationShared();
+        const primary = &self.core.primary_store_owner;
+        if (!primary.hasReadyLsmMaintenanceWorkBestEffort()) return false;
+
+        var replication_mutation = if (self.replicationMutationBarrier()) |barrier|
+            barrier.tryAcquireShared() orelse return false
+        else
+            null;
         defer if (replication_mutation) |*lease| lease.release();
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        var snapshot_replay = self.core.snapshot_replay_admission.tryAcquireMutation() orelse return false;
         defer snapshot_replay.release();
-        if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
-        const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
-        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
-        if (primary_score == 0 and !primary_reclaim_due) return false;
-        if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
-        self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
-        return false;
+        return try primary.runReadyLsmMaintenanceStepBestEffort();
     }
 
     pub fn hasActiveDenseBulkWork(self: *const DB) bool {
@@ -7200,6 +7199,143 @@ pub const DB = struct {
             }
         }
         return steps;
+    }
+
+    test "db lsm maintenance idle best-effort polls preserve the replay revision" {
+        const alloc = std.testing.allocator;
+        var directory = try TestDirectory.init("idle-lsm-maintenance");
+        defer directory.cleanup();
+        var options = db_config.primary_lsm_options_default;
+        options.obsolete_retention_ns = 0;
+        var db = try DB.open(alloc, directory.path(), .{
+            .primary_backend = .{ .lsm = options },
+            .start_optional_runtimes = false,
+            .start_index_workers = false,
+            .executor = .{ .backend = .manual },
+        });
+        defer db.close();
+        const backend = db.core.primary_store_owner.lsmBackend() orelse return error.TestUnexpectedResult;
+        const root = backend.root_dir orelse return error.TestUnexpectedResult;
+        const storage = backend.storage orelse return error.TestUnexpectedResult;
+
+        _ = try db.runLsmMaintenanceUntilIdle();
+        db.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+        try std.testing.expect(!db.source_pin_cleanup.due(monotonicTimeNs()));
+        try std.testing.expect(backend.readyMaintenanceScoreBestEffort(false) == 0);
+
+        const revision = db.core.snapshot_replay_admission.quietRevision().?;
+        try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+        try std.testing.expect(!try db.runPrimaryLsmMaintenanceStepBestEffort());
+        try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+
+        // Keep the backend mutex held until both best-effort polls return.
+        // The timeout releases the mutex before joining if either poll blocks.
+        const Poll = struct {
+            db: *DB,
+            primary_only: ?bool = null,
+            done: Io.Event = .unset,
+            result: anyerror!bool = false,
+
+            fn run(self: *@This()) void {
+                self.result = self.poll();
+                self.done.set(std.testing.io);
+            }
+
+            fn poll(self: *@This()) !bool {
+                if (self.primary_only) |only| {
+                    return if (only)
+                        self.db.runPrimaryLsmMaintenanceStepBestEffort()
+                    else
+                        self.db.runLsmMaintenanceStepBestEffort();
+                }
+                const primary = try self.db.runPrimaryLsmMaintenanceStepBestEffort();
+                const combined = try self.db.runLsmMaintenanceStepBestEffort();
+                return primary or combined;
+            }
+        };
+        {
+            var poll: Poll = .{ .db = &db };
+            var worker: ?std.Thread = null;
+            defer if (worker) |thread| thread.join();
+            try std.testing.expect(backend.mu.tryLock());
+            defer backend.mu.unlock();
+            worker = try std.Thread.spawn(.{}, Poll.run, .{&poll});
+            try poll.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try std.testing.expect(!try poll.result);
+            try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+        }
+
+        for ([_]bool{ true, false }, 0..) |primary_only, i| {
+            const obsolete = try lsm_backend_mod.repository.runPath(alloc, root, 999_999 + i);
+            defer alloc.free(obsolete);
+            try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(storage, obsolete, "obsolete");
+            {
+                const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete));
+            }
+            {
+                var poll: Poll = .{ .db = &db, .primary_only = primary_only };
+                var worker: ?std.Thread = null;
+                defer if (worker) |thread| thread.join();
+                var capture = db.core.snapshot_replay_admission.tryAcquireCapture().?;
+                defer capture.release();
+                worker = try std.Thread.spawn(.{}, Poll.run, .{&poll});
+                try poll.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+                try std.testing.expect(!try poll.result);
+                try std.testing.expectEqual(revision + i, db.core.snapshot_replay_admission.mutationRevision());
+            }
+            const progressed = if (primary_only)
+                try db.runPrimaryLsmMaintenanceStepBestEffort()
+            else
+                try db.runLsmMaintenanceStepBestEffort();
+            try std.testing.expect(progressed);
+            try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(alloc, obsolete, 1024));
+            try std.testing.expectEqual(@as(?u64, revision + i + 1), db.core.snapshot_replay_admission.quietRevision());
+        }
+    }
+
+    test "db lsm maintenance skips a busy secondary index with cached debt" {
+        const alloc = std.testing.allocator;
+        var directory = try TestDirectory.init("busy-index-maintenance");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{
+            .start_optional_runtimes = false,
+            .start_index_workers = false,
+            .executor = .{ .backend = .manual },
+        });
+        defer db.close();
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        _ = try db.runLsmMaintenanceUntilIdle();
+        db.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+        db.core.index_manager.refreshLsmMaintenanceDebtHint();
+        try std.testing.expect(!db.source_pin_cleanup.due(monotonicTimeNs()));
+        try std.testing.expect(!db.core.primary_store_owner.hasReadyLsmMaintenanceWorkBestEffort());
+        try std.testing.expect(!db.core.index_manager.hasReadyLsmMaintenanceWorkBestEffort());
+
+        const text = db.core.textIndexEntry("text").?.persistent;
+        const backend = switch (text.main_store_owner) {
+            .lsm => |handle| handle.backend,
+            else => return error.TestUnexpectedResult,
+        };
+        const revision = db.core.snapshot_replay_admission.quietRevision().?;
+        backend.notePotentialMaintenanceDebt();
+        try std.testing.expect(db.core.index_manager.hasReadyLsmMaintenanceWorkBestEffort());
+        {
+            try std.testing.expect(text.storage_mu.tryLock());
+            defer text.storage_mu.unlock(std.testing.io);
+            try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+            try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+        }
+        {
+            try std.testing.expect(backend.mu.tryLock());
+            defer backend.mu.unlock();
+            try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+            try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+        }
+        try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+        try std.testing.expectEqual(@as(?u64, revision + 1), db.core.snapshot_replay_admission.quietRevision());
+        try std.testing.expectEqual(@as(u64, 0), backend.maintenanceDebtHint());
     }
 
     test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
@@ -45670,19 +45806,21 @@ pub const DB = struct {
             HybridComponents.ownerAllocatorCanOverlap(self.alloc) and
             (HybridComponents.Budget.reusableHeadroom(alloc) orelse 0) >= HybridComponents.workspace_bytes;
         const io = if (can_overlap and reusable) exec_ctx.io orelse self.backend_runtime.io() else null;
-        const revisions = if (io != null) HybridComponents.quietRevisions(self) else null;
+        const revisions = if (io != null) HybridComponents.quietRevisions(self, null) else null;
         const probe = if (builtin.is_test) test_hybrid_probe else null;
         const sources = if (revisions != null) HybridComponents.resolveSources(self, alloc, req, probe) else null;
+        const profile_hybrid = has_text and has_dense and benchQueryProfileEnabled();
         var hybrid: HybridComponents = .{
             .db = self,
             .io = if (sources != null) io else null,
             .sources = sources orelse .{},
             .probe = probe,
+            .profile = profile_hybrid,
             .component_alloc = .{ .backing = alloc },
         };
-        if (sources != null) hybrid.cut = hybrid.readCutFrom(revisions.?);
+        if (sources != null) hybrid.cut = hybrid.readCutFrom(revisions.?, null);
         hybrid.lexical_budget = .{ .backing = hybrid.component_alloc.allocator(), .limit = if (probe) |test_probe| test_probe.workspace_bytes else HybridComponents.workspace_bytes };
-        defer if (has_text and has_dense and benchQueryProfileEnabled()) {
+        defer if (profile_hybrid) {
             std.log.info("antfly_bench_hybrid launched={} accepted={} replay={s}", .{
                 hybrid.launched,                                            hybrid.accepted_batch and hybrid.retry_reason == null,
                 if (hybrid.retry_reason) |err| @errorName(err) else "none",
@@ -45711,7 +45849,7 @@ pub const DB = struct {
             .attach_graph_results = attachGraphResultsCallback,
         };
         var attempt = db_query_search.searchComposed(alloc, req, executor);
-        if (hybrid.accepted_batch and !std.meta.eql(hybrid.cut, hybrid.readCut())) {
+        if (hybrid.accepted_batch and !hybrid.cutMatches("fusion")) {
             if (attempt) |value| {
                 var abandoned = value;
                 abandoned.deinit();
@@ -45773,6 +45911,14 @@ pub const DB = struct {
         const scheduler = @import("../../sql/parallel_scheduler.zig");
         const Budget = @import("../../sql/memory_budget.zig");
         const workspace_bytes = 16 * 1024 * 1024;
+        const CutFailure = enum {
+            changed,
+            primary_unquiet,
+            replay_unquiet,
+            dense_publishing,
+            replay_bracket,
+            primary_bracket,
+        };
         const Revisions = struct { primary: u64, replay: u64 };
         const Cut = struct {
             primary: u64,
@@ -45793,6 +45939,7 @@ pub const DB = struct {
         io: ?Io,
         cut: ?Cut = null,
         sources: Sources,
+        profile: bool,
         probe: ?*HybridTestProbe,
         component_alloc: scheduler.LockedAllocator,
         launched: bool = false,
@@ -45838,25 +45985,35 @@ pub const DB = struct {
             return (entry orelse return null).persistent.writer.snapshotEpoch();
         }
 
-        fn quietRevisions(db: *DB) ?Revisions {
+        fn unavailable(comptime T: type, failure: ?*CutFailure, reason: CutFailure) ?T {
+            if (failure) |out| out.* = reason;
+            return null;
+        }
+
+        fn quietRevisions(db: *DB, failure: ?*CutFailure) ?Revisions {
             return .{
-                .primary = db.core.snapshot_admission.quietRevision() orelse return null,
-                .replay = db.core.snapshot_replay_admission.quietRevision() orelse return null,
+                .primary = db.core.snapshot_admission.quietRevision() orelse return unavailable(Revisions, failure, .primary_unquiet),
+                .replay = db.core.snapshot_replay_admission.quietRevision() orelse return unavailable(Revisions, failure, .replay_unquiet),
             };
         }
 
-        fn readCut(self: *HybridComponents) ?Cut {
-            return self.readCutFrom(quietRevisions(self.db) orelse return null);
+        fn cutMatches(self: *HybridComponents, comptime phase: []const u8) bool {
+            var reason: CutFailure = .changed;
+            const failure = if (self.profile) &reason else null;
+            const current = if (quietRevisions(self.db, failure)) |revisions| self.readCutFrom(revisions, failure) else null;
+            if (std.meta.eql(self.cut, current)) return true;
+            if (self.profile) std.log.info("antfly_bench_hybrid_cut phase={s} reason={s} old={any} new={any} db={s}", .{ phase, @tagName(reason), self.cut, current, self.db.core.path });
+            return false;
         }
 
-        fn readCutFrom(self: *HybridComponents, revisions: Revisions) ?Cut {
+        fn readCutFrom(self: *HybridComponents, revisions: Revisions, failure: ?*CutFailure) ?Cut {
             if (builtin.is_test) {
                 if (self.probe) |probe| probe.read_cut_samples += 1;
             }
             const db = self.db;
             const generation = if (self.sources.dense) |entry| entry.index.publishedGeneration() else null;
             const mutation = if (self.sources.dense) |entry| entry.index.publishedMutationEpoch() else null;
-            if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return null;
+            if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return unavailable(Cut, failure, .dense_publishing);
             const cut: Cut = .{
                 .primary = revisions.primary,
                 .replay = revisions.replay,
@@ -45868,8 +46025,8 @@ pub const DB = struct {
             };
             // Bracket source sampling in reverse order so both mutation
             // domains were quiet over a common interval.
-            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, revisions.replay) or
-                db.core.snapshot_admission.quietRevision() != @as(?u64, revisions.primary)) return null;
+            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, revisions.replay)) return unavailable(Cut, failure, .replay_bracket);
+            if (db.core.snapshot_admission.quietRevision() != @as(?u64, revisions.primary)) return unavailable(Cut, failure, .primary_bracket);
             return cut;
         }
 
@@ -45968,7 +46125,7 @@ pub const DB = struct {
             var text_owned = text_outcome catch null;
             errdefer if (text_owned) |*result| result.deinit();
 
-            if (!std.meta.eql(self.cut, self.readCut())) return error.HybridReadCutChanged;
+            if (!self.cutMatches("retrieval")) return error.HybridReadCutChanged;
             if (text_outcome) |_| {} else |err| {
                 if (err == error.OutOfMemory and self.lexical_budget.isExhausted())
                     return error.HybridSerialRetry;
