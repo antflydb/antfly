@@ -54,6 +54,26 @@ authentication mechanism: enabling CORS without `allowed_origins` grants no
 cross-origin access. Configure exact trusted origins; `"*"` requires explicit
 opt-in and cannot be combined with credentialed CORS.
 
+### Replication grants
+
+The `replicate` table permission grants export authority separately from `read`,
+`write`, and `curator`. Those permissions do not imply replication, and a
+replication-only credential does not acquire ordinary SELECT or mutation access.
+Table administrators include replication authority. API keys remain bounded by
+both their original grants and their owner's current permissions; revoking a
+replication role removes its authority without rotating the key.
+
+Row policies still apply to exported data, including both historical images of
+an update. A replication grant does not bypass table/row/field policy, feed or
+slot ownership, or publication selection. Native cursors and PostgreSQL LSNs are
+positions rather than credentials. Trusted gateways can grant `replicate` in
+`operations` or in a concrete table's `table_operations` list; an ordinary
+read-only signed identity cannot export through that grant.
+
+This permission is part of the change pipeline implementation. It does not by
+itself activate a public changefeed or PostgreSQL replication endpoint; those
+interfaces require their runtime capabilities and qualification.
+
 ### Native memory curation
 
 Grant the shared table permission `curator` on a memory space's logical table

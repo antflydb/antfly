@@ -23,6 +23,7 @@ pub const test_sources = [_][]const u8{
     "kernel_owner_provisioned_source_test.zig",
     "enrichment_compute_test.zig",
     "kernel_owner_handoff_reopen_test.zig",
+    "kernel_owner_legacy_terminal_test.zig",
 };
 
 /// Exercise the same storage archive linked by serving and embedded consumers.
@@ -87,6 +88,8 @@ pub fn add(
             });
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
+            if (index == 0) b.step("history-resolution-owner-test", "Verify compiled immutable resolution reads and qualified cuts").dependOn(&runs[index].step);
+            if (index == 1) b.step("history-resolution-routed-test", "Verify frozen routed completion receipt reads").dependOn(&runs[index].step);
             if (index == 2) {
                 b.step("enrichment-compute-owner-test", "Run the compiled media owner contract regressions").dependOn(&runs[index].step);
                 tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
@@ -219,17 +222,19 @@ pub fn add(
     physical_imports.boundary_profile = .owner;
     physical_imports.configureStorage(b, physical_module, true);
     @import("../../../build_support/embedded/storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
-    physical_imports.storage_boundary.configureProfile(physical_module, true, true, .owner);
+    physical_imports.storage_boundary.configureProfile(physical_module, false, true, .owner);
     const handoff_tests = @import("linked_tests.zig").add(b, .{
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = physical_module,
-        .filters = &.{"storage owner handoff receipt survives shared-context hidden to public reopen"},
+        .filters = &.{ "storage owner handoff receipt survives shared-context hidden to public reopen", "storage owner legacy terminal resolution" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
     inline for (.{ .storage_kernel, .local_query, .enrichment_compute, .inference }) |unit|
         handoff_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
     b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner handoff receipt reopen regression")
+        .dependOn(&handoff_tests.run(b).step);
+    b.step("antfly-storage-owner-legacy-terminal-test", "Run original terminal recovery through the native opaque owner and physical reopen")
         .dependOn(&handoff_tests.run(b).step);
     return .{ .runs = std.mem.concat(b.allocator, *std.Build.Step.Run, &.{ &runs, additional_runs.items }) catch @panic("OOM"), .benchmark = benchmark };
 }

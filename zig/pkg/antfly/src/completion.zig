@@ -96,7 +96,7 @@ pub const commands = [_]Command{
     .{ .name = "agents", .description = "Run AI agents", .route = .cli, .subcommands = &agents_subcommands },
     .{ .name = "backup", .description = "Back up tables and inspect backup files", .route = .cli, .subcommands = &backup_subcommands },
     .{ .name = "restore", .description = "Restore tables", .route = .cli },
-    .{ .name = "storage", .description = "Manage table storage", .route = .storage, .subcommands = &.{"migrate"} },
+    .{ .name = "storage", .description = "Manage table storage", .route = .storage, .subcommands = &.{ "migrate", "provision-pgwire-spool" } },
     .{ .name = "connections", .description = "Manage provider connections", .route = .cli, .subcommands = &connections_subcommands },
     .{ .name = "auth", .description = "Manage users and authorization", .route = .cli, .subcommands = &auth_subcommands },
     .{ .name = "internal", .description = "Run internal cluster commands", .route = .cli, .subcommands = &internal_subcommands },

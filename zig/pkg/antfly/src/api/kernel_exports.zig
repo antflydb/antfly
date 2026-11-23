@@ -255,6 +255,13 @@ pub fn setHotStandbyExecutor(context: *const CallContext) callconv(.c) abi.Statu
     return .ok;
 }
 
+pub fn lakeStreamOwnerOptions(context: *const CallContext) callconv(.c) abi.Status {
+    const owner = @import("lake_source_owner.zig");
+    if (validateCall(owner.OptionsInput, owner.Options, context)) |failure| return failure;
+    output(owner.Options, context).* = serverState(context).server.lakeStreamOwnerOptions(input(owner.OptionsInput, context).*) catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn attachRuntimeRestoreStore(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(backend_erased.Store, void, context)) |failure| return failure;
     serverState(context).server.attachRestoreJobRuntimeStore(@constCast(input(backend_erased.Store, context))) catch |err|
@@ -556,7 +563,7 @@ const function_table: abi.FunctionTable = .{
     .capabilities = abi.Capability.core |
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
-        abi.Capability.internal_service_ingress,
+        abi.Capability.internal_service_ingress | abi.Capability.lake_stream_owner,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -582,6 +589,7 @@ const function_table: abi.FunctionTable = .{
     .handler_destroy = &handlerDestroy,
     .inference_admission_stats = &inferenceAdmissionStats,
     .handler_authorize_internal_service = &handlerAuthorizeInternalService,
+    .lake_stream_owner_options = &lakeStreamOwnerOptions,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
