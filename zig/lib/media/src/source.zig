@@ -170,13 +170,21 @@ pub const Source = struct {
             .range => |range| {
                 const copy = range.peek_at orelse return 0;
                 const owner = self.physical orelse self;
-                if (!range.concurrent) try owner.provider_gate.lock(self.control);
+                const control: Control = .{ .context = self, .check_fn = checkPeekControl };
+                if (!range.concurrent) try owner.provider_gate.lock(control);
                 defer if (!range.concurrent) owner.provider_gate.unlock();
+                try control.check();
                 const n = copy(range.context, offset, out);
+                try control.check();
                 if (n > out.len) return error.InvalidSourceRead;
                 return n;
             },
         }
+    }
+
+    fn checkPeekControl(context: ?*const anyopaque) anyerror!void {
+        const self: *const Source = @ptrCast(@alignCast(context.?));
+        try self.checkControl();
     }
 
     /// Reads a small or isolated span without the transport's normal read-ahead.
@@ -809,4 +817,34 @@ test "optional views preserve physical read and byte reserves" {
     try std.testing.expectEqual(@as(usize, 3), physical.reads);
     var required = try physical.read(0, 2);
     required.deinit();
+}
+
+test "resident peek observes physical cancellation while the provider is contended" {
+    const Fixture = struct {
+        checks: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.checks += 1;
+            if (self.checks >= 2) return error.Cancelled;
+        }
+        fn read(_: *anyopaque, _: u64, _: []u8, _: Control) !usize {
+            return error.UnexpectedRead;
+        }
+        fn peek(_: *anyopaque, _: u64, _: []u8) usize {
+            unreachable;
+        }
+    };
+    var fixture = Fixture{};
+    var owner = Source{
+        .allocator = std.testing.allocator,
+        .identity = "peek-cancellation",
+        .storage = .{ .range = .{ .context = &fixture, .read_at = Fixture.read, .peek_at = Fixture.peek, .length = 1 } },
+        .control = .{ .context = &fixture, .check_fn = Fixture.check },
+    };
+    var worker = owner.view(std.testing.allocator, null, .{});
+    try owner.provider_gate.lock(null);
+    defer owner.provider_gate.unlock();
+    var out: [1]u8 = undefined;
+    try std.testing.expectError(error.Cancelled, worker.peek(0, &out));
+    try std.testing.expectEqual(@as(usize, 0), owner.reads);
 }
