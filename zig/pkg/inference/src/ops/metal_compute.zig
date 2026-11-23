@@ -13238,17 +13238,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     };
 
-    fn buildProjectionPack(cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph, request: ProjectionPack.Request, funded: *FundedProjectionPack, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
-        var active = try operation_mod.enter(cb.*, graph, null, .managed);
-        defer active.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
-        const token = active.token() orelse return error.PreparedMetadataAuthorityUnavailable;
-        if (cleanup.boundary) |epoch| if (!try active.bindCleanupEpoch(epoch)) return error.BackendOperationCleanupUnavailable;
-        try publishFundedProjectionPack(cb, graph, token, request, funded);
-        // Closing the operation can itself acquire the slot index lock.
-        try active.finish();
-    }
-
-    fn publishFundedProjectionPack(cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph, token: operation_mod.Borrowed, request: ProjectionPack.Request, funded: *FundedProjectionPack) !void {
+    fn publishFundedProjectionPack(cb: *const ops.ComputeBackend, graph: ?*const ml.graph.Graph, token: operation_mod.Borrowed, request: ProjectionPack.Request, funded: *FundedProjectionPack) !void {
         try token.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph, .mode = .managed });
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         // The numerical Gate excludes other execution, but residency can
@@ -13282,30 +13272,68 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         funded.published = true;
     }
 
-    /// Called only by the actual Session BeforeExecution service, with the
-    /// retained model's original Domain, before any Model/lane/profile entry.
-    pub fn prepareProjectionPackOutsideExecution(cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph, request: ProjectionPack.Request, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+    const PendingProjectionPack = struct {
+        cold: bool,
+        funded: ?FundedProjectionPack = null,
+    };
+
+    /// Called before any Model/lane/profile entry, with the retained model's
+    /// original admission domain. The single-head path needs no scratch heap.
+    pub fn prepareProjectionPackOutsideExecution(cb: *const ops.ComputeBackend, graph: ?*const ml.graph.Graph, request: ProjectionPack.Request, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+        var pending: [1]PendingProjectionPack = undefined;
+        try prepareProjectionPackBatchOutsideExecution(cb, graph, &.{request}, &pending, pin, cleanup);
+    }
+
+    pub fn prepareProjectionPacksOutsideExecution(cb: *const ops.ComputeBackend, graph: ?*const ml.graph.Graph, requests: []const ProjectionPack.Request, allocator: std.mem.Allocator, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+        if (comptime !build_options.enable_metal) return;
+        const pending = try allocator.alloc(PendingProjectionPack, requests.len);
+        defer allocator.free(pending);
+        try prepareProjectionPackBatchOutsideExecution(cb, graph, requests, pending, pin, cleanup);
+    }
+
+    fn prepareProjectionPackBatchOutsideExecution(cb: *const ops.ComputeBackend, graph: ?*const ml.graph.Graph, requests: []const ProjectionPack.Request, pending: []PendingProjectionPack, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
         if (comptime !build_options.enable_metal) return;
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.ForeignPreparedProjectionBackend;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         if (!DenseProjectionProfile.noFrame(self) or currentEngineOperation(self) != null) return error.UnpreparedPackedProjectionScope;
-        const layout = try request.layout();
-        const existing = blk: {
+        std.debug.assert(requests.len == pending.len);
+
+        // Take one metadata snapshot before any supplier or device allocation.
+        // Validate the complete batch even when some entries are already warm.
+        const any_cold = blk: {
             var metadata = try operation_mod.enter(cb.*, graph, null, .metadata);
             defer metadata.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
             if (metadata.token() == null) return error.PreparedMetadataAuthorityUnavailable;
             const cache = self.projectionPackCache();
             platform.sync.lockYielding(&cache.mutex);
             defer cache.mutex.unlock();
-            break :blk self.packedProjection(cache, request) != null;
+            var any_cold = false;
+            for (requests, pending) |request, *entry| {
+                _ = try request.layout();
+                const cold = self.packedProjection(cache, request) == null;
+                entry.* = .{ .cold = cold };
+                any_cold = any_cold or cold;
+            }
+            break :blk any_cold;
         };
-        if (existing) return;
-        // Remove only stale-generation entries. Readers independently retain
-        // Owner; logical removal never refunds an in-flight SDK root.
+        if (!any_cold) return;
+
+        // Readers independently retain Owner. Logical removal never refunds
+        // an in-flight SDK root. Publication revalidates every cold request
+        // against the live slot declarations after funding.
         try self.retireStaleProjectionPacksOutsideExecution(cb, graph);
-        var funded = try self.fundProjectionPackOutsideExecution(layout, pin);
-        defer funded.deinitOutsideExecution();
-        try buildProjectionPack(cb, graph, request, &funded, cleanup);
+        defer for (pending) |*entry| if (entry.funded) |*funded| funded.deinitOutsideExecution();
+        for (requests, pending) |request, *entry| {
+            if (entry.cold) entry.funded = try self.fundProjectionPackOutsideExecution(try request.layout(), pin);
+        }
+
+        var active = try operation_mod.enter(cb.*, graph, null, .managed);
+        defer active.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        const token = active.token() orelse return error.PreparedMetadataAuthorityUnavailable;
+        if (cleanup.boundary) |epoch| if (!try active.bindCleanupEpoch(epoch)) return error.BackendOperationCleanupUnavailable;
+        for (requests, pending) |request, *entry| if (entry.funded) |*funded| try publishFundedProjectionPack(cb, graph, token, request, funded);
+        // Closing the operation can itself acquire the slot index lock.
+        try active.finish();
     }
 
     fn fundProjectionPackOutsideExecution(self: *MetalCompute, layout: ProjectionPack.Layout, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !FundedProjectionPack {
@@ -13396,7 +13424,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .data = self.data, .provider = self.provider_impl, .layout = layout, .roots = .{ weight, bias }, .owner = owner, .node = node, .charge = charge };
     }
 
-    fn retireStaleProjectionPacksOutsideExecution(self: *MetalCompute, cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph) !void {
+    fn retireStaleProjectionPacksOutsideExecution(self: *MetalCompute, cb: *const ops.ComputeBackend, graph: ?*const ml.graph.Graph) !void {
         self.data.prefetch.lock();
         var residency_locked = true;
         defer if (residency_locked) self.data.prefetch.unlock();

@@ -13250,7 +13250,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
         pair.generations[2] = 0;
         pair.declarations[2] = 0;
         pair.widths[2] = 0;
-        try MetalCompute.prepareProjectionPackOutsideExecution(&target.cb, target.executable.graph, pair, &pin, .{ .outside_execution = true });
+        try MetalCompute.prepareProjectionPacksOutsideExecution(&target.cb, null, &.{ request, pair }, a, &pin, .{ .outside_execution = true });
         const packed_pair = compute.projectionPackCache().entries orelse return error.MissingPackedProjectionEntry;
         try std.testing.expect(packed_pair != qkv);
         const current_runtime = compute.provider_impl.raw_decode_runtime;
