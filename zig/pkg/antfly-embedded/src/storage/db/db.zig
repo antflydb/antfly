@@ -62306,6 +62306,9 @@ fn loadDocumentTimestampsManyWithIdentityShape(self: *DB, alloc: Allocator, keys
     return timestamps;
 }
 
+const PresenceProbeTestPhase = enum { read, finished };
+threadlocal var test_presence_probe_hook: ?*const fn (PresenceProbeTestPhase) void = null;
+
 fn filterPresentSearchHitsMany(
     self: *DB,
     alloc: Allocator,
@@ -62350,23 +62353,35 @@ fn filterPresentSearchHitsMany(
     const batch_size = if (stop != null) @min(batch_limit, keys.len) else keys.len;
     const values = try scratch.alloc(?[]const u8, batch_size);
     for (pending, 0..) |item, i| keys[i] = item.key;
-    var txn = try self.core.store.beginProbeTxn();
-    defer txn.abort();
+    var txn: ?docstore_mod.DocStore.Txn = null;
+    defer if (txn) |*active| active.abort();
     // Presence only needs the primary reference, not its decoded vector.
     var members = @import("artifact_chunk_generation.zig").MemberReader.init(alloc);
     defer members.deinit();
     var start: usize = 0;
     while (start < keys.len) {
         try control.check();
+        if (txn == null) txn = try self.core.store.beginProbeTxn();
+        const active = &txn.?;
         const end = start + @min(batch_size, keys.len - start);
         const batch_keys = keys[start..end];
         const batch_values = values[0 .. end - start];
-        try txn.getManySortedPhysical(batch_keys, batch_values);
+        try active.getManySortedPhysical(batch_keys, batch_values);
+        if (builtin.is_test) if (test_presence_probe_hook) |hook| hook(.read);
         try control.check();
         for (batch_keys, batch_values, pending[start..end]) |key, value, item| {
-            keep[item.hit_index] = (try members.override(&txn, key, value)) != null;
+            keep[item.hit_index] = (try members.override(active, key, value)) != null;
         }
         start = end;
+        if (start < keys.len and !(try active.releasePhysicalProbeResults())) {
+            // Backends without independent result lifetimes must close the
+            // probe before continuing. Refresh generation metadata as well.
+            active.abort();
+            txn = null;
+            members.deinit();
+            members = @import("artifact_chunk_generation.zig").MemberReader.init(alloc);
+        }
+        if (builtin.is_test) if (test_presence_probe_hook) |hook| hook(.finished);
     }
     return keep;
 }
@@ -132849,6 +132864,31 @@ test "db search marks a truncated fused candidate union as a lower bound" {
     try std.testing.expectEqual(types.TotalHitsRelation.exact, full_window.total_hits_relation);
 }
 
+test "db hybrid search visibility reuses the memory probe across batches" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{ .primary_backend = .{ .mem = .{} }, .start_index_workers = false });
+    defer db.close();
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:present", .value = "{}" }} });
+    var candidates: [257]types.SearchHit = undefined;
+    var present = "doc:present".*;
+    var missing = "doc:absent".*;
+    for (&candidates, 0..) |*hit, i| {
+        hit.* = .{ .id = if (i % 2 == 0) &present else &missing };
+    }
+
+    var txn = try db.core.store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expect(try txn.releasePhysicalProbeResults());
+
+    const stop: std.atomic.Value(bool) = .init(false);
+    const visible = try filterStoredSearchCandidatesManyControlled(&db, alloc, &candidates, &stop);
+    defer alloc.free(visible);
+    for (visible, 0..) |keep, i| try std.testing.expectEqual(i % 2 == 0, keep);
+}
+
 test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     const alloc = std.testing.allocator;
 
@@ -132981,8 +133021,22 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
         const visible = try filterStoredSearchCandidatesManyControlled(&db, alloc, &candidates, &stop);
         defer alloc.free(visible);
         for (visible, 0..) |keep, i| try std.testing.expectEqual(i % 3 != 0, keep);
-        stop.store(true, .release);
+        const CancelAfterBatch = struct {
+            var physical_reads: usize = 0;
+            var signal: *std.atomic.Value(bool) = undefined;
+            fn observe(phase: PresenceProbeTestPhase) void {
+                switch (phase) {
+                    .read => physical_reads += 1,
+                    .finished => signal.store(true, .release),
+                }
+            }
+        };
+        CancelAfterBatch.physical_reads = 0;
+        CancelAfterBatch.signal = &stop;
+        test_presence_probe_hook = CancelAfterBatch.observe;
+        defer test_presence_probe_hook = null;
         try std.testing.expectError(error.Cancelled, filterStoredSearchCandidatesManyControlled(&db, alloc, &candidates, &stop));
+        try std.testing.expectEqual(@as(usize, 1), CancelAfterBatch.physical_reads);
     }
 
     var opaque_allocator = std.testing.FailingAllocator.init(alloc, .{});
