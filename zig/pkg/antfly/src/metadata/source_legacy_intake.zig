@@ -125,6 +125,11 @@ fn writeCheckpointIndex(txn: anytype, group: u64, owner_group: u64, scope: contr
     };
 }
 
+pub fn hasCheckpointOwner(txn: anytype, group: u64, owner_group: u64) !bool {
+    var buffer: [160]u8 = undefined;
+    return txn.hasPrefix(try checkpointPrefix(&buffer, group, owner_group, false));
+}
+
 pub fn checkpointActors(txn: anytype, group: u64, owner_group: u64, after: ?CheckpointActor) !CheckpointPage {
     return checkpointActorsFiltered(txn, group, owner_group, after, false);
 }

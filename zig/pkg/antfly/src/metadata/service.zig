@@ -4990,15 +4990,23 @@ pub fn ensureQueryPopulationCapabilityWithContext(service: anytype, context: api
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_population_version);
 }
 
-pub fn ensureRestoreStagingDecoderWithContext(service: anytype, command_json: []const u8, context: api_operation.RequestContext) !void {
+pub fn ensureRestoreStagingDecoderWithContext(service: anytype, action: @import("restore_staging.zig").Command.Action, command_json: []const u8, context: api_operation.RequestContext) !void {
+    // Admission, cutover and publication all participate in the source pin guard.
+    const guards_replacement = switch (action) {
+        .reserve, .freeze_rewrite, .begin_cutover, .begin_activation, .publish => true,
+        else => false,
+    };
     const command: metadata_storage.TransitionCommand = .{ .apply_restore_staging = command_json };
-    if (!@import("schema_reader_wire.zig").requiresRestoreReservationOutcome(command_json))
-        return ensureCoordinatedDecoderWithContext(service, command, context);
-    try context.ensureActive();
-    try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
-    // Receipt-bearing restore commands check the committed barrier during
-    // apply. A successful decoder probe alone cannot authorize an append.
-    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.restore_reservation_outcome_version);
+    if (@import("schema_reader_wire.zig").requiresRestoreReservationOutcome(command_json)) {
+        try context.ensureActive();
+        try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
+        return ensureDurableDecoderActivation(service, context, if (guards_replacement)
+            metadata_topology_protocol.source_restore_guard_version
+        else
+            metadata_topology_protocol.restore_reservation_outcome_version);
+    }
+    if (guards_replacement) try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.source_restore_guard_version);
+    return ensureCoordinatedDecoderWithContext(service, command, context);
 }
 
 pub fn ensureCatalogAtomicAdmissionDecoderWithContext(service: anytype, context: api_operation.RequestContext) !void {
@@ -5006,10 +5014,10 @@ pub fn ensureCatalogAtomicAdmissionDecoderWithContext(service: anytype, context:
 }
 
 pub fn ensureCatalogRestoreDecoderWithContext(service: anytype, context: api_operation.RequestContext, progress: bool) !void {
-    return ensureDurableDecoderActivation(service, context, if (progress)
-        metadata_topology_protocol.sql_catalog_progress_version
-    else
-        metadata_topology_protocol.sql_catalog_reservation_version);
+    return ensureDurableDecoderActivation(service, context, @max(
+        metadata_topology_protocol.source_restore_guard_version,
+        if (progress) metadata_topology_protocol.sql_catalog_progress_version else metadata_topology_protocol.sql_catalog_reservation_version,
+    ));
 }
 
 /// Capability observation alone does not install the apply-side barrier. Own

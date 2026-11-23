@@ -17309,6 +17309,59 @@ test "relational integrity restore staging reserves external parent and rejects 
     try store.applyTransitionCommandTxn(&txn, group_id, .{ .upsert_range = old_range });
     _ = try txn.get(try tableKeyForGroup(&buf, group_id, old.table_id));
     try std.testing.expect(try store.restoreReplacementMatchesTxn(&txn, group_id, target));
+    {
+        const identity = "11111111111111111111111111111111".*;
+        try store.applyTransitionCommandTxn(&txn, group_id, .{ .initialize_metadata_incarnation = identity });
+        var proof: topology_protocol.Activation = .{ .version = topology_protocol.source_restore_guard_version - 1, .incarnation = identity, .member_count = 1, .membership_fingerprint = @splat(7) };
+        const prior_floor = try std.json.Stringify.valueAlloc(alloc, proof, .{});
+        defer alloc.free(prior_floor);
+        try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group_id), prior_floor);
+        var work_buf: [256]u8 = undefined;
+        const work_key = try source_control.workKey(&work_buf, group_id, old.table_id);
+        var work_count: [8]u8 = undefined;
+        std.mem.writeInt(u64, &work_count, 1, .little);
+        try txn.put(work_key, &work_count);
+        try std.testing.expect(try store.restoreReplacementMatchesTxn(&txn, group_id, target));
+        proof.version = topology_protocol.source_restore_guard_version;
+        const floor = try std.json.Stringify.valueAlloc(alloc, proof, .{});
+        defer alloc.free(floor);
+        try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group_id), floor);
+        try std.testing.expect(!try store.restoreReplacementMatchesTxn(&txn, group_id, target));
+        try txn.delete(work_key);
+        try std.testing.expect(try store.restoreReplacementMatchesTxn(&txn, group_id, target));
+        const remote_actor: source_control.State = .{
+            .scope = .{
+                .table_id = parent_table.table_id,
+                .source_id = @splat(1),
+                .source_ordinal = 0,
+                .generation = 1,
+                .definition = @splat(2),
+                .provider = @splat(3),
+                .destination = .native,
+                .destination_binding = @splat(4),
+            },
+            .scope_fencing = true,
+            .checkpoint_authority = .{
+                .binding = @splat(5),
+                .table_name = old.name,
+                .owner = .{
+                    .metadata_group_id = group_id,
+                    .metadata_incarnation = identity,
+                    .namespace = @splat(6),
+                    .table_binding = changefeed_control.tableBinding(old),
+                    .group_id = old_range.group_id,
+                    .topology_epoch = 1,
+                    .root_generation = 0,
+                },
+            },
+        };
+        const intake = @import("../source_legacy_intake.zig");
+        try intake.indexTransition(&txn, group_id, .{}, remote_actor);
+        try std.testing.expect(!try store.restoreReplacementMatchesTxn(&txn, group_id, target));
+        try intake.indexTransition(&txn, group_id, remote_actor, .{});
+        try std.testing.expect(try store.restoreReplacementMatchesTxn(&txn, group_id, target));
+        try txn.delete(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group_id));
+    }
     try std.testing.expect(try store.restoreExternalParentMatchesTxn(&txn, group_id, parent));
     try std.testing.expect(try store.restoreIncomingDependenciesClosedTxn(&txn, group_id, plan));
     const locks = @import("../table_lifecycle_lock.zig");
@@ -33489,6 +33542,20 @@ pub const RaftApplyStore = struct {
             error.OutOfMemory => return err,
             else => return,
         };
+        const opens_table_work = (!source_control.hasWork(state) and source_control.hasWork(next)) or write.mutation == .pin_payload_prewrite;
+        const owner_to_pin = activating orelse switch (write.mutation) {
+            .begin_checkpoint_transfer, .prepare_checkpoint_successor => new_authority,
+            else => null,
+        };
+        // These are the reverse admission checks for restore replacement. The
+        // reservation and each new source pin must contend in the same txn.
+        if (opens_table_work and try restoreStagingReplacesTableTxn(txn, group_id, scope.table_id) and
+            try self.sourceRestoreGuardActiveTxn(txn, group_id)) return;
+        if (owner_to_pin) |authority| {
+            const owner_table = std.mem.readInt(u64, authority.owner.namespace[0..8], .big);
+            if (try restoreStagingReplacesTableTxn(txn, group_id, owner_table) and
+                try self.sourceRestoreGuardActiveTxn(txn, group_id)) return;
+        }
         const output = source_control.encode(a, next) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return,
@@ -42584,11 +42651,21 @@ pub const RaftApplyStore = struct {
         return payload;
     }
 
+    fn sourceRestoreGuardActiveTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64) !bool {
+        _ = self.requireTopologyActivationTxn(txn, group_id, topology_protocol.source_restore_guard_version) catch |err| switch (err) {
+            error.TableTopologyProtocolUpgradeRequired => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     fn restoreReplacementMatchesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, target: restore_staging.Target) !bool {
         var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
         const name_value = try stagingGet(txn, try tableNameIndexKey(&key_buf, group_id, target.table.name));
         const old = target.replace orelse return name_value == null;
         if (try @import("../source_legacy_intake.zig").hasPayloadPrewrites(txn, group_id, old.table.table_id)) return false;
+        const source_guard_active = try self.sourceRestoreGuardActiveTxn(txn, group_id);
+        if (source_guard_active and try tableHasSourceWorkTxn(self.alloc, txn, group_id, old.table.table_id)) return false;
         if (std.mem.eql(u8, old.table.name, target.table.name)) {
             if (name_value == null or name_value.?.len != 8 or std.mem.readInt(u64, name_value.?[0..8], .little) != old.table.table_id) return false;
         } else if (target.catalog_binding == null or name_value != null) return false;
@@ -42606,6 +42683,10 @@ pub const RaftApplyStore = struct {
             try self.extensionOwnsTableTxn(txn, group_id, old.table.name)) return false;
         var membership: topology_protocol.RangeMembershipAccumulator = .{};
         for (old.ranges) |range| {
+            if (source_guard_active and
+                (try @import("../source_legacy_intake.zig").hasCheckpointOwner(txn, group_id, range.group_id) or
+                    try @import("../source_legacy_intake.zig").hasPendingSuccessors(txn, group_id, range.group_id))) return false;
+
             const actual_bytes = (try stagingGet(txn, try rangeKeyForGroup(&key_buf, group_id, range.group_id))) orelse return false;
             const actual = try decodeRangeRecord(self.alloc, actual_bytes);
             defer metadata_table_manager.freeRange(self.alloc, actual);
@@ -44350,6 +44431,9 @@ pub const RaftApplyStore = struct {
                 .begin_cutover => {
                     try @import("../trigger_restore_claims.zig").requireHeld(catalog_arena.allocator(), txn, group_id, job.value.plan);
                     if (next.state != .validating or next.completed_owners != total or old_total + parent_total == 0) return;
+                    if (try self.sourceRestoreGuardActiveTxn(txn, group_id)) {
+                        for (job.value.plan.targets) |target| if (!try self.restoreReplacementMatchesTxn(txn, group_id, target)) return;
+                    }
                     for (job.value.plan.targets) |target| {
                         if (target.generation_handoffs.len == 0) continue;
                         const old = target.replace orelse return;
@@ -45117,6 +45201,8 @@ pub const RaftApplyStore = struct {
             return self.putReplicationSourceStatusTxn(txn, group_id, key, observed);
         }
         if (std.mem.eql(u8, record.phase, source_control.native_bootstrap_preparing_phase)) {
+            if (try restoreStagingReplacesTableTxn(txn, group_id, record.table_id) and
+                try self.sourceRestoreGuardActiveTxn(txn, group_id)) return;
             if (raw) |bytes| {
                 const previous = try decodeReplicationSourceStatusRecord(a, bytes);
                 if (!source_control.nativeBootstrapCanReplaceStatus(previous) or previous.snapshot_cleanup_job.len != 0 or
@@ -63526,13 +63612,18 @@ fn backupCohortLockKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const
 
 /// Authoritative metadata admission check, also used for FK parent DDL. A
 /// backup's source definitions cannot change until all owner fences retire.
-pub fn restoreStagingLocksTableTxn(txn: anytype, group_id: u64, table_id: u64) !bool {
+fn restoreStagingReplacesTableTxn(txn: anytype, group_id: u64, table_id: u64) !bool {
     var buf: [256]u8 = undefined;
-    const old = txn.get(try restore_staging.identityKey(&buf, group_id, .old_table, table_id)) catch |err| switch (err) {
-        error.NotFound => null,
+    _ = txn.get(try restore_staging.identityKey(&buf, group_id, .old_table, table_id)) catch |err| switch (err) {
+        error.NotFound => return false,
         else => return err,
     };
-    if (old != null) return true;
+    return true;
+}
+
+pub fn restoreStagingLocksTableTxn(txn: anytype, group_id: u64, table_id: u64) !bool {
+    if (try restoreStagingReplacesTableTxn(txn, group_id, table_id)) return true;
+    var buf: [256]u8 = undefined;
     const parent = txn.get(try restore_staging.identityKey(&buf, group_id, .parent_table, table_id)) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -85417,6 +85508,15 @@ test "metadata source control handover atomically fences the legacy checkpoint" 
     try store.applyStandaloneCommand(group, .{ .apply_source_control = try source_control.encodeWrite(scratch, write) });
     try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(scratch, group, table.table_id, 0, definition));
     write.mutation.begin_legacy_handover.checkpoint = status.stream_checkpoint;
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        const proof: topology_protocol.Activation = .{ .version = topology_protocol.source_restore_guard_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) };
+        try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buffer, group), try std.json.Stringify.valueAlloc(scratch, proof, .{}));
+        try txn.put(try restore_staging.identityKey(&buffer, group, .old_table, table.table_id), &(try restore_staging.idForAttempt(7, 1)));
+        try store.applySourceControlTxn(&txn, group, try source_control.encodeWrite(scratch, write));
+        try std.testing.expectError(error.NotFound, txn.get(try source_control.keyForGroup(&buffer, group, table.table_id, scope.source_id)));
+    }
     try store.applyStandaloneCommand(group, .{ .apply_source_control = try source_control.encodeWrite(scratch, write) });
     try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(scratch, group, table.table_id, 0, definition));
     try std.testing.expect(try store.nativeRootProducerCohortSealed(group, table.name, changefeed_control.tableBinding(table)));
