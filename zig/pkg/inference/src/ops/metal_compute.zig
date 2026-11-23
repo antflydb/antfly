@@ -22774,6 +22774,40 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         buf.* = .{ .cache_identity = nextPreparedValueIdentity(), .data = @as([*]f32, @ptrFromInt(@alignOf(f32)))[0..0], .allocator = a, .owned = false, .logical_shape = shape, .metal_tensor = tensor, .integer_storage = tensor.dtype != .f32 };
         return @ptrCast(buf);
     }
+    fn wrapOwnedMetalPersistentTensor(tensor: MetalTensor) !CT {
+        errdefer {
+            var owned = tensor;
+            owned.deinit();
+        }
+        return wrapMetalPersistentTensor(tensor);
+    }
+
+    /// Reserve all views before allocating their bank. The ordinary bank
+    /// helper owns the separate SDK payload and root-reference reservation.
+    fn metalAudioArenaBank(self: *MetalCompute, owner: *PreparedTensorStorage, bytes: usize, wrapper_bytes: usize) !?MetalTensor {
+        const cache = if (self.data.tier_cache) |*value| value else return null;
+        const host_bytes = try std.math.add(usize, owner.host_bytes, wrapper_bytes);
+        {
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            cache.reserve(.host, wrapper_bytes) catch return null;
+        }
+        var committed = false;
+        defer if (!committed) {
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            cache.noteRelease(.host, wrapper_bytes);
+        };
+        owner.host_bytes = host_bytes;
+        defer if (!committed) {
+            owner.host_bytes -= wrapper_bytes;
+        };
+        const bank = (try self.metalPersistentBuffer(owner, bytes, false)) orelse return null;
+        committed = true;
+        owner.drop_ct = dropMetalPersistentTensor;
+        return bank;
+    }
+
     fn audioPlanAllocationBound(self: *MetalCompute, bytes: usize, shared: bool) ?usize {
         if (bytes == 0) return null;
         // Shared coefficient banks also support devices without Shared heaps.
@@ -22860,7 +22894,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
                 plan.retry_delay = @min(@as(u8, 64), plan.retry_delay *| 2);
                 switch (err) {
-                    error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return,
+                    error.OutOfMemory, error.MetalBufferAllocFailed, error.AudioScheduleAdmission => return,
                     else => return err,
                 }
             };
@@ -22902,28 +22936,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         for (plan.nodes[0..plan.count]) |*node| if (try plan.arena_recipe.workspaceView(node, .separate)) |view| {
             wrapper_bytes = try std.math.add(usize, wrapper_bytes, persistentTensorBytes(view.shape.len));
         };
-        const cache = if (self.data.tier_cache) |*value| value else return error.AudioScheduleAdmission;
-        {
-            self.data.prefetch.lock();
-            defer self.data.prefetch.unlock();
-            try cache.reserve(.host, wrapper_bytes);
-        }
-        staged.host_bytes = wrapper_bytes;
-        staged.drop_ct = dropMetalPersistentTensor;
-
-        const bank = (try self.metalPersistentBuffer(&staged, bytes, false)) orelse return error.AudioScheduleAdmission;
-        staged_bank = wrapMetalPersistentTensor(bank) catch |err| {
-            var owned = bank;
-            owned.deinit();
-            return err;
-        };
+        const bank = (try self.metalAudioArenaBank(&staged, bytes, wrapper_bytes)) orelse return error.AudioScheduleAdmission;
+        staged_bank = try wrapOwnedMetalPersistentTensor(bank);
         for (plan.nodes[0..plan.count], 0..) |*node, i| if (try plan.arena_recipe.workspaceView(node, .separate)) |region| {
-            const view = try bank.retainedView(region.offset, region.bytes, &region.shape);
-            staged.outputs[i] = wrapMetalPersistentTensor(view) catch |err| {
-                var owned = view;
-                owned.deinit();
-                return err;
-            };
+            staged.outputs[i] = try wrapOwnedMetalPersistentTensor(try bank.retainedView(region.offset, region.bytes, &region.shape));
         };
         const host = try std.math.add(usize, plan.storage.host_bytes, staged.host_bytes);
         const backend = try std.math.add(usize, plan.storage.backend_bytes, staged.backend_bytes);
@@ -23061,38 +23077,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Preserve the previous output-bank eligibility and admission fallback.
         // Optional clamp scratch must not evict an otherwise fitting bank.
         if (recipe.initialBank(plan.workspaces.len, plan.count, audio_schedule_bank_limit)) |request| {
+            var output_headers = persistentTensorBytes(1);
+            var scratch_headers: usize = 0;
+            for (plan.nodes[0..plan.count]) |*node| {
+                if (try recipe.outputView(node)) |region| {
+                    if (plan.storage.outputs.len != 0 and !plan.linear_only)
+                        output_headers = try std.math.add(usize, output_headers, persistentTensorBytes(region.shape.len));
+                }
+                if (request.workspace_bytes != 0) if (try recipe.workspaceView(node, .combined)) |region| {
+                    scratch_headers = try std.math.add(usize, scratch_headers, persistentTensorBytes(region.shape.len));
+                };
+            }
             var workspace_bytes = request.workspace_bytes;
             var bytes = request.bytes;
-            var bank: ?MetalTensor = if (bytes != 0) try self.metalPersistentBuffer(&plan.storage, bytes, false) else null;
+            const headers = try std.math.add(usize, output_headers, scratch_headers);
+            var bank: ?MetalTensor = if (bytes != 0) try self.metalAudioArenaBank(&plan.storage, bytes, headers) else null;
             if (bank == null and workspace_bytes != 0) {
                 workspace_bytes = 0;
                 bytes = recipe.outputs_bytes;
-                if (bytes != 0) bank = try self.metalPersistentBuffer(&plan.storage, bytes, false);
+                if (bytes != 0) bank = try self.metalAudioArenaBank(&plan.storage, bytes, output_headers);
             }
             if (bank) |mt| {
-                plan.arena = self.metalPersistentTensor(&plan.storage, mt) catch |err| {
-                    var owned = mt;
-                    owned.deinit();
-                    return err;
-                };
+                plan.arena = try wrapOwnedMetalPersistentTensor(mt);
                 plan.arena_size = bytes;
                 plan.input_workspace_bytes = workspace_bytes;
                 for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.outputView(node)) |region| {
                     if (plan.storage.outputs.len == 0 or plan.linear_only) continue;
-                    const view = try mt.retainedView(region.offset, region.bytes, &region.shape);
-                    plan.storage.outputs[i] = self.metalPersistentTensor(&plan.storage, view) catch |err| {
-                        var owned = view;
-                        owned.deinit();
-                        return err;
-                    };
+                    plan.storage.outputs[i] = try wrapOwnedMetalPersistentTensor(try mt.retainedView(region.offset, region.bytes, &region.shape));
                 };
                 if (workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.workspaceView(node, .combined)) |region| {
-                    const view = try mt.retainedView(region.offset, region.bytes, &region.shape);
-                    plan.workspaces[i] = self.metalPersistentTensor(&plan.storage, view) catch |err| {
-                        var owned = view;
-                        owned.deinit();
-                        return err;
-                    };
+                    plan.workspaces[i] = try wrapOwnedMetalPersistentTensor(try mt.retainedView(region.offset, region.bytes, &region.shape));
                 };
             } else if (recipe.outputs_bytes != 0) return error.AudioScheduleAdmission;
         }
@@ -62104,7 +62118,8 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
     const output_bound = compute.audioPlanAllocationBound(recipe.outputs_bytes, false) orelse return error.TestUnexpectedResult;
     const full_bound = compute.audioPlanAllocationBound(recipe.total_bytes, false) orelse return error.TestUnexpectedResult;
     try std.testing.expect(full_bound > output_bound);
-    cache.budget.backend_limit_bytes = output_bound;
+    cache.budget.backend_limit_bytes = full_bound + output_bound;
+    cache.budget.host_limit_bytes = cache.host_bytes + metal_tensor_mod.device_buffer_ref_bytes + MetalCompute.persistentTensorBytes(1) + MetalCompute.persistentTensorBytes(2);
     try compute.audioTryPrepare(plan);
     try std.testing.expect(plan.prepared);
     try std.testing.expectEqual(recipe.outputs_bytes, plan.arena_size);
