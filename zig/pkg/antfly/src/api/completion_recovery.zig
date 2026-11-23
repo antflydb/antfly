@@ -601,11 +601,16 @@ const consumer_tests = if (@hasDecl(@import("antfly_source_root"), "implementati
         try std.testing.expectEqualDeep(scope_ref, prepared.plan.source_scope.?);
         const encoded_prepared = try prepared.plan.encodeFrozen(a);
         defer a.free(encoded_prepared);
-        var reprepared = (try coordinator.prepare(a, admission.transaction_id, 10, &source_inputs, .{})).?;
+        const reversed_source_inputs = [_]admission_mod.Input{ source_inputs[1], source_inputs[0] };
+        var reprepared = (try coordinator.prepare(a, admission.transaction_id, 10, &reversed_source_inputs, .{})).?;
         defer reprepared.deinit();
         const rebuilt_bytes = try reprepared.plan.encodeFrozen(a);
         defer a.free(rebuilt_bytes);
         try std.testing.expectEqualSlices(u8, encoded_prepared, rebuilt_bytes);
+        for (prepared.routes, reprepared.routes) |original, rebuilt| {
+            try std.testing.expectEqualDeep(original.owner, rebuilt.owner);
+            try std.testing.expectEqual(original.fence.route.group_id, rebuilt.fence.route.group_id);
+        }
         var restored_prepared = try plan_mod.Plan.restoreFrozen(a, encoded_prepared, try plan_mod.frozenDigest(encoded_prepared));
         defer restored_prepared.deinit();
         try std.testing.expectEqualDeep(scope_ref, restored_prepared.source_scope.?);
