@@ -4066,17 +4066,19 @@ test "model aware media can build optional WebM audio independently of video ind
     const webm = try codecs.webm.buildOpusTestFileAlloc(a, ogg.packets[0].bytes, packets);
     defer a.free(webm);
     const Provider = struct {
+        bytes: []const u8,
+
         fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
-            const bytes: *[]const u8 = @ptrCast(@alignCast(raw));
-            @memcpy(out, bytes.*[@intCast(offset)..][0..out.len]);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
             return out.len;
         }
     };
-    var bytes: []const u8 = webm;
+    var provider = Provider{ .bytes = webm };
     var source = media.source.Source{
         .allocator = a,
         .identity = "cold-audio",
-        .storage = .{ .range = .{ .context = &bytes, .read_at = Provider.read, .length = webm.len } },
+        .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = webm.len } },
     };
     var result = Qualification{};
     var runner = try Runner.init(a, .{
