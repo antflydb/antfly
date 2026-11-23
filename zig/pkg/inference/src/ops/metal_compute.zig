@@ -40376,7 +40376,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.out_dim,
             out_mt,
         )) return true;
-        return metal_runtime.tryApplyDenseRuntimeLinearInto(
+        return metal_runtime.decoderRuntimeApplyLinearDeviceInto(
             self.provider_impl,
             request.slot,
             linear_input,
