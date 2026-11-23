@@ -20577,6 +20577,49 @@ fn audioOutputMatches(input: *const CudaTensor, output: *const CudaTensor, bytes
     return output.dtype == .f32 and output.elem_count == input.elem_count and output.buffer.len >= bytes;
 }
 
+fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !void {
+    // The caller proves every source is outside the arena and the placement
+    // gives each destination a separate slice. A batch has no internal order.
+    const debug_copy = self.debug_cuda_graph_capture_active;
+    if (!debug_copy) try self.ctx.makeCurrent();
+    if (!debug_copy and self.ctx.stream != null and inputs.len > 1) batch: {
+        const submit = self.ctx.driver.fns.cuMemcpyBatchAsync orelse break :batch;
+        var destinations: [20]driver_mod.CUdeviceptr = undefined;
+        var sources: [20]driver_mod.CUdeviceptr = undefined;
+        var sizes: [20]usize = undefined;
+        var count: usize = 0;
+        var bytes: usize = 0;
+        for (inputs, spans) |ct, span| {
+            if (span.bytes == 0) continue;
+            destinations[count] = (try audioBufferView(input_bank, span.offset, span.bytes)).ptr;
+            sources[count] = tensorFromCt(ct).buffer.ptr;
+            sizes[count] = span.bytes;
+            count += 1;
+            bytes += span.bytes;
+        }
+        if (count <= 1) break :batch;
+        var attributes = [_]driver_mod.MemcpyAttributes{.{}};
+        var attribute_indices = [_]usize{0};
+        // An error may reflect pending work. Never retry a batch as separate
+        // submissions after calling the driver.
+        try self.ctx.driver.check(submit(&destinations, &sources, &sizes, count, &attributes, &attribute_indices, 1, self.ctx.stream));
+        @import("../../execution/transfer_audit.zig").deviceCopy(bytes);
+        self.stats.d2d_bytes += bytes;
+        return;
+    }
+    for (inputs, spans) |ct, span| {
+        if (span.bytes == 0) continue;
+        const destination = try audioBufferView(input_bank, span.offset, span.bytes);
+        const source = tensorFromCt(ct).buffer;
+        if (debug_copy) {
+            try copyFromDeviceTracked(self, destination, source, span.bytes);
+        } else {
+            try destination.copyFromCurrentDevice(&self.ctx, source, span.bytes);
+            self.stats.d2d_bytes += span.bytes;
+        }
+    }
+}
+
 fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
@@ -20741,19 +20784,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     if (replay or capture) {
         // Capture only records the stable addresses. Stage bytes after a
         // successful recording and immediately before the common launch.
-        const use_copy_kernel = self.debug_cuda_graph_capture_active;
-        if (!use_copy_kernel) try self.ctx.makeCurrent();
-        for (inputs, spans) |ct, span| {
-            if (span.bytes == 0) continue;
-            const destination = try audioBufferView(input_bank, span.offset, span.bytes);
-            const source = tensorFromCt(ct).buffer;
-            if (use_copy_kernel) {
-                try copyFromDeviceTracked(self, destination, source, span.bytes);
-            } else {
-                try destination.copyFromCurrentDevice(&self.ctx, source, span.bytes);
-                self.stats.d2d_bytes += span.bytes;
-            }
-        }
+        try stageAudioGraphInputs(self, input_bank, inputs, spans);
         try arena.launch(&self.ctx);
         if (replay) self.audio_graph_replays += 1;
     }
@@ -60268,7 +60299,8 @@ test "public source audio linear recreates input bank through actual learning ca
         }
         if (iteration == 3 or iteration == 6) {
             try std.testing.expectEqual(before_calls, run.calls); // actual replay bypasses host body
-            try std.testing.expectEqual(@as(u64, 3), transfers.device_copy_calls);
+            const expected_copies: u64 = if (compute.ctx.driver.fns.cuMemcpyBatchAsync != null and compute.ctx.stream != null) 2 else 3;
+            try std.testing.expectEqual(expected_copies, transfers.device_copy_calls);
             try std.testing.expectEqual(@as(u64, 3 * @sizeOf([4]f32)), transfers.device_copy_bytes);
             try std.testing.expectEqual(@as(u64, if (iteration == 3) 1 else 2), compute.audio_graph_replays);
             try std.testing.expectEqual(ordinary_pointer, compute.source_linear_scratch.buffer.ptr);
