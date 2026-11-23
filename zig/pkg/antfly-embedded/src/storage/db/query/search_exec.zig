@@ -822,7 +822,9 @@ pub const ComposedSearchExecutor = struct {
     ctx: ?*anyopaque,
     /// Optional independent component executions. Results must retain input
     /// order; fusion, graph dependencies and transforms remain on the caller.
-    search_components: ?*const fn (?*anyopaque, Allocator, []const ComposedComponent) anyerror!ComposedComponentBatch = null,
+    /// Returning null declines admission and uses the ordinary serial path.
+    search_components: ?*const fn (?*anyopaque, Allocator, []const ComposedComponent) anyerror!?ComposedComponentBatch = null,
+    component_ctx: ?*anyopaque = null,
     resolve_structured_doc_filter: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1138,7 +1140,7 @@ pub fn searchComposed(
         if (executor.search_dense_profiled == null or executor.dense_profile_sink == null) {
             const components = try composedComponents(alloc, shared_req);
             defer alloc.free(components);
-            if (components.len > 1) component_batch = try run(executor.ctx, alloc, components);
+            if (components.len > 1) component_batch = try run(executor.component_ctx orelse executor.ctx, alloc, components);
         }
     }
 
@@ -40351,7 +40353,7 @@ test "external lake metadata navigation composed batches preserve component sema
         fn graph(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: *types.SearchResult, _: []const graph_exec.NamedResultSet) !void {
             return error.UnexpectedGraphAttachment;
         }
-        fn batch(_: ?*anyopaque, alloc: Allocator, components: []const ComposedComponent) !ComposedComponentBatch {
+        fn batch(_: ?*anyopaque, alloc: Allocator, components: []const ComposedComponent) !?ComposedComponentBatch {
             try std.testing.expectEqual(@as(usize, 2), components.len);
             try std.testing.expect(components[0].query == .text and components[1].query == .dense);
             try std.testing.expect(components[0].request.full_text != null and components[1].request.full_text == null);

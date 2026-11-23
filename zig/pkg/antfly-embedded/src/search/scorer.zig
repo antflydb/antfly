@@ -636,113 +636,110 @@ pub const WANDScorer = struct {
         else
             try self.alloc.alloc(usize, self.terms.items.len);
         defer if (self.terms.items.len > sorted_stack.len) self.alloc.free(sorted);
-        for (sorted, 0..) |*s, i| s.* = i;
+        const terms = self.terms.items;
+        for (sorted, 0..) |*index, i| index.* = i;
+        var active = repairWANDOrder(terms, sorted);
 
-        while (true) {
-            // Count active terms and sort indices by current doc_id
-            var active: usize = 0;
-            for (sorted) |idx| {
-                if (!self.terms.items[idx].exhausted) active += 1;
+        while (active != 0) {
+            if (try self.seekCandidate(collector, terms[sorted[0]].current.?.doc_id)) {
+                active = repairWANDOrder(terms, sorted[0..active]);
+                continue;
             }
-            if (active == 0) break;
-
-            // Pivot advances usually move one iterator forward, so the prior
-            // order is almost sorted. Insertion repair avoids a general sort
-            // and its comparator setup on every WAND iteration.
-            const terms = self.terms.items;
-            var sort_pos: usize = 1;
-            while (sort_pos < sorted.len) : (sort_pos += 1) {
-                const moving = sorted[sort_pos];
-                var insert_pos = sort_pos;
-                while (insert_pos > 0 and termIndexBefore(terms, moving, sorted[insert_pos - 1])) : (insert_pos -= 1) {
-                    sorted[insert_pos] = sorted[insert_pos - 1];
-                }
-                sorted[insert_pos] = moving;
-            }
-
-            if (try self.seekCandidate(collector, self.terms.items[sorted[0]].current.?.doc_id)) continue;
-            if (try self.skipNonCompetitiveFrontBlock(collector, sorted)) {
+            if (try self.skipNonCompetitiveFrontBlock(collector, sorted[0..active])) {
                 collector.markLowerBound();
+                active = repairWANDOrder(terms, sorted[0..active]);
                 continue;
             }
 
-            // Find pivot: smallest position where sum of max-impacts reaches
-            // the collector's current competitive score.
+            // Find the first position whose cumulative bound reaches top-k.
             const threshold = collector.minCompetitiveScore();
             var cumulative: f32 = 0;
-            var pivot_pos: ?usize = null;
-            for (sorted, 0..) |idx, pos| {
-                const t = &self.terms.items[idx];
-                if (t.exhausted) break;
-                cumulative += self.termMaxImpact(t);
-                if (cumulative >= threshold) {
-                    pivot_pos = pos;
-                    break;
-                }
+            var pivot_pos: usize = 0;
+            while (pivot_pos < active) : (pivot_pos += 1) {
+                cumulative += self.termMaxImpact(&terms[sorted[pivot_pos]]);
+                if (cumulative >= threshold) break;
             }
-
-            if (pivot_pos == null) {
+            if (pivot_pos == active) {
                 collector.markLowerBound();
                 break;
             }
 
-            const pivot_doc = self.terms.items[sorted[pivot_pos.?]].current.?.doc_id;
-
-            // Check if all terms up to pivot are at pivot_doc
-            var all_at_pivot = true;
-            for (sorted[0 .. pivot_pos.? + 1]) |idx| {
-                const t = &self.terms.items[idx];
-                if (t.exhausted or t.current.?.doc_id != pivot_doc) {
-                    all_at_pivot = false;
-                    break;
-                }
-            }
-
-            if (all_at_pivot) {
-                // Fully score this document
-                self.pivots_scored += 1;
-                var score: f32 = 0;
-                for (self.terms.items) |*t| {
-                    if (t.exhausted) continue;
-                    if (t.current.?.doc_id == pivot_doc) {
-                        const hit = t.current.?;
-                        score += t.bm25_scorer.score(hit.freq, hit.norm);
-                        self.next_in_score += 1;
-                    }
-                }
-                try collector.collect(.{ .doc_id = pivot_doc, .score = score });
-
-                // Multi-term WAND already reaches the chunk-skip path on
-                // pivot advances. Calling advanceTo for every scored term adds
-                // measurable overhead to balanced disjunctions where the
-                // combined global bound prevents chunk pruning.
-                for (self.terms.items) |*t| {
-                    if (t.exhausted or t.current.?.doc_id != pivot_doc) continue;
-                    t.current = try t.iter.nextScoring();
-                    if (t.current) |*hit| {
-                        hit.doc_id += t.doc_offset;
-                    } else {
-                        t.exhausted = true;
-                    }
-                }
-            } else {
-                // Advance the first term that's not at pivot_doc past pivot_doc.
-                // Then apply Block-Max chunk skipping: if the chunk this term
-                // landed in can't contribute enough (combined with the other
-                // terms' max-impacts) to beat the current top-k threshold, hop
-                // to the start of the next chunk and try again. This is the
-                // core Block-Max WAND skip on top of WAND's pivot-level pruning.
+            const pivot_doc = terms[sorted[pivot_pos]].current.?.doc_id;
+            const front = &terms[sorted[0]];
+            if (front.current.?.doc_id != pivot_doc) {
                 self.pivots_advanced += 1;
                 collector.markLowerBound();
-                for (sorted[0 .. pivot_pos.? + 1]) |idx| {
-                    const t = &self.terms.items[idx];
-                    if (!t.exhausted and t.current.?.doc_id < pivot_doc) {
-                        try self.advancePastWithChunkSkip(t, pivot_doc, threshold, false);
-                        break;
-                    }
+                try self.advancePastWithChunkSkip(front, pivot_doc, threshold, false);
+                active = reinsertWANDPrefix(terms, sorted[0..active], 1);
+                continue;
+            }
+
+            // All matches form a prefix, ordered by original term index
+            // within the document. Keep that order for floating-point sums.
+            self.pivots_scored += 1;
+            var score: f32 = 0;
+            var matches: usize = 0;
+            for (sorted[0..active]) |index| {
+                const term = &terms[index];
+                const hit = term.current.?;
+                if (hit.doc_id != pivot_doc) break;
+                score += term.bm25_scorer.score(hit.freq, hit.norm);
+                matches += 1;
+            }
+            self.next_in_score += matches;
+            try collector.collect(.{ .doc_id = pivot_doc, .score = score });
+
+            // Ordinary nextScoring avoids redundant chunk-impact checks after
+            // collection. Pivot advances and the front-block sweep do pruning.
+            for (sorted[0..matches]) |index| {
+                const term = &terms[index];
+                term.current = try term.iter.nextScoring();
+                if (term.current) |*hit| {
+                    hit.doc_id += term.doc_offset;
+                } else {
+                    term.exhausted = true;
                 }
             }
+            active = reinsertWANDPrefix(terms, sorted[0..active], matches);
         }
+    }
+
+    /// Bulk seeks and block skips can change any active iterator.
+    fn repairWANDOrder(terms: []const TermState, sorted: []usize) usize {
+        var active: usize = 0;
+        for (sorted) |index| {
+            if (terms[index].exhausted) continue;
+            var pos = active;
+            while (pos > 0 and termIndexBefore(terms, index, sorted[pos - 1])) : (pos -= 1) {
+                sorted[pos] = sorted[pos - 1];
+            }
+            sorted[pos] = index;
+            active += 1;
+        }
+        return active;
+    }
+
+    /// Only the prefix moved. Insert it back from right to left into the
+    /// already sorted suffix, dropping exhausted iterators as they appear.
+    fn reinsertWANDPrefix(terms: []const TermState, sorted: []usize, prefix: usize) usize {
+        if (prefix > sorted.len / 2) return repairWANDOrder(terms, sorted);
+        var active = sorted.len;
+        var pos = prefix;
+        while (pos > 0) {
+            pos -= 1;
+            const index = sorted[pos];
+            if (terms[index].exhausted) {
+                @memmove(sorted[pos .. active - 1], sorted[pos + 1 .. active]);
+                active -= 1;
+                continue;
+            }
+            var dest = pos;
+            while (dest + 1 < active and termIndexBefore(terms, sorted[dest + 1], index)) : (dest += 1) {
+                sorted[dest] = sorted[dest + 1];
+            }
+            sorted[dest] = index;
+        }
+        return active;
     }
 
     /// Apply an aligned Block-Max test to the lowest logical document block.
@@ -1459,6 +1456,50 @@ test "WAND membership seeks preserve selective single multi and unbounded scorin
         try std.testing.expectEqual(@as(u32, 1), collector.base.total_count);
         try std.testing.expectEqual(@as(u32, 7001), collector.base.hits.items[0].doc_id);
         try std.testing.expect(collector.calls <= 4);
+    };
+}
+
+test "WAND matching prefixes preserve score order across uneven postings" {
+    const a = std.testing.allocator;
+    const doc_count = 4096;
+    var names: [32][2]u8 = undefined;
+    for (&names, 0..) |*name, i| name.* = .{ 't', @as(u8, 'A') + @as(u8, @intCast(i)) };
+    var builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 128 });
+    defer builder.deinit();
+    for (0..doc_count) |doc| {
+        var hits: std.ArrayList(inverted.InvertedIndexBuilder.TermHit) = .empty;
+        defer hits.deinit(a);
+        for (&names, 0..) |*name, i| {
+            // Different list lengths yield both single matches and large
+            // tied prefixes, with a changing set of active iterators.
+            if (doc / 4 < 1024 - 17 * i and (doc / 4 + i) % (i + 2) == 0) {
+                try hits.append(a, .{ .term = name, .freq = @intCast(1 + i % 5), .norm = 20 });
+            }
+        }
+        if (hits.items.len != 0) try builder.addDocument(@intCast(doc), hits.items);
+    }
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try inverted.InvertedIndexReader.init(a, bytes);
+    for ([_]usize{ 2, names.len }) |count| for ([_]u32{ 1, 100, doc_count }) |k| {
+        var wand = WANDScorer.init(a, k, doc_count, reader.avgDocLen(), .{});
+        defer wand.deinit();
+        var reference = WANDScorer.init(a, k, doc_count, reader.avgDocLen(), .{});
+        defer reference.deinit();
+        // Supply terms in reverse dictionary order to exercise score order.
+        var i = count;
+        while (i > 0) {
+            i -= 1;
+            const lookup = reader.lookup(&names[i]) orelse return error.TestUnexpectedResult;
+            const postings = lookup.postings;
+            try wand.addTerm(try lookup.iterator(a), lookup.docFreq(), postings.block_max, postings.scoringChunkSize(), 0);
+            try reference.addTerm(try lookup.iterator(a), lookup.docFreq(), null, postings.scoringChunkSize(), 0);
+        }
+        const expected = try reference.execute();
+        defer a.free(expected.hits);
+        const actual = try wand.execute();
+        defer a.free(actual.hits);
+        try std.testing.expectEqualDeep(expected.hits, actual.hits);
     };
 }
 

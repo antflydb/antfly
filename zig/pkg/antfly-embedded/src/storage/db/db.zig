@@ -47781,7 +47781,16 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
         dense_profile_sink: ?*db_query_search.DenseSearchProfile,
     ) !types.SearchResult {
-        _ = exec_ctx;
+        const has_text = req.full_text != null or req.full_text_queries.len != 0 or
+            (!db_query_search.isDefaultMatchAll(req.query) and db_query_search.isTextQuery(req.query));
+        const has_dense = req.dense != null or req.dense_queries.len != 0;
+        const can_overlap = has_text and has_dense and req.full_text_queries.len <= 1 and
+            req.dense_queries.len <= 1 and req.sparse == null and req.sparse_queries.len == 0;
+        const io = if (can_overlap and (exec_ctx.max_parallelism orelse 2) >= 2)
+            exec_ctx.io orelse self.backend_runtime.io()
+        else
+            null;
+        var hybrid: HybridComponents = .{ .db = self, .io = io, .alloc = .{ .backing = alloc } };
         const metric_name = composedQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
         errdefer if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
@@ -47789,6 +47798,8 @@ pub const DB = struct {
         };
         const result = try db_query_search.searchComposed(alloc, req, .{
             .ctx = self,
+            .component_ctx = &hybrid,
+            .search_components = if (io != null) HybridComponents.run else null,
             .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
             .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
             .search_text_query = searchTextQueryCallback,
@@ -47807,6 +47818,120 @@ pub const DB = struct {
         }
         return result;
     }
+
+    const HybridComponents = struct {
+        const scheduler = @import("../../sql/parallel_scheduler.zig");
+
+        db: *DB,
+        io: ?Io,
+        // Both lanes can allocate into the caller's budget or arena. All
+        // component results are consumed and destroyed inside searchComposed.
+        alloc: scheduler.LockedAllocator,
+
+        const Lexical = struct {
+            owner: *HybridComponents,
+            component: db_query_search.ComposedComponent,
+            done: Io.Event = .unset,
+            cancelled: std.atomic.Value(bool) = .init(false),
+            elapsed_ns: u64 = 0,
+            diagnostic: ?db_query_search.SortRejectionDiagnostic = null,
+            diagnostic_field: [256]u8 = undefined,
+
+            fn isCancelled(raw: *const anyopaque) bool {
+                const worker: *const Lexical = @ptrCast(@alignCast(raw));
+                return worker.cancelled.load(.acquire) or worker.component.request.cancellation.?.isCancelled();
+            }
+
+            fn run(worker: *@This()) anyerror!types.SearchResult {
+                const start = platform_time.monotonicNs();
+                defer {
+                    worker.elapsed_ns = platform_time.monotonicNs() -| start;
+                    worker.done.set(worker.owner.io.?);
+                }
+                db_query_search.resetLastSortRejectionDiagnostic();
+                errdefer if (db_query_search.takeLastSortRejectionDiagnostic()) |diagnostic| {
+                    const field = worker.diagnostic_field[0..diagnostic.field.len];
+                    @memcpy(field, diagnostic.field);
+                    worker.diagnostic = .{ .field = field, .reason = diagnostic.reason, .detail = diagnostic.detail };
+                };
+                var req = worker.component.request;
+                const cancellation: types.CancellationToken = .{ .ptr = worker, .is_cancelled_fn = isCancelled };
+                if (req.cancellation != null) req.cancellation = cancellation;
+                const db = worker.owner.db;
+                const a = worker.owner.alloc.allocator();
+                try db_query_search.checkSearchRequestDeadline(req);
+                return switch (worker.component.query) {
+                    .text => |query| db.searchTextQuery(a, req, query),
+                    .default_text => db.searchText(a, req),
+                    else => unreachable,
+                };
+            }
+        };
+
+        fn run(raw: ?*anyopaque, a: Allocator, components: []const db_query_search.ComposedComponent) !?db_query_search.ComposedComponentBatch {
+            const self: *HybridComponents = @ptrCast(@alignCast(raw.?));
+            const io = self.io orelse return null;
+            if (components.len != 2 or components[1].query != .dense) return null;
+            switch (components[0].query) {
+                .text, .default_text => {},
+                else => return null,
+            }
+
+            const dense = components[1];
+            const entry = self.db.core.denseIndex(dense.request.index_name) orelse return null;
+            // LEANN can drop apply-shared around external inference. Keep
+            // those requests serial so the coordinator's pinned cut remains
+            // valid throughout both component reads.
+            if (entry.index.leann != null) return null;
+            // Fallible checkpoints may own mutable, task-local state.
+            if (dense.request.cancellation) |token| if (token.check_fn != null) return null;
+            try db_query_search.checkSearchRequestDeadline(dense.request);
+
+            var lexical: Lexical = .{ .owner = self, .component = components[0] };
+            var task = scheduler.global().submit(io, 16 * 1024 * 1024, Lexical.run, .{&lexical}) orelse return null;
+            var joined = false;
+            defer if (!joined) {
+                lexical.cancelled.store(true, .release);
+                if (task.cancel(io)) |value| {
+                    var abandoned = value;
+                    abandoned.deinit();
+                } else |_| {}
+            };
+
+            // The coordinator retains apply-shared and its thread-local
+            // dense recovery state. The worker uses independent read cursors
+            // and borrows only the request and its already resolved filters.
+            const start = platform_time.monotonicNs();
+            const dense_outcome = self.db.searchDense(self.alloc.allocator(), dense.request, dense.query.dense);
+            const dense_ns = platform_time.monotonicNs() -| start;
+            errdefer if (dense_outcome) |value| {
+                var abandoned = value;
+                abandoned.deinit();
+            } else |_| {};
+
+            if (dense_outcome) |_| {} else |err| {
+                if (err == error.Canceled or err == error.Cancelled or err == error.Timeout) return err;
+            }
+            try lexical.done.wait(io);
+            joined = true;
+            var text_result = task.await(io) catch |err| {
+                db_query_search.resetLastSortRejectionDiagnostic();
+                if (lexical.diagnostic) |diagnostic|
+                    db_query_search.recordSortRejectionDiagnostic(diagnostic.field, diagnostic.reason, diagnostic.detail);
+                return err;
+            };
+            errdefer text_result.deinit();
+            const dense_result = try dense_outcome;
+            try db_query_search.checkSearchRequestDeadline(dense.request);
+
+            const results = try a.alloc(?types.SearchResult, 2);
+            errdefer a.free(results);
+            const execution_ns = try a.dupe(u64, &.{ lexical.elapsed_ns, dense_ns });
+            results[0] = text_result;
+            results[1] = dense_result;
+            return .{ .alloc = a, .results = results, .execution_ns = execution_ns };
+        }
+    };
 
     fn composedQueryMetricIndexName(req: types.SearchRequest) ?[]const u8 {
         if (req.index_name) |name| return name;
@@ -127444,14 +127569,14 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"body\":\"semantic alpha concept\",\"_embeddings\":{\"dv_v1\":[1,0,0]}}" },
-            .{ .key = "doc:b", .value = "{\"body\":\"keyword quickstart only\",\"_embeddings\":{\"dv_v1\":[0,1,0]}}" },
-            .{ .key = "doc:c", .value = "{\"body\":\"plain body unrelated\",\"_embeddings\":{\"dv_v1\":[0,0,1]}}" },
+            .{ .key = "doc:a", .value = "{\"tenant\":\"alpha\",\"body\":\"semantic alpha concept\",\"_embeddings\":{\"dv_v1\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"tenant\":\"alpha\",\"body\":\"keyword quickstart only\",\"_embeddings\":{\"dv_v1\":[0,1,0]}}" },
+            .{ .key = "doc:c", .value = "{\"tenant\":\"beta\",\"body\":\"plain body unrelated\",\"_embeddings\":{\"dv_v1\":[0,0,1]}}" },
         },
         .sync_level = .full_index,
     });
 
-    var result = try db.search(alloc, .{
+    const req: types.SearchRequest = .{
         .index_name = "ft_v1",
         .full_text = .{ .match = .{ .field = "body", .text = "quickstart" } },
         .dense_queries = &.{
@@ -127473,7 +127598,8 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
             },
         },
         .limit = 3,
-    });
+    };
+    var result = try db.searchWithExecutionContext(alloc, req, .{ .io = std.testing.io, .max_parallelism = 2 });
     defer result.deinit();
 
     try std.testing.expect(result.total_hits >= 2);
@@ -127485,6 +127611,24 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     }
     try std.testing.expect(saw_semantic_only_hit);
     try std.testing.expect(saw_text_hit);
+
+    var filtered = req;
+    filtered.filter_query_json = "{\"term\":{\"tenant\":\"alpha\"}}";
+    var serial = try db.searchWithExecutionContext(alloc, filtered, .{ .max_parallelism = 1 });
+    defer serial.deinit();
+    var parallel = try db.searchWithExecutionContext(alloc, filtered, .{ .io = std.testing.io, .max_parallelism = 2 });
+    defer parallel.deinit();
+    try std.testing.expectEqual(serial.total_hits, parallel.total_hits);
+    try std.testing.expectEqual(serial.total_hits_relation, parallel.total_hits_relation);
+    try std.testing.expectEqualDeep(serial.hits, parallel.hits);
+    try std.testing.expectEqual(@as(usize, 2), parallel.hits.len);
+    for (parallel.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:c"));
+
+    var invalid = req;
+    invalid.full_text = .{ .term = .{ .field = "body", .term = "quickstart" } };
+    invalid.index_name = "missing";
+    try std.testing.expectError(error.IndexNotFound, db.searchWithExecutionContext(alloc, invalid, .{ .max_parallelism = 1 }));
+    try std.testing.expectError(error.IndexNotFound, db.searchWithExecutionContext(alloc, invalid, .{ .io = std.testing.io, .max_parallelism = 2 }));
 }
 
 test "db search fuses full_text and dense named searches before graph expansion with durable lsm primary backend" {
