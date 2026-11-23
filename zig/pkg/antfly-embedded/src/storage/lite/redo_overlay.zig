@@ -357,6 +357,15 @@ pub const SharedRedoOverlay = struct {
         return start;
     }
 
+    fn addChangeAssumeCapacity(self: *SharedRedoOverlay, change: Change) void {
+        if (change.sequence <= self.reclaimed_through) return;
+        const index = if (self.changes.items.len == self.changes_start or self.changes.items[self.changes.items.len - 1].sequence <= change.sequence)
+            self.changes.items.len
+        else
+            self.changeEnd(change.sequence);
+        self.changes.insertAssumeCapacity(index, change);
+    }
+
     pub fn deinit(self: *SharedRedoOverlay, _: Allocator) void {
         const allocator = owned_allocator;
         self.changes.deinit(allocator);
@@ -739,13 +748,7 @@ pub const SharedRedoOverlay = struct {
             gop.key_ptr.* = owned_key;
         }
         gop.value_ptr.* = node;
-        if (track_change) {
-            const index = if (self.changes.items.len == self.changes_start or self.changes.items[self.changes.items.len - 1].sequence <= sequence)
-                self.changes.items.len
-            else
-                self.changeEnd(sequence);
-            self.changes.insertAssumeCapacity(index, .{ .sequence = sequence, .key = gop.key_ptr.*, .origin = origin, .root = root });
-        }
+        self.addChangeAssumeCapacity(.{ .sequence = sequence, .key = gop.key_ptr.*, .origin = origin, .root = root });
     }
 
     /// Undoes a single, still-in-flight transaction's own append onto
@@ -1535,15 +1538,18 @@ pub const SharedRedoOverlay = struct {
                     continue;
                 };
                 if (newer) |above| {
+                    if (sequence > self.reclaimed_through) try self.changes.ensureUnusedCapacity(allocator, 1);
                     const node = try self.entry_pool.create(allocator);
                     node.* = decoded;
                     node.older = cursor;
                     above.older = node;
+                    self.addChangeAssumeCapacity(.{ .sequence = sequence, .key = gop.key_ptr.*, .origin = 0, .root = root });
                     _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
                     self.pending_retirement_versions += 1;
                     continue;
                 }
             }
+            if (sequence > self.reclaimed_through) try self.changes.ensureUnusedCapacity(allocator, 1);
             const node = try self.entry_pool.create(allocator);
             errdefer self.entry_pool.destroy(node);
             node.* = decoded;
@@ -1567,6 +1573,7 @@ pub const SharedRedoOverlay = struct {
                 gop.key_ptr.* = owned_key;
             }
             gop.value_ptr.* = node;
+            self.addChangeAssumeCapacity(.{ .sequence = sequence, .key = gop.key_ptr.*, .origin = 0, .root = root });
             _ = self.replayed_sequence[root].fetchMax(sequence, .acq_rel);
         }
     }
@@ -2129,4 +2136,15 @@ test "redo overlay change index excludes rolled back versions and discarded suff
     defer for (changed) |key| a.free(key);
     try std.testing.expectEqual(@as(usize, 1), changed.len);
     try std.testing.expectEqualStrings("kept", changed[0]);
+
+    // Peer replay can arrive after our own later append for the same key.
+    try overlay.appendVersionFrom(1, io, 2, "peer", 6, try owned_allocator.dupe(u8, "local"), false, 0, 0);
+    const peer_record = "\x02\x04\x00peer\x00\x01\x00\x00\x00v";
+    try overlay.decodeLogicalMutationsPayload(a, peer_record, 5);
+    try overlay.decodeLogicalMutationsPayload(a, peer_record, 5);
+    const peer_changes = try overlay.changedKeysAfterAlloc(a, io, 2, 4, 1);
+    defer a.free(peer_changes);
+    defer for (peer_changes) |key| a.free(key);
+    try std.testing.expectEqual(@as(usize, 1), peer_changes.len);
+    try std.testing.expectEqualStrings("peer", peer_changes[0]);
 }
