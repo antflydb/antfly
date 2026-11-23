@@ -25,6 +25,14 @@ const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 
 pub const SnapshotAdmission = struct {
     lock: apply_rw_lock_mod.ApplyRwLock = .{},
+    mutation_revision: std.atomic.Value(u64) = .init(0),
+
+    /// When sampled under capture, revisions bracket an interval free of
+    /// mutation leases if both samples match. Retains share the original
+    /// interval and need no additional increment.
+    pub fn mutationRevision(self: *const @This()) u64 {
+        return self.mutation_revision.load(.monotonic);
+    }
 
     pub const MutationLease = struct {
         admission: *SnapshotAdmission,
@@ -64,6 +72,7 @@ pub const SnapshotAdmission = struct {
 
         pub fn borrowMutation(self: *const @This()) MutationLease {
             std.debug.assert(self.active);
+            _ = self.admission.mutation_revision.fetchAdd(1, .monotonic);
             return .{ .admission = self.admission, .capture = self };
         }
 
@@ -80,11 +89,13 @@ pub const SnapshotAdmission = struct {
 
     pub fn acquireMutation(self: *@This()) MutationLease {
         self.lock.lockShared();
+        _ = self.mutation_revision.fetchAdd(1, .monotonic);
         return .{ .admission = self };
     }
 
     pub fn acquireMutationIo(self: *@This(), io: std.Io, cancellation: anytype) !MutationLease {
         try self.lock.lockSharedIo(io, cancellation);
+        _ = self.mutation_revision.fetchAdd(1, .monotonic);
         return .{ .admission = self };
     }
 

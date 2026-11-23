@@ -527,6 +527,13 @@ pub const WANDScorer = struct {
         return false;
     }
 
+    inline fn checkActive(collector: anytype, iterations: *usize) !void {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(collector)).pointer.child, "checkActive")) {
+            if (iterations.* & 255 == 0) try collector.checkActive();
+            iterations.* +%= 1;
+        }
+    }
+
     /// Single-term Block-Max top-k does not need pivot ordering, cumulative
     /// bounds, or the generic multi-term front-interval sweep. Score the
     /// current posting directly and feed the raised threshold into the same
@@ -537,7 +544,9 @@ pub const WANDScorer = struct {
         const term = &self.terms.items[0];
         const block_max = term.block_max.?;
 
+        var iterations: usize = 0;
         while (!term.exhausted) {
+            try checkActive(collector, &iterations);
             const hit = term.current orelse break;
             if (try self.seekCandidate(collector, hit.doc_id)) continue;
             self.pivots_scored += 1;
@@ -591,7 +600,9 @@ pub const WANDScorer = struct {
 
     /// Brute-force: score every document that appears in any term's postings.
     fn executeBruteForce(self: *WANDScorer, collector: anytype) !void {
+        var iterations: usize = 0;
         while (true) {
+            try checkActive(collector, &iterations);
             // Find the minimum doc_id across all active terms
             var min_doc: ?u32 = null;
             for (self.terms.items) |t| {
@@ -640,7 +651,9 @@ pub const WANDScorer = struct {
         for (sorted, 0..) |*index, i| index.* = i;
         var active = repairWANDOrder(terms, sorted);
 
+        var iterations: usize = 0;
         while (active != 0) {
+            try checkActive(collector, &iterations);
             if (try self.seekCandidate(collector, terms[sorted[0]].current.?.doc_id)) {
                 active = repairWANDOrder(terms, sorted[0..active]);
                 continue;
