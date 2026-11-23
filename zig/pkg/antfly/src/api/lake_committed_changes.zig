@@ -573,7 +573,7 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
             var events: std.ArrayList(wire_json.Raw) = .empty;
             var occupied = overhead;
             var ordinal: usize = from;
-            while (ordinal < stop and events.items.len < limits.events) : (ordinal += 1) {
+            while (ordinal < stop) : (ordinal += 1) {
                 try request.ensureActive();
                 const index = indexes[ordinal - from] orelse continue;
                 const key = keys.items[index];
@@ -605,7 +605,7 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 };
                 const bytes = try wire_json.size(event);
                 const total = occupied +| bytes +| @as(u64, @intFromBool(events.items.len != 0));
-                if (total > limits.bytes) {
+                if (total > limits.bytes or events.items.len == limits.events) {
                     if (ordinal == from and overhead +| bytes > delivery.max_page_bytes) return error.ChangefeedEventTooLarge;
                     if (bound != null or ordinal == from) return error.ChangefeedBackpressure;
                     break;

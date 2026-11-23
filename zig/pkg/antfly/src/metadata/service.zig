@@ -11200,22 +11200,15 @@ pub const MetadataHttpService = struct {
         return self.advanceNativeReplicationActor(a, table, record, null, context);
     }
 
-    pub fn beginLegacyReplicationHandover(self: *MetadataHttpService, a: std.mem.Allocator, tables: []const metadata_table_manager.TableRecord, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !bool {
+    pub fn beginLegacyReplicationHandover(self: *MetadataHttpService, a: std.mem.Allocator, tables: []const metadata_table_manager.TableRecord, index_allocator: std.mem.Allocator, producer_counts: *?@import("source_control.zig").ProducerCounts, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !bool {
         if (!try metadata_replication_backfill.legacyHandoverEligible(a, table, record, self.destination_authorizer)) return false;
         const control = @import("source_control.zig");
         const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
         try ensureCdcWorkPermit(self);
-        for (tables) |other| {
-            try context.ensureActive();
-            if (other.replication_sources_json.len == 0) continue;
-            var sources = try std.json.parseFromSlice(std.json.Value, a, other.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
-            defer sources.deinit();
-            if (sources.value != .array) return error.InvalidSourceControl;
-            for (sources.value.array.items, 0..) |source, ordinal| {
-                if (other.table_id == table.table_id and ordinal == record.source_ordinal) continue;
-                if (try control.sourceMayWriteNativeDestination(source, other.name, table.name)) return false;
-            }
-        }
+        if (producer_counts.* == null)
+            producer_counts.* = try control.nativeProducerCounts(index_allocator, a, tables, context);
+        if (producer_counts.*.?.get(table.name) != 1) return false;
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.scoped_stream_lifecycle_protocol_version);
         try self.advanceNativeReplicationActor(a, table, record, control.legacyHandoverCheckpoint(record).?, context);
         return true;
     }
@@ -11323,6 +11316,8 @@ pub const MetadataHttpService = struct {
         const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, table.table_id, ordinal)) orelse return;
         defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
         const handover = std.mem.eql(u8, source_status.phase, control.legacy_handover_phase);
+        if (handover)
+            _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.scoped_stream_lifecycle_protocol_version);
         if (!handover and !control.isNativeBootstrapPhase(source_status.phase)) return;
         if ((!handover and !std.mem.eql(u8, source_status.phase, control.native_bootstrap_prepared_phase)) or
             !std.meta.eql(source_status.native_bootstrap_catalog_digest, control.nativeBootstrapCatalogDigest(table)))
@@ -11548,7 +11543,44 @@ pub const MetadataHttpService = struct {
             }, context);
         } else null;
         defer if (snapshot) |*captured| captured.deinit(a);
-        try runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, context);
+        if (state.value.stream_failure) |failure| if (failure.terminal) return;
+        runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, context) catch |err| {
+            if (metadata_replication_backfill.replicationErrorEndsRound(err)) return err;
+            const terminal = std.mem.eql(u8, metadata_replication_backfill.classifyReplicationError(err), "terminal");
+            if (state.value.stream_failure) |previous| {
+                if (previous.terminal == terminal and std.mem.eql(u8, previous.code, @errorName(err))) return err;
+            }
+            try self.observeScopedStreamFailure(a, table, state.value, .{
+                .code = @errorName(err),
+                .terminal = terminal,
+                .observed_at_ms = @max(1, platform_time.realtimeNs() / std.time.ns_per_ms),
+            }, context);
+            return err;
+        };
+        if (state.value.stream_failure != null) {
+            const latest_raw = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
+            defer a.free(latest_raw);
+            var latest = try control.parse(a, latest_raw);
+            defer latest.deinit();
+            try self.observeScopedStreamFailure(a, table, latest.value, null, context);
+        }
+    }
+
+    fn observeScopedStreamFailure(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, failure: ?@import("source_control.zig").StreamFailure, context: api_operation.RequestContext) !void {
+        const control = @import("source_control.zig");
+        const scope = state.scope orelse return error.SourceBindingConflict;
+        try ensureCdcWorkPermit(self);
+        control.mutateOnService(self, a, .{
+            .table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .expected_revision = state.revision,
+            .expected_binding = scope.identity(),
+            .expected_catalog_digest = control.digest(table.replication_sources_json),
+            .mutation = .{ .observe_stream_failure = failure },
+        }, context) catch |err| switch (err) {
+            error.TableTopologyProtocolUpgradeRequired => {},
+            else => return err,
+        };
     }
 
     pub fn replicationSourceAuthorityCurrent(

@@ -2114,8 +2114,11 @@ def test_stateful_postgres_cdc_required_exact_cutover_isolates_logical_name_coll
         ), f"source did not resume streaming to {key}"
 
 
+@pytest.mark.parametrize(
+    "require_exact", [True, False], ids=["protected", "handed-over"]
+)
 def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
-    stateful_api, pg_cdc_source
+    stateful_api, pg_cdc_source, require_exact
 ):
     _require_cluster(stateful_api, "uses the metadata reseed admin route")
     table_name = f"cdc_reseed_exact_cutover_docs_{time.time_ns()}"
@@ -2142,7 +2145,7 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
                     "key_template": "id",
                     "slot_name": pg_cdc_source["slot_name"],
                     "publication_name": pg_cdc_source["publication_name"],
-                    "require_exact_cutover": True,
+                    "require_exact_cutover": require_exact,
                     "on_delete": [{"op": "$delete_document"}],
                 }
             ],
@@ -2158,6 +2161,7 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
                     )
                     if status.get("cutover_mode") == "exported_snapshot"
                     and status.get("phase") == "streaming"
+                    and status.get("accepted_stream_checkpoint")
                 ),
                 None,
             ),
@@ -2240,7 +2244,8 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
         )
         assert reseeded_status is not None, (
             "reseeded exact cutover did not publish a replacement authority\n"
-            f"{_metadata_replication_statuses(stateful_api)}"
+            f"{_metadata_replication_statuses(stateful_api)}\n"
+            f"{_server_logs(stateful_api)}"
         )
         new_physical_slot_name = reseeded_status["slot_name"]
         new_physical_publication_name = reseeded_status["publication_name"]
@@ -2343,6 +2348,7 @@ def test_stateful_postgres_cdc_recovers_publication_loss_but_marks_missing_slot_
                 if int(status.get("table_id", 0)) == table_id
                 and int(status.get("source_ordinal", -1)) == 0
                 and status.get("phase") == "streaming"
+                and status.get("accepted_stream_checkpoint")
             ),
             None,
         ),
@@ -2842,6 +2848,7 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         check_row_count()
 
         feed = None
+        filtered_feeds = []
         if deployment != "standalone":
             if mixed:
                 call("POST", f"/tables/{native_table}", {"num_shards": 1})
@@ -2865,6 +2872,29 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
                 },
             ).json()
             feed = f"{feeds}/{created['id']}"
+            if deployment == "distributed":
+                # One of the filtered feeds advances past an invisible suffix
+                # in the same committed key-move transaction.
+                for key in ("user-1", "user-2"):
+                    filtered = _changefeed_call(
+                        client,
+                        "POST",
+                        feeds,
+                        headers={"Idempotency-Key": f"filtered-key-move-{key}"},
+                        json={
+                            "tables": ["cdc_iceberg"],
+                            "start": "now",
+                            "selectors": [
+                                {
+                                    "table": "cdc_iceberg",
+                                    "predicates": [{"field": "id", "value": key}],
+                                }
+                            ],
+                        },
+                    ).json()
+                    filtered_feeds.append(
+                        (f"{feeds}/{filtered['id']}", filtered["cursor"])
+                    )
 
         if publication_failure:
 
@@ -2909,6 +2939,24 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         assert resumed["antfly.cdc.checkpoint"] != cut
         assert rows() == [["user-2", "Bob"]]
         check_row_count()
+        for filtered_feed, cursor in filtered_feeds:
+            page = _changefeed_call(
+                client, "GET", f"{filtered_feed}/events", params={"after": cursor}
+            )
+            assert len(page.json()["events"]) == 1
+            assert page.json()["transaction"]["complete"]
+            replay = _changefeed_call(
+                client,
+                "GET",
+                f"{filtered_feed}/events",
+                params={"after": cursor, "limit": 1},
+            )
+            assert replay.content == page.content
+            assert (
+                replay.headers["Antfly-Changefeed-Cursor"]
+                == page.headers["Antfly-Changefeed-Cursor"]
+            )
+            _changefeed_call(client, "DELETE", filtered_feed)
         if publication_failure:
             saved_catalog = call("GET", table + "/lake/catalog")["metadata"]
 

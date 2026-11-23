@@ -28,6 +28,7 @@ pub const closing_protocol_version: u16 = 115;
 pub const native_bootstrap_protocol_version: u16 = 130;
 pub const scoped_snapshot_protocol_version: u16 = 131;
 pub const legacy_handover_protocol_version: u16 = 137;
+pub const scoped_stream_lifecycle_protocol_version: u16 = 138;
 pub const legacy_handover_phase = "native_legacy_handover";
 
 pub fn legacyHandoverCheckpoint(record: anytype) ?[]const u8 {
@@ -245,6 +246,16 @@ pub const Accepted = struct {
     payload_digest: Digest,
     receipt: []const u8,
 };
+pub const StreamFailure = struct {
+    code: []const u8,
+    terminal: bool,
+    observed_at_ms: u64,
+
+    fn validate(self: StreamFailure) !void {
+        if (!text(self.code, 128, false) or self.observed_at_ms == 0) return error.InvalidSourceControl;
+    }
+};
+
 pub const State = struct {
     version: u32 = 1,
     revision: u64 = 0,
@@ -258,6 +269,7 @@ pub const State = struct {
     scope_fencing: bool = false,
     native_bootstrap_checkpoint: ?[]const u8 = null,
     native_bootstrap_first_page: ?Digest = null,
+    stream_failure: ?StreamFailure = null,
     manifest_retention: bool = false,
     retirement_receipt: []const u8 = "",
     retired_reservation_digest: Digest = @splat(0),
@@ -284,6 +296,10 @@ pub const State = struct {
         if (self.checkpoint_authority) |authority| {
             try authority.validate();
             if (self.scope == null or self.scope.?.destination != .native or self.artifact_control == null or !std.mem.eql(u8, &authority.binding, &self.scope.?.identity()) or (authority.retirement != null and !self.retired)) return error.InvalidSourceControl;
+        }
+        if (self.stream_failure) |failure| {
+            if (!self.scope_fencing) return error.InvalidSourceControl;
+            try failure.validate();
         }
         if (self.manifest_retention and (self.scope == null or self.artifact_control == null)) return error.InvalidSourceControl;
         if (self.native_bootstrap_checkpoint) |checkpoint| {
@@ -400,6 +416,7 @@ pub fn isNativeSnapshotScopedCheckpoint(checkpoint: []const u8) bool {
 }
 
 pub const Mutation = union(enum) {
+    observe_stream_failure: ?StreamFailure,
     begin_legacy_handover: struct {
         scope: Scope,
         authority: checkpoint_authority.Spec,
@@ -436,6 +453,7 @@ pub const Mutation = union(enum) {
 
     pub fn validate(self: Mutation) !void {
         switch (self) {
+            .observe_stream_failure => |failure| if (failure) |value| try value.validate(),
             .begin_legacy_handover => |handover| {
                 try handover.scope.validate();
                 try handover.authority.validate();
@@ -476,6 +494,14 @@ pub const Mutation = union(enum) {
         try state.validate();
         var next = try state.advance();
         switch (self) {
+            .observe_stream_failure => |failure| {
+                if (!state.scope_fencing or state.closing or state.retired) return error.SourceBindingConflict;
+                next.stream_failure = if (failure) |value| .{
+                    .code = try a.dupe(u8, value.code),
+                    .terminal = value.terminal,
+                    .observed_at_ms = value.observed_at_ms,
+                } else null;
+            },
             .begin_legacy_handover => |handover| {
                 if (state.scope != null) return error.SourceBindingConflict;
                 next.scope = handover.scope;
@@ -912,6 +938,47 @@ pub fn nativeBootstrapSourceId(table_id: u64, ordinal: u32, definition: Digest) 
     return hash.finalResult();
 }
 
+/// Scheduler hint for one immutable catalog view. Raft rechecks membership in
+/// its writer transaction before closing legacy intake.
+pub const ProducerCounts = std.StringHashMapUnmanaged(usize);
+
+pub fn nativeProducerCounts(a: A, scratch: A, tables: anytype, context: anytype) !ProducerCounts {
+    var counts: ProducerCounts = .empty;
+    for (tables) |table| {
+        try context.ensureActive();
+        if (table.replication_sources_json.len == 0) continue;
+        var sources = try std.json.parseFromSlice(std.json.Value, scratch, table.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
+        defer sources.deinit();
+        if (sources.value != .array) return error.InvalidSourceControl;
+        for (sources.value.array.items) |source| {
+            if (source != .object) return error.InvalidSourceControl;
+            const routes = source.object.get("routes") orelse std.json.Value.null;
+            if (routes == .null or (routes == .array and routes.array.items.len == 0)) {
+                try countNativeProducer(a, &counts, table.name);
+                continue;
+            }
+            if (routes != .array) return error.InvalidSourceControl;
+            for (routes.array.items) |route| {
+                if (route != .object) return error.InvalidSourceControl;
+                const target = route.object.get("target_table") orelse return error.InvalidSourceControl;
+                if (target != .string or target.string.len == 0) return error.InvalidSourceControl;
+                try countNativeProducer(a, &counts, target.string);
+            }
+        }
+    }
+    return counts;
+}
+
+fn countNativeProducer(a: A, counts: *ProducerCounts, destination: []const u8) !void {
+    const entry = try counts.getOrPut(a, destination);
+    if (entry.found_existing) {
+        entry.value_ptr.* = 2;
+    } else {
+        entry.key_ptr.* = try a.dupe(u8, destination);
+        entry.value_ptr.* = 1;
+    }
+}
+
 pub fn sourceMayWriteNativeDestination(source: std.json.Value, default_table: []const u8, destination: []const u8) !bool {
     if (source != .object) return error.InvalidReplicationSourceConfig;
     const routes = source.object.get("routes") orelse return std.mem.eql(u8, default_table, destination);
@@ -1337,7 +1404,7 @@ test "source control replans only proven unadmitted delivery while retaining log
 fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page")) @field(value, name) != null else true;
+        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page") or std.mem.eql(u8, name, "stream_failure")) @field(value, name) != null else true;
         if (include) {
             try stream.objectField(name);
             try stream.write(@field(value, name));
@@ -1348,6 +1415,7 @@ fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!
 pub fn requiredProtocol(mutation: Mutation) u16 {
     return switch (mutation) {
         .begin_legacy_handover => legacy_handover_protocol_version,
+        .observe_stream_failure => scoped_stream_lifecycle_protocol_version,
         .close, .enable_scope_fencing => closing_protocol_version,
         .certify_native_bootstrap => native_bootstrap_protocol_version,
         .certify_native_snapshot_pages => scoped_snapshot_protocol_version,

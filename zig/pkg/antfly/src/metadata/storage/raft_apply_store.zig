@@ -11159,11 +11159,11 @@ pub const RaftApplyStore = struct {
             return error.MetadataHAChunkSequenceGap;
     }
 
-    fn standbyRelationActivationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64) !topology_protocol.Activation {
+    fn standbyRelationActivationTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !topology_protocol.Activation {
         var buf: [160]u8 = undefined;
         const raw = (try stagingGet(txn, try topologyActivationKeyForGroup(&buf, group))) orelse return error.TableTopologyProtocolUpgradeRequired;
         if (raw.len > 1024) return error.InvalidCatalogRecord;
-        var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, raw, .{});
+        var parsed = try std.json.parseFromSlice(topology_protocol.Activation, a, raw, .{});
         defer parsed.deinit();
         const activation = parsed.value;
         if (activation.version < topology_protocol.relation_publication_version) return error.TableTopologyProtocolUpgradeRequired;
@@ -11173,6 +11173,14 @@ pub const RaftApplyStore = struct {
         if (!std.meta.eql((try decodeMetadataIncarnationRecord(identity_raw)).incarnation, activation.incarnation))
             return error.TableTopologyProtocolUpgradeRequired;
         return activation;
+    }
+
+    fn scopedStreamLifecycleActiveTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64) !bool {
+        const activation = standbyRelationActivationTxn(a, txn, group) catch |err| switch (err) {
+            error.TableTopologyProtocolUpgradeRequired => return false,
+            else => return err,
+        };
+        return activation.version >= source_control.scoped_stream_lifecycle_protocol_version;
     }
 
     /// Inspect one frame and advance at most one local proof page before the
@@ -11243,7 +11251,7 @@ pub const RaftApplyStore = struct {
             if (before_live == null or !root.eql(before_live.?.generation) or std.mem.order(u8, &root.job_id, &live.generation.job_id) != .lt)
                 return error.InvalidCatalogRecord;
         } else if (before_live != null) return error.InvalidCatalogRecord;
-        const activation = try self.standbyRelationActivationTxn(&read, state.group_id);
+        const activation = try standbyRelationActivationTxn(self.alloc, &read, state.group_id);
         const proof = try self.requireRelationPublicationProof(state, platform_time.monotonicNs());
         if (!std.meta.eql(proof.root, observed.root) or proof.applied_index != observed.applied_index) return error.CatalogPublicationProofPending;
         return .{ .proof = proof, .activation = activation };
@@ -11315,7 +11323,7 @@ pub const RaftApplyStore = struct {
         if (!current_timeline or frame.index != pending.next or record.lsn <= pending.last_lsn) return error.MetadataHAChunkSequenceGap;
         if (publication) |verified| {
             if (!try verified.proof.matchesTxn(&txn)) return error.CatalogPublicationProofPending;
-            if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id)))
+            if (!std.meta.eql(verified.activation, try standbyRelationActivationTxn(self.alloc, &txn, descriptor.group_id)))
                 return error.TableTopologyProtocolUpgradeRequired;
         }
         try txn.put(&metadataChunkKey(frame.index), record.payload);
@@ -11389,7 +11397,7 @@ pub const RaftApplyStore = struct {
                         !live.epoch.eql(try relationSourceEpochTxn(&txn, descriptor.group_id)) or
                         try durableAppliedIndexTxn(&txn, descriptor.group_id) != verified.proof.applied_index or
                         !try relationWriterEnabledTxn(&txn, descriptor.group_id)) return error.InvalidCatalogRecord;
-                    if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id)))
+                    if (!std.meta.eql(verified.activation, try standbyRelationActivationTxn(self.alloc, &txn, descriptor.group_id)))
                         return error.TableTopologyProtocolUpgradeRequired;
                 }
             }
@@ -16102,7 +16110,7 @@ pub const RaftApplyStore = struct {
             if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
         } else if ((write.mutation != .configure and write.mutation != .begin_legacy_handover) or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
         switch (write.mutation) {
-            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover => {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover, .observe_stream_failure => {
                 const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return,
@@ -16134,6 +16142,13 @@ pub const RaftApplyStore = struct {
                 !std.mem.eql(u8, handover.authority.table_name, table.name) or
                 !std.meta.eql(handover.authority.owner.table_binding, changefeed_control.tableBinding(table)) or
                 !std.meta.eql(scope.source_id, source_control.nativeBootstrapSourceId(table.table_id, scope.source_ordinal, scope.definition))) return;
+            if (try scopedStreamLifecycleActiveTxn(a, txn, group_id)) {
+                const external = @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return,
+                };
+                if (external != null) return;
+            }
             const sources = try std.json.parseFromSliceLeaky(std.json.Value, a, table.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
             if (sources != .array or scope.source_ordinal >= sources.array.items.len or !source_control.supportsLegacyHandover(sources.array.items[scope.source_ordinal])) return;
             const status_key = try replicationSourceStatusKeyForGroup(&handover_key_buffer, group_id, scope.table_id, scope.source_ordinal);
@@ -16228,7 +16243,7 @@ pub const RaftApplyStore = struct {
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         if (next.native_bootstrap_checkpoint != null and
             (next.accepted.sequence != state.accepted.sequence or next.committed.sequence != state.committed.sequence or
-                next.closing != state.closing or next.retired != state.retired))
+                next.closing != state.closing or next.retired != state.retired or write.mutation == .observe_stream_failure))
         {
             self.notifyProjectionListeners(.{
                 .kind = .replication_source_status,
@@ -16719,9 +16734,25 @@ pub const RaftApplyStore = struct {
             if (status.accepted_stream_checkpoint) |prior| alloc.free(prior);
             status.accepted_stream_checkpoint = accepted;
         }
-        if (state.committed.sequence == 0 or source_control.isNativeSnapshotScopedCheckpoint(state.committed.checkpoint)) return status;
-
-        const phase = try alloc.dupe(u8, "streaming");
+        if (state.stream_failure) |failure| {
+            const code = try alloc.dupe(u8, failure.code);
+            errdefer alloc.free(code);
+            const class = try alloc.dupe(u8, if (failure.terminal) "terminal" else "retryable");
+            alloc.free(status.last_error);
+            alloc.free(status.failure_class);
+            status.last_error = code;
+            status.failure_class = class;
+            status.consecutive_failures = @max(status.consecutive_failures, 1);
+            status.updated_at_ms = @max(status.updated_at_ms, failure.observed_at_ms);
+        }
+        const has_commit = state.committed.sequence != 0 and !source_control.isNativeSnapshotScopedCheckpoint(state.committed.checkpoint);
+        if (!has_commit and state.stream_failure == null) return status;
+        const phase = try alloc.dupe(u8, if (state.stream_failure != null) "streaming_failed" else "streaming");
+        if (!has_commit) {
+            alloc.free(status.phase);
+            status.phase = phase;
+            return status;
+        }
         errdefer alloc.free(phase);
         const projected = try alloc.dupe(u8, state.committed.checkpoint);
         errdefer alloc.free(projected);
@@ -16837,11 +16868,13 @@ pub const RaftApplyStore = struct {
         // The supplied arena owns the parsed source state for the duration of
         // this metadata transaction.
         const state = (try source_control.parse(a, raw)).value;
-        if (state.native_bootstrap_first_page == null) return null;
+        const handover = std.mem.eql(u8, record.phase, source_control.legacy_handover_phase);
+        if (!handover and state.native_bootstrap_first_page == null) return null;
+        const checkpoint = state.native_bootstrap_checkpoint orelse return null;
         const scope = state.scope orelse return error.SourceControlCorrupt;
         const provider = try source_control.nativeSourceProviderBinding(record);
         if (!std.meta.eql(scope.source_id, id) or !std.meta.eql(scope.definition, definition) or
-            !std.meta.eql(scope.provider, provider) or !std.mem.eql(u8, record.prepared_checkpoint, state.native_bootstrap_checkpoint.?))
+            !std.meta.eql(scope.provider, provider) or !std.mem.eql(u8, if (handover) record.stream_checkpoint else record.prepared_checkpoint, checkpoint))
             return error.SourceBindingConflict;
         return state;
     }
@@ -23196,7 +23229,7 @@ pub const RaftApplyStore = struct {
                 binding.deinit(a);
                 return false;
             }
-            const activation = self.standbyRelationActivationTxn(txn, group_id) catch |err| switch (err) {
+            const activation = standbyRelationActivationTxn(self.alloc, txn, group_id) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => return false,
                 else => return err,
             };
@@ -23264,7 +23297,9 @@ pub const RaftApplyStore = struct {
             var buffer: [224]u8 = undefined;
             const status_key = try replicationSourceStatusKeyForGroup(&buffer, group_id, current.table_id, idx);
             const status = try decodeReplicationSourceStatusRecord(a, (try stagingGet(txn, status_key)) orelse return null);
-            if (!std.mem.eql(u8, status.phase, source_control.native_bootstrap_prepared_phase) or
+            if ((!std.mem.eql(u8, status.phase, source_control.native_bootstrap_prepared_phase) and
+                (!std.mem.eql(u8, status.phase, source_control.legacy_handover_phase) or
+                    !try scopedStreamLifecycleActiveTxn(a, txn, group_id))) or
                 status.pending_snapshot_page != null or status.snapshot_cleanup_job.len != 0 or
                 status.retired_cutover_authority_id != 0 or
                 !std.meta.eql(status.native_bootstrap_catalog_digest, source_control.nativeBootstrapCatalogDigest(current))) return null;
@@ -23304,7 +23339,7 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
-    fn rebindNativeBootstrapStatusesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord, reseed_ordinal: ?u32) !void {
+    fn rebindNativeBootstrapStatusesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord, reseed_ordinal: ?u32, handover_only: bool) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -23314,9 +23349,16 @@ pub const RaftApplyStore = struct {
         const new_digest = source_control.nativeBootstrapCatalogDigest(replacement);
         for (try docstore.DocStore.scanPrefixTxn(a, txn, prefix)) |entry| {
             var status = try decodeReplicationSourceStatusRecord(a, entry.value);
-            if (!std.meta.eql(status.native_bootstrap_catalog_digest, old_digest)) continue;
+            if (!std.meta.eql(status.native_bootstrap_catalog_digest, old_digest) or
+                (handover_only and !std.mem.eql(u8, status.phase, source_control.legacy_handover_phase))) continue;
             status.native_bootstrap_catalog_digest = new_digest;
             if (reseed_ordinal == status.source_ordinal) {
+                // The retired actor retains the handed-over frontiers. The
+                // replacement uses this row to qualify provider retirement.
+                if (std.mem.eql(u8, status.phase, source_control.legacy_handover_phase)) {
+                    status.stream_checkpoint = "";
+                    status.accepted_stream_checkpoint = null;
+                }
                 status.phase = source_control.native_bootstrap_reseed_phase;
                 status.checkpoint = "snapshot_offset:0";
                 status.snapshot_offset = 0;
@@ -23342,6 +23384,18 @@ pub const RaftApplyStore = struct {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
             const status = try decodeReplicationSourceStatusRecord(a, row.value);
             defer metadata_table_manager.freeReplicationSourceStatus(a, status);
+            if (std.mem.eql(u8, status.phase, source_control.legacy_handover_phase) and
+                try scopedStreamLifecycleActiveTxn(a, txn, group_id))
+            {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const scratch = arena.allocator();
+                var table_buffer: [224]u8 = undefined;
+                const table_key = try tableKeyForGroup(&table_buffer, group_id, table_id);
+                const table = try decodeTableRecord(scratch, (try stagingGet(txn, table_key)) orelse return true);
+                const actor = (try readScopedSnapshotActorTxn(scratch, txn, group_id, table, status)) orelse return true;
+                if (actor.committed.sequence == 0 and !actor.retired) return true;
+            }
             if (status.snapshot_cleanup_job.len != 0 or
                 (source_control.isNativeBootstrapPhase(status.phase) and
                     !std.mem.eql(u8, status.phase, source_control.native_bootstrap_prepared_phase))) return true;
@@ -23472,6 +23526,12 @@ pub const RaftApplyStore = struct {
         if (retained == null and !try self.sourceDefinitionAllowedTxn(txn, group_id, record, true)) return;
         if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
         try self.putTableRecordTxn(txn, group_id, key, admission);
+        if (retained) |previous| {
+            if (nativeBootstrapDefinitionChanged(previous, admission) and
+                try hasNativeRootCohortSealTxn(txn, group_id, admission.name) and
+                try scopedStreamLifecycleActiveTxn(self.alloc, txn, group_id))
+                try self.rebindNativeBootstrapStatusesTxn(txn, group_id, previous, admission, null, true);
+        }
     }
 
     fn indexedTableRangeIdsTxn(
@@ -25380,7 +25440,7 @@ pub const RaftApplyStore = struct {
             std.crypto.hash.Blake3.hash(expected.schema_json, &digest, .{});
             if (bound.table_id != expected.table_id or !std.mem.eql(u8, bound.name, expected.name) or !std.mem.eql(u8, &digest, &guard.owner.schema_digest)) return error.CatalogGenerationChanged;
         } else {
-            const activation = try self.standbyRelationActivationTxn(txn, group_id);
+            const activation = try standbyRelationActivationTxn(self.alloc, txn, group_id);
             if (activation.version < topology_protocol.relation_mutation_version) return error.TableTopologyProtocolUpgradeRequired;
             const epoch = try relationSourceEpochTxn(txn, group_id);
             if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
@@ -25450,7 +25510,7 @@ pub const RaftApplyStore = struct {
         if ((renamed or !std.mem.eql(u8, current.replication_sources_json, replacement.replication_sources_json)) and
             (root_sealed or !try self.sourceDefinitionAllowedTxn(txn, group_id, replacement, false)))
         {
-            const activation = self.standbyRelationActivationTxn(txn, group_id) catch |err| switch (err) {
+            const activation = standbyRelationActivationTxn(self.alloc, txn, group_id) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => {
                     try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
                     return;
@@ -25598,7 +25658,10 @@ pub const RaftApplyStore = struct {
         if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
         try self.putTableRecordTxn(txn, group_id, key, replacement);
         if (append_scoped_source or reseed_ordinal != null)
-            try self.rebindNativeBootstrapStatusesTxn(txn, group_id, current, replacement, reseed_ordinal);
+            try self.rebindNativeBootstrapStatusesTxn(txn, group_id, current, replacement, reseed_ordinal, false)
+        else if (root_sealed and nativeBootstrapDefinitionChanged(current, replacement) and
+            try scopedStreamLifecycleActiveTxn(self.alloc, txn, group_id))
+            try self.rebindNativeBootstrapStatusesTxn(txn, group_id, current, replacement, null, true);
     }
 
     fn relationalDefinitionsRetained(self: *RaftApplyStore, previous: metadata.TableRecord, next: metadata.TableRecord) !bool {
@@ -47901,6 +47964,41 @@ test "metadata source control handover atomically fences the legacy checkpoint" 
     try std.testing.expectEqualStrings(source_control.legacy_handover_phase, saved.phase);
     try std.testing.expectEqualStrings(status.stream_checkpoint, saved.stream_checkpoint);
     try std.testing.expectEqualStrings(status.prepared_checkpoint, saved.prepared_checkpoint);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(!try RaftApplyStore.tableHasNativeBootstrapWorkTxn(scratch, &txn, group, table.table_id));
+        const activation: topology_protocol.Activation = .{
+            .version = source_control.scoped_stream_lifecycle_protocol_version,
+            .incarnation = incarnation,
+            .member_count = 1,
+            .membership_fingerprint = @splat(1),
+        };
+        try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buffer, group), try std.json.Stringify.valueAlloc(scratch, activation, .{}));
+        try std.testing.expect(try RaftApplyStore.tableHasNativeBootstrapWorkTxn(scratch, &txn, group, table.table_id));
+        try txn.commit();
+    }
+
+    write.expected_revision = 1;
+    write.mutation = .{ .observe_stream_failure = .{
+        .code = "ForeignReplicationSlotMissing",
+        .terminal = true,
+        .observed_at_ms = 42,
+    } };
+    try store.applyStandaloneCommand(group, .{ .apply_source_control = try source_control.encodeWrite(scratch, write) });
+    const projected = try store.listReplicationSourceStatuses(scratch, group);
+    try std.testing.expectEqual(@as(usize, 1), projected.len);
+    try std.testing.expectEqualStrings("streaming_failed", projected[0].phase);
+    try std.testing.expectEqualStrings("terminal", projected[0].failure_class);
+    try std.testing.expectEqualStrings("ForeignReplicationSlotMissing", projected[0].last_error);
+    try std.testing.expectEqualStrings(status.stream_checkpoint, projected[0].stream_checkpoint);
+
+    write.expected_revision = 2;
+    write.mutation = .{ .observe_stream_failure = null };
+    try store.applyStandaloneCommand(group, .{ .apply_source_control = try source_control.encodeWrite(scratch, write) });
+    const cleared = try store.listReplicationSourceStatuses(scratch, group);
+    try std.testing.expectEqualStrings(source_control.legacy_handover_phase, cleared[0].phase);
+    try std.testing.expectEqualStrings("", cleared[0].last_error);
 }
 
 test "metadata source control survives reopen fences catalog and protects table retirement" {

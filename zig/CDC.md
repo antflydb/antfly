@@ -457,7 +457,12 @@ is the sole CDC writer for its native destination and uses passthrough writes
 with optional document deletion. Handover preserves the snapshot checkpoint,
 slot and publication. Legacy intake closes before the destination establishes
 its fenced baseline. Roots with unresolved legacy transactions remain fenced
-until the original transactions resolve.
+until the original transactions resolve. A failed handover attempt leaves
+compatibility polling active when metadata still confirms legacy ownership.
+The fenced actor reports retryable and terminal failures alongside its last
+accepted and committed checkpoints. A terminal failure requires an explicit
+reseed, which can retire either an original scoped writer or a handed-over
+writer before rotating its PostgreSQL resources.
 
 An interruption between a compatibility write and its source checkpoint can
 replay that write. Use idempotent transforms on a compatibility stream.

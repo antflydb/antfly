@@ -139,7 +139,7 @@ fn ioNowMillis(io: std.Io) u64 {
 /// is shutting down, or cannot allocate. Any other error belongs to the one
 /// source being run, whose runner already recorded it on the source status,
 /// so the round continues with the remaining sources instead of starving them.
-fn replicationErrorEndsRound(err: anyerror) bool {
+pub fn replicationErrorEndsRound(err: anyerror) bool {
     return switch (err) {
         error.CdcWorkLeaseLost,
         error.CdcWorkShuttingDown,
@@ -152,7 +152,7 @@ fn replicationErrorEndsRound(err: anyerror) bool {
     };
 }
 
-fn classifyReplicationError(err: anyerror) []const u8 {
+pub fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
         error.ReplicationProjectionIncomplete,
         error.ReplicationExactCutoverRequired,
@@ -2207,7 +2207,9 @@ pub const StreamingReplicationRunner = struct {
             .publication_name = try a.dupe(u8, status.publication_name),
             .filter_query_json = if (parsed.publication_filter_json) |value| try a.dupe(u8, value) else null,
             .checkpoint = try a.dupe(u8, resume_cut),
-            .limit = self.batch_size,
+            // PostgreSQL's message-count hint stops at the first complete
+            // transaction. This actor can reserve only that transaction.
+            .limit = 1,
             .execution_deadline_ns = context.deadline_ns,
             .expected_provider_identity = status.cutover_provider_identity,
         });
@@ -2578,6 +2580,9 @@ pub const StreamingReplicationCoordinator = struct {
             service.freeProjectedReplicationSourceStatuses(self.alloc, statuses);
         };
 
+        var producer_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer producer_arena.deinit();
+        var producer_counts: ?@import("source_control.zig").ProducerCounts = null;
         var summary: StreamingRoundSummary = .{};
         if (tables.len == 0) return summary;
         // See SnapshotBackfillCoordinator.runRound: resume after the last
@@ -2656,14 +2661,14 @@ pub const StreamingReplicationCoordinator = struct {
 
                 if (comptime @hasDecl(Service, "beginLegacyReplicationHandover")) {
                     const deadline = (try self.runner.workDeadlineNs()) orelse quantum_deadline_ns;
-                    if (service.beginLegacyReplicationHandover(self.alloc, tables, table, existing, @min(deadline, quantum_deadline_ns)) catch |err| switch (err) {
+                    if (service.beginLegacyReplicationHandover(self.alloc, tables, producer_arena.allocator(), &producer_counts, table, existing, @min(deadline, quantum_deadline_ns)) catch |err| switch (err) {
                         error.TableTopologyProtocolUpgradeRequired => false,
-                        error.SourceControlConflict, error.MetadataMutationOutcomeUnknown => true,
                         else => blk: {
                             if (replicationErrorEndsRound(err)) return err;
-                            summary.sources_failed += 1;
+                            const ownership = try legacyIntake(service, self.alloc, table, @intCast(ordinal));
+                            if (ownership == .unproven) summary.sources_failed += 1;
                             std.log.warn("metadata native source handover deferred table={s} source={d} err={s}", .{ table.name, ordinal, @errorName(err) });
-                            break :blk true;
+                            break :blk ownership != .allowed;
                         },
                     }) continue;
                 }
@@ -8966,6 +8971,11 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         close_at: ReplicationLifecyclePhase = .stream_polled,
         upserts: usize = 0,
         recoveries: usize = 0,
+        handover_attempts: usize = 0,
+        pub fn beginLegacyReplicationHandover(self: *@This(), _: Allocator, _: []const metadata_table_manager.TableRecord, _: Allocator, _: *?@import("source_control.zig").ProducerCounts, _: metadata_table_manager.TableRecord, _: metadata_table_manager.ReplicationSourceStatusRecord, _: ?u64) anyerror!bool {
+            self.handover_attempts += 1;
+            return error.ReadUnavailable;
+        }
         pub fn legacyReplicationSourceIntakeAllowed(self: *@This(), _: u64, _: u32, _: [32]u8) !bool {
             return self.legacy_allowed;
         }
@@ -9136,6 +9146,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
     try std.testing.expectEqual(@as(usize, 1), second.sources_resumed);
     try std.testing.expectEqual(@as(usize, 1), second.sources_polled);
     try std.testing.expectEqual(@as(usize, 2), stream_ctx.poll_calls);
+    try std.testing.expectEqual(@as(usize, 2), service.handover_attempts);
     try std.testing.expectEqualStrings("lsn:5", stream_ctx.checkpoints.items[1]);
     try std.testing.expectEqualStrings("lsn:prepared", service.statuses.items[0].prepared_checkpoint);
     try std.testing.expectEqualStrings("lsn:5", service.statuses.items[0].stream_checkpoint);
