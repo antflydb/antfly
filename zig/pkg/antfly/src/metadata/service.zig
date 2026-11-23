@@ -3813,21 +3813,36 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
         if (wire.requiresSqlViewIndexProofs(bytes) or wire.requiresSqlDocumentViewReaders(bytes)) metadata_topology_protocol.sql_document_view_indexes_version else 0
     else
         0;
-    if (command == .apply_restore_staging and wire.requiresRestoreReservationOutcome(command.apply_restore_staging))
+    if (command == .apply_restore_staging and wire.requiresRestoreReservationOutcome(command.apply_restore_staging)) {
+        // Marker detection is conservative on malformed JSON. Do not treat a
+        // parse failure as a valid reservation-only capability floor.
+        if (wire.catalogMarkers(command.apply_restore_staging) == null) return metadata_topology_protocol.current_version;
         return @max(index_proof_version, metadata_topology_protocol.restore_reservation_outcome_version);
+    }
     var required = @max(index_proof_version, try transitionBaseDecoderVersion(a, command));
     switch (command) {
         .apply_system_catalog => |bytes| {
-            const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind, expected_incarnation: ?[16]u8 = null, expected_resource_id: ?u64 = null, expected_parent_id: ?u64 = null, expected_tablespace_id: ?u64 = null } };
+            const Mutation = struct {
+                kind: @import("antfly_local_sources").system_catalog_domain.Kind,
+                expected_incarnation: ?[16]u8 = null,
+                expected_resource_id: ?u64 = null,
+                expected_parent_id: ?u64 = null,
+                expected_tablespace_id: ?u64 = null,
+            };
+            // SQL catalog envelopes can carry an operation-specific command
+            // without a generic resource mutation.
+            const Header = struct { mutation: ?Mutation = null };
             var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return metadata_topology_protocol.current_version,
             };
             defer parsed.deinit();
-            if (parsed.value.mutation.expected_parent_id != null) required = @max(required, metadata_topology_protocol.bound_create_parent_version);
-            if (parsed.value.mutation.expected_incarnation != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
-            if (parsed.value.mutation.expected_resource_id != null or parsed.value.mutation.expected_tablespace_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
-            if (parsed.value.mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
+            if (parsed.value.mutation) |mutation| {
+                if (mutation.expected_parent_id != null) required = @max(required, metadata_topology_protocol.bound_create_parent_version);
+                if (mutation.expected_incarnation != null) required = @max(required, metadata_topology_protocol.bound_catalog_incarnation_version);
+                if (mutation.expected_resource_id != null or mutation.expected_tablespace_id != null) required = @max(required, metadata_topology_protocol.bound_ddl_version);
+                if (mutation.kind == .graph) required = @max(required, metadata_topology_protocol.graph_definition_version);
+            }
         },
         .apply_fk_initial_create => |bytes| {
             const Parent = struct { support_after: ?struct { schema_json: []const u8 } = null };
@@ -4623,10 +4638,8 @@ test "relational index publication admission requires its own coordinated decode
 test "system catalog USING rewrite decoder barrier precedes lower schema reader requirements" {
     const bytes = "{\"plan\":{\"targets\":[{\"table\":{\"schema_reader_requirements\":{}},\"rewrite\":{\"column_transforms\":[{}]}}]}}";
     try std.testing.expectEqual(metadata_topology_protocol.sql_column_transform_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = bytes })));
-    // Both projections treat malformed envelopes as requiring support.
-    // Admission must retain the stronger document-view index proof floor.
-    const malformed_floor = @max(metadata_topology_protocol.restore_reservation_outcome_version, metadata_topology_protocol.sql_document_view_indexes_version);
-    try std.testing.expectEqual(malformed_floor, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = "{" })));
+    // An unclassifiable envelope cannot bypass the active decoder floor.
+    try std.testing.expectEqual(metadata_topology_protocol.current_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = "{" })));
 }
 
 test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {
