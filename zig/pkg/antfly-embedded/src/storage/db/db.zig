@@ -132843,6 +132843,27 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     try std.testing.expect(probe.overlapped);
     try std.testing.expectEqual(@as(usize, 0), probe.scheduler.workers);
 
+    const Predicate = struct {
+        owner: std.Thread.Id,
+        calls: usize = 0,
+
+        fn allows(raw: *anyopaque, _: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.owner, std.Thread.getCurrentId());
+            self.calls += 1;
+            return true;
+        }
+    };
+    probe = .{};
+    var predicate: Predicate = .{ .owner = std.Thread.getCurrentId() };
+    var guarded = filtered;
+    guarded.native_key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows };
+    var guarded_result = try db.searchWithExecutionContext(alloc, guarded, parallel_context);
+    defer guarded_result.deinit();
+    try std.testing.expect(!probe.overlapped);
+    try std.testing.expect(predicate.calls != 0);
+    try std.testing.expectEqualDeep(serial.hits, guarded_result.hits);
+
     probe = .{};
     var invalid = req;
     invalid.full_text = .{ .term = .{ .field = "body", .term = "quickstart" } };
