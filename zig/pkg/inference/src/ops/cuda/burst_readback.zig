@@ -68,24 +68,7 @@ pub const Slot = struct {
     /// A synchronous borrow of the exact cold token; no supplier on this path.
     pub fn prepareAdmitted(self: *Slot, ctx: *context.CudaContext, lease: *@import("prepared_cache.zig").Lease, current: Cleanup) !bool {
         if (self.host.ptr != null or self.event != null or self.quota.hasLease() or self.failed or self.busy) return error.InvalidCacheRetirementState;
-        const owner = lease.owner orelse return error.UnpreparedCacheAdmission;
-        const entry = lease.entry orelse return error.InvalidPreparedCacheState;
-        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
-        if (current.outside_execution or owner.state != .bound or entry.state != .taken) return error.InvalidPreparedCacheState;
-        const expected_epoch = owner.boundary orelse return error.InvalidPreparedCacheState;
-        if (try epoch.isSealed() or try expected_epoch.isSealed()) return error.RetirementEpochSealed;
-        const actual = try epoch.boundary();
-        const expected = try expected_epoch.boundary();
-        if (actual.context != expected.context or actual.nonce != expected.nonce) return error.ForeignPreparedCacheBoundary;
-        var found = false;
-        for (owner.entries) |*candidate| if (candidate == entry) {
-            found = true;
-            break;
-        };
-        if (!found or entry.request != .auxiliary or entry.request.auxiliary.kind != .burst_readback_host or entry.request.auxiliary.device_bytes != 0 or entry.request.auxiliary.host_bytes != capacity) return error.PreparedCacheAmountChanged;
-        const value = lease.value orelse return error.MissingCacheRetirementLease;
-        const pin = owner.domain_pin orelse return error.MissingCacheRetirementDomain;
-        if (value.controller != pin.controller() or !std.meta.eql(value.amounts, memory.AdmissionAmounts{ .host_scratch_bytes = capacity })) return error.ForeignAdmissionDomain;
+        try lease.validatePinnedHost(.burst_readback_host, capacity, current);
         self.host = buffer.HostBuffer.alloc(ctx, capacity) catch return false;
         self.quota = lease.publishQuota();
         self.event = ctx.createStreamEvent() catch {

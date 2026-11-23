@@ -661,6 +661,27 @@ pub const Funding = struct {
 /// A cached payload receives only its exact independently owned lease. A cold
 /// failure moves it into the preallocated pure Charge AFTER checked SDK death.
 pub const Lease = struct {
+    pub fn validatePinnedHost(self: *const Lease, kind: Auxiliary.Kind, bytes: usize, current: @import("../../execution/cleanup_context.zig").Context) !void {
+        const owner = self.owner orelse return error.UnpreparedCacheAdmission;
+        const entry = self.entry orelse return error.InvalidPreparedCacheState;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (current.outside_execution or owner.state != .bound or entry.state != .taken) return error.InvalidPreparedCacheState;
+        const expected_epoch = owner.boundary orelse return error.InvalidPreparedCacheState;
+        if (try epoch.isSealed() or try expected_epoch.isSealed()) return error.RetirementEpochSealed;
+        const actual = try epoch.boundary();
+        const expected = try expected_epoch.boundary();
+        if (actual.context != expected.context or actual.nonce != expected.nonce) return error.ForeignPreparedCacheBoundary;
+        var found = false;
+        for (owner.entries) |*candidate| if (candidate == entry) {
+            found = true;
+            break;
+        };
+        if (!found or entry.request != .auxiliary or entry.request.auxiliary.kind != kind or entry.request.auxiliary.device_bytes != 0 or entry.request.auxiliary.host_bytes != bytes) return error.PreparedCacheAmountChanged;
+        const value = self.value orelse return error.MissingCacheRetirementLease;
+        const pin = owner.domain_pin orelse return error.MissingCacheRetirementDomain;
+        if (value.controller != pin.controller() or !std.meta.eql(value.amounts, memory.AdmissionAmounts{ .host_scratch_bytes = bytes })) return error.ForeignAdmissionDomain;
+    }
+
     value: ?memory.AdmissionLease = null,
     owner: ?*Funding = null,
     entry: ?*Funding.Entry = null,

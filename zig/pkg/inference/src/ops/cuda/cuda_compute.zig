@@ -2840,7 +2840,7 @@ pub const CudaCompute = struct {
     /// Immutable operation-policy metadata only. No SDK/weight access or
     /// guessed credit: every retained byte belongs to one actual cache owner.
     fn auxiliaryCacheRequest(self: *const CudaCompute, kind: CacheFunding.Auxiliary.Kind) ?CacheFunding.Request {
-        if (kind == .pinned_input_host) return if (self.ocr_pinned_input.quota == .raw or (self.ocr_pinned_inputs_enabled and (self.capability_profile == .lightonocr3 or self.capability_profile == .florence2)))
+        if (kind == .pinned_input_host) return if (self.ocr_pinned_inputs_enabled and (self.capability_profile == .lightonocr3 or self.capability_profile == .florence2))
             .{ .auxiliary = .{ .kind = kind, .device_bytes = 0, .host_bytes = @import("pinned_input_arena.zig").capacity } }
         else
             null;
@@ -2855,7 +2855,7 @@ pub const CudaCompute = struct {
                 .{ .auxiliary = .{ .kind = kind, .device_bytes = lighton_mrope_position_capacity * @sizeOf(u32), .host_bytes = lighton_mrope_position_capacity * @sizeOf(u32) } }
             else
                 null,
-            .pinned_metadata_host => if (self.ocr_pinned_metadata_enabled or self.ocr_pinned_metadata_arena.quota == .raw)
+            .pinned_metadata_host => if (self.ocr_pinned_metadata_enabled)
                 .{ .auxiliary = .{ .kind = kind, .device_bytes = 0, .host_bytes = @import("pinned_input_arena.zig").capacity } }
             else
                 null,
@@ -2871,7 +2871,7 @@ pub const CudaCompute = struct {
             // A materialized raw owner needs SAME-lease metadata upgrade even
             // on a disabled/zero-hint managed request. This never reserves an
             // empty arena or allocates SDK payload.
-            if (kind != .pinned_input_host or self.ocr_pinned_input.quota == .raw) if (self.auxiliaryCacheRequest(kind)) |request| try builder.add(request);
+            if (kind != .pinned_input_host) if (self.auxiliaryCacheRequest(kind)) |request| try builder.add(request);
         }
     }
     /// Exact synchronous upload-byte hint, independent of model/shape guesses.
@@ -13764,7 +13764,7 @@ fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, byte
             try self.acquirePinnedMetadataArena()
         else
             &self.ocr_pinned_metadata_arena else null;
-        if (arena) |selected| if (if (self.ctx.video_cache_budget.admission != null) try selected.uploadPrepared(&self.ctx, device, bytes) else try selected.upload(&self.ctx, device, bytes)) {
+        if (arena) |selected| if (if (self.ctx.video_cache_budget.admission != null) try selected.uploadPrepared(&self.ctx, device, bytes) else try selected.uploadUnadmitted(&self.ctx, device, bytes)) {
             self.stats.h2d_bytes += bytes.len;
             self.ocr_pinned_metadata_uploads += 1;
             self.ocr_pinned_metadata_event_uploads += 1;
@@ -14971,7 +14971,7 @@ fn copyFromPinnedOcrInputArena(self: *CudaCompute, device: buffer_mod.DeviceBuff
     else
         &self.ocr_pinned_input;
     const wraps = arena.wraps;
-    if (if (self.ctx.video_cache_budget.admission != null) !try arena.uploadPrepared(&self.ctx, device, bytes) else !try arena.upload(&self.ctx, device, bytes)) return false;
+    if (if (self.ctx.video_cache_budget.admission != null) !try arena.uploadPrepared(&self.ctx, device, bytes) else !try arena.uploadUnadmitted(&self.ctx, device, bytes)) return false;
     self.stats.h2d_bytes += bytes.len;
     self.ocr_pinned_input_uploads += 1;
     self.ocr_pinned_input_wraps += self.ocr_pinned_input.wraps - wraps;
@@ -42941,7 +42941,7 @@ test "LightOnOCR3 CUDA pinned OCR metadata owns queued host bytes across arena a
         if (events) {
             // This legacy wrap fixture explicitly creates its raw backing
             // outside execution. The managed cold-token path is tested below.
-            try std.testing.expect(try compute.ocr_pinned_metadata_arena.upload(&compute.ctx, small, &.{ 0, 0, 0, 0 }));
+            try std.testing.expect(try compute.ocr_pinned_metadata_arena.uploadUnadmitted(&compute.ctx, small, &.{ 0, 0, 0, 0 }));
             try compute.ctx.synchronize();
             compute.ocr_pinned_metadata_arena.offset = capacity - 256;
         }
@@ -43203,13 +43203,7 @@ test "LightOnOCR3 CUDA pinned OCR image inputs retain host admission and queued 
     cb.free(declined);
     try std.testing.expectEqual(@as(usize, 0), compute.ocr_pinned_input_uploads);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
-    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = ocr_pinned_input_capacity;
-    {
-        var raw_destination = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, std.mem.sliceAsBytes(data).len);
-        defer raw_destination.free(&compute.ctx);
-        try std.testing.expect(try compute.ocr_pinned_input.upload(&compute.ctx, raw_destination, std.mem.sliceAsBytes(data)));
-        try compute.ctx.synchronize(); // explicit raw outside setup; numerical wrap assertions unchanged
-    }
+    compute.ctx.video_cache_budget.admission = null;
     var tensors: [10]CT = undefined;
     for (&tensors, 0..) |*tensor, i| {
         @memset(data, @floatFromInt(i + 1));
@@ -43224,7 +43218,7 @@ test "LightOnOCR3 CUDA pinned OCR image inputs retain host admission and queued 
     }
     try std.testing.expectEqual(@as(usize, 10), compute.ocr_pinned_input_uploads);
     try std.testing.expect(compute.ocr_pinned_input_wraps > 0);
-    try std.testing.expectEqual(@as(usize, ocr_pinned_input_capacity), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     compute.capability_profile = .embedding_gemma2;
     const ordinary = try cb.fromFloat32(data);
     cb.free(ordinary);
@@ -56479,14 +56473,6 @@ test "CUDA large pinned input exact cold byte hint warms real upload without sup
         gate: std.atomic.Mutex = .unlocked,
         callbacks: usize = 0,
         under_gate: bool = false,
-        reenter_arena: ?*Arena.Arena = null,
-        reenter_ctx: ?*context_mod.CudaContext = null,
-        reenter_device: buffer_mod.DeviceBuffer = .{},
-        reenter_bytes: []const u8 = &.{},
-        reentered: bool = false,
-        reentry_failure: ?anyerror = null,
-        reentry_before_bytes: usize = 0,
-        reentry_after_bytes: usize = 0,
         fn check(self: *@This()) void {
             self.callbacks += 1;
             if (self.gate.tryLock()) self.gate.unlock() else self.under_gate = true;
@@ -56503,17 +56489,6 @@ test "CUDA large pinned input exact cold byte hint warms real upload without sup
         fn release(raw: *anyopaque, _: usize) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.check();
-            if (self.reenter_arena) |arena| {
-                self.reenter_arena = null; // one actual same-Arena callback
-                const controller = self.reenter_ctx.?.video_cache_budget.admission.?.controller;
-                self.reentry_before_bytes = controller.snapshot().host_scratch_bytes;
-                const uploaded = arena.upload(self.reenter_ctx.?, self.reenter_device, self.reenter_bytes) catch |err| {
-                    self.reentry_failure = err;
-                    return;
-                };
-                if (!uploaded) self.reentry_failure = error.SameArenaUploadDeclined else self.reentered = true;
-                self.reentry_after_bytes = controller.snapshot().host_scratch_bytes;
-            }
         }
         fn rejectHost(_: ?*anyopaque) callconv(.c) driver_mod.CUresult {
             return 1;
@@ -56636,80 +56611,6 @@ test "CUDA large pinned input exact cold byte hint warms real upload without sup
     guard.finish();
     try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
     try std.testing.expect(!probe.under_gate);
-    // Legitimate historical raw outside publication, then a managed text-only
-    // request with the feature disabled. Upgrade SAME actual owner/lease only.
-    try std.testing.expect(try arena.upload(&compute.ctx, device, input));
-    const raw_host = arena.host.ptr;
-    const raw_event = arena.event;
-    const raw_lease = arena.quota.peek().?;
-    try std.testing.expect(arena.quota == .raw);
-    compute.ocr_pinned_inputs_enabled = false;
-    var transition_requests: [CacheFunding.Auxiliary.count + 1]CacheFunding.Request = undefined;
-    var transition_builder: CacheFunding.Builder = .{ .storage = &transition_requests };
-    try transition_builder.add(compute.auxiliaryCacheRequest(.pinned_input_host).?); // SAME raw arena, ZERO upload hint
-    try std.testing.expectEqual(@as(usize, 1), transition_builder.len);
-    try std.testing.expectEqual(CacheFunding.Auxiliary.Kind.pinned_input_host, transition_requests[0].auxiliary.kind);
-    // Supplying a hint too must not duplicate the already-inventoried owner.
-    try compute.appendPinnedInputCacheWorkload(&transition_builder, upload_bytes);
-    try std.testing.expectEqual(@as(usize, 1), transition_builder.len);
-    try transition_builder.add(try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize)));
-    const transition_work = transition_builder.workload();
-    const upgrade = try CacheFunding.Funding.create(transition_work);
-    defer upgrade.finishOutsideExecution();
-    const before_upgrade = probe.callbacks;
-    try compute.snapshotLightOnNormFunding(upgrade, desired);
-    try upgrade.fundLightOnOutsideExecution(&pin);
-    try std.testing.expectEqual(before_upgrade, probe.callbacks);
-    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
-    var next_guard = try sink.enter();
-    defer next_guard.finish();
-    var next_epoch = try next_guard.retainEpoch();
-    defer next_epoch.release();
-    try std.testing.expect(probe.gate.tryLock());
-    gate_owned = true;
-    try CudaCompute.beginLightOnNormFunding(&compute, transition_work, upgrade, &next_epoch, desired);
-    var upgrade_bound = true;
-    defer if (upgrade_bound) CudaCompute.unbindCacheFunding(&cb, &compute, upgrade);
-    try compute.configureEmbeddingGemma2AdmissionWithCleanup(desired, .{ .boundary = &next_epoch });
-    try std.testing.expectEqual(raw_host, arena.host.ptr);
-    try std.testing.expectEqual(raw_event, arena.event);
-    try std.testing.expect(arena.quota == .prepared);
-    try std.testing.expectEqualDeep(raw_lease, arena.quota.peek().?);
-    try std.testing.expectEqual(before_upgrade, probe.callbacks);
-    // Final current-B policy cleanup is now supported with zero new credit.
-    try arena.clearWithCleanup(&compute.ctx, .{ .boundary = &next_epoch });
-    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
-    CudaCompute.unbindCacheFunding(&cb, &compute, upgrade);
-    upgrade_bound = false;
-    probe.gate.unlock();
-    gate_owned = false;
-    next_guard.finish();
-    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
-    try std.testing.expect(!probe.under_gate);
-    // Exact raw explicit-outside refund can synchronously upload into this
-    // SAME now-empty Arena. Old cleanup must never reset that newly owned SDK
-    // Host/Event/quota after the callback has published them.
-    // The controller pins the OLD local reservation through its external
-    // release callback. Reentrant new backing therefore needs the real
-    // simultaneous 2x capacity; only this explicit outside phase allows it.
-    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = 2 * Arena.capacity;
-    try std.testing.expect(try arena.upload(&compute.ctx, device, input));
-    probe.reenter_arena = arena;
-    probe.reenter_ctx = &compute.ctx;
-    probe.reenter_device = device;
-    probe.reenter_bytes = input;
-    try arena.clear(&compute.ctx);
-    if (probe.reentry_failure) |failure| return failure;
-    try std.testing.expect(probe.reentered and arena.host.ptr != null and arena.event != null and arena.quota == .raw);
-    try std.testing.expectEqual(Arena.capacity, probe.reentry_before_bytes);
-    try std.testing.expectEqual(2 * Arena.capacity, probe.reentry_after_bytes);
-    try std.testing.expectEqual(Arena.capacity, domain.controller.snapshot().host_scratch_bytes);
-    try device.copyToHost(&compute.ctx, actual);
-    try compute.ctx.synchronize();
-    try std.testing.expectEqualSlices(u8, input, actual);
-    try arena.clear(&compute.ctx);
-    try std.testing.expect(arena.host.ptr == null and arena.event == null and !arena.quota.hasLease());
-    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
 }
 
 test "CUDA actual temporary recurrent producer reuses one cold peak only after checked SDK retirement and retains it across failure retry" {
