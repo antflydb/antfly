@@ -2047,12 +2047,12 @@ test "TracingCompute resident cross attention omits all-valid mask operands" {
     const v = try cb.getWeight("v");
 
     const plain = try cb.crossAttention(q, k, v, null, 1, 1, 3, 2, 2);
-    const plain_node = tc.graph.node(nodeIdFromCT(plain));
+    const plain_node = tc.graph.node(TracingCompute.nodeIdFromCT(plain));
     try std.testing.expect(plain_node.op.fused_cross_attention.all_keys_visible);
     try std.testing.expectEqual(@as(usize, 3), plain_node.getInputs().len);
 
     const masked = try cb.crossAttention(q, k, v, &.{ 1, 0, 1 }, 1, 1, 3, 2, 2);
-    const masked_node = tc.graph.node(nodeIdFromCT(masked));
+    const masked_node = tc.graph.node(TracingCompute.nodeIdFromCT(masked));
     try std.testing.expect(!masked_node.op.fused_cross_attention.all_keys_visible);
     try std.testing.expectEqual(@as(usize, 4), masked_node.getInputs().len);
     try std.testing.expectEqual(.bool_, tc.graph.node(masked_node.inputs[3]).output_shape.dtype);
