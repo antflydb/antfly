@@ -134,6 +134,10 @@ pub const Backend = struct {
             return try BoundTxn.open(self.backend, self.namespace, true);
         }
 
+        pub fn beginProbe(self: *@This()) !BoundTxn {
+            return self.beginRead();
+        }
+
         pub fn beginWrite(self: *@This()) !BoundTxn {
             return try BoundTxn.open(self.backend, self.namespace, false);
         }
