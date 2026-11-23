@@ -27011,6 +27011,19 @@ test "selected owner readiness transition index cancels while observations are l
 
 test "source control requires its coordinated decoder floor before metadata proposal" {
     const contract = @import("source_control.zig");
+    const floors = [_]u16{
+        metadata_topology_protocol.sql_idle_session_reenrollment_version,
+        contract.scoped_completion_health_protocol_version,
+        contract.independent_completion_stall_protocol_version,
+        contract.qualified_completion_stall_protocol_version,
+        contract.retained_payload_protocol_version,
+        contract.checkpoint_authority.successor_protocol_version,
+        metadata_topology_protocol.source_successor_retirement_guard_version,
+        contract.payload_prewrite_protocol_version,
+    };
+    for (floors[0 .. floors.len - 1], floors[1..]) |previous, next|
+        try std.testing.expect(previous < next);
+    try std.testing.expect(metadata_topology_protocol.current_version >= floors[floors.len - 1]);
     const a = std.testing.allocator;
     try std.testing.expectEqual(contract.manifest_protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = "{}" }));
     const scope: contract.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
@@ -27018,6 +27031,10 @@ test "source control requires its coordinated decoder floor before metadata prop
     const legacy = try contract.encodeWrite(a, write);
     defer a.free(legacy);
     try std.testing.expectEqual(contract.protocol_version, try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_source_control = legacy }));
+    write.mutation = .{ .pin_payload_prewrite = .{ .digest = @splat(6), .bytes = "manifest" } };
+    const prewrite = try contract.encodeWrite(a, write);
+    defer a.free(prewrite);
+    try std.testing.expectEqual(contract.payload_prewrite_protocol_version, try transitionRequiredCoordinatedDecoderVersion(a, .{ .apply_source_control = prewrite }));
     write.mutation = .{ .seal_artifact = .{ .reservation_digest = @splat(6), .stamp = @splat(7) } };
     const artifact = try contract.encodeWrite(a, write);
     defer a.free(artifact);

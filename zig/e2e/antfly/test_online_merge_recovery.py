@@ -732,6 +732,15 @@ class CdcUploadFault(OwnerLinkFault):
             phase = transaction.get("phase")
             path = body.get("_fault_path", "")
             if self.window == "cdc_accepted":
+                if (
+                    self.original is None
+                    and command is not None
+                    and command["action"] == "begin"
+                    and len(command["spec"]["chunk_hashes"]) > 1
+                ):
+                    # Keep the request identity even if BEGIN's response is
+                    # ambiguous. The matching committed decision proves it.
+                    self.acceptance_upload = body
                 if self.acceptance_upload is None:
                     return False
                 if phase == "publish_completion_v1" and transaction[
@@ -847,12 +856,6 @@ class CdcUploadFault(OwnerLinkFault):
         body["_upload_applied"] = True
         with self.lock:
             if self.original is None:
-                if (
-                    self.armed
-                    and command["action"] == "begin"
-                    and len(command["spec"]["chunk_hashes"]) > 1
-                ):
-                    self.acceptance_upload = body
                 return
             old = self.original["command"]["spec"]["attempt"]
             if command["action"] == "reclaim" and command["spec"]["attempt"] == old:

@@ -2417,20 +2417,3 @@ test "source control checkpoint successor preparation survives reload and fences
     try std.testing.expectEqual(adoption.adopt_checkpoint_successor.installed, state.checkpoint_install_receipt.?);
     try std.testing.expectEqual(state.revision, (try adoption.apply(ca, state)).revision);
 }
-
-test "source control assigns CDC decoder floors after SQL session reenrollment" {
-    const topology = @import("topology_protocol.zig");
-    const ordered = [_]u16{
-        topology.sql_idle_session_reenrollment_version,
-        scoped_completion_health_protocol_version,
-        independent_completion_stall_protocol_version,
-        qualified_completion_stall_protocol_version,
-        retained_payload_protocol_version,
-        checkpoint_authority.successor_protocol_version,
-        topology.source_successor_retirement_guard_version,
-        payload_prewrite_protocol_version,
-    };
-    for (ordered[0 .. ordered.len - 1], ordered[1..]) |previous, next|
-        try std.testing.expect(previous < next);
-    try std.testing.expect(topology.current_version >= ordered[ordered.len - 1]);
-}
