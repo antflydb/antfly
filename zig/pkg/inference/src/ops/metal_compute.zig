@@ -11781,8 +11781,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (need.dispatch_workspace.byte_size != self.scratch_bytes or need.dispatch_workspace.host_byte_size != 0 or
             need.preparation_workspace.byte_size != 0 or need.preparation_workspace.host_byte_size != 0) return false;
         if (owned.covered_nodes.ptr != &self.nodes or owned.covered_nodes.len < self.count or owned.covered_nodes.len > self.nodes.len or
-            owned.input_nodes.ptr != &self.inputs or owned.input_nodes.len != self.count + 1 or
+            owned.input_nodes.ptr != &self.inputs or owned.input_nodes.len != self.input_count or
             need.outputs.ptr != &self.outputs or need.outputs.len != self.count) return false;
+        var operands: usize = 1;
+        for (self.linears[0..self.count]) |linear| {
+            const prepared: *const PreparedDenseLinear = @ptrCast(@alignCast(linear.context));
+            operands += prepared.descriptor.input_count - 1;
+        }
+        if (operands != self.input_count) return false;
         const pack_request = self.packed_request orelse return owned.policy_key == 1 and self.scratch_bytes == 0 and owned.covered_nodes.len == self.count;
         if (owned.policy_key != 2 or self.scratch_bytes == 0 or need.dispatch_workspace.alignment != @alignOf(f32) or pack_request.count != self.count) return false;
         const scope = self.compute.packed_projection_profile orelse return false;
@@ -12630,44 +12636,45 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 continue;
             }
             const input = request.graph.node(first_node).inputs[0];
+            var group: [3]ml.graph.NodeId = .{ first_node, ml.graph.null_node, ml.graph.null_node };
+            var member_positions: [3]usize = .{ cursor, 0, 0 };
             var count: usize = 1;
             var dimensions: [3]usize = .{ first.operation.linear.out_dim, 0, 0 };
-            // Adjacent numerical projections only: no consumer or future
-            // source producer can be moved across this entry point.
-            while (count < 3 and cursor + count < partition_nodes.len) {
-                const next_node = partition_nodes[cursor + count];
+            // Only declarations can appear between otherwise adjacent
+            // numerical projections. Never cross another producer/consumer.
+            var scan = cursor + 1;
+            while (count < group.len and scan < partition_nodes.len) : (scan += 1) {
+                const next_node = partition_nodes[scan];
+                if (request.graph.node(next_node).op == .parameter) continue;
                 const next = DenseProjectionRegion.candidate(request.graph, next_node) orelse break;
                 if (request.graph.node(next_node).inputs[0] != input or next.operation.linear.in_dim != first.operation.linear.in_dim or next.operation.linear.rows != first.operation.linear.rows) break;
+                group[count] = next_node;
+                member_positions[count] = scan;
                 dimensions[count] = next.operation.linear.out_dim;
                 count += 1;
             }
             if (count == 3 and dimensions[1] != dimensions[2]) count = 2;
-            if (count == 2 and dimensions[0] != dimensions[1]) {
+            if (count < 2 or (count == 2 and dimensions[0] != dimensions[1])) {
                 cursor += 1;
                 continue;
             }
-            if (count < 2) {
-                cursor += 1;
-                continue;
-            }
-            // Every external operand must already have been submitted when
-            // the first member is reached. Node IDs are not submission order.
+            const members = group[0..count];
             const entry_position = positions[first_node];
             if (entry_position == std.math.maxInt(u32)) return error.InvalidRegionOrder;
-            var ready = true;
-            for (partition_nodes[cursor..][0..count]) |node| for (request.graph.node(node).getInputs()) |source| {
-                if (source >= positions.len) {
-                    ready = false;
-                } else if (positions[source] >= entry_position) {
-                    ready = false;
-                }
-            };
-            for (partition_nodes[cursor..][0..count], 0..) |node, index| {
-                const weight = request.graph.node(node).inputs[1];
-                for (partition_nodes[cursor..][0..index]) |previous| if (request.graph.node(previous).inputs[1] == weight) {
-                    ready = false;
+            const ready = ready: {
+                for (members) |node| for (request.graph.node(node).getInputs()) |source| {
+                    if (source >= positions.len or positions[source] == std.math.maxInt(u32)) break :ready false;
+                    if (positions[source] < entry_position) continue;
+                    if (request.graph.node(source).op != .parameter) break :ready false;
+                    const fact = request.node_facts[source];
+                    if (fact != .tensor or fact.tensor.implementation.context != ctx or !acceptsPhysicalImplementation(fact.tensor.implementation.table)) break :ready false;
                 };
-            }
+                for (members, 0..) |node, index| {
+                    const weight = request.graph.node(node).inputs[1];
+                    for (members[0..index]) |previous| if (request.graph.node(previous).inputs[1] == weight) break :ready false;
+                }
+                break :ready true;
+            };
             if (!ready) {
                 cursor += 1;
                 continue;
@@ -12677,7 +12684,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var transferred = false;
             defer if (!transferred) DenseProjectionRegion.deinit(owner);
             owner.inputs[0] = input;
-            for (partition_nodes[cursor..][0..count], 0..) |node, index| {
+            for (members, 0..) |node, index| {
                 const descriptor = DenseProjectionRegion.candidate(request.graph, node).?;
                 const operands = request.graph.node(node).getInputs();
                 if (operands.len != descriptor.input_count) break;
@@ -12700,7 +12707,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // Slices point into their stable heap owner, never this call frame.
             try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0..owner.input_count], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table });
             transferred = true;
-            cursor += count;
+            cursor = member_positions[count - 1] + 1;
         }
         // This synchronous execution profile is installed only for a fully
         // covered numerical partition. Missing/cold slot or layout readiness
@@ -55646,8 +55653,8 @@ const PreparedDenseRegionFixture = struct {
         const interpreter = @import("../graph/interpreter.zig");
         const route = @import("../execution/kernel_route.zig");
         const parameter_count = values.len;
-        var bindings: [4]route.InputBinding = undefined;
-        var inputs: [4]interpreter.RuntimeInput = undefined;
+        var bindings: [7]route.InputBinding = undefined;
+        var inputs: [7]interpreter.RuntimeInput = undefined;
         for (nodes[0..parameter_count], values, 0..) |node, value, index| {
             bindings[index] = .{ .node_id = node, .value = .{ .tensor = .{ .value = value, .implementation = .{ .context = cb.ptr, .table = cb.vtable } } } };
             inputs[index] = .{ .node_id = node, .value = value, .source_backend = &cb };
@@ -55728,6 +55735,65 @@ const PreparedDenseRegionFixture = struct {
             const actual = try cb.toFloat32(output, a);
             defer a.free(actual);
             for (actual, wants) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
+        }
+    }
+    fn checkBiased(cb: ops.ComputeBackend, reference: ops.ComputeBackend) !void {
+        const a = std.testing.allocator;
+        const data: [64]f32 = @splat(0.125);
+        const resident = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&data, &.{ 1, 64 }));
+        defer cb.free(resident);
+        const source = try reference.fromFloat32Shape(&data, &.{ 1, 64 });
+        defer reference.free(source);
+        const shape = ml.graph.Shape.init(.f32, &.{ 1, 64 });
+        const weight_shape = ml.graph.Shape.init(.f32, &.{ 64, 64 });
+        const bias_shape = ml.graph.Shape.init(.f32, &.{64});
+        for ([_]usize{ 2, 3 }) |count| {
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const input = try builder.parameter("x", shape);
+            var nodes: [7]ml.graph.NodeId = undefined;
+            var values: [7]CT = undefined;
+            var expected: [3][]f32 = undefined;
+            nodes[0] = input;
+            values[0] = resident;
+            var parameters: usize = 1;
+            var produced: usize = 0;
+            defer for (values[1..parameters]) |value| cb.free(value);
+            defer for (expected[0..produced]) |value| a.free(value);
+            for ([_][]const u8{ "q", "k", "v" }, [_][]const u8{ "q.bias", "k.bias", "v.bias" }, 0..) |name, bias_name, index| {
+                if (index == count) break;
+                const weight = try cb.ensureDeviceResidentOwned(try cb.getWeight(name));
+                nodes[parameters] = builder.parameter(name, weight_shape) catch |err| {
+                    cb.free(weight);
+                    return err;
+                };
+                const weight_node = nodes[parameters];
+                values[parameters] = weight;
+                parameters += 1;
+                const reference_weight = try reference.getWeight(name);
+                defer reference.free(reference_weight);
+                const output, const reference_output = if (index == 1) unbiased: {
+                    _ = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = null, .in_dim = 64, .out_dim = 64 })) orelse return error.LinearSlotPreparationDeclined;
+                    break :unbiased .{ try builder.linearNoBias(input, weight_node, 1, 64, 64), try reference.linearNoBias(source, reference_weight, 1, 64, 64) };
+                } else biased: {
+                    const bias_node = try builder.parameter(bias_name, bias_shape);
+                    const bias_data: [64]f32 = @splat(if (index == 0) 0.25 else -0.5);
+                    const bias = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&bias_data, &.{64}));
+                    nodes[parameters] = bias_node;
+                    values[parameters] = bias;
+                    parameters += 1;
+                    const reference_bias = try reference.fromFloat32Shape(&bias_data, &.{64});
+                    defer reference.free(reference_bias);
+                    _ = (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = weight, .bias = bias, .in_dim = 64, .out_dim = 64 })) orelse return error.LinearSlotPreparationDeclined;
+                    break :biased .{ try builder.linear(input, weight_node, bias_node, 1, 64, 64), try reference.linear(source, reference_weight, reference_bias, 1, 64, 64) };
+                };
+                defer reference.free(reference_output);
+                try graph.markOutput(output);
+                expected[index] = try reference.toFloat32(reference_output, a);
+                produced += 1;
+            }
+            try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..count]);
         }
     }
     fn check(cb: ops.ComputeBackend, reference: ops.ComputeBackend) !void {
@@ -55905,6 +55971,10 @@ const PreparedDenseRegionFixture = struct {
 
 test "Metal prepared dense row projections install pair QKV owners and preserve original values lifetimes and failure bounds" {
     try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, PreparedDenseRegionFixture.check);
+}
+
+test "Metal prepared pair and QKV dispatch mixed bias operands without readback" {
+    try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, PreparedDenseRegionFixture.checkBiased);
 }
 
 test "Metal prepared projection geometry recognizes multirow heads while row-one profile stays bounded" {
