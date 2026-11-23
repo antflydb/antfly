@@ -4243,6 +4243,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             vector: []const f32,
             progress: apply_state.Progress,
             coverage_plan: ?InlineCoveragePlan = null,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
 
             fn reset(_: *anyopaque) void {}
             fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
@@ -4272,28 +4274,68 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
-            /// Call only once the host transaction's commit has actually
-            /// returned successfully (see `InlineTextPublication.install`'s
-            /// identical warning).
-            pub fn participant(self: *InlineDensePublication) commit_participant.Participant {
-                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
             }
 
-            pub fn install(self: *InlineDensePublication) void {
-                std.debug.assert(self.apply_guard.locked());
-                self.entry.index.installStagedWrite(&self.staged) catch |err| {
-                    std.log.err("inline dense publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.publishQueuedStagedWrite(&self.staged, self.vector_id) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                } else |_| {}
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineDensePublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
                 };
-                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
-                self.apply_guard.unlock();
-                self.alloc.destroy(self);
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineDensePublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.advancePrivateStagedWrite(&self.staged) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineDensePublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
             }
 
             pub fn abort(self: *InlineDensePublication) void {
-                std.debug.assert(self.apply_guard.locked());
-                self.entry.index.abortStagedWrite(&self.staged);
+                const owner = if (self.enqueued) self.entry.index else &self.entry.inline_writer.view.?;
+                owner.abortStagedWrite(&self.staged);
                 if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
-                self.apply_guard.unlock();
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
                 self.alloc.destroy(self);
             }
         };
@@ -4348,11 +4390,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const assignment = (try index_manager.assignDenseVectorIdInlineTxn(&probe_txn, entry, index_ref.name, write.doc_key)) orelse
                 return error.InlineDensePublicationUnsupported;
 
-            const staged = entry.index.insertWithMetadataStaged(assignment.vector_id, write.vector, write.doc_key) catch |err| switch (err) {
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            var staged = queue.view.?.insertWithMetadataStaged(assignment.vector_id, write.vector, write.doc_key) catch |err| switch (err) {
                 error.StagedPublicationUnsupported => return error.InlineDensePublicationUnsupported,
                 else => return err,
             };
 
+            errdefer queue.view.?.abortStagedWrite(&staged);
             const result = try alloc.create(InlineDensePublication);
             result.* = .{
                 .alloc = alloc,

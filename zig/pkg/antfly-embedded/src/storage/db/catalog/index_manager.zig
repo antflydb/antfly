@@ -2433,6 +2433,7 @@ pub const IndexManager = struct {
         // entries move during array growth and generation cutover, so owning
         // the runtime by value would invalidate those identities. Keep the
         // runtime at one stable heap address for its entire lifetime.
+        inline_writer: @import("../../commit_participant.zig").WriterViewQueue(hbc_mod.HBCIndex) = .{},
         index: *hbc_mod.HBCIndex,
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,

@@ -4417,6 +4417,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             errdefer if (txn_ticket) |*ticket| ticket.wait() catch {};
             if (inline_graph_publication) |prepared| prepared.markEnqueued();
             if (inline_sparse_publication) |prepared| prepared.markEnqueued();
+            if (inline_dense_publication) |prepared| prepared.markEnqueued();
             local_coverage_guard.release();
             if (opts.primary_committed) |committed| committed.* = true;
             if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
@@ -4622,8 +4623,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
             }
             if (inline_dense_publication) |prepared| {
-                prepared.install();
                 inline_dense_publication = null;
+                try prepared.install();
                 if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
             }
             // Same durability boundary as the inline text publications just

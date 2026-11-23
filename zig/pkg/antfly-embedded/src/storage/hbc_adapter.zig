@@ -15400,9 +15400,11 @@ pub const HBCIndex = struct {
             var writer = try idx.forkInlineWriter();
             defer writer.close();
             var first = try writer.insertWithMetadataStaged(11, &.{ 1.0, 0.0 }, "");
-            try writer.installStagedWrite(&first);
+            defer writer.abortStagedWrite(&first);
+            try writer.advancePrivateStagedWrite(&first);
             var next = try writer.insertWithMetadataStaged(12, &.{ 0.0, 1.0 }, "");
-            try writer.installStagedWrite(&next);
+            defer writer.abortStagedWrite(&next);
+            try writer.advancePrivateStagedWrite(&next);
             try std.testing.expectEqual(@as(u64, 2), writer.publishedActiveCount());
             try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
             try std.testing.expectEqual(submit_calls, test_sink.submit_calls);
@@ -19916,24 +19918,60 @@ pub const HBCIndex = struct {
     /// (`native_catalog_backend.Backend.invalidateMirror`), so this index
     /// fails closed until reopened from the committed catalog.
     pub fn installStagedWrite(self: *HBCIndex, staged: *vectorindex_hbc_index.StagedWrite) !void {
-        var mirror_err: ?anyerror = null;
-        if (self.env_owner == .native_catalog and staged.mutations.len != 0) mirror: {
-            const backend = self.env_owner.native_catalog;
-            const converted = self.alloc.alloc(native_catalog_backend.Mutation, staged.mutations.len) catch |err| {
-                backend.invalidateMirror();
-                mirror_err = err;
-                break :mirror;
-            };
-            defer self.alloc.free(converted);
-            for (staged.mutations, converted) |pending, *out| {
-                out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
-            }
-            backend.applyExternallyCommittedMutations(converted) catch |err| {
-                mirror_err = err;
-            };
-        }
+        const mirrored = self.applyStagedCatalogMutations(staged.mutations);
         try vectorindex_hbc_index.installStagedWrite(self, staged);
-        if (mirror_err) |err| return err;
+        try mirrored;
+    }
+
+    fn applyStagedCatalogMutations(self: *HBCIndex, mutations: []const vectorindex_store.PendingMutation) !void {
+        if (self.env_owner != .native_catalog or mutations.len == 0) return;
+        const backend = self.env_owner.native_catalog;
+        errdefer backend.invalidateMirror();
+        const converted = try self.alloc.alloc(native_catalog_backend.Mutation, mutations.len);
+        defer self.alloc.free(converted);
+        for (mutations, converted) |pending, *out| {
+            out.* = .{ .namespace = pending.namespace, .key = pending.key, .value = pending.value, .is_delete = pending.is_delete };
+        }
+        try backend.applyExternallyCommittedMutations(converted);
+    }
+
+    /// Advances only the private runtime. The host still owns the queued
+    /// mutation bytes and releases them when the durable ticket resolves.
+    pub fn advancePrivateStagedWrite(self: *HBCIndex, staged: *vectorindex_hbc_index.StagedWrite) !void {
+        std.debug.assert(staged.publishing);
+        std.debug.assert(self.env_owner.native_catalog.writer_view_parent != null);
+        defer staged.publishing = false;
+        errdefer self.abortPublishedSearchStateRefresh();
+        try self.applyStagedCatalogMutations(staged.mutations);
+        self.finishPublishedSearchStateRefresh();
+    }
+
+    /// Publishes a previously prepared mutation on the durable serving
+    /// tree. Routing metadata and cache invalidation share its search epoch.
+    pub fn publishQueuedStagedWrite(self: *HBCIndex, staged: *const vectorindex_hbc_index.StagedWrite, vector_id: u64) !void {
+        var metadata: ?IndexMetadata = null;
+        for (staged.mutations) |mutation| {
+            const namespace = mutation.namespace orelse continue;
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and std.mem.eql(u8, mutation.key, meta_key) and !mutation.is_delete)
+                metadata = IndexMetadata.decode(mutation.value);
+        }
+        const next = metadata orelse return error.InvalidQueuedIndexMetadata;
+        try self.beginPublishedSearchStateRefreshIo();
+        errdefer self.abortPublishedSearchStateRefresh();
+        try self.markPublishedSearchStateCommitting();
+        try self.applyStagedCatalogMutations(staged.mutations);
+        for (staged.mutations) |mutation| {
+            const namespace = mutation.namespace orelse continue;
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.nodes).name.?)) {
+                if (decodeNodeKey(mutation.key)) |node| self.invalidateNodeCache(node.id);
+            } else if (std.mem.eql(u8, namespace, runtimeNamespace(.quant).name.?)) {
+                if (decodeQuantizedNodeId(mutation.key)) |node_id| self.invalidateQuantizedCache(node_id);
+            }
+        }
+        self.invalidateVectorCache(vector_id);
+        self.invalidateMetadataCache(vector_id);
+        self.metadata = next;
+        self.finishPublishedSearchStateRefresh();
     }
 
     /// `staged.mutations` were never committed durably. Restores this
