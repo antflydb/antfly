@@ -18,10 +18,39 @@ const protocol = @import("protocol.zig");
 const backend = @import("backend.zig");
 
 const Mock = struct {
+    procedure_notice_failure: bool = false,
     describes: usize = 0,
+    replication_enabled: bool = false,
+    replication_denied: bool = false,
+    replication_revoke_after_command: bool = false,
+    replication_unknown: bool = false,
+    replication_error: ?anyerror = null,
+    replication_opens: usize = 0,
+    replication_closes: usize = 0,
+    replication_checks: usize = 0,
+    invalid_slot_reply: enum { none, name, lsn, snapshot, plugin } = .none,
+    replication_commands: usize = 0,
+    replication_stream_enabled: bool = false,
+    replication_large_payload: []const u8 = "",
+    replication_stream_opens: usize = 0,
+    replication_stream_closes: usize = 0,
+    replication_polls: usize = 0,
+    replication_feedbacks: usize = 0,
+    replication_ack: u64 = 0,
+    replication_live_chunks: usize = 0,
+    replication_revoke_after_poll: bool = false,
+    replication_defer_first_poll: bool = false,
+    replication_defer_first_feedback: bool = false,
+    replication_wait_for_feedback: bool = false,
     catalog_rebind: bool = false,
     cached_rename: bool = false,
     probe_change_at: ?usize = null,
+    compatible_revision: bool = false,
+    cancel_during_validation: bool = false,
+    cancel_during_pull: bool = false,
+    cancel_during_open: bool = false,
+    stream_without_detach: bool = false,
+    session: ?*protocol.Session = null,
     replace_incarnation: bool = false,
     replace_before_setting_execute: bool = false,
     probes: usize = 0,
@@ -43,9 +72,12 @@ const Mock = struct {
     json_null_results: bool = false,
     array_results: bool = false,
     array_parameters: bool = false,
+    two_parameters: bool = false,
     native_parameters: bool = false,
+    enum_view: ?*const @import("antfly_local_sources").sql_scalar.EnumValues.View = null,
     native_parameter_checks: usize = 0,
     result_override: ?backend.Result = null,
+    result_override_executions: usize = 0,
     result_cells: bool = false,
     ddl_pending: bool = false,
     ddl_unknown: bool = false,
@@ -63,6 +95,21 @@ const Mock = struct {
     entered: ?*std.Io.Event = null,
     blocked: bool = false,
     stream_rows: usize = 0,
+    stream_definitions: ?[]const backend.Column = null,
+    cursor_readable: bool = true,
+    copy_out: ?@import("copy_out.zig").Options = null,
+    copy_in: ?@import("copy_out.zig").Options = null,
+    copy_predicate: bool = false,
+    copy_staged: usize = 0,
+    copy_committed: usize = 0,
+    copy_sum: i64 = 0,
+    copy_sql_nulls: usize = 0,
+    copy_json_nulls: usize = 0,
+    copy_instant: ?i64 = null,
+    copy_batches: usize = 0,
+    copy_batch_error: ?anyerror = null,
+    copy_rollbacks: usize = 0,
+    stream_text: ?[]const u8 = null,
     stream_cells: bool = false,
     stream_page_begin: usize = 0,
     expected_stream_statement: ?[]const u8 = null,
@@ -80,6 +127,9 @@ const Mock = struct {
     cursor_revoked: bool = false,
     buffered_filter_changed: bool = false,
     revoke_on_buffered_resume: bool = false,
+    deny_describe_at: ?usize = null,
+    deny_stream_validation: bool = false,
+    stream_lease_lost: bool = false,
     stream_fail_at: ?usize = null,
     failed_transactions: usize = 0,
     canceled: std.atomic.Value(bool) = .init(false),
@@ -93,9 +143,11 @@ const Mock = struct {
     setting_snapshots: usize = 0,
     observed_setting: ?i64 = null,
     describe_setting_epoch: ?u64 = null,
+    guarded_select_stream: bool = false,
     observed_setting_epoch: ?u64 = null,
     setting_epoch_changes_on_describe: bool = false,
     setting_changes_before_admission: bool = false,
+    role_timeout_default: ?i64 = null,
 
     fn settingEpoch(self: *const Mock) ?u64 {
         return if (self.describe_setting_epoch) |epoch| epoch + (if (self.setting_epoch_changes_on_describe) self.describes - 1 else 0) else null;
@@ -112,17 +164,148 @@ const Mock = struct {
         }
     }
 
+    const source_tables: [2][2]backend.Backend.VTable = blk: {
+        var tables: [2][2]backend.Backend.VTable = undefined;
+        for (0..2) |native_index| for (0..2) |replication_index| {
+            tables[native_index][replication_index] = .{
+                .native_parameters = native_index == 1,
+                .authenticate = authenticate,
+                .refresh = refresh,
+                .describe = describe,
+                .description_current = descriptionCurrent,
+                .execute = Mock.execute,
+                .load_settings = loadSettings,
+                .validate_namespace = validateNamespace,
+                .evaluate_parameters = evaluateParameters,
+                .fail_transaction = failTransaction,
+                .open_stream = openStream,
+                .disconnect = disconnect,
+                .open_replication_session = if (replication_index == 1) openReplication else null,
+            };
+        };
+        break :blk tables;
+    };
+    const guarded_source = blk: {
+        var table = source_tables[0][0];
+        table.guarded_select_stream = true;
+        break :blk table;
+    };
     fn source(self: *Mock) backend.Backend {
-        if (self.native_parameters) return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .description_current = descriptionCurrent, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .refresh = refresh, .describe = describe, .description_current = descriptionCurrent, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        if (self.guarded_select_stream) return .{ .context = self, .vtable = &guarded_source };
+        return .{ .context = self, .vtable = &source_tables[@intFromBool(self.native_parameters)][@intFromBool(self.replication_enabled)] };
+    }
+    fn openReplication(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.ReplicationSession {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_opens += 1;
+        if (self.replication_denied) return error.Forbidden;
+        return .{ .context = self, .authorize = replicationAuthorize, .command = replicationCommand, .close = replicationClose, .open_stream = if (self.replication_stream_enabled) replicationStreamOpen else null };
+    }
+    fn replicationStreamOpen(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request, start: backend.replication_commands.Start) !backend.ReplicationStream {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_stream_opens += 1;
+        const resume_position = @max(@as(u64, 1), @backingInt(start.position));
+        const end = self.replicationEnd();
+        if (resume_position > end) return error.ChangefeedResynchronizationRequired;
+        return .{ .context = self, .initial_lsn = @fromBackingInt(if (resume_position == end) end else @as(u64, 1)), .resume_lsn = @fromBackingInt(resume_position), .initial_end_lsn = @fromBackingInt(end), .poll = replicationPoll, .feedback = replicationFeedback, .close = replicationStreamClose };
+    }
+    fn replicationEnd(self: *const Mock) u64 {
+        // Start LSN 1, 21-byte Begin and 26-byte Commit. A text Insert has
+        // 13 bytes of framing plus the payload itself.
+        return 48 + if (self.replication_large_payload.len == 0) @as(u64, 0) else @as(u64, self.replication_large_payload.len + 13);
+    }
+
+    fn replicationPoll(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, after: backend.pgoutput.Lsn, maximum: u32) !backend.ReplicationPoll {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_polls += 1;
+        if (self.replication_defer_first_poll and self.replication_polls == 1) {
+            try request.io.sleep(.fromMilliseconds(150), .awake);
+            return error.ReplicationReadDeferred;
+        }
+        if (self.replication_revoke_after_poll) self.replication_denied = true;
+        const offset = @backingInt(after);
+        const end = self.replicationEnd();
+        if (self.replication_wait_for_feedback and self.replication_feedbacks == 0) return .{ .end_lsn = @fromBackingInt(end) };
+        if (offset == end) return .{ .end_lsn = @fromBackingInt(end) };
+        const commit: backend.pgoutput.Lsn = @fromBackingInt(end - 26);
+        const bytes = if (offset == 1)
+            try backend.pgoutput.encode(a, .{ .begin = .{ .final_lsn = commit, .commit_time = 0, .xid = 42 } }, maximum)
+        else if (offset == @backingInt(commit))
+            try backend.pgoutput.encode(a, .{ .commit = .{ .commit_lsn = commit, .end_lsn = @fromBackingInt(end), .commit_time = 0 } }, maximum)
+        else if (offset == 22 and self.replication_large_payload.len != 0)
+            try backend.pgoutput.encode(a, .{ .insert = .{ .relation = 42, .values = &.{.{ .text = self.replication_large_payload }} } }, maximum)
+        else
+            return error.TestUnexpectedResult;
+        self.replication_live_chunks += 1;
+        return .{ .end_lsn = @fromBackingInt(end), .chunk = .{ .start_lsn = after, .bytes = bytes }, .owner = .{ .context = self, .release = replicationChunkRelease } };
+    }
+    fn replicationChunkRelease(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.replication_live_chunks -= 1;
+    }
+    fn replicationFeedback(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request, feedback: backend.pgoutput.Feedback) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_feedbacks += 1;
+        if (self.replication_defer_first_feedback and self.replication_feedbacks == 1) {
+            try request.io.sleep(.fromMilliseconds(150), .awake);
+            return error.ReplicationFeedbackDeferred;
+        }
+        // The real slot authority rounds to complete issued transactions;
+        // transport alone must never acknowledge a partial transaction.
+        if (@backingInt(feedback.flushed) == 48) self.replication_ack = 48;
+    }
+    fn replicationStreamClose(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.replication_live_chunks == 0);
+        self.replication_stream_closes += 1;
+    }
+    fn replicationAuthorize(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request, _: ?backend.replication_commands.Command) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_checks += 1;
+        if (self.replication_denied or (self.replication_revoke_after_command and self.replication_commands != 0)) return error.Forbidden;
+    }
+    fn replicationClose(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.replication_closes += 1;
+    }
+    fn replicationCommand(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, command: backend.replication_commands.Command) !backend.Result {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_commands += 1;
+        if (self.replication_unknown) return error.MetadataMutationOutcomeUnknown;
+        if (self.replication_error) |err| {
+            self.replication_error = null;
+            return err;
+        }
+        const rows = try a.alloc([]const std.json.Value, if (command == .drop_slot) 0 else 1);
+        if (command == .identify_system) {
+            rows[0] = try a.dupe(std.json.Value, &.{ .{ .string = "123456789" }, .{ .integer = 1 }, .{ .string = "0/1" }, .{ .string = request.database orelse "db" } });
+            return .{ .columns = &.{ .{ .name = "systemid", .type = .string }, .{ .name = "timeline", .type = .integer }, .{ .name = "xlogpos", .type = .string }, .{ .name = "dbname", .type = .string } }, .rows = rows, .command_tag = "IDENTIFY_SYSTEM" };
+        }
+        if (command == .create_slot) {
+            rows[0] = try a.dupe(std.json.Value, &.{
+                .{ .string = if (self.invalid_slot_reply == .name) "other-slot" else command.create_slot.slot },
+                .{ .string = if (self.invalid_slot_reply == .lsn) "0/0" else "0/1" },
+                if (command.create_slot.snapshot == .export_snapshot and self.invalid_slot_reply != .snapshot) .{ .string = "snapshot-fixture" } else .null,
+                .{ .string = if (self.invalid_slot_reply == .plugin) "other-plugin" else "pgoutput" },
+            });
+            return .{ .columns = &.{ .{ .name = "slot_name", .type = .string }, .{ .name = "consistent_point", .type = .string }, .{ .name = "snapshot_name", .type = .string }, .{ .name = "output_plugin", .type = .string } }, .rows = rows, .command_tag = "CREATE_REPLICATION_SLOT", .mutation_outcome = .committed };
+        }
+        if (command != .drop_slot) return error.TestUnexpectedResult;
+        return .{ .columns = &.{}, .rows = rows, .command_tag = "DROP_REPLICATION_SLOT", .mutation_outcome = .committed };
     }
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.setting_snapshots += 1;
-        const definitions = try alloc.alloc(@import("antfly_local_sources").sql_setting_catalog.Definition, 3);
+        const definitions = try alloc.alloc(@import("antfly_local_sources").sql_setting_catalog.Definition, if (self.role_timeout_default != null) 4 else 3);
         definitions[0] = .{ .identity = .{ .id = 1, .generation = self.setting_generation }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } };
         definitions[1] = .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "owner" } };
         definitions[2] = .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.tenant_id", .kind = .string, .session_writable = true, .default = .{ .string = "unassigned" } };
+        if (self.role_timeout_default) |value| definitions[3] = .{ .identity = .{ .id = 4, .generation = 1 }, .name = "statement_timeout", .kind = .integer, .session_writable = true, .default = .{ .integer = 0 }, .role_default = .{ .integer = value } };
         return .{ .scope = .{ .principal = "tester", .database = request.database orelse "db" }, .epoch = self.setting_generation, .definitions = definitions };
     }
     fn validateNamespace(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !void {
@@ -158,7 +341,7 @@ const Mock = struct {
             self.receipt_budget_fallbacks += 1;
             return null;
         }
-        if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
+        if (self.copy_out == null and (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT"))) return null;
         try self.checkSettingEpoch(request);
         self.read_log[self.lake_count] = request.read_requirements;
         self.lake_log[self.lake_count] = request.lake_visibility;
@@ -167,7 +350,12 @@ const Mock = struct {
         try request.check();
         if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, if (self.catalog_rebind) "current-catalog-binding" else "immutable-catalog-binding") else false;
-        return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream, .detach = detachStream, .validate = validateStream };
+        if (self.cancel_during_open) self.session.?.cancel_requested.store(true, .release);
+        return .{ .context = self, .columns = self.streamColumns(), .next = nextPage, .close = closeStream, .detach = if (self.stream_without_detach) null else detachStream, .validate = validateStream, .copy_out = self.copy_out };
+    }
+    fn streamColumns(self: *Mock) []const backend.Column {
+        if (self.stream_definitions) |columns| return columns;
+        return if (self.stream_text != null) &.{.{ .name = "n", .type = .string }} else &.{.{ .name = "n", .type = .integer }};
     }
     fn detachStream(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -179,26 +367,39 @@ const Mock = struct {
         try request.check();
         if (self.expected_cursor_namespace) |expected| if (!std.mem.eql(u8, expected, request.namespace orelse "public")) return error.CatalogGenerationChanged;
         self.stream_validations += 1;
-        if (self.cursor_revoked) return error.Forbidden;
+        if (self.cancel_during_validation) {
+            const session = self.session.?;
+            if (session.executing.load(.acquire)) session.cancel_requested.store(true, .release);
+        }
+        if (self.stream_lease_lost) return error.SessionLeaseLost;
+        if (self.cursor_revoked or self.deny_stream_validation) return error.Forbidden;
     }
     fn nextPage(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request, wanted: u32) !backend.StreamPage {
         const self: *Mock = @ptrCast(@alignCast(raw));
         try request.check();
         self.stream_pulls += 1;
+        if (self.cancel_during_pull) self.session.?.cancel_requested.store(true, .release);
         if (self.stream_fail_at) |at| if (self.stream_offset >= at) return error.QueryCanceled;
         const count = @min(wanted, self.stream_rows - self.stream_offset);
+        if (self.stream_text) |text| {
+            const rows = try alloc.alloc([]const std.json.Value, count);
+            for (rows) |*row| row.* = try alloc.dupe(std.json.Value, &.{.{ .string = text }});
+            self.stream_offset += count;
+            self.stream_live_pages += 1;
+            return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = self.streamColumns(), .rows = rows, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
+        }
         if (self.stream_cells) {
             std.debug.assert(self.stream_live_pages == 0);
             self.stream_page_begin = self.stream_offset;
             self.stream_offset += count;
             self.stream_live_pages += 1;
-            return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .cells = .{ .context = self, .count = count, .width = 1, .read = streamCell }, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
+            return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = self.streamColumns(), .cells = .{ .context = self, .count = count, .width = 1, .read = streamCell }, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
         }
         const rows = try alloc.alloc([]const std.json.Value, count);
         for (rows, 0..) |*row, i| row.* = try alloc.dupe(std.json.Value, &.{.{ .integer = @intCast(self.stream_offset + i) }});
         self.stream_offset += count;
         self.stream_live_pages += 1;
-        return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = rows, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
+        return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = self.streamColumns(), .rows = rows, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
     }
     fn releaseStreamPage(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -240,18 +441,34 @@ const Mock = struct {
         try req.check();
         if (self.cursor_revoked or self.buffered_filter_changed or (self.revoke_on_buffered_resume and !materialized)) return error.Forbidden;
     }
-    fn describe(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
+    fn describe(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Description {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.describes += 1;
+        if (self.deny_describe_at == self.describes) return error.Forbidden;
         try request.check();
+        if (self.enum_view) |view| {
+            const columns = try alloc.alloc(backend.Column, 1);
+            columns[0] = .{ .name = "state", .type = .enumeration, .enum_view = view };
+            const descriptors = try alloc.alloc(backend.Parameter, 1);
+            descriptors[0] = .{ .kind = .enumeration, .enum_view = view };
+            return .{ .columns = columns, .parameter_types = &.{.enumeration}, .parameter_descriptors = descriptors };
+        }
         if (self.replace_before_setting_execute and self.describes == 3) self.catalog_revision += 1;
+        if (self.guarded_select_stream) return .{
+            .stamp = .{ .catalog = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(1), .revision = self.catalog_revision } }, .authority = 1, .reusable = true },
+            .binding_guard = "immutable-catalog-binding",
+            .columns = &.{.{ .name = "n", .type = .integer }},
+            .setting_epoch = self.settingEpoch(),
+            .is_select = true,
+        };
         if (self.probe_change_at != null or self.replace_before_setting_execute) return .{
             .stamp = .{ .catalog = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(if (self.replace_incarnation) @intCast(self.catalog_revision) else 1), .revision = self.catalog_revision } }, .authority = 1, .reusable = !self.replace_before_setting_execute },
-            .binding_guard = if (self.replace_incarnation or self.catalog_revision == 1) "original table" else "replacement table",
+            .binding_guard = if (self.compatible_revision or self.replace_incarnation or self.catalog_revision == 1) "original table" else "replacement table",
             .columns = &.{},
         };
         if (self.cached_rename and self.describes > 1) return .{ .columns = &.{.{ .name = "renamed", .type = .integer }}, .parameter_types = &.{.integer} };
         if (self.cached_shape_change and self.describes > 1) return .{ .columns = &.{.{ .name = "n", .type = .string }}, .parameter_types = &.{.integer} };
+        if (self.two_parameters) return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = &.{ .integer, .integer } };
         if (self.array_parameters) {
             if (request.parameter_descriptors.len != 0 and request.parameter_descriptors[0].kind != null) try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), request.parameter_descriptors[0].element_type);
             return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = &.{.array}, .parameter_descriptors = &.{.{ .kind = .array, .element_type = .int64 }} };
@@ -260,21 +477,55 @@ const Mock = struct {
         if (self.cursor_revoked) return error.Forbidden;
         if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
         if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
+        if (self.stream_definitions) |columns| if (std.mem.startsWith(u8, request.statement, "SELECT")) return .{ .columns = columns, .cursor_readable = self.cursor_readable };
+        if (std.ascii.startsWithIgnoreCase(request.statement, "ROLLBACK TO ") or std.ascii.eqlIgnoreCase(request.statement, "ROLLBACK") or std.ascii.eqlIgnoreCase(request.statement, "COMMIT")) return .{ .columns = &.{} };
         if (self.json_null_results) return .{ .is_select = true, .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
-        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
+        if (self.copy_in) |options| if (@import("session_commands.zig").isCopy(request.statement)) return .{ .parameter_types = if (self.copy_predicate) &.{.integer} else &.{}, .parameter_descriptors = if (self.copy_predicate) &.{.{ .kind = .integer, .element_type = .int64 }} else &.{}, .copy_in = .{ .source_statement = if (self.copy_predicate) "COPY t FROM STDIN WHERE n > $1" else null, .table = .{ .table = "t" }, .columns = self.stream_definitions orelse &.{.{ .name = "n", .type = .integer }}, .options = options }, .binding_guard = "immutable-catalog-binding" };
+        return .{ .cursor_readable = self.cursor_readable, .copy_out = self.copy_out, .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         var result = try executeStatement(raw, alloc, request);
-        if (request.capture_cursor_authority) result.cursor_authority = .{ .ptr = raw, .validate = validateBuffered };
+        if (request.capture_cursor_authority != .none and std.mem.startsWith(u8, result.command_tag, "SELECT")) result.cursor_authority = .{ .ptr = raw, .validate = validateBuffered };
         return result;
     }
     fn executeStatement(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
-        if (self.result_override) |result| return result;
-        self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
+        if (self.enum_view) |view| {
+            self.executions += 1;
+            const cells = request.parameter_cells orelse return error.ExpectedNativeEnum;
+            try std.testing.expectEqual(@as(usize, 1), cells.len);
+            try std.testing.expectEqual(@as(usize, 1), request.parameter_descriptors.len);
+            try std.testing.expectEqual(view.record.identity.id, request.parameter_descriptors[0].enum_view.?.record.identity.id);
+            if (!cells[0].sql_null) try std.testing.expectEqualStrings("z", try view.output(cells[0].enumeration().?));
+            const columns = try alloc.alloc(backend.Column, 1);
+            columns[0] = .{ .name = "state", .type = .enumeration, .enum_view = view };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = try alloc.dupe(std.json.Value, &.{if (cells[0].sql_null) .null else .{ .string = "z" }});
+            return .{ .columns = columns, .rows = rows, .command_tag = "SELECT 1" };
+        }
+        if (self.procedure_notice_failure) {
+            const diagnostic = request.diagnostics orelse return error.InvalidSqlBackendResponse;
+            try backend.Diagnostic.emitNotice(diagnostic, .{ .message = "before failure" });
+            diagnostic.set("22012", "division by zero", null, null);
+            return error.SqlDivisionByZero;
+        }
+        if (self.array_parameters) for (request.parameters) |parameter| try retainedAllocator(parameter, alloc);
+        if (self.result_override) |result| {
+            self.result_override_executions += 1;
+            return result;
+        }
+        self.observed_setting = null;
+        for (request.setting_overlay) |entry| if (entry.identity.id == 1) {
+            if (entry.value != .integer) return error.InvalidSettingValue;
+            self.observed_setting = entry.value.integer;
+        };
         try self.checkSettingEpoch(request);
         self.executions += 1;
+        if (std.mem.eql(u8, request.statement, "ALTER ROLE tester SET statement_timeout='1ms'")) {
+            self.role_timeout_default = 1;
+            return .{ .command_tag = "ALTER ROLE" };
+        }
         if (std.mem.startsWith(u8, request.statement, "SELECT")) {
             if (self.receipt_budget_fallback) {
                 const budget = request.read_receipt_budget orelse return error.InvalidSqlBackendResponse;
@@ -284,23 +535,50 @@ const Mock = struct {
             self.lake_log[self.lake_count] = request.lake_visibility;
             self.lake_count += 1;
         }
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin") or std.mem.eql(u8, request.statement, "BEGIN ISOLATION LEVEL READ COMMITTED")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "commit")) {
             if (self.unknown_commit) {
                 request.diagnostics.?.transaction_status = .idle;
                 return error.SqlTransactionOutcomeUnknown;
             }
+            self.copy_committed += self.copy_staged;
+            self.copy_staged = 0;
             if (self.revoke_after_commit) {
                 if (self.stream_rows == 0) self.buffered_filter_changed = true else self.cursor_revoked = true;
             }
             return .{ .command_tag = "COMMIT", .transaction_status = .idle };
         }
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "rollback")) return .{ .command_tag = "ROLLBACK", .transaction_status = .idle };
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "rollback")) {
+            self.copy_staged = 0;
+            self.copy_rollbacks += 1;
+            return .{ .command_tag = "ROLLBACK", .transaction_status = .idle };
+        }
         if (try @import("session_commands.zig").control(alloc, request.statement)) |command| return .{ .command_tag = switch (command) {
             .savepoint => "SAVEPOINT",
             .rollback_to => "ROLLBACK",
             .release => "RELEASE",
         }, .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
+        if (self.copy_in != null and std.mem.startsWith(u8, request.statement, "INSERT INTO")) {
+            try std.testing.expect(request.session_id != null);
+            const instant = request.statement_instant orelse return error.MissingCopyClock;
+            if (self.copy_instant) |prior| try std.testing.expectEqual(prior, instant.micros) else self.copy_instant = instant.micros;
+            try std.testing.expectEqualStrings("immutable-catalog-binding", request.binding_guard.?);
+            try std.testing.expect(request.parameters.len <= 128);
+            try std.testing.expectEqual(request.parameters.len, request.parameter_cells.?.len);
+            if (self.copy_predicate) {
+                try std.testing.expectEqualStrings("COPY t FROM STDIN WHERE n > $1", request.copy_source_statement.?);
+                try std.testing.expectEqual(@as(usize, 1), request.copy_source_inputs.len);
+                try std.testing.expectEqual(@as(i64, 10), request.copy_source_inputs[0].datum.value.integer);
+                try std.testing.expectEqual(@as(usize, 1), request.copy_source_descriptors.len);
+            }
+            self.copy_batches += 1;
+            if (self.copy_batch_error) |err| return err;
+            for (request.parameter_cells.?) |cell| {
+                if (cell.sql_null) self.copy_sql_nulls += 1 else if (cell.value == .null) self.copy_json_nulls += 1 else if (cell.value == .integer) self.copy_sum += cell.value.integer;
+            }
+            self.copy_staged += request.parameters.len;
+            return .{ .command_tag = "INSERT", .rows_affected = request.parameters.len, .transaction_status = .in_transaction, .session_id = request.session_id };
+        }
         if (self.expected_execute_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, if (self.catalog_rebind) "current-catalog-binding" else "immutable-catalog-binding") else false;
         if (self.entered) |event| event.set(request.io);
@@ -335,6 +613,8 @@ const Mock = struct {
             .sql_nulls = if (self.result_cells) null else &.{ &.{false}, &.{true} },
             .cells = if (self.result_cells) .{ .context = self, .count = 2, .width = 1, .read = resultCell } else null,
             .command_tag = "SELECT 2",
+            .transaction_status = if (request.session_id != null) .in_transaction else .idle,
+            .session_id = if (request.session_id != null) "0123456789abcdef0123456789abcdef" else null,
         };
         self.saw_statement_unchanged = std.mem.eql(u8, request.statement, "SELECT $1");
         if (self.namespace_count < self.namespace_log.len) {
@@ -426,6 +706,17 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.releases += 1;
     }
+    fn retainedAllocator(value: std.json.Value, alloc: std.mem.Allocator) anyerror!void {
+        switch (value) {
+            .array => |items| {
+                try std.testing.expectEqual(alloc.ptr, items.allocator.ptr);
+                try std.testing.expectEqual(alloc.vtable, items.allocator.vtable);
+                for (items.items) |item| try retainedAllocator(item, alloc);
+            },
+            .object => |items| for (items.values()) |item| try retainedAllocator(item, alloc),
+            else => {},
+        }
+    }
 };
 
 fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
@@ -491,8 +782,60 @@ fn run(mock: *Mock, input: []const u8, limits: protocol.Limits) !std.Io.Writer.A
         session.deinit();
         mock.completion_safe_after_run = session.completion_safe;
     }
+    mock.session = &session;
+    defer mock.session = null;
     try session.run();
     return output;
+}
+
+test "pgwire role default publication affects only future logins and RESET retains login timeout" {
+    const Check = struct {
+        fn rows(bytes: []const u8, expected: []const []const u8) !void {
+            var messages: protocol.Cursor = .{ .bytes = bytes };
+            var count: usize = 0;
+            while (messages.offset < messages.bytes.len) {
+                const tag = try messages.int(u8);
+                const length = try messages.int(u32);
+                var body: protocol.Cursor = .{ .bytes = try messages.take(length - 4) };
+                if (tag == 'E') return error.UnexpectedRoleDefaultProtocolError;
+                if (tag == 'D') {
+                    try std.testing.expect(count < expected.len);
+                    try std.testing.expectEqual(@as(u16, 1), try body.int(u16));
+                    const len = try body.int(i32);
+                    try std.testing.expect(len >= 0);
+                    try std.testing.expectEqualStrings(expected[count], try body.take(@intCast(len)));
+                    try body.finish();
+                    count += 1;
+                }
+            }
+            try std.testing.expectEqual(expected.len, count);
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SHOW statement_timeout\x00",
+        "ALTER ROLE tester SET statement_timeout='1ms'\x00",
+        "SHOW statement_timeout\x00",
+        "SET statement_timeout='5ms'\x00",
+        "RESET statement_timeout\x00",
+        "SHOW statement_timeout\x00",
+        "RESET ALL\x00",
+        "SHOW statement_timeout\x00",
+    }) |sql| try frame(&input.writer, 'Q', sql);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .role_timeout_default = 42 };
+    var old = try run(&mock, input.written(), .{});
+    defer old.deinit();
+    try Check.rows(old.written(), &.{ "42ms", "42ms", "42ms", "42ms" });
+    input.clearRetainingCapacity();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SHOW statement_timeout\x00");
+    try frame(&input.writer, 'X', "");
+    var future = try run(&mock, input.written(), .{});
+    defer future.deinit();
+    try Check.rows(future.written(), &.{"1ms"});
 }
 
 fn tags(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -505,6 +848,93 @@ fn tags(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
         _ = try cursor.take(len - 4);
     }
     return out.toOwnedSlice(alloc);
+}
+
+test "pgwire Bind cumulative admission rejects before publishing a partial portal" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    var payload: std.Io.Writer.Allocating = .init(a);
+    defer payload.deinit();
+    try payload.writer.writeAll("q\x00SELECT $1, $2\x00");
+    try payload.writer.writeInt(u16, 2, .big);
+    try payload.writer.writeInt(u32, 20, .big);
+    try payload.writer.writeInt(u32, 20, .big);
+    try frame(&input.writer, 'P', payload.written());
+    payload.writer.end = 0;
+    try payload.writer.writeAll("p\x00q\x00");
+    try payload.writer.writeInt(u16, 1, .big);
+    try payload.writer.writeInt(u16, 1, .big);
+    try payload.writer.writeInt(u16, 2, .big);
+    for ([_]i64{ 1, 2 }) |value| {
+        try payload.writer.writeInt(i32, 8, .big);
+        try payload.writer.writeInt(i64, value, .big);
+    }
+    try payload.writer.writeInt(u16, 0, .big);
+    try frame(&input.writer, 'B', payload.written());
+    const sync_offset = input.written().len;
+    try frame(&input.writer, 'S', "");
+    try execute(&input.writer, "p", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .two_parameters = true };
+    var output = try run(&mock, input.written(), .{ .parameter_work = 17 });
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    var messages: protocol.Cursor = .{ .bytes = output.written() };
+    var errors: usize = 0;
+    while (messages.offset < messages.bytes.len) {
+        const tag = try messages.int(u8);
+        const length = try messages.int(u32);
+        const body = try messages.take(length - 4);
+        try std.testing.expect(tag != '2');
+        if (tag == 'E') {
+            const expected = if (errors == 0) "C54000\x00" else "C34000\x00";
+            try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
+            errors += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), errors);
+    // Both cells must fit exactly; neither metadata nor the second parameter
+    // may renew the owner or consume work already charged by the first cell.
+    var admitted: Mock = .{ .two_parameters = true };
+    var success_input: std.Io.Writer.Allocating = .init(a);
+    defer success_input.deinit();
+    // Successful implicit-transaction portals must execute before Sync.
+    try success_input.writer.writeAll(input.written()[0..sync_offset]);
+    try success_input.writer.writeAll(input.written()[sync_offset + 5 ..]);
+    var success = try run(&admitted, success_input.written(), .{ .parameter_work = 18 });
+    defer success.deinit();
+    try std.testing.expectEqual(@as(usize, 1), admitted.executions);
+    var complete: protocol.Cursor = .{ .bytes = success.written() };
+    var bound: usize = 0;
+    while (complete.offset < complete.bytes.len) {
+        const tag = try complete.int(u8);
+        const length = try complete.int(u32);
+        _ = try complete.take(length - 4);
+        try std.testing.expect(tag != 'E');
+        if (tag == '2') bound += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), bound);
+    // Protocol errors may legitimately consume an allocation failure and
+    // continue to Sync. Sweep every cut, including portal/registry admission,
+    // and require all retained regions to retire without a leak either way.
+    var cut: usize = 0;
+    while (true) : (cut += 1) {
+        var failing: std.testing.FailingAllocator = .init(a, .{ .fail_index = cut, .resize_fail_index = 0 });
+        var reader: std.Io.Reader = .fixed(success_input.written());
+        var responses: std.Io.Writer.Allocating = .init(a);
+        defer responses.deinit();
+        var faulted: Mock = .{ .two_parameters = true };
+        {
+            var session: protocol.Session = .{ .alloc = failing.allocator(), .io = std.testing.io, .source = faulted.source(), .reader = &reader, .writer = &responses.writer, .limits = .{ .parameter_work = 18 } };
+            defer session.deinit();
+            session.run() catch |err| if (err != error.OutOfMemory) return err;
+        }
+        if (!failing.has_induced_failure) break;
+    }
+    try std.testing.expect(cut > 0);
 }
 
 test "pgwire Parse Bind Execute retain inferred and declared array parameter identity" {
@@ -525,7 +955,7 @@ test "pgwire Parse Bind Execute retain inferred and declared array parameter ide
         defer source.deinit();
         var encoded: std.Io.Writer.Allocating = .init(a);
         defer encoded.deinit();
-        if (format == 0) try sources.sql_array_text.encode(source.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(source.value, &encoded.writer, .{});
+        if (format == 0) try sources.sql_array_text.encode(a, source.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(a, source.value, &encoded.writer, .{});
         var bind_payload: std.Io.Writer.Allocating = .init(a);
         defer bind_payload.deinit();
         try bind_payload.writer.writeAll("p\x00q\x00");
@@ -806,6 +1236,159 @@ test "pgwire pull portals stream beyond result cap without replay and release on
     }
 }
 
+test "pgwire COPY streams all rows in bounded pages for simple and extended protocols" {
+    for ([_]bool{ false, true }) |simple| for ([_]bool{ false, true }) |native| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) {
+            try frame(&input.writer, 'Q', "COPY t TO STDOUT\x00");
+        } else {
+            try parse(&input.writer, "q", "COPY t TO STDOUT", false);
+            try frame(&input.writer, 'D', "Sq\x00");
+            try bind(&input.writer, "p", "q", null);
+            try frame(&input.writer, 'D', "Pp\x00");
+            // COPY is not a suspendable row portal; Execute's row count must
+            // not truncate the stream or emit PortalSuspended.
+            try execute(&input.writer, "p", 1);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 5000, .stream_cells = native, .copy_out = .{} };
+        var output = try run(&mock, input.written(), .{ .result_rows = 73 });
+        defer output.deinit();
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "H"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "c"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "D"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "T"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "s"));
+        try std.testing.expectEqual(@as(usize, if (simple) 0 else 2), std.mem.count(u8, messages, "n"));
+        var payload: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer payload.deinit();
+        var cursor: protocol.Cursor = .{ .bytes = output.written() };
+        while (cursor.offset < cursor.bytes.len) {
+            const tag = try cursor.int(u8);
+            const size = try cursor.int(u32);
+            const bytes = try cursor.take(size - 4);
+            if (tag == 'd') {
+                try std.testing.expect(bytes.len <= 16 * 1024);
+                try payload.writer.writeAll(bytes);
+            }
+            if (tag == 'H') try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 0 }, bytes);
+        }
+        var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer expected.deinit();
+        for (0..5000) |row| try expected.writer.print("{d}\n", .{row});
+        try std.testing.expectEqualStrings(expected.written(), payload.written());
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "COPY 5000\x00") != null);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+        try std.testing.expectEqual(@as(usize, 69), mock.stream_pulls);
+    };
+}
+
+test "pgwire COPY is not admitted as a SQL prepared statement or a declared row cursor" {
+    for ([_][]const u8{ "PREPARE q AS COPY t TO STDOUT\x00", "DECLARE c CURSOR WITH HOLD FOR COPY t TO STDOUT\x00" }) |statement| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', statement);
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 1, .copy_out = .{} };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "42601") != null);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_pulls);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    }
+}
+
+test "pgwire COPY splits large fields across bounded frames and validates before response" {
+    const a = std.testing.allocator;
+    var field_bytes: [80 * 1024]u8 = @splat('x');
+    field_bytes[40000] = '\n';
+    for ([_]bool{ false, true }) |invalid| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "COPY t TO STDOUT (FORMAT csv)\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 1, .stream_text = &field_bytes, .copy_out = .{ .format = .csv, .force_quote_columns = if (invalid) &.{"missing"} else &.{} } };
+        var output = try run(&mock, input.written(), .{ .frame_bytes = 1024 });
+        defer output.deinit();
+        var data: std.Io.Writer.Allocating = .init(a);
+        defer data.deinit();
+        var cursor: protocol.Cursor = .{ .bytes = output.written() };
+        var frames: usize = 0;
+        var started = false;
+        var failed = false;
+        while (cursor.offset < cursor.bytes.len) {
+            const tag = try cursor.int(u8);
+            const size = try cursor.int(u32);
+            const payload = try cursor.take(size - 4);
+            if (tag == 'H') started = true;
+            if (tag == 'E') {
+                failed = true;
+                try std.testing.expect(std.mem.indexOf(u8, payload, "42703") != null);
+            }
+            if (tag == 'd') {
+                frames += 1;
+                try std.testing.expect(payload.len <= 1020);
+                try data.writer.writeAll(payload);
+            }
+        }
+        try std.testing.expectEqual(!invalid, started);
+        try std.testing.expectEqual(invalid, failed);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        if (!invalid) {
+            try std.testing.expect(frames > 80);
+            try std.testing.expectEqual(field_bytes.len + 3, data.written().len);
+            try std.testing.expectEqual(@as(u8, '"'), data.written()[0]);
+            try std.testing.expectEqualSlices(u8, &field_bytes, data.written()[1..][0..field_bytes.len]);
+            try std.testing.expectEqualStrings("\"\n", data.written()[field_bytes.len + 1 ..]);
+        } else try std.testing.expectEqual(@as(usize, 0), mock.stream_pulls);
+    }
+}
+
+test "pgwire COPY empty binary stream and canceled streams do not fabricate completion" {
+    for ([_]bool{ false, true }) |cancel| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "COPY t TO STDOUT (FORMAT binary)\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = if (cancel) 600 else 0, .copy_out = .{ .format = .binary }, .stream_fail_at = if (cancel) 256 else null };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "H"));
+        try std.testing.expectEqual(@as(usize, if (cancel) 0 else 1), std.mem.count(u8, messages, "c"));
+        try std.testing.expectEqual(@as(usize, if (cancel) 1 else 0), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+        if (cancel) {
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "COPY ") == null);
+        } else {
+            var bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer bytes.deinit();
+            var cursor: protocol.Cursor = .{ .bytes = output.written() };
+            while (cursor.offset < cursor.bytes.len) {
+                const tag = try cursor.int(u8);
+                const size = try cursor.int(u32);
+                const data = try cursor.take(size - 4);
+                if (tag == 'd') try bytes.writer.writeAll(data);
+            }
+            try std.testing.expectEqualStrings("PGCOPY\n\xff\r\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff", bytes.written());
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "COPY 0\x00") != null);
+        }
+    }
+}
+
 test "pgwire forward cursors stream bounded fetches and close with transaction" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -971,6 +1554,31 @@ test "pgwire materialized cursor enforces quota and reauthorizes held fetch" {
     }
 }
 
+test "forward cursor validates empty and exhausted fetches before describing columns" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "DECLARE rows CURSOR FOR SELECT n FROM t\x00");
+    try frame(&input.writer, 'Q', "FETCH 0 FROM rows\x00");
+    try frame(&input.writer, 'Q', "FETCH ALL FROM rows\x00");
+    try frame(&input.writer, 'Q', "FETCH 1 FROM rows\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 1 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, messages, "T"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 2), mock.stream_validations);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_pulls);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_detaches);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+}
+
 test "pgwire failed cursor fetch marks transaction aborted and releases retained stream" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -986,9 +1594,31 @@ test "pgwire failed cursor fetch marks transaction aborted and releases retained
     const messages = try tags(std.testing.allocator, output.written());
     defer std.testing.allocator.free(messages);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "T"));
     try std.testing.expectEqual(@as(usize, 1), mock.failed_transactions);
     try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
     try std.testing.expectEqual(@as(usize, 2), mock.executions);
+}
+
+test "pgwire stale portal detaches without failing the current lease" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try parse(&input.writer, "q", "SELECT n FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 1);
+    try frame(&input.writer, 'D', "Pp\x00");
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 2, .stream_lease_lost = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "E"));
+    try std.testing.expectEqual(@as(usize, 0), mock.failed_transactions);
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "Z\x00\x00\x00\x05I"));
 }
 
 test "pgwire scroll hold cursor materializes before commit and retains exact position" {
@@ -1465,6 +2095,30 @@ test "pgwire prepared statement carries setting catalog epoch to execution" {
     try std.testing.expectEqual(@as(?u64, 17), mock.observed_setting_epoch);
 }
 
+test "pgwire guarded select validates its opened shape without a second catalog probe" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "plan", "SELECT 1", false);
+    try bind(&input.writer, "portal", "plan", null);
+    try execute(&input.writer, "portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    for ([_]bool{ true, false }) |compatible| {
+        var mock: Mock = .{
+            .guarded_select_stream = true,
+            .stream_rows = 2,
+            .stream_definitions = if (compatible) null else &.{.{ .name = "renamed", .type = .integer }},
+        };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.probes);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, if (compatible) 1 else 0), mock.stream_pulls);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    }
+}
+
 test "pgwire cached statements refresh settings guards and fence changes after rebind" {
     for ([_]bool{ false, true }) |sql_prepare| {
         for ([_]bool{ false, true }) |streaming| {
@@ -1539,6 +2193,46 @@ test "pgwire DISCARD ALL inside a transaction leaves prepared plans intact" {
     try std.testing.expectEqual(@as(usize, 1), rows);
 }
 
+test "pgwire transaction preparation rolls back newly held cursors before reporting rejection" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "BEGIN\x00",
+        "DECLARE rows SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00",
+        "PREPARE TRANSACTION 'held'\x00",
+        "FETCH NEXT FROM rows\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 5 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    var messages: protocol.Cursor = .{ .bytes = output.written() };
+    var errors: usize = 0;
+    var last_status: u8 = 0;
+    while (messages.offset < messages.bytes.len) {
+        const tag = try messages.int(u8);
+        const length = try messages.int(u32);
+        const body = try messages.take(length - 4);
+        try std.testing.expect(tag != 'D');
+        if (tag == 'E') {
+            const expected = if (errors == 0) "C0A000\x00" else "C34000\x00";
+            try std.testing.expect(std.mem.indexOf(u8, body, expected) != null);
+            errors += 1;
+        }
+        if (tag == 'Z') {
+            try std.testing.expectEqual(@as(usize, 1), body.len);
+            last_status = body[0];
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), errors);
+    try std.testing.expectEqual(@as(u8, 'I'), last_status);
+    try std.testing.expectEqual(@as(usize, 2), mock.executions);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.stream_detaches);
+}
+
 test "pgwire unknown commit cannot publish held cursor rows" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -1554,6 +2248,24 @@ test "pgwire unknown commit cannot publish held cursor rows" {
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "E"));
     try std.testing.expectEqual(@as(usize, 1), mock.stream_detaches);
     try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+}
+
+test "pgwire simple streaming query sends metadata after its first successful pull" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+    try frame(&input.writer, 'X', "");
+    for ([_]bool{ true, false }) |fail| {
+        var mock: Mock = .{ .stream_rows = 1, .stream_fail_at = if (fail) 0 else null };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, @intFromBool(fail)), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, @intFromBool(!fail)), std.mem.count(u8, messages, "T"));
+        try std.testing.expectEqual(@as(usize, @intFromBool(!fail)), std.mem.count(u8, messages, "D"));
+    }
 }
 
 test "pgwire pull failure and disconnect close snapshots before releasing identity" {
@@ -1572,6 +2284,231 @@ test "pgwire pull failure and disconnect close snapshots before releasing identi
         try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
         try std.testing.expectEqual(@as(usize, 0), mock.executions);
         try std.testing.expectEqual(@as(usize, 1), mock.releases);
+    }
+}
+
+test "pgwire simple query and SQL EXECUTE revalidate blocking results between delivery pages" {
+    const rows: [257][]const std.json.Value = @splat(&.{.{ .integer = 1 }});
+    for ([_]bool{ false, true }) |prepared| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (prepared) try frame(&input.writer, 'Q', "PREPARE blocking AS SELECT n FROM t ORDER BY n\x00");
+        try frame(&input.writer, 'Q', if (prepared) "EXECUTE blocking\x00" else "SELECT n FROM t ORDER BY n\x00");
+        try frame(&input.writer, 'X', "");
+        for ([_]bool{ false, true }) |denied_at_start| {
+            var mock: Mock = .{ .result_override = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = &rows, .command_tag = "SELECT 257" }, .revoke_on_buffered_resume = true, .cursor_revoked = denied_at_start };
+            var output = try run(&mock, input.written(), .{});
+            defer output.deinit();
+            var cursor: protocol.Cursor = .{ .bytes = output.written() };
+            var emitted: usize = 0;
+            var descriptions: usize = 0;
+            var forbidden = false;
+            while (cursor.offset < cursor.bytes.len) {
+                const tag = try cursor.int(u8);
+                const length = try cursor.int(u32);
+                const payload = try cursor.take(length - 4);
+                if (tag == 'T') descriptions += 1;
+                if (tag == 'D') emitted += 1;
+                if (tag == 'E') forbidden = std.mem.indexOf(u8, payload, "42501") != null;
+            }
+            try std.testing.expectEqual(@as(usize, if (denied_at_start) 0 else 1), descriptions);
+            try std.testing.expectEqual(@as(usize, if (denied_at_start) 0 else 256), emitted);
+            try std.testing.expect(forbidden);
+        }
+    }
+}
+
+test "extended rollback closes a suspended transaction portal before Sync" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try parse(&input.writer, "q", "SELECT j FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 1);
+    try parse(&input.writer, "end", "ROLLBACK", false);
+    try bind(&input.writer, "end", "end", null);
+    try execute(&input.writer, "end", 0);
+    try execute(&input.writer, "p", 1);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .json_null_results = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "D"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "34000") != null);
+}
+
+test "extended rollback to savepoint closes later portals and preserves earlier bindings" {
+    for ([_]bool{ false, true }) |streaming| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try parse(&input.writer, "q", "SELECT n FROM t", false);
+        try bind(&input.writer, "before", "q", null);
+        try bind(&input.writer, "also_before", "q", null);
+        try frame(&input.writer, 'Q', "SAVEPOINT sp\x00");
+        try bind(&input.writer, "after", "q", null);
+        try bind(&input.writer, "also_after", "q", null);
+        try execute(&input.writer, "after", 1);
+        try parse(&input.writer, "rollback", "ROLLBACK TO sp", false);
+        try bind(&input.writer, "rollback", "rollback", null);
+        try execute(&input.writer, "rollback", 0);
+        try frame(&input.writer, 'D', "Pbefore\x00");
+        try frame(&input.writer, 'D', "Palso_before\x00");
+        try execute(&input.writer, "after", 1);
+        try frame(&input.writer, 'S', "");
+        try execute(&input.writer, "also_after", 1);
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .json_null_results = !streaming, .stream_rows = if (streaming) 3 else 0 };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expect(std.mem.endsWith(u8, observed, "12CTTEZEZ"));
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "34000") != null);
+    }
+}
+
+test "Describe Portal checks authorization before returning columns or executing" {
+    for ([_]bool{ false, true }) |suspended| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try parse(&input.writer, "q", "SELECT j FROM t", false);
+        try bind(&input.writer, "p", "q", null);
+        if (suspended) try execute(&input.writer, "p", 1);
+        try frame(&input.writer, 'D', "Pp\x00");
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .json_null_results = true, .revoke_on_buffered_resume = suspended, .deny_describe_at = if (suspended) null else 3 };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "T"));
+        try std.testing.expectEqual(@as(usize, @intFromBool(suspended)), mock.executions);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "42501") != null);
+    }
+}
+
+test "Describe Portal reuses a compatible revision across frames" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "UPDATE t SET n = 1", false);
+    try bind(&input.writer, "p", "q", null);
+    for (0..3) |_| try frame(&input.writer, 'D', "Pp\x00");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{ .probe_change_at = 2, .compatible_revision = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mock.describes);
+    try std.testing.expectEqual(@as(usize, 4), mock.probes);
+}
+
+test "FETCH checks cancellation after the final pull and zero-row validation" {
+    for ([_]bool{ true, false }) |pull| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try frame(&input.writer, 'Q', "DECLARE rows CURSOR FOR SELECT n FROM t\x00");
+        try frame(&input.writer, 'Q', if (pull) "FETCH ALL FROM rows\x00" else "FETCH 0 FROM rows\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 1, .cancel_during_pull = pull, .cancel_during_validation = !pull };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqual(@as(usize, @intFromBool(pull)), mock.stream_pulls);
+        try std.testing.expect(std.mem.endsWith(u8, observed, "CZEZ"));
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "57014") != null);
+    }
+}
+
+test "stream handoff preserves cancellation and retained portal authority" {
+    for ([_]bool{ true, false }) |extended| {
+        for ([_]bool{ true, false }) |cancel| {
+            var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer input.deinit();
+            try startup(&input.writer);
+            if (extended) {
+                try parse(&input.writer, "q", "SELECT n FROM t", false);
+                try bind(&input.writer, "p", "q", null);
+                try execute(&input.writer, "p", 0);
+                try frame(&input.writer, 'S', "");
+            } else try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+            try frame(&input.writer, 'X', "");
+            var mock: Mock = .{ .stream_rows = 1, .cancel_during_open = cancel, .stream_without_detach = !cancel };
+            var output = try run(&mock, input.written(), .{});
+            defer output.deinit();
+            try std.testing.expectEqual(@as(usize, if (extended or cancel) 0 else 1), mock.stream_pulls);
+            try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+            if (cancel) try std.testing.expect(std.mem.indexOf(u8, output.written(), "57014") != null);
+        }
+    }
+}
+
+test "repeated Execute checks cancellation after validating an exhausted portal" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "SELECT n FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 0);
+    try execute(&input.writer, "p", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 1, .cancel_during_validation = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_validations);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "57014") != null);
+}
+
+test "Describe Portal accepts cancellation during retained-reader validation" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "SELECT n FROM t", false);
+    try bind(&input.writer, "p", "q", null);
+    try execute(&input.writer, "p", 1);
+    try frame(&input.writer, 'D', "Pp\x00");
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{ .stream_rows = 2, .cancel_during_validation = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_validations);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "57014") != null);
+}
+
+test "Describe validates native portal authority after suspension and exhaustion" {
+    for ([_]usize{ 1, 2 }) |rows| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try parse(&input.writer, "q", "SELECT n FROM t", false);
+        try bind(&input.writer, "p", "q", null);
+        try execute(&input.writer, "p", 1);
+        try frame(&input.writer, 'D', "Pp\x00");
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = rows, .deny_stream_validation = true };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "T"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "D"));
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_validations);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "42501") != null);
     }
 }
 
@@ -1750,6 +2687,56 @@ test "pgwire unknown DDL admission never claims a committed declaration" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "40003") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "committed") == null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "job-1") != null);
+}
+
+test "pgwire catalog recovery receipt preserves exact identity and never completes uncertain DDL" {
+    for ([_]bool{ false, true }) |unknown| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "CREATE SEQUENCE counter\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .result_override = .{
+            .command_tag = if (unknown) "DDL PENDING" else "CREATE SEQUENCE",
+            .mutation_outcome = if (unknown) null else .committed,
+            .catalog_receipt_json = if (unknown)
+                "{\"state\":\"unknown\",\"recovery_token\":\"retained-operation\"}"
+            else
+                "{\"state\":\"committed\",\"recovery_token\":\"retained-operation\",\"object_id\":\"18446744073709551615\"}",
+        } };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "retained-operation") != null);
+        try std.testing.expectEqual(@as(usize, if (unknown) 0 else 1), std.mem.count(u8, observed, "C"));
+        try std.testing.expectEqual(@as(usize, if (unknown) 1 else 0), std.mem.count(u8, observed, "E"));
+        if (unknown) {
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "40003") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "committed") == null);
+        } else try std.testing.expect(std.mem.indexOf(u8, output.written(), "18446744073709551615") != null);
+    }
+}
+
+test "pgwire catalog recovery receipt drains extended execution until Sync without replay" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "ddl", "CREATE SEQUENCE counter", false);
+    try bind(&input.writer, "ddl_portal", "ddl", null);
+    try execute(&input.writer, "ddl_portal", 0);
+    try execute(&input.writer, "ddl_portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .result_override = .{ .command_tag = "DDL PENDING", .catalog_receipt_json = "{\"state\":\"unknown\",\"recovery_token\":\"retained-operation\"}" } };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "E"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "C"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "40003") != null);
+    try std.testing.expectEqual(@as(usize, 1), mock.result_override_executions);
 }
 
 test "pgwire unknown DDL admission drains extended execution until Sync without replay" {
@@ -2076,7 +3063,7 @@ test "pgwire extended typed bind describes without execution and resumes once" {
         var mock: Mock = .{ .native_parameters = native };
         var output = try run(&mock, input.written(), .{});
         defer output.deinit();
-        try std.testing.expectEqual(@as(usize, 4), mock.describes);
+        try std.testing.expectEqual(@as(usize, 5), mock.describes);
         try std.testing.expectEqual(@as(usize, 1), mock.executions);
         try std.testing.expect(mock.saw_statement_unchanged);
         try std.testing.expect(mock.saw_binding_guard);
@@ -2531,13 +3518,15 @@ test "pgwire typed cells match column-aware materialized text and binary frames"
     var array = try sources.sql_array_text.decode(a, .int32, "[-1:1]={1,NULL,7}", .{});
     defer array.deinit();
     var numeric_context: sources.sql_numeric_value.Context = .{ .alloc = a };
-    var numeric = try sources.sql_numeric_value.parse(&numeric_context, "12345678901234567890.123456789");
+    const numeric_digits: [1000]u8 = @splat('7');
+    const numeric_text = numeric_digits ++ ".123456789";
+    var numeric = try sources.sql_numeric_value.parse(&numeric_context, numeric_text);
     defer numeric.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const row = [_]std.json.Value{
-        .{ .integer = 32767 },                           .{ .integer = 2147483647 },                                                  .{ .float = 1.25 },
-        .{ .string = "12345678901234567890.123456789" }, try sources.sql_array_wire.toJsonLeaky(arena.allocator(), array.value, .{}),
+        .{ .integer = 32767 },       .{ .integer = 2147483647 },                                                  .{ .float = 1.25 },
+        .{ .string = numeric_text }, try sources.sql_array_wire.toJsonLeaky(arena.allocator(), array.value, .{}),
     };
     const columns = [_]backend.Column{
         .{ .name = "s", .type = .integer, .element_type = .int16 },
@@ -2584,15 +3573,652 @@ test "pgwire typed cells match column-aware materialized text and binary frames"
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
         std.debug.print("PGWIRE_TYPED_COLUMNS binary={} columns=5 identical_frames=true native_array_numeric=true\n", .{binary});
         // Both representations enforce the frame before emitting any DataRow.
-        var small_rows = try run(&rows_mock, input.written(), .{ .frame_bytes = 64 });
+        // Admit startup, RowDescription and ErrorResponse; reject the large
+        // numeric DataRow in both text and binary representations.
+        var small_rows = try run(&rows_mock, input.written(), .{ .frame_bytes = 256 });
         defer small_rows.deinit();
-        var small_cells = try run(&cells_mock, input.written(), .{ .frame_bytes = 64 });
+        var small_cells = try run(&cells_mock, input.written(), .{ .frame_bytes = 256 });
         defer small_cells.deinit();
         const failures = try tags(a, small_cells.written());
         defer a.free(failures);
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, failures, "D"));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, failures, "E"));
     }
+}
+
+test "pgwire PostgreSQL cursor oracle preserves binary scroll hold and Bind format overrides" {
+    const oracle = @import("cursor_reference_test_support.zig");
+    const a = std.testing.allocator;
+    const reference = try std.json.parseFromSlice(oracle.Reference, a, oracle.bytes, .{});
+    defer reference.deinit();
+    try std.testing.expectEqualStrings("sql-0049", reference.value.original_id);
+    for (reference.value.profiles) |profile| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try oracle.input(a, &input.writer, profile, "tester", "secret", "db");
+        var mock: Mock = .{ .stream_rows = 5, .stream_definitions = &.{.{ .name = "id", .type = .integer }} };
+        var output = try run(&mock, input.written(), .{ .result_rows = 2 });
+        defer output.deinit();
+        try oracle.verify(a, output.written(), profile);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+        // Every profile drains its rows, releasing snapshot resources while
+        // retaining cursor authority to validate the next FETCH.
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_detaches);
+    }
+}
+
+test "pgwire extended FETCH suspends without duplicating scroll rows and MOVE ignores row limit" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |binary| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try frame(&input.writer, 'Q', if (binary) "DECLARE rows BINARY SCROLL CURSOR FOR SELECT n FROM t\x00" else "DECLARE rows SCROLL CURSOR FOR SELECT n FROM t\x00");
+        try parse(&input.writer, "fetch", "FETCH FORWARD 4 FROM rows", false);
+        try bind(&input.writer, "fetch_portal", "fetch", null);
+        try frame(&input.writer, 'D', "Pfetch_portal\x00");
+        try execute(&input.writer, "fetch_portal", 2);
+        try execute(&input.writer, "fetch_portal", 1);
+        try execute(&input.writer, "fetch_portal", 2);
+        try parse(&input.writer, "back", "FETCH BACKWARD 3 FROM rows", false);
+        try bind(&input.writer, "back_portal", "back", null);
+        try execute(&input.writer, "back_portal", 1);
+        try execute(&input.writer, "back_portal", 1);
+        try execute(&input.writer, "back_portal", 1);
+        try parse(&input.writer, "move", "MOVE FORWARD 4 FROM rows", false);
+        try bind(&input.writer, "move_portal", "move", null);
+        try execute(&input.writer, "move_portal", 1);
+        try frame(&input.writer, 'Q', "FETCH NEXT FROM rows\x00");
+        try frame(&input.writer, 'Q', "ROLLBACK\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 8 };
+        var output = try run(&mock, input.written(), .{ .result_rows = 2 });
+        defer output.deinit();
+        var messages: protocol.Cursor = .{ .bytes = output.written() };
+        const expected = [_]i64{ 0, 1, 2, 3, 2, 1, 0, 5 };
+        var rows: usize = 0;
+        var suspended: usize = 0;
+        var fetches: usize = 0;
+        var moves: usize = 0;
+        while (messages.offset < messages.bytes.len) {
+            const tag = try messages.int(u8);
+            const size = try messages.int(u32);
+            var body: protocol.Cursor = .{ .bytes = try messages.take(size - 4) };
+            try std.testing.expect(tag != 'E');
+            if (tag == 's') suspended += 1;
+            if (tag == 'C') {
+                const command = try body.string();
+                if (std.mem.eql(u8, command, "FETCH 1")) fetches += 1;
+                if (std.mem.eql(u8, command, "MOVE 4")) moves += 1;
+            }
+            if (tag == 'D') {
+                try std.testing.expect(rows < expected.len);
+                try std.testing.expectEqual(@as(u16, 1), try body.int(u16));
+                const len = try body.int(u32);
+                const value = if (rows == expected.len - 1 and !binary)
+                    try std.fmt.parseInt(i64, try body.take(len), 10)
+                else value: {
+                    try std.testing.expectEqual(@as(u32, 8), len);
+                    break :value try body.int(i64);
+                };
+                try std.testing.expectEqual(expected[rows], value);
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(expected.len, rows);
+        try std.testing.expectEqual(@as(usize, 4), suspended);
+        try std.testing.expectEqual(@as(usize, 3), fetches);
+        try std.testing.expectEqual(@as(usize, 1), moves);
+    }
+}
+
+test "pgwire suspended FETCH retains evaluated rows after cursor close and name reuse" {
+    const oracle = @import("cursor_reference_test_support.zig");
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |scroll| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try oracle.suspendedInput(a, &input.writer, scroll, "tester", "secret", "db");
+        var mock: Mock = .{ .stream_rows = 5, .stream_definitions = &.{.{ .name = "id", .type = .integer }} };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try oracle.verifySuspended(output.written());
+        try std.testing.expectEqual(@as(usize, 2), mock.stream_closes);
+    }
+}
+
+test "pgwire binary held cursor extended FETCH preserves revocation and commit ambiguity fences" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |unknown| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        try frame(&input.writer, 'Q', "DECLARE rows BINARY SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00");
+        try parse(&input.writer, "fetch", "FETCH ALL FROM rows", false);
+        try frame(&input.writer, 'Q', "COMMIT\x00");
+        try bind(&input.writer, "fetch_portal", "fetch", null);
+        try execute(&input.writer, "fetch_portal", 1);
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 5, .unknown_commit = unknown, .revoke_after_commit = !unknown };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "D"));
+        try std.testing.expect(std.mem.count(u8, messages, "E") >= 1);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+    }
+}
+
+test "pgwire DECLARE rejects mutation result shapes before any execution or stream admission" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |extended| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "BEGIN\x00");
+        const declaration = "DECLARE rows BINARY SCROLL CURSOR FOR DELETE FROM t RETURNING n";
+        if (extended) {
+            try parse(&input.writer, "bad", declaration, false);
+            try bind(&input.writer, "bad_portal", "bad", null);
+            try execute(&input.writer, "bad_portal", 0);
+            try frame(&input.writer, 'S', "");
+        } else {
+            const terminated = try std.fmt.allocPrint(a, "{s}\x00", .{declaration});
+            defer a.free(terminated);
+            try frame(&input.writer, 'Q', terminated);
+        }
+        try frame(&input.writer, 'Q', "ROLLBACK\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .cursor_readable = false };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "42601") != null);
+        try std.testing.expectEqual(@as(usize, 2), mock.executions);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_pulls);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_closes);
+    }
+}
+
+test "pgwire extended DECLARE and CLOSE retain native cursor ownership without replay" {
+    const a = std.testing.allocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try parse(&input.writer, "decl", "DECLARE rows BINARY SCROLL CURSOR FOR SELECT n FROM t", false);
+    try bind(&input.writer, "declaration", "decl", null);
+    try execute(&input.writer, "declaration", 0);
+    try frame(&input.writer, 'S', "");
+    try parse(&input.writer, "fetch", "FETCH FORWARD 2 FROM rows", false);
+    try bind(&input.writer, "fetch_portal", "fetch", null);
+    try execute(&input.writer, "fetch_portal", 1);
+    try execute(&input.writer, "fetch_portal", 0);
+    try parse(&input.writer, "close", "CLOSE rows", false);
+    try bind(&input.writer, "close_portal", "close", null);
+    try execute(&input.writer, "close_portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 4 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(a, output.written());
+    defer a.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "s"));
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 2), mock.executions);
+}
+
+test "pgwire extended FETCH quota failure exposes no partial rows or successful completion" {
+    const a = std.testing.allocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "DECLARE rows BINARY NO SCROLL CURSOR FOR SELECT n FROM t\x00");
+    try parse(&input.writer, "fetch", "FETCH ALL FROM rows", false);
+    try bind(&input.writer, "fetch_portal", "fetch", null);
+    try execute(&input.writer, "fetch_portal", 1);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 100 };
+    var output = try run(&mock, input.written(), .{ .cursor_rows = 3, .result_rows = 2 });
+    defer output.deinit();
+    const messages = try tags(a, output.written());
+    defer a.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "FETCH ") == null);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+}
+
+test "pgwire materialized FETCH cannot emit continuation rows in a failed transaction" {
+    const oracle = @import("cursor_reference_test_support.zig");
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |scroll| {
+        var input = std.Io.Writer.Allocating.init(a);
+        defer input.deinit();
+        try oracle.failedInput(a, &input.writer, scroll, "tester", "secret", "db");
+        var mock: Mock = .{ .stream_rows = 5, .stream_definitions = &.{.{ .name = "id", .type = .integer }} };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try oracle.verifyFailed(output.written());
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    }
+}
+
+test "pgwire COPY input batches transactional typed rows across simple and extended fragmented streams" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |simple| for ([_]@import("copy_out.zig").Options{ .{}, .{ .format = .csv, .header = true }, .{ .format = .binary } }) |options| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00") else {
+            try parse(&input.writer, "q", "COPY t FROM STDIN", false);
+            try bind(&input.writer, "p", "q", null);
+            try frame(&input.writer, 'D', "Pp\x00");
+            try execute(&input.writer, "p", 1);
+            // libpq can pipeline Sync before waiting for CopyInResponse.
+            try frame(&input.writer, 'S', "");
+        }
+        var arena: std.heap.ArenaAllocator = .init(a);
+        defer arena.deinit();
+        var encoder = try @import("copy_out.zig").Encoder.init(a, arena.allocator(), &.{.{ .name = "n", .type = .integer }}, options, 1024);
+        defer encoder.deinit();
+        var payload: std.Io.Writer.Allocating = .init(a);
+        defer payload.deinit();
+        try encoder.start(&payload.writer);
+        for (0..300) |i| try encoder.row(arena.allocator(), &payload.writer, .{ .columns = encoder.columns, .rows = &.{&.{.{ .integer = @intCast(i) }}}, .command_tag = "SELECT" }, 0);
+        try encoder.finish(&payload.writer);
+        // Single-byte frames cover length words, UTF8 and row boundaries.
+        for (payload.written()) |byte| try frame(&input.writer, 'd', &.{byte});
+        try frame(&input.writer, 'c', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = options };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        if (std.mem.count(u8, messages, "E") != 0) std.debug.print("COPY input simple={} format={s} errors={d}\n", .{ simple, @tagName(options.format), std.mem.count(u8, messages, "E") });
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "G"));
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "Z"));
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "COPY 300\x00") != null);
+        try std.testing.expectEqual(@as(usize, 300), mock.copy_committed);
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_staged);
+        try std.testing.expectEqual(@as(usize, 3), mock.copy_batches);
+        try std.testing.expectEqual(@as(i64, 44850), mock.copy_sum);
+    };
+}
+
+test "pgwire COPY FREEZE requires generation admission before the handshake" {
+    const a = std.testing.allocator;
+    const Reference = struct { freeze: struct { id: []const u8, sql: []const u8 } };
+    const reference = try std.json.parseFromSlice(Reference, a, @embedFile("fixtures/copy_input_reference.json"), .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try std.testing.expectEqualStrings("sql-0372", reference.value.freeze.id);
+    const sql = reference.value.freeze.sql;
+    for ([_]bool{ true, false }) |simple| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) {
+            const query = try std.fmt.allocPrintSentinel(a, "{s}", .{sql}, 0);
+            defer a.free(query);
+            try frame(&input.writer, 'Q', query[0 .. query.len + 1]);
+        } else {
+            try parse(&input.writer, "q", sql, false);
+            try bind(&input.writer, "p", "q", null);
+            try frame(&input.writer, 'D', "Pp\x00");
+            try execute(&input.writer, "p", 0);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = .{ .freeze = true } };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "G"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_batches);
+        if (!simple) try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "n"));
+    }
+}
+
+test "pgwire COPY input aborts an implicit transaction after a staged batch and drains queued data" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |copy_fail| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+        for (0..128) |_| try frame(&input.writer, 'd', "1\n");
+        if (copy_fail) try frame(&input.writer, 'f', "client canceled\x00") else {
+            try frame(&input.writer, 'd', "too\tmany\n");
+            try frame(&input.writer, 'd', "already queued\n");
+            try frame(&input.writer, 'c', "");
+        }
+        try frame(&input.writer, 'Q', "SELECT 1\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = .{} };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_committed);
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_staged);
+        try std.testing.expectEqual(@as(usize, 1), mock.copy_batches);
+        try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), if (copy_fail) "57014" else "22P04") != null);
+    }
+}
+
+test "pgwire COPY input preserves independent SQL and JSON null provenance in native batches" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+    try frame(&input.writer, 'd', "\\N\nnull\n{\"x\":1}\n");
+    try frame(&input.writer, 'c', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .copy_in = .{}, .stream_definitions = &.{.{ .name = "j", .type = .json }} };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 3), mock.copy_committed);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_sql_nulls);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_json_nulls);
+}
+
+test "pgwire COPY local input failure marks an explicit transaction failed after staged batches" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+    for (0..128) |_| try frame(&input.writer, 'd', "1\n");
+    try frame(&input.writer, 'd', "too\tmany\n");
+    try frame(&input.writer, 'c', "");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .copy_in = .{} };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.failed_transactions);
+    try std.testing.expectEqual(@as(usize, 0), mock.copy_committed);
+    try std.testing.expectEqual(@as(usize, 0), mock.copy_staged);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Z\x00\x00\x00\x05E") != null);
+}
+
+test "pgwire COPY input ignores only conversion failures with bounded rejection and notices" {
+    const a = std.testing.allocator;
+    for ([_]@import("copy_out.zig").Options{
+        .{ .on_error = .ignore },
+        .{ .on_error = .ignore, .log_verbosity = .verbose },
+        .{ .on_error = .ignore, .log_verbosity = .silent },
+        .{ .on_error = .ignore, .reject_limit = 1 },
+    }) |options| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+        for (0..128) |_| try frame(&input.writer, 'd', "1\n");
+        try frame(&input.writer, 'd', "bad\n2\n99999999999999999999999999\n3\n");
+        try frame(&input.writer, 'c', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = options };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const messages = try tags(a, output.written());
+        defer a.free(messages);
+        if (options.reject_limit != null) {
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "REJECT_LIMIT (1)") != null);
+            try std.testing.expectEqual(@as(usize, 0), mock.copy_committed);
+            try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "22P02") != null);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+            try std.testing.expectEqual(@as(usize, 130), mock.copy_committed);
+            try std.testing.expectEqual(@as(usize, 2), mock.copy_batches);
+            try std.testing.expectEqual(@as(usize, switch (options.log_verbosity) {
+                .default => 1,
+                .verbose => 3,
+                .silent => 0,
+            }), std.mem.count(u8, messages, "N"));
+        }
+    }
+}
+
+test "pgwire COPY input option admission matches independent PostgreSQL contracts" {
+    const a = std.testing.allocator;
+    const Reference = struct { option_checks: []const struct { sql: []const u8, sqlstate: ?[]const u8 } };
+    const reference = try std.json.parseFromSlice(Reference, a, @embedFile("fixtures/copy_input_reference.json"), .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    const local = @import("antfly_local_sources");
+    for (reference.value.option_checks) |check| {
+        var compiled = local.sql_compiler.compile(a, check.sql, .{}) catch |err| {
+            errdefer std.debug.print("COPY option contract sql={s} err={s}\n", .{ check.sql, @errorName(err) });
+            try std.testing.expectEqualStrings(check.sqlstate orelse return error.UnexpectedCopyOptionRejection, local.sql_errors.describe(err).code);
+            continue;
+        };
+        defer compiled.deinit();
+        if (check.sqlstate != null) {
+            std.debug.print("COPY option unexpectedly admitted sql={s}\n", .{check.sql});
+            return error.UnexpectedCopyOptionAdmission;
+        }
+    }
+}
+
+test "pgwire COPY input preserves earlier native error ordering without retrying admission" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 128 }) |count| for ([_]anyerror{ error.UniqueConstraintViolation, error.SqlInvalidTextRepresentation, error.SqlMutationOutcomeUnknown }) |failure| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "COPY t FROM STDIN\x00");
+        for (0..count) |_| try frame(&input.writer, 'd', "1\n");
+        try frame(&input.writer, 'd', "malformed\textra\n");
+        try frame(&input.writer, 'c', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .copy_in = .{}, .copy_batch_error = failure };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.copy_batches);
+        try std.testing.expectEqual(@as(usize, 1), mock.copy_rollbacks);
+        try std.testing.expectEqual(@as(usize, 0), mock.copy_committed);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), @import("antfly_local_sources").sql_errors.describe(failure).code) != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "22P04") == null);
+    };
+}
+
+test "pgwire COPY prepared predicate arguments remain separate from imported row arguments" {
+    const a = std.testing.allocator;
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "q", "COPY t FROM STDIN WHERE n > $1", true);
+    try bind(&input.writer, "p", "q", 10);
+    try execute(&input.writer, "p", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'd', "11\n12\n");
+    try frame(&input.writer, 'c', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .copy_in = .{}, .copy_predicate = true, .native_parameters = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(a, output.written());
+    defer a.free(messages);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(i64, 23), mock.copy_sum);
+    try std.testing.expectEqual(@as(usize, 2), mock.copy_committed);
+    try std.testing.expectEqual(@as(usize, 1), mock.copy_batches);
+}
+
+test "pgwire procedure notices survive failing statement arenas and precede the error frame" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "CALL fail()\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .procedure_notice_failure = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expect(std.mem.endsWith(u8, observed, "NEZ"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "SNOTICE\x00C00000\x00Mbefore failure\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "C22012\x00") != null);
+}
+
+test "SQL named enum pgwire Parse Bind close statement and execute retain exact OIDs and labels" {
+    const a = std.testing.allocator;
+    const scalar = @import("antfly_local_sources").sql_scalar;
+    var definition = try scalar.EnumTypes.Owned.create(a, &.{ "z", "a", "" });
+    defer definition.deinit();
+    const record: scalar.EnumTypes.Record = .{ .identity = try scalar.EnumTypes.Identity.init(7, 2, 1, @splat(3)), .definition = definition.definition, .owner = .auth_disabled };
+    var view = try scalar.EnumValues.View.init(a, record);
+    defer view.deinit(a);
+    for ([_]u32{ 0, record.identity.oid }) |declared| for ([_]u16{ 0, 1 }) |format| for ([_]bool{ false, true }) |is_null| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        var p: std.Io.Writer.Allocating = .init(a);
+        defer p.deinit();
+        try p.writer.writeAll("q\x00SELECT $1\x00");
+        try p.writer.writeInt(u16, 1, .big);
+        try p.writer.writeInt(u32, declared, .big);
+        try frame(&input.writer, 'P', p.written());
+        try frame(&input.writer, 'D', "Sq\x00");
+        var b: std.Io.Writer.Allocating = .init(a);
+        defer b.deinit();
+        try b.writer.writeAll("p\x00q\x00");
+        try b.writer.writeInt(u16, 1, .big);
+        try b.writer.writeInt(u16, format, .big);
+        try b.writer.writeInt(u16, 1, .big);
+        try b.writer.writeInt(i32, if (is_null) -1 else 1, .big);
+        if (!is_null) try b.writer.writeByte('z');
+        try b.writer.writeInt(u16, 1, .big);
+        try b.writer.writeInt(u16, format, .big);
+        try frame(&input.writer, 'B', b.written());
+        try frame(&input.writer, 'C', "Sq\x00");
+        try execute(&input.writer, "p", 0);
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .native_parameters = true, .enum_view = &view };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        var messages: protocol.Cursor = .{ .bytes = output.written() };
+        var descriptions: usize = 0;
+        var data: usize = 0;
+        while (messages.offset < messages.bytes.len) {
+            const tag = try messages.int(u8);
+            const length = try messages.int(u32);
+            var payload: protocol.Cursor = .{ .bytes = try messages.take(length - 4) };
+            if (tag == 'E') {
+                std.debug.print("enum wire error={s}\n", .{payload.bytes});
+                return error.UnexpectedEnumParameterError;
+            }
+            if (tag == 't') {
+                descriptions += 1;
+                try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+                try std.testing.expectEqual(record.identity.oid, try payload.int(u32));
+            }
+            if (tag == 'D') {
+                data += 1;
+                try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+                try std.testing.expectEqual(@as(i32, if (is_null) -1 else 1), try payload.int(i32));
+                if (!is_null) try std.testing.expectEqualStrings("z", try payload.take(1));
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), descriptions);
+        try std.testing.expectEqual(@as(usize, 1), data);
+        try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    };
+}
+
+test "pgwire native sync controls preserve PostgreSQL lifetime rows command tags and warning severity" {
+    const a = std.testing.allocator;
+    const Reference = struct { actions: []const struct { sql: []const u8, command_tag: []const u8, rows: []const []const []const u8, notices: []const []const u8 } };
+    var reference = try std.json.parseFromSlice(Reference, a, @import("antfly_local_sources").sql_parity_fixtures.sync_control_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    for (reference.value.actions) |action| {
+        const text = try std.fmt.allocPrint(a, "{s}\x00", .{action.sql});
+        defer a.free(text);
+        try frame(&input.writer, 'Q', text);
+    }
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    var ordinal: usize = 0;
+    var row_count: usize = 0;
+    var notice_count: usize = 0;
+    var cursor: protocol.Cursor = .{ .bytes = output.written() };
+    while (cursor.offset < cursor.bytes.len) {
+        const tag = try cursor.int(u8);
+        const length = try cursor.int(u32);
+        var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+        if (tag == 'E') {
+            std.debug.print("sync pgwire error ordinal={d} payload={s}\n", .{ ordinal, payload.bytes });
+            return error.UnexpectedPgwireSyncError;
+        }
+        if (tag == 'C' or tag == 'D' or tag == 'N') {
+            try std.testing.expect(ordinal < reference.value.actions.len);
+            const action = reference.value.actions[ordinal];
+            if (tag == 'C') {
+                try std.testing.expectEqualStrings(action.command_tag, try payload.string());
+                try std.testing.expectEqual(action.rows.len, row_count);
+                try std.testing.expectEqual(action.notices.len, notice_count);
+                ordinal += 1;
+                row_count = 0;
+                notice_count = 0;
+            } else if (tag == 'D') {
+                try std.testing.expect(row_count < action.rows.len);
+                const expected = action.rows[row_count];
+                try std.testing.expectEqual(@as(u16, @intCast(expected.len)), try payload.int(u16));
+                for (expected) |text| try std.testing.expectEqualStrings(text, try payload.take(try payload.int(u32)));
+                row_count += 1;
+            } else {
+                try std.testing.expect(notice_count < action.notices.len);
+                var severity = false;
+                var code = false;
+                while (try payload.int(u8) != 0) {
+                    const field = payload.bytes[payload.offset - 1];
+                    const text = try payload.string();
+                    if (field == 'S') {
+                        try std.testing.expectEqualStrings("WARNING", text);
+                        severity = true;
+                    } else if (field == 'C') {
+                        try std.testing.expectEqualStrings(action.notices[notice_count], text);
+                        code = true;
+                    }
+                }
+                try std.testing.expect(severity and code);
+                notice_count += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(reference.value.actions.len, ordinal);
 }
 
 test "pgwire trusted renewal is private silent and preserves prepared portals" {
@@ -2777,6 +4403,515 @@ test "pgwire producer capacity rejects execution before backend and preserves ro
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
 }
 
+comptime {
+    _ = @import("../api/sql/copy/io.zig");
+}
+
+test "pgwire logical startup authenticates and dispatches replication administration outside SQL" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT\x00");
+    try frame(&input.writer, 'Q', "DROP_REPLICATION_SLOT s WAIT\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 7), mock.replication_checks);
+    try std.testing.expectEqual(@as(usize, 3), mock.replication_commands);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "CREATE_REPLICATION_SLOT") != null);
+}
+test "pgwire logical slot creation withholds mismatched slot results" {
+    for ([_]@FieldType(Mock, "invalid_slot_reply"){ .name, .lsn, .snapshot, .plugin }) |invalid| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .invalid_slot_reply = invalid };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "CREATE_REPLICATION_SLOT") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "40003") != null);
+    }
+}
+
+test "pgwire logical startup requires backend capability and explicit live authorization" {
+    for ([_]bool{ false, true }) |enabled| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        var mock: Mock = .{ .replication_enabled = enabled, .replication_denied = true };
+        if (enabled) try std.testing.expectError(error.Forbidden, run(&mock, input.written(), .{})) else try std.testing.expectError(error.UnsupportedReplicationMode, run(&mock, input.written(), .{}));
+        try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_commands);
+        try std.testing.expectEqual(@as(usize, 1), mock.releases);
+    }
+}
+test "pgwire logical mode rejects extended messages and never sends START to SQL or administration" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '1', publication_names 'p')\x00");
+    try frame(&input.writer, 'Q', "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '2', publication_names 'p')\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "0A000") != null);
+    input.writer.end = 0;
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'P', "\x00SELECT 1\x00\x00\x00");
+    mock = .{ .replication_enabled = true };
+    try std.testing.expectError(error.ProtocolViolation, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.describes);
+}
+test "pgwire replication results recheck authorization and uncertain slots do not become SQL completion work" {
+    for ([_]bool{ false, true }) |unknown| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .replication_unknown = unknown, .replication_revoke_after_command = !unknown };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "40003") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") == null);
+        try std.testing.expect(mock.completion_safe_after_run);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+    }
+}
+test "pgwire replication owner failures preserve actionable SQLSTATEs without replay or SQL completion debt" {
+    const Case = struct { failure: anyerror, code: []const u8 };
+    for ([_]Case{
+        .{ .failure = error.ChangefeedCapabilityUnsupported, .code = "0A000" },
+        .{ .failure = error.ChangefeedResynchronizationRequired, .code = "55000" },
+        .{ .failure = error.ChangefeedLeaseExpired, .code = "55000" },
+        .{ .failure = error.ChangefeedConflict, .code = "55000" },
+        .{ .failure = error.HistoryResynchronizationRequired, .code = "55000" },
+        .{ .failure = error.HistoryCheckpointConflict, .code = "55000" },
+        .{ .failure = error.HistoryConsumerConflict, .code = "55000" },
+        .{ .failure = error.HistoryAuthorityRequired, .code = "55000" },
+        .{ .failure = error.HistoryPreparedTransactionsPresent, .code = "55000" },
+        .{ .failure = error.ChangefeedBackpressure, .code = "53300" },
+        .{ .failure = error.HistoryFull, .code = "53300" },
+        .{ .failure = error.HistoryConsumerLimit, .code = "53300" },
+        .{ .failure = error.HistoryTooLarge, .code = "54000" },
+        .{ .failure = error.MetadataMutationOutcomeUnknown, .code = "40003" },
+        .{ .failure = error.CommitDecisionUnknown, .code = "40003" },
+        .{ .failure = error.SourceOutcomeUnresolved, .code = "40003" },
+        // Corruption remains an internal error, never a retry/capacity signal.
+        .{ .failure = error.HistoryCorrupt, .code = "XX000" },
+    }) |case| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput\x00");
+        // A subsequent read-only command can inspect state after uncertainty.
+        try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .replication_error = case.failure };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        var expected: [7]u8 = undefined;
+        expected[0] = 'C';
+        @memcpy(expected[1..6], case.code);
+        expected[6] = 0;
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), &expected) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), @errorName(case.failure)) == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") == null);
+        try std.testing.expectEqual(@as(usize, 2), mock.replication_commands);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+        try std.testing.expect(mock.completion_safe_after_run);
+    }
+}
+
+test "pgwire replication commands require logical startup while false preserves ordinary SQL" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00false\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'Q', "SELECT 1\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "0A000") != null);
+}
+
+test "pgwire failed logical authorization closes the opened owner before releasing identity" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    var mock: Mock = .{ .replication_enabled = true, .replication_revoke_after_command = true, .replication_commands = 1 };
+    try std.testing.expectError(error.Forbidden, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 1), mock.releases);
+}
+test "pgwire malformed replication command cannot fall back to SQL and duplicate startup is rejected" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM/**/\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "42601") != null);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expectEqual(@as(usize, 0), mock.replication_commands);
+    input.writer.end = 0;
+    try startupOptions(&input.writer, "replication\x00database\x00replication\x00false\x00");
+    mock = .{ .replication_enabled = true };
+    try std.testing.expectError(error.ProtocolViolation, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 0), mock.authentications);
+}
+
+const ReplicationWireFrame = struct {
+    tag: u8,
+    bytes: []u8,
+    fn deinit(self: *@This()) void {
+        std.testing.allocator.free(self.bytes);
+    }
+};
+fn replicationRead(reader: *std.Io.Reader) !ReplicationWireFrame {
+    const tag = try reader.takeByte();
+    const length = try reader.takeInt(u32, .big);
+    if (length < 4 or length > backend.pgoutput.max_message_bytes + backend.pgoutput.wal_header_bytes - 1) return error.ProtocolViolation;
+    return .{ .tag = tag, .bytes = try reader.readAlloc(std.testing.allocator, length - 4) };
+}
+fn replicationClientStart(stream: std.Io.net.Stream, reader: *std.Io.Reader) !struct { pid: i32, key: i32 } {
+    const value = try replicationClientStartAt(stream, reader, "0/0");
+    return .{ .pid = value.pid, .key = value.key };
+}
+fn replicationClientStartAt(stream: std.Io.net.Stream, reader: *std.Io.Reader, position: []const u8) !struct { pid: i32, key: i32 } {
+    var bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer bytes.deinit();
+    try startupOptions(&bytes.writer, "replication\x00database\x00");
+    var writer = stream.writer(std.testing.io, &.{});
+    try writer.interface.writeAll(bytes.written());
+    try writer.interface.flush();
+    var key: struct { pid: i32, key: i32 } = .{ .pid = 0, .key = 0 };
+    while (true) {
+        var response = try replicationRead(reader);
+        defer response.deinit();
+        if (response.tag == 'E') return error.TestUnexpectedResult;
+        if (response.tag == 'K') key = .{ .pid = std.mem.readInt(i32, response.bytes[0..4], .big), .key = std.mem.readInt(i32, response.bytes[4..8], .big) };
+        if (response.tag == 'Z') break;
+    }
+    const query = try std.fmt.allocPrint(std.testing.allocator, "START_REPLICATION SLOT s LOGICAL {s} (proto_version '1', publication_names 'p')\x00", .{position});
+    defer std.testing.allocator.free(query);
+    try frame(&writer.interface, 'Q', query);
+    try writer.interface.flush();
+    var response = try replicationRead(reader);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u8, 'W'), response.tag);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, response.bytes);
+    return .{ .pid = key.pid, .key = key.key };
+}
+fn replicationStatus(writer: *std.Io.Writer, lsn: u64, reply: bool) !void {
+    var bytes: [34]u8 = @splat(0);
+    bytes[0] = 'r';
+    std.mem.writeInt(u64, bytes[1..9], lsn, .big);
+    std.mem.writeInt(u64, bytes[9..17], lsn, .big);
+    std.mem.writeInt(u64, bytes[17..25], lsn, .big);
+    bytes[33] = @intFromBool(reply);
+    try frame(writer, 'd', &bytes);
+}
+const replication_test_limits: protocol.Limits = .{ .idle_timeout_ms = 1000, .startup_timeout_ms = 3000, .statement_timeout_ms = 3000, .replication_timeout_ms = 3000, .replication_keepalive_ms = 50, .replication_poll_ms = 5, .replication_callback_ms = 1000, .replication_write_ms = 1000 };
+test "pgwire CopyBoth sends committed messages accepts duplex feedback and preserves following commands" {
+    for ([_]bool{ false, true }) |acknowledge| {
+        var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .renewable_auth = true, .replication_defer_first_poll = true, .replication_defer_first_feedback = true };
+        var limits = replication_test_limits;
+        limits.replication_callback_ms = 100;
+        var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = limits });
+        defer listener.deinit();
+        const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+        defer socket.close(std.testing.io);
+        var buffer: [1024]u8 = undefined;
+        var reader = socket.reader(std.testing.io, &buffer);
+        _ = try replicationClientStart(socket, &reader.interface);
+        var received: usize = 0;
+        while (received < 2) {
+            var response = try replicationRead(&reader.interface);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+            if (response.bytes[0] != 'w') continue;
+            try std.testing.expectEqual(@as(u64, 48), std.mem.readInt(u64, response.bytes[9..17], .big));
+            try std.testing.expectEqual(@as(u8, if (received == 0) 'B' else 'C'), response.bytes[25]);
+            received += 1;
+        }
+        var writer = socket.writer(std.testing.io, &.{});
+        try frame(&writer.interface, 'p', "renewed\x00");
+        if (acknowledge) {
+            try replicationStatus(&writer.interface, 48, true);
+            try replicationStatus(&writer.interface, 48, true);
+            try writer.interface.flush();
+            while (true) {
+                var response = try replicationRead(&reader.interface);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+                if (response.bytes[0] == 'k' and response.bytes[17] == 0) break;
+            }
+        }
+        try frame(&writer.interface, 'c', "");
+        try frame(&writer.interface, 'Q', "IDENTIFY_SYSTEM\x00");
+        try writer.interface.flush();
+        var ready: usize = 0;
+        var completions: usize = 0;
+        while (ready < 2) {
+            var response = try replicationRead(&reader.interface);
+            defer response.deinit();
+            try std.testing.expect(response.tag != 'E');
+            if (response.tag == 'Z') ready += 1;
+            if (response.tag == 'C') completions += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), completions);
+        try frame(&writer.interface, 'X', "");
+        try writer.interface.flush();
+        listener.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_opens);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_live_chunks);
+        try std.testing.expect(mock.replication_polls >= 3);
+        try std.testing.expectEqual(@as(u64, if (acknowledge) 48 else 0), mock.replication_ack);
+        try std.testing.expectEqual(@as(usize, if (acknowledge) 2 else 0), mock.replication_feedbacks);
+        try std.testing.expectEqual(@as(usize, 1), mock.renewals);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    }
+}
+test "pgwire CopyBoth transports a pgoutput message larger than the SQL frame limit" {
+    const alloc = std.testing.allocator;
+    const payload = try alloc.alloc(u8, 1024 * 1024 + 1);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .replication_large_payload = payload };
+    var listener = try @import("server.zig").start(alloc, .{
+        .io = std.testing.io,
+        .backend = mock.source(),
+        .bind_port = 0,
+        .limits = replication_test_limits,
+    });
+    defer listener.deinit();
+    const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+    defer socket.close(std.testing.io);
+    var buffer: [8192]u8 = undefined;
+    var reader = socket.reader(std.testing.io, &buffer);
+    _ = try replicationClientStart(socket, &reader.interface);
+    var received_insert = false;
+    while (true) {
+        var response = try replicationRead(&reader.interface);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+        if (response.bytes[0] != 'w') continue;
+        switch (response.bytes[25]) {
+            'B' => {},
+            'I' => {
+                try std.testing.expectEqual(payload.len + 13 + 25, response.bytes.len);
+                try std.testing.expect(std.mem.eql(u8, payload, response.bytes[38..]));
+                received_insert = true;
+            },
+            'C' => break,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(received_insert);
+}
+
+test "pgwire CopyBoth rejects future feedback and authorization revocation before payload" {
+    for ([_]bool{ false, true }) |revoke| {
+        var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .replication_revoke_after_poll = revoke };
+        var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = replication_test_limits });
+        defer listener.deinit();
+        const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+        defer socket.close(std.testing.io);
+        var buffer: [1024]u8 = undefined;
+        var reader = socket.reader(std.testing.io, &buffer);
+        _ = try replicationClientStart(socket, &reader.interface);
+        if (!revoke) {
+            var writer = socket.writer(std.testing.io, &.{});
+            try replicationStatus(&writer.interface, 10000, false);
+            try writer.interface.flush();
+        }
+        while (true) {
+            var response = try replicationRead(&reader.interface);
+            defer response.deinit();
+            if (response.tag == 'E') {
+                try std.testing.expect(std.mem.indexOf(u8, response.bytes, if (revoke) "42501" else "08P01") != null);
+                break;
+            }
+            if (revoke) return error.TestUnexpectedResult;
+        }
+        listener.deinit();
+        try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_feedbacks);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_live_chunks);
+    }
+}
+
+fn replicationDrainTransaction(reader: *std.Io.Reader) !void {
+    while (true) {
+        var response = try replicationRead(reader);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+        if (response.bytes[0] == 'w' and response.bytes[25] == 'C') return;
+    }
+}
+test "pgwire CopyBoth idle keepalives cannot extend a silent consumer deadline" {
+    var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true };
+    var limits = replication_test_limits;
+    limits.replication_timeout_ms = 1200;
+    limits.replication_keepalive_ms = 200;
+    // Waiting for a new poll must not spend the callback's own execution
+    // budget. Keepalive scheduling also precedes a longer poll interval.
+    limits.replication_callback_ms = 100;
+    limits.replication_poll_ms = 350;
+    var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = limits });
+    defer listener.deinit();
+    const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+    defer socket.close(std.testing.io);
+    var buffer: [1024]u8 = undefined;
+    var reader = socket.reader(std.testing.io, &buffer);
+    _ = try replicationClientStart(socket, &reader.interface);
+    try replicationDrainTransaction(&reader.interface);
+    var keepalive = try replicationRead(&reader.interface);
+    defer keepalive.deinit();
+    try std.testing.expectEqual(@as(u8, 'd'), keepalive.tag);
+    try std.testing.expectEqual(@as(u8, 'k'), keepalive.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 1), keepalive.bytes[17]);
+    while (true) {
+        var response = replicationRead(&reader.interface) catch |err| switch (err) {
+            error.EndOfStream, error.ReadFailed => break,
+            else => return err,
+        };
+        defer response.deinit();
+        if (response.tag == 'E') break;
+        try std.testing.expectEqual(@as(u8, 'd'), response.tag);
+        try std.testing.expectEqual(@as(u8, 'k'), response.bytes[0]);
+    }
+    listener.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.replication_feedbacks);
+    try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
+}
+test "pgwire CopyBoth cancel and shutdown join reader before releasing stream and credential" {
+    for ([_]bool{ false, true }) |cancel| {
+        var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true };
+        var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = replication_test_limits });
+        defer listener.deinit();
+        const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+        defer socket.close(std.testing.io);
+        var buffer: [1024]u8 = undefined;
+        var reader = socket.reader(std.testing.io, &buffer);
+        const key = try replicationClientStart(socket, &reader.interface);
+        try replicationDrainTransaction(&reader.interface);
+        if (cancel) {
+            try sendCancel(listener.address(), key.pid, key.key);
+            while (true) {
+                var response = try replicationRead(&reader.interface);
+                defer response.deinit();
+                if (response.tag == 'E') {
+                    try std.testing.expect(std.mem.indexOf(u8, response.bytes, "57014") != null);
+                    break;
+                }
+            }
+        }
+        listener.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_live_chunks);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+        try std.testing.expectEqual(@as(usize, 1), mock.releases);
+        try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
+    }
+}
+
+test "pgwire CopyBoth validated reconnect feedback can precede rewound transaction replay" {
+    var mock: Mock = .{ .replication_enabled = true, .replication_stream_enabled = true, .replication_wait_for_feedback = true };
+    var listener = try @import("server.zig").start(std.testing.allocator, .{ .io = std.testing.io, .backend = mock.source(), .bind_port = 0, .limits = replication_test_limits });
+    defer listener.deinit();
+    const socket = try listener.address().connect(std.testing.io, .{ .mode = .stream });
+    defer socket.close(std.testing.io);
+    var buffer: [1024]u8 = undefined;
+    var reader = socket.reader(std.testing.io, &buffer);
+    // 0/16 is inside the retained transaction. Its backend-approved rewind
+    // starts at Begin, while old durable client feedback may still say 0/16.
+    _ = try replicationClientStartAt(socket, &reader.interface, "0/16");
+    var writer = socket.writer(std.testing.io, &.{});
+    try replicationStatus(&writer.interface, 22, true);
+    try writer.interface.flush();
+    try replicationDrainTransaction(&reader.interface);
+    try frame(&writer.interface, 'c', "");
+    try writer.interface.flush();
+    while (true) {
+        var response = try replicationRead(&reader.interface);
+        defer response.deinit();
+        try std.testing.expect(response.tag != 'E');
+        if (response.tag == 'Z') break;
+    }
+    listener.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_feedbacks);
+    try std.testing.expectEqual(@as(u64, 0), mock.replication_ack);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_stream_closes);
+}
+
+test "pgwire snapshot imports dispatch only inside the current transaction" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn attach(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request, name: []const u8) !void {
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", request.session_id.?);
+            try std.testing.expectEqualStrings("qualified-snapshot", name);
+            try request.check();
+            mock.setting_stream_opens += 1;
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "SELECT 1\x00");
+    try frame(&input.writer, 'Q', "SET TRANSACTION SNAPSHOT 'qualified-snapshot'\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var source = mock.source();
+    var vtable = source.vtable.*;
+    vtable.import_snapshot = Fixture.attach;
+    source.vtable = &vtable;
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    var session: protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+    defer session.deinit();
+    try session.run();
+    try std.testing.expectEqual(@as(usize, 1), mock.setting_stream_opens);
+    try std.testing.expectEqual(@as(usize, 5), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "25001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "25P01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "SET\x00") != null);
+}
+
 test "pgwire setting-dependent portal retains its catalog incarnation across fresh descriptions" {
     var input = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer input.deinit();
@@ -2815,4 +4950,81 @@ test "pgwire warm descriptions survive prepared close and bound writes reject a 
         try std.testing.expectEqual(@as(usize, if (change_at == 3) 0 else 1), mock.executions);
         try std.testing.expectEqual(change_at == 3, std.mem.indexOf(u8, output.written(), "40001") != null);
     }
+}
+
+test "pgwire logical walsender authenticates before CopyBoth and serializes feedback and stop" {
+    const a = std.testing.allocator;
+    const frontend = @import("logical_replication_frontend.zig");
+    const Fixture = struct {
+        mock: Mock = .{},
+        actions: usize = 0,
+        feedback_seen: bool = false,
+        stopped: bool = false,
+        closed: bool = false,
+
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, _: backend.Request) !frontend.Port {
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            const self: *@This() = @fieldParentPtr("mock", mock);
+            try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+            return .{ .ptr = self, .vtable = &.{ .command = command, .poll = poll, .feedback = acknowledge, .stop = stop, .heartbeat = heartbeat, .close = close } };
+        }
+        fn command(raw: *anyopaque, _: std.mem.Allocator, _: backend.Request, action: frontend.commands.Command) !frontend.Reply {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.actions += 1;
+            return switch (action) {
+                .identify_system => .{ .identity = .{
+                    .identity = .{ .realm = .{ .group_id = 1, .database_id = 1, .incarnation = @splat('1') }, .system_identifier = 31, .timeline = 1, .database_oid = 1 },
+                    .lsn = 1,
+                    .database = "db",
+                } },
+                .start => .started,
+                else => error.UnexpectedCommand,
+            };
+        }
+        fn poll(_: *anyopaque, _: std.mem.Allocator, _: backend.Request, _: *std.Io.Writer) !bool {
+            return false;
+        }
+        fn acknowledge(raw: *anyopaque, _: std.mem.Allocator, _: backend.Request, bytes: []const u8, _: *std.Io.Writer) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("feedback", bytes);
+            self.feedback_seen = true;
+        }
+        fn stop(raw: *anyopaque, _: std.mem.Allocator, _: backend.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.feedback_seen);
+            self.stopped = true;
+        }
+        fn heartbeat(_: *anyopaque, _: std.mem.Allocator, _: backend.Request) !void {}
+        fn close(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+            return true;
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = fixture.mock.source();
+    var methods = source.vtable.*;
+    methods.open_replication = Fixture.open;
+    source.vtable = &methods;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'Q', "START_REPLICATION SLOT testslot LOGICAL 0/1 (proto_version '1', publication_names 'p')\x00");
+    try frame(&input.writer, 'd', "feedback");
+    try frame(&input.writer, 'c', "");
+    try frame(&input.writer, 'X', "");
+    var reader = std.Io.Reader.fixed(input.written());
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    {
+        var session: protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+        defer session.deinit();
+        try session.run();
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.actions);
+    try std.testing.expect(fixture.stopped and fixture.closed);
+    const messages = try tags(a, output.written());
+    defer a.free(messages);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "WcCZ") != null);
 }

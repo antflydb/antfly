@@ -225,8 +225,9 @@ fatbin cubins for the supported SM targets when `cuobjdump` is available, and
 checks that required CUDA symbols are present before updating checked-in
 artifacts. CUDA-enabled CI may verify checked-in artifact freshness, but normal
 CI should not need CUDA.
-Fatbin generation explicitly uses `--compress-mode=size`. This losslessly
-compresses device code; the CUDA driver handles decompression at module load.
+Fatbin generation explicitly uses `--compress-mode=speed -Xfatbin=-compress-all`
+to favor fast module loading over the smallest file. This losslessly compresses
+device code; the CUDA driver handles decompression at module load.
 All supported cubins and the PTX fallback remain included. The compression
 format requires drivers from CUDA 12.4 or newer; it does not reduce model
 weights, runtime device allocations, or the PTX ISA driver requirement above.
@@ -430,6 +431,14 @@ its native context policy. Preload configuration accepts `cuda_precision`:
 `auto` currently resolves to FP32. Managed loads reject explicit `fp16`/`bf16`
 with `UnqualifiedGlinerCudaPrecision` until release evidence is available.
 Precision is part of both resident and in-flight model identity.
+
+The public Decide-1B CUDA route uses the pinned all-F32 checkpoint and the
+existing span service envelope of one request item, up to 64 prepared sequences,
+and up to 1,024 encoder tokens per sequence. The 7,999-token marker-classifier
+measurements and the split Q8_0 benchmark use separate qualification profiles.
+The pinned Multi-Decide checkpoint has separate CUDA rows for bounded,
+single-window extraction and typed decisions. Those rows preserve the
+individual prompt bounds from the captured reference cases.
 
 Diagnostic constructors may measure reduced-precision candidates. For
 Decide-1B only encoder matrix weights are reduced; embeddings, norms,

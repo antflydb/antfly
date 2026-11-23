@@ -18,6 +18,16 @@
 //! changes from forcing code generation for every storage and search test.
 
 const http_server = @import("api/http_server.zig");
+test {
+    _ = @import("system_catalog/sql_notifications.zig");
+    _ = @import("api/sql/notifications/hub.zig");
+    _ = @import("api/sql/notifications/maintenance.zig");
+    _ = @import("api/relational_expression_contract.zig");
+    _ = @import("api/row_policy_publication_coordinator.zig");
+    _ = @import("api/retained_read_rpc.zig");
+    _ = @import("api/replication_subscription_apply.zig");
+    _ = @import("antfly_local_sources").api_batch;
+}
 const httpx_handler = @import("api/httpx_handler.zig");
 const indexes = @import("api/indexes.zig");
 const kernel_abi = @import("api/kernel_abi.zig");
@@ -38,17 +48,24 @@ test {
     _ = @import("api/resolvers.zig");
     _ = @import("api/managed_sources.zig");
     _ = @import("api/protected_future.zig");
-    _ = @import("api/sql_graph_overlay_test.zig");
+    _ = @import("api/sql/testing/graph_overlay_test.zig");
     _ = @import("api/graph_execution.zig");
     _ = @import("api/graph_statement_source.zig");
     _ = @import("api/retained_read_client.zig").consumer_tests;
-    _ = @import("api/sql_connection_record.zig");
-    _ = @import("api/sql_connections.zig");
+    _ = @import("api/sql/session/connection_record.zig");
+    _ = @import("api/sql/session/connections.zig");
+    _ = @import("api/sql/testing/command_producer_test.zig");
+    _ = @import("api/native_sql_lock_read.zig");
+    _ = @import("api/sql/session/data_locks.zig");
+    _ = @import("api/sql/testing/ordinary_catalog_test.zig");
+    _ = @import("api/sql/execution/execution.zig");
     _ = @import("api/kernel_owner_source.zig");
-    _ = @import("api/sql_execution.zig");
+    _ = @import("api/sql/execution/execution.zig");
     _ = @import("api/lake_row_payloads.zig");
     _ = @import("api/lake_expiring_objects.zig");
-    _ = @import("api/sql_pgwire.zig");
+    _ = @import("api/sql/transport/pgwire.zig");
+    _ = @import("api/sql/testing/catalog_campaign_test.zig");
+    _ = @import("api/sql/testing/conflict_scope_test.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/table_reads.zig").document_hydration_tests;
@@ -89,6 +106,15 @@ test "system catalog routing and transport discovery" {
     _ = @import("api/distributed_entity_sink.zig");
 }
 
+test "system catalog schema validation submission discovery" {
+    _ = @import("api/schema_validation/recovery.zig");
+    _ = @import("api/schema_validation/admission.zig");
+    _ = @import("metadata/http_client.zig");
+    _ = @import("metadata/http_server.zig");
+    _ = @import("system_catalog/operations.zig");
+    _ = @import("system_catalog/server_call.zig");
+}
+
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 test {
@@ -103,7 +129,7 @@ test {
     _ = @import("serverless/build/lake_build_limits.zig");
     _ = @import("api/lake_index_coordinator.zig");
     _ = @import("api/lake_index_sql_rows.zig");
-    _ = @import("api/sql_memory_owner.zig");
+    _ = @import("api/sql/execution/memory_owner.zig");
     _ = @import("api/lake_artifact_ranges.zig");
     _ = @import("api/lake_index_text_statistics.zig");
     _ = @import("api/lake_index_page_mutations.zig");
@@ -123,12 +149,13 @@ test {
 
 // Schema admission is part of the public lake SQL binding contract.
 test "external lake SQL schema cache discovery" {
-    _ = @import("api/sql_schema_cache.zig");
+    _ = @import("api/sql/execution/schema_cache.zig");
 }
 
 // Filtered roots must reach the mounted transport tests through a named anchor.
 test "api HTTP runtime discovery" {
     _ = httpx_handler;
+    _ = @import("api/artifact_history_operations.zig");
     _ = @import("api/backup_cohort_driver.zig");
 }
 
@@ -142,7 +169,58 @@ test "linear merge discovery" {
     _ = @import("api/linear_merge.zig");
 }
 
+test "completion begin wire discovery" {
+    _ = @import("antfly_local_sources").api_internal_batch;
+}
+
+test "completion live owner discovery" {
+    _ = @import("api/completion_owner_admission.zig");
+}
+
+test "completion begin wire executes retained owner validation across the private boundary" {
+    const std = @import("std");
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const batch = local.api_internal_batch;
+    const completion = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
+    const types = local.storage_db_selected_root.db.types;
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 7, .group_id = 9, .topology_epoch = 4 };
+    const members = [_]completion.Participant{.{ .namespace = owner.namespace, .owner_fence = owner.digest(), .input_digest = @splat(3), .roles = completion.Roles.guards | completion.Roles.checkpoint, .locator = "table2:00000004:docs:9", .routed_owner = owner }};
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = @splat(4), .admission_digest = @splat(5), .coordinator_namespace = owner.namespace, .coordinator_fence = owner.digest(), .participants = &members };
+    const raw = try completion.encodeAdmission(a, admission);
+    defer a.free(raw);
+    var request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = admission.transaction_id, .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = owner.topology_epoch, .participants = &.{members[0].locator}, .completion_admission = raw, .completion_owner = owner } } };
+    const encoded = try batch.encodeBatchRequest(a, request);
+    defer a.free(encoded);
+    var decoded = try batch.parseInternalBatchRequest(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings(raw, decoded.req.transaction.?.begin.completion_admission.?);
+    try std.testing.expectError(error.InvalidBatchRequest, batch.parseBatchRequest(a, encoded));
+    request.transaction.?.begin.completion_owner = null;
+    try std.testing.expectError(error.InvalidBatchRequest, batch.encodeBatchRequest(a, request));
+    var replaced = owner;
+    replaced.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, batch.validateCompletionBegin(a, raw, admission.transaction_id, &.{members[0].locator}, replaced, owner.topology_epoch));
+    try std.testing.expectError(error.InvalidBatchRequest, batch.validateCompletionBegin(a, raw, admission.transaction_id, &.{"substituted"}, owner, owner.topology_epoch));
+    try std.testing.expectError(error.InvalidBatchRequest, batch.validateCompletionBegin(a, raw, admission.transaction_id, &.{members[0].locator}, owner, owner.topology_epoch + 1));
+}
+
+test "source plan HTTP discovery" {
+    _ = @import("api/source_plan_operations.zig");
+    _ = @import("api/source_plan_delivery.zig");
+    _ = @import("data/source_plan_http_wire.zig");
+}
+
+test "source checkpoint authority discovery" {
+    _ = @import("metadata/source_control.zig");
+    _ = @import("metadata/source_delivery.zig");
+}
+
+test "source checkpoint observation discovery" {
+    _ = @import("api/source_checkpoint_operations.zig");
+}
+
 test "index alias object runtime discovery" {
-    _ = @import("api/sql_execution.zig");
+    _ = @import("api/sql/execution/execution.zig");
     _ = @import("api/object_table_runtime.zig");
 }

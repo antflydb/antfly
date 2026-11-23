@@ -15,14 +15,205 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const kernel_math = @import("antfly_tile").native_math;
 const primitives = @import("primitives.zig");
 const gemm = @import("gemm_dispatch.zig");
 const pool = @import("pool.zig");
+
+pub const AttentionFamily = enum { flash_head_lane, segment_head, relative_head, relative_head_chunk, dense_online_rows };
+pub const AttentionProgramRecord = struct {
+    family: AttentionFamily = .flash_head_lane,
+    program_identity: usize = 0,
+    original_callback_identity: usize = 0,
+    entries: u64 = 0,
+    returns: u64 = 0,
+    error_returns: u64 = 0,
+    not_entered: u64 = 0,
+    last_error: ?anyerror = null,
+};
+pub const AttentionObservation = struct {
+    records: [8]AttentionProgramRecord = @splat(.{}),
+    count: u8 = 0,
+    submitted: u64 = 0,
+    entries: u64 = 0,
+    returns: u64 = 0,
+    error_returns: u64 = 0,
+    not_entered: u64 = 0,
+    unrecorded_events: u64 = 0,
+    unobserved_capacity_jobs: u64 = 0,
+    gemm_values: gemm.GemmObservation = .{},
+    fn add(self: *AttentionObservation, family: AttentionFamily, program: usize, original: usize, entered: bool, returned: bool, failure: ?anyerror, inner: gemm.GemmObservation) void {
+        self.submitted +|= 1;
+        self.entries +|= @intFromBool(entered);
+        self.returns +|= @intFromBool(returned);
+        self.error_returns +|= @intFromBool(returned and failure != null);
+        self.not_entered +|= @intFromBool(!entered);
+        self.gemm_values.merge(inner);
+        var found: ?*AttentionProgramRecord = null;
+        for (self.records[0..self.count]) |*item| if (item.family == family and item.program_identity == program and item.original_callback_identity == original) {
+            found = item;
+            break;
+        };
+        if (found == null) {
+            if (self.count == self.records.len) {
+                self.unrecorded_events +|= 1;
+                return;
+            }
+            found = &self.records[self.count];
+            self.count += 1;
+            found.?.* = .{ .family = family, .program_identity = program, .original_callback_identity = original };
+        }
+        found.?.entries +|= @intFromBool(entered);
+        found.?.returns +|= @intFromBool(returned);
+        found.?.not_entered +|= @intFromBool(!entered);
+        if (returned) if (failure) |err| {
+            found.?.error_returns +|= 1;
+            found.?.last_error = err;
+        };
+    }
+};
+const AttentionValueEntry = *const fn (*anyopaque, *gemm.GemmObservation) void;
+const AttentionValueSlot = struct {
+    original: pool.Job,
+    value_entry: ?AttentionValueEntry,
+    inner: gemm.GemmObservation = .{},
+    entered: bool = false,
+    returned: bool = false,
+    fn run(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.entered = true;
+        defer self.returned = true;
+        if (self.value_entry) |function| function(self.original.ctx, &self.inner) else self.original.fn_ptr(self.original.ctx);
+    }
+};
+fn attentionContextError(ctx: anytype) ?anyerror {
+    const Context = @TypeOf(ctx);
+    if (comptime @hasField(Context, "failure")) return ctx.failure;
+    if (comptime @hasField(Context, "err")) return ctx.err;
+    if (comptime @hasField(Context, "cancelled")) return if (ctx.cancelled) error.Canceled else null;
+    return null;
+}
+// This enabled-only body has bounded private slots. All original context data
+// fields and default pool calls remain unchanged. The old pool drains before
+// any private/context result is read, including cancellation/error returns.
+// A synchronous scheduler cannot cancel. Keep its metadata path nonfallible
+// so enabling values does not widen the public sync relative-attention API.
+noinline fn dispatchAttentionValues(comptime uses_io: bool, io: if (uses_io) std.Io else void, jobs: []const pool.Job, contexts: anytype, family: AttentionFamily, program_identity: usize, values: ?AttentionValueEntry, out: *AttentionObservation) (if (uses_io) std.Io.Cancelable!void else void) {
+    if (jobs.len > pool.max_workers or jobs.len != contexts.len) {
+        out.submitted +|= jobs.len;
+        out.unobserved_capacity_jobs +|= jobs.len;
+        if (comptime uses_io) try pool.dispatchJobsIo(io, jobs) else pool.dispatchJobs(jobs);
+        return;
+    }
+    var slots: [pool.max_workers]AttentionValueSlot = undefined;
+    var forwarded: [pool.max_workers]pool.Job = undefined;
+    for (jobs, 0..) |job, i| {
+        slots[i] = .{ .original = job, .value_entry = values };
+        forwarded[i] = .{ .fn_ptr = AttentionValueSlot.run, .ctx = &slots[i] };
+    }
+    defer for (slots[0..jobs.len], contexts) |slot, ctx| out.add(family, program_identity, @intFromPtr(slot.original.fn_ptr), slot.entered, slot.returned, attentionContextError(ctx), slot.inner);
+    if (comptime uses_io) try pool.dispatchJobsIo(io, forwarded[0..jobs.len]) else pool.dispatchJobs(forwarded[0..jobs.len]);
+}
+noinline fn singleAttentionValue(comptime Context: type, ctx: *Context, callback: *const fn (*anyopaque) void, value_entry: ?AttentionValueEntry, family: AttentionFamily, program_identity: usize, out: *AttentionObservation) void {
+    var slot = AttentionValueSlot{ .original = .{ .fn_ptr = callback, .ctx = ctx }, .value_entry = value_entry };
+    AttentionValueSlot.run(&slot);
+    out.add(family, program_identity, @intFromPtr(callback), slot.entered, slot.returned, attentionContextError(ctx.*), slot.inner);
+}
+const SequentialGemm = struct {
+    pub const sgemmSync = gemm.sgemmSequential;
+    pub const sgemmTransBSync = gemm.sgemmTransBSequential;
+    pub const sgemmSyncValue = gemm.sgemmSequentialValue;
+    pub const sgemmTransBSyncValue = gemm.sgemmTransBSequentialValue;
+};
+inline fn attentionGemm(comptime observing: bool, comptime transposed: bool, comptime Gemm: type, m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32, values: if (observing) *gemm.GemmObservation else void) void {
+    const plain = if (transposed) "sgemmTransBSync" else "sgemmSync";
+    if (comptime !observing) return @field(Gemm, plain)(m, n, k, alpha, a, b, beta, c);
+    const measured = if (transposed) "sgemmTransBSyncValue" else "sgemmSyncValue";
+    if (comptime @hasDecl(Gemm, measured)) @field(Gemm, measured)(m, n, k, alpha, a, b, beta, c, values) else {
+        @field(Gemm, plain)(m, n, k, alpha, a, b, beta, c);
+        values.unobserved_callback_returns +|= 1;
+    }
+}
 
 const vec_len = primitives.vec_len;
 const F32xN = @Vector(vec_len, f32);
 const BLOCK_Q: usize = 64;
 const BLOCK_KV: usize = 256;
+
+/// One aligned owner for the score tile and two disjoint row-stat planes.
+/// Both flash schedules retain their arithmetic and per-lane slice extents.
+const FlashScratch = struct {
+    storage: []align(64) f32,
+    scores: []f32,
+    row_max: []f32,
+    row_sum: []f32,
+
+    inline fn init(allocator: std.mem.Allocator, score_count: usize, row_count: usize) !FlashScratch {
+        const mask: usize = 64 / @sizeOf(f32) - 1;
+        const row_max_offset = (std.math.add(usize, score_count, mask) catch return error.InvalidAttentionShape) & ~mask;
+        const row_stride = (std.math.add(usize, row_count, mask) catch return error.InvalidAttentionShape) & ~mask;
+        const row_sum_offset = std.math.add(usize, row_max_offset, row_stride) catch return error.InvalidAttentionShape;
+        const count = std.math.add(usize, row_sum_offset, row_count) catch return error.InvalidAttentionShape;
+        const storage = try allocator.alignedAlloc(f32, .@"64", count);
+        return .{ .storage = storage, .scores = storage[0..score_count], .row_max = storage[row_max_offset..][0..row_count], .row_sum = storage[row_sum_offset..][0..row_count] };
+    }
+};
+
+/// Admitted online-softmax row schedules. Maximum reduction, empty-tile handling,
+/// output scaling and store order are numerical/performance policies, not models.
+pub const OnlineRowSchedule = enum { flash, segment, dense };
+
+/// In-place probability tile and running output/statistics update. Callers own
+/// disjoint score/output/stat planes, GEMM boundaries, cancellation and scratch.
+pub inline fn updateOnlineRow(comptime schedule: OnlineRowSchedule, scores: []f32, output: []f32, maximum: *f32, sum: *f32) void {
+    // Dense evaluates the prior maximum before its SIMD tile reduction.
+    const prior_max = if (schedule == .dense) maximum.* else 0;
+    var block_max: f32 = -std.math.inf(f32);
+    switch (schedule) {
+        .flash => for (scores) |score| {
+            if (score > block_max) block_max = score;
+        },
+        .segment => for (scores) |score| {
+            block_max = @max(block_max, score);
+        },
+        .dense => block_max = denseRowMax(scores),
+    }
+    const old_max = if (schedule == .dense) prior_max else maximum.*;
+    const new_max = @max(old_max, block_max);
+    if (schedule != .dense and new_max == -std.math.inf(f32)) {
+        @memset(scores, 0);
+        return;
+    }
+    if (sum.* != 0 and (schedule != .dense or new_max != old_max)) {
+        const rescale = @exp(old_max - new_max);
+        if (schedule == .dense or rescale != 1.0) {
+            switch (schedule) {
+                .flash => {
+                    const r_splat: F32xN = @splat(rescale);
+                    var d: usize = 0;
+                    while (d + vec_len <= output.len) : (d += vec_len) {
+                        const ov: F32xN = output[d..][0..vec_len].*;
+                        output[d..][0..vec_len].* = ov * r_splat;
+                    }
+                    while (d < output.len) : (d += 1) output[d] *= rescale;
+                },
+                .segment => for (output) |*value| {
+                    value.* *= rescale;
+                },
+                .dense => denseScaleRow(output, rescale),
+            }
+            sum.* *= rescale;
+        }
+    }
+    if (schedule == .flash) {
+        const block_sum = primitives.expSubtractAndSum(scores, new_max);
+        maximum.* = new_max;
+        sum.* += block_sum;
+    } else {
+        sum.* += primitives.expSubtractAndSum(scores, new_max);
+        maximum.* = new_max;
+    }
+}
 
 /// T5 relative position bucket computation.
 /// Maps a relative position (key_pos - query_pos) to a bucket index.
@@ -64,6 +255,18 @@ pub fn t5RelativePositionBucket(relative_position: i64, num_buckets_: usize, max
 /// for token index `tok`. Tokens with position 0 are identity (cos 0 = 1,
 /// sin 0 = 0) so padded slots are left unchanged.
 pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, consecutive_pairs: bool) void {
+    const Positions = struct {
+        values: []const usize,
+        pub inline fn positionAt(self: @This(), chunk: usize) usize {
+            return self.values[chunk];
+        }
+    };
+    ropeCoreWithPositions(output, Positions{ .values = positions }, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
+}
+
+/// The position source is a static policy. Formula-backed layouts avoid a
+/// temporary position array while sharing the exact rotation and cache order.
+pub fn ropeCoreWithPositions(output: []f32, positions: anytype, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, consecutive_pairs: bool) void {
     const total_tokens = output.len / head_dim;
     const half = rope_dim / 2;
     const head_half = head_dim / 2;
@@ -78,7 +281,7 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
     };
     var previous_position: ?usize = null;
     for (0..total_tokens) |tok| {
-        const pos = positions[tok];
+        const pos = positions.positionAt(tok);
         const base = tok * head_dim;
         if (cached and (previous_position == null or previous_position.? != pos)) {
             for (0..half) |j| {
@@ -96,8 +299,9 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
             const idx1 = if (consecutive_pairs) 2 * j + 1 else j + head_half;
             const x0 = output[base + idx0];
             const x1 = output[base + idx1];
-            output[base + idx0] = x0 * cos_val - x1 * sin_val;
-            output[base + idx1] = x0 * sin_val + x1 * cos_val;
+            const operands = .{ .value = x0, .other = x1, .cosine = cos_val, .sine = sin_val };
+            output[base + idx0] = (comptime kernel_math.rotary(false)).evaluate(struct {}, operands);
+            output[base + idx1] = (comptime kernel_math.rotary(true)).evaluate(struct {}, operands);
         }
     }
 }
@@ -138,34 +342,61 @@ pub fn flashCausalAttentionHost(
     num_kv_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    _ = try hostAttentionShape(Q.len, K.len, V.len, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
-    var workspace = try FlashCausalAttentionWorkspace.init(allocator, batch, q_seq_len, kv_seq_len, num_heads, head_dim);
-    errdefer allocator.free(workspace.output);
-    defer allocator.free(workspace.scratch);
-    return flashCausalAttentionHostWithWorkspace(&workspace, Q, K, V, bias, attn_or_mask, sliding_window, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
+    // Preserve ordinary refusal before allocating output or workspace.
+    const shape = try hostAttentionShape(Q.len, K.len, V.len, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
+    const plan = try FlashCausalWorkspace.init(q_seq_len, kv_seq_len, head_dim);
+    const output = try allocator.alloc(f32, shape.q_expected);
+    errdefer allocator.free(output);
+    const workspace = try allocator.alignedAlloc(f32, .@"64", plan.floats);
+    defer allocator.free(workspace);
+    try flashCausalAttentionHostInto(Q, K, V, bias, attn_or_mask, sliding_window, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim, output, workspace);
+    return output;
 }
+
+/// Exact original flash tiles plus disjoint row statistics and head packs.
+/// One workspace is reused across batches/heads, matching the original loop.
+pub const FlashCausalWorkspace = struct {
+    floats: usize,
+    score_count: usize,
+    row_max_offset: usize,
+    row_sum_offset: usize,
+    q_offset: usize,
+    k_offset: usize,
+    v_offset: usize,
+    out_offset: usize,
+    bq: usize,
+    bkv: usize,
+    pub fn init(query_rows: usize, key_rows: usize, dim: usize) !@This() {
+        if (dim == 0) return error.InvalidAttentionShape;
+        const bq = @min(BLOCK_Q, query_rows);
+        const bkv = @min(BLOCK_KV, key_rows);
+        const scores = try std.math.mul(usize, bq, bkv);
+        const row_max = (try std.math.add(usize, scores, 15)) & ~@as(usize, 15);
+        const row_sum = try std.math.add(usize, row_max, (try std.math.add(usize, bq, 15)) & ~@as(usize, 15));
+        const q = try std.math.add(usize, row_sum, bq);
+        const k = try std.math.add(usize, q, try std.math.mul(usize, bq, dim));
+        const v = try std.math.add(usize, k, try std.math.mul(usize, bkv, dim));
+        const out = try std.math.add(usize, v, try std.math.mul(usize, bkv, dim));
+        return .{ .floats = try std.math.add(usize, out, try std.math.mul(usize, bq, dim)), .score_count = scores, .row_max_offset = row_max, .row_sum_offset = row_sum, .q_offset = q, .k_offset = k, .v_offset = v, .out_offset = out, .bq = bq, .bkv = bkv };
+    }
+};
 
 /// Prepared on the calling thread; execution never touches the allocator.
 /// Each concurrent attention invocation must have an exclusive workspace.
 pub const FlashCausalAttentionWorkspace = struct {
     output: []f32,
-    scratch: []f32,
+    scratch: []align(64) f32,
 
     pub fn init(allocator: std.mem.Allocator, batch: usize, q_len: usize, kv_len: usize, heads: usize, dim: usize) !@This() {
         if (heads == 0 or dim == 0) return error.InvalidAttentionShape;
         const output_len = try std.math.mul(usize, try std.math.mul(usize, batch, q_len), try std.math.mul(usize, heads, dim));
         const output = try allocator.alloc(f32, output_len);
         errdefer allocator.free(output);
-        return .{ .output = output, .scratch = try allocator.alloc(f32, try scratchLength(q_len, kv_len, dim)) };
+        return .{ .output = output, .scratch = try allocator.alignedAlloc(f32, .@"64", try scratchLength(q_len, kv_len, dim)) };
     }
 
     fn scratchLength(q_len: usize, kv_len: usize, dim: usize) !usize {
-        const bq: usize = @min(BLOCK_Q, q_len);
-        const bkv: usize = @min(BLOCK_KV, kv_len);
-        const tile = try std.math.mul(usize, bq, bkv);
-        const rows = try std.math.mul(usize, 2, bq);
-        const packs = try std.math.mul(usize, try std.math.mul(usize, 2, try std.math.add(usize, bq, bkv)), dim);
-        return std.math.add(usize, try std.math.add(usize, tile, rows), packs);
+        return (try FlashCausalWorkspace.init(q_len, kv_len, dim)).floats;
     }
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -174,7 +405,8 @@ pub const FlashCausalAttentionWorkspace = struct {
     }
 };
 
-/// Allocation-free variant with borrowed output, invalidated by workspace reuse.
+/// Borrowed-output adapter over the same original tiled numerical program.
+/// The returned output is invalidated by reuse of this exclusive workspace.
 pub fn flashCausalAttentionHostWithWorkspace(
     workspace: *FlashCausalAttentionWorkspace,
     Q: []const f32,
@@ -193,6 +425,31 @@ pub fn flashCausalAttentionHostWithWorkspace(
     head_dim: usize,
 ) ![]f32 {
     const shape = try hostAttentionShape(Q.len, K.len, V.len, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
+    if (workspace.output.len != shape.q_expected or workspace.scratch.len != try FlashCausalAttentionWorkspace.scratchLength(q_seq_len, kv_seq_len, head_dim)) return error.InvalidAttentionWorkspace;
+    try flashCausalAttentionHostInto(Q, K, V, bias, attn_or_mask, sliding_window, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim, workspace.output, workspace.scratch);
+    return workspace.output;
+}
+
+/// Allocation-free original tiled causal schedule. All validation precedes writes.
+pub fn flashCausalAttentionHostInto(
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    attn_or_mask: ?[]const u8,
+    sliding_window: usize,
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    output: []f32,
+    workspace: []align(64) f32,
+) !void {
+    const shape = try hostAttentionShape(Q.len, K.len, V.len, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
     const H_q = shape.h_q;
     const H_kv = shape.h_kv;
     const heads_per_group = shape.heads_per_group;
@@ -200,26 +457,33 @@ pub fn flashCausalAttentionHostWithWorkspace(
     const mask_seq_len = shape.mask_seq_len;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-    if (workspace.output.len != q_expected or workspace.scratch.len != try FlashCausalAttentionWorkspace.scratchLength(q_seq_len, kv_seq_len, head_dim)) return error.InvalidAttentionWorkspace;
-    const output = workspace.output;
+    const plan = try FlashCausalWorkspace.init(q_seq_len, kv_seq_len, head_dim);
+    if (output.len != q_expected or workspace.len < plan.floats) return error.InvalidAttentionShape;
+    const used = workspace[0..plan.floats];
+    const Alias = struct {
+        fn overlaps(a: []const f32, b: []const f32) bool {
+            return @intFromPtr(a.ptr) < @intFromPtr(b.ptr) + b.len * 4 and @intFromPtr(b.ptr) < @intFromPtr(a.ptr) + a.len * 4;
+        }
+    };
+    for ([_][]const f32{ Q, K, V, bias orelse &.{} }) |input| {
+        if (Alias.overlaps(input, output) or Alias.overlaps(input, used)) return error.InvalidAttentionAlias;
+    }
+    if (Alias.overlaps(output, used)) return error.InvalidAttentionAlias;
+    if (attn_or_mask) |mask| {
+        const output_bytes = std.mem.sliceAsBytes(output);
+        const scratch_bytes = std.mem.sliceAsBytes(used);
+        if ((@intFromPtr(mask.ptr) < @intFromPtr(output_bytes.ptr) + output_bytes.len and @intFromPtr(output_bytes.ptr) < @intFromPtr(mask.ptr) + mask.len) or (@intFromPtr(mask.ptr) < @intFromPtr(scratch_bytes.ptr) + scratch_bytes.len and @intFromPtr(scratch_bytes.ptr) < @intFromPtr(mask.ptr) + mask.len)) return error.InvalidAttentionAlias;
+    }
     @memset(output, 0.0);
-    const bq: usize = @min(BLOCK_Q, q_seq_len);
-    const bkv: usize = @min(BLOCK_KV, kv_seq_len);
-    var rest = workspace.scratch;
-    const score_tile = rest[0 .. bq * bkv];
-    rest = rest[score_tile.len..];
-    const row_max = rest[0..bq];
-    rest = rest[bq..];
-    const row_sum = rest[0..bq];
-    rest = rest[bq..];
-    const q_pack = rest[0 .. bq * head_dim];
-    rest = rest[q_pack.len..];
-    const k_pack = rest[0 .. bkv * head_dim];
-    rest = rest[k_pack.len..];
-    const v_pack = rest[0 .. bkv * head_dim];
-    rest = rest[v_pack.len..];
-    const out_pack = rest;
-
+    const bq = plan.bq;
+    const bkv = plan.bkv;
+    const score_tile = used[0..plan.score_count];
+    const row_max = used[plan.row_max_offset..][0..bq];
+    const row_sum = used[plan.row_sum_offset..][0..bq];
+    const q_pack = used[plan.q_offset..][0 .. bq * head_dim];
+    const k_pack = used[plan.k_offset..][0 .. bkv * head_dim];
+    const v_pack = used[plan.v_offset..][0 .. bkv * head_dim];
+    const out_pack = used[plan.out_offset..][0 .. bq * head_dim];
     for (0..batch) |b| {
         for (0..num_heads) |h| {
             const kv_h = h / heads_per_group;
@@ -298,39 +562,7 @@ pub fn flashCausalAttentionHostWithWorkspace(
                     for (0..cur_bq) |qi_local| {
                         const out_row = out_pack[qi_local * head_dim ..][0..head_dim];
 
-                        var block_max: f32 = -std.math.inf(f32);
-                        for (0..cur_bkv) |ki_local| {
-                            const s = score_tile[qi_local * cur_bkv + ki_local];
-                            if (s > block_max) block_max = s;
-                        }
-
-                        const old_max = row_max[qi_local];
-                        const new_max = @max(old_max, block_max);
-                        if (new_max == -std.math.inf(f32)) {
-                            @memset(score_tile[qi_local * cur_bkv ..][0..cur_bkv], 0.0);
-                            continue;
-                        }
-
-                        if (row_sum[qi_local] != 0.0) {
-                            const rescale = @exp(old_max - new_max);
-                            if (rescale != 1.0) {
-                                const r_splat: F32xN = @splat(rescale);
-                                var d: usize = 0;
-                                while (d + vec_len <= head_dim) : (d += vec_len) {
-                                    const ov: F32xN = out_row[d..][0..vec_len].*;
-                                    out_row[d..][0..vec_len].* = ov * r_splat;
-                                }
-                                while (d < head_dim) : (d += 1) {
-                                    out_row[d] *= rescale;
-                                }
-                                row_sum[qi_local] *= rescale;
-                            }
-                        }
-
-                        const score_row = score_tile[qi_local * cur_bkv ..][0..cur_bkv];
-                        const block_sum = primitives.expSubtractAndSum(score_row, new_max);
-                        row_max[qi_local] = new_max;
-                        row_sum[qi_local] += block_sum;
+                        updateOnlineRow(.flash, score_tile[qi_local * cur_bkv ..][0..cur_bkv], out_row, &row_max[qi_local], &row_sum[qi_local]);
                     }
 
                     // Batched V projection: out_pack[bq, hd] += score_tile[bq, bkv] @ V_pack[bkv, hd].
@@ -366,8 +598,6 @@ pub fn flashCausalAttentionHostWithWorkspace(
             }
         }
     }
-
-    return output;
 }
 
 fn mul3(a: usize, b: usize, c: usize) ?usize {
@@ -482,6 +712,12 @@ pub fn flashAttentionHostWithIo(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
+    return flashAttentionHostBody(false, allocator, io, Q, K, V, bias, mask, batch, seq_len, num_heads, head_dim, {});
+}
+pub fn flashAttentionHostWithIoObserved(allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, bias: ?[]const f32, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| flashAttentionHostBody(true, allocator, io, Q, K, V, bias, mask, batch, seq_len, num_heads, head_dim, out) else flashAttentionHostBody(false, allocator, io, Q, K, V, bias, mask, batch, seq_len, num_heads, head_dim, {});
+}
+inline fn flashAttentionHostBody(comptime observing: bool, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, bias: ?[]const f32, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, observation: if (observing) *AttentionObservation else void) ![]f32 {
     if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
     const expected = std.math.mul(usize, std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape, H) catch return error.InvalidAttentionShape;
@@ -503,12 +739,11 @@ pub fn flashAttentionHostWithIo(
     const lanes = if (io != null and seq_len >= 256) @min(head_count, @min(pool.max_workers, @max(1, pool.cachedCpuCount()))) else 1;
     const bq: usize = @min(BLOCK_Q, seq_len);
     const bkv: usize = @min(BLOCK_KV, seq_len);
-    const score_tile = try allocator.alloc(f32, std.math.mul(usize, try std.math.mul(usize, bq, bkv), lanes) catch return error.InvalidAttentionShape);
-    defer allocator.free(score_tile);
-    const row_max = try allocator.alloc(f32, bq * lanes);
-    defer allocator.free(row_max);
-    const row_sum = try allocator.alloc(f32, bq * lanes);
-    defer allocator.free(row_sum);
+    const scratch = try FlashScratch.init(allocator, std.math.mul(usize, try std.math.mul(usize, bq, bkv), lanes) catch return error.InvalidAttentionShape, try std.math.mul(usize, bq, lanes));
+    defer allocator.free(scratch.storage);
+    const score_tile = scratch.scores;
+    const row_max = scratch.row_max;
+    const row_sum = scratch.row_sum;
 
     var contexts: [pool.max_workers]FlashHeadWork = undefined;
     var jobs: [pool.max_workers]pool.Job = undefined;
@@ -521,9 +756,9 @@ pub fn flashAttentionHostWithIo(
         job.* = .{ .fn_ptr = FlashHeadWork.run, .ctx = ctx };
     }
     if (io) |handle| {
-        try pool.dispatchJobsIo(handle, jobs[0..lanes]);
+        if (comptime observing) try dispatchAttentionValues(true, handle, jobs[0..lanes], contexts[0..lanes], .flash_head_lane, @intFromPtr(&FlashHeadWork.runValue), FlashHeadWork.runValue, observation) else try pool.dispatchJobsIo(handle, jobs[0..lanes]);
         try handle.checkCancel();
-    } else FlashHeadWork.run(&contexts[0]);
+    } else if (comptime observing) singleAttentionValue(FlashHeadWork, &contexts[0], FlashHeadWork.run, FlashHeadWork.runValue, .flash_head_lane, @intFromPtr(&FlashHeadWork.runValue), observation) else FlashHeadWork.run(&contexts[0]);
     for (contexts[0..lanes]) |ctx| if (ctx.cancelled) return error.Canceled;
 
     return output;
@@ -550,7 +785,21 @@ const FlashHeadWork = struct {
     row_max: []f32,
     row_sum: []f32,
     cancelled: bool = false,
-    fn run(raw: *anyopaque) void {
+    const run = if (builtin.cpu.arch.isWasm()) runUnaligned else runAligned;
+    fn runUnaligned(raw: *anyopaque) void {
+        runBodyShared(false, raw, {});
+    }
+    fn runAligned(raw: *anyopaque) align(64) void {
+        runBodyShared(false, raw, {});
+    }
+    const runValue = if (builtin.cpu.arch.isWasm()) runValueUnaligned else runValueAligned;
+    noinline fn runValueUnaligned(raw: *anyopaque, values: *gemm.GemmObservation) void {
+        runBodyShared(true, raw, values);
+    }
+    noinline fn runValueAligned(raw: *anyopaque, values: *gemm.GemmObservation) align(64) void {
+        runBodyShared(true, raw, values);
+    }
+    inline fn runBodyShared(comptime observing: bool, raw: *anyopaque, values: if (observing) *gemm.GemmObservation else void) void {
         const self: *FlashHeadWork = @ptrCast(@alignCast(raw));
         const Q = self.Q;
         const K = self.K;
@@ -625,7 +874,7 @@ const FlashHeadWork = struct {
                     // the GEMM, so we drop a `* scale` per (qi, ki).
                     const q_block = Q[bh_offset + q_start * head_dim ..][0 .. cur_bq * head_dim];
                     const k_block = K[bh_offset + kv_start * head_dim ..][0 .. cur_bkv * head_dim];
-                    gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, q_block, k_block, 0.0, score_tile[0 .. cur_bq * cur_bkv]);
+                    attentionGemm(observing, true, SequentialGemm, cur_bq, cur_bkv, head_dim, scale, q_block, k_block, 0.0, score_tile[0 .. cur_bq * cur_bkv], values);
 
                     // Add position bias if provided.
                     if (bias) |bdata| if (bias_offset) |off| {
@@ -659,41 +908,7 @@ const FlashHeadWork = struct {
                         const qi = q_start + qi_local;
                         const out_ptr = output[bh_offset + qi * head_dim ..][0..head_dim];
 
-                        var block_max: f32 = -std.math.inf(f32);
-                        for (0..cur_bkv) |ki_local| {
-                            const s = score_tile[qi_local * cur_bkv + ki_local];
-                            if (s > block_max) block_max = s;
-                        }
-
-                        const old_max = row_max[qi_local];
-                        const new_max = @max(old_max, block_max);
-                        if (new_max == -std.math.inf(f32)) {
-                            // All scores -inf for this row → zero its score_row
-                            // so the deferred GEMM contributes nothing.
-                            @memset(score_tile[qi_local * cur_bkv ..][0..cur_bkv], 0.0);
-                            continue;
-                        }
-
-                        if (row_sum[qi_local] != 0.0) {
-                            const rescale = @exp(old_max - new_max);
-                            if (rescale != 1.0) {
-                                const r_splat: F32xN = @splat(rescale);
-                                var d: usize = 0;
-                                while (d + vec_len <= head_dim) : (d += vec_len) {
-                                    const ov: F32xN = out_ptr[d..][0..vec_len].*;
-                                    out_ptr[d..][0..vec_len].* = ov * r_splat;
-                                }
-                                while (d < head_dim) : (d += 1) {
-                                    out_ptr[d] *= rescale;
-                                }
-                                row_sum[qi_local] *= rescale;
-                            }
-                        }
-
-                        const score_row = score_tile[qi_local * cur_bkv ..][0..cur_bkv];
-                        const block_sum = primitives.expSubtractAndSum(score_row, new_max);
-                        row_max[qi_local] = new_max;
-                        row_sum[qi_local] += block_sum;
+                        updateOnlineRow(.flash, score_tile[qi_local * cur_bkv ..][0..cur_bkv], out_ptr, &row_max[qi_local], &row_sum[qi_local]);
                     }
 
                     // V projection: out[bq, hd] += score_tile[bq, bkv] @
@@ -704,7 +919,7 @@ const FlashHeadWork = struct {
                     // per-row rescale above has already prepared `out`.
                     const out_block = output[bh_offset + q_start * head_dim ..][0 .. cur_bq * head_dim];
                     const v_block = V[bh_offset + kv_start * head_dim ..][0 .. cur_bkv * head_dim];
-                    gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, 1.0, score_tile[0 .. cur_bq * cur_bkv], v_block, 1.0, out_block);
+                    attentionGemm(observing, false, SequentialGemm, cur_bq, head_dim, cur_bkv, 1.0, score_tile[0 .. cur_bq * cur_bkv], v_block, 1.0, out_block, values);
 
                     kv_start = kv_end;
                 }
@@ -781,7 +996,7 @@ pub fn segmentAttentionHostWithGemm(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, null, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null);
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, null, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
 }
 
 /// Independent heads share immutable inputs and use caller-preallocated scratch.
@@ -802,44 +1017,45 @@ pub fn segmentAttentionHostWithGemmParallelIo(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null);
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
+}
+pub fn segmentAttentionHostWithGemmParallelIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(false, true, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, out) else segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
 }
 
 /// Serial heads with cancellation between bounded GEMM tiles. A threaded
 /// system BLAS owns parallelism; scratch remains independent of head count.
 pub fn segmentAttentionHostWithGemmSerialIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null);
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
+}
+pub fn segmentAttentionHostWithGemmSerialIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(false, true, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, out) else segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
 }
 
 /// Compact grouped K/V, reusing one packed K/V head across its query heads.
 /// Threaded BLAS owns parallelism; no expanded [keys, query_heads, dim] tensors.
+pub fn segmentAttentionGroupedBf16HostWithGemmIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(true, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+}
+pub fn segmentAttentionGroupedBf16HostWithGemmIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(true, true, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, out) else segmentAttentionHostWithGemmImpl(true, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+}
+
 pub fn segmentAttentionGroupedHostWithGemmIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale);
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+}
+pub fn segmentAttentionGroupedHostWithGemmIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(false, true, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, out) else segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
 }
 
 pub fn segmentAttentionGroupedHostWithGemmParallelIo(comptime Gemm: type, allocator: std.mem.Allocator, io: std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale);
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+}
+pub fn segmentAttentionGroupedHostWithGemmParallelIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(false, true, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, out) else segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
 }
 
-fn segmentAttentionHostWithGemmImpl(
-    comptime Gemm: type,
-    allocator: std.mem.Allocator,
-    io: ?std.Io,
-    parallel: bool,
-    Q: []const f32,
-    K: []const f32,
-    V: []const f32,
-    ranges: []const u32,
-    query_positions: []const i32,
-    key_positions: []const i32,
-    window: u32,
-    queries: usize,
-    keys: usize,
-    num_heads: usize,
-    head_dim: usize,
-    num_kv_heads: usize,
-    score_scale: ?f32,
-) ![]f32 {
+fn segmentAttentionHostWithGemmImpl(comptime bf16_probability: bool, comptime observing: bool, comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, parallel: bool, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize, num_kv_heads: usize, score_scale: ?f32, observation: if (observing) *AttentionObservation else void) ![]f32 {
     const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
     const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
     if (num_kv_heads == 0 or num_heads % num_kv_heads != 0 or num_heads == 0 or head_dim == 0 or queries == 0 or keys == 0) return error.InvalidAttentionShape;
@@ -869,7 +1085,7 @@ fn segmentAttentionHostWithGemmImpl(
     defer allocator.free(ohs);
     const scores = try allocator.alloc(f32, score_count);
     defer allocator.free(scores);
-    const Head = SegmentHeadWork(Gemm);
+    const Head = SegmentHeadWork(Gemm, bf16_probability);
     if (parallel and io != null) {
         const handle = io.?;
         const heads = try allocator.alloc(Head, num_heads);
@@ -890,20 +1106,20 @@ fn segmentAttentionHostWithGemmImpl(
             ctx.* = .{ .pack_kv = false, .io = io, .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .KH = KH, .kv_h = h / (num_heads / num_kv_heads), .h = h, .scale = scale, .output = output, .qh = qhs[h * queries * head_dim ..][0 .. queries * head_dim], .kh = khs[(h / (num_heads / num_kv_heads)) * keys * head_dim ..][0 .. keys * head_dim], .vh = vhs[(h / (num_heads / num_kv_heads)) * keys * head_dim ..][0 .. keys * head_dim], .oh = ohs[h * queries * head_dim ..][0 .. queries * head_dim], .score_tile = scores[h * block_q * block_kv ..][0 .. block_q * block_kv] };
             job.* = .{ .fn_ptr = Head.run, .ctx = ctx };
         }
-        try pool.dispatchJobsIo(handle, jobs);
+        if (comptime observing) try dispatchAttentionValues(true, handle, jobs, heads, .segment_head, @intFromPtr(&Head.executeValue), Head.runValue, observation) else try pool.dispatchJobsIo(handle, jobs);
         for (heads) |head| if (head.failure) |err| return err;
         try handle.checkCancel();
     } else {
         for (0..num_heads) |h| {
             var ctx = Head{ .pack_kv = h % (num_heads / num_kv_heads) == 0, .io = io, .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .KH = KH, .kv_h = h / (num_heads / num_kv_heads), .h = h, .scale = scale, .output = output, .qh = qhs, .kh = khs, .vh = vhs, .oh = ohs, .score_tile = scores };
-            Head.run(&ctx);
+            if (comptime observing) singleAttentionValue(Head, &ctx, Head.run, Head.runValue, .segment_head, @intFromPtr(&Head.executeValue), observation) else Head.run(&ctx);
             if (ctx.failure) |err| return err;
         }
     }
     return output;
 }
 
-fn SegmentHeadWork(comptime Gemm: type) type {
+fn SegmentHeadWork(comptime Gemm: type, comptime bf16_probability: bool) type {
     const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
     const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
     return struct {
@@ -937,7 +1153,19 @@ fn SegmentHeadWork(comptime Gemm: type) type {
                 self.failure = err;
             };
         }
+        fn runValue(raw: *anyopaque, values: *gemm.GemmObservation) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.executeValue(values) catch |err| {
+                self.failure = err;
+            };
+        }
         fn execute(self: *@This()) !void {
+            return executeBody(false, self, {});
+        }
+        noinline fn executeValue(self: *@This(), values: *gemm.GemmObservation) !void {
+            return executeBody(true, self, values);
+        }
+        inline fn executeBody(comptime observing: bool, self: *@This(), values: if (observing) *gemm.GemmObservation else void) !void {
             const Q = self.Q;
             const K = self.K;
             const V = self.V;
@@ -1000,47 +1228,46 @@ fn SegmentHeadWork(comptime Gemm: type) type {
                 }
                 const q_block = qh[q_start * head_dim ..][0 .. cur_bq * head_dim];
                 const out_block = oh[q_start * head_dim ..][0 .. cur_bq * head_dim];
-                for (intervals[0..merged]) |interval| {
-                    var kv_start: usize = interval[0];
-                    while (kv_start < interval[1]) {
-                        if (self.io) |io| try io.checkCancel();
-                        const kv_end = @min(kv_start + block_kv, interval[1]);
-                        const cur_bkv = kv_end - kv_start;
-                        const tile = score_tile[0 .. cur_bq * cur_bkv];
-                        Gemm.sgemmTransBSync(cur_bq, cur_bkv, head_dim, scale, q_block, kh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 0.0, tile);
-                        for (0..cur_bq) |r| {
-                            const qi = q_start + r;
-                            const own = ranges[qi * 6 ..][0..6];
-                            const qp = query_positions[qi];
-                            const row = tile[r * cur_bkv ..][0..cur_bkv];
-                            if (window == std.math.maxInt(u32)) {
-                                maskSegmentRangeGaps(row, kv_start, own);
-                            } else {
-                                for (row, kv_start..) |*score, k| {
-                                    const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
-                                    const near = @abs(@as(i64, qp) - key_positions[k]) <= window;
-                                    if (!in_range or !near) score.* = -std.math.inf(f32);
+                // BF16 probability rounding must use the global maximum.
+                // Two passes retain tiled scratch instead of a dense score bank.
+                for (0..if (bf16_probability) @as(usize, 2) else 1) |pass| {
+                    for (intervals[0..merged]) |interval| {
+                        var kv_start: usize = interval[0];
+                        while (kv_start < interval[1]) {
+                            if (self.io) |io| try io.checkCancel();
+                            const kv_end = @min(kv_start + block_kv, interval[1]);
+                            const cur_bkv = kv_end - kv_start;
+                            const tile = score_tile[0 .. cur_bq * cur_bkv];
+                            attentionGemm(observing, true, Gemm, cur_bq, cur_bkv, head_dim, scale, q_block, kh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 0.0, tile, values);
+                            for (0..cur_bq) |r| {
+                                const qi = q_start + r;
+                                const own = ranges[qi * 6 ..][0..6];
+                                const qp = query_positions[qi];
+                                const row = tile[r * cur_bkv ..][0..cur_bkv];
+                                if (window == std.math.maxInt(u32)) {
+                                    maskSegmentRangeGaps(row, kv_start, own);
+                                } else {
+                                    for (row, kv_start..) |*score, k| {
+                                        const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
+                                        const near = @abs(@as(i64, qp) - key_positions[k]) <= window;
+                                        if (!in_range or !near) score.* = -std.math.inf(f32);
+                                    }
                                 }
+                                if (comptime bf16_probability) {
+                                    if (pass == 0) {
+                                        for (row) |score| row_max[r] = @max(row_max[r], score);
+                                    } else {
+                                        for (row) |*score| {
+                                            const probability: f32 = if (row_max[r] == -std.math.inf(f32)) 0 else @exp(score.* - row_max[r]);
+                                            row_sum[r] += probability;
+                                            score.* = @import("antfly_tile").fexpr.roundBf16Value(probability);
+                                        }
+                                    }
+                                } else updateOnlineRow(.segment, row, out_block[r * head_dim ..][0..head_dim], &row_max[r], &row_sum[r]);
                             }
-                            var block_max: f32 = -std.math.inf(f32);
-                            for (row) |score| block_max = @max(block_max, score);
-                            const new_max = @max(row_max[r], block_max);
-                            if (new_max == -std.math.inf(f32)) {
-                                @memset(row, 0);
-                                continue;
-                            }
-                            if (row_sum[r] != 0) {
-                                const rescale = @exp(row_max[r] - new_max);
-                                if (rescale != 1.0) {
-                                    for (out_block[r * head_dim ..][0..head_dim]) |*o| o.* *= rescale;
-                                    row_sum[r] *= rescale;
-                                }
-                            }
-                            row_sum[r] += primitives.expSubtractAndSum(row, new_max);
-                            row_max[r] = new_max;
+                            if (!bf16_probability or pass != 0) attentionGemm(observing, false, Gemm, cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block, values);
+                            kv_start = kv_end;
                         }
-                        Gemm.sgemmSync(cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block);
-                        kv_start = kv_end;
                     }
                 }
                 for (0..cur_bq) |r| {
@@ -1504,13 +1731,32 @@ pub fn crossAttentionHost(
     head_dim: usize,
 ) ![]f32 {
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-
     const output = try allocator.alloc(f32, std.math.mul(usize, batch * dec_seq, H) catch return error.InvalidAttentionShape);
-    @memset(output, 0.0);
-
+    errdefer allocator.free(output);
     const scores = try allocator.alloc(f32, dec_seq * enc_seq);
     defer allocator.free(scores);
+    crossAttentionHostInto(Q, K, V, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim, output, scores);
+    return output;
+}
+
+/// Same synchronous arithmetic as crossAttentionHost. The caller validates and
+/// owns exact live input spans, output and one reusable query-by-key score span.
+pub fn crossAttentionHostInto(
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    enc_mask: []const i64,
+    batch: usize,
+    dec_seq: usize,
+    enc_seq: usize,
+    num_heads: usize,
+    head_dim: usize,
+    output: []f32,
+    scores: []f32,
+) void {
+    const H = num_heads * head_dim;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    @memset(output, 0.0);
 
     for (0..batch) |b| {
         for (0..num_heads) |h| {
@@ -1539,8 +1785,6 @@ pub fn crossAttentionHost(
             }
         }
     }
-
-    return output;
 }
 
 // Per-(batch, head) work unit for the disentangled attention.  A single job
@@ -1576,6 +1820,12 @@ const DebertaJobCtx = struct {
 };
 
 fn debertaDisentangledHead(ctx: *DebertaJobCtx) void {
+    relativeHeadBody(false, ctx, {});
+}
+noinline fn relativeHeadValue(ctx: *DebertaJobCtx, values: *gemm.GemmObservation) void {
+    relativeHeadBody(true, ctx, values);
+}
+inline fn relativeHeadBody(comptime observing: bool, ctx: *DebertaJobCtx, values: if (observing) *gemm.GemmObservation else void) void {
     const seq_len = ctx.seq_len;
     const H = ctx.H;
     const head_dim = ctx.head_dim;
@@ -1626,16 +1876,7 @@ fn debertaDisentangledHead(ctx: *DebertaJobCtx) void {
             // Content-to-content scores: Q @ K^T.  The relative DeBERTa
             // terms are index-shifted by (qi, ki), so they stay in the exact
             // scalar loop below while the dense term uses the SGEMM kernel.
-            gemm.sgemmTransBSequential(
-                cur_bq,
-                cur_bkv,
-                head_dim,
-                scale,
-                ctx.q_pack[0 .. cur_bq * head_dim],
-                k_block,
-                0.0,
-                ctx.score_tile[0 .. cur_bq * cur_bkv],
-            );
+            attentionGemm(observing, true, SequentialGemm, cur_bq, cur_bkv, head_dim, scale, ctx.q_pack[0 .. cur_bq * head_dim], k_block, 0.0, ctx.score_tile[0 .. cur_bq * cur_bkv], values);
 
             for (0..cur_bq) |qi_local| {
                 const qi = q_start + qi_local;
@@ -1695,16 +1936,7 @@ fn debertaDisentangledHead(ctx: *DebertaJobCtx) void {
                 ctx.row_sum[qi_local] += block_sum;
             }
 
-            gemm.sgemmSequential(
-                cur_bq,
-                head_dim,
-                cur_bkv,
-                1.0,
-                ctx.score_tile[0 .. cur_bq * cur_bkv],
-                v_block,
-                1.0,
-                ctx.out_pack[0 .. cur_bq * head_dim],
-            );
+            attentionGemm(observing, false, SequentialGemm, cur_bq, head_dim, cur_bkv, 1.0, ctx.score_tile[0 .. cur_bq * cur_bkv], v_block, 1.0, ctx.out_pack[0 .. cur_bq * head_dim], values);
 
             kv_start = kv_end;
         }
@@ -1744,6 +1976,12 @@ pub fn debertaDisentangledAttentionHost(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
+    return relativeAttentionHostBody(false, allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim, {});
+}
+pub fn relativeAttentionHostObserved(allocator: std.mem.Allocator, Q: []const f32, K: []const f32, V: []const f32, Q_r: []const f32, K_r: []const f32, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| relativeAttentionHostBody(true, allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim, out) else relativeAttentionHostBody(false, allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim, {});
+}
+inline fn relativeAttentionHostBody(comptime observing: bool, allocator: std.mem.Allocator, Q: []const f32, K: []const f32, V: []const f32, Q_r: []const f32, K_r: []const f32, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, observation: if (observing) *AttentionObservation else void) ![]f32 {
     if (batch == 0 or seq_len == 0) {
         return allocator.alloc(f32, 0);
     }
@@ -1842,7 +2080,7 @@ pub fn debertaDisentangledAttentionHost(
             for (0..num_heads) |h| {
                 ctx.b = b;
                 ctx.head_off = h * head_dim;
-                debertaDisentangledHead(&ctx);
+                if (comptime observing) observeRelativeHead(&ctx, observation) else debertaDisentangledHead(&ctx);
             }
         }
         return output;
@@ -1864,6 +2102,12 @@ pub fn debertaDisentangledAttentionHost(
         head_dim: usize,
 
         fn run(raw: *anyopaque) void {
+            runBody(false, raw, {});
+        }
+        fn runValue(raw: *anyopaque, values: *gemm.GemmObservation) void {
+            runBody(true, raw, values);
+        }
+        inline fn runBody(comptime measured: bool, raw: *anyopaque, values: if (measured) *gemm.GemmObservation else void) void {
             const cc: *@This() = @ptrCast(@alignCast(raw));
             var local = cc.outer.*;
             var off: usize = 0;
@@ -1884,11 +2128,24 @@ pub fn debertaDisentangledAttentionHost(
             while (idx < cc.b_end) : (idx += 1) {
                 local.b = idx / cc.num_heads;
                 local.head_off = (idx % cc.num_heads) * cc.head_dim;
-                debertaDisentangledHead(&local);
+                if (comptime measured) relativeHeadValue(&local, values) else debertaDisentangledHead(&local);
             }
         }
     };
 
+    if (comptime builtin.is_test) {
+        const OriginalChunk = struct {
+            outer: *const DebertaJobCtx,
+            b_start: usize,
+            b_end: usize, // (b, head) range expressed as flat indices into [0, total_jobs)
+            scratch: []f32,
+            num_heads: usize,
+            head_dim: usize,
+        };
+        if (@sizeOf(ChunkCtx) != @sizeOf(OriginalChunk) or @alignOf(ChunkCtx) != @alignOf(OriginalChunk)) @compileError("disabled relative chunk gained metadata");
+        const legacy_run: *const fn (*anyopaque) void = ChunkCtx.run;
+        _ = legacy_run;
+    }
     var contexts: [pool.max_workers]ChunkCtx = undefined;
     var jobs: [pool.max_workers]pool.Job = undefined;
 
@@ -1931,7 +2188,7 @@ pub fn debertaDisentangledAttentionHost(
         jobs[num_jobs] = .{ .fn_ptr = ChunkCtx.run, .ctx = @ptrCast(&contexts[num_jobs]) };
         num_jobs += 1;
     }
-    pool.dispatchJobs(jobs[0..num_jobs]);
+    if (comptime observing) dispatchAttentionValues(false, {}, jobs[0..num_jobs], contexts[0..num_jobs], .relative_head_chunk, @intFromPtr(&ChunkCtx.runValue), ChunkCtx.runValue, observation) else pool.dispatchJobs(jobs[0..num_jobs]);
 
     return output;
 }
@@ -2048,7 +2305,8 @@ fn allowsFutureAttention(attn_or_mask: ?[]const u8, total_sequence_len: usize, q
 }
 
 fn allowsPastAttention(sliding_window: usize, query_pos: usize, key_pos: usize) bool {
-    if (key_pos > query_pos) return false;
+    // Future-key permission is checked independently by the causal/block mask.
+    if (key_pos > query_pos) return true;
     if (sliding_window == 0) return true;
     return query_pos - key_pos < sliding_window;
 }
@@ -2706,13 +2964,14 @@ test "segmentAttentionHost cancellation drains running parallel heads before scr
     const result = request.cancel(io);
     pending = false;
     try std.testing.expectError(error.Canceled, result);
-    // Cancellation may prevent queued heads from starting. Every BLAS call
-    // that did start must finish before its borrowed scratch is released.
-    const drained = lifecycle.finished.load(.acquire);
-    try std.testing.expect(drained > 0);
-    try std.testing.expectEqual(lifecycle.started.load(.acquire), drained);
+    // Cancellation may prevent queued heads from starting. The lifecycle
+    // contract is that every already-running BLAS call has finished before
+    // scratch is released, independent of the executor's available slots.
+    const started = lifecycle.started.load(.acquire);
+    try std.testing.expect(started > 0 and started <= 4);
+    try std.testing.expectEqual(started, lifecycle.finished.load(.acquire));
     try Case.run(io);
-    try std.testing.expectEqual(drained + 4, lifecycle.finished.load(.acquire));
+    try std.testing.expectEqual(started + 4, lifecycle.finished.load(.acquire));
 }
 
 test "segmentAttentionHost matches dense masked softmax with ranges, window, and fewer queries" {
@@ -3124,6 +3383,12 @@ test "segmentAttentionHost serial Io bounds scratch and cancels between BLAS til
 /// Narrow vision heads use bounded BLAS tiles and explicit portable SIMD row
 /// reductions. One head's reusable scratch keeps live storage linear in tokens.
 pub fn denseAttentionHostWithGemmIo(comptime Gemm: type, a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize) ![]f32 {
+    return denseAttentionHostBody(false, Gemm, a, io, q, k, v, batch, sequence, heads, dim, {});
+}
+pub fn denseAttentionHostWithGemmIoObserved(comptime Gemm: type, a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| denseAttentionHostBody(true, Gemm, a, io, q, k, v, batch, sequence, heads, dim, out) else denseAttentionHostBody(false, Gemm, a, io, q, k, v, batch, sequence, heads, dim, {});
+}
+inline fn denseAttentionHostBody(comptime observing: bool, comptime Gemm: type, a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize, observation: if (observing) *AttentionObservation else void) ![]f32 {
     if (batch == 0 or sequence == 0 or heads == 0 or dim == 0) return error.InvalidAttentionShape;
     const width = try std.math.mul(usize, heads, dim);
     const rows = try std.math.mul(usize, batch, sequence);
@@ -3162,9 +3427,9 @@ pub fn denseAttentionHostWithGemmIo(comptime Gemm: type, a: std.mem.Allocator, i
                 if (io) |runtime| try runtime.checkCancel();
                 const nk: usize = @min(bk, sequence - key);
                 const tile = scores[0 .. nq * nk];
-                Gemm.sgemmTransBSync(nq, nk, dim, scale, qh[first * dim ..][0 .. nq * dim], kh[key * dim ..][0 .. nk * dim], 0, tile);
-                try normalizeDenseTile(io, tile, dst, maxima[0..nq], sums[0..nq], nk, dim);
-                Gemm.sgemmSync(nq, dim, nk, 1, tile, vh[key * dim ..][0 .. nk * dim], 1, dst);
+                attentionGemm(observing, true, Gemm, nq, nk, dim, scale, qh[first * dim ..][0 .. nq * dim], kh[key * dim ..][0 .. nk * dim], 0, tile, if (comptime observing) &observation.gemm_values else {});
+                try normalizeDenseTile(observing, io, tile, dst, maxima[0..nq], sums[0..nq], nk, dim, observation);
+                attentionGemm(observing, false, Gemm, nq, dim, nk, 1, tile, vh[key * dim ..][0 .. nk * dim], 1, dst, if (comptime observing) &observation.gemm_values else {});
             }
             for (0..nq) |r| denseScaleRow(dst[r * dim ..][0..dim], 1 / sums[r]);
         }
@@ -3194,18 +3459,11 @@ const DenseTileRows = struct {
         for (self.first..self.last) |r| {
             if (self.io) |runtime| try runtime.checkCancel();
             const row = self.tile[r * self.keys ..][0..self.keys];
-            const next = @max(self.maxima[r], denseRowMax(row));
-            if (self.sums[r] != 0 and next != self.maxima[r]) {
-                const rescale = @exp(self.maxima[r] - next);
-                denseScaleRow(self.output[r * self.dim ..][0..self.dim], rescale);
-                self.sums[r] *= rescale;
-            }
-            self.sums[r] += primitives.expSubtractAndSum(row, next);
-            self.maxima[r] = next;
+            updateOnlineRow(.dense, row, self.output[r * self.dim ..][0..self.dim], &self.maxima[r], &self.sums[r]);
         }
     }
 };
-fn normalizeDenseTile(io: ?std.Io, tile: []f32, output: []f32, maxima: []f32, sums: []f32, keys: usize, dim: usize) !void {
+fn normalizeDenseTile(comptime observing: bool, io: ?std.Io, tile: []f32, output: []f32, maxima: []f32, sums: []f32, keys: usize, dim: usize, observation: if (observing) *AttentionObservation else void) !void {
     // BLAS has completed before these row workers start. Never nest workers
     // around threaded BLAS; switch the parallelism owner at tile boundaries.
     const workers: usize = if (io != null and maxima.len >= 128 and keys >= 256) 4 else 1;
@@ -3215,7 +3473,9 @@ fn normalizeDenseTile(io: ?std.Io, tile: []f32, output: []f32, maxima: []f32, su
         row.* = .{ .io = io, .tile = tile, .output = output, .maxima = maxima, .sums = sums, .keys = keys, .dim = dim, .first = maxima.len * index / workers, .last = maxima.len * (index + 1) / workers };
         job.* = .{ .fn_ptr = DenseTileRows.run, .ctx = row };
     }
-    if (workers == 1) DenseTileRows.run(&rows[0]) else try pool.dispatchJobsIo(io.?, jobs[0..workers]);
+    if (comptime observing) {
+        if (workers == 1) singleAttentionValue(DenseTileRows, &rows[0], DenseTileRows.run, null, .dense_online_rows, @intFromPtr(&DenseTileRows.run), observation) else try dispatchAttentionValues(true, io.?, jobs[0..workers], rows[0..workers], .dense_online_rows, @intFromPtr(&DenseTileRows.run), null, observation);
+    } else if (workers == 1) DenseTileRows.run(&rows[0]) else try pool.dispatchJobsIo(io.?, jobs[0..workers]);
     for (rows[0..workers]) |row| if (row.failure) |err| return err;
 }
 
@@ -3355,6 +3615,12 @@ test "embeddinggemma2 dense vision row workers drain cancellation before retry" 
 /// register-tiled SIMD GEMM. Pack once before dispatch; no nested GEMM workers.
 /// The existing head-major flash kernel owns online softmax and bounded tiles.
 pub fn denseAttentionPortableHostWithIo(a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize) ![]f32 {
+    return denseAttentionPortableHostBody(false, a, io, q, k, v, batch, sequence, heads, dim, {});
+}
+pub fn denseAttentionPortableHostWithIoObserved(a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| denseAttentionPortableHostBody(true, a, io, q, k, v, batch, sequence, heads, dim, out) else denseAttentionPortableHostBody(false, a, io, q, k, v, batch, sequence, heads, dim, {});
+}
+inline fn denseAttentionPortableHostBody(comptime observing: bool, a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize, observation: if (observing) *AttentionObservation else void) ![]f32 {
     if (batch == 0 or sequence == 0 or heads == 0 or dim == 0) return error.InvalidAttentionShape;
     const rows = try std.math.mul(usize, batch, sequence);
     const width = try std.math.mul(usize, heads, dim);
@@ -3375,7 +3641,7 @@ pub fn denseAttentionPortableHostWithIo(a: std.mem.Allocator, io: ?std.Io, q: []
             @memcpy(vh[dst..][0..dim], v[src..][0..dim]);
         }
     };
-    const headed = try flashAttentionHostWithIo(a, io, qh, kh, vh, null, &.{}, batch, sequence, heads, dim);
+    const headed = if (comptime observing) try flashAttentionHostBody(true, a, io, qh, kh, vh, null, &.{}, batch, sequence, heads, dim, observation) else try flashAttentionHostWithIo(a, io, qh, kh, vh, null, &.{}, batch, sequence, heads, dim);
     defer a.free(headed);
     const output = try a.alloc(f32, count);
     errdefer a.free(output);
@@ -3447,6 +3713,659 @@ test "embeddinggemma2 grouped shared KV workers drain allocation failure and can
     try Case.run(std.testing.allocator, std.testing.io);
 }
 
+test "RoPE formula position providers match explicit positions across cached and scalar geometries" {
+    const Formula = struct {
+        offset: usize,
+        calls: *usize,
+        pub fn positionAt(self: @This(), chunk: usize) usize {
+            self.calls.* += 1;
+            return self.offset + ((chunk / 2) % 3);
+        }
+    };
+    inline for (.{ .{ 8, 4 }, .{ 64, 64 }, .{ 520, 520 } }) |geometry| {
+        const head_dim = geometry[0];
+        const rope_dim = geometry[1];
+        inline for (.{ false, true }) |consecutive_pairs| {
+            for ([_]usize{ 0, 7 }) |offset| {
+                var explicit: [12]usize = undefined;
+                for (&explicit, 0..) |*value, chunk| value.* = offset + ((chunk / 2) % 3);
+                var expected: [12 * head_dim]f32 = undefined;
+                for (&expected, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 71)) / 17 - 2;
+                var actual = expected;
+                var calls: usize = 0;
+                ropeCore(&expected, &explicit, head_dim, rope_dim, 10000, 0.75, consecutive_pairs);
+                ropeCoreWithPositions(&actual, Formula{ .offset = offset, .calls = &calls }, head_dim, rope_dim, 10000, 0.75, consecutive_pairs);
+                try std.testing.expectEqual(@as(usize, 12), calls);
+                try std.testing.expectEqualSlices(f32, &expected, &actual);
+            }
+        }
+    }
+}
+
+noinline fn observeRelativeHead(ctx: *DebertaJobCtx, out: *AttentionObservation) void {
+    var inner: gemm.GemmObservation = .{};
+    relativeHeadValue(ctx, &inner);
+    out.add(.relative_head, @intFromPtr(&relativeHeadValue), @intFromPtr(&relativeHeadValue), true, true, ctx.err, inner);
+}
+
+fn attentionValueReturns(value: AttentionObservation) u64 {
+    var result: u64 = 0;
+    for (value.gemm_values.successful_leaf_returns) |count| result += count;
+    return result;
+}
+test "attention returned values preserve actual flash segment and dense worker schedules and bits" {
+    const a = std.testing.allocator;
+    const seq = 257;
+    const heads = 2;
+    const dim = 3;
+    var q: [seq * heads * dim]f32 = undefined;
+    var k: @TypeOf(q) = undefined;
+    var v: @TypeOf(q) = undefined;
+    for (&q, &k, &v, 0..) |*x, *y, *z, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i % 43))) * 0.25;
+        y.* = @cos(@as(f32, @floatFromInt(i % 31))) * 0.5;
+        z.* = @as(f32, @floatFromInt(i % 17)) / 19;
+    }
+    var flash_values: AttentionObservation = .{};
+    const flash = try flashAttentionHostWithIo(a, std.testing.io, &q, &k, &v, null, &.{}, 1, seq, heads, dim);
+    defer a.free(flash);
+    const flash_measured = try flashAttentionHostWithIoObserved(a, std.testing.io, &q, &k, &v, null, &.{}, 1, seq, heads, dim, &flash_values);
+    defer a.free(flash_measured);
+    try std.testing.expectEqualSlices(f32, flash, flash_measured);
+    try std.testing.expectEqual(flash_values.submitted, flash_values.entries);
+    try std.testing.expectEqual(flash_values.entries, flash_values.returns);
+    try std.testing.expectEqual(@as(u64, 0), flash_values.error_returns);
+    try std.testing.expectEqual(@as(u64, 0), flash_values.gemm_values.dispatched_workers);
+    try std.testing.expect(attentionValueReturns(flash_values) > 0);
+    try std.testing.expectEqual(@intFromPtr(&FlashHeadWork.runValue), flash_values.records[0].program_identity);
+    const ValueGemm = struct {
+        pub const query_block = 17;
+        pub const key_block = 23;
+        pub const sgemmSync = SequentialGemm.sgemmSync;
+        pub const sgemmTransBSync = SequentialGemm.sgemmTransBSync;
+        pub const sgemmSyncValue = SequentialGemm.sgemmSyncValue;
+        pub const sgemmTransBSyncValue = SequentialGemm.sgemmTransBSyncValue;
+    };
+    var ranges: [seq * 6]u32 = @splat(0);
+    const positions: [seq]i32 = @splat(0);
+    for (0..seq) |i| ranges[i * 6 + 1] = seq;
+    var segment_values: AttentionObservation = .{};
+    const segment = try segmentAttentionHostWithGemmParallelIo(ValueGemm, a, std.testing.io, &q, &k, &v, &ranges, &positions, &positions, std.math.maxInt(u32), seq, seq, heads, dim);
+    defer a.free(segment);
+    const segment_measured = try segmentAttentionHostWithGemmParallelIoObserved(ValueGemm, a, std.testing.io, &q, &k, &v, &ranges, &positions, &positions, std.math.maxInt(u32), seq, seq, heads, dim, &segment_values);
+    defer a.free(segment_measured);
+    try std.testing.expectEqualSlices(f32, segment, segment_measured);
+    try std.testing.expectEqual(@as(u64, heads), segment_values.submitted);
+    try std.testing.expectEqual(segment_values.submitted, segment_values.returns);
+    try std.testing.expect(attentionValueReturns(segment_values) > segment_values.submitted);
+    try std.testing.expectEqual(@intFromPtr(&SegmentHeadWork(ValueGemm, false).executeValue), segment_values.records[0].program_identity);
+    var dense_values: AttentionObservation = .{};
+    const dense = try denseAttentionHostWithGemmIo(SequentialGemm, a, std.testing.io, &q, &k, &v, 1, seq, heads, dim);
+    defer a.free(dense);
+    const dense_measured = try denseAttentionHostWithGemmIoObserved(SequentialGemm, a, std.testing.io, &q, &k, &v, 1, seq, heads, dim, &dense_values);
+    defer a.free(dense_measured);
+    try std.testing.expectEqualSlices(f32, dense, dense_measured);
+    try std.testing.expectEqual(@as(u64, 10), dense_values.submitted); // 4+1 row callbacks per head
+    try std.testing.expectEqual(dense_values.submitted, dense_values.returns);
+    try std.testing.expectEqual(@intFromPtr(&DenseTileRows.run), dense_values.records[0].program_identity);
+    try std.testing.expect(attentionValueReturns(dense_values) > 0);
+}
+test "attention relative program values preserve actual chunk or serial head arithmetic" {
+    const a = std.testing.allocator;
+    const seq = 128;
+    const heads = 4;
+    const dim = 32;
+    const count = seq * heads * dim;
+    const values = try a.alloc(f32, count);
+    defer a.free(values);
+    const relative = try a.alloc(f32, (2 * seq - 1) * heads * dim);
+    defer a.free(relative);
+    for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i % 67))) * 0.125;
+    for (relative, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i % 29))) * 0.25;
+    const mask: [seq]i64 = @splat(1);
+    const plain = try debertaDisentangledAttentionHost(a, values, values, values, relative, relative, &mask, 1, seq, heads, dim);
+    defer a.free(plain);
+    var observed: AttentionObservation = .{};
+    const measured = try relativeAttentionHostObserved(a, values, values, values, relative, relative, &mask, 1, seq, heads, dim, &observed);
+    defer a.free(measured);
+    try std.testing.expectEqualSlices(f32, plain, measured);
+    try std.testing.expect(observed.submitted > 0);
+    try std.testing.expectEqual(observed.entries, observed.returns);
+    try std.testing.expect(attentionValueReturns(observed) > 0);
+    try std.testing.expectEqual(@as(u64, 0), observed.gemm_values.dispatched_workers);
+}
+test "attention program values retain actual canceled body return without publishing unfinished work" {
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Cancel.check;
+    var io = std.testing.io;
+    io.vtable = &table;
+    var tile = [_]f32{1};
+    var output = [_]f32{0};
+    var maxima = [_]f32{-std.math.inf(f32)};
+    var sums = [_]f32{0};
+    var row = DenseTileRows{ .io = io, .tile = &tile, .output = &output, .maxima = &maxima, .sums = &sums, .keys = 1, .dim = 1, .first = 0, .last = 1 };
+    var observed: AttentionObservation = .{};
+    singleAttentionValue(DenseTileRows, &row, DenseTileRows.run, null, .dense_online_rows, @intFromPtr(&DenseTileRows.run), &observed);
+    try std.testing.expectEqual(error.Canceled, row.failure.?);
+    try std.testing.expectEqual(@as(u64, 1), observed.entries);
+    try std.testing.expectEqual(@as(u64, 1), observed.returns);
+    try std.testing.expectEqual(@as(u64, 1), observed.error_returns);
+    try std.testing.expectEqual(error.Canceled, observed.records[0].last_error.?);
+    try std.testing.expectEqual(@as(f32, 1), tile[0]);
+    try std.testing.expectEqual(@as(f32, 0), output[0]);
+}
+test "attention observed allocation failures retain original unwind and no hidden allocation" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const input = [_]f32{ 1, 0, 0, 1 };
+            var observed: AttentionObservation = .{};
+            const result = try flashAttentionHostWithIoObserved(a, null, &input, &input, &input, null, &.{}, 1, 2, 1, 2, &observed);
+            defer a.free(result);
+            try std.testing.expectEqual(@as(u64, 1), observed.entries);
+            try std.testing.expectEqual(@as(u64, 1), observed.returns);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+test "attention custom GEMM remains explicitly unobserved and bounded identity overflow is counted" {
+    const input = [_]f32{ 1, 0, 0, 1 };
+    var observed: AttentionObservation = .{};
+    const result = try denseAttentionHostWithGemmIoObserved(SegmentParallelTestGemm, std.testing.allocator, null, &input, &input, &input, 1, 2, 1, 2, &observed);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(u64, 2), observed.gemm_values.unobserved_callback_returns);
+    try std.testing.expectEqual(@as(u64, 0), attentionValueReturns(observed));
+    for (0..10) |i| observed.add(.segment_head, i + 1, i + 2, true, true, null, .{});
+    try std.testing.expectEqual(@as(u8, 8), observed.count);
+    try std.testing.expectEqual(@as(u64, 3), observed.unrecorded_events);
+}
+
+test "attention returned values publish only after actual canceled head workers drain" {
+    const Lifecycle = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        started: std.atomic.Value(usize) = .init(0),
+        finished: std.atomic.Value(usize) = .init(0),
+    };
+    const BlockingGemm = struct {
+        var lifecycle: *Lifecycle = undefined;
+        pub fn sgemmTransBSync(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+            _ = lifecycle.started.fetchAdd(1, .acq_rel);
+            lifecycle.entered.set(lifecycle.io);
+            // Model an already-running BLAS call, which cannot be interrupted.
+            lifecycle.release.waitUncancelable(lifecycle.io);
+            gemm.sgemmTransBSequential(m, n, k, alpha, a, b, beta, c);
+        }
+        pub fn sgemmSync(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+            gemm.sgemmSequential(m, n, k, alpha, a, b, beta, c);
+            _ = lifecycle.finished.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Case = struct {
+        fn run(io: std.Io, values: *AttentionObservation) !void {
+            const Q: [24]f32 = @splat(0.25);
+            const K: [36]f32 = @splat(-0.5);
+            const V: [36]f32 = @splat(0.75);
+            const output = try segmentAttentionHostWithGemmParallelIoObserved(BlockingGemm, std.testing.allocator, io, &Q, &K, &V, &.{ 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0 }, &.{ 0, 1 }, &.{ 0, 1, 2 }, std.math.maxInt(u32), 2, 3, 4, 3, values);
+            defer std.testing.allocator.free(output);
+            for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.75), value, 1e-6);
+        }
+        fn release(lifecycle: *Lifecycle) void {
+            std.Io.sleep(lifecycle.io, .fromMilliseconds(20), .awake) catch unreachable;
+            lifecycle.release.set(lifecycle.io);
+        }
+    };
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4), .concurrent_limit = .limited(8) });
+    defer runtime.deinit();
+    const io = runtime.io();
+    var lifecycle = Lifecycle{ .io = io };
+    BlockingGemm.lifecycle = &lifecycle;
+    var values: AttentionObservation = .{};
+    var request = try io.concurrent(Case.run, .{ io, &values });
+    var pending = true;
+    defer if (pending) {
+        lifecycle.release.set(io);
+        _ = request.cancel(io) catch {};
+    };
+    lifecycle.entered.waitUncancelable(io);
+    var releaser = try io.concurrent(Case.release, .{&lifecycle});
+    defer releaser.await(io);
+    const result = request.cancel(io);
+    pending = false;
+    try std.testing.expectError(error.Canceled, result);
+    // Cancellation may prevent queued heads from starting. The lifecycle
+    // contract is that every already-running BLAS call has finished before
+    // scratch is released, independent of the executor's available slots.
+    const started = lifecycle.started.load(.acquire);
+    try std.testing.expect(started > 0 and started <= 4);
+    try std.testing.expectEqual(started, lifecycle.finished.load(.acquire));
+    try std.testing.expectEqual(values.entries, values.returns);
+    try std.testing.expectEqual(@as(u64, 4), values.submitted);
+    try std.testing.expectEqual(values.submitted - values.entries, values.not_entered);
+    try std.testing.expect(values.returns >= started);
+    const canceled_entries = values.entries;
+    try Case.run(io, &values);
+    try std.testing.expectEqual(canceled_entries + 4, values.entries);
+    try std.testing.expectEqual(values.entries, values.returns);
+    try std.testing.expectEqual(started + 4, lifecycle.finished.load(.acquire));
+}
+
+test "attention value capacity refusal runs all original callbacks without changing scheduler" {
+    const Context = struct {
+        count: usize = 0,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var contexts: [pool.max_workers + 1]Context = @splat(.{});
+    var jobs: [contexts.len]pool.Job = undefined;
+    for (&contexts, &jobs) |*ctx, *job| job.* = .{ .fn_ptr = Context.run, .ctx = ctx };
+    var observed: AttentionObservation = .{};
+    dispatchAttentionValues(false, {}, &jobs, &contexts, .segment_head, @intFromPtr(&Context.run), null, &observed);
+    for (contexts) |ctx| try std.testing.expectEqual(@as(usize, 1), ctx.count);
+    try std.testing.expectEqual(@as(u64, contexts.len), observed.submitted);
+    try std.testing.expectEqual(@as(u64, contexts.len), observed.unobserved_capacity_jobs);
+    try std.testing.expectEqual(@as(u64, 0), observed.entries);
+}
+
+test "attention disabled worker contexts retain original sizes alignments and callback ABI" {
+    const OriginalFlash = struct {
+        io: ?std.Io,
+        Q: []const f32,
+        K: []const f32,
+        V: []const f32,
+        bias: ?[]const f32,
+        mask: []const i64,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        seq_sq: usize,
+        bias_shared_len: usize,
+        bias_batched_len: usize,
+        head_start: usize,
+        head_end: usize,
+        output: []f32,
+        score_tile: []f32,
+        row_max: []f32,
+        row_sum: []f32,
+        cancelled: bool = false,
+    };
+    try std.testing.expectEqual(@sizeOf(OriginalFlash), @sizeOf(FlashHeadWork));
+    try std.testing.expectEqual(@alignOf(OriginalFlash), @alignOf(FlashHeadWork));
+    const OriginalSegment = struct {
+        io: ?std.Io = null,
+        failure: ?anyerror = null,
+        Q: []const f32,
+        K: []const f32,
+        V: []const f32,
+        ranges: []const u32,
+        query_positions: []const i32,
+        key_positions: []const i32,
+        window: u32,
+        queries: usize,
+        keys: usize,
+        head_dim: usize,
+        H: usize,
+        KH: usize,
+        kv_h: usize,
+        pack_kv: bool = true,
+        h: usize,
+        scale: f32,
+        output: []f32,
+        qh: []f32,
+        kh: []f32,
+        vh: []f32,
+        oh: []f32,
+        score_tile: []f32,
+    };
+    try std.testing.expectEqual(@sizeOf(OriginalSegment), @sizeOf(SegmentHeadWork(SequentialGemm, false)));
+    try std.testing.expectEqual(@alignOf(OriginalSegment), @alignOf(SegmentHeadWork(SequentialGemm, false)));
+    const OriginalRelative = struct {
+        Q: []const f32,
+        K: []const f32,
+        V: []const f32,
+        Q_r: []const f32,
+        K_r: []const f32,
+        mask: []const i64,
+        output: []f32,
+        score_tile: []f32, // per-job scratch [BLOCK_Q * BLOCK_KV]
+        q_pack: []f32,
+        k_pack: []f32,
+        v_pack: []f32,
+        out_pack: []f32,
+        row_max: []f32,
+        row_sum: []f32,
+        seq_len: usize,
+        H: usize,
+        head_dim: usize,
+        scale: f32,
+        b: usize,
+        head_off: usize,
+        err: ?anyerror = null,
+    };
+    try std.testing.expectEqual(@sizeOf(OriginalRelative), @sizeOf(DebertaJobCtx));
+    try std.testing.expectEqual(@alignOf(OriginalRelative), @alignOf(DebertaJobCtx));
+    const OriginalDense = struct {
+        io: ?std.Io,
+        tile: []f32,
+        output: []f32,
+        maxima: []f32,
+        sums: []f32,
+        keys: usize,
+        dim: usize,
+        first: usize,
+        last: usize,
+        failure: ?anyerror = null,
+    };
+    try std.testing.expectEqual(@sizeOf(OriginalDense), @sizeOf(DenseTileRows));
+    try std.testing.expectEqual(@alignOf(OriginalDense), @alignOf(DenseTileRows));
+    const legacy_flash: *const fn (*anyopaque) void = FlashHeadWork.run;
+    const legacy_rows: *const fn (*anyopaque) void = DenseTileRows.run;
+    const Head = SegmentHeadWork(SequentialGemm, false);
+    const legacy_segment: *const fn (*Head) anyerror!void = Head.execute;
+    const legacy_relative: *const fn (*DebertaJobCtx) void = debertaDisentangledHead;
+    _ = legacy_flash;
+    _ = legacy_rows;
+    _ = legacy_segment;
+    _ = legacy_relative;
+}
+
+test "attention synchronous observed relative API preserves original noncancelable error set" {
+    const plain_result = @typeInfo(@TypeOf(debertaDisentangledAttentionHost)).@"fn".return_type.?;
+    const observed_result = @typeInfo(@TypeOf(relativeAttentionHostObserved)).@"fn".return_type.?;
+    const PlainErrors = @typeInfo(plain_result).error_union.error_set;
+    const ObservedErrors = @typeInfo(observed_result).error_union.error_set;
+    const Contract = struct {
+        // These noinline functions are called below, so both bodies must be
+        // analyzed with their complete parameter error sets. Distinct inferred
+        // type identities are allowed; either extra error member is rejected.
+        noinline fn observedToPlain(value: ObservedErrors) PlainErrors {
+            return value;
+        }
+        noinline fn plainToObserved(value: PlainErrors) ObservedErrors {
+            return value;
+        }
+    };
+    try std.testing.expectEqual(@as(PlainErrors, error.OutOfMemory), Contract.observedToPlain(Contract.plainToObserved(error.OutOfMemory)));
+    try std.testing.expectEqual(@as(ObservedErrors, error.OutOfMemory), Contract.plainToObserved(Contract.observedToPlain(error.OutOfMemory)));
+    const Context = struct {
+        calls: usize = 0,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var context = [_]Context{.{}};
+    const jobs = [_]pool.Job{.{ .fn_ptr = Context.run, .ctx = &context[0] }};
+    var values: AttentionObservation = .{};
+    const result: void = dispatchAttentionValues(false, {}, &jobs, &context, .relative_head_chunk, @intFromPtr(&Context.run), null, &values);
+    _ = result;
+    try std.testing.expectEqual(@as(usize, 1), context[0].calls);
+    try std.testing.expectEqual(@as(u64, 1), values.entries);
+    try std.testing.expectEqual(@as(u64, 1), values.returns);
+}
+
+fn originalFlashCausalForDeclaredTest(
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    attn_or_mask: ?[]const u8,
+    sliding_window: usize,
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    if (num_kv_heads == 0 or num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+    if (num_heads % num_kv_heads != 0) return error.InvalidAttentionShape;
+    const H_q = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const H_kv = std.math.mul(usize, num_kv_heads, head_dim) catch return error.InvalidAttentionShape;
+    const heads_per_group = num_heads / num_kv_heads;
+    const q_expected = std.math.mul(usize, std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape, H_q) catch return error.InvalidAttentionShape;
+    const kv_expected = std.math.mul(usize, std.math.mul(usize, batch, kv_seq_len) catch return error.InvalidAttentionShape, H_kv) catch return error.InvalidAttentionShape;
+    if (Q.len != q_expected or K.len != kv_expected or V.len != kv_expected) return error.InvalidAttentionShape;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const query_end = std.math.add(usize, query_position_offset, q_seq_len) catch return error.InvalidAttentionShape;
+    const kv_total_end = std.math.add(usize, kv_position_offset, kv_seq_len) catch return error.InvalidAttentionShape;
+    const mask_seq_len = @max(query_end, kv_total_end);
+
+    const output_elems = std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape;
+    const output = try allocator.alloc(f32, std.math.mul(usize, output_elems, H_q) catch return error.InvalidAttentionShape);
+    errdefer allocator.free(output);
+    @memset(output, 0.0);
+
+    const bq = @min(BLOCK_Q, q_seq_len);
+    const bkv = @min(BLOCK_KV, kv_seq_len);
+    const scratch = try FlashScratch.init(allocator, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape, bq);
+    defer allocator.free(scratch.storage);
+    const score_tile = scratch.scores;
+    const row_max = scratch.row_max;
+    const row_sum = scratch.row_sum;
+
+    // Q/K/V are token-major here (each token packs all heads contiguously),
+    // so the per-head rows are strided by H_q/H_kv.  The register-tiled SGEMM
+    // expects contiguous matrices, so we pack each head's current Q-/K-/V-
+    // block into scratch buffers, run the GEMM, then scatter the packed
+    // output rows back to the strided `output` at the end of each Q-block.
+    // Packing cost: cur_bq + 2*cur_bkv head_dim-sized memcpys per K-block,
+    // which is < 2% of the GEMM work it enables.
+    const q_pack = try allocator.alloc(f32, bq * head_dim);
+    defer allocator.free(q_pack);
+    const k_pack = try allocator.alloc(f32, bkv * head_dim);
+    defer allocator.free(k_pack);
+    const v_pack = try allocator.alloc(f32, bkv * head_dim);
+    defer allocator.free(v_pack);
+    const out_pack = try allocator.alloc(f32, bq * head_dim);
+    defer allocator.free(out_pack);
+
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            const kv_h = h / heads_per_group;
+            var q_start: usize = 0;
+            while (q_start < q_seq_len) {
+                const q_end = @min(q_start + BLOCK_Q, q_seq_len);
+                const cur_bq = q_end - q_start;
+
+                for (0..cur_bq) |r| {
+                    row_max[r] = -std.math.inf(f32);
+                    row_sum[r] = 0.0;
+                }
+
+                // Pack Q for this head's Q-block into a contiguous tile.
+                // Q is token-major so each Q row is at stride H_q in memory.
+                for (0..cur_bq) |qi_local| {
+                    const qi = q_start + qi_local;
+                    const src = Q[(b * q_seq_len + qi) * H_q + h * head_dim ..][0..head_dim];
+                    @memcpy(q_pack[qi_local * head_dim ..][0..head_dim], src);
+                }
+                // Packed output accumulator for this Q-block; scattered back
+                // to `output` at the end.
+                @memset(out_pack[0 .. cur_bq * head_dim], 0.0);
+
+                var kv_start: usize = 0;
+                while (kv_start < kv_seq_len) {
+                    const kv_end = @min(kv_start + BLOCK_KV, kv_seq_len);
+                    const cur_bkv = kv_end - kv_start;
+
+                    // Pack K and V for this K-block (one head's slab) into
+                    // contiguous tiles so the GEMM kernel's register tiling
+                    // can reuse each K/V row across all Q rows in the block.
+                    for (0..cur_bkv) |ki_local| {
+                        const ki = kv_start + ki_local;
+                        const k_src = K[(b * kv_seq_len + ki) * H_kv + kv_h * head_dim ..][0..head_dim];
+                        const v_src = V[(b * kv_seq_len + ki) * H_kv + kv_h * head_dim ..][0..head_dim];
+                        @memcpy(k_pack[ki_local * head_dim ..][0..head_dim], k_src);
+                        @memcpy(v_pack[ki_local * head_dim ..][0..head_dim], v_src);
+                    }
+
+                    // QK^T as a single register-tiled GEMM with prescaled Q
+                    // (alpha=scale folds the per-cell `* scale` into the
+                    // matmul, dropping cur_bq*cur_bkv scalar muls).
+                    gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, q_pack[0 .. cur_bq * head_dim], k_pack[0 .. cur_bkv * head_dim], 0.0, score_tile[0 .. cur_bq * cur_bkv]);
+
+                    if (bias) |bias_data| {
+                        for (0..cur_bq) |qi_local| {
+                            const qi = q_start + qi_local;
+                            const query_pos = query_position_offset + qi;
+                            for (0..cur_bkv) |ki_local| {
+                                const ki = kv_start + ki_local;
+                                const key_pos = kv_position_offset + ki;
+                                if (causalBiasValue(bias_data, b, h, qi, query_pos, ki, key_pos, batch, q_seq_len, kv_seq_len, mask_seq_len, num_heads)) |bias_value| {
+                                    score_tile[qi_local * cur_bkv + ki_local] += bias_value;
+                                }
+                            }
+                        }
+                    }
+
+                    for (0..cur_bq) |qi_local| {
+                        const query_pos = query_position_offset + q_start + qi_local;
+                        for (0..cur_bkv) |ki_local| {
+                            const key_pos = kv_position_offset + kv_start + ki_local;
+                            if ((key_pos > query_pos and !allowsFutureAttention(attn_or_mask, mask_seq_len, query_pos, key_pos)) or
+                                !allowsPastAttention(sliding_window, query_pos, key_pos))
+                            {
+                                score_tile[qi_local * cur_bkv + ki_local] = -std.math.inf(f32);
+                            }
+                        }
+                    }
+
+                    // Streaming softmax: per Q-row, find block max, rescale
+                    // out_pack, then turn score_row into exp(score - new_max).
+                    // V projection is deferred to a single batched GEMM after
+                    // the loop (see below).
+                    for (0..cur_bq) |qi_local| {
+                        const out_row = out_pack[qi_local * head_dim ..][0..head_dim];
+
+                        updateOnlineRow(.flash, score_tile[qi_local * cur_bkv ..][0..cur_bkv], out_row, &row_max[qi_local], &row_sum[qi_local]);
+                    }
+
+                    // Batched V projection: out_pack[bq, hd] += score_tile[bq, bkv] @ V_pack[bkv, hd].
+                    gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, 1.0, score_tile[0 .. cur_bq * cur_bkv], v_pack[0 .. cur_bkv * head_dim], 1.0, out_pack[0 .. cur_bq * head_dim]);
+
+                    kv_start = kv_end;
+                }
+
+                // Scatter packed output back to the strided `output`,
+                // applying the final 1/row_sum normalization in the same
+                // pass to avoid an extra memory sweep.
+                for (0..cur_bq) |qi_local| {
+                    const qi = q_start + qi_local;
+                    const dst = output[(b * q_seq_len + qi) * H_q + h * head_dim ..][0..head_dim];
+                    const src = out_pack[qi_local * head_dim ..][0..head_dim];
+                    if (row_sum[qi_local] != 0.0) {
+                        const inv_sum = 1.0 / row_sum[qi_local];
+                        const inv_splat: F32xN = @splat(inv_sum);
+                        var d: usize = 0;
+                        while (d + vec_len <= head_dim) : (d += vec_len) {
+                            const sv: F32xN = src[d..][0..vec_len].*;
+                            dst[d..][0..vec_len].* = sv * inv_splat;
+                        }
+                        while (d < head_dim) : (d += 1) {
+                            dst[d] = src[d] * inv_sum;
+                        }
+                    } else {
+                        @memcpy(dst, src);
+                    }
+                }
+
+                q_start = q_end;
+            }
+        }
+    }
+
+    return output;
+}
+
+fn declaredCausalIntoCase(a: std.mem.Allocator) !void {
+    for ([_]usize{ 1, 2, 3, 65, 257 }) |rows| {
+        const width = 4;
+        const q = try a.alloc(f32, rows * width);
+        defer a.free(q);
+        const k = try a.alloc(f32, rows * width);
+        defer a.free(k);
+        const v = try a.alloc(f32, rows * width);
+        defer a.free(v);
+        for (q, k, v, 0..) |*qq, *kk, *vv, i| {
+            qq.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) / 16;
+            kk.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 8;
+            vv.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) / 4;
+        }
+        const expected = try originalFlashCausalForDeclaredTest(a, q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2);
+        defer a.free(expected);
+        const plan = try FlashCausalWorkspace.init(rows, rows, 2);
+        const scratch = try a.alignedAlloc(f32, .@"64", plan.floats);
+        defer a.free(scratch);
+        const result = try a.alloc(f32, q.len);
+        defer a.free(result);
+        try flashCausalAttentionHostInto(q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2, result, scratch);
+        try std.testing.expectEqualSlices(f32, expected, result);
+        // Independent scalar F64 causal dot/softmax/value oracle, including
+        // both original query and key tile boundaries with nonzero data.
+        for (0..rows) |row| for (0..2) |head| {
+            var maximum: f64 = -std.math.inf(f64);
+            for (0..row + 1) |key| {
+                var dot: f64 = 0;
+                for (0..2) |d| dot += @as(f64, q[row * width + head * 2 + d]) * k[key * width + head * 2 + d];
+                maximum = @max(maximum, dot / @sqrt(@as(f64, 2)));
+            }
+            var denominator: f64 = 0;
+            var sums = [_]f64{ 0, 0 };
+            for (0..row + 1) |key| {
+                var dot: f64 = 0;
+                for (0..2) |d| dot += @as(f64, q[row * width + head * 2 + d]) * k[key * width + head * 2 + d];
+                const weight = @exp(dot / @sqrt(@as(f64, 2)) - maximum);
+                denominator += weight;
+                for (0..2) |d| sums[d] += weight * v[key * width + head * 2 + d];
+            }
+            for (0..2) |d| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(sums[d] / denominator)), result[row * width + head * 2 + d], 0.00001);
+        };
+        @memset(result, 77);
+        try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHostInto(q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2, result, scratch[0 .. scratch.len - 1]));
+        for (result) |value| try std.testing.expectEqual(@as(f32, 77), value);
+        try std.testing.expectError(error.InvalidAttentionAlias, flashCausalAttentionHostInto(q, k, v, null, null, 0, 1, rows, rows, 0, 0, 2, 2, 2, q, scratch));
+    }
+}
+test "declared causal Into preserves frozen tiled arithmetic scalar oracle and short workspace refusal at both tile boundaries" {
+    try declaredCausalIntoCase(std.testing.allocator);
+}
+test "declared causal allocation and original oracle unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, declaredCausalIntoCase, .{});
+}
+
+test "ordinary causal attention retains frozen empty query and empty key compatibility without widening assigned descriptors" {
+    const a = std.testing.allocator;
+    const values = [_]f32{ 1, -2, 3, -4 };
+    for ([_][2]usize{ .{ 0, 2 }, .{ 2, 0 }, .{ 0, 0 } }) |shape| {
+        const q = values[0 .. shape[0] * 2];
+        const kv = values[0 .. shape[1] * 2];
+        const original = try originalFlashCausalForDeclaredTest(a, q, kv, kv, null, null, 0, 1, shape[0], shape[1], 0, 0, 1, 1, 2);
+        defer a.free(original);
+        const ordinary = try flashCausalAttentionHost(a, q, kv, kv, null, null, 0, 1, shape[0], shape[1], 0, 0, 1, 1, 2);
+        defer a.free(ordinary);
+        try std.testing.expectEqualSlices(f32, original, ordinary);
+        const plan = try FlashCausalWorkspace.init(shape[0], shape[1], 2);
+        const workspace = try a.alignedAlloc(f32, .@"64", plan.floats);
+        defer a.free(workspace);
+        const assigned = try a.alloc(f32, q.len);
+        defer a.free(assigned);
+        try flashCausalAttentionHostInto(q, kv, kv, null, null, 0, 1, shape[0], shape[1], 0, 0, 1, 1, 2, assigned, workspace);
+        try std.testing.expectEqualSlices(f32, original, assigned);
+    }
+}
+
 test "prepared host attention workspace reuses scratch without retaining previous values" {
     const a = std.testing.allocator;
     var workspace = try FlashCausalAttentionWorkspace.init(a, 1, 2, 2, 1, 1);
@@ -3463,4 +4382,47 @@ test "prepared host attention workspace reuses scratch without retaining previou
 test "host attention validates shape before allocating workspace" {
     try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHost(std.testing.failing_allocator, &.{1}, &.{1}, &.{1}, null, null, 0, 1, 1, 1, 0, 0, 0, 0, 1));
     try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHost(std.testing.failing_allocator, &.{1}, &.{1}, &.{1}, null, null, 0, 1, 2, 1, 0, 0, 1, 1, 1));
+}
+
+test "BF16 segment probabilities use global maxima across tiles and preserve empty rows" {
+    const a = std.testing.allocator;
+    const Tiny = struct {
+        pub const query_block = 1;
+        pub const key_block = 2;
+        pub const sgemmTransBSync = gemm.sgemmTransBSequential;
+        pub const sgemmSync = gemm.sgemmSequential;
+    };
+    const q = [_]f32{ 1, -1, 0, 1 };
+    const k = [_]f32{ 0, 1, 4, 2, -1 };
+    const v = [_]f32{ 1, -8, 2, 3, -2 };
+    const ranges = [_]u32{ 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const out = try segmentAttentionGroupedBf16HostWithGemmIo(Tiny, a, null, &q, &k, &v, &ranges, &.{ 0, 1 }, &.{ 0, 1, 2, 3, 4 }, std.math.maxInt(u32), 2, 5, 2, 1, 1, 1);
+    defer a.free(out);
+    for (0..2) |head| {
+        const maximum: f32 = if (head == 0) 4 else 1;
+        var numerator: f32 = 0;
+        var denominator: f32 = 0;
+        for (k, v) |key, value| {
+            const probability = @exp(q[head] * key - maximum);
+            denominator += probability;
+            numerator += @import("antfly_tile").fexpr.roundBf16Value(probability) * value;
+        }
+        try std.testing.expectApproxEqAbs(numerator / denominator, out[head], 1e-6);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, out[2..]);
+}
+
+test "causal attention block visibility keeps allowed future keys in the sliding overlay" {
+    const a = std.testing.allocator;
+    const zero = [_]f32{ 0, 0, 0 };
+    const values = [_]f32{ 2, 4, 8 };
+    const mask = [_]u8{ 0, 1, 0, 0, 0, 0, 0, 0, 0 };
+    for ([_]usize{ 0, 2 }) |window| {
+        const actual = try flashCausalAttentionHost(a, &zero, &zero, &values, null, &mask, window, 1, 3, 3, 0, 0, 1, 1, 1);
+        defer a.free(actual);
+        // Uniform scores: row zero sees self and the explicitly allowed next
+        // key; the window clips only old keys, never that future permission.
+        const expected = [_]f32{ 3, 3, if (window == 0) @as(f32, 14) / 3 else 6 };
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
 }

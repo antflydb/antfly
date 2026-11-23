@@ -89,6 +89,7 @@ pub const DenseNativeStoragePhase = table_manager.DenseNativeStoragePhase;
 pub const SchemaProgressRecord = table_manager.SchemaProgressRecord;
 pub const RestoreProgressRecord = table_manager.RestoreProgressRecord;
 pub const ReplicationSourceStatusRecord = table_manager.ReplicationSourceStatusRecord;
+pub const CapturedNativeSnapshotPage = table_manager.CapturedNativeSnapshotPage;
 pub const ShuffleJoinLeaseRecord = table_manager.ShuffleJoinLeaseRecord;
 pub const StoreObservation = store_observer.StoreObservation;
 pub const PlacementStatusTag = store_observer.PlacementStatusTag;

@@ -54,7 +54,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test "data runtime commit requirements activate prepared effects before source admission" {
     const protocol = @import("common/data_raft_protocol.zig");
     const direct: @import("antfly_local_sources").storage_db_selected_root.db.types.BatchRequest = .{ .commit_requires = .direct_enrichments };
-    try std.testing.expectEqual(protocol.batch_prepared_enrichments_protocol_version, runtime.DataServer.requiredRaftBatchProtocolVersion(direct));
+    try std.testing.expectEqual(protocol.batch_prepared_enrichments_protocol_version, try runtime.DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, direct));
     const a = std.testing.allocator;
     try std.testing.expectError(error.InvalidBatchRequest, raft_batch.encode(a, "docs", direct));
     var prepared = direct;
@@ -62,5 +62,5 @@ test "data runtime commit requirements activate prepared effects before source a
     const encoded = try raft_batch.encode(a, "docs", prepared);
     defer a.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "prepared-enrichments-batch-v1") != null);
-    try std.testing.expectEqual(protocol.batch_prepared_enrichments_protocol_version, runtime.DataServer.requiredRaftBatchProtocolVersion(prepared));
+    try std.testing.expectEqual(protocol.batch_prepared_enrichments_protocol_version, try runtime.DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, prepared));
 }

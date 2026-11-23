@@ -22,6 +22,9 @@ import argparse
 from pathlib import Path
 
 
+SOURCE_AXIAL_COMMENT = "\n// Source axial inverse frequencies: original Gemma4VisionRotaryEmbedding,\n// Transformers5.19 source edc123ab83fbb25548ec65536eaecee998c088653adf683be3ef69d62e2bfea9,\n// original pinned config b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3.\n// Captured on CPU Torch2.14.1; original default-F32 constructor bits also\n// match pinned Torch2.13.0+cu130, including the actual BF16-loaded model's\n// F32 vision inv_freq buffer. Device trigonometric receiving remains pending.\n"
+
+
 def render(model: Path) -> str:
     import torch
     from transformers import EmbeddingGemma2Config
@@ -29,9 +32,8 @@ def render(model: Path) -> str:
         EmbeddingGemma2RotaryEmbedding,
     )
 
-    config = EmbeddingGemma2Config.from_pretrained(
-        model, local_files_only=True
-    ).text_config
+    whole_config = EmbeddingGemma2Config.from_pretrained(model, local_files_only=True)
+    config = whole_config.text_config
     rotary = EmbeddingGemma2RotaryEmbedding(config, device="cpu")
     result = [
         "// Copyright 2026 Antfly, Inc.",
@@ -87,6 +89,21 @@ def render(model: Path) -> str:
             "",
         ]
     )
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionRotaryEmbedding
+    vision = whole_config.vision_config
+    if vision.head_dim != 64 or vision.rope_parameters != {"rope_theta": 100.0, "rope_type": "axial"}:
+        raise ValueError("unsupported source axial frequency geometry")
+    axial, factor = Gemma4VisionRotaryEmbedding.compute_axial_rope_parameters(vision, device="cpu")
+    if axial.dtype != torch.float32 or axial.numel() != 16 or factor != 1.0:
+        raise ValueError("invalid source axial frequency metadata")
+    # Original local capture used Torch2.14.1; validation on another version
+    # MUST compare actual original-function bits, never substitute generic pow.
+    result.extend(SOURCE_AXIAL_COMMENT.lstrip("\n").splitlines())
+    result.append("static __device__ __constant__ unsigned int antfly_rotary_axis32_theta100_bits[16] = {")
+    axial_bits = axial.view(torch.int32).tolist()
+    for offset in range(0, 16, 8):
+        result.append("    " + ", ".join(f"0x{value:08x}u" for value in axial_bits[offset:offset+8]) + ",")
+    result.extend(["};", ""])
     return "\n".join(result)
 
 
@@ -97,7 +114,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=Path(__file__).resolve().parents[2]
-        / "src/ops/cuda/kernels/embedding_gemma2_training_rope.cuh",
+        / "src/ops/cuda/kernels/rotary_frequency_training.cuh",
     )
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args()
@@ -108,7 +125,7 @@ def main() -> None:
         raise SystemExit(
             "training RoPE constants differ from the pinned reference initialization"
         )
-    print("official training RoPE: 384 FP32 frequencies verified")
+    print("official RoPE: 384 training and 16 source axial FP32 frequencies verified")
 
 
 if __name__ == "__main__":

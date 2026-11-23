@@ -37,15 +37,17 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
     const storage: @import("../common/table_storage.zig").Settings = req.storage orelse .{};
     const min_ranges = if (storage.engine == .object) 0 else req.num_shards orelse 1;
     return .{
+        .sql_persistence = req.sql_persistence,
         .storage = storage,
         .table_id = deriveId(table_name, 0x54424c45),
         .name = table_name,
         .description = req.description orelse "",
         .schema_json = effectiveSchemaJson(req.schema_json),
         .indexes_json = req.indexes_json orelse default_indexes_json,
+        .sql_native_indexes_json = req.sql_native_indexes_json orelse "",
         .replication_sources_json = req.replication_sources_json orelse "[]",
         .placement_role = "data",
-        .desired_replica_count = if (storage.engine == .object) 0 else 3,
+        .desired_replica_count = if (storage.engine == .object) 0 else if (req.sql_persistence != null) 1 else 3,
         .min_ranges = min_ranges,
     };
 }
@@ -90,7 +92,7 @@ pub fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: boo
 }
 
 pub fn validateStoredIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch return error.InvalidCreateTableRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidCreateTableRequest;
     defer parsed.deinit();
     try validateIndexesValue(parsed.value, true);
 }

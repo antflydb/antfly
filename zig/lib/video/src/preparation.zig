@@ -1360,3 +1360,63 @@ test "shared displayed RGB preserves embedding patch geometry and values" {
         }
     }
 }
+
+extern fn av_owned_resource_interval_begin(*anyopaque, usize) usize;
+extern fn av_owned_resource_interval_snapshot(*anyopaque, [*]u64) void;
+extern fn av_owned_resource_interval_finish(*anyopaque, [*]u64) void;
+/// One process-wide authored video resource root. This is not whole-device
+/// residency and includes unrelated users of this video preparer implementation.
+/// CVMetalTextureCache/plane wrappers retain external CVPixelBuffer backing;
+/// they are not counted as new authored allocations. Buffer/texture peaks are
+/// subsets and must not be summed; the all-owned peak is measured directly.
+pub const OwnedResourceIntervalReport = struct {
+    root_identity: usize,
+    coverage: enum { tracked_authored_resources, partial_metadata_failure },
+    scope: enum { process_authored_video_resources_including_concurrent_users } = .process_authored_video_resources_including_concurrent_users,
+    backing: enum { owned_MTLBuffer_and_MTLTexture_allocatedSize_not_residency } = .owned_MTLBuffer_and_MTLTexture_allocatedSize_not_residency,
+    semantic_lifetime_classes: enum { mixed_owned_lifetimes_not_inferred_from_storageMode } = .mixed_owned_lifetimes_not_inferred_from_storageMode,
+    /// Order: all owned resources, buffer subset, texture subset.
+    live_bytes: [3]u64,
+    interval_peak_bytes: [3]u64,
+    lifetime_peak_bytes: [3]u64,
+    buffer_allocations: u64,
+    buffer_frees: u64,
+    texture_allocations: u64,
+    texture_frees: u64,
+    /// Optional metadata failure preserves payload ownership, but prevents a
+    /// claim of complete authored-root coverage even after this interval ends.
+    lifetime_metadata_failures: u64,
+    interval_metadata_failures: u64,
+};
+pub const OwnedResourceInterval = struct {
+    storage: [128]u8 align(16) = undefined,
+    root_identity: usize = 0,
+    /// Call only at the final address, valid until the single finish call.
+    /// Disabled/unsupported callers neither link native symbols nor allocate.
+    pub fn begin(self: *OwnedResourceInterval, comptime enabled: bool) void {
+        self.root_identity = if (enabled and supported) av_owned_resource_interval_begin(&self.storage, self.storage.len) else 0;
+    }
+    fn report(identity: usize, values: [15]u64) OwnedResourceIntervalReport {
+        return .{ .root_identity = identity, .coverage = if (values[13] == 0) .tracked_authored_resources else .partial_metadata_failure, .live_bytes = values[0..3].*, .interval_peak_bytes = values[3..6].*, .lifetime_peak_bytes = values[6..9].*, .buffer_allocations = values[9], .buffer_frees = values[10], .texture_allocations = values[11], .texture_frees = values[12], .lifetime_metadata_failures = values[13], .interval_metadata_failures = values[14] };
+    }
+    pub fn snapshot(self: *OwnedResourceInterval, comptime enabled: bool) ?OwnedResourceIntervalReport {
+        if (!enabled or !supported or self.root_identity == 0) return null;
+        var values: [15]u64 = undefined;
+        av_owned_resource_interval_snapshot(&self.storage, &values);
+        return report(self.root_identity, values);
+    }
+    pub fn finish(self: *OwnedResourceInterval, comptime enabled: bool) ?OwnedResourceIntervalReport {
+        if (!enabled or !supported or self.root_identity == 0) return null;
+        var values: [15]u64 = undefined;
+        av_owned_resource_interval_finish(&self.storage, &values);
+        const identity = self.root_identity;
+        self.root_identity = 0;
+        return report(identity, values);
+    }
+};
+test "disabled video owned resource interval needs no native linkage" {
+    var interval: OwnedResourceInterval = .{};
+    interval.begin(false);
+    try std.testing.expect(interval.snapshot(false) == null);
+    try std.testing.expect(interval.finish(false) == null);
+}

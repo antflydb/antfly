@@ -1,0 +1,359 @@
+{
+  "date_utc": "2026-11-21",
+  "runtime_source": "94ae2691ebeaef4dfdb31b0e962072e722e6773e",
+  "baseline_source": "88bcfa3c9e36d6c8252a94c2b5902b7398aec2ee",
+  "baseline_binary_sha256": "ac01a3a20b0d6acacaa3ebdea963e2822633c0eebe5ceb2f3d8a2db70acf0c83",
+  "co_resident_gpu_memory_mib": 26284,
+  "release_policy": "GB10 compact projector is restricted to the offline qualification constructor. Managed serving retains its prior route.",
+  "oracle_continuation_evidence": "CPU teacher forcing consumed cached-timed-result.json. All fixed-budget tokens in all three repeats and every first-step logit byte matched the final qualification constructor.",
+  "reference_native_tokens_sha256": "0309f7f9b729bb23848ee0c263de8d3df46cc447a5d01a880404cd9d2ec07308",
+  "final_native_tokens_sha256": "166c3de6d4163526698b671f75d89f313d61245ab95234cf8c4e63fd460b2537",
+  "independent_reference": "Unmodified FP32 Transformers from the same dequantized GGUF tensors on ARM CPU. Teacher forcing uses the native continuation through the first EOS or the case budget.",
+  "timing_scope": "Encoded input through greedy output readback, one untimed prime per case and three timed repeats, fixed output budgets, shared GB10. Baseline uses equivalent inline media markers and the prior GB10 F32 weight-loading path.",
+  "gpu": "NVIDIA GB10",
+  "compute_capability": "12.1",
+  "driver": "580.178.04",
+  "benchmark_sha256": "c4af3897277a8e04b8c4b0d1b6c6e2603c4aa72abb881cccca2233efa74b58d4",
+  "profile_sha256": "a27eec3038607e700c03c0796f49b39bbe0cec59e112d9bfd3c2b0d4865cc916",
+  "oracle_checkpoint": "830aebdd9b",
+  "reference": {
+    "version": "5.23.0",
+    "modeling_sha256": "c951ebdc3eaa071c715df656614936884b5ef06717680e7acfff56bc2d6adb0f",
+    "forward_module": "transformers.models.gemma4.modeling_gemma4",
+    "logit_position": "first_step"
+  },
+  "packages": {
+    "transformers": "5.23.0",
+    "gguf": "0.19.0",
+    "torch": "2.15.0",
+    "av": "19.0.2",
+    "numpy": "2.5.5",
+    "pillow": "13.0.0"
+  },
+  "inputs_sha256": {
+    "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "config.json": "7f0cd2d17bdb0d5adc6db8e7168bb9a9aa68a6c4ad879d80ecf83e6819c893d3",
+    "chat_template.jinja": "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5",
+    "processor_config.json": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c",
+    "gemma-4-E4B-it-mmproj.gguf": "7498a37cb619e55f2fcf87eb931f56e99389ed6d432e4c5c66110694c0d65578",
+    "gemma-4-E4B_q4_0-it.gguf": "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee"
+  },
+  "media": {
+    "video-6s.mp4": {
+      "sha256": "312420b16dfc192c91023d6c656a262398adc519de0d776f4186eb39cee6dd7d",
+      "bytes": 1322831
+    },
+    "audio-30s.wav": {
+      "sha256": "49051d1235937979c9c0af9f25da03f9316d9af8451c27982ac5ef9a45ab2348",
+      "bytes": 960044
+    },
+    "audio-12s.wav": {
+      "sha256": "1993eed22234dc0765bd4dfa9cdfc2522a6e078c3dee6145dc6f7a4d23a23298",
+      "bytes": 384044
+    },
+    "image.jpg": {
+      "sha256": "5e29f2c7e2a0546e487070494868d6e6b39882523a28d170de7e946ace2d8001",
+      "bytes": 179710
+    },
+    "audio-1s.wav": {
+      "sha256": "af73e1682bb146c28544fd49e404439cebfdbdbae16ef062d82e7ac2f41c6ddd",
+      "bytes": 32044
+    }
+  },
+  "context_tokens": 8192,
+  "kv_dtype": "f16",
+  "reference_decisions_pass": false,
+  "checked_decisions": 585,
+  "baseline_checked_decisions": 585,
+  "cases": [
+    {
+      "id": "text_short_256",
+      "prompt_tokens": 32,
+      "decode_budget": 256,
+      "cosine": 0.999991895,
+      "relative_l2": 0.004042537,
+      "native_argmax": 70895,
+      "reference_argmax": 70895,
+      "first_step_pass": true,
+      "reference_decisions": 256,
+      "all_decisions_match": false,
+      "median_ms": 7527.13,
+      "samples_ms": [
+        7526.67,
+        7527.13,
+        7527.65
+      ],
+      "residual_projections_per_request": 0,
+      "reference_sha256": "0941ba44e6e922abf36e7f0b94620db5c6809157afde4ee04985f56b41a31d18",
+      "native_sha256": "c3caab86e7ef97fb8d616dd474444c9d3ae0eed575aa3018798b6a852acd9397",
+      "baseline_samples_ms": [
+        7520.03,
+        7521.06,
+        7523.0
+      ],
+      "baseline_median_ms": 7521.06,
+      "native_repeat_tokens_sha256": "a823fafcd6eda7f535033202ffd9ef0838f7e7e53e507efc2cc436fa1c934308",
+      "mismatch_steps": [
+        76,
+        117,
+        206
+      ],
+      "baseline_mismatch_steps": [
+        76,
+        117,
+        206
+      ],
+      "baseline_checked_decisions": 256,
+      "tokens_identical_to_baseline": true
+    },
+    {
+      "id": "page_summary_128",
+      "prompt_tokens": 419,
+      "decode_budget": 128,
+      "cosine": 0.999995806,
+      "relative_l2": 0.002910589,
+      "native_argmax": 818,
+      "reference_argmax": 818,
+      "first_step_pass": true,
+      "reference_decisions": 128,
+      "all_decisions_match": false,
+      "median_ms": 6303.16,
+      "samples_ms": [
+        6303.16,
+        6304.17,
+        6303.1
+      ],
+      "residual_projections_per_request": 0,
+      "reference_sha256": "5e9600d944b0edbb3d5055aac1efabd2e69b7fd26079baa2d2f16bf061d87520",
+      "native_sha256": "113f93d958c2cd5948ed5a8411ba013dfa6bbc6cdf7020a21959704ab0c0b34a",
+      "baseline_samples_ms": [
+        6300.43,
+        6298.03,
+        6300.58
+      ],
+      "baseline_median_ms": 6300.43,
+      "native_repeat_tokens_sha256": "b67b6bbe47703de94360d7af77ec68ca9451c793fb98b6f7851e03dd91954bfc",
+      "mismatch_steps": [
+        102
+      ],
+      "baseline_mismatch_steps": [
+        102
+      ],
+      "baseline_checked_decisions": 128,
+      "tokens_identical_to_baseline": true
+    },
+    {
+      "id": "long2k_summary_64",
+      "prompt_tokens": 1775,
+      "decode_budget": 64,
+      "cosine": 0.999994804,
+      "relative_l2": 0.003408825,
+      "native_argmax": 818,
+      "reference_argmax": 818,
+      "first_step_pass": true,
+      "reference_decisions": 55,
+      "all_decisions_match": true,
+      "median_ms": 10070.63,
+      "samples_ms": [
+        10071.91,
+        10070.63,
+        10068.75
+      ],
+      "residual_projections_per_request": 0,
+      "reference_sha256": "28a18c3582e12e91a66d6f26ab669c52a4d3802025f7026a86d46cb50c2cee4e",
+      "native_sha256": "92603532a9d037c4d6cde3e26e128c02a5dca92c8186d1863c777c38b990dc7e",
+      "baseline_samples_ms": [
+        9960.24,
+        9946.32,
+        9949.32
+      ],
+      "baseline_median_ms": 9949.32,
+      "native_repeat_tokens_sha256": "3f631900b9e1a2fb915ca4bb1ec4804e2f00a96e8b4e1059de5609ac3fb12328",
+      "mismatch_steps": [],
+      "baseline_mismatch_steps": [],
+      "baseline_checked_decisions": 55,
+      "tokens_identical_to_baseline": true
+    },
+    {
+      "id": "image_64",
+      "prompt_tokens": 284,
+      "decode_budget": 64,
+      "cosine": 0.999996569,
+      "relative_l2": 0.00264315,
+      "native_argmax": 2094,
+      "reference_argmax": 2094,
+      "first_step_pass": true,
+      "reference_decisions": 64,
+      "all_decisions_match": false,
+      "median_ms": 3731.63,
+      "samples_ms": [
+        3713.7,
+        3731.63,
+        3774.63
+      ],
+      "residual_projections_per_request": 113,
+      "reference_sha256": "f6e20119d2fd967f32b4a6433843776edf774e5c34f8764b989a25f2e564d938",
+      "native_sha256": "1ab2cf429fbcca353d1f6aa6c16a3e2dca4b31ad44ded0c60f248a8bb1178366",
+      "baseline_samples_ms": [
+        6781.44,
+        7371.94,
+        7294.69
+      ],
+      "baseline_median_ms": 7294.69,
+      "native_repeat_tokens_sha256": "ea5021bbae96d8a9863c17cdd0322c6998123f6a134782989037f160e1d96d64",
+      "mismatch_steps": [
+        17
+      ],
+      "baseline_mismatch_steps": [],
+      "baseline_checked_decisions": 64,
+      "tokens_identical_to_baseline": false
+    },
+    {
+      "id": "audio_1s_64",
+      "prompt_tokens": 42,
+      "decode_budget": 64,
+      "cosine": 0.999988473,
+      "relative_l2": 0.004828119,
+      "native_argmax": 11947,
+      "reference_argmax": 11947,
+      "first_step_pass": true,
+      "reference_decisions": 4,
+      "all_decisions_match": true,
+      "median_ms": 1800.53,
+      "samples_ms": [
+        1849.83,
+        1792.7,
+        1800.53
+      ],
+      "residual_projections_per_request": 134,
+      "reference_sha256": "391ba3223ceb1a071890139b25b1e16c8e182fc2b1bd5b5f998d0a2d8c25a092",
+      "native_sha256": "12dd2fcbe06c9124a554532ba59765aa5de416b21d96ec783987847bdb46c535",
+      "baseline_samples_ms": [
+        1908.18,
+        1963.82,
+        1895.58
+      ],
+      "baseline_median_ms": 1908.18,
+      "native_repeat_tokens_sha256": "69688d28416ac86942c6cf1096d7eda57e21ba67e66130d1b020c59dd1b8135c",
+      "mismatch_steps": [],
+      "baseline_mismatch_steps": [],
+      "baseline_checked_decisions": 4,
+      "tokens_identical_to_baseline": false
+    },
+    {
+      "id": "audio_12s_64",
+      "prompt_tokens": 317,
+      "decode_budget": 64,
+      "cosine": 0.999990154,
+      "relative_l2": 0.005104204,
+      "native_argmax": 818,
+      "reference_argmax": 818,
+      "first_step_pass": true,
+      "reference_decisions": 7,
+      "all_decisions_match": true,
+      "median_ms": 3453.84,
+      "samples_ms": [
+        3453.84,
+        3441.58,
+        3454.74
+      ],
+      "residual_projections_per_request": 134,
+      "reference_sha256": "1deb800aeddfa358f39fc08d866eda0edf7ffe7421a99b68fbb1ac761caa9c01",
+      "native_sha256": "58147ddf8d8b36266e1a1ed71863ed2164e920d9016e5356077d8c46f037fc71",
+      "baseline_samples_ms": [
+        3502.38,
+        3498.96,
+        3502.83
+      ],
+      "baseline_median_ms": 3502.38,
+      "native_repeat_tokens_sha256": "017e2d656d67bbf22e0cd2a446013446536f416418ea188e071ca1900ce1877d",
+      "mismatch_steps": [],
+      "baseline_mismatch_steps": [],
+      "baseline_checked_decisions": 7,
+      "tokens_identical_to_baseline": false
+    },
+    {
+      "id": "audio_30s_64",
+      "prompt_tokens": 767,
+      "decode_budget": 64,
+      "cosine": 0.999990349,
+      "relative_l2": 0.004621801,
+      "native_argmax": 818,
+      "reference_argmax": 818,
+      "first_step_pass": true,
+      "reference_decisions": 7,
+      "all_decisions_match": true,
+      "median_ms": 3666.17,
+      "samples_ms": [
+        3657.14,
+        3666.17,
+        3672.85
+      ],
+      "residual_projections_per_request": 134,
+      "reference_sha256": "17e87545a3e0c8e20d4b1e48a5ef6b3374aa2312331eb993faa57048aaeaefaa",
+      "native_sha256": "37ef4cd872f96c8bef05fe832c412a794703d05338a0a4c9da7bf0983618cd4b",
+      "baseline_samples_ms": [
+        3765.14,
+        3742.74,
+        3771.86
+      ],
+      "baseline_median_ms": 3765.14,
+      "native_repeat_tokens_sha256": "017e2d656d67bbf22e0cd2a446013446536f416418ea188e071ca1900ce1877d",
+      "mismatch_steps": [],
+      "baseline_mismatch_steps": [],
+      "baseline_checked_decisions": 7,
+      "tokens_identical_to_baseline": true
+    },
+    {
+      "id": "video_6s_64",
+      "prompt_tokens": 465,
+      "decode_budget": 64,
+      "cosine": 0.999936146,
+      "relative_l2": 0.011325948,
+      "native_argmax": 2094,
+      "reference_argmax": 2094,
+      "first_step_pass": true,
+      "reference_decisions": 64,
+      "all_decisions_match": false,
+      "median_ms": 4220.61,
+      "samples_ms": [
+        4235.3,
+        4213.14,
+        4220.61
+      ],
+      "residual_projections_per_request": 678,
+      "reference_sha256": "6ec4d2a1f551bb6f10e8d84235940221fb5a6e92bd3f685f836f19a52aa7b497",
+      "native_sha256": "e96f450f160c77074df0c0ecf3da93f6a1bb1d6890bdbbb64c9bb56d8b24cfa5",
+      "baseline_samples_ms": [
+        7735.94,
+        7493.33,
+        7649.77
+      ],
+      "baseline_median_ms": 7649.77,
+      "native_repeat_tokens_sha256": "ae49e0b8b999eb4aa23cf21ec819e46844cc2ae752ca561f03d785ecf80950e1",
+      "mismatch_steps": [
+        55,
+        61
+      ],
+      "baseline_mismatch_steps": [
+        55,
+        61
+      ],
+      "baseline_checked_decisions": 64,
+      "tokens_identical_to_baseline": true
+    }
+  ],
+  "image_decision_17": {
+    "reference_token": 152794,
+    "two_term_token": 211902,
+    "three_term_token": 211902,
+    "reference_logit_gap": 0.0059528350830078125
+  },
+  "first_step_gate": {
+    "minimum_cosine": 0.9999,
+    "maximum_relative_l2": 0.02,
+    "identical_argmax": true
+  },
+  "baseline_matching_decisions": 579,
+  "candidate_matching_decisions": 578
+}

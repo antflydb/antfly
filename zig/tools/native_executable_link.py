@@ -30,6 +30,7 @@ from macho_merged_globals import prepare_entry_object
 # treats any stderr output as failure.
 BENIGN_LD_WARNINGS = (
     "__eh_frame section too large (max 16MB) to encode dwarf unwind offsets",
+    "-ld_classic is deprecated and will be removed",
 )
 
 parser = argparse.ArgumentParser()
@@ -43,28 +44,43 @@ args = parser.parse_args()
 with open(args.sdk + "/SDKSettings.json") as source:
     sdk_version = json.load(source)["Version"]
 inputs = args.inputs[1:] if args.inputs[:1] == ["--"] else args.inputs
-result = subprocess.run(
-    [
-        "/usr/bin/ld",
-        "-arch",
-        args.arch,
-        "-platform_version",
-        "macos",
-        args.deployment,
-        sdk_version,
-        "-syslibroot",
-        args.sdk,
-        "-dead_strip",
-        "-adhoc_codesign",
-        "-o",
-        args.output,
-        str(prepare_entry_object(Path(args.object), Path(args.output))),
-        *inputs,
-        "-lSystem",
-    ],
-    stderr=subprocess.PIPE,
-    text=True,
+command = [
+    "/usr/bin/ld",
+    "-arch",
+    args.arch,
+    "-platform_version",
+    "macos",
+    args.deployment,
+    sdk_version,
+    "-syslibroot",
+    args.sdk,
+    "-dead_strip",
+    "-adhoc_codesign",
+    "-o",
+    args.output,
+    str(prepare_entry_object(Path(args.object), Path(args.output))),
+    *inputs,
+    "-lSystem",
+]
+result = subprocess.run([*command, "-no_snapshot"], stderr=subprocess.PIPE, text=True)
+if result.returncode and "unknown option: -no_snapshot" in result.stderr:
+    result = subprocess.run(command, stderr=subprocess.PIPE, text=True)
+# Some versions of the modern linker assert on legal private Debug symbols
+# in the relocatable entry object and its archives. Retry only this assertion,
+# with exactly the same object graph and link flags.
+symbol_string_assertion = (
+    "Assertion failed: (name.size() <= maxLength), "
+    "function makeSymbolStringInPlace, file SymbolString.cpp"
 )
+if result.returncode and symbol_string_assertion in result.stderr:
+    fallback = subprocess.run(
+        [command[0], "-ld_classic", *command[1:]],
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if fallback.returncode:
+        print(result.stderr, file=sys.stderr, end="")
+    result = fallback
 for line in result.stderr.splitlines():
     if not any(warning in line for warning in BENIGN_LD_WARNINGS):
         print(line, file=sys.stderr)

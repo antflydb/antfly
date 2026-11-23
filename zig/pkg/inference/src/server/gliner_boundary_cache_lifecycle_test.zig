@@ -149,13 +149,13 @@ fn inspect(node: *Node, directory: []const u8, pins: pipeline.PublishedModelFile
                 try std.testing.expectEqual(@as(u64, pin.size_bytes), identity.sidecars[index].size_bytes);
             }
             const lease = loaded.resource_lease orelse return error.MissingModelResourceLease;
-            try std.testing.expect(lease.controller == &domain.admission);
+            try std.testing.expect(lease.controller == domain.admission);
             try std.testing.expect(lease.amounts.backend_weight_bytes >= pins.@"model.safetensors".size_bytes);
             const tokenizer_lease = loaded.tokenizer_resource_lease orelse return error.MissingTokenizerResourceLease;
-            try std.testing.expect(tokenizer_lease.controller == &domain.admission);
+            try std.testing.expect(tokenizer_lease.controller == domain.admission);
             try std.testing.expect(tokenizer_lease.amounts.host_weight_bytes > 0);
             const run_admission = loaded.session.run_admission orelse return error.MissingSessionRunAdmission;
-            try std.testing.expect(run_admission.controller == &domain.admission);
+            try std.testing.expect(run_admission.controller == domain.admission);
             try std.testing.expectEqual(.gpu, run_admission.backend_class);
             try std.testing.expect(run_admission.check_live_memory);
             // HTTP's default alias is borrowed from the canonical cache owner.

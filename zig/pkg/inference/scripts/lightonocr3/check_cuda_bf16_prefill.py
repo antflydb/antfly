@@ -54,6 +54,18 @@ lib.antfly_lighton_prefill_execute.argtypes = [
     c.c_void_p,
 ]
 lib.antfly_lighton_prefill_execute.restype = c.c_int
+class WorkspaceGeometry(c.Structure):
+    _fields_ = [
+        ("key_heads", c.c_int32), ("value_heads", c.c_int32), ("items", c.c_int32),
+        ("offsets", c.c_int32 * 64), ("lengths", c.c_int32 * 64),
+    ]
+
+assert c.sizeof(WorkspaceGeometry) == 524
+lib.antfly_recurrent_prefill_workspace_geometry_abi.restype = c.c_uint64
+assert lib.antfly_recurrent_prefill_workspace_geometry_abi() == (1 << 32) | 524
+lib.antfly_recurrent_prefill_workspace_geometry.argtypes = [c.POINTER(WorkspaceGeometry)]
+lib.antfly_recurrent_prefill_workspace_geometry.restype = c.c_size_t
+
 gpu = Driver(args.artifact)
 results = []
 for h in [16, 32]:
@@ -66,6 +78,16 @@ for h in [16, 32]:
         [128 if i % 4 == 0 else 1 for i in range(64)],
     ]:
         count = len(lengths)
+        # True values-only cold query BEFORE this case allocates CUDA storage.
+        # No fabricated Ragged/page/tensor pointer is passed to the library.
+        geometry = WorkspaceGeometry(key_heads=16, value_heads=h, items=count)
+        cursor = 0
+        for index, length in enumerate(lengths):
+            geometry.offsets[index] = cursor
+            geometry.lengths[index] = length
+            cursor += length
+        cold_needed = lib.antfly_recurrent_prefill_workspace_geometry(c.byref(geometry))
+        assert cold_needed != (1 << 64) - 1
         total = sum(lengths)
         width = h * 128
         channels = (32 + h) * 128
@@ -261,6 +283,7 @@ for h in [16, 32]:
                     row += lengths[i]
             needed = lib.antfly_lighton_prefill_workspace(c.byref(p))
             assert needed != (1 << 64) - 1
+            assert needed == cold_needed, "cold metadata and actual packet workspace differ"
             scratch = alloc((needed,), torch.uint8) if needed else None
             torch.cuda.synchronize()
             if needed:
@@ -314,6 +337,7 @@ for h in [16, 32]:
                 "prefixes": len(prefixes),
                 "turn": turn,
                 "scratch_bytes": needed,
+                "cold_geometry_bytes": cold_needed,
                 "wrapper_output_state_bitwise": True,
                 "readonly": True,
                 "guards": True,

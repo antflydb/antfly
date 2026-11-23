@@ -234,8 +234,13 @@ clip, in the same space as the text, image, and audio vectors:
 To index long recordings, declare a chunk enrichment with EmbeddingGemma 2 as
 its boundary model. Antfly cuts the source into windows, embeds each window,
 and can transcribe the same windows in the same pass. [Resumable Media
-Enrichment](/docs/guides/media-pass) has the configuration. CUDA video
-decoding needs Linux NVDEC and an H.264 MP4 of at most 60 seconds.
+Enrichment](/docs/guides/media-pass) has the configuration. See the [inference guide](/docs/guides/inference) for CUDA video codecs, hardware requirements, and clip limits.
+
+Audio windows read from a remote WebM Opus source use the container's seek
+preroll, with a minimum of 80 ms and a maximum supported declaration of two
+seconds. This preserves sample positions and makes
+each window repeatable across retries. The PCM after a seek can differ from
+uninterrupted decoding, even at the same sample positions.
 
 ### Rerank with Images
 

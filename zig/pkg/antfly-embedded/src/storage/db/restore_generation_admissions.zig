@@ -17,7 +17,7 @@
 //! to the target incarnation. Imported proof keys are evidence, not authority.
 const std = @import("std");
 const contract = @import("restore_staging_contract.zig");
-const admission = @import("relational_integrity_generation_admission.zig");
+const admission = @import("relational/integrity/generation_admission.zig");
 const portable = @import("../portable_backup.zig");
 
 pub fn loadReceipt(txn: anytype) !?contract.GenerationAdmissionReceipt {

@@ -188,7 +188,7 @@ fn filterSliceToStatefulTextQueryAlloc(
     return out;
 }
 
-fn cloneFilterAlloc(alloc: std.mem.Allocator, filter: search_filter_mod.Filter) FilterCloneError!search_filter_mod.Filter {
+pub fn cloneFilterAlloc(alloc: std.mem.Allocator, filter: search_filter_mod.Filter) FilterCloneError!search_filter_mod.Filter {
     return switch (filter) {
         .match_all => .{ .match_all = {} },
         .match_none => .{ .match_none = {} },

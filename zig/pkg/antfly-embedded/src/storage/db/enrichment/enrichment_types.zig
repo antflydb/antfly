@@ -100,70 +100,13 @@ pub fn interactiveActivity(kind: u32, delta: i32) callconv(.c) u32 {
     return previous;
 }
 
-pub const ExecutionPolicy = struct {
-    batch_items: ?usize = null,
-    batch_bytes: ?usize = null,
-    max_document_pages: ?usize = null,
-};
-
-pub fn parseExecutionPolicyJson(alloc: Allocator, execution_json: []const u8) !ExecutionPolicy {
-    if (execution_json.len == 0) return .{};
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, execution_json, .{});
-    defer parsed.deinit();
-    return try parseExecutionPolicyValue(parsed.value);
-}
-
-pub fn parseExecutionPolicyValue(value: std.json.Value) !ExecutionPolicy {
-    if (value != .object) return error.InvalidEnrichmentExecutionConfig;
-    var out = ExecutionPolicy{};
-    var iter = value.object.iterator();
-    while (iter.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "batch_items")) {
-            if (entry.value_ptr.* == .null) continue;
-            out.batch_items = try parsePositiveExecutionInteger(entry.value_ptr.*);
-        } else if (std.mem.eql(u8, entry.key_ptr.*, "batch_bytes")) {
-            if (entry.value_ptr.* == .null) continue;
-            out.batch_bytes = try parsePositiveExecutionInteger(entry.value_ptr.*);
-        } else if (std.mem.eql(u8, entry.key_ptr.*, "max_document_pages")) {
-            if (entry.value_ptr.* == .null) continue;
-            out.max_document_pages = try parsePositiveExecutionInteger(entry.value_ptr.*);
-        } else {
-            return error.InvalidEnrichmentExecutionConfig;
-        }
-    }
-    return out;
-}
-
-fn parsePositiveExecutionInteger(value: std.json.Value) !usize {
-    const raw = switch (value) {
-        .integer => |n| n,
-        else => return error.InvalidEnrichmentExecutionConfig,
-    };
-    if (raw <= 0) return error.InvalidEnrichmentExecutionConfig;
-    return std.math.cast(usize, raw) orelse error.InvalidEnrichmentExecutionConfig;
-}
-
-pub fn executionBatchItemsOrDefault(alloc: Allocator, execution_json: []const u8, default_value: usize) usize {
-    const policy = parseExecutionPolicyJson(alloc, execution_json) catch return default_value;
-    return policy.batch_items orelse default_value;
-}
-
-pub fn executionBatchBytesOrDefault(alloc: Allocator, execution_json: []const u8, default_value: usize) usize {
-    const policy = parseExecutionPolicyJson(alloc, execution_json) catch return default_value;
-    return policy.batch_bytes orelse default_value;
-}
-
-test "execution policy admits a positive PDF document page ceiling" {
-    const policy = try parseExecutionPolicyJson(
-        std.testing.allocator,
-        "{\"batch_items\":4,\"batch_bytes\":1024,\"max_document_pages\":200}",
-    );
-    try std.testing.expectEqual(@as(?usize, 200), policy.max_document_pages);
-    try std.testing.expectError(
-        error.InvalidEnrichmentExecutionConfig,
-        parseExecutionPolicyJson(std.testing.allocator, "{\"max_document_pages\":0}"),
-    );
-}
+const execution_policy = @import("execution_policy.zig");
+pub const ExecutionPolicy = execution_policy.ExecutionPolicy;
+pub const parseExecutionPolicyJson = execution_policy.parseExecutionPolicyJson;
+pub const parseExecutionPolicyValue = execution_policy.parseExecutionPolicyValue;
+pub const executionBatchItemsOrDefault = execution_policy.executionBatchItemsOrDefault;
+pub const executionBatchBytesOrDefault = execution_policy.executionBatchBytesOrDefault;
+pub const withGenerationBudgetAlloc = execution_policy.withGenerationBudgetAlloc;
 
 pub const GeneratedEnrichmentKind = enum {
     dense_embedding,

@@ -39,7 +39,7 @@ pub const Layout = struct { batch: u32, sequence: u32 };
 
 /// `materialized_v1` builds `[B*heads,S,S]` scores from primitives and dense
 /// masks. `fused_v1` uses the ModernBERT training attention op
-/// (ops/modernbert_training_attention.zig): storage linear in the sequence,
+/// (ops/range_attention_reference.zig): storage linear in the sequence,
 /// driven by one i32 control of key ranges and logical positions.
 pub const AttentionProfile = enum { materialized_v1, fused_v1 };
 

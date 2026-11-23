@@ -120,16 +120,7 @@ test "microbatch working budgets and task families are distinct execution keys" 
     }
 }
 
-pub const Task = enum {
-    read,
-    generate,
-    embed,
-    rerank,
-    chunk,
-    extract,
-    rewrite,
-    transcribe,
-};
+pub const Task = @import("../execution/tensor_dispatch.zig").Task;
 
 pub const BatchMode = enum { none, serial_compatibility, native };
 pub const ResourceClass = enum { cpu, gpu, remote };

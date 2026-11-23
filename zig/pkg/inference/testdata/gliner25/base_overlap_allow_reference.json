@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "id": "base_overlap_allow_cross_label_v1",
+  "scope": "Independent pinned original CPU FP32 capture; Native/Metal wholemodel acceptance of newqualification row remains pending. This fixture is not Antfly output.",
+  "model": {
+    "model_id": "fastino/gliner2.5-base-v1",
+    "revision": "72ac19b486cd4557424c8d61114e7530c243e9b0",
+    "files": {
+      "config.json": {
+        "size_bytes": 3150,
+        "sha256": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 857,
+        "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4"
+      },
+      "model.safetensors": {
+        "size_bytes": 774366564,
+        "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a"
+      },
+      "tokenizer.json": {
+        "size_bytes": 8341713,
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 645,
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      }
+    }
+  },
+  "reference": {
+    "source_revision": "3c913c7369301133d3b7699252074c4303ada50e",
+    "runtime": {
+      "python": "3.12.3",
+      "unicode": "15.0.0",
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      }
+    },
+    "original_reference_sha256": "471fab11a53ce399de9ee65f3322b2a53b2912e85cdf6a87c376baf741418210",
+    "generator": "Maintained oracle.prepare_runtime + original AutoExtractor.extract(... overlap_policy=\"allow\", threshold=0.5, include_confidence=True, include_spans=True, max_len=oracle.MAX_WORDS), CPU float32 eval, same exact input/schema.",
+    "tolerance": {
+      "absolute_score": 0.0005,
+      "labels_offsets_order": "exact"
+    }
+  },
+  "request": {
+    "model": "base",
+    "schema_version": 2,
+    "schema": {
+      "entities": [
+        "person",
+        "full_name",
+        "first_name",
+        "last_name",
+        "address",
+        "street_address",
+        "city"
+      ]
+    },
+    "inputs": [
+      {
+        "id": "overlap-allow",
+        "content": "John Smith lives in New York at 12 Main Street."
+      }
+    ],
+    "options": {
+      "threshold": 0.5,
+      "offset_unit": "unicode_codepoints",
+      "include_spans": true,
+      "include_confidence": true,
+      "overlap": "allow"
+    }
+  },
+  "expected_entities": [
+    {
+      "label": "person",
+      "text": "John Smith",
+      "start": 0,
+      "end": 10,
+      "score": 0.9413127899169922
+    },
+    {
+      "label": "full_name",
+      "text": "John Smith",
+      "start": 0,
+      "end": 10,
+      "score": 0.9716919660568237
+    },
+    {
+      "label": "first_name",
+      "text": "John",
+      "start": 0,
+      "end": 4,
+      "score": 0.980289876461029
+    },
+    {
+      "label": "last_name",
+      "text": "Smith",
+      "start": 5,
+      "end": 10,
+      "score": 0.974338710308075
+    },
+    {
+      "label": "street_address",
+      "text": "12 Main Street",
+      "start": 32,
+      "end": 46,
+      "score": 0.9871416091918945
+    },
+    {
+      "label": "city",
+      "text": "New York",
+      "start": 20,
+      "end": 28,
+      "score": 0.9990633130073547
+    }
+  ],
+  "expected_classifications": []
+}

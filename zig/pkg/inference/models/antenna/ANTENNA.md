@@ -419,7 +419,7 @@ step 1 (`src/finetune/`, `src/graph/`, `lib/ml/src/graph/`,
 | LoRA, LoRA+, QLoRA (NF4), recursive LoRA | `src/finetune/lora*.zig`, `qlora_nf4.zig`, `recursive_lora.zig` | |
 | Activation checkpointing and bounded recomputation | `lib/ml/src/graph/checkpoint.zig`, `src/graph/recomputed_training.zig` | |
 | Device-resident training on Metal and CUDA | `src/graph/resident_training_*.zig` | GLiNER2.5 and Laya |
-| Fused training attention with backward | `src/ops/cuda/gliner25.zig` (`debertaTrainingAttentionBackwardV1`) | DeBERTa, CUDA; the ModernBERT op (CPU, Metal) is gap 1 |
+| Fused training attention with backward | `src/ops/cuda/resident_structured.zig` (`debertaTrainingAttentionBackwardV1`) | DeBERTa, CUDA; the ModernBERT op (CPU, Metal) is gap 1 |
 | Host contrastive and embedding losses: InfoNCE, Matryoshka, cross-batch memory, SPLADE with FLOPS regularization, NEFTune | `src/finetune/fused_chunker_train.zig`, `infonce_cpu.zig` | loss code only; not yet connected to a trained encoder (see Background) |
 | ModernBERT training graph on resident Metal | `src/finetune/laya/graph.zig`, `training.zig`, `job.zig` | Hugging Face layout, global and local layers, runtime RoPE tables and masks; attention materialized, capped at `batch·S²·heads ≤ 64Mi` |
 | Encoder-independent boundary heads and losses | `src/finetune/gliner/boundary_encoder_graph.zig` (`RoutedNodes`), `boundary_train_step.zig` | encoder is one builder call; DeBERTa-specific today |

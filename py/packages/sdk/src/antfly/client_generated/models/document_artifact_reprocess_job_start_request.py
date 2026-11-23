@@ -6,6 +6,9 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.document_artifact_reprocess_job_start_request_selection import (
+    DocumentArtifactReprocessJobStartRequestSelection,
+)
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="DocumentArtifactReprocessJobStartRequest")
@@ -16,6 +19,11 @@ class DocumentArtifactReprocessJobStartRequest:
     """Request to create a durable table artifact reprocess job.
 
     Attributes:
+        selection (DocumentArtifactReprocessJobStartRequestSelection | Unset): all explicitly regenerates selected
+            source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction
+            artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other
+            producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does
+            not certify inference completion. Default: DocumentArtifactReprocessJobStartRequestSelection.ALL.
         from_key (str | Unset): Exclusive lower bound source document key. Default: ''.
         to_key (str | Unset): Inclusive upper bound source document key, or empty for the end of the table/range.
             Default: ''.
@@ -25,6 +33,9 @@ class DocumentArtifactReprocessJobStartRequest:
             Default: True.
     """
 
+    selection: DocumentArtifactReprocessJobStartRequestSelection | Unset = (
+        DocumentArtifactReprocessJobStartRequestSelection.ALL
+    )
     from_key: str | Unset = ""
     to_key: str | Unset = ""
     limit: int | Unset = 100
@@ -32,6 +43,10 @@ class DocumentArtifactReprocessJobStartRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        selection: str | Unset = UNSET
+        if not isinstance(self.selection, Unset):
+            selection = self.selection.value
+
         from_key = self.from_key
 
         to_key = self.to_key
@@ -43,6 +58,8 @@ class DocumentArtifactReprocessJobStartRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if selection is not UNSET:
+            field_dict["selection"] = selection
         if from_key is not UNSET:
             field_dict["from_key"] = from_key
         if to_key is not UNSET:
@@ -57,6 +74,13 @@ class DocumentArtifactReprocessJobStartRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        _selection = d.pop("selection", UNSET)
+        selection: DocumentArtifactReprocessJobStartRequestSelection | Unset
+        if isinstance(_selection, Unset):
+            selection = UNSET
+        else:
+            selection = DocumentArtifactReprocessJobStartRequestSelection(_selection)
+
         from_key = d.pop("from_key", UNSET)
 
         to_key = d.pop("to_key", UNSET)
@@ -66,6 +90,7 @@ class DocumentArtifactReprocessJobStartRequest:
         advance = d.pop("advance", UNSET)
 
         document_artifact_reprocess_job_start_request = cls(
+            selection=selection,
             from_key=from_key,
             to_key=to_key,
             limit=limit,

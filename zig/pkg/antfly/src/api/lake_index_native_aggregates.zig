@@ -53,7 +53,7 @@ pub fn recipeFor(a: A, table: local.sql_catalog.Table, config: std.json.Value, m
     const operation = mat.object.get("op") orelse return error.InvalidAlgebraicConfig;
     if (operation != .string) return error.InvalidAlgebraicConfig;
     const kind = std.meta.stringToEnum(operators.Aggregate.Kind, operation.string) orelse return null;
-    if (kind == .pattern_set) return null;
+    if (kind == .pattern_set or kind == .array_agg) return null;
     const measure = mat.object.get("measure") orelse mat.object.get("value_field");
     const input: ?local.sql_catalog.Column = if (measure) |value| key: {
         if (value == .null) break :key null;
@@ -114,7 +114,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
     const io = parent_provider.context.io orelse return error.UnsupportedSqlExecution;
     try parent_source.ensureInventory(parent_provider.context);
     try parent_source.ensureCanonicalPlan(parent_provider.context);
-    var schemas = @import("sql_schema_cache.zig").Cache.init(a);
+    var schemas = @import("sql/execution/schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
     const contract = try ca.alloc(local.serverless_query_lake_schema.Column, sql_table.columns.len);
@@ -1253,6 +1253,16 @@ fn consumeCohort(a: A, provider: *@import("lake_index_row_source.zig").Provider,
     }
 }
 
+fn expectAggregateInteger(spec: operators.AggregateSpec, actual: local.sql_scalar.Datum, expected: i64) !void {
+    if (operators.Aggregate.bigintSum(spec.kind, spec.input_type, spec.input_element)) {
+        try std.testing.expect(actual.numeric != null);
+        var digits: [5]u16 = undefined;
+        const number = local.sql_numeric_value.integerView(expected, &digits);
+        const wanted = local.sql_scalar.Datum.typedNumeric(&number);
+        try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(actual, wanted));
+    } else try std.testing.expectEqual(expected, actual.value.integer);
+}
+
 test "external lake native algebraic recipes preserve aliases and SQL NULL identities" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1368,7 +1378,7 @@ test "external lake native algebraic publication reads real Parquet into exact S
     defer group.deinit();
     try group.importPartialBatch(partials);
     const result = (try group.nextResult(page.allocator())).?;
-    try std.testing.expectEqual(@as(i64, 18014398509481985), result.aggregates[0].value.integer);
+    try expectAggregateInteger(spec, result.aggregates[0], 18014398509481985);
     try std.testing.expect((try cursor.next(cursor.ptr, page.allocator(), 32)) == null);
     // A count-only Parquet publication must not decode a single value row.
     // The same file's normal aggregate path exceeds this explicit row limit.
@@ -1525,12 +1535,12 @@ test "external lake aggregate radix reductions reuse unchanged subtrees across a
             try group.importPartialBatch(rows[0..1]);
             const result = (try group.nextResult(output.allocator())).?;
             const files: i64 = if (phase == 1) 17 else 16;
-            try std.testing.expectEqual(@as(i64, switch (slot) {
+            try expectAggregateInteger(recipe.inputs[0].spec, result.aggregates[0], @as(i64, switch (slot) {
                 0 => files * 10,
                 1 => files * 3,
                 2 => 1,
                 else => 7,
-            }), result.aggregates[0].value.integer);
+            }));
         }
         previous = built;
     }
@@ -1711,11 +1721,11 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
             while (try group.nextResult(output.allocator())) |result| {
                 const key = result.keys[0].value.integer;
                 const files: i64 = if (phase == 0) 16 else if (phase == 1) (if (key == 1) @as(i64, 17) else 16) else (if (key == 1) @as(i64, 16) else if (phase == 3) 13 else 15);
-                try std.testing.expectEqual(@as(i64, switch (slot) {
+                try expectAggregateInteger(recipe.inputs[0].spec, result.aggregates[0], @as(i64, switch (slot) {
                     0 => files * key,
                     1 => files,
                     else => key,
-                }), result.aggregates[0].value.integer);
+                }));
                 count += 1;
             }
             try std.testing.expectEqual(@as(usize, 300), count);

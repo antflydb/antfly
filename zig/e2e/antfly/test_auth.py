@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import signal
@@ -477,6 +478,86 @@ def test_standalone_auth_user_and_api_key_flow(auth_api: AuthApi):
         and permission["type"] == "read"
         for permission in me["permissions"]
     )
+
+
+def test_service_credential_query_timing(auth_api: AuthApi):
+    """Set ANTFLY_AUTH_SAMPLES to qualify a release build with paired requests."""
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    auth_api.create_table("docs")
+    auth_api.batch_write(
+        "docs",
+        {
+            "inserts": {"allowed": {"tier": "gold"}, "hidden": {"tier": "silver"}},
+            "sync_level": "full_index",
+        },
+    )
+    read_docs = {"resource_type": "table", "resource": "docs", "type": "read"}
+    auth_api.post(
+        "/auth/v1/users/reader",
+        {"password": "reader", "initial_policies": [read_docs]},
+    )
+    auth_api.put("/auth/v1/users/reader/row-filters/docs", {"term": {"tier": "gold"}})
+    key = auth_api.post(
+        "/auth/v1/users/reader/api-keys",
+        {"name": "benchmark", "permissions": [read_docs]},
+    )
+    credentials = [
+        ("basic", _basic_auth("reader", "reader")),
+        ("api_key", f"Bearer {key['encoded']}"),
+    ]
+    query = {"full_text_search": {"match_all": {}}, "limit": 2}
+    samples = int(os.environ.get("ANTFLY_AUTH_SAMPLES", "1"))
+    assert samples >= 1
+    durations = {
+        name: {"auth_ms": [], "query_ms": [], "client_ms": []}
+        for name, _ in credentials
+    }
+    for trial in range(samples + 1):
+        for name, credential in (
+            credentials if trial % 2 == 0 else reversed(credentials)
+        ):
+            headers = {"Authorization": credential}
+            if trial:
+                headers["X-Antfly-Server-Timing"] = "1"
+            start = time.perf_counter_ns()
+            response = auth_api.request_raw(
+                "POST", "/tables/docs/query", headers=headers, json=query, timeout=30
+            )
+            client_ms = (time.perf_counter_ns() - start) / 1e6
+            response.raise_for_status()
+            result = response.json()["responses"][0]
+            assert [hit["_id"] for hit in result["hits"]["hits"]] == ["allowed"]
+            timing = response.headers.get("Server-Timing")
+            if trial == 0:  # Warm each credential and check the default response.
+                assert timing is None
+                continue
+            match = re.fullmatch(r"auth;dur=(\d+\.\d{3})", timing or "")
+            assert match, timing
+            durations[name]["auth_ms"].append(float(match[1]))
+            durations[name]["query_ms"].append(result["took"])
+            durations[name]["client_ms"].append(client_ms)
+
+    # Invalid credentials must not expose a verifier timing.
+    rejected = auth_api.request_raw(
+        "POST",
+        "/tables/docs/query",
+        json=query,
+        timeout=30,
+        headers={
+            "Authorization": _basic_auth("reader", "wrong"),
+            "X-Antfly-Server-Timing": "1",
+        },
+    )
+    assert rejected.status_code == 401
+    assert "Server-Timing" not in rejected.headers
+
+    if samples > 1:
+        for name, phases in durations.items():
+            for phase, values in phases.items():
+                values.sort()
+                p50 = values[math.ceil(samples * 0.50) - 1]
+                p95 = values[math.ceil(samples * 0.95) - 1]
+                print(f"{name} {phase} n={samples} p50={p50:.3f} p95={p95:.3f}")
 
 
 def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):

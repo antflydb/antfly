@@ -145,6 +145,15 @@ const OpaqueApiHttpServer = struct {
         callInfallible(?hot_standby_http_operation.Executor, void, self.functions.set_ha_executor, self.opaque_handle, &input, null);
     }
 
+    pub fn lakeStreamOwnerOptions(self: *OpaqueApiHttpServer, request: @import("lake_source_owner.zig").OptionsInput) !@import("lake_source_owner.zig").Options {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.lake_stream_owner)) return error.UnsupportedReplicationRoute;
+        const owner = @import("lake_source_owner.zig");
+        var input = request;
+        var result: owner.Options = undefined;
+        try callFallible(owner.OptionsInput, owner.Options, self.functions.lake_stream_owner_options, self.opaque_handle, &input, &result);
+        return result;
+    }
+
     pub fn attachRestoreJobRuntimeStore(self: *OpaqueApiHttpServer, store: *backend_erased.Store) !void {
         try callFallible(backend_erased.Store, void, self.functions.attach_runtime_restore_store, self.opaque_handle, store, null);
     }
@@ -152,6 +161,22 @@ const OpaqueApiHttpServer = struct {
     pub fn attachReplicatedRestoreJobStore(self: *OpaqueApiHttpServer, persistence: restore_jobs.ReplicatedPersistence) !void {
         var input = persistence;
         try callError(self.functions.attach_replicated_restore_store(abi.abi_version, self.opaque_handle, &input));
+    }
+
+    pub fn authorizeSqlLock(self: *OpaqueApiHttpServer, value: @import("sql/session/data_locks.zig").AuthorizationInput) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
+        const Input = @import("sql/session/data_locks.zig").AuthorizationInput;
+        const Output = @import("antfly_local_sources").storage_pessimistic_lock_control.Command;
+        var result: Output = undefined;
+        try callFallible(Input, Output, self.functions.authorize_sql_lock, self.opaque_handle, &value, &result);
+        return result;
+    }
+
+    pub fn executeQueryPopulationJob(self: *OpaqueApiHttpServer, alloc: std.mem.Allocator, context: @import("antfly_local_sources").api_operation.RequestContext, request: @import("../metadata/query_population_job.zig").Request) ![]u8 {
+        const Input = @import("../metadata/query_population_job.zig").Input;
+        const value: Input = .{ .alloc = alloc, .context = context, .request = request };
+        var result: []u8 = undefined;
+        try callFallible(Input, []u8, self.functions.query_population_job, self.opaque_handle, &value, &result);
+        return result;
     }
 
     pub fn resumeRestoreJobsOnce(self: *OpaqueApiHttpServer) !void {
@@ -165,6 +190,10 @@ const OpaqueApiHttpServer = struct {
     pub fn prepareRestoreLeadership(self: *OpaqueApiHttpServer, term: u64) !void {
         var input = term;
         try callFallible(u64, void, self.functions.prepare_restore_leadership, self.opaque_handle, &input, null);
+    }
+
+    pub fn drainSqlConnections(self: *OpaqueApiHttpServer, deadline: @import("../common/runtime_lifecycle.zig").ShutdownDeadline) !void {
+        try callFallible(@import("../common/runtime_lifecycle.zig").ShutdownDeadline, void, self.functions.drain_sql_connections, self.opaque_handle, &deadline, null);
     }
 
     pub fn scheduleSessionMaintenance(self: *OpaqueApiHttpServer) !void {
@@ -207,6 +236,16 @@ const OpaqueApiHttpServer = struct {
     }
 };
 
+fn withRequestForwardLane(raw: *anyopaque, context: *anyopaque, callback: abi.RequestForwardLaneSource.Callback) callconv(.c) bool {
+    const runtime: *@import("antfly_local_sources").storage_background_runtime.BackendRuntime = @ptrCast(@alignCast(raw));
+    var lane = runtime.acquireDedicatedRequestForwardLane() catch return false;
+    defer lane.release();
+    const io = lane.io();
+    const borrow: abi.native_abi.IoBorrow = .init(&io);
+    callback(context, &borrow);
+    return true;
+}
+
 fn createOpaqueServer(
     owner_alloc: std.mem.Allocator,
     cfg: server_mod.ApiHttpServerConfig,
@@ -225,7 +264,12 @@ fn createOpaqueServer(
     const api_network_borrow: ?abi.native_abi.IoBorrow = if (api_network_io) |io| .init(&io) else null;
     const api_filesystem_borrow: ?abi.native_abi.IoBorrow = if (api_filesystem_io) |io| .init(&io) else null;
     const durable_borrow: ?abi.native_abi.IoBorrow = if (durable_io) |io| .init(&io) else null;
+    const request_forward: ?abi.RequestForwardLaneSource = if (cfg.backend_runtime) |runtime|
+        .{ .context = runtime, .with_lane = withRequestForwardLane }
+    else
+        null;
     const runtime_io: abi.RuntimeIoBorrows = .{
+        .request_forward = if (request_forward) |*lane_source| lane_source else null,
         .api = if (api_borrow) |*borrow| borrow else null,
         .api_network = if (api_network_borrow) |*borrow| borrow else null,
         .api_filesystem = if (api_filesystem_borrow) |*borrow| borrow else null,
@@ -282,9 +326,9 @@ fn callFallible(
     try callError(function(&.{
         .abi_version = abi.abi_version,
         .handle = handle,
-        .input = input,
+        .input = if (input) |value| @ptrCast(value) else null,
         .input_contract = .of(Input),
-        .output = output,
+        .output = if (output) |value| @ptrCast(value) else null,
         .output_contract = .of(Output),
     }));
 }
@@ -623,6 +667,45 @@ pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.Ant
         server.antfly_provider = provider
     else
         server.setAntflyProvider(provider);
+}
+
+test "API kernel forward lane reserves owning runtime capacity" {
+    const runtime_mod = @import("antfly_local_sources").storage_background_runtime;
+    var runtime = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.sql_request_forward_workers_per_request },
+    });
+    defer runtime.deinit();
+
+    const Probe = struct {
+        owner: *runtime_mod.BackendRuntime,
+        called: bool = false,
+        busy: bool = false,
+
+        fn invoke(raw: *anyopaque, borrow: *const abi.native_abi.IoBorrow) callconv(.c) void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            _ = borrow.receive() catch return;
+            probe.called = true;
+            var additional = probe.owner.acquireDedicatedRequestForwardLane() catch |err| {
+                probe.busy = err == error.RequestForwardCapacityUnavailable;
+                return;
+            };
+            additional.release();
+        }
+    };
+
+    var probe: Probe = .{ .owner = runtime.ptr() };
+    try std.testing.expect(withRequestForwardLane(probe.owner, &probe, Probe.invoke));
+    try std.testing.expect(probe.called and probe.busy);
+    var acquired = try probe.owner.acquireDedicatedRequestForwardLane();
+    defer acquired.release();
+
+    var borrowed = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = std.testing.io },
+    });
+    defer borrowed.deinit();
+    try std.testing.expect(!withRequestForwardLane(borrowed.ptr(), &probe, Probe.invoke));
 }
 
 test "opaque host middleware protects direct internal routes across the kernel ABI" {

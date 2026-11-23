@@ -429,7 +429,7 @@ test "external lake leased publication adaptive spill cache reduces wide drain r
         fn runSized(compressed: bool, fixed: bool, publication: bool, count: usize, cache_bytes: usize) !Measurement {
             var resources = local.storage_resource_manager.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 << 20 } });
             defer resources.deinit(std.heap.smp_allocator);
-            const memory = try @import("sql_memory_owner.zig").create(std.heap.smp_allocator, std.heap.smp_allocator, &resources);
+            const memory = try @import("sql/execution/memory_owner.zig").create(std.heap.smp_allocator, std.heap.smp_allocator, &resources);
             defer memory.release(memory.ptr);
             var budget: local.sql_memory_budget = .{ .backing = memory.allocator, .limit = 32 << 20, .pressure = memory.pressure };
             var working = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(if (publication) std.heap.smp_allocator else memory.allocator, .{ .max_working_set_bytes = 64 << 20 });

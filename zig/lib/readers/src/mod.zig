@@ -278,7 +278,7 @@ pub const BatchResult = struct {
     /// Decoded HTTP response body bytes, when the adapter uses HTTP.
     response_body_bytes: ?usize = null,
 
-    pub fn responseBytes(self: BatchResult) usize {
+    pub fn retainedPayloadBytes(self: BatchResult) usize {
         var retained_bytes: usize = 0;
         for (self.items) |item| {
             retained_bytes +|= item.text.len +| item.item_id.len +|
@@ -287,7 +287,11 @@ pub const BatchResult = struct {
                 (if (item.regions_json) |value| value.len else 0) +|
                 (if (item.source_fingerprint) |value| value.len else 0);
         }
-        return @max(retained_bytes, self.response_body_bytes orelse 0);
+        return retained_bytes;
+    }
+
+    pub fn responseBytes(self: BatchResult) usize {
+        return @max(self.retainedPayloadBytes(), self.response_body_bytes orelse 0);
     }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -520,6 +524,7 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
 }
 
 pub const RemoteOptions = struct {
+    image_first: bool = false,
     json_size_hint: ?usize = null,
     max_request_bytes: ?usize = null,
     max_attachments: ?usize = null,
@@ -1082,7 +1087,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             state.* = .{ .alloc = alloc, .http = http, .options = options, .base_url = "", .model = "", .max_tokens = cfg.max_tokens };
             errdefer state.deinitState();
             state.gateway_id = try dupOpt(alloc, cfg.gateway_id);
-            state.base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse switch (provider) {
+            state.base_url = if (provider == .cloudflare) try config.cloudflare.baseUrl(alloc, cfg.account_id, cfg.base_url orelse cfg.url) else try alloc.dupe(u8, cfg.base_url orelse (if (provider == .openai) cfg.resolvedUrl() else null) orelse switch (provider) {
                 .openai => "https://api.openai.com/v1",
                 .vertex => "https://aiplatform.googleapis.com/v1",
                 else => unreachable,
@@ -1175,8 +1180,11 @@ fn CloudReaderState(comptime provider: Provider) type {
                 for (content.items) |*item| deinitJsonValue(alloc, item);
                 content.deinit();
             }
-            try appendTextPart(alloc, &content, req.prompt orelse self.prompt orelse "Read the image and return the text.");
+            const prompt = req.prompt orelse self.prompt orelse "Read the image and return the text.";
+            const include_prompt = prompt.len > 0 or provider != .openai;
+            if (include_prompt and !self.options.image_first) try appendTextPart(alloc, &content, prompt);
             for (req.images) |image| try appendImageUrlPart(alloc, &content, image);
+            if (include_prompt and self.options.image_first) try appendTextPart(alloc, &content, prompt);
             const messages = [_]struct { role: []const u8, content: std.json.Value }{
                 .{ .role = "user", .content = .{ .array = content } },
             };
@@ -1191,7 +1199,7 @@ fn CloudReaderState(comptime provider: Provider) type {
                 .max_tokens = req.max_tokens orelse self.max_tokens,
             });
             defer alloc.free(body);
-            const url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{self.base_url});
+            const url = try std.fmt.allocPrint(alloc, "{s}/chat/completions", .{std.mem.trimEnd(u8, self.base_url, "/")});
             defer alloc.free(url);
             var headers = std.ArrayList([2][]const u8).empty;
             defer headers.deinit(alloc);
@@ -2014,6 +2022,16 @@ test "hosted reader transports enforce complete OCR and retain measured usage fo
             server.handleOne() catch {};
         }
     };
+    const ImageOnly = struct {
+        fn inspect(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const messages = parsed.value.object.get("messages").?.array.items;
+            const parts = messages[0].object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), parts.len);
+            try std.testing.expectEqualStrings("image_url", parts[0].object.get("type").?.string);
+        }
+    };
     for ([_]Provider{ .cloudflare, .openai, .vertex }) |provider| {
         for (0..4) |mode| {
             const body: []const u8 = if (provider == .vertex) switch (mode) {
@@ -2028,7 +2046,12 @@ test "hosted reader transports enforce complete OCR and retain measured usage fo
                 else => "{\"choices\":[{\"message\":{\"content\":\"partial\"}}]}",
             };
             const path = if (provider == .vertex) "/projects/project/locations/us-central1/publishers/google/models/reader:generateContent" else "/chat/completions";
-            var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = path, .respond = .{ .body = body } }});
+            var server = try httpx.TestServer.start(a, io, &.{.{
+                .method = .POST,
+                .path = path,
+                .assert_request = if (provider == .openai) ImageOnly.inspect else null,
+                .respond = .{ .body = body },
+            }});
             defer server.deinit();
             var group = std.Io.Group.init;
             defer group.cancel(io);
@@ -2039,7 +2062,9 @@ test "hosted reader transports enforce complete OCR and retain measured usage fo
                 .provider = provider,
                 .account_id = if (provider == .cloudflare) "account" else null,
                 .model = if (provider == .cloudflare) "@cf/mistralai/mistral-small-3.1-24b-instruct" else "reader",
-                .base_url = server.baseUrl(),
+                .base_url = if (provider == .openai) null else server.baseUrl(),
+                .url = if (provider == .openai) server.baseUrl() else null,
+                .prompt = if (provider == .openai) "" else null,
                 .bearer_token = "fixture",
                 .project_id = "project",
             };

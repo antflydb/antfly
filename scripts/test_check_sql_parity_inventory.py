@@ -13,11 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import contextlib
+import copy
 import io
 import json
+import os
+import select
+import signal
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from check_sql_parity_inventory import (
@@ -27,12 +33,81 @@ from check_sql_parity_inventory import (
     main,
     release_blockers,
     run_evidence,
+    run_gate,
     select_evidence_gates,
     validate,
 )
 
 
 class ParityInventoryTest(unittest.TestCase):
+    def test_timed_out_gate_kills_its_process_group_and_waits(self):
+        command = ["zig", "build"]
+        with (
+            patch("check_sql_parity_inventory.subprocess.Popen") as spawn,
+            patch("check_sql_parity_inventory.os.killpg") as kill_group,
+            patch("check_sql_parity_inventory.os.waitid", return_value=None),
+        ):
+            child = spawn.return_value.__enter__.return_value
+            child.pid = 123
+            child.wait.return_value = -signal.SIGKILL
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_gate(command, cwd=Path("."), timeout=0)
+        spawn.assert_called_once_with(command, cwd=Path("."), start_new_session=True)
+        kill_group.assert_called_once_with(123, signal.SIGKILL)
+        self.assertEqual(child.wait.call_count, 1)
+
+    def assert_gate_signal_cleanup(self, *, leader_exits):
+        gate = (
+            "import os, subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print(os.getpid(), flush=True); "
+            + ("" if leader_exits else "__import__('time').sleep(60)")
+        )
+        runner = (
+            "from check_sql_parity_inventory import run_gate; "
+            "from pathlib import Path; import sys; "
+            "run_gate([sys.executable, '-c', sys.argv[1]], cwd=Path.cwd(), timeout=60)"
+        )
+        if leader_exits:
+            runner = (
+                "import os, signal\n"
+                "waitid = os.waitid\n"
+                "def observe(*args):\n"
+                "    result = waitid(*args)\n"
+                "    if result: os.kill(os.getpid(), signal.SIGTERM)\n"
+                "    return result\n"
+                "os.waitid = observe\n"
+            ) + runner
+        with subprocess.Popen(
+            [sys.executable, "-c", runner, gate],
+            cwd=Path(__file__).resolve().parent,
+            stdout=subprocess.PIPE,
+        ) as supervisor:
+            group = None
+            try:
+                readable, _, _ = select.select([supervisor.stdout], [], [], 10)
+                self.assertTrue(readable, "gate did not report startup")
+                group = int(supervisor.stdout.readline())
+                if not leader_exits:
+                    supervisor.terminate()
+                # Both descendants inherit the write end, so EOF proves
+                # the entire group stopped, even after the supervisor exited.
+                supervisor.communicate(timeout=10)
+                self.assertEqual(supervisor.returncode, 128 + signal.SIGTERM)
+                group = None
+            finally:
+                if group is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(group, signal.SIGKILL)
+                if supervisor.poll() is None:
+                    supervisor.kill()
+
+    def test_sigterm_reaps_gate_with_live_grandchild(self):
+        self.assert_gate_signal_cleanup(leader_exits=False)
+
+    def test_sigterm_reaps_gate_after_leader_exits(self):
+        self.assert_gate_signal_cleanup(leader_exits=True)
+
     @classmethod
     def setUpClass(cls):
         cls.inventory = (FIXTURES / "sql_parity_inventory.json").read_bytes()
@@ -62,12 +137,9 @@ class ParityInventoryTest(unittest.TestCase):
     def test_completed_status_needs_executable_evidence(self):
         for status in ("implemented", "rejected", "superseded"):
             ledger = copy.deepcopy(self.ledger)
-            unresolved = next(
-                entry
-                for entry in ledger["entries"]
-                if entry["status"] == "unresolved" and not entry.get("evidence")
-            )
-            unresolved["status"] = status
+            entry = ledger["entries"][0]
+            entry.pop("evidence", None)
+            entry["status"] = status
             with self.assertRaisesRegex(ValueError, "executable evidence"):
                 validate(self.inventory, ledger)
 
@@ -205,7 +277,23 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertIn("still block release", output.getvalue())
 
     def test_family_report_does_not_turn_release_into_a_subset_gate(self):
+        inventory = json.loads(self.inventory)
+        outside_family = next(
+            case for case in inventory["entries"] if case["family"] != "read"
+        )
+        ledger = copy.deepcopy(self.ledger)
+        next(
+            entry for entry in ledger["entries"] if entry["id"] == outside_family["id"]
+        )["status"] = "unresolved"
+        read_bytes = Path.read_bytes
+
+        def read_fixture(path):
+            if path == FIXTURES / "sql_parity_dispositions.json":
+                return json.dumps(ledger).encode()
+            return read_bytes(path)
+
         with (
+            patch.object(Path, "read_bytes", read_fixture),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()) as errors,
             patch("check_sql_parity_inventory.run_evidence") as run,
@@ -218,12 +306,25 @@ class ParityInventoryTest(unittest.TestCase):
     def test_unresolved_partial_evidence_is_checked_and_runs_without_release_credit(
         self,
     ):
-        _, entries, gate_ids = validate(self.inventory, self.ledger)
+        # The live case may legitimately graduate. Exercise partial evidence
+        # using a controlled disposition, not a permanently unresolved case.
+        ledger = copy.deepcopy(self.ledger)
+        next(entry for entry in ledger["entries"] if entry["id"] == "sql-0008")[
+            "status"
+        ] = "unresolved"
+        _, entries, gate_ids = validate(self.inventory, ledger)
         partial = next(entry for entry in entries if entry["id"] == "sql-0008")
         self.assertEqual("unresolved", partial["status"])
+        self.assertIn(partial, release_blockers(entries))
         self.assertIn("sql-original-prepared-cte-runtime", gate_ids)
         self.assertIn("pgwire-original-prepared-cte", gate_ids)
-        ledger = copy.deepcopy(self.ledger)
+        with patch("check_sql_parity_inventory.run_gate") as run:
+            run_evidence(
+                sorted({proof["gate"] for proof in partial["evidence"]}),
+                ledger["gates"],
+            )
+        self.assertTrue(run.called)
+        self.assertEqual("unresolved", partial["status"])
         partial = next(
             entry for entry in ledger["entries"] if entry["id"] == "sql-0008"
         )
@@ -237,7 +338,7 @@ class ParityInventoryTest(unittest.TestCase):
             "pgwire original prepared CTE INSERT defers mutation until execute"
         )
         partial["evidence"][2]["test"] = (
-            "SQL document reads reject the relational stateless fallback before transport"
+            "SQL stateless fallback rejects JSON scans before transport"
         )
         with self.assertRaisesRegex(ValueError, "at least one cited evidence test"):
             validate(self.inventory, ledger)
@@ -247,21 +348,22 @@ class ParityInventoryTest(unittest.TestCase):
             validate(self.inventory, self.ledger, source_bytes=b"{}")
 
     def test_referenced_evidence_can_run_before_release_is_ready(self):
-        _, entries, gate_ids = validate(self.inventory, self.ledger)
+        ledger = copy.deepcopy(self.ledger)
+        ledger["entries"][0]["status"] = "unresolved"
+        _, entries, gate_ids = validate(self.inventory, ledger)
         self.assertGreater(len(release_blockers(entries)), 0)
         self.assertTrue(gate_ids)
-        runs = evidence_runs(gate_ids, self.ledger["gates"])
+        runs = evidence_runs(gate_ids, ledger["gates"])
         self.assertLess(len(runs), len(gate_ids))
         self.assertEqual(
             gate_ids, sorted(gate for run in runs for gate in run["gate_ids"])
         )
-        with patch("check_sql_parity_inventory.subprocess.run") as run:
+        with patch("check_sql_parity_inventory.run_gate") as run:
             run_evidence(gate_ids, self.ledger["gates"])
         self.assertEqual(len(runs), run.call_count)
         for planned, call in zip(runs, run.call_args_list, strict=True):
             self.assertEqual(planned["command"], call.args[0])
             self.assertEqual(planned["timeout_seconds"], call.kwargs["timeout"])
-            self.assertTrue(call.kwargs["check"])
 
     def test_evidence_grouping_preserves_distinct_filters_and_isolation(self):
         gates = {
@@ -307,6 +409,7 @@ class ParityInventoryTest(unittest.TestCase):
                 "timeout_seconds": 13,
             },
         }
+        gates["f"] = {**gates["e"], "timeout_seconds": 15}
         runs = evidence_runs(list(gates), gates)
         self.assertEqual(4, len(runs))
         self.assertEqual(["a", "b"], runs[0]["gate_ids"])
@@ -326,7 +429,8 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertEqual(12, runs[0]["timeout_seconds"])
         self.assertEqual(["c"], runs[1]["gate_ids"])
         self.assertEqual(["d"], runs[2]["gate_ids"])
-        self.assertEqual(["e"], runs[3]["gate_ids"])
+        self.assertEqual(["e", "f"], runs[3]["gate_ids"])
+        self.assertEqual(15, runs[3]["timeout_seconds"])
 
     def test_compile_filter_grouping_keeps_owner_and_build_options_isolated(self):
         def gate(filters, target="sql-test", options=()):
@@ -358,6 +462,31 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertEqual(10, runs[0]["timeout_seconds"])
         self.assertEqual(["c"], runs[1]["gate_ids"])
         self.assertEqual(["d"], runs[2]["gate_ids"])
+
+    def test_compile_and_runtime_filter_groups_never_share_an_argv(self):
+        prefix = ["zig", "build", "sql-test", "-Doptimize=Debug", "-j1"]
+        for compile_first in (True, False):
+            gates = {
+                "compile": {
+                    "command": prefix + ["-Dtest-filter=alpha"],
+                    "cwd": "zig",
+                    "timeout_seconds": 5,
+                },
+                "runtime": {
+                    "command": prefix + ["--", "--test-filter", "beta"],
+                    "cwd": "zig",
+                    "timeout_seconds": 7,
+                },
+            }
+            ids = ["compile", "runtime"] if compile_first else ["runtime", "compile"]
+            runs = evidence_runs(ids, gates)
+            self.assertEqual(2, len(runs))
+            for run, gate_id in zip(runs, ids, strict=True):
+                self.assertEqual([gate_id], run["gate_ids"])
+                self.assertEqual(gates[gate_id]["command"], run["command"])
+                self.assertEqual(
+                    gates[gate_id]["timeout_seconds"], run["timeout_seconds"]
+                )
 
 
 if __name__ == "__main__":

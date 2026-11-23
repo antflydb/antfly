@@ -66,7 +66,11 @@ pub const Store = struct {
         if (row.values.len != self.width) return error.InvalidSqlSpill;
         var bytes: usize = @sizeOf(operators.Row) + row.values.len * @sizeOf(Datum);
         for (row.values) |value| bytes +|= try operators.datumBytes(value);
-        if (self.pending.items.len != 0 and (self.pending.items.len >= 64 or bytes > @min(64 * 1024, self.file.manager.max_record_bytes / 4) -| self.bytes)) try self.flush();
+        if (self.pending.items.len != 0) {
+            const window = @min(64 * 1024, self.file.manager.max_record_bytes / 4);
+            const available = @import("memory_budget.zig").headroom(self.a) orelse std.math.maxInt(usize);
+            if (self.pending.items.len >= 64 or bytes > @min(window, available / 4) -| self.bytes) try self.flush();
+        }
         const a = self.arena.allocator();
         const values = try a.alloc(Datum, self.width);
         for (row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);

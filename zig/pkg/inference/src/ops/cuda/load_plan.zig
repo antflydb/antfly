@@ -61,7 +61,10 @@ pub fn residencyPolicyFromEnv() ResidencyPolicy {
         .tensor_core_packed_weights = tensorCorePackedWeightsRequested(),
         .dequantize_all_weights = dequantizeAllWeights(),
         .dequantize_q4_0_to_bf16 = dequantizeQ4_0ToBf16(),
-        .retain_q4_0_bf16_mirror = retainQ4_0Bf16Mirror(),
+        // Reserve the existing conservative upper bound before model
+        // geometry is available. Actual donor allocation is selective.
+        .retain_q4_0_bf16_mirror = retainQ4_0Bf16Mirror() or
+            @import("../../execution/gemma4_native_plan.zig").explicitSelection() == .bf16_donors,
     };
 }
 

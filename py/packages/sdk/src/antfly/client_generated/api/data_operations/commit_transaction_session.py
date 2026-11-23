@@ -9,6 +9,7 @@ from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.transaction_commit_request import TransactionCommitRequest
 from ...models.transaction_session_commit_response import TransactionSessionCommitResponse
+from ...models.transaction_write_error import TransactionWriteError
 from ...types import UNSET, Response, Unset
 
 
@@ -37,7 +38,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | TransactionSessionCommitResponse | None:
+) -> Error | TransactionWriteError | TransactionSessionCommitResponse | str | None:
     if response.status_code == 200:
         response_200 = TransactionSessionCommitResponse.from_dict(response.json())
 
@@ -53,12 +54,37 @@ def _parse_response(
 
         return response_400
 
+    if response.status_code == 403:
+        if response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/plain":
+            return response.text
+
+        def _parse_response_403(data: object) -> Error | TransactionWriteError:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                response_403_type_0 = TransactionWriteError.from_dict(data)
+
+                return response_403_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            response_403_type_1 = Error.from_dict(data)
+
+            return response_403_type_1
+
+        response_403 = _parse_response_403(response.json())
+
+        return response_403
+
     if response.status_code == 404:
         response_404 = Error.from_dict(response.json())
 
         return response_404
 
     if response.status_code == 409:
+        if response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/plain":
+            return response.text
         response_409 = TransactionSessionCommitResponse.from_dict(response.json())
 
         return response_409
@@ -68,6 +94,29 @@ def _parse_response(
 
         return response_500
 
+    if response.status_code == 503:
+        if response.headers.get("content-type", "").partition(";")[0].strip().lower() == "text/plain":
+            return response.text
+
+        def _parse_response_503(data: object) -> Error | TransactionWriteError:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                response_503_type_0 = TransactionWriteError.from_dict(data)
+
+                return response_503_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            response_503_type_1 = Error.from_dict(data)
+
+            return response_503_type_1
+
+        response_503 = _parse_response_503(response.json())
+
+        return response_503
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -76,7 +125,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | TransactionSessionCommitResponse]:
+) -> Response[Error | TransactionWriteError | TransactionSessionCommitResponse | str]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -90,7 +139,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: TransactionCommitRequest | Unset = UNSET,
-) -> Response[Error | TransactionSessionCommitResponse]:
+) -> Response[Error | TransactionWriteError | TransactionSessionCommitResponse | str]:
     """Commit a transaction session
 
     Args:
@@ -111,7 +160,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | TransactionSessionCommitResponse]
+        Response[Error | TransactionWriteError | TransactionSessionCommitResponse | str]
     """
 
     kwargs = _get_kwargs(
@@ -131,7 +180,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: TransactionCommitRequest | Unset = UNSET,
-) -> Error | TransactionSessionCommitResponse | None:
+) -> Error | TransactionWriteError | TransactionSessionCommitResponse | str | None:
     """Commit a transaction session
 
     Args:
@@ -152,7 +201,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | TransactionSessionCommitResponse
+        Error | TransactionWriteError | TransactionSessionCommitResponse | str
     """
 
     return sync_detailed(
@@ -167,7 +216,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: TransactionCommitRequest | Unset = UNSET,
-) -> Response[Error | TransactionSessionCommitResponse]:
+) -> Response[Error | TransactionWriteError | TransactionSessionCommitResponse | str]:
     """Commit a transaction session
 
     Args:
@@ -188,7 +237,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | TransactionSessionCommitResponse]
+        Response[Error | TransactionWriteError | TransactionSessionCommitResponse | str]
     """
 
     kwargs = _get_kwargs(
@@ -206,7 +255,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: TransactionCommitRequest | Unset = UNSET,
-) -> Error | TransactionSessionCommitResponse | None:
+) -> Error | TransactionWriteError | TransactionSessionCommitResponse | str | None:
     """Commit a transaction session
 
     Args:
@@ -227,7 +276,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | TransactionSessionCommitResponse
+        Error | TransactionWriteError | TransactionSessionCommitResponse | str
     """
 
     return (

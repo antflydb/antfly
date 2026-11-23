@@ -26,7 +26,7 @@ pub fn isHelpRequest(args: []const []const u8) bool {
 }
 
 fn runFlagTakesValue(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--host") or
+    return std.mem.startsWith(u8, arg, "--pjrt-") or std.mem.eql(u8, arg, "--host") or
         std.mem.eql(u8, arg, "--port") or
         std.mem.eql(u8, arg, "--models-dir") or
         std.mem.eql(u8, arg, "--ml-dir") or

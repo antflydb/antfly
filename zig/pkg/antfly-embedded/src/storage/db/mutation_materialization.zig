@@ -69,9 +69,10 @@ const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const commit_participant = @import("../commit_participant.zig");
 const native_catalog_backend = @import("../native_catalog_backend.zig");
+const roaring = @import("../../encoding/roaring.zig");
 const persistent_mod = @import("../persistent.zig");
 const projection_seal = @import("../projection_seal.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 const resolver_lib = @import("antfly_resolver");
 const resource_manager_mod = @import("../resource_manager.zig");
 const result_collectors = @import("result_collectors.zig");
@@ -1490,6 +1491,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             error_code: []const u8,
             error_message: []const u8,
             error_stage: []const u8,
+            execution_json: []const u8,
             artifact_writes: anytype,
         ) !void {
             var previous_state = DocumentExtractionPreviousState{};
@@ -1511,6 +1513,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 error_code,
                 error_message,
                 error_stage,
+                execution_json,
             );
             defer alloc.free(manifest);
             try appendPreparedArtifactCopy(alloc, artifact_writes, manifest_key, manifest);
@@ -3374,22 +3377,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             alloc: Allocator,
             index_manager: *index_manager_mod.IndexManager,
+            index_ref: index_manager_mod.ManagedIndexRef,
             entry: *index_manager_mod.IndexManager.TextIndex,
+            /// Held from prepare to the end of `stage` only: decisions run in
+            /// the group apply (`resolution`), so nothing here is held across
+            /// the commit or its fsync.
+            /// The catalog stays shared from prepare to `finish`, so the
+            /// index and `entry` stay put; the index's own mutex is held only
+            /// from prepare to the end of `stage` and again for `install`
+            /// (`index_locked`).
             apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+            index_locked: bool = true,
             segments: [max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined,
             segment_count: usize = 0,
             seal: ?persistent_mod.PersistentIndex.SealPublication = null,
-            delete: persistent_mod.PersistentIndex.PreparedDeleteByIds = .{ .delete_infos = &.{}, .seg_keys = &.{} },
+            /// This write's copies and deletes, decided at the commit's tip
+            /// in the group apply, last writer wins by version.
+            resolution: persistent_mod.PersistentIndex.VersionResolution,
             progress: apply_state.Progress,
 
-            fn mutationsAlloc(self: *const InlineTextPublication, alloc: Allocator) ![]native_catalog_backend.Mutation {
+            fn mutationsAlloc(self: *InlineTextPublication, alloc: Allocator) ![]native_catalog_backend.Mutation {
                 var out = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
                 errdefer out.deinit(alloc);
                 for (self.segments[0..self.segment_count]) |*seg| try out.appendSlice(alloc, &seg.mutations());
                 if (self.seal) |*seal| try out.append(alloc, seal.mutation());
-                const delete_mutations = try self.delete.mutationsAlloc(alloc);
-                defer alloc.free(delete_mutations);
-                try out.appendSlice(alloc, delete_mutations);
                 return try out.toOwnedSlice(alloc);
             }
 
@@ -3398,10 +3409,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             fn stage(ptr: *anyopaque, view: commit_participant.View, _: []const u8) anyerror!void {
                 const self: *InlineTextPublication = @ptrCast(@alignCast(ptr));
                 const scope = self.entry.persistent.nativeCatalogScope() orelse return error.NotNativeCatalogBackend;
+                const resolution_bytes = native_catalog_backend.resolution(self.resolution.resolverForStaging());
+                try view.putIndexCatalog(scope, &.{.{ .namespace = native_catalog_backend.resolve_namespace, .key = "resolver", .value = &resolution_bytes }});
                 const mutations = try self.mutationsAlloc(self.alloc);
                 defer self.alloc.free(mutations);
                 if (mutations.len != 0) try view.putIndexCatalog(scope, mutations);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
+                // Nothing staged depends on another writer of this index:
+                // other writes may prepare and join the same group commit.
+                self.releaseGuard();
             }
 
             /// `commit_participant.Participant.stage` is called BEFORE the
@@ -3415,15 +3431,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
             }
 
-            /// Runs only after this publication's mutations are durable:
-            /// syncs the `.native_catalog` backend's own in-memory read
-            /// mirror (it never saw `stage`'s `view.putIndexCatalog` call,
-            /// which wrote the native file directly), installs the
-            /// in-memory writer snapshot for every segment and the
-            /// delete-tracking state, then releases the apply guard held
-            /// since `prepareInlineTextPublication`.
+            /// Runs only after this publication is durable: syncs the
+            /// `.native_catalog` backend's in-memory mirror (it never saw the
+            /// records, written into the native transaction directly), adds
+            /// the level-0 segments to the writer snapshot and marks the
+            /// versions this write made dead. Takes the index's apply guard
+            /// for just this, not across the commit.
             pub fn install(self: *InlineTextPublication) void {
-                std.debug.assert(self.apply_guard.locked());
+                if (!self.index_locked) {
+                    self.apply_guard.relockIndex();
+                    self.index_locked = true;
+                }
                 if (self.mutationsAlloc(self.alloc)) |mutations| {
                     defer self.alloc.free(mutations);
                     self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations) catch |err| {
@@ -3432,39 +3450,44 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } else |err| {
                     std.log.err("inline text publication install: rebuilding mutations failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
                 }
+                self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(self.resolution.decidedMutations()) catch |err| {
+                    std.log.err("inline text publication install: native_catalog mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                };
                 for (self.segments[0..self.segment_count]) |*seg| self.entry.persistent.installInlineSegmentPublication(seg);
-                self.entry.persistent.installInlineDeleteByIdsTracked(self.alloc, &self.delete);
-                // This fast path adds a one-document segment directly and
-                // never goes through `finalizeTextBatchMutations` (the
-                // non-inline batch-apply path's own post-write bookkeeping),
-                // so nothing else ever marks `compaction_pending` for an
-                // inline-published index: `TextMergeScheduler.select` only
-                // ever considers entries with that bit set, so segments
-                // would otherwise accumulate one per write with no merge
-                // ever scheduled, and `IndexWriter.deleteAllByIdsTracked`'s
-                // per-write segment scan would grow with them. Mirrors the
-                // exact needsMerge/schedule/noteComplete sequence
-                // `finalizeTextBatchMutations`/`beginTextMergeTask` already
-                // use for the slow path.
-                if (self.segment_count != 0 or !self.delete.isEmpty()) {
-                    self.index_manager.noteInlineTextPublicationSegments(self.entry) catch |err| {
-                        std.log.err("inline text publication install: merge-need check failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
-                    };
-                }
-                self.apply_guard.unlock();
-                self.alloc.destroy(self);
+                self.segment_count = 0;
+                // Durable now: only from here may queries see the deletes.
+                self.resolution.install();
+                // Inline writes publish level-0 segments that only merges
+                // fold away: mark the index for its merge scheduler.
+                self.index_manager.noteInlineTextPublicationSegments(self.entry) catch |err| {
+                    std.log.err("inline text publication install: merge-need check failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                };
+                self.finish();
             }
 
-            /// The mutations were never committed (preparation succeeded
-            /// but the caller fell back, or the primary write itself
-            /// failed before committing): undo every in-memory change
-            /// `prepareInlineTextPublication` already made and release the
-            /// apply guard.
+            /// The mutations were never committed (preparation succeeded but
+            /// the caller fell back, or the primary write failed before
+            /// committing): nothing becomes visible.
             pub fn abort(self: *InlineTextPublication) void {
-                std.debug.assert(self.apply_guard.locked());
                 for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
-                self.entry.persistent.abortInlineDeleteByIdsTracked(self.alloc, &self.delete);
-                self.apply_guard.unlock();
+                self.segment_count = 0;
+                self.finish();
+            }
+
+            fn releaseGuard(self: *InlineTextPublication) void {
+                if (self.index_locked) self.apply_guard.unlockIndex();
+                self.index_locked = false;
+            }
+
+            fn finish(self: *InlineTextPublication) void {
+                _ = self.entry.persistent.inline_in_flight.fetchSub(1, .acq_rel);
+                // Segments neither installed nor aborted (an install that
+                // could not retake the guard) are released here.
+                for (self.segments[0..self.segment_count]) |*seg| seg.abort(self.alloc);
+                self.segment_count = 0;
+                self.releaseGuard();
+                self.apply_guard.unlockCatalog();
+                self.resolution.deinit();
                 self.alloc.destroy(self);
             }
         };
@@ -3539,6 +3562,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             defer collected.deinit();
             if (collected.missing_required != 0 or collected.docs.items.len == 0) return error.InlineTextPublicationUnsupported;
+            // Each copy's version: this write's sequence, then its position.
+            for (collected.docs.items, 0..) |*doc, position| doc.doc_version = try persistent_mod.DocVersion.of(batch.sequence, position);
 
             var publication_plan = try index_manager.planTextMapperDocsPublication(
                 index_ref.name,
@@ -3572,20 +3597,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const entry = index_manager.textIndexEntry(index_ref.name) orelse return error.InlineTextPublicationUnsupported;
             if (entry.persistent.main_backend != .native_catalog) return error.InlineTextPublicationUnsupported;
 
+            if (!entry.persistent.versioned) return error.InlineTextPublicationUnsupported;
+
             const delete_keys = try collectTextReplayDeleteKeys(alloc, index_manager, batch, index_ref.name, publication_context);
             defer if (delete_keys.len > 0) alloc.free(delete_keys);
-
-            var prepared_delete = try entry.persistent.prepareInlineDeleteByIdsTracked(alloc, delete_keys);
-            errdefer entry.persistent.abortInlineDeleteByIdsTracked(alloc, &prepared_delete);
 
             var prepared_segments: [InlineTextPublication.max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined;
             var prepared_segment_count: usize = 0;
             errdefer for (prepared_segments[0..prepared_segment_count]) |*seg| seg.abort(alloc);
-            for (prepared_publication.segments, 0..) |*segment, i| {
+            for (prepared_publication.segments) |*segment| {
                 if (segment.len == 0) continue;
                 const owned = segment.*;
                 segment.* = &.{};
-                prepared_segments[i] = entry.persistent.prepareInlineSegmentPublication(owned) catch |err| {
+                prepared_segments[prepared_segment_count] = entry.persistent.prepareInlineSegmentPublication(owned) catch |err| {
                     alloc.free(owned);
                     return err;
                 };
@@ -3595,16 +3619,35 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const seal_value = try buildInlineProjectionSeal(index_manager, store, entry, batch.sequence);
             const prepared_seal = if (seal_value) |seal| try entry.persistent.prepareInlineProjectionSealMutation(seal) else null;
 
+            // A key this write indexes again needs no delete: its new copy
+            // supersedes the old one. The rest are deleted at versions after
+            // every copy's.
+            var indexed = std.StringHashMapUnmanaged(void).empty;
+            defer indexed.deinit(alloc);
+            for (collected.docs.items) |doc| try indexed.put(alloc, doc.key, {});
+            var resolution = persistent_mod.PersistentIndex.VersionResolution.init(&entry.persistent);
+            errdefer resolution.deinit();
+            for (prepared_segments[0..prepared_segment_count]) |*seg| try resolution.addCopies(seg.copies);
+            var delete_position = collected.docs.items.len;
+            for (delete_keys) |key| {
+                if (indexed.contains(key)) continue;
+                try resolution.addDelete(key, try persistent_mod.DocVersion.of(batch.sequence, delete_position));
+                delete_position += 1;
+            }
+
             const result = try alloc.create(InlineTextPublication);
+            // Under the apply guard, which `refreshFromTip` also takes.
+            _ = entry.persistent.inline_in_flight.fetchAdd(1, .acq_rel);
             result.* = .{
                 .alloc = alloc,
                 .index_manager = index_manager,
+                .index_ref = index_ref,
                 .entry = entry,
                 .apply_guard = apply_guard,
                 .segments = prepared_segments,
                 .segment_count = prepared_segment_count,
                 .seal = prepared_seal,
-                .delete = prepared_delete,
+                .resolution = resolution,
                 .progress = .{
                     .consumer = index_ref.name,
                     .sequence = batch.sequence,
@@ -4438,6 +4481,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
                 defer collected.deinit();
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
+                var replay_versions = try TextReplayVersions.init(ctx.alloc, batch, collected.docs.items);
+                defer replay_versions.deinit();
 
                 const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
                 var write_start: usize = 0;
@@ -4521,10 +4566,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     publication_context,
                                 );
                             defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
+                            const versioned = if (ctx.index_manager.textIndexEntry(index_ref.name)) |entry| entry.persistent.versioned else false;
+                            var deletes = if (versioned) try replay_versions.deletesAlloc(delete_keys) else TextReplayVersions.Deletes{ .keys = delete_keys };
+                            defer if (versioned) deletes.deinit(ctx.alloc);
                             try ctx.index_manager.applyPreparedTextMapperPublicationByNameWithOptions(
                                 ctx.store,
                                 index_ref.name,
-                                delete_keys,
+                                deletes.keys,
+                                deletes.versions,
                                 &prepared_publication,
                                 text_replay_options,
                             );
@@ -4959,7 +5008,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
                 .algebraic => {
                     if (ctx.projection_only) return error.InvalidShadowIndexKind;
-                    try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, batch, .{ .mode = .bulk_ingest });
+                    // Journal replay carries logical keys, not inline JSON.
+                    // Resolve the profile-specific primary namespace and pin
+                    // the row's declared layout through the shared collector.
+                    // A missing live row must not advance the index checkpoint.
+                    var writes = try collectDocumentWritesProfiled(ctx.alloc, ctx.store, ctx.index_manager, batch.documents, ctx.index_manager.byte_range, .{
+                        .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                        .relational_base_rows = ctx.relational_base_rows,
+                    }, null);
+                    defer writes.deinit();
+                    if (writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+                    const documents = try ctx.alloc.alloc(derived_types.DerivedDocument, writes.items.len);
+                    defer ctx.alloc.free(documents);
+                    for (writes.items, documents) |write, *document| document.* = .{ .key = write.key, .action = .upsert, .cleaned_value = write.value };
+                    var prepared = batch;
+                    prepared.documents = documents;
+                    try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, prepared, .{ .mode = .bulk_ingest });
                 },
             }
             if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
@@ -6778,6 +6842,81 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
 
+        /// Full-text versions for one replayed batch, which may fold several
+        /// journal records: each copy and each delete takes its own record's
+        /// sequence (`DerivedDocument.sequence`, `DerivedBatch.delete_sequences`),
+        /// with positions counted per sequence.
+        pub const TextReplayVersions = struct {
+            alloc: Allocator,
+            batch: derived_types.DerivedBatch,
+            next_position: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+            indexed: std.StringHashMapUnmanaged(void) = .empty,
+
+            pub const Deletes = struct {
+                keys: []const []const u8,
+                versions: []const u64 = &.{},
+
+                pub fn deinit(self: *Deletes, alloc: Allocator) void {
+                    if (self.keys.len != 0) alloc.free(self.keys);
+                    if (self.versions.len != 0) alloc.free(self.versions);
+                }
+            };
+
+            /// Stamps `docs` with their versions.
+            pub fn init(alloc: Allocator, batch: derived_types.DerivedBatch, docs: []mapper.MapperDoc) !TextReplayVersions {
+                var self: TextReplayVersions = .{ .alloc = alloc, .batch = batch };
+                errdefer self.deinit();
+                var sequences = std.StringHashMapUnmanaged(u64).empty;
+                defer sequences.deinit(alloc);
+                for (batch.documents) |doc| try sequences.put(alloc, doc.key, if (doc.sequence != 0) doc.sequence else self.keySequence());
+                for (docs) |*doc| {
+                    doc.doc_version = try self.next(sequences.get(doc.key) orelse self.keySequence());
+                    try self.indexed.put(alloc, doc.key, {});
+                }
+                return self;
+            }
+
+            pub fn deinit(self: *TextReplayVersions) void {
+                self.next_position.deinit(self.alloc);
+                self.indexed.deinit(self.alloc);
+            }
+
+            fn keySequence(self: *const TextReplayVersions) u64 {
+                return if (self.batch.key_sequence != 0) self.batch.key_sequence else self.batch.sequence;
+            }
+
+            fn next(self: *TextReplayVersions, sequence: u64) !u64 {
+                const slot = try self.next_position.getOrPut(self.alloc, sequence);
+                if (!slot.found_existing) slot.value_ptr.* = 0;
+                defer slot.value_ptr.* += 1;
+                return try persistent_mod.DocVersion.of(sequence, slot.value_ptr.*);
+            }
+
+            /// The keys this batch deletes without indexing a new copy, at
+            /// their records' versions. A key indexed again needs no delete:
+            /// its new copy supersedes the old one.
+            pub fn deletesAlloc(self: *TextReplayVersions, delete_keys: []const []const u8) !Deletes {
+                var sequences = std.StringHashMapUnmanaged(u64).empty;
+                defer sequences.deinit(self.alloc);
+                if (self.batch.delete_sequences.len == self.batch.overwritten_doc_keys.len) {
+                    for (self.batch.overwritten_doc_keys, self.batch.delete_sequences) |key, sequence| if (sequence != 0) try sequences.put(self.alloc, key, sequence);
+                }
+                if (self.batch.deleted_sequences.len == self.batch.deleted_keys.len) {
+                    for (self.batch.deleted_keys, self.batch.deleted_sequences) |key, sequence| if (sequence != 0) try sequences.put(self.alloc, key, sequence);
+                }
+                var keys = std.ArrayListUnmanaged([]const u8).empty;
+                errdefer keys.deinit(self.alloc);
+                var versions = std.ArrayListUnmanaged(u64).empty;
+                errdefer versions.deinit(self.alloc);
+                for (delete_keys) |key| {
+                    if (self.indexed.contains(key)) continue;
+                    try versions.append(self.alloc, try self.next(sequences.get(key) orelse self.keySequence()));
+                    try keys.append(self.alloc, key);
+                }
+                return .{ .keys = try keys.toOwnedSlice(self.alloc), .versions = try versions.toOwnedSlice(self.alloc) };
+            }
+        };
+
         pub fn collectTextReplayDeleteKeys(
             alloc: Allocator,
             index_manager: *index_manager_mod.IndexManager,
@@ -7063,6 +7202,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
+            if (producer_cfg.type == .reader or producer_cfg.type == .generator) {
+                if (try enrichment_types.withGenerationBudgetAlloc(alloc, producer_cfg.config_json, request.execution_json)) |updated| {
+                    alloc.free(producer_cfg.config_json);
+                    producer_cfg.config_json = updated;
+                }
+            }
             if (producer_cfg.type != .copy) {
                 if (deferred_asset_producer_items) |items| {
                     const request_clone = try enrichment_types.cloneGeneratedRequest(alloc, request);
@@ -7547,6 +7692,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var config = try document_extraction_mod.parseConfig(alloc, config_json);
             defer config.deinit(alloc);
             enrichment_runtime_mod.applyDocumentExtractionRuntimePolicy(&config);
+            try document_extraction_mod.applyExecutionPolicy(alloc, &config, request.execution_json);
             try document_extraction_mod.applySourceMetadataFromJson(alloc, &config, doc_value);
 
             const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
@@ -7575,12 +7721,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 0;
             const to_generation = from_generation + 1;
+            const must_force = force_reprocess and (request.reprocess_generation == 0 or from_generation < request.reprocess_generation);
 
             const metadata_fingerprint = try document_extraction_mod.metadataFingerprintAlloc(alloc, source_url, config_json, config);
             defer if (metadata_fingerprint) |fingerprint| alloc.free(fingerprint);
             // As in async replay, checksum opt-in requires verified bytes;
             // metadata-only legacy fingerprints cannot prove that provenance.
-            if (!force_reprocess) {
+            if (!must_force) {
                 if (metadata_fingerprint) |fingerprint| {
                     if (try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
                 }
@@ -7633,7 +7780,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else
                     raw_err;
                 if (err != error.DocumentExtractionWorkingSetTooLarge and !document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
-                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
+                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", request.execution_json, artifact_writes);
                 return;
             };
             const downloaded = switch (fetched) {
@@ -7643,7 +7790,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return error.RemoteDocumentFetchFailed;
                     const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
                     defer alloc.free(message);
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", request.execution_json, artifact_writes);
                     return;
                 },
             };
@@ -7659,7 +7806,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var content_digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(downloaded_mut.data, &content_digest, .{});
                 document_extraction_mod.verifyChecksumDigest(config, &content_digest) catch |raw_err| {
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(raw_err), "declared checksum does not match the downloaded bytes", "document_checksum_verification", request.execution_json, artifact_writes);
                     return;
                 };
             }
@@ -7671,7 +7818,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
             const source_fingerprint = metadata_fingerprint orelse byte_source_fingerprint.?;
 
-            if (metadata_fingerprint == null and !force_reprocess and
+            if (metadata_fingerprint == null and !must_force and
                 try reuseDocumentExtractionByFingerprint(alloc, db, request.doc_key, artifact_name, source_fingerprint, existing_state, existing_manifest, manifest_key, from_generation, artifact_writes, artifact_delete_keys)) return;
 
             // Downloaded bytes, inspection state, and decoded extraction results are
@@ -7708,10 +7855,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const exact_error_name = if (err != raw_err) @errorName(err) else boundaryFailureErrorName(&extraction_failure, err);
                 const decode_failure = document_extraction_mod.failureStageFromErrorName(exact_error_name, "").len != 0;
                 if (err == error.OutOfMemory or err == error.ResourceTemporarilyUnavailable or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.Timeout or (!decode_failure and enrichment_runtime_mod.isRetryableEnrichmentError(err))) return err;
-                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
+                try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), request.execution_json, artifact_writes);
                 return;
             };
             defer extraction.deinit(document_extraction_alloc);
+            extraction.execution_json = request.execution_json;
             if (S.ownerField(db, "enrichment_runtime").*) |runtime| {
                 enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
                     if (document_execution) |execution| &execution.runtime else runtime,
@@ -7733,7 +7881,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else
                         raw_err;
                     if (err != error.DocumentExtractionWorkingSetTooLarge) return err;
-                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "generated document text exceeded its working-set limit", "document_generated_text", artifact_writes);
+                    try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "generated document text exceeded its working-set limit", "document_generated_text", request.execution_json, artifact_writes);
                     return;
                 };
             } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
@@ -8746,6 +8894,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             error_code: []const u8,
             error_message: []const u8,
             error_stage: []const u8,
+            execution_json: []const u8,
         ) ![]u8 {
             var out = std.ArrayListUnmanaged(u8).empty;
             errdefer out.deinit(alloc);
@@ -8760,6 +8909,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", "");
             try appendJsonFieldString(alloc, &out, &first, "content_type", "");
             try appendJsonFieldString(alloc, &out, &first, "route_type", "error");
+            if (execution_json.len > 0) {
+                try appendJsonFieldName(alloc, &out, &first, "execution");
+                try out.appendSlice(alloc, execution_json);
+            }
             try appendJsonFieldUsize(alloc, &out, &first, "unit_count", unit_keys.len);
             try appendJsonFieldUsize(alloc, &out, &first, "chunk_count", chunk_keys.len);
             try appendJsonFieldName(alloc, &out, &first, "child_ranges");
@@ -8843,6 +8996,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
             try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
             try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+            if (extraction.execution_json.len > 0) {
+                try appendJsonFieldName(alloc, &out, &first, "execution");
+                try out.appendSlice(alloc, extraction.execution_json);
+            }
             if (extraction.unsupported_reason.len > 0) {
                 try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
             }

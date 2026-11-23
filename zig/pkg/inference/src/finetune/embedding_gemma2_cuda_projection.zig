@@ -35,7 +35,7 @@ pub fn baseForward(compute: *CudaCompute, weight_bf16: DeviceBuffer, input_bf16:
     try require(input_bf16, try bytes(rows, input_dim, @sizeOf(u16)));
     try require(output_bf16, try bytes(rows, output_dim, @sizeOf(u16)));
     try (try compute.embeddingGemma2TrainingCublasLt()).matmulBf16WeightBf16Out(compute.embeddingGemma2TrainingContext(), output_bf16, input_bf16, weight_bf16, workspace, rows, input_dim, output_dim);
-    (try compute.embeddingGemma2Module()).noteCublasLtMatmul();
+    (try compute.encoderMultimodalModule()).noteCublasLtMatmul();
 }
 
 pub fn baseInputVjp(compute: *CudaCompute, weight_bf16: DeviceBuffer, dy_f32: DeviceBuffer, dx_f32: DeviceBuffer, dy_bf16: DeviceBuffer, workspace: DeviceBuffer, rows: usize, input_dim: usize, output_dim: usize) !void {
@@ -50,7 +50,7 @@ pub fn baseInputVjp(compute: *CudaCompute, weight_bf16: DeviceBuffer, dy_f32: De
     const dx_bf16 = DeviceBuffer{ .ptr = workspace.ptr, .len = dx_bf16_bytes };
     const lt_workspace = DeviceBuffer{ .ptr = workspace.ptr + lt_offset, .len = workspace.len - lt_offset };
     const output_count = std.math.cast(u32, output_elements) orelse return error.InvalidEmbeddingGemma2Projection;
-    const module = try compute.embeddingGemma2Module();
+    const module = try compute.encoderMultimodalModule();
     const ctx = compute.embeddingGemma2TrainingContext();
     try module.launchF32ToBf16(ctx, dy_bf16, dy_f32, output_count);
     try (try compute.embeddingGemma2TrainingCublasLt()).matmulEmbeddingGemma2Attention(ctx, dx_bf16, dy_bf16, weight_bf16, lt_workspace, rows, input_dim, output_dim, output_dim, input_dim, input_dim, 1, 0, 0, 0, false, false, false, 1);
@@ -84,7 +84,7 @@ pub fn forward(
     try lt.matmulBf16WeightBf16Out(ctx, buffers.output_bf16, input_bf16, base_weight, buffers.workspace, rows, input_dim, output_dim);
     try lt.matmulBf16WeightBf16Out(ctx, buffers.low_rank_bf16, input_bf16, adapter.a_bf16, buffers.workspace, rows, input_dim, rank);
     try lt.matmulBf16WeightBf16Out(ctx, buffers.delta_bf16, buffers.low_rank_bf16, adapter.b_bf16, buffers.workspace, rows, rank, output_dim);
-    const module = try compute.embeddingGemma2Module();
+    const module = try compute.encoderMultimodalModule();
     const output_count = std.math.cast(u32, try elementCount(rows, output_dim)) orelse return error.InvalidEmbeddingGemma2Projection;
     const adapter_scale = alpha / @as(f32, @floatFromInt(rank));
     if (isNormalPowerOfTwo(adapter_scale)) {
@@ -148,7 +148,7 @@ pub fn backward(
     const gradients = try state.gradientSlice(adapter_index, false);
     const base_weight = try compute.embeddingGemma2Bf16Weight(base_weight_name);
     try require(base_weight, try bytes(output_dim, input_dim, @sizeOf(u16)));
-    const module = try compute.embeddingGemma2Module();
+    const module = try compute.encoderMultimodalModule();
     const ctx = compute.embeddingGemma2TrainingContext();
     const output_count = std.math.cast(u32, output_elements) orelse return error.InvalidEmbeddingGemma2Projection;
     try module.launchF32ToBf16(ctx, buffers.dy_bf16, dy_f32, output_count);

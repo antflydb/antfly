@@ -395,7 +395,7 @@ pub const Trainer = struct {
             hash.update(&scan_sms);
             std.mem.writeInt(u32, &scan_sms, self.backend.cuda_backend.?.training_math.?.shared_memory_per_block, .little);
             hash.update(&scan_sms);
-            const attention_hash = @import("../../ops/cuda/boundary_attention.zig").artifactHash();
+            const attention_hash = @import("../../ops/cuda/boundary_attention.zig").artifactHashForDevice(self.backend.cuda_backend.?.ctx.info.compute_major);
             hash.update(&attention_hash);
         }
         if (options.attention_profile != .materialized_v1) {

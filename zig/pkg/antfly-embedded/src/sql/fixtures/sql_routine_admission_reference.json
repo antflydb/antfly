@@ -1,0 +1,62 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "entries": [
+    {
+      "id": "sql-0156",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0384",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0385",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0386",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0387",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0388",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0389",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0390",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0391",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0392",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0393",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0395",
+      "sqlstate": "42601"
+    },
+    {
+      "id": "sql-0396",
+      "sqlstate": "42P13"
+    },
+    {
+      "id": "sql-0413",
+      "sqlstate": "42P13"
+    }
+  ]
+}

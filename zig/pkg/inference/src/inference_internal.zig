@@ -13,15 +13,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const pjrt_options = @import("execution/pjrt_options.zig");
 pub const pull_diagnostics = @import("registry/pull_diagnostics.zig");
 
 const build_options = @import("build_options");
 pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
+pub const gliner_boundary_executor = @import("extractors/gliner_boundary_executor.zig");
+pub const extraction_v2 = @import("extractors/extraction_v2.zig");
 pub const gliner_span_v2_executor = @import("extractors/gliner_span_v2_executor.zig");
 
 pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
 pub const hard_cancellation_watchdog = @import("hard_cancellation_watchdog.zig");
+pub const execution = @import("execution/root.zig");
+pub const native_export_gguf = @import("native_export_gguf.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -49,6 +54,7 @@ pub const server = struct {
     pub const model_manager = @import("server/model_manager.zig");
 };
 pub const pipelines = struct {
+    pub const transcription = @import("pipelines/transcription.zig");
     pub const generation = @import("pipelines/generation.zig");
     pub const image = @import("pipelines/image.zig");
     pub const media_chunking = @import("pipelines/media_chunking.zig");
@@ -204,4 +210,8 @@ test "model aware media module declarations" {
 
 test "model aware media audio projector declarations" {
     _ = @import("architectures/gemma4_projector.zig");
+}
+
+test {
+    _ = execution;
 }

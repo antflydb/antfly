@@ -63,7 +63,17 @@ fn ownershipSnapshot(node: *Node) OwnershipSnapshot {
             const loaded = entry.*;
             if (loaded.resource_lease) |lease| result.model = result.model.merge(lease.amounts) catch result.model;
             if (loaded.tokenizer_resource_lease) |lease| result.tokenizer_load = result.tokenizer_load.merge(lease.amounts) catch result.tokenizer_load;
-            result.weight_cache = result.weight_cache.merge(factory.sharedCacheAdmissionAmounts(loaded.session)) catch result.weight_cache;
+            if (factory.sharedCacheAdmissionSnapshot(loaded.session)) |cache| cache_once: {
+                // load_lock keeps all actual Model/cache identities alive.
+                var prior_iterator = node.model_manager.loaded.valueIterator();
+                while (prior_iterator.next()) |prior| {
+                    if (prior == entry) break; // exact map slot, including aliased Model values
+                    if (factory.sharedCacheAdmissionSnapshot(prior.*.session)) |previous| {
+                        if (previous.identity == cache.identity) break :cache_once;
+                    }
+                }
+                result.weight_cache = result.weight_cache.merge(cache.amounts) catch result.weight_cache;
+            }
             result.workspace = result.workspace.merge(factory.glinerBoundaryWorkspaceAdmissionAmounts(loaded.session)) catch result.workspace;
         }
     }
@@ -260,12 +270,16 @@ fn dispatchWithIo(a: Allocator, io: std.Io, node: *Node, raw: []const u8) !httpx
 }
 
 fn dispatchExtraction(a: Allocator, node: *Node, raw: []const u8) !httpx.Response {
+    return dispatchExtractionWithBodyLimit(a, node, raw, 64 * 1024);
+}
+
+fn dispatchExtractionWithBodyLimit(a: Allocator, node: *Node, raw: []const u8, body_limit: usize) !httpx.Response {
     var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
     defer request.deinit();
     request.body = raw;
     var context = httpx.Context.init(a, std.testing.io, &request);
     defer context.deinit();
-    context.max_request_body_size = 64 * 1024;
+    context.max_request_body_size = body_limit;
     context.application_deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s;
     return node.extractJSON(&context);
 }
@@ -427,7 +441,17 @@ fn expectIdleWithActiveHandles(node: *Node, active_handles: usize) !memory.Admis
             try std.testing.expectEqual(active_handles, loaded.active_handles);
             if (loaded.resource_lease) |lease| retained = try retained.merge(lease.amounts);
             if (loaded.tokenizer_resource_lease) |lease| retained = try retained.merge(lease.amounts);
-            retained = try retained.merge(factory.sharedCacheAdmissionAmounts(loaded.session));
+            if (factory.sharedCacheAdmissionSnapshot(loaded.session)) |cache| cache_once: {
+                // load_lock keeps all actual Model/cache identities alive.
+                var prior_iterator = node.model_manager.loaded.valueIterator();
+                while (prior_iterator.next()) |prior| {
+                    if (prior == entry) break; // exact map slot, including aliased Model values
+                    if (factory.sharedCacheAdmissionSnapshot(prior.*.session)) |previous| {
+                        if (previous.identity == cache.identity) break :cache_once;
+                    }
+                }
+                retained = try retained.merge(cache.amounts);
+            }
             // Currently zero for ModernBERT span sessions; retaining this
             // architecture-aware reader keeps the ownership assertion valid
             // if a boundary session ever shares this helper.
@@ -714,8 +738,10 @@ fn explicitV1ClassificationRegression(
     defer a.free(two_http_json);
     var two_http = try dispatchExtraction(a, node, two_http_json);
     defer two_http.deinit();
-    try std.testing.expectEqual(@as(u16, 400), two_http.status.code);
-    try std.testing.expect(std.mem.indexOf(u8, two_http.body orelse return error.MissingResponseBody, "UnsupportedGlinerDecisionGeometry") != null);
+    try std.testing.expectEqual(@as(u16, 413), two_http.status.code);
+    const two_body = two_http.body orelse return error.MissingResponseBody;
+    try std.testing.expect(std.mem.indexOf(u8, two_body, "EXTRACTION_LIMIT_EXCEEDED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, two_body, "qualified item, sequence or token limit") != null);
 
     var long_text = std.ArrayListUnmanaged(u8).empty;
     defer long_text.deinit(a);
@@ -781,6 +807,71 @@ fn expandedKnowledgeGraphParity(a: Allocator, node: *Node) !void {
             try std.testing.expectEqual(@as(u16, 200), response.status.code);
         }
     }
+    _ = try expectIdle(node);
+}
+
+fn cudaWindowEnvelope(a: Allocator, node: *Node, directory: []const u8) !void {
+    const limits = @import("../models/gliner_span_window_limits.zig").qualified;
+    const words_per_window = 896;
+    const word = "token ";
+    // The processor adds a terminal word to each window of this text.
+    const body_words_per_window = words_per_window - 1;
+    const text = try a.alloc(u8, limits.max_windows * body_words_per_window * word.len);
+    defer a.free(text);
+    for (0..text.len / word.len) |i| @memcpy(text[i * word.len ..][0..word.len], word);
+    const request = try std.fmt.allocPrint(a,
+        \\{{"schema_version":2,"model":"model","schema":{{"classifications":[{{"name":"intent","labels":["refund","support"]}}]}},"inputs":[{{"content":{f}}}],"options":{{"long_document":{{"mode":"window","window_words":{d},"overlap_words":0,"max_windows":{d}}}}}}}
+    , .{ std.json.fmt(text, .{}), words_per_window, limits.max_windows });
+    defer a.free(request);
+
+    var handle = try node.model_manager.acquireFromDir(directory);
+    defer handle.release();
+    const loaded = handle.get();
+    const session = loaded.session;
+    const prompt_tokens = measured: {
+        const wire = @import("../extractors/extraction_v2.zig");
+        var parsed = try wire.parseJson(a, request, .{});
+        defer parsed.deinit();
+        var plan = try span_executor.plan(a, loaded.getTokenizer(), &parsed, .{
+            .processor = .{ .max_sequence_tokens = 1024, .max_batch_tokens = 1024 },
+            .max_prompt_tokens = 1024,
+            .max_sequences_per_item = limits.max_windows,
+            .long_document_limits = limits,
+        });
+        defer plan.deinit(a);
+        try std.testing.expectEqual(limits.max_windows, plan.items[0].batches.len);
+        try std.testing.expect(span_executor.maxPlannedSequenceTokens(&plan) >= words_per_window);
+        break :measured plan.items[0].prompt_tokens;
+    };
+
+    const Stop = struct {
+        session: @import("../backends/session.zig").Session,
+        owner: std.Thread.Id,
+        before: usize,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            // This injection observes owner-lane CUDA counters at cooperative
+            // checkpoints. The watchdog also polls the callback on its own
+            // thread, where the counters and allocator inventory are mutable.
+            if (std.Thread.getCurrentId() != self.owner) return;
+            const stats = factory.getCudaRuntimeStats(self.session) orelse return error.MissingCudaRuntimeStats;
+            if (stats.kernel_launches > self.before) return error.Cancelled;
+        }
+    };
+    const before_stats = factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats;
+    var stop = Stop{ .session = session, .owner = std.Thread.getCurrentId(), .before = before_stats.kernel_launches };
+    const control: @import("../execution_control.zig").InferenceExecutionControl = .{ .io = std.testing.io };
+    try std.testing.expectError(error.Cancelled, node.extractV2DirectJsonWithControl(a, request, control.withCheckpoint(&stop, Stop.check)));
+    _ = try expectIdleWithActiveHandles(node, 1);
+    handle.release();
+
+    var response = try dispatchExtractionWithBodyLimit(a, node, request, limits.max_document_bytes + 4096);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var json = try std.json.parseFromSlice(std.json.Value, a, response.body orelse return error.MissingResponseBody, .{});
+    defer json.deinit();
+    try std.testing.expectEqual(@as(i64, @intCast(prompt_tokens)), json.value.object.get("usage").?.object.get("prompt_tokens").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), json.value.object.get("data").?.array.items.len);
     _ = try expectIdle(node);
 }
 
@@ -1163,7 +1254,8 @@ fn serviceParity(comptime backend: BackendType) !void {
         if (comptime !build_options.enable_metal or builtin.os.tag != .macos) return error.SkipZigTest;
         if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     }
-    const requested = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return error.SkipZigTest;
+    const requested = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse
+        return if (backend == .cuda) error.MissingRequiredGlinerArtifact else error.SkipZigTest;
     const a = std.testing.allocator;
     var perf_config = try perf.Config.fromEnv(a);
     defer if (perf_config) |*config| config.deinit();
@@ -1203,8 +1295,17 @@ fn serviceParity(comptime backend: BackendType) !void {
     const publication = try registry.synthesizePulledModelManifestJson(a, directory, null, null);
     defer a.free(publication);
     try expectSpanPublication(a, publication);
+    var provider_options = if (backend == .pjrt) try decide_parity.pjrtOptions() else factory.PjrtSessionOptions{};
+    // Fit the existing service envelope without granting additional memory.
+    // Independent raw-oracle qualification uses its separate provider budget.
+    if (provider_options.memory_policy) |*policy| {
+        if (policy.* == .cuda) policy.cuda.capacity_bytes = @min(policy.cuda.capacity_bytes, 6 * 1024 * 1024 * 1024);
+    }
     var node = try Node.init(a, .{
         .models_dir = models_dir,
+        .pjrt_memory_policy = provider_options.memory_policy,
+        .pjrt_precision = provider_options.precision,
+        .pjrt_gemm = provider_options.gemm,
         .max_loaded_models = 1,
         .max_concurrent_requests = 1,
         .keep_alive_ms = 30 * 60 * 1000,
@@ -1249,7 +1350,7 @@ fn serviceParity(comptime backend: BackendType) !void {
         if (cached == null) {
             cached = try expectCached(&node, directory, backend);
             resident_model = direct_model;
-            if (backend == .metal)
+            if (backend == .metal or backend == .cuda)
                 try std.testing.expect(resident_model.?.backend_weight_bytes >= pins.@"model.safetensors".size_bytes)
             else
                 try std.testing.expect(resident_model.?.host_weight_bytes >= pins.@"model.safetensors".size_bytes);
@@ -1335,11 +1436,24 @@ fn serviceParity(comptime backend: BackendType) !void {
     // timing scope. These compatibility regressions run only in qualification.
     if (!run_perf) {
         try explicitV1ClassificationRegression(a, &node, directory, capture.value);
-        try expandedKnowledgeGraphParity(a, &node);
+        if (backend != .pjrt) try expandedKnowledgeGraphParity(a, &node);
+        if (backend == .cuda) try cudaWindowEnvelope(a, &node, directory);
         try std.testing.expectEqual(cached.?, try expectCached(&node, directory, backend));
         try expectSameModelWeights(resident_model.?, try modelOwned(&node));
     }
     try shared.verifyFiles(a, directory, pins);
+}
+
+test "GLiNER2.5 Decide-1B exact PJRT F32 direct and HTTP classification parity" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    if (!platform.env.getenvBool("ANTFLY_GLINER25_DECIDE_1B_PJRT_PARITY")) return error.SkipZigTest;
+    try serviceParity(.pjrt);
+}
+
+test "GLiNER2.5 Decide-1B exact CUDA direct and HTTP service parity" {
+    if (!platform.env.getenvBool("ANTFLY_GLINER25_DECIDE_1B_CUDA_PARITY")) return error.SkipZigTest;
+    if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+    try serviceParity(.cuda);
 }
 
 test "GLiNER2.5 Decide-1B exact native direct and HTTP service parity" {

@@ -107,6 +107,20 @@ pub const Sink = struct {
     /// allocated with the given allocator and freed by the caller
     /// immediately after use.
     loadAllAlloc: *const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry,
+    /// Optional: one committed entry read straight from the file, never from
+    /// this backend's mirror. With it, the `tip_namespace` records stay out of
+    /// the mirror and are always read this way (see `tip_namespace`).
+    loadOneAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
+    /// With `loadOneAlloc`: every committed `tip_namespace` entry of `scope`
+    /// (which `loadAllAlloc` leaves out), for removing them all.
+    loadTipAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
+    /// Whether `submit` runs a commit's `Resolver`s itself, while applying
+    /// the commit at the file's tip. When false, the backend resolves them
+    /// against its own view before submitting (a single-process sink).
+    resolves: bool = false,
+    /// Like loadAllAlloc, with empty values allocated by the same allocator.
+    loadKeysAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
+    deleteScope: ?*const fn (ptr: *anyopaque, scope: []const u8) anyerror!void = null,
     /// Optional (`null` for a `Sink` with no deferred path, e.g. the test
     /// fakes below): like `submit`, but for `durable = false` only, and
     /// never blocks waiting for the underlying group commit to apply --
@@ -136,6 +150,101 @@ pub const Sink = struct {
     resumeMaintenance: ?*const fn (ptr: *anyopaque) void = null,
 };
 
+/// Records a write reads only from the file, never from process memory: the
+/// full-text doc map (one entry per live document), which is too large to
+/// mirror and must always be current. When the sink has `loadOneAlloc`, this
+/// namespace is never loaded into or kept in the mirror; a transaction reads
+/// it from its own staged writes, then the file. See
+/// docs/design/lite-performance/lite-full-text-storage.md.
+pub const tip_namespace = "docmap";
+
+/// A decision a commit makes at the tip, while it is applied under writer
+/// authority, from reads of its own scope at that point: the commit's
+/// earlier group members and every other process's commits included. A
+/// background publication (a merge) prepares its work off the write path
+/// and decides what depends on the current records (doc map entries,
+/// tombstones, the segment counter) here, so it never acts on a stale view
+/// and never has to be refused because the scope moved.
+///
+/// It reads the scope as of its position in the commit: staged first, it
+/// sees nothing of the commit's own changes. `resolve` appends its mutations to
+/// `outputs` (allocated from `arena`); they apply right after it, and the
+/// backend applies them to its mirror once the commit succeeds. Returning
+/// an error refuses the commit (`error.IndexScopeChanged` for a stale
+/// publication). It may run more than once for one commit; each run starts
+/// with `outputs` empty. Never stored or mirrored itself.
+pub const Resolver = struct {
+    ptr: *anyopaque,
+    resolve: *const fn (ptr: *anyopaque, tip: TipReader, resolver: *Resolver) anyerror!void,
+    arena: std.heap.ArenaAllocator,
+    outputs: std.ArrayListUnmanaged(Mutation) = .empty,
+
+    pub fn init(allocator: Allocator, ptr: *anyopaque, resolve: *const fn (ptr: *anyopaque, tip: TipReader, resolver: *Resolver) anyerror!void) Resolver {
+        return .{ .ptr = ptr, .resolve = resolve, .arena = .init(allocator) };
+    }
+
+    pub fn deinit(self: *Resolver) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Runs `resolve` from a clean output list.
+    pub fn run(self: *Resolver, tip: TipReader) !void {
+        self.outputs = .empty;
+        _ = self.arena.reset(.retain_capacity);
+        try self.resolve(self.ptr, tip, self);
+    }
+
+    pub fn put(self: *Resolver, namespace: ?[]const u8, key: []const u8, value: []const u8) !void {
+        const a = self.arena.allocator();
+        try self.outputs.append(a, .{ .namespace = try dupeOpt(a, namespace), .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
+    }
+
+    pub fn delete(self: *Resolver, namespace: ?[]const u8, key: []const u8) !void {
+        const a = self.arena.allocator();
+        try self.outputs.append(a, .{ .namespace = try dupeOpt(a, namespace), .key = try a.dupe(u8, key), .is_delete = true });
+    }
+};
+
+/// One record of the resolving commit's scope, as of the point the resolver
+/// runs; null when absent.
+pub const TipReader = struct {
+    ptr: *anyopaque,
+    getFn: *const fn (ptr: *anyopaque, allocator: Allocator, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8,
+
+    pub fn get(self: TipReader, allocator: Allocator, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+        return self.getFn(self.ptr, allocator, namespace, key);
+    }
+};
+
+pub const resolve_namespace = "\x00resolve";
+
+/// The mutation that stages `resolver`. Its value names the resolver in this
+/// process; it never reaches the file or the mirror.
+pub fn resolution(resolver: *Resolver) [8]u8 {
+    return std.mem.toBytes(@as(u64, @intFromPtr(resolver)));
+}
+
+pub fn isResolution(namespace: ?[]const u8) bool {
+    return if (namespace) |name| std.mem.eql(u8, name, resolve_namespace) else false;
+}
+
+pub fn resolverOf(m: Mutation) !*Resolver {
+    if (!isResolution(m.namespace) or m.value.len != 8) return error.InvalidResolver;
+    const address = std.mem.bytesToValue(u64, m.value[0..8]);
+    if (address == 0) return error.InvalidResolver;
+    return @ptrFromInt(@as(usize, @intCast(address)));
+}
+
+fn isTipNamespace(namespace: ?[]const u8) bool {
+    return if (namespace) |name| std.mem.eql(u8, name, tip_namespace) else false;
+}
+
+/// Staged only: never mirrored.
+fn isStagedOnly(namespace: ?[]const u8) bool {
+    return isResolution(namespace);
+}
+
 /// Durably removes every entry currently committed under `scope`, so a
 /// later `Backend.init` for the same scope -- e.g. after the index that
 /// owned it is deleted and a differently-configured index of the same name
@@ -147,6 +256,7 @@ pub const Sink = struct {
 /// saying the index is gone while its stale scope survives underneath a
 /// later re-admission. A no-op when nothing is committed under `scope`.
 pub fn deleteAllForScope(allocator: Allocator, sink: Sink, scope: []const u8) !void {
+    if (sink.deleteScope) |delete_scope| return delete_scope(sink.ptr, scope);
     var deletes = try ScopeDeletes.load(allocator, sink, scope);
     defer deletes.deinit();
     if (deletes.mutations.len == 0) return;
@@ -163,7 +273,18 @@ pub const ScopeDeletes = struct {
     mutations: []Mutation,
 
     pub fn load(allocator: Allocator, sink: Sink, scope: []const u8) !ScopeDeletes {
-        const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+        const mirrored = try (sink.loadKeysAlloc orelse sink.loadAllAlloc)(sink.ptr, allocator, scope);
+        const loaded = if (sink.loadTipAlloc) |load_tip| blk: {
+            errdefer freeLoaded(allocator, mirrored);
+            const tip = try load_tip(sink.ptr, allocator, scope);
+            defer allocator.free(tip);
+            errdefer for (tip) |entry| freeEntry(allocator, entry);
+            const all = try allocator.alloc(Entry, mirrored.len + tip.len);
+            @memcpy(all[0..mirrored.len], mirrored);
+            @memcpy(all[mirrored.len..], tip);
+            allocator.free(mirrored);
+            break :blk all;
+        } else mirrored;
         errdefer freeLoaded(allocator, loaded);
         const mutations = try allocator.alloc(Mutation, loaded.len);
         for (loaded, 0..) |entry, i| {
@@ -179,12 +300,14 @@ pub const ScopeDeletes = struct {
     }
 
     fn freeLoaded(allocator: Allocator, loaded: []Entry) void {
-        for (loaded) |entry| {
-            if (entry.namespace) |n| allocator.free(n);
-            allocator.free(entry.key);
-            allocator.free(entry.value);
-        }
+        for (loaded) |entry| freeEntry(allocator, entry);
         allocator.free(loaded);
+    }
+
+    fn freeEntry(allocator: Allocator, entry: Entry) void {
+        if (entry.namespace) |n| allocator.free(n);
+        allocator.free(entry.key);
+        allocator.free(entry.value);
     }
 };
 
@@ -276,30 +399,8 @@ pub const Backend = struct {
         const scope = try allocator.dupe(u8, options.scope);
         errdefer allocator.free(scope);
 
-        var tree: ordered.Tree = .empty;
+        var tree = try loadTree(allocator, options.sink, scope);
         errdefer tree.release(allocator);
-
-        // `loadAllAlloc` hands back allocator-owned entries (namespace, key
-        // and value each separately allocated); `tree.put` dupes its own
-        // copies, so every entry's bytes must be freed here once copied in,
-        // on every path (including an error partway through the loop).
-        const loaded = try options.sink.loadAllAlloc(options.sink.ptr, allocator, scope);
-        defer allocator.free(loaded);
-        var freed: usize = 0;
-        defer for (loaded[freed..]) |entry| {
-            if (entry.namespace) |n| allocator.free(n);
-            allocator.free(entry.key);
-            allocator.free(entry.value);
-        };
-        for (loaded) |entry| {
-            const next = try tree.put(allocator, entry.namespace, entry.key, entry.value);
-            tree.release(allocator);
-            tree = next;
-            if (entry.namespace) |n| allocator.free(n);
-            allocator.free(entry.key);
-            allocator.free(entry.value);
-            freed += 1;
-        }
 
         const rc = try allocator.create(RcState);
         rc.* = .{ .refs = 1, .state = .{ .tree = tree } };
@@ -310,6 +411,54 @@ pub const Backend = struct {
             .open_options = options.backend,
             .state = rc,
         };
+    }
+
+    fn loadTree(allocator: Allocator, sink: Sink, scope: []const u8) !ordered.Tree {
+        var tree: ordered.Tree = .empty;
+        errdefer tree.release(allocator);
+
+        // `loadAllAlloc` hands back allocator-owned entries (namespace, key
+        // and value each separately allocated); `tree.put` dupes its own
+        // copies, so every entry's bytes must be freed here once copied in,
+        // on every path (including an error partway through the loop).
+        const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+        defer allocator.free(loaded);
+        var freed: usize = 0;
+        defer for (loaded[freed..]) |entry| {
+            if (entry.namespace) |n| allocator.free(n);
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        };
+        const tip_reads = sink.loadOneAlloc != null;
+        for (loaded) |entry| {
+            if (!(tip_reads and isTipNamespace(entry.namespace)) and !isStagedOnly(entry.namespace)) {
+                const next = try tree.put(allocator, entry.namespace, entry.key, entry.value);
+                tree.release(allocator);
+                tree = next;
+            }
+            if (entry.namespace) |n| allocator.free(n);
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+            freed += 1;
+        }
+        return tree;
+    }
+
+    /// Replaces the mirror with the scope as the sink now reads it, for a
+    /// process that learned another one committed under this scope. Open
+    /// transactions keep the state they retained. Clears an invalidated
+    /// mirror: it is current again.
+    pub fn reloadMirror(self: *Backend) !void {
+        var tree = try loadTree(self.allocator, self.sink, self.scope);
+        errdefer tree.release(self.allocator);
+        const rc = try self.allocator.create(RcState);
+        rc.* = .{ .refs = 1, .state = .{ .tree = tree } };
+        lockBackend(self);
+        const old = self.state;
+        self.state = rc;
+        releaseState(self.allocator, old);
+        self.mutex.unlock();
+        self.mirror_invalid.store(false, .release);
     }
 
     pub fn close(self: *Backend) void {
@@ -557,6 +706,21 @@ pub const Backend = struct {
     /// pending-mutation bookkeeping `NamespaceTxn` needs for its own
     /// (separate) commit.
     /// See `mirror_invalid`.
+    fn tipReads(self: *const Backend) bool {
+        return self.sink.loadOneAlloc != null;
+    }
+
+    /// Every committed `tip_namespace` entry (empty without tip reads).
+    /// Free with `freeEntries`.
+    pub fn loadTipEntriesAlloc(self: *const Backend, allocator: Allocator) ![]Entry {
+        const load_tip = self.sink.loadTipAlloc orelse return try allocator.alloc(Entry, 0);
+        return try load_tip(self.sink.ptr, allocator, self.scope);
+    }
+
+    pub fn freeEntries(allocator: Allocator, entries: []Entry) void {
+        ScopeDeletes.freeLoaded(allocator, entries);
+    }
+
     pub fn invalidateMirror(self: *Backend) void {
         self.mirror_invalid.store(true, .release);
     }
@@ -572,6 +736,7 @@ pub const Backend = struct {
         var cloned = current.state.clone();
         errdefer cloned.deinit(self.allocator);
         for (mutations) |m| {
+            if ((self.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
             const namespace: backend_types.Namespace = .{ .name = m.namespace };
             if (m.is_delete) {
                 // Matches `NamespaceTxn.delete`'s own unconditional `try`
@@ -751,7 +916,11 @@ pub const Backend = struct {
                 // old always-blocking `submit` for a `Sink` with no deferred
                 // path (every current fake/test `Sink`), which keeps this
                 // exactly as correct -- just not as fast -- as before.
-                if (!self.durable and self.backend.sink.submitDeferred != null) {
+                // A resolving commit can be refused and must return its
+                // resolutions before the mirror swap: never deferred.
+                const resolving = self.hasResolver();
+                if (resolving and !self.backend.sink.resolves) try self.resolveLocally();
+                if (!self.durable and self.backend.sink.submitDeferred != null and !resolving) {
                     const pending = try self.backend.sink.submitDeferred.?(self.backend.sink.ptr, self.backend.scope, self.pending.items);
                     try self.backend.enqueuePendingRideAlong(pending);
                 } else {
@@ -776,6 +945,12 @@ pub const Backend = struct {
                 // publishes, and that publish is what gets counted.
             }
 
+            // The sink resolved at the tip: its decisions join the mirror.
+            if (self.backend.sink.resolves) for (self.pending.items) |m| {
+                if (!isResolution(m.namespace)) continue;
+                try self.mirrorResolved(try resolverOf(m));
+            };
+
             lockBackend(self.backend);
             const old = self.backend.state;
             self.backend.state = rc;
@@ -787,14 +962,89 @@ pub const Backend = struct {
             self.pending_arena.deinit();
         }
 
+        /// Stages `resolver` (see `Resolver`); the caller keeps it alive
+        /// until the commit returns.
+        pub fn stageResolver(self: *NamespaceTxn, resolver: *Resolver) !void {
+            if (self.read_only) return error.ReadOnly;
+            const bytes = resolution(resolver);
+            try self.stage(.{ .name = resolve_namespace }, "resolver", &bytes, false);
+        }
+
+        fn hasResolver(self: *const NamespaceTxn) bool {
+            for (self.pending.items) |m| if (isResolution(m.namespace)) return true;
+            return false;
+        }
+
+        fn mirrorResolved(self: *NamespaceTxn, resolver: *Resolver) !void {
+            for (resolver.outputs.items) |m| {
+                if ((self.backend.tipReads() and isTipNamespace(m.namespace)) or isStagedOnly(m.namespace)) continue;
+                if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
+                const namespace: backend_types.Namespace = .{ .name = m.namespace };
+                self.replaceTree(if (m.is_delete)
+                    try self.rc.?.state.tree.remove(self.allocator, namespace.name, m.key)
+                else
+                    try self.rc.?.state.tree.put(self.allocator, namespace.name, m.key, m.value));
+            }
+        }
+
+        /// For a sink that does not resolve: runs each resolver against the
+        /// state this transaction started from (the committed mirror, and
+        /// the file for `tip_namespace`) and replaces it with its decisions.
+        fn resolveLocally(self: *NamespaceTxn) !void {
+            const Reader = struct {
+                txn: *NamespaceTxn,
+                fn get(ptr: *anyopaque, allocator: Allocator, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 {
+                    const r: *@This() = @ptrCast(@alignCast(ptr));
+                    const backend = r.txn.backend;
+                    if (backend.tipReads() and isTipNamespace(namespace)) return backend.sink.loadOneAlloc.?(backend.sink.ptr, allocator, backend.scope, namespace, key);
+                    lockBackend(backend);
+                    defer backend.mutex.unlock();
+                    const value = backend.state.state.get(.{ .name = namespace }, key) catch return null;
+                    return try allocator.dupe(u8, value);
+                }
+            };
+            var reader: Reader = .{ .txn = self };
+            const tip: TipReader = .{ .ptr = &reader, .getFn = Reader.get };
+            const arena = self.pending_arena.allocator();
+            var resolved = std.ArrayListUnmanaged(Mutation).empty;
+            for (self.pending.items) |m| {
+                if (!isResolution(m.namespace)) {
+                    try resolved.append(arena, m);
+                    continue;
+                }
+                const resolver = try resolverOf(m);
+                try resolver.run(tip);
+                try resolved.appendSlice(arena, resolver.outputs.items);
+                try self.mirrorResolved(resolver);
+            }
+            self.pending = resolved;
+        }
+
         pub fn get(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            if (self.backend.tipReads() and isTipNamespace(namespace.name)) return self.getAtTip(namespace, key);
             const value = try self.rc.?.state.get(namespace, key);
             self.read_since_write = true;
             return value;
         }
 
+        /// A `tip_namespace` read: this transaction's latest staged write,
+        /// then the file. The value lives until the transaction ends.
+        fn getAtTip(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
+            var i = self.pending.items.len;
+            while (i > 0) {
+                i -= 1;
+                const staged = self.pending.items[i];
+                if (!isTipNamespace(staged.namespace) or !std.mem.eql(u8, staged.key, key)) continue;
+                if (staged.is_delete) return error.NotFound;
+                return staged.value;
+            }
+            const load_one = self.backend.sink.loadOneAlloc.?;
+            return (try load_one(self.backend.sink.ptr, self.pending_arena.allocator(), self.backend.scope, namespace.name, key)) orelse error.NotFound;
+        }
+
         pub fn put(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
             if (self.read_only) return error.ReadOnly;
+            if ((self.backend.tipReads() and isTipNamespace(namespace.name)) or isStagedOnly(namespace.name)) return self.stage(namespace, key, value, false);
             if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
             self.replaceTree(try self.rc.?.state.tree.put(self.allocator, namespace.name, key, value));
             try self.pending.append(self.pending_arena.allocator(), .{
@@ -804,8 +1054,21 @@ pub const Backend = struct {
             });
         }
 
+        /// Stages a `tip_namespace` mutation for the sink without touching
+        /// the mirror.
+        fn stage(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8, is_delete: bool) !void {
+            const arena = self.pending_arena.allocator();
+            try self.pending.append(arena, .{
+                .namespace = try dupeOpt(arena, namespace.name),
+                .key = try arena.dupe(u8, key),
+                .value = if (is_delete) "" else try arena.dupe(u8, value),
+                .is_delete = is_delete,
+            });
+        }
+
         pub fn delete(self: *NamespaceTxn, namespace: backend_types.Namespace, key: []const u8) !void {
             if (self.read_only) return error.ReadOnly;
+            if (self.backend.tipReads() and isTipNamespace(namespace.name)) return self.stage(namespace, key, "", true);
             if (self.read_since_write) try self.borrowed_trees.ensureUnusedCapacity(self.allocator, 1);
             self.replaceTree(try self.rc.?.state.tree.remove(self.allocator, namespace.name, key));
             try self.pending.append(self.pending_arena.allocator(), .{

@@ -16,7 +16,7 @@
 //! Standalone exact-NUMERIC contracts and microbenchmarks. No runtime/server
 //! graph is needed to validate the arithmetic or canonical row/key boundary.
 test {
-    _ = @import("sql/numeric_value.zig");
-    _ = @import("sql/numeric_binary.zig");
-    _ = @import("sql/numeric_key.zig");
+    _ = @import("sql/numeric/value.zig");
+    _ = @import("sql/numeric/binary.zig");
+    _ = @import("sql/numeric/key.zig");
 }

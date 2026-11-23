@@ -2483,7 +2483,7 @@ pub fn predictPendingEnrichmentAlloc(
             false;
         const has_chunk_source = blk: {
             if (!requested.needsChunkSource()) break :blk false;
-            if (projection.chunk_embeddings_pending) break :blk true;
+            if (projection.chunk_embeddings_pending or projection.chunk_embeddings_terminal) break :blk true;
             break :blk if (projection.chunk_preview) |chunks|
                 chunks.len > 0
             else

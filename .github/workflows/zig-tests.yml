@@ -685,7 +685,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Install Nix
-        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
 
@@ -807,6 +807,8 @@ jobs:
           python3 -m unittest discover -s scripts/ci -p test_artifact_exchange.py
           python3 -m unittest discover -s scripts/release -p test_r2_scope_restore.py
           python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
+          python3 -m unittest discover -s zig/tools -p 'test_benchmark_inference_policies.py'
+          python3 -m unittest discover -s zig/tools -p 'test_qualify_cpu_media.py'
           python3 -m unittest discover -s scripts/ci -p test_lite_embedding_bundle.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
@@ -819,6 +821,10 @@ jobs:
       - name: Test Laya data and qualification contracts
         run: |
           PYTHONPATH=scripts/laya python3 -m unittest discover -s scripts/laya -p 'test_*.py'
+
+      - name: Check generated kernel ownership and canonical source closure
+        working-directory: zig/pkg/inference
+        run: zig build check-kernel-ownership
 
       - name: Check inference kernels through the root build graph
         working-directory: zig
@@ -844,6 +850,7 @@ jobs:
             scripts.gemma4.test_run_gemma4_cuda_preference_smoke \
             scripts.gemma4.test_run_gemma4_unsloth_preference_benchmark \
             scripts.test_paired_benchmark \
+            scripts.test_kernel_ownership_inventory \
             scripts.test_regen_cuda_artifacts \
             scripts.test_regen_cuda_training_math \
             scripts.test_regen_cuda_boundary_attention \
@@ -895,6 +902,10 @@ jobs:
         if: needs.changes.outputs.zig_tests == 'true'
         run: python3 zig/tools/fixture_workspace.py prepare
 
+      - name: Install Wasmtime for mandatory SQL extension owners
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: bash scripts/ci/install-wasmtime-c-api.sh
+
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         env:
@@ -933,7 +944,7 @@ jobs:
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -1018,7 +1029,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Install Nix
-        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
 
@@ -1155,7 +1166,7 @@ jobs:
       # These are the same large native CAPI test objects as the full gate.
       # Keep the compiler allocator and measured admission profile identical.
       - name: Install Nix
-        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1319,7 +1330,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Install Nix
-        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1396,6 +1407,8 @@ jobs:
           python3 -m unittest discover -s scripts/ci -p test_artifact_exchange.py
           python3 -m unittest discover -s scripts/release -p test_r2_scope_restore.py
           python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
+          python3 -m unittest discover -s zig/tools -p 'test_benchmark_inference_policies.py'
+          python3 -m unittest discover -s zig/tools -p 'test_qualify_cpu_media.py'
           python3 -m unittest discover -s scripts/ci -p test_lite_embedding_bundle.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
@@ -1428,6 +1441,9 @@ jobs:
 
       - name: Prepare bounded correctness-fixture workspace
         run: python3 zig/tools/fixture_workspace.py prepare
+
+      - name: Install Wasmtime for mandatory SQL extension owners
+        run: bash scripts/ci/install-wasmtime-c-api.sh
 
       - name: Run library, Antfly, and inference unit tests
         env:
@@ -1536,7 +1552,7 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
-        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -1727,7 +1743,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Install Nix
-        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -2051,7 +2067,7 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/native-sdk-artifact/"*.tar.gz -C "${RUNNER_TEMP}/native-sdk"
       - name: Set up Go
         if: matrix.sdk == 'go'
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false
@@ -2121,7 +2137,7 @@ jobs:
       - name: Install candidate E2E executable
         run: tar -xzf "${RUNNER_TEMP}/source-sdk-artifact/"*.tar.gz -C zig
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false
@@ -2184,7 +2200,7 @@ jobs:
       - name: Install candidate E2E executable
         run: tar -xzf "${RUNNER_TEMP}/pgwire-driver-artifact/"*.tar.gz -C zig
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
           cache: false
@@ -2979,25 +2995,7 @@ jobs:
 
       - name: Install Wasmtime C API
         if: startsWith(matrix.suite, 'antfly-')
-        env:
-          WASMTIME_VERSION: v45.0.2
-        run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64) arch=x86_64 ;;
-            aarch64|arm64) arch=aarch64 ;;
-            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          archive="wasmtime-${WASMTIME_VERSION}-${arch}-linux-c-api.tar.xz"
-          root="/tmp/wasmtime-c-api"
-          rm -rf "$root"
-          mkdir -p "$root"
-          curl -L "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/${archive}" -o "/tmp/${archive}"
-          tar -xJf "/tmp/${archive}" -C "$root" --strip-components=1
-          lib="$(find "$root/lib" -maxdepth 1 -name 'libwasmtime.so*' | sort | head -n 1)"
-          test -n "$lib"
-          echo "ANTFLY_WASMTIME_LIB=$lib" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+        run: bash scripts/ci/install-wasmtime-c-api.sh
 
       - name: Restore verified inference model bundles
         if: startsWith(matrix.suite, 'inference-')

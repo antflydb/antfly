@@ -46,6 +46,7 @@ const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").A
 const LmdbBackend = @import("../../../build_support/embedded/storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
+    native_inference: *std.Build.Step.Compile,
     strip: bool,
     inference_enable_cuda: bool,
     apple_bridge: ?std.Build.LazyPath = null,
@@ -122,6 +123,42 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const pdf_mod = options.antfly_imports.pdf;
     const antfly_imports = options.antfly_imports;
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+    const postgres_replication_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/postgres_replication_provider_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, postgres_replication_provider_mod, true, true);
+    const postgres_replication_provider_tests = b.addTest(.{
+        .root_module = postgres_replication_provider_mod,
+        .filters = &.{
+            "postgres pgoutput",
+            "subscription",
+            "postgres libpq parser decodes pgoutput",
+            "postgres libpq live logical poll",
+            "postgres libpq live prepare replication",
+            "postgres libpq prepared replication snapshot",
+            "postgres libpq exact cutover authority failure",
+            "postgres libpq poll resumes from durable checkpoint",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-postgres-replication-provider-test", "Verify PostgreSQL subscription snapshots, transactions and acknowledgement fences")
+        .dependOn(&addFilteredTestRunArtifact(b, postgres_replication_provider_tests).step);
+    const replication_custody_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/replication_source_custody_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, replication_custody_mod, true, true);
+    const replication_custody_tests = b.addTest(.{
+        .root_module = replication_custody_mod,
+        .filters = &.{ "replication payload", "replication snapshot capture", "subscription capture", "subscription native transaction admission", "Source artifact custody", "Source physical", "Source terminal participant", "native Source streamed", "initialization attestation", "Source READY attestation", "SQL logical replication subscription work" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const replication_custody_run = addFilteredTestRunArtifact(b, replication_custody_tests);
+    replication_custody_run.addArg("--require-no-skips");
+    b.step("antfly-replication-source-custody-test", "Verify durable subscription discovery and retained Source payload custody").dependOn(&replication_custody_run.step);
     const vopr_mod = options.vopr;
     const casbin_mod = antfly_imports.casbin;
     const antfly_mod = options.antfly_mod;
@@ -235,7 +272,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const cypher_control_wire_tests = b.addTest(.{
         .root_module = batch_contract_mod,
-        .filters = &.{ "distributed txn private control wire", "internal batch topology control", "ordered artifact inventory private batch", "ordered artifact inventory merge proof adoption is private", "artifact publication upload control is private", "row policy publication Raft codec", "internal batch graph endpoint cleanup", "leann record survives the internal batch wire", "time series document revision wire" },
+        .filters = &.{ "distributed txn private control wire", "completion begin wire", "internal batch topology control", "ordered artifact inventory private batch", "ordered artifact inventory merge proof adoption is private", "artifact publication upload control is private", "row policy publication Raft codec", "internal batch graph endpoint cleanup", "leann record survives the internal batch wire", "time series document revision wire" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("cypher-control-wire-test", "Verify private control exclusivity across document revision wire versions")
@@ -323,7 +360,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const parser_source = schema_contract_mod.import_table.get("antfly_local_sources").?;
     const parser_selection = b.addOptions();
-    parser_selection.addOption([]const []const u8, "names", &.{"schema_table_schema_impl"});
+    parser_selection.addOption([]const []const u8, "names", &.{ "schema_table_schema_impl", "schema_mod" });
     parser_source.addOptions("antfly_local_test_sources", parser_selection);
     const schema_parser_tests = b.addTest(.{
         .root_module = parser_source,
@@ -383,7 +420,265 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
+    const native_reporter_recovery_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
+        .filters = &.{ "native reporter", "system catalog baseline", "system catalog schema reader baseline", "runtime status report GC" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const native_reporter_recovery_run = addFilteredTestRunArtifact(b, native_reporter_recovery_tests);
+    native_reporter_recovery_run.addArg("--require-no-skips");
+    b.step("antfly-native-reporter-recovery-test", "Verify bounded native startup retirement, signed profiles, snapshots and cold recovery")
+        .dependOn(&native_reporter_recovery_run.step);
+    const source_transaction_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_transaction.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const replication_transaction_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[7],
+        .filters = &.{
+            "metadata replication stream",
+            "metadata replication backfill",
+            "metadata snapshot backfill stops before apply",
+            "replication transactions group opaque checkpoints",
+            "postgres libpq parser rejects truncate",
+            "postgres libpq parser decodes pgoutput",
+            "postgres libpq poll resumes from durable checkpoint",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const source_effects_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/source_effects_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"source effects"},
+    });
+    source_effects_tests.root_module.addImport("antfly_cancellation", antfly_imports.cancellation);
+    const run_source_effects_tests = b.addRunArtifact(source_effects_tests);
+    const source_control_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/metadata/source_control.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{ "source control", "source checkpoint authority" },
+    });
+    source_control_tests.root_module.addImport("antfly_local_sources", metadata_unit_baseline_mods[8].import_table.get("antfly_local_sources").?);
+    const run_source_control_tests = b.addRunArtifact(source_control_tests);
+    const source_delivery_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/metadata/source_delivery.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{ "delivery recovers", "delivery closing source" },
+    });
+    source_delivery_tests.root_module.addImport("antfly_local_sources", metadata_unit_baseline_mods[8].import_table.get("antfly_local_sources").?);
+    const run_source_delivery_tests = b.addRunArtifact(source_delivery_tests);
+    const source_control_storage_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "metadata source control", "metadata raft apply store snapshot key registry covers every durable projection class" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const source_control_service_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "source control requires its coordinated decoder floor", "metadata source scope HTTP" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const changefeed_control_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/changefeed_control.zig"), .target = target, .optimize = optimize }),
+    });
+    const run_changefeed_control_tests = b.addRunArtifact(changefeed_control_tests);
+    const changefeed_delivery_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/changefeed_delivery.zig"), .target = target, .optimize = optimize }),
+        .filters = &.{"feed delivery"},
+    });
+    const run_changefeed_delivery_tests = b.addRunArtifact(changefeed_delivery_tests);
+    const changefeed_projection_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/common/changefeed_projection.zig"), .target = target, .optimize = optimize }),
+        .filters = &.{"feed projection"},
+    });
+    const run_changefeed_projection_tests = b.addRunArtifact(changefeed_projection_tests);
+    const changefeed_projection_cursor_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/changefeed_projection_cursor.zig"), .target = target, .optimize = optimize }),
+        .filters = &.{"projection continuation"},
+    });
+    const run_changefeed_projection_cursor_tests = b.addRunArtifact(changefeed_projection_cursor_tests);
+    const changefeed_json_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/changefeed_json.zig"), .target = target, .optimize = optimize }),
+        .filters = &.{"feed JSON"},
+    });
+    const run_changefeed_json_tests = b.addRunArtifact(changefeed_json_tests);
+    const pgoutput_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pgwire/replication_commands.zig"), .target = target, .optimize = optimize }),
+    });
+    const run_pgoutput_tests = b.addRunArtifact(pgoutput_tests);
+    const pg_spool_codec_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pg_spool_codec_test_root.zig"), .target = target, .optimize = optimize }),
+    });
+    const run_pg_spool_codec_tests = b.addRunArtifact(pg_spool_codec_tests);
+    const pg_spool_artifact_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/pg_spool_artifact_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, pg_spool_artifact_mod, true, true);
+    pg_spool_artifact_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const pg_spool_artifact_tests = b.addTest(.{
+        .root_module = pg_spool_artifact_mod,
+        .filters = &.{"pg spool artifact"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_pg_spool_artifact_tests = addFilteredTestRunArtifact(b, pg_spool_artifact_tests);
+    const pg_spool_step = b.step("pg-spool-test", "Verify bounded committed spooling, authenticated seeks and durable artifact reopen");
+    pg_spool_step.dependOn(&run_pg_spool_codec_tests.step);
+    pg_spool_step.dependOn(&run_pg_spool_artifact_tests.step);
+
+    const pg_spool_stream_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pg_spool_stream_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, pg_spool_stream_mod, true, true);
+    pg_spool_stream_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const pg_spool_stream_tests = b.addTest(.{ .root_module = pg_spool_stream_mod, .filters = &.{"pg spool stream"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_pg_spool_stream_tests = addFilteredTestRunArtifact(b, pg_spool_stream_tests);
+    b.step("pg-spool-stream-test", "Verify retained spool delivery and metadata feedback over CopyBoth").dependOn(&run_pg_spool_stream_tests.step);
+
+    const pgoutput_step = b.step("pgoutput-test", "Verify pgoutput v1 encoding, feedback framing and replication command negotiation");
+    pgoutput_step.dependOn(&run_pgoutput_tests.step);
+
+    const history_control_entry_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/history_control_entry_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, history_control_entry_mod, true, true);
+    history_control_entry_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const history_control_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{ "history control entry", "source producer closure entry", "source legacy terminal", "source legacy inventory", "source producer closure ingress", "source producer control", "history root control outcome", "history root control driver", "history root control observation", "history root discovery", "history page ingress", "history feed metadata port", "raft batch", "raft protocol barrier", "ordered artifact merge adoption" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const source_plan_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{"source plan entry"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-plan-entry-test", "Verify activated frozen-owner source plan Raft envelopes").dependOn(&b.addRunArtifact(source_plan_entry_tests).step);
+    const source_scope_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{"source scope entry"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-scope-entry-test", "Verify activated native source-scope control envelopes").dependOn(&b.addRunArtifact(source_scope_entry_tests).step);
+    const source_scope_control_wire_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{ "source scope control wire", "source scope control ingress" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-scope-control-wire-test", "Verify correlated source lifecycle submit and recovery contracts").dependOn(&b.addRunArtifact(source_scope_control_wire_tests).step);
+    const source_retirement_authority_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{"source scope retirement authority"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-retirement-authority-test", "Verify independently read coordinator ABORT and owned retirement commands").dependOn(&b.addRunArtifact(source_retirement_authority_tests).step);
+    const run_history_control_entry_tests = b.addRunArtifact(history_control_entry_tests);
+    b.step("history-control-entry-test", "Verify bounded fail-closed ordered retention envelopes").dependOn(&run_history_control_entry_tests.step);
+    const completion_plan_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/completion_plan_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, completion_plan_mod, true, true);
+    completion_plan_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const completion_plan_tests = b.addTest(.{ .root_module = completion_plan_mod, .filters = &.{"completion frozen plan"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_completion_plan_tests = b.addRunArtifact(completion_plan_tests);
+    b.step("completion-frozen-plan-test", "Verify owned frozen completion artifacts without current routing or schema").dependOn(&run_completion_plan_tests.step);
+    const source_completion_recovery_tests = b.addTest(.{ .root_module = completion_plan_mod, .filters = &.{ "completion frozen plan discovery", "data raft ordered history completion recovery" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_source_completion_recovery_tests = b.addRunArtifact(source_completion_recovery_tests);
+    run_source_completion_recovery_tests.addArgs(&.{ "--suite-filter", "data raft ordered history completion recovery" });
+    b.step("source-completion-recovery-test", "Verify receipt-bound source completion and retained two-owner recovery").dependOn(&run_source_completion_recovery_tests.step);
+    const source_plan_wire_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_plan_wire.zig"), .target = target, .optimize = optimize });
+    const source_plan_wire_tests = b.addTest(.{ .root_module = source_plan_wire_mod });
+    const run_source_plan_wire_tests = b.addRunArtifact(source_plan_wire_tests);
+    b.step("source-plan-wire-test", "Verify bounded binary-safe source plan command ownership and strict decoding").dependOn(&run_source_plan_wire_tests.step);
+    const source_plan_storage_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_plan_storage.zig"), .target = target, .optimize = optimize });
+    const source_plan_storage_tests = b.addTest(.{ .root_module = source_plan_storage_mod });
+    const run_source_plan_storage_tests = b.addRunArtifact(source_plan_storage_tests);
+    b.step("source-plan-storage-test", "Verify bounded native source artifacts, seal cuts and explicit reclamation fences").dependOn(&run_source_plan_storage_tests.step);
+    const transaction_completion_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/committed_frame.zig"), .target = target, .optimize = optimize });
+    const transaction_completion_tests = b.addTest(.{ .root_module = transaction_completion_mod });
+    const run_transaction_completion_tests = b.addRunArtifact(transaction_completion_tests);
+    b.step("transaction-completion-test", "Verify frozen distributed completion evidence and committed frame contracts").dependOn(&run_transaction_completion_tests.step);
+    const feed_metadata_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{ "metadata changefeed state transport", "metadata pg publication transport", "metadata linearizable head uses the fenced source operation" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_feed_metadata_transport_tests = b.addRunArtifact(feed_metadata_transport_tests);
+    b.step("changefeed-metadata-transport-test", "Verify private metadata feed state transport and uncertain mutation boundaries").dependOn(&run_feed_metadata_transport_tests.step);
+
+    const changefeed_storage_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "metadata changefeed control", "metadata raft apply store snapshot key registry covers every durable projection class" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_changefeed_storage_tests = b.addRunArtifact(changefeed_storage_tests);
+    const changefeed_service_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{ "changefeed control requires its coordinated decoder floor", "changefeed control expiry applies", "relation reconciliation worker activates and publishes verified roots", "metadata http service catalog cache is independent" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_changefeed_service_tests = b.addRunArtifact(changefeed_service_tests);
+    const changefeed_control_step = b.step("changefeed-control-test", "Verify durable feed ACK windows, bootstrap lifecycle and metadata recovery");
+    changefeed_control_step.dependOn(&run_changefeed_control_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_delivery_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_projection_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_projection_cursor_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_json_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_storage_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_service_tests.step);
+    const source_control_step = b.step("source-control-test", "Verify durable source reservations, receipt frontiers and metadata recovery");
+    const run_source_control_storage_tests = b.addRunArtifact(source_control_storage_tests);
+    const run_source_control_service_tests = b.addRunArtifact(source_control_service_tests);
+    const source_scope_control_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_scope_rebind_test.zig"), .target = target, .optimize = optimize });
+    const source_scope_control_tests = b.addTest(.{ .root_module = source_scope_control_mod });
+    source_control_step.dependOn(&b.addRunArtifact(source_scope_control_tests).step);
+    const source_scope_wire_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/source_scope_wire.zig"),
+        .target = target,
+        .optimize = optimize,
+    }), .filters = &.{"metadata source scope wire"} });
+    source_scope_wire_tests.root_module.addImport("antfly_local_sources", metadata_unit_baseline_mods[8].import_table.get("antfly_local_sources").?);
+    const run_source_scope_wire_tests = b.addRunArtifact(source_scope_wire_tests);
+    source_control_step.dependOn(&run_source_scope_wire_tests.step);
+    b.step("source-scope-metadata-wire-test", "Verify bounded and correlated metadata lifecycle captures").dependOn(&run_source_scope_wire_tests.step);
+    source_control_step.dependOn(&run_source_control_tests.step);
+    source_control_step.dependOn(&run_source_delivery_tests.step);
+    source_control_step.dependOn(&run_source_control_storage_tests.step);
+    source_control_step.dependOn(&run_source_control_service_tests.step);
+    const source_transaction_step = b.step("source-transaction-test", "Verify shared source envelopes and complete CDC transaction checkpoints");
+    const run_source_transaction_tests = b.addRunArtifact(source_transaction_tests);
+    source_transaction_step.dependOn(&run_source_transaction_tests.step);
+    source_transaction_step.dependOn(&run_source_effects_tests.step);
+    source_transaction_step.dependOn(&b.addRunArtifact(replication_transaction_tests).step);
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
+    const sql_notification_decoder_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"SQL notification decoder"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_notification_decoder_run = addFilteredTestRunArtifact(b, sql_notification_decoder_tests);
+    sql_notification_decoder_run.addArg("--require-no-skips");
+    b.step("antfly-sql-notification-decoder-test", "Qualify notification capability barriers without parsing SQL payloads").dependOn(&sql_notification_decoder_run.step);
+    const sql_notification_storage_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"SQL prepared transaction notification queue"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_notification_storage_run = addFilteredTestRunArtifact(b, sql_notification_storage_tests);
+    sql_notification_storage_run.addArg("--require-no-skips");
+    b.step("antfly-sql-notification-storage-test", "Qualify notification WAL atomicity and installed metadata snapshots").dependOn(&sql_notification_storage_run.step);
+    const sql_command_fence_native_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "SQL command fence", "sequence catalog allocator commands" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_command_fence_decoder_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"SQL command fence decoder"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_command_fence_step = b.step("antfly-sql-command-fence-test", "Verify fenced metadata effects, native cold replay, bounded eviction and transport identity binding");
+    const sql_command_fence_native_run = addFilteredTestRunArtifact(b, sql_command_fence_native_tests);
+    sql_command_fence_native_run.addArg("--require-no-skips");
+    const sql_command_fence_inventory = b.addRunArtifact(sql_command_fence_native_tests);
+    sql_command_fence_inventory.addArg("--list-tests");
+    const sql_command_fence_audit = b.addSystemCommand(&.{"python3"});
+    sql_command_fence_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL command fence catalog hashing streams large canonical definitions with zero heap allocation",
+        "SQL command fence view journal serialization binds definitions and rejects mixed envelopes",
+        "SQL command fence relation packets bind full records and annotation epoch policy without heap hashing",
+        "SQL command fence catalog identity binds the whole prepared command without duplicating intent",
+        "SQL command fence catalog preparation cannot silently rebind a prepared native command",
+        "SQL command fence ordinary catalog DDL journals exact topology outcomes across cold replicas and eviction",
+        "SQL command fence guards native catalog and counter effects through cold replay and bounded eviction",
+        "SQL command fence remains bound to the authenticated internal HTTP body",
+        "SQL command fence catalog preparation preserves definite naming diagnostics before submission",
+        "SQL command fence binds forwarded identities and rejects substitution and unjournaled mutations",
+        "sequence catalog allocator commands preserve catalog epochs and exact bounded cold outcomes",
+    }) |required| sql_command_fence_audit.addArgs(&.{ "--filter", required });
+    sql_command_fence_audit.addArg("--inventory");
+    sql_command_fence_audit.addFileArg2(sql_command_fence_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_command_fence_native_run.step.dependOn(&sql_command_fence_audit.step);
+    sql_command_fence_step.dependOn(&sql_command_fence_native_run.step);
+    const sql_command_fence_decoder_run = addFilteredTestRunArtifact(b, sql_command_fence_decoder_tests);
+    sql_command_fence_decoder_run.addArg("--require-no-skips");
+    sql_command_fence_step.dependOn(&sql_command_fence_decoder_run.step);
+
     const cypher_owner_readiness = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "selected owner readiness", "system catalog baseline resumes after snapshot and activates atomically before sparse updates" } });
     const cypher_owner_readiness_step = b.step("cypher-owner-readiness-test", "Verify compact selected-owner report and namespace readiness");
     cypher_owner_readiness_step.dependOn(&b.addRunArtifact(cypher_owner_readiness).step);
@@ -418,7 +713,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }
     const initial_fk_admission_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
-        .filters = &.{ "initial self FK reserves one hidden child owner", "initial self FK resumes the second hidden range", "FK generation publication initial create reserves hidden identity", "generation lock freezes the table cut while initial support permits exact schema retirement", "native initial support finalization requires current bound root", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation", "canceled hidden reservation permits only exact tagged placement removal", "hosted initial FK retirement", "initial FK retirement ACK signature", "retirement ACK validates exact canceled work", "initial child root receipt", "initial child physical attestation", "store root enrollment proof" },
+        .filters = &.{ "initial self FK reserves one hidden child owner", "initial FK counter effects stay hidden", "initial FK counter cancellation", "initial FK copied definitions", "initial FK copied counters", "sequence definition leases", "initial self FK resumes the second hidden range", "FK generation publication initial create reserves hidden identity", "generation lock freezes the table cut while initial support permits exact schema retirement", "native initial support finalization requires current bound root", "initial partial support begin survives restart", "initial MATCH PARTIAL publication pins parent witness support", "initial FK root generation", "canceled hidden reservation permits only exact tagged placement removal", "hosted initial FK retirement", "initial FK retirement ACK signature", "retirement ACK validates exact canceled work", "initial child root receipt", "initial child physical attestation", "store root enrollment proof" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_resolver_activation_tests = b.addTest(.{
@@ -430,6 +725,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-graph-resolver-activation-test", "Verify targeted graph index resolver activation and sibling isolation").dependOn(&graph_resolver_activation_run.step);
     const initial_fk_admission_step = b.step("antfly-metadata-initial-fk-admission-test", "Run initial-FK preflight and stale-begin metadata fault regressions");
     initial_fk_admission_step.dependOn(&addFilteredTestRunArtifact(b, initial_fk_admission_tests).step);
+    const initial_counter_run = addFilteredTestRunArtifactWithRuntimeFilters(b, initial_fk_admission_tests, &.{ "initial FK counter effects stay hidden", "initial FK counter cancellation" });
+    initial_counter_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-initial-counter-test", "Verify atomic initial FK/counter visibility cancellation and cold namespace ownership").dependOn(&initial_counter_run.step);
+
+    const initial_copy_run = addFilteredTestRunArtifactWithRuntimeFilters(b, initial_fk_admission_tests, &.{"initial FK copied definitions"});
+    initial_copy_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-initial-copy-test", "Verify guarded LIKE source and annotation publication through real cold owners").dependOn(&initial_copy_run.step);
+
+    const copied_counter_run = addFilteredTestRunArtifactWithRuntimeFilters(b, initial_fk_admission_tests, &.{ "initial FK copied counters", "sequence definition leases" });
+    copied_counter_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-copied-counter-test", "Verify copied counter publication cancellation shared leases and cold integrity").dependOn(&copied_counter_run.step);
+
     const initial_fk_placement_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[0],
         .filters = &.{"hidden initial FK owner receives placement"},
@@ -465,20 +772,183 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
     });
+    const replication_catalog_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "SQL logical replication native catalog", "SQL logical replication membership", "SQL logical replication capture receipts", "SQL logical replication installation", "SQL logical replication publisher schema", "SQL retained snapshot exports", "logical walsender", "pgoutput", "logical publisher" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const replication_catalog_run = addFilteredTestRunArtifact(b, replication_catalog_tests);
+    replication_catalog_run.addArg("--require-no-skips");
+    b.step("antfly-sql-replication-catalog-test", "Verify logical replication catalog identity, placement and cold retention").dependOn(&replication_catalog_run.step);
     const relation_namespace_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "system catalog relation namespace transaction", "relation mutation ownership" },
+        .filters = &.{ "system catalog relation namespace transaction", "system catalog restore reconciliation", "relation mutation ownership" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
+    const index_publication_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "relational index publication", "snapshot key registry" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const index_publication_run = addFilteredTestRunArtifact(b, index_publication_tests);
+    const index_publication_step = b.step("antfly-relational-index-publication-test", "Verify immutable UNIQUE plans, durable admission, namespace rollback and recovery faults");
+    index_publication_step.dependOn(&index_publication_run.step);
+    const index_publication_barrier_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"relational index publication admission requires its own coordinated decoder floor"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    index_publication_step.dependOn(&addFilteredTestRunArtifact(b, index_publication_barrier_tests).step);
+    const index_owner_ack_http_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "relational index publication ACK", "system catalog read identity" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const index_owner_ack_step = b.step("antfly-relational-index-ack-test", "Verify authenticated index owner receipt submission and exact ambiguous-outcome observation");
+    index_owner_ack_step.dependOn(&index_publication_run.step);
+    index_owner_ack_step.dependOn(&addFilteredTestRunArtifact(b, index_owner_ack_http_tests).step);
+    const owner_authority_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "runtime status", "store observer durable projection includes", "relational index publication authenticated owner ACKs", "store root attestation", "schema validation attestation" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const owner_authority_step = b.step("antfly-native-owner-authority-test", "Verify durable source observations, wire profiles and root receipt authority");
+    const table_retirement_manifest_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "table retirement manifest", "initial FK copied counters borrow SERIAL", "generation replacement authorization preflight" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const table_retirement_manifest_run = addFilteredTestRunArtifact(b, table_retirement_manifest_tests);
+    table_retirement_manifest_run.addArg("--require-no-skips");
+    b.step("antfly-table-retirement-manifest-test", "Verify exact FK, counter and view effects, owned canonical manifests and read-only capture")
+        .dependOn(&table_retirement_manifest_run.step);
+    const incoming_fk_directory_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "incoming FK directory", "relational integrity metadata drop is fenced" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const incoming_fk_directory_run = addFilteredTestRunArtifact(b, incoming_fk_directory_tests);
+    incoming_fk_directory_run.addArg("--require-no-skips");
+    b.step("antfly-incoming-fk-directory-test", "Verify transactional FK dependency lookup, retained layouts and cold native recovery")
+        .dependOn(&incoming_fk_directory_run.step);
+    const restore_parent_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "relational integrity restore staging reserves external parent", "relational integrity restore staging fences incoming dependency admission" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const restore_parent_run = addFilteredTestRunArtifact(b, restore_parent_tests);
+    restore_parent_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-restore-parent-test", "Verify restore parent reservation, dependency exclusion and exact publication proofs")
+        .dependOn(&restore_parent_run.step);
+    const schema_publication_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "schema validation publication", "table lifecycle lock", "relational integrity restore staging reserves external parent", "relational integrity restore staging fences incoming dependency admission" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const schema_publication_run = addFilteredTestRunArtifact(b, schema_publication_tests);
+    schema_publication_run.addArg("--require-no-skips");
+    const schema_publication_step = b.step("antfly-schema-validation-publication-test", "Verify compact all-owner validation, install, publication and terminal barriers");
+    schema_publication_step.dependOn(&schema_publication_run.step);
+    const schema_publication_service_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "schema validation publication", "table lifecycle lock", "relational integrity restore staging reserves external parent", "relational integrity restore staging fences incoming dependency admission" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const schema_publication_service_run = addFilteredTestRunArtifact(b, schema_publication_service_tests);
+    schema_publication_service_run.addArg("--require-no-skips");
+    schema_publication_step.dependOn(&schema_publication_service_run.step);
+    const domain_schema_publication_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"schema validation publication domain NOT NULL"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const domain_schema_publication_run = addFilteredTestRunArtifact(b, domain_schema_publication_tests);
+    domain_schema_publication_run.addArg("--require-no-skips");
+    b.step("antfly-schema-validation-domain-epoch-test", "Verify durable domain epoch cohorts, cancellation and every publication fault").dependOn(&domain_schema_publication_run.step);
+    owner_authority_step.dependOn(&addFilteredTestRunArtifact(b, owner_authority_tests).step);
+    const owner_authority_service_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "runtime status source authority", "runtime status exposes only released compatibility profiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    owner_authority_step.dependOn(&addFilteredTestRunArtifact(b, owner_authority_service_tests).step);
+    const lifecycle_lock_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "table lifecycle lock", "generation lock freezes the table cut", "index build lock freezes the table cut" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const lifecycle_lock_run = addFilteredTestRunArtifact(b, lifecycle_lock_tests);
+    b.step("antfly-table-lifecycle-lock-test", "Verify shared FK/index table locks and metadata writer exclusion")
+        .dependOn(&lifecycle_lock_run.step);
+    const index_candidate_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"relational index candidate"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const index_candidate_run = addFilteredTestRunArtifact(b, index_candidate_tests);
+    b.step("antfly-relational-index-candidate-test", "Verify independent private UNIQUE schema and catalog candidates")
+        .dependOn(&index_candidate_run.step);
+    const fk_name_admission_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "self-FK generation plan binds both roles", "system catalog relation namespace transaction FK generation publication begins durably", "system catalog relation namespace transaction activated generated FK begin", "FK generation publication catalog", "system catalog FK column publication" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-fk-generated-name-admission-test", "Verify FK generated-name plan digests, recovery and atomic lower-capability nonadmission")
+        .dependOn(&addFilteredTestRunArtifact(b, fk_name_admission_tests).step);
+    const checks_identity_decoder_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "system catalog CHECK identity decoder barrier", "system catalog USING rewrite decoder" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-checks-catalog-identity-test", "Verify CHECK-aware FK metadata admission and owner ACK decoder barriers")
+        .dependOn(&addFilteredTestRunArtifact(b, checks_identity_decoder_tests).step);
+    const rewrite_name_admission_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata_rewrite_name_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, rewrite_name_admission_mod, true, true);
+    const rewrite_name_admission_tests = b.addTest(.{
+        .root_module = rewrite_name_admission_mod,
+        .filters = &.{ "relational integrity restore staging rewrite intent binds original schema source pin and immutable target", "metadata raft apply store generated primary rewrite cannot reserve names or jobs below capability", "system catalog relation namespace transaction generated addition races publish and recover under activated occupancy", "metadata raft apply store activated primary rewrite" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-rewrite-generated-name-admission-test", "Verify primary-key rewrite naming guard recovery and frozen intent binding")
+        .dependOn(&addFilteredTestRunArtifact(b, rewrite_name_admission_tests).step);
+    const relation_command_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/relation_reconciliation_command.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, relation_command_test_mod, true, true);
+    const relation_command_tests = b.addTest(.{ .root_module = relation_command_test_mod, .filters = &.{"system catalog relation"} });
+    b.step("system-catalog-reconciliation-command-test", "Verify bounded catalog control framing and decoder/activation floors")
+        .dependOn(&b.addRunArtifact(relation_command_tests).step);
+    const relation_worker_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/relation_reconciliation_worker.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, relation_worker_test_mod, true, true);
+    const relation_worker_tests = b.addTest(.{ .root_module = relation_worker_test_mod, .filters = &.{ "relation reconciliation worker", "relation publication preparation", "relation publication proof pool" } });
+    b.step("system-catalog-reconciliation-worker-test", "Verify bounded publication preparation and capability-preserving coordinator scheduling")
+        .dependOn(&b.addRunArtifact(relation_worker_tests).step);
     const relation_coordinator_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
-        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement", "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof", "metadata table topology protocol fences namespace writers" },
+        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement", "system catalog hidden FK prepare preserves definite naming diagnostics", "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof", "metadata table topology protocol fences namespace writers" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relation-coordinator-test", "Verify relation control and tracked-writer decoder admission")
         .dependOn(&addFilteredTestRunArtifact(b, relation_coordinator_tests).step);
+    const naming_coordinator_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "system catalog hidden FK prepare preserves definite naming diagnostics" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-generated-name-coordinator-test", "Verify naming decoder barriers and definite read-only preparation diagnostics")
+        .dependOn(&addFilteredTestRunArtifact(b, naming_coordinator_tests).step);
     const system_catalog_store_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
@@ -504,7 +974,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-document-owner-simulation-test", "Replay document owner failure schedules on the shared VOPR durable lane").dependOn(&addFilteredTestRunArtifact(b, document_owner_simulation_tests).step);
     const document_owner_metadata_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "metadata durable job state", "metadata raft apply store snapshot key registry" },
+        .filters = &.{ "metadata durable job state", "metadata raft apply store snapshot key registry", "system catalog merged service ownership preserves published main command identity" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-document-owner-metadata-test", "Verify authoritative document metadata CAS, replay and reopen").dependOn(&addFilteredTestRunArtifact(b, document_owner_metadata_tests).step);
@@ -515,7 +985,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
     const lake_catalog_step = b.step("antfly-lake-index-catalog-test", "Run durable native lake index generation framing and decoder admission contracts");
     for ([_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[1] }) |module| {
-        const tests = b.addTest(.{ .root_module = module, .filters = &.{ "metadata.lake index", "metadata.lake reader authority", "metadata raft apply store snapshot key registry" } });
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{ "metadata.lake index", "metadata.lake reader authority", "metadata raft apply store snapshot key registry", "lake lifecycle history records committed activation" } });
         lake_catalog_step.dependOn(&b.addRunArtifact(tests).step);
     }
     const system_catalog_projection_tests = b.addTest(.{
@@ -575,9 +1045,185 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
-    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL policy DDL", "SQL pgwire", "SQL rewrite response" } });
+    const schema_submission_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "system catalog schema validation", "system catalog read identity avoids diagnostic inventories and fences replacement" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const schema_recovery_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/schema_validation_recovery_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, schema_recovery_mod, true, true);
+    schema_recovery_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const schema_recovery_tests = b.addTest(.{
+        .root_module = schema_recovery_mod,
+        .filters = &.{"schema validation source outbox"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const schema_recovery_run = addFilteredTestRunArtifact(b, schema_recovery_tests);
+    schema_recovery_run.addArg("--require-no-skips");
+    const schema_recovery_inventory = b.addRunArtifact(schema_recovery_tests);
+    schema_recovery_inventory.addArg("--list-tests");
+    const schema_recovery_audit = b.addSystemCommand(&.{"python3"});
+    schema_recovery_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "schema validation source outbox cold recovery preserves exact grant and never replays uncertainty",
+        "schema validation source outbox retirement stays durable until release succeeds and bounds churn",
+        "schema validation source outbox real client persists grants rearms proven nonsends and only reads uncertainty",
+        "schema validation source outbox terminal cohorts discharge uncertainty and unlink outside guards across restart",
+    }) |required| schema_recovery_audit.addArgs(&.{ "--filter", required });
+    schema_recovery_audit.addArg("--inventory");
+    schema_recovery_audit.addFileArg2(schema_recovery_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    schema_recovery_run.step.dependOn(&schema_recovery_audit.step);
+    b.step("antfly-schema-validation-recovery-test", "Verify durable source intent, exact submission recovery and bounded retirement")
+        .dependOn(&schema_recovery_run.step);
+    const schema_submission_run = addFilteredTestRunArtifact(b, schema_submission_tests);
+    schema_submission_run.addArg("--require-no-skips");
+    const schema_submission_inventory = b.addRunArtifact(schema_submission_tests);
+    schema_submission_inventory.addArg("--list-tests");
+    const schema_submission_audit = b.addSystemCommand(&.{"python3"});
+    schema_submission_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "system catalog schema validation binary submissions bind raw grants exact receipts and single attempt delivery",
+        "system catalog schema validation client binds exact identity projection frames and negative replies",
+        "system catalog schema validation submissions preflight once observe exact acceptance and never replay uncertainty",
+        "system catalog schema validation receipts require narrow authority without proposing mutations",
+        "system catalog schema validation owner reads require narrow authority and preserve binary projection",
+        "system catalog schema validation reads bind projection and never serialize authority",
+        "system catalog schema validation recovery token binds immutable metadata table and plan identity without granting authority",
+        "system catalog schema validation admission waits for known nonsends with one prepared identity and never retries uncertainty",
+        "system catalog schema validation administrative observations use the read transport without weakening authority",
+        "system catalog read identity avoids diagnostic inventories and fences replacement",
+    }) |required| schema_submission_audit.addArgs(&.{ "--filter", required });
+    schema_submission_audit.addArg("--inventory");
+    schema_submission_audit.addFileArg2(schema_submission_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    schema_submission_run.step.dependOn(&schema_submission_audit.step);
+    b.step("antfly-schema-validation-submission-test", "Verify audited binary schema submissions, exact durable acceptance and grant isolation")
+        .dependOn(&schema_submission_run.step);
+    system_catalog_api_step.dependOn(&schema_submission_run.step);
+    const ordinary_catalog_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{"SQL catalog ordinary"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const ordinary_catalog_run = addFilteredTestRunArtifact(b, ordinary_catalog_tests);
+    ordinary_catalog_run.addArg("--require-no-skips");
+    const ordinary_catalog_inventory = b.addRunArtifact(ordinary_catalog_tests);
+    ordinary_catalog_inventory.addArg("--list-tests");
+    const ordinary_catalog_audit = b.addSystemCommand(&.{"python3"});
+    ordinary_catalog_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL catalog ordinary scoped evolution observes lost replies without replaying mutations",
+        "SQL catalog ordinary typed table unknown admission recovers after cold reopen and executor fencing",
+        "SQL catalog ordinary recovery rejects label substitution and current authorization revocation",
+        "SQL catalog ordinary constrained create preserves activation receipts without result allocation after admission",
+        "SQL catalog ordinary uncertain nonsend becomes definite rejection only after native executor fencing",
+        "SQL catalog ordinary view lifecycle retains exact lost replies dependency closure and cold recovery",
+        "SQL catalog ordinary view post effect failures abort publication and journal together",
+        "SQL catalog ordinary view outcome decoder preserves object generations and rejects impossible completions",
+        "SQL catalog ordinary schema and annotation commands retain exact outcomes across lost replies and cold reopen",
+        "SQL catalog ordinary schema preparation waits for the complete route cut before any admission",
+        "SQL catalog ordinary schema preparation retries owner readiness but never authorization or submission",
+        "SQL catalog ordinary relation faults roll back all definition and annotation effects and retire definite refusals",
+        "SQL catalog ordinary relation completion owns response identities before admission and preserves unknown recovery",
+    }) |required| ordinary_catalog_audit.addArgs(&.{ "--filter", required });
+    ordinary_catalog_audit.addArg("--inventory");
+    ordinary_catalog_audit.addFileArg2(ordinary_catalog_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    ordinary_catalog_run.step.dependOn(&ordinary_catalog_audit.step);
+    const ordinary_catalog_step = b.step("antfly-sql-catalog-recovery-test", "Verify authorized scoped DDL, native lost-reply recovery and label-bound public receipts");
+    ordinary_catalog_step.dependOn(&ordinary_catalog_run.step);
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL policy DDL", "SQL pgwire", "SQL rewrite response", "httpx SQL original nullability relaxation" } });
+    const sql_command_producer_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "SQL command producer native", "SQL relation lifetime source outbox owns TEMP through discard generation failure and retired cleanup", "SQL execution lease borrowing", "HTTP connection", "HTTP sequence sessions", "SQL connection admission", "durable SQL session rejects duplicate savepoint ids", "durable SQL connection execution projection", "distributed txn session preserves numeric tokens" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_command_producer_run = addFilteredTestRunArtifact(b, sql_command_producer_tests);
+    sql_command_producer_run.addArg("--require-no-skips");
+    const sql_command_producer_inventory = b.addRunArtifact(sql_command_producer_tests);
+    sql_command_producer_inventory.addArg("--list-tests");
+    const sql_command_producer_audit = b.addSystemCommand(&.{"python3"});
+    sql_command_producer_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL relation lifetime source outbox owns TEMP through discard generation failure and retired cleanup",
+        "SQL command producer native begin observation cannot erase TEMP namespace cleanup ownership",
+        "SQL command producer native cold recovery never replays SQL and retires bound scopes incrementally",
+        "SQL command producer native shared facades preserve execution ownership lease renewal and admission recovery",
+        "SQL command producer native connection GC retains uncertain owners and native fences prevent identity resurrection",
+        "SQL command producer native supervisor uses existing authenticated transport without executing abandoned SQL",
+        "SQL command producer native outbox aborts every staged write before WAL publication",
+        "SQL command producer native providers must prove transaction-wide shared writer serialization",
+        "SQL command producer native idle facade handoff stages one command and cannot adopt ready or executing SQL",
+        "SQL command producer native orphaned connections retire through native fences without evaluating SQL",
+        "SQL command producer native closure survives a delayed renewal after its outbox was superseded",
+        "SQL command producer native retired sources preserve independent connection begin and terminal reconciliation",
+        "SQL command producer native scoped COMMIT survives every metadata delivery boundary and cold adoption",
+        "SQL command producer native scoped rollback retains its durable abort and releases only transaction locks",
+        "SQL command producer native advisory effect delivery is exact across cold lost replies and key spaces",
+        "SQL command producer native completion cancels abandoned waiter across cold replies preserving prior session grants",
+        "SQL command producer native advisory SQL pipeline uses real receipts and bound transaction scope",
+        "SQL command producer native completion finishes abandoned unlock all quanta without releasing transaction grants",
+        "SQL command producer native advisory contention avoids journal churn and hard deadlocks retain earlier grants",
+        "SQL command producer native advisory complete overload matrix retains scopes through uncertain delivery",
+        "SQL command producer native transaction savepoint projection retains monotone identities across cold rollback and release",
+        "SQL command producer native savepoint publication atomically rewinds SQL and reparents locks through cold lost control replies",
+        "SQL command producer native shared SQL savepoint adapter drains exact control without replaying SQL",
+        "SQL command producer native ingress discovers one database enrolls exact owners and never reissues a body",
+        "SQL command producer native ingress discovery is capability gated and cannot mix selectors or realms",
+        "SQL command producer native ingress cancellation skips an untaken body without dropping existing session locks",
+        "SQL connection admission liveness binds the exact command and cannot be renewed by a newer request",
+        "SQL command producer native exact command heartbeat renews through cold lost replies and rejects replacement admissions",
+        "SQL command producer native completion renews pending control without replaying SQL or dropping session grants",
+        "SQL command producer native supervisor renews only live local owners and leaves expired sources fenced",
+        "SQL command producer native DISCARD atomically resets resources with resumable unlock intent across cold faults",
+        "SQL command producer native DISCARD settings adapter survives lost control replies and cancellation after reset",
+        "SQL command producer native upkeep progresses with exhausted request concurrency and a blocked owner",
+        "SQL command producer native enrolled HTTP requests own authority through cancellation and close",
+        "SQL command producer native autocommit advisory reads lazily decide and release transaction grants",
+        "SQL command producer native sealed execution fences completion before the connection marker across restart",
+        "SQL connection admission publishes lease signals only to the exact live command",
+        "durable SQL connection execution projection bounds reads and avoids unchanged writes",
+        "durable SQL session rejects duplicate savepoint ids without double freeing overlays",
+        "distributed txn session preserves numeric tokens across staging savepoints and durable recovery",
+    }) |required| sql_command_producer_audit.addArgs(&.{ "--filter", required });
+    sql_command_producer_audit.addArg("--inventory");
+    sql_command_producer_audit.addFileArg2(sql_command_producer_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_command_producer_run.step.dependOn(&sql_command_producer_audit.step);
+    b.step("antfly-sql-command-producer-test", "Qualify durable SQL source permits, exact control delivery and native cold retirement")
+        .dependOn(&sql_command_producer_run.step);
+    const sql_read_admission_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"SQL statement read admission"} });
+    const sql_view_authority_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "SQL read policy proof cache", "SQL owner view legacy filters", "SQL require-index equality uses exact native bounds only inside a guarded statement", "SQL view public resolver", "SQL view filters", "SQL prepared view manifests", "SQL pgwire view", "retained read client admission retries", "retained read client never replays an ambiguous page", "relational statement retries unavailable capture", "SQL policy DDL writes a durable draft", "row policy coordinator", "row policy publication Raft codec", "retained read admission is independent" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_view_authority_run = addFilteredTestRunArtifact(b, sql_view_authority_tests);
+    sql_view_authority_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-view-authority-test", "Verify scoped view proof caching and existing Antfly row-filter/RLS scan integration")
+        .dependOn(&sql_view_authority_run.step);
+    b.step("antfly-sql-read-admission-test", "Verify SQL read admission availability without weakening error or mutation semantics")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_read_admission_tests).step);
+    const sql_index_ddl_run = addFilteredTestRunArtifact(b, sql_index_ddl_tests);
+    const sql_index_ddl_inventory = b.addRunArtifact(sql_index_ddl_tests);
+    sql_index_ddl_inventory.addArg("--list-tests");
+    const sql_index_ddl_audit = b.addSystemCommand(&.{"python3"});
+    sql_index_ddl_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL index DDL drops the exact qualified owner without a catalog snapshot",
+        "SQL catalog ALTER submits native schema CAS without client generations",
+        "httpx SQL original nullability relaxation preserves ambiguous metadata results across cold authority recovery",
+        "httpx SQL catalog validated declarations require execution authority and preserve native owners across restart",
+        "httpx SQL catalog originals commit through native authority and recover topology",
+        "httpx SQL catalog diagnostics preserve authority and uncertain commits are not replayed",
+    }) |required| sql_index_ddl_audit.addArgs(&.{ "--filter", required });
+    sql_index_ddl_audit.addArg("--inventory");
+    sql_index_ddl_audit.addFileArg2(sql_index_ddl_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_index_ddl_run.step.dependOn(&sql_index_ddl_audit.step);
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
-        .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
+        .dependOn(&sql_index_ddl_run.step);
     const sql_native_cells_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "SQL pgwire native", "SQL stateless fallback" },
@@ -587,6 +1233,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-managed-sources-test", "Run managed CDC source configuration and status contracts").dependOn(&addFilteredTestRunArtifact(b, managed_sources_tests).step);
     b.step("antfly-api-sql-native-cells-test", "Verify native SQL result cells and retained-read requirements")
         .dependOn(&addFilteredTestRunArtifact(b, sql_native_cells_tests).step);
+    const sql_conflict_scope_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "SQL original conflict references", "SQL conflict scope", "compiler conflict row assignments" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-sql-conflict-scope-test", "Verify PostgreSQL conflict scope, atomic rejection and qualified native writes")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_conflict_scope_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });
@@ -670,7 +1323,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, cypher_runtime_admission_tests).step);
     const sql_expression_apply_tests = b.addTest(.{
         .root_module = data_implementation_module,
-        .filters = &.{"SQL expression apply failures preserve exact semantic rejections"},
+        .filters = &.{ "SQL expression apply failures preserve exact semantic rejections", "SQL policy apply denials preserve typed outcomes without rejecting committed decisions" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-sql-expression-apply-contract-test", "Run deterministic SQL expression rejection classification")
@@ -748,6 +1401,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_common_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, common_http_tests, &.{});
     const common_http_test_step = b.step("common-http-test", "Run common HTTP listener and client tests");
     common_http_test_step.dependOn(&run_common_http_tests.step);
+    const retained_http_io = addFilteredTestRunArtifactWithRuntimeFilters(b, common_http_tests, &.{"std http executor exports request Io"});
+    retained_http_io.addArg("--require-no-skips");
+    b.step("common-http-retained-io-test", "Verify the HTTP executor retains its std.Io clock and secure-random capability")
+        .dependOn(&retained_http_io.step);
 
     const api_json_helpers_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/api/json_helpers.zig"),
@@ -812,7 +1469,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     restore_source_imports.configure(b, restore_owner_test_mod, true, true);
     const restore_owner_tests = b.addTest(.{
         .root_module = restore_owner_test_mod,
-        .filters = &.{ "restore owner verified decoder", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "relational integrity topology durable backup seal survives restart and later writes", "relational integrity historical restore stays fenced while coherent HA seed preserves namespace", "relational integrity accepted generation survives restart and bounded two-phase GC", "mapped restore admission" },
+        .filters = &.{ "restore owner SQL population", "restore owner verified decoder", "restore owner independent repository snapshot", "restore decoder", "relational integrity portable decoder resumes bounded row pages across LSM reopen", "relational integrity topology durable backup seal survives restart and later writes", "relational integrity historical restore stays fenced while coherent HA seed preserves namespace", "relational integrity accepted generation survives restart and bounded two-phase GC", "mapped restore admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-owner-test", "Run authenticated source cache and replicated owner control integration").dependOn(&addFilteredTestRunArtifact(b, restore_owner_tests).step);
@@ -834,6 +1491,170 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const native_snapshot_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system native Raft snapshot"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-native-raft-snapshot-test", "Verify native snapshot transfer and frozen archive ownership").dependOn(&addCuratedTestRunArtifact(b, native_snapshot_tests, native_snapshot_tests.filters).step);
+    const partition_owner_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system partition owner"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const partition_owner_run = addFilteredTestRunArtifact(b, partition_owner_tests);
+    partition_owner_run.addArg("--require-no-skips");
+    b.step("antfly-partition-owner-test", "Verify partition owner validation, install, and cold recovery").dependOn(&partition_owner_run.step);
+    const publication_owner_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"native publication capture observes actual owner"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const publication_owner_run = addFilteredTestRunArtifact(b, publication_owner_tests);
+    publication_owner_run.addArg("--require-no-skips");
+    b.step("antfly-publication-owner-test", "Verify native publication capture control and cold standby recovery").dependOn(&publication_owner_run.step);
+    const compatible_enum_epoch_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system compatible enum epoch"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const compatible_enum_epoch_run = addFilteredTestRunArtifact(b, compatible_enum_epoch_tests);
+    compatible_enum_epoch_run.addArg("--require-no-skips");
+    b.step("antfly-relational-enum-epoch-test", "Verify compatible enum epochs on populated LSM rows, existing indexes and cold native owners").dependOn(&compatible_enum_epoch_run.step);
+    const domain_restore_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system domain handoffs materialize"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const domain_restore_run = addFilteredTestRunArtifact(b, domain_restore_tests);
+    domain_restore_run.addArg("--require-no-skips");
+    b.step("antfly-relational-domain-restore-test", "Verify historical domain handoffs across native restore and cold rows").dependOn(&domain_restore_run.step);
+    const domain_epoch_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "relational index system domain NOT NULL epoch", "relational index system compatible enum epoch", "relational index system rewrite admission owns complete immutable historical schema manifest" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const domain_epoch_run = addFilteredTestRunArtifact(b, domain_epoch_tests);
+    domain_epoch_run.addArg("--require-no-skips");
+    b.step("antfly-relational-domain-epoch-test", "Verify populated domain epochs and complete historical schema manifests").dependOn(&domain_epoch_run.step);
+    const default_retirement_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system compatible default retirement"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const default_retirement_run = addFilteredTestRunArtifact(b, default_retirement_tests);
+    default_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-relational-default-retirement-test", "Verify zero-row default removal, native owner installation, cancellation and cold LSM rows").dependOn(&default_retirement_run.step);
+    const indexed_document_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system indexed document"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const indexed_document_run = addFilteredTestRunArtifact(b, indexed_document_tests);
+    indexed_document_run.addArg("--require-no-skips");
+    b.step("antfly-indexed-document-read-test", "Verify exact retained document text predicates through native LSM reads").dependOn(&indexed_document_run.step);
+    const document_integrity_storage_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system document schema integrity"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const document_integrity_storage_run = addFilteredTestRunArtifact(b, document_integrity_storage_tests);
+    document_integrity_storage_run.addArg("--require-no-skips");
+    b.step("antfly-document-integrity-storage-test", "Verify plain document schema admission, atomic invalid batches, failed prepares, cold intents and allocation cleanup")
+        .dependOn(&document_integrity_storage_run.step);
+    const document_generated_storage_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system document generated portable LSM round trip preserves historical values"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const document_generated_storage_run = addFilteredTestRunArtifact(b, document_generated_storage_tests);
+    document_generated_storage_run.addArg("--require-no-skips");
+    b.step("antfly-document-generated-storage-test", "Verify document producers through real LSM portable restore and reopened writes")
+        .dependOn(&document_generated_storage_run.step);
+    const clock_rewrite_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system rewrite clock defaults freeze one admitted instant across snapshot tail and cold intent"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const clock_rewrite_run = addFilteredTestRunArtifact(b, clock_rewrite_tests);
+    clock_rewrite_run.addArg("--require-no-skips");
+    b.step("antfly-relational-clock-rewrite-test", "Verify transaction-bound stable defaults survive historical rewrite, retained tails and cold intent recovery")
+        .dependOn(&clock_rewrite_run.step);
+    const constraint_cover_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system covering constraint derives compact payloads and cold index-only reads"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const constraint_cover_run = addFilteredTestRunArtifact(b, constraint_cover_tests);
+    constraint_cover_run.addArg("--require-no-skips");
+    b.step("antfly-relational-constraint-cover-test", "Verify covering constraint payload maintenance and cold reads avoid primary hydration")
+        .dependOn(&constraint_cover_run.step);
+    const temporal_integrity_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "SQL range temporal claims", "relational integrity preparation cleans up every allocation failure and bounds admission", "relational integrity transfer validates borrowed action jobs before companion reads", "relational index system integrity compare claim fences absence and exact owner before combined writes" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const temporal_integrity_run = addFilteredTestRunArtifact(b, temporal_integrity_tests);
+    temporal_integrity_run.addArg("--require-no-skips");
+    b.step("antfly-relational-temporal-integrity-test", "Verify ordered temporal claims, exclusive transaction gaps and cold intent recovery")
+        .dependOn(&temporal_integrity_run.step);
+    const deferred_check_storage_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"NOT VALID history"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const deferred_check_storage_run = addFilteredTestRunArtifact(b, deferred_check_storage_tests);
+    deferred_check_storage_run.addArg("--require-no-skips");
+    b.step("antfly-relational-deferred-check-storage-test", "Verify historical CHECK import, rewrite, restore and new-write enforcement")
+        .dependOn(&deferred_check_storage_run.step);
+    const fk_validation_scan_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system foreign key validation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const fk_validation_scan_run = addFilteredTestRunArtifact(b, fk_validation_scan_tests);
+    fk_validation_scan_run.addArg("--require-no-skips");
+    b.step("antfly-relational-fk-validation-scan-test", "Verify bounded FK source witnesses, cold LSM scans, replay and cancellation").dependOn(&fk_validation_scan_run.step);
+    const nullability_scan_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system nullability scan"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const nullability_scan_run = addFilteredTestRunArtifact(b, nullability_scan_tests);
+    nullability_scan_run.addArg("--require-no-skips");
+    b.step("antfly-relational-nullability-scan-test", "Verify bounded physical NULL validation, retained source cuts, resume and cancellation atomicity").dependOn(&nullability_scan_run.step);
+    const dependent_retirement_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "dependent retirement", "column sequence defaults require exact schema-only", "dependency retirement preserves proven coverage", "relational integrity activation coverage", "relational index build pages activation preserves" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const dependent_retirement_run = addFilteredTestRunArtifact(b, dependent_retirement_tests);
+    dependent_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-dependent-retirement-owner-test", "Verify subtract-only FK/default owner preparation, cold LSM publication and allocation failures")
+        .dependOn(&dependent_retirement_run.step);
+    const nullability_job_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "relational index system nullability job", "schema apply outcomes", "native backup origin", "schema row-audit cache" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const nullability_job_run = addFilteredTestRunArtifact(b, nullability_job_tests);
+    nullability_job_run.addArg("--require-no-skips");
+    b.step("antfly-relational-nullability-job-test", "Verify durable fenced validation progress, cold resume and transactional cancellation").dependOn(&nullability_job_run.step);
+    const relational_index_page_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "relational index build pages", "relational index release", "relational index system ready publication waits", "relational index system prepared writer reserves", "relational index system ordinary tuple replacement" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const concurrent_index_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system concurrent partial generation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const concurrent_index_run = addFilteredTestRunArtifact(b, concurrent_index_tests);
+    concurrent_index_run.addArg("--require-no-skips");
+    b.step("antfly-relational-concurrent-index-test", "Verify live writes, bounded historical backfill, cold progress and retired-generation readers").dependOn(&concurrent_index_run.step);
+    const relational_index_page_step = b.step("antfly-relational-index-pages-test", "Verify bounded public/private index pages, frozen source CAS and pre-generation writer drain");
+    relational_index_page_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_page_tests).step);
     const native_ranked_hydration_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{"relational index system query lease typed point hydration"},
@@ -848,7 +1669,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-native-row-projection-test", "Verify native row projection ownership, nulls and allocation bounds")
         .dependOn(&addFilteredTestRunArtifact(b, native_row_projection_tests).step);
-
     const retained_transfer_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{ "relational index system rewrite", "relational index system retained", "relational index system merge tail", "relational index system source pin prepared crash", "storage.source_snapshot." },
@@ -857,14 +1677,33 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-retained-transfer-test", "Run bounded retained-frame transfer, cold resume and corruption regressions").dependOn(&addFilteredTestRunArtifact(b, retained_transfer_tests).step);
     const sql_pk_transform_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
-        .filters = &.{ "SQL primary-key rewrite retains a present key across nullable-to-required row mapping", "SQL scoped defaults" },
+        .filters = &.{ "SQL primary-key rewrite retains a present key across nullable-to-required row mapping", "SQL scoped defaults", "SQL USING rewrite" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-sql-primary-key-transform-test", "Run focused SQL primary-key native row-transform regression")
         .dependOn(&addFilteredTestRunArtifact(b, sql_pk_transform_tests).step);
+    const sql_using_transform_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"SQL USING rewrite"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_using_transform_run = addFilteredTestRunArtifact(b, sql_using_transform_tests);
+    sql_using_transform_run.addArg("--require-no-skips");
+    b.step("antfly-sql-using-transform-test", "Verify typed USING programs, historical epochs, cold intent reconstruction and allocation rollback")
+        .dependOn(&sql_using_transform_run.step);
+    const sql_column_rename_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"SQL column rename"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_column_rename_run = addFilteredTestRunArtifact(b, sql_column_rename_tests);
+    sql_column_rename_run.addArg("--require-no-skips");
+    b.step("antfly-sql-column-rename-transform-test", "Verify rename snapshot/tail mapping, bounded replay, cancellation and cold recovery")
+        .dependOn(&sql_column_rename_run.step);
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
+            "restore immutable rewrite failures are terminal but transport pressure is retryable",
             "replicated restore persistence maps private callback errors to stable unavailability",
             "restore jobs compound staging persistence",
             "failed destination authorization refresh reuses the idempotent restore job",
@@ -876,6 +1715,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore idempotency keys are scoped by principal and resource",
             "successful restore completion wins a racing cancellation",
             "restore staging incarnation survives retries and cancellation waits for owner cleanup",
+            "restore staging terminal failures preserve durable causes through cleanup and recovery",
             "restore staging driver shares stable identities and existing destination modes",
             "rewrite shared job",
             "restore staging cohort proof binds every source identity and durable seal",
@@ -984,6 +1824,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "import preflights full portable envelope before mutating destination",
             "export and import documents preserve timestamps",
             "portable backup round trips relational rows and schema metadata",
+            "export and import preserves portable schema and catalog metadata",
             "portable backup curation proposal metadata",
             "portable backup native resolver authority",
             "portable backup refuses retained retirement and topology authority without a catalog",
@@ -1328,6 +2169,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_api_cluster_secret_status_tests = addFilteredTestRunArtifact(b, api_cluster_secret_status_tests);
     lib_common_secrets_test_step.dependOn(&run_api_cluster_secret_status_tests.step);
 
+    usermgr_mod.addOptions("build_options", build_options);
     const lib_usermgr_tests = b.addTest(.{
         .root_module = usermgr_mod,
         .filters = &.{"usermgr."},
@@ -1608,6 +2450,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "postgres libpq idle reclamation transfers only missing capacity",
         "postgres libpq reclamation leaves permit scheduling responsive",
         "postgres libpq connection-error sanitizer",
+        "postgres libpq parser rejects truncate",
+        "postgres libpq parser decodes pgoutput",
+        "replication transactions group opaque checkpoints",
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
@@ -2216,6 +3061,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "external lake read refresh hints coalesce",
         "admission routing",
         "native memory",
+        "SQL command producer native",
         "httpx internal control routes call typed operations directly",
         "caller cancellation does not interrupt protected child work",
         "httpx SQL dispatch preserves imported executor authority including unavailable views",
@@ -2244,6 +3090,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx restore owner accepts bounded rewrite source chunks above legacy control limit",
         "httpx hidden handoff receipt rejects public caller even in legacy internal mode",
         "httpx FK source control rejects missing service token in legacy internal mode",
+        "httpx private index claims",
+        "private index claim client",
+        "httpx private index control",
+        "private index control client",
+        "httpx source scope control",
         "hidden generation handoff receipt requires exact scoped read-index request",
         "hidden generation handoff identity requires exact scoped read-index request",
         "httpx schema patch merges at the authority and accepts version zero ETag",
@@ -2397,6 +3248,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "prefixUpperBoundAlloc",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
+    const source_scope_http_auth_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "httpx source scope control", "httpx source producer closure observe", "httpx source producer control", "httpx source legacy terminal", "httpx source legacy inventory" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-scope-http-auth-test", "Verify lifecycle RPC service authentication and conservative unknown outcomes").dependOn(&addFilteredTestRunArtifact(b, source_scope_http_auth_tests).step);
+    const changefeed_http_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"httpx changefeed"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("changefeed-http-test", "Verify public changefeed HTTP request and authorization contracts").dependOn(&addFilteredTestRunArtifact(b, changefeed_http_tests).step);
     const resolver_adjudication_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "resolver adjudication public policy", "DistributedCandidateSource", "resolver curation status cloning" },
@@ -2420,6 +3275,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-enrichment-shorthand-test", "Validate enrichment shorthand expansion into producer configs")
         .dependOn(&addFilteredTestRunArtifact(b, enrichment_shorthand_api_tests).step);
+
+    const artifact_policy_filters = &.{ "enrichment shorthand", "artifact replacement" };
+    const artifact_policy_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = artifact_policy_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-execution-policy-api-test", "Verify producer inheritance, typed transcription and policy continuation contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_policy_tests, artifact_policy_filters).step);
 
     const admission_routing_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
@@ -2459,10 +3323,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors(b, &.{ "api module compiles", "api HTTP runtime discovery" }, api_http_runtime_filters),
-        // Native lake kernels peak at 18.50 GB in macOS ReleaseFast codegen.
-        // Reserve measured usage plus
-        // headroom; the shared runner still caps aggregate compilation.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 19 else 7) * 1024 * 1024 * 1024,
+        // This API owner measured 22.45 GB in macOS Debug; reserve more than
+        // 25% headroom. ReleaseFast measured 18.50 GB. Keep the unmeasured
+        // Linux estimate unchanged; the runner caps aggregate compilation.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 28 else 19) else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -2590,6 +3454,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "HTTP connection publishes",
         "durable SQL session rejects malformed connection id without leaking principal",
         "httpx SQL connection routes preserve settings and retire prepared resources",
+        "SQL pgwire native HTTP resources forward",
+        "SQL pgwire native HTTP connection capacity proves no execution and failed forwarding stays unknown",
+        "API imported runtime capability struct retains versioned C layout",
+        "API kernel runtime I/O receivers validate capability layout and domains",
+        "API kernel forward lane reserves owning runtime capacity",
     };
     const sql_connection_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
@@ -2968,14 +3837,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_raft_queued_transport_tests = addFilteredTestRunArtifact(b, raft_queued_transport_tests);
     const graph_cleanup_runtime_tests = b.addTest(.{
         .root_module = data_implementation_module,
-        .filters = &.{ "graph endpoint cleanup routing", "raft batch round trips guarded graph owner replay afterimages" },
+        .filters = &.{"graph endpoint cleanup routing"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("graph-cleanup-runtime-test", "Run cleanup routing scalability and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_runtime_tests).step);
+    // Wire tests belong to the consumer owner: the implementation owner
+    // intentionally excludes consumer suites through implementation_tests_only.
+    const graph_cleanup_wire_tests = b.addTest(.{
+        .root_module = data_consumer_module,
+        .filters = &.{"raft batch round trips guarded graph owner replay afterimages"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_cleanup_runtime_step = b.step("graph-cleanup-runtime-test", "Run cleanup routing scalability and protocol regressions");
+    graph_cleanup_runtime_step.dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_runtime_tests).step);
+    graph_cleanup_runtime_step.dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_wire_tests).step);
     const leann_regression_tests = b.addTest(.{
-        .name = "leann-regression-tests",
         .root_module = antfly_test_mod,
-        .filters = selectTestFilters(b, &.{ "leann", "reembed", "chunked dense", "synchronous chunk", "synchronously builds chunk", "generated memo reuses only", "public table query handler preserves retryable", "preserves public query availability" }),
+        .filters = selectTestFilters(b, &.{ "leann replication round", "leann", "reembed", "chunked dense", "synchronous chunk", "synchronously builds chunk", "generated memo reuses only", "public table query handler preserves retryable", "preserves public query availability" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("leann-regression-test", "Run LEANN storage, provenance, split and recovery regressions")
@@ -3021,21 +3898,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, raft_storage_test_mod, true, true);
+    const raft_storage_runtime_filters = selectTestFilters(b, &.{
+        "raft.storage.file_snapshot_store.",
+        "raft.storage.native_snapshot.",
+        "raft.storage.snapshot_payload_store.",
+    });
     const raft_storage_tests = b.addTest(.{
         .root_module = raft_storage_test_mod,
         // Snapshot transport reaches the physical DB. Keep this suite scoped
         // to its owners instead of collecting every transitive engine test.
-        .filters = selectTestFilters(b, &.{
-            "raft snapshot storage tests are reachable",
-            "raft.storage.file_snapshot_store.",
-            "raft.storage.native_snapshot.",
-        }),
+        .filters = compileFiltersWithAnchors(b, &.{"raft snapshot storage tests are reachable"}, raft_storage_runtime_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_raft_storage_tests = addFilteredTestRunArtifact(b, raft_storage_tests);
+    const run_raft_storage_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, raft_storage_tests, raft_storage_runtime_filters);
+    const snapshot_publication_filters = &.{ "raft.storage.replica_state.", "raft.storage.wal_replica_state.", "raft.storage.snapshot_payload_store.", "raft.storage.snapshot_metadata." };
+    const snapshot_publication_tests = b.addTest(.{
+        .root_module = raft_storage_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"raft snapshot storage tests are reachable"}, snapshot_publication_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_snapshot_publication_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, snapshot_publication_tests, snapshot_publication_filters);
+    run_snapshot_publication_tests.addArg("--require-no-skips");
+    b.step("antfly-raft-snapshot-publication-test", "Verify snapshot payload publication, checkpoint joins and crash recovery")
+        .dependOn(&run_snapshot_publication_tests.step);
     const raft_snapshot_maintenance_vopr_tests = b.addTest(.{
         .root_module = raft_storage_test_mod,
         .filters = &.{
@@ -3211,6 +4099,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(&schema_submission_run.step);
+    unit_test_step.dependOn(&index_candidate_run.step);
+    unit_test_step.dependOn(&lifecycle_lock_run.step);
+    unit_test_step.dependOn(&index_publication_run.step);
+    unit_test_step.dependOn(&run_history_control_entry_tests.step);
+    unit_test_step.dependOn(&run_transaction_completion_tests.step);
+    unit_test_step.dependOn(&run_completion_plan_tests.step);
+    unit_test_step.dependOn(&run_changefeed_control_tests.step);
+    unit_test_step.dependOn(&run_changefeed_delivery_tests.step);
+    unit_test_step.dependOn(&run_changefeed_projection_tests.step);
+    unit_test_step.dependOn(&run_changefeed_projection_cursor_tests.step);
+    unit_test_step.dependOn(&run_changefeed_json_tests.step);
+    unit_test_step.dependOn(&run_pgoutput_tests.step);
+    unit_test_step.dependOn(&run_pg_spool_codec_tests.step);
+    unit_test_step.dependOn(&run_pg_spool_artifact_tests.step);
+    unit_test_step.dependOn(&run_pg_spool_stream_tests.step);
+    unit_test_step.dependOn(&run_changefeed_storage_tests.step);
+    unit_test_step.dependOn(&run_changefeed_service_tests.step);
     unit_test_step.dependOn(&remote_content_adapter_run.step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("antfly-google-embedding-catalog-test").?.step);
@@ -3387,6 +4293,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, lake_scaffold_test_mod, true, true);
     lake_scaffold_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const source_transaction_lake_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, source_transaction_lake_mod, true, true);
+    const source_transaction_lake_source = source_transaction_lake_mod.import_table.get("antfly_local_sources").?;
+    const source_transaction_lake_selection = b.addOptions();
+    source_transaction_lake_selection.addOption([]const []const u8, "names", &.{"serverless_external_source_mod"});
+    source_transaction_lake_source.addOptions("antfly_local_test_sources", source_transaction_lake_selection);
+    const source_transaction_lake_tests = b.addTest(.{
+        .root_module = source_transaction_lake_source,
+        .filters = &.{ "lake native row commit", "serverless external source module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    source_transaction_step.dependOn(&b.addRunArtifact(source_transaction_lake_tests).step);
     const lake_scaffold_tests = b.addTest(.{
         // Measured macOS ReleaseSafe partition peak: 15.67 GB. Reserve headroom
         // for native lake API codegen rather than failing scheduler admission.
@@ -3542,6 +4464,29 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_data_runtime_tests = data_tests_addTests_result.run_lib_data_runtime_tests;
     const run_lib_data_storage_tests = data_tests_addTests_result.run_lib_data_storage_tests;
+    const reader_admission_step = b.step("antfly-store-reader-admission-test", "Verify durable decoder readiness and incarnation-bound schema reader advertisement");
+    const reader_contract_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/common/schema_readers.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const reader_contract_run = b.addRunArtifact(reader_contract_tests);
+    reader_admission_step.dependOn(&reader_contract_run.step);
+    unit_test_step.dependOn(&reader_contract_run.step);
+    for ([_]struct { module: *std.Build.Module, filters: []const []const u8 }{
+        .{ .module = metadata_unit_baseline_mods[1], .filters = &.{ "system catalog schema reader readiness", "system catalog schema reader publication", "catalog projection schema reader facts" } },
+        .{ .module = metadata_unit_baseline_mods[8], .filters = &.{"system catalog schema reader table"} },
+        .{ .module = data_consumer_module, .filters = &.{"data runtime schema reader"} },
+    }) |fixture| {
+        const tests = b.addTest(.{
+            .root_module = fixture.module,
+            .filters = fixture.filters,
+            .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        });
+        reader_admission_step.dependOn(&addFilteredTestRunArtifact(b, tests).step);
+    }
 
     const db_tests_addTests_result = db_tests.addTests(b, .{
         .antfly_test_mod = antfly_test_mod,
@@ -3553,6 +4498,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const metadata_tests_addTests_result = metadata_tests.addTests(b, .{
         .target = target,
         .antfly_test_mod = antfly_test_mod,
+        .metadata_storage_test_mod = metadata_unit_baseline_mods[metadata_unit_baseline_mods.len - 1],
     });
     const run_lib_metadata_vopr_data_tests = metadata_tests_addTests_result.run_lib_metadata_vopr_data_tests;
     const lib_metadata_runtime_filters = metadata_tests_addTests_result.lib_metadata_runtime_filters;
@@ -3582,6 +4528,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_algebraic_dynamic_template_tests = api_tests_addTests_result.run_algebraic_dynamic_template_tests;
     const run_lib_api_connections_tests = api_tests_addTests_result.run_lib_api_connections_tests;
     const run_lib_api_storage_authority_tests = api_tests_addTests_result.run_lib_api_storage_authority_tests;
+    changefeed_control_step.dependOn(&b.top_level_steps.get("native-history-consumer-test").?.step);
+    unit_test_step.dependOn(&b.top_level_steps.get("native-history-consumer-test").?.step);
     const api_table_writes_docid_test_mod = api_tests_addTests_result.api_table_writes_docid_test_mod;
     const api_table_reads_docid_test_mod = api_tests_addTests_result.api_table_reads_docid_test_mod;
     const run_lib_api_docid_tests = api_tests_addTests_result.run_lib_api_docid_tests;
@@ -3803,6 +4751,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("time-series-runtime-test", "Verify temporal predicate proof, owner fanout and fallback contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, time_series_runtime_tests, time_series_filters).step);
 
     const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
+    const pessimistic_lock_native_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"pessimistic locks native LSM"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_pessimistic_lock_native_tests = addFilteredTestRunArtifact(b, pessimistic_lock_native_tests);
+    run_pessimistic_lock_native_tests.addArg("--require-no-skips");
+    b.step("antfly-pessimistic-lock-native-test", "Qualify LSM/WAL lock receipts, abort atomicity and bounded cold prepared handoff")
+        .dependOn(&run_pessimistic_lock_native_tests.step);
+
     const graph_ttl_migration_tests = b.addTest(.{
         .name = "graph-ttl-migration-tests",
         .root_module = antfly_test_mod,
@@ -4172,6 +5130,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_job_tests.step);
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_status_tests.step);
     dense_index_lifecycle_regression_step.dependOn(&run_dense_index_repair_runtime_tests.step);
+
+    const dense_inline_coverage_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "db inline dense generation remains rebuilding until outcomes cover the live corpus", "applied sequence coalescer", "db dense artifact repair retains one source cut", "db vector indexes combine direct document and chunk-backed artifact sources", "dense repair read retains source cut", "dense repair primary matrix", "dense repair native WAL", "replay matrix reads exact native base", "db field vector repair", "db restart automatically resumes pinned explicit dense generation rebuild", "native rerank", "native read scratch pool", "native residual scratch", "dense vector load session caches decoded" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const dense_inline_coverage_run = addFilteredTestRunArtifact(b, dense_inline_coverage_tests);
+    dense_inline_coverage_run.addArg("--require-no-skips");
+    b.step("dense-inline-coverage-test", "Verify inline dense lifecycle completion preserves complete source coverage")
+        .dependOn(&dense_inline_coverage_run.step);
 
     const vopr_contract_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/vopr/src/root.zig"),
@@ -5560,9 +6528,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const integration_test_step = b.step("antfly-integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_vopr_public_integration_tests.step);
     integration_test_step.dependOn(&run_lib_metadata_vopr_forwarding_integration_tests.step);
-    // Both aggregates share the audited focused owner group, so the default
-    // test DAG executes each stateful parity fixture exactly once.
+    // Both aggregates share this run node, so the default test DAG executes
+    // the stateful parity suite once. The focused alias remains independent.
     integration_test_step.dependOn(public_api_parity_step);
+    // These are the same run nodes as the focused aliases: real owner
+    // lifecycle coverage must execute in CI, without duplicate DAG campaigns.
+    for (api_tests_addTests_result.run_sql_owner_lifecycle_tests) |run| {
+        integration_test_step.dependOn(&run.step);
+    }
     // Keep document-identity regressions in the owning integration suite.
     // The mixed lifecycle artifact remains intact so removing its public
     // shortcut does not discard metadata, cache, or distributed-query cases.
@@ -5691,8 +6664,45 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const memory_standalone_tests = b.addTest(.{ .root_module = system_catalog_standalone_test_mod, .filters = &.{"native memory ownership"} });
     memory_metadata_step.dependOn(&b.addRunArtifact(memory_standalone_tests).step);
+    const prepared_catalog_standalone_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"system catalog prepared ordinary DDL"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const prepared_catalog_standalone_run = addFilteredTestRunArtifact(b, prepared_catalog_standalone_tests);
+    prepared_catalog_standalone_run.addArg("--require-no-skips");
+    const prepared_catalog_inventory = b.addRunArtifact(prepared_catalog_standalone_tests);
+    prepared_catalog_inventory.addArg("--list-tests");
+    const prepared_catalog_audit = b.addSystemCommand(&.{"python3"});
+    prepared_catalog_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    prepared_catalog_audit.addArgs(&.{ "--filter", "system catalog prepared ordinary DDL submits exact native outcomes through standalone recovery", "--inventory" });
+    prepared_catalog_audit.addFileArg2(prepared_catalog_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    prepared_catalog_standalone_run.step.dependOn(&prepared_catalog_audit.step);
+    const sql_catalog_command_step = b.step("antfly-sql-catalog-command-test", "Qualify prepared ordinary catalog submission and exact standalone cold outcomes");
+    sql_catalog_command_step.dependOn(&prepared_catalog_standalone_run.step);
+    sql_catalog_command_step.dependOn(sql_command_fence_step);
+    ordinary_catalog_step.dependOn(sql_catalog_command_step);
+    const standalone_scope_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{ "SQL scope retirement standalone", "system catalog standalone setting publication", "standalone catalog restore receipt progress preserves routes until structural publication" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const standalone_scope_run = addFilteredTestRunArtifact(b, standalone_scope_tests);
+    standalone_scope_run.addArg("--require-no-skips");
+    b.step("antfly-standalone-scope-retirement-test", "Verify native scope reservation and catalog settings through standalone cold owners").dependOn(&standalone_scope_run.step);
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
+    // Same physical source module and linked provider as the broad catalog
+    // gate; a strict focused runner cannot report success by skipping it.
+    const sequence_seed_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{ "system catalog standalone paired sequence seed", "system catalog standalone startup migrates old relation seals" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sequence_seed_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sequence_seed_tests, &.{ "system catalog standalone paired sequence seed", "system catalog standalone startup migrates old relation seals" });
+    sequence_seed_run.addArg("--require-no-skips");
+    b.step("antfly-system-catalog-sequence-seed-test", "Verify paired native sequence seeds through staged materialization and cold standalone startup")
+        .dependOn(&sequence_seed_run.step);
     const standalone_alias_tests = b.addTest(.{
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"index alias standalone"},
@@ -5814,11 +6824,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
+            "standalone native index owner catalog calls",
             "standalone shared catalog resumes private restore and publishes atomically",
             "standalone standby catalog create rejects before contended locks",
             "offline migration rejects authoritative metadata",
             "standalone catalog remote apply outage preserves committed creation and retry authority",
+            "standalone catalog restore receipt progress preserves routes until structural publication",
             "standalone metadata replay refreshes colliding revisions and only publishes complete effects",
+            "standalone native SQL connection enrolls the real durable producer before lending temporary ownership",
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone catalog journal preserves imported policy publication as fail closed",
             "standalone schema mutation supports atomic merge patch and version CAS",
@@ -5843,10 +6856,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
         // This root intentionally links the complete standalone runtime and
         // embedded inference ABI. With native policy coordinator/owner paths,
-        // macOS Debug codegen peaked at 16.42 GB; reserve scheduling headroom.
+        // macOS Debug codegen peaked at 21.98 GB; reserve scheduling headroom.
         // This is a compile-memory scheduling claim, not a service limit.
         // Native Linux has its own measured inline-inference owner profile.
-        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("standalone-runtime-owner-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024),
+        .max_rss = @import("runtime_memory.zig").testCompileMaxRss("standalone-runtime-owner-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 24 else 7) * 1024 * 1024 * 1024),
     });
     const standalone_config_tests = b.addTest(.{
         .name = "standalone-config-tests",
@@ -5858,6 +6871,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-standalone-config-test", "Verify standalone default and explicit artifact collection policy")
         .dependOn(&addCuratedTestRunArtifact(b, standalone_config_tests, &.{"standalone without config supplies default artifact collection policy"}).step);
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
+    // Bind the inline provider BEFORE cloning the consumer graph. A late
+    // original provider import would introduce a second inference-host type.
+    lib_standalone_runtime_test_mod.addImport("antfly_inference_native_exports", options.native_inference.root_module);
+    const native_schema_submission_tests = @import("linked_tests.zig").add(b, .{
+        .name = "native-schema-submission-tests",
+        .root_module = lib_standalone_runtime_test_mod,
+        .filters = &.{"standalone native index owner catalog calls preserve authority and capability barriers"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
+    });
+    if (options.antfly_imports.shared_inference_core)
+        @import("../../../build_support/embedded/source_owner.zig").registerLocalProvider(native_schema_submission_tests.executable.root_module, options.native_inference);
+    const native_schema_submission_run = native_schema_submission_tests.run(b);
+    native_schema_submission_run.addArg("--require-no-skips");
+    const native_schema_submission_inventory = b.addRunArtifact(native_schema_submission_tests.executable);
+    native_schema_submission_inventory.addArg("--list-tests");
+    const native_schema_submission_audit = b.addSystemCommand(&.{"python3"});
+    native_schema_submission_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    native_schema_submission_audit.addArgs(&.{ "--filter", "standalone native index owner catalog calls preserve authority and capability barriers", "--inventory" });
+    native_schema_submission_audit.addFileArg2(native_schema_submission_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    native_schema_submission_run.step.dependOn(&native_schema_submission_audit.step);
+    schema_submission_run.step.dependOn(&native_schema_submission_run.step);
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
     // Real hidden-owner publication crosses the storage-kernel C ABI. Give
@@ -5879,14 +6914,30 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_initial_fk_test_mod.addImport("antfly_root", standalone_initial_fk_test_mod);
     usermgr_storage_initial_fk_test_mod.addImport("antfly_platform", platform_mod);
     standalone_initial_fk_test_mod.addImport("usermgr_storage", usermgr_storage_initial_fk_test_mod);
+    const standalone_native_activation_tests = b.addTest(.{
+        .root_module = standalone_initial_fk_test_mod,
+        .filters = &.{ "standalone native startup activates actual root", "standalone native root ownership excludes" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
+    });
+    const standalone_native_activation_run = addFilteredTestRunArtifact(b, standalone_native_activation_tests);
+    standalone_native_activation_run.addArg("--require-no-skips");
+    b.step("antfly-standalone-native-activation-test", "Verify real native startup enrollment, cancellation and interrupted reporter recovery")
+        .dependOn(&standalone_native_activation_run.step);
     const standalone_initial_fk_tests = b.addTest(.{
         .root_module = standalone_initial_fk_test_mod,
         .filters = &.{
+            "fence-deferred owner preserves control admission without exposing stale public catalog",
+            "standalone native root ownership excludes independent catalogs until shutdown",
+            "standalone native startup activates actual root",
+            "standalone physical root lease",
             "standalone initial self FK private owners publish two ranges after restart",
             "standalone initial external MATCH PARTIAL FK publishes native parent receipts after restart",
             "standalone initial external MATCH PARTIAL FK cancellation retires private child after restart",
             "standalone native TRUNCATE external FK and graph publish after restart",
             "standalone ordinary FK publication uses durable native receipts after restart",
+            "standalone public SQL CASCADE retires mutual FK owners",
+            "standalone SQL prepared transactions preserve node-zero ownership and row decisions across cold reopen",
             "standalone ordinary schema migration never acquires native FK ownership",
             "standalone canceled initial self FK retires exact private owners after restart",
             "system catalog resolver curation standalone record commits retain large destination definitions",
@@ -5894,6 +6945,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
+    const standalone_sql_prepared_run = b.addRunArtifact(standalone_initial_fk_tests);
+    standalone_sql_prepared_run.addArgs(&.{ "--test-filter", "standalone SQL prepared transactions preserve node-zero ownership and row decisions across cold reopen", "--require-no-skips" });
+    b.step("antfly-standalone-sql-prepared-test", "Verify public standalone prepared rows, local ownership and complete cold resolution").dependOn(&standalone_sql_prepared_run.step);
     // These fixtures use resident DB owners, not the control-only source in
     // the initial-FK executable. Keep them linked but never silently skipped.
     const standalone_policy_ha_test_mod = b.createModule(.{
@@ -6013,7 +7067,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = standalone_runtime_test_mod,
         .filters = &.{"standalone shared"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 28 else 16) else 7) * 1024 * 1024 * 1024,
     });
     const run_standalone_restore_tests = b.addRunArtifact(standalone_restore_tests);
     run_standalone_restore_tests.addArgs(&.{ "--suite-filter", "standalone shared" });
@@ -6064,6 +7118,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"local transaction recovery"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const completion_recovery_maintenance_tests = b.addTest(.{
+        .root_module = server_db_test_mod,
+        .filters = &.{ "transaction recovery completion", "transaction recovery never presumes abort", "transaction recovery delegates stale coordinator", "replicated recovery is coordinator-owned" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("completion-recovery-maintenance-test", "Verify retained completion scheduling and preserve legacy maintenance").dependOn(&addFilteredTestRunArtifact(b, completion_recovery_maintenance_tests).step);
     b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
     const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range.", "storage.server_group_metadata." };
     const server_db_tests = b.addTest(.{
@@ -6264,8 +7324,55 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_docstore_unit_tests = addCuratedTestRunArtifact(b, docstore_unit_tests, &.{ "storage.docstore.", "storage.transactions." });
 
+    const source_plan_native_tests = b.addTest(.{
+        .root_module = docstore_test_mod,
+        .filters = &.{"docstore source artifact"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_source_plan_native_tests = addFilteredTestRunArtifact(b, source_plan_native_tests);
+    b.step("source-plan-native-storage-test", "Verify native artifact abort, reopen, persistent fences and reclamation").dependOn(&run_source_plan_native_tests.step);
+
+    const committed_history_tests = b.addTest(.{
+        .root_module = docstore_test_mod,
+        .filters = &.{ "docstore committed history", "committed history transaction reservations", "committed history completion admission", "transaction source purpose", "history decision read" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_committed_history_tests = addFilteredTestRunArtifact(b, committed_history_tests);
+    const committed_frame_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/committed_frame.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_committed_frame_tests = b.addRunArtifact(committed_frame_tests);
+    const source_admission_codec_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_admission.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_source_admission_codec_tests = b.addRunArtifact(source_admission_codec_tests);
+    b.step("source-admission-codec-test", "Verify bounded durable source receipts and pending replay fencing").dependOn(&run_source_admission_codec_tests.step);
+    unit_test_step.dependOn(&run_source_admission_codec_tests.step);
+    unit_test_step.dependOn(&run_source_effects_tests.step);
+    unit_test_step.dependOn(&run_source_control_tests.step);
+    unit_test_step.dependOn(&run_source_delivery_tests.step);
+    unit_test_step.dependOn(&run_source_control_storage_tests.step);
+    unit_test_step.dependOn(&run_source_control_service_tests.step);
+    const committed_history_step = b.step("docstore-history-test", "Verify atomic committed before/after images, prepared credits and retention");
+    committed_history_step.dependOn(&run_committed_history_tests.step);
+    committed_history_step.dependOn(&run_committed_frame_tests.step);
+    unit_test_step.dependOn(&run_committed_history_tests.step);
+    unit_test_step.dependOn(&run_committed_frame_tests.step);
+
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
+    const row_heap_tests = b.addTest(.{
+        .root_module = docstore_test_mod,
+        .filters = &.{"row heap"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const row_heap_run = addCuratedTestRunArtifact(b, row_heap_tests, &.{"row heap"});
+    row_heap_run.addArg("--require-no-skips");
+    b.step("docstore-row-heap-test", "Verify physical row placement, pinned reads, collection and cold batch amplification").dependOn(&row_heap_run.step);
     const retained_effects_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "storage.docstore.", "storage.transactions." },
@@ -6280,6 +7387,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-transaction-reservations-test", "Run native transaction prepare, reserved retention and recovery regressions")
         .dependOn(&addFilteredTestRunArtifact(b, retained_transaction_tests).step);
+    const transaction_debt_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "transaction debt", "postings run compaction", "spill sort incremental" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const transaction_debt_run = addFilteredTestRunArtifact(b, transaction_debt_tests);
+    transaction_debt_run.addArg("--require-no-skips");
+    b.step("docstore-transaction-debt-test", "Verify epoch-bound atomic transaction debt, bounded legacy reconciliation and invalidation GC")
+        .dependOn(&transaction_debt_run.step);
 
     const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     antfly_imports.configureRuntimeContracts(vector_payload_bench_mod);
@@ -6606,6 +7722,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const graph_admission_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = selectTestFilters(b, &.{
+            "prepared pattern filters",
             "graph legacy ordinal batches bound resolver calls and preserve membership",
             "graph predicate cache clones outside locks and pins evicted membership",
             "graph predicate cache shares process admission across pinned generations and indexes",
@@ -6652,6 +7769,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("local-query-abi-test", "Validate local-query capability contracts under their owning module")
         .dependOn(&run_local_query_contract_tests.step);
     unit_test_step.dependOn(&run_local_query_contract_tests.step);
+
+    const kernel_owner_abi_tests = b.addTest(.{
+        .name = "storage-kernel-owner-abi-tests",
+        .root_module = antfly_imports.storage_boundary.owner,
+    });
+    const run_kernel_owner_abi_tests = addFilteredTestRunArtifact(b, kernel_owner_abi_tests);
+    b.step("storage-kernel-owner-abi-test", "Validate wire ordinals through the storage owner ABI module")
+        .dependOn(&run_kernel_owner_abi_tests.step);
+    unit_test_step.dependOn(&run_kernel_owner_abi_tests.step);
 
     const opaque_read_session_step = b.step("opaque-read-session-test", "Run source and independently compiled statement and read-session lifetime regressions");
     if (b.top_level_steps.get("opaque-read-session-abi-integration-test")) |integration|
@@ -7069,6 +8195,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db managed full text admission replays transitive artifact producers",
         "db full text repair page replay is idempotent without compaction",
         "db algebraic bulk ingest survives reopen with durable lsm primary backend",
+        "db algebraic relational replay materializes typed rows and preserves document replay across cold owners",
         "db managed algebraic admission builds and reopens an isolated generation",
         "db algebraic generation build yields and resumes from its durable source cursor",
         "db graph index reloads on reopen for neighbor queries with durable lsm primary backend",
@@ -7130,6 +8257,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")
         .dependOn(&addFilteredTestRunArtifact(b, lite_merge_publication_runtime_tests).step);
 
+    const sql_ordered_lock_apply_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "SQL ordered lock admission yields without holding snapshot or writer ownership", "storage.db snapshot admission nonblocking mutation yields to capture" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_ordered_lock_apply_run = addFilteredTestRunArtifact(b, sql_ordered_lock_apply_tests);
+    sql_ordered_lock_apply_run.addArg("--require-no-skips");
+    sql_ordered_lock_apply_run.addArg("--timeout-ms=30000");
+    b.step("antfly-sql-lock-apply-test", "Verify ordered lock admission never waits on native owner fences")
+        .dependOn(&sql_ordered_lock_apply_run.step);
+
     const bounded_read_integration_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{
@@ -7142,6 +8280,45 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("bounded-read-integration-test", "Verify scoped row reads and bounded scratch through relational scans")
         .dependOn(&addFilteredTestRunArtifact(b, bounded_read_integration_tests).step);
+
+    const relational_read_layout_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"relational rows snapshot native pages preserve logical slots across historical layouts"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const relational_read_layout_run = addFilteredTestRunArtifact(b, relational_read_layout_tests);
+    relational_read_layout_run.addArg("--require-no-skips");
+    b.step("antfly-relational-read-layout-test", "Verify owned native scan pages across mixed physical schema versions")
+        .dependOn(&relational_read_layout_run.step);
+
+    const deferred_check_validation_tests = b.addTest(.{
+        .root_module = parser_source,
+        .filters = &.{"relational index system NOT VALID CHECK enforces writes without historical coverage"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const deferred_check_validation_run = addFilteredTestRunArtifact(b, deferred_check_validation_tests);
+    deferred_check_validation_run.addArg("--require-no-skips");
+    b.step("antfly-relational-deferred-check-test", "Verify independent CHECK write enforcement, historical validity, and reader capabilities")
+        .dependOn(&deferred_check_validation_run.step);
+    const deferred_primary_tests = b.addTest(.{
+        .root_module = parser_source,
+        .filters = &.{ "relational primary keys retain deferred enforcement timing", "relational declarations index owners cannot be primary or deferred" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const deferred_primary_run = addFilteredTestRunArtifact(b, deferred_primary_tests);
+    deferred_primary_run.addArg("--require-no-skips");
+    b.step("antfly-relational-deferred-primary-test", "Verify deferred primary key declarations and reader capabilities")
+        .dependOn(&deferred_primary_run.step);
+
+    const relational_restore_replay_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "relational integrity scoped standby historical CHECK replay preserves admission and cold images", "relational index system schema reader requirements cover every durable expression gate" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const relational_restore_replay_run = addFilteredTestRunArtifact(b, relational_restore_replay_tests);
+    relational_restore_replay_run.addArg("--require-no-skips");
+    b.step("antfly-relational-restore-replay-test", "Verify historical CHECK import replay, strict admission, exact timestamps and cold recovery")
+        .dependOn(&relational_restore_replay_run.step);
 
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
@@ -7191,6 +8368,113 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-protected-backfill-test", "Verify protected model migration batching without model inference")
         .dependOn(&addFilteredTestRunArtifact(b, protected_backfill_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    db_test_step.dependOn(&run_kernel_owner_abi_tests.step);
+    const index_publication_progress_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/relational_index_publication_progress_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_index_publication_progress_tests = b.addRunArtifact(index_publication_progress_tests);
+    b.step("relational-index-publication-progress-test", "Run bounded index publication, cancellation and receipt CAS contracts")
+        .dependOn(&run_index_publication_progress_tests.step);
+    db_test_step.dependOn(&run_index_publication_progress_tests.step);
+    unit_test_step.dependOn(&run_index_publication_progress_tests.step);
+    const native_index_candidate_mod = makeLmdbModule(b, "pkg/antfly-embedded/src/relational_index_candidate_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    antfly_imports.configureEmbedded(b, native_index_candidate_mod, true);
+    antfly_imports.storage_boundary.configureSources(native_index_candidate_mod, false, false);
+    const native_index_candidate_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{ "relational index candidate", "relational index private addition" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const native_index_candidate_run = addFilteredTestRunArtifact(b, native_index_candidate_tests);
+    relational_index_page_step.dependOn(&native_index_candidate_run.step);
+    b.step("relational-index-candidate-test", "Verify native private UNIQUE candidate compilation without server dependencies")
+        .dependOn(&native_index_candidate_run.step);
+    const private_claim_transfer_tests = b.addTest(.{
+        .root_module = restore_owner_test_mod,
+        .filters = &.{ "relational integrity transfer validates borrowed action jobs", "relational integrity topology handoff transfers routed companions" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const private_claim_transfer_step = b.step("antfly-private-claim-transfer-test", "Verify private claim ownership, borrowed companions and routed handoff");
+    private_claim_transfer_step.dependOn(&native_index_candidate_run.step);
+    private_claim_transfer_step.dependOn(&addFilteredTestRunArtifact(b, private_claim_transfer_tests).step);
+    db_test_step.dependOn(&native_index_candidate_run.step);
+    unit_test_step.dependOn(&native_index_candidate_run.step);
+    const fk_validation_projection_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{"foreign key validation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const fk_validation_projection_run = addFilteredTestRunArtifact(b, fk_validation_projection_tests);
+    fk_validation_projection_run.addArg("--require-no-skips");
+    db_test_step.dependOn(&fk_validation_projection_run.step);
+    unit_test_step.dependOn(&fk_validation_projection_run.step);
+    b.step("relational-fk-validation-test", "Verify exact FK validity candidates and typed source reference-set witnesses")
+        .dependOn(&fk_validation_projection_run.step);
+    const historical_fk_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{"NOT VALID"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const historical_fk_run = addFilteredTestRunArtifact(b, historical_fk_tests);
+    historical_fk_run.addArg("--require-no-skips");
+    b.step("relational-fk-not-valid-test", "Verify historical orphan coverage, claim guards and unchanged-key enforcement")
+        .dependOn(&historical_fk_run.step);
+    const native_index_catalog_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{ "relational index catalog", "relational index private addition" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("relational-index-catalog-test", "Verify native ordered catalog allocation, recovery and private reservation contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, native_index_catalog_tests).step);
+    const sql_revision_compatibility_step = b.step("sql-revision-compatibility-test", "Verify SQL controls, domain provenance and transaction codecs preserve document revisions");
+    const sql_revision_compatibility_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "time series record codec", "time series intent document scheme", "document revision admission", "document revision reservation stages the watermark and row custody atomically", "document revision reservation adoption binds the header and exact native decision together", "document revision reservation aborts before BEGIN without leaking the reserved row lock" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_revision_compatibility_run = addFilteredTestRunArtifact(b, sql_revision_compatibility_tests);
+    sql_revision_compatibility_run.addArg("--require-no-skips");
+    sql_revision_compatibility_step.dependOn(&sql_revision_compatibility_run.step);
+    const sql_revision_codec_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/batch_codec_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configureEmbedded(b, sql_revision_codec_mod, true);
+    antfly_imports.storage_boundary.configureSources(sql_revision_codec_mod, false, false);
+    const sql_revision_codec_filters: []const []const u8 = &.{ "document revision reservation", "public batch rejects every privileged command field", "row policy publication Raft codec", "SQL domain internal preparation handoffs", "time series document revision wire", "time series merge revision floor", "time series staged timestamp wire", "range tracking activation codec", "ordered artifact inventory private batch roundtrip", "artifact publication upload control", "internal batch topology control", "SQL relation lifetime frozen native lock controls" };
+    const sql_revision_codec_tests = b.addTest(.{
+        .root_module = sql_revision_codec_mod,
+        .filters = sql_revision_codec_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_revision_codec_run = addFilteredTestRunArtifact(b, sql_revision_codec_tests);
+    sql_revision_codec_run.addArg("--require-no-skips");
+    const sql_revision_codec_inventory = b.addRunArtifact(sql_revision_codec_tests);
+    sql_revision_codec_inventory.addArg("--list-tests");
+    const sql_revision_codec_audit = b.addSystemCommand(&.{ "python3", "tools/audit_test_selection.py" });
+    for (sql_revision_codec_filters) |filter| sql_revision_codec_audit.addArgs(&.{ "--filter", filter });
+    sql_revision_codec_audit.addArg("--inventory");
+    sql_revision_codec_audit.addFileArg2(sql_revision_codec_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_revision_codec_run.step.dependOn(&sql_revision_codec_audit.step);
+    sql_revision_compatibility_step.dependOn(&sql_revision_codec_run.step);
+    const artifact_policy_storage_filters = &.{
+        "db execution policy",                                                                "db document extraction manifest inspection and reprocess API",
+        "execution budgets preserve extraction fingerprints",                                 "execution policy preserves ordered semantic identity",
+        "ordered artifact inventory producer definition identity binds every provider field", "ordered artifact inventory direct producers carry unchanged input across unrelated row changes",
+    };
+    const artifact_policy_storage_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = artifact_policy_storage_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-execution-policy-storage-test", "Verify operational policy persistence, immutable authority and incomplete-only retry")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_policy_storage_tests, artifact_policy_storage_filters).step);
+
     const inference_evaluation_tests = b.addTest(.{
         .name = "inference-evaluation-storage-tests",
         .root_module = db_test_mod,
@@ -7281,7 +8565,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-graph-replacement-producer-test", "Verify replacement producer replay, bounded pages and upstream dependencies")
         .dependOn(&addFilteredTestRunArtifact(b, graph_producer_tests).step);
-
     const v02_upgrade_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },
@@ -7299,7 +8582,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "storage.db.relational_index_catalog.", "storage.db.relational_index_gc.", "storage.db.relational_index_jobs.", "storage.db.relational_index_records." },
+        .filters = &.{ "storage.db.relational.indexes.catalog.", "storage.db.relational.indexes.gc.", "storage.db.relational.indexes.jobs.", "storage.db.relational.indexes.records." },
     });
     const relational_index_lifecycle_step = b.step("antfly-relational-index-lifecycle-test", "Run relational index dependency and retirement admission tests");
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
@@ -7595,6 +8878,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_restore_managed_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{
+            "native backup origin",
+            "db native snapshot exports self-contained generation",
             "db restore snapshot replays managed chunked dense embeddings",
             "native restore backend configuration is resolved exactly once",
             "native restore filesystem publication rejects non-publishable storage capabilities",
@@ -7875,7 +9160,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.online_graph_receiver_test.",
             "storage.db.online_vector_artifacts.",
             "storage.db.online_vector_snapshot.",
-            "storage.db.relational_integrity_handoff.",
+            "storage.db.relational.",
             "storage.db.source_artifact_batch.",
             "storage.db.source_proof_batch.",
             "storage.db.backfill_state.",
@@ -7952,15 +9237,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.online_merge_receiver.",
             "storage.db.online_merge_snapshot.",
             "storage.db.online_source.",
-            "storage.db.relational_expression_system_test.",
-            "storage.db.relational_index_cover_system_test.",
-            "storage.db.relational_index_maintenance_contract.",
-            "storage.db.relational_predicate_implication.",
-            "storage.db.relational_rewrite_staging_test.",
-            "storage.db.relational_rewrite_program.",
-            "storage.db.relational_row_transform_test.",
-            "storage.db.relational_row_transform.",
-            "storage.db.relational_index_cover.",
+            "storage.db.native_backup_origin.",
             "storage.db.source_pin.",
             "storage.db.source_pin_gc.",
             "storage.db.source_publication_job.",
@@ -7978,29 +9255,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.publication.",
             "storage.db.query_metrics.",
             "storage.db.range_state.",
-            "storage.db.relational_columns.",
-            "storage.db.relational_index_keys.",
-            "storage.db.relational_index_plan.",
-            "storage.db.relational_index_catalog.",
-            "storage.db.relational_index_records.",
-            "storage.db.relational_index_jobs.",
-            "storage.db.relational_index_maintenance_sweep.",
-            "storage.db.relational_index_system_test.",
-            "storage.db.relational_constraint_jobs.",
-            "storage.db.relational_integrity.",
-            "storage.db.relational_integrity_json.",
-            "storage.db.relational_integrity_contract.",
-            "storage.db.relational_integrity_topology_contract.",
-            "storage.db.relational_transition_contract.",
-            "storage.db.relational_integrity_catalog.",
-            "storage.db.relational_integrity_integration_test.",
-            "storage.db.relational_integrity_range.",
-            "storage.db.relational_integrity_activation.",
-            "storage.db.relational_integrity_retirement.",
-            "storage.db.relational_integrity_generation_retirement.",
             "storage.db.retirement_set_summary.",
-            "storage.db.relational_integrity_generation_admission.",
-            "storage.db.relational_initial_child_publication.",
             "storage.db.row_policy_gate.",
             "storage.db.authority_invalidation.",
             "storage.db.row_policy_bundle.",
@@ -8008,11 +9263,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.restore_staging.",
             "storage.db.restore_staging_contract.",
             "storage.db.restore_generation_admissions.",
-            "storage.db.relational_integrity_topology.",
-            "storage.db.relational_index_gc.",
-            "storage.db.relational_row_cursor.",
-            "storage.db.relational_predicate.",
-            "storage.db.relational_store.",
             "storage.db.schema_cache_admission.",
             "storage.db.schema_registry.",
             "storage.db.table_catalog.",
@@ -8021,6 +9271,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.repair_failure.",
             "storage.db.root_identity.",
             "storage.db.root_signing_identity.",
+            "storage.db.foreign_key_validation.",
+            "storage.db.graph_statement_snapshot_test.",
+            "storage.db.logical_replication_outbox.",
+            "storage.db.logical_replication_outbox_contract.",
+            "storage.db.logical_replication_prepare_frame.",
+            "storage.db.logical_replication_request.",
+            "storage.db.logical_replication_terminal_frame.",
+            "storage.db.mutation_coalescing.",
+            "storage.db.native_empty_generation.",
+            "storage.db.native_empty_image_attempt.",
+            "storage.db.native_empty_origin.",
+            "storage.db.prepared_graph_effects.",
+            "storage.db.raw_graph_read_lease.",
+            "storage.db.replication_source_apply_store.",
+            "storage.db.replication_source_commit_participant.",
+            "storage.db.row_policy_schema_pair_test.",
+            "storage.db.temporal_integrity_contract.",
+            "storage.db.text_analysis_config.",
             "storage.db.snapshot_admission.",
             "storage.db.template_remote_stub.",
             "storage.db.template_stub.",
@@ -8044,6 +9312,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
         &.{
             "storage.backend_adapter.",
+            "storage.transaction_cohort_proof.",
+            "storage.document_revision_control.",
+            "storage.document_revision_reservation.",
+            "storage.graph_read_snapshot.",
+            "storage.pessimistic_lock.",
+            "storage.publication_prepare_sink.",
+            "storage.raw_graph_read_lease.",
+            "storage.read_consistency.",
+            "storage.row_heap.",
+            "storage.row_heap_benchmark.",
+            "storage.row_heap_restore_test.",
+            "storage.row_heap_scope.",
+            "storage.sql_population_cohort_test.",
+            "storage.transaction_decision_owner.",
+            "storage.transaction_debt.",
             "storage.artifact_payload.",
             "storage.artifact_footprint.",
             "storage.artifact_input_capture.",
@@ -8068,6 +9351,30 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.prepared_score_request.",
             "storage.document_mutation_revision.",
             "storage.source_authority.",
+            "storage.committed_frame.",
+            "storage.committed_history.",
+            "storage.history_admission_wire.",
+            "storage.history_decision_wire.",
+            "storage.history_grant_wire.",
+            "storage.history_ordered.",
+            "storage.history_page_wire.",
+            "storage.history_publication_wire.",
+            "storage.history_resolution_wire.",
+            "storage.source_admission.",
+            "storage.source_checkpoint.",
+            "storage.source_checkpoint_read.",
+            "storage.source_effects.",
+            "storage.source_legacy_terminal_ordered.",
+            "storage.source_plan_storage.",
+            "storage.source_plan_wire.",
+            "storage.source_producer_policy.",
+            "storage.source_scope.",
+            "storage.source_scope_control.",
+            "storage.source_scope_ordered.",
+            "storage.source_scope_rebind_test.",
+            "storage.source_scope_retirement.",
+            "storage.source_transaction.",
+            "storage.transaction_completion.",
             "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",
@@ -8172,6 +9479,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run the storage portion of the default antfly-unit-test target in bounded codegen shards",
     );
     unit_storage_sharded_test_step.dependOn(&run_unit_server_db_tests.step);
+    unit_storage_sharded_test_step.dependOn(&run_kernel_owner_abi_tests.step);
     // Ordinals are a separately configured module; importing their sources in
     // the storage manifest would give each file two module owners.
     unit_storage_sharded_test_step.dependOn(&b.top_level_steps.get("storage-ordinal-core-test").?.step);
@@ -8184,6 +9492,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_storage_shard_audit.addDirectoryArg(b.path("pkg/antfly-embedded/src/storage"));
     unit_storage_shard_audit.addArg("--local-catalog");
     unit_storage_shard_audit.addFileArg(b.path("pkg/antfly-embedded/src/source_catalog.zig"));
+    unit_storage_shard_audit.addArgs(&.{ "--local-module", "read_session_backend" });
+    unit_storage_shard_audit.addFileArg(b.path(@import("../../../build_support/embedded/source_owner.zig").read_session_source_path));
     unit_storage_shard_audit.addArg("--manifest");
     unit_storage_shard_audit.addFileArg2(b.path("pkg/antfly/src/storage/test_manifest.zig"), .{ .make_absolute = true });
     for (unit_storage_shard_filters) |shard_filters| {
@@ -8195,7 +9505,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
-    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig", "artifact_upload_recovery.zig", "server_coordinated_ttl.zig", "server_query_visibility.zig", "server_document_child_range.zig", "server_group_metadata.zig" }) |source| {
+    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig", "artifact_upload_recovery.zig", "server_coordinated_ttl.zig", "server_query_visibility.zig", "server_document_child_range.zig", "server_group_metadata.zig", "kernel_owner_trigger_test.zig", "metadata_raft_apply_client.zig" }) |source| {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
@@ -8204,7 +9514,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // wiring the storage test roots do not (both benchmarks open their DB
     // through the real capi.openLiteHandleWithRuntime seam, same reason as
     // the crash sweep).
-    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "lite/crash_consistency_capi_test.zig", "lite/write_amplification_bench_test.zig", "lite/write_amplification_cpu_bench_test.zig", "local_query_abi.zig" }) |source| {
+    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig", "lite/crash_consistency_capi_test.zig", "lite/write_amplification_bench_test.zig", "lite/write_amplification_cpu_bench_test.zig", "local_query_abi.zig", "kernel_owner_abi.zig" }) |source| {
         unit_storage_shard_audit.addArg("--local-dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly-embedded/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
@@ -8213,6 +9523,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     for (unit_storage_db_core_lane_filters) |lane_filter| {
         unit_storage_shard_audit.addArgs(&.{ "--runtime-partition-filter", lane_filter });
     }
+    const uuid_default_tests = b.addTest(.{
+        .name = "uuid-default-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{ "relational index system UUID defaults survive cold reopen and both portable restore paths without replacing historical IDs", "SQL UUID defaults backfill once through snapshot tail replay corruption cancellation and cold resume" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    uuid_default_tests.step.dependOn(&unit_storage_shard_audit.step);
+    b.step("antfly-storage-uuid-default-test", "Run durable UUID defaults, portable restore and online backfill fault qualification")
+        .dependOn(&addFilteredTestRunArtifact(b, uuid_default_tests).step);
     const unit_storage_shard_audit_step = b.step(
         "unit-storage-test-audit",
         "Verify every test-bearing storage module belongs to a bounded codegen shard",
@@ -8758,6 +10078,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Runtime exclusions above give explicit API filters first ownership,
     // storage second ownership, and module-sharded metadata third ownership.
     dependOnAll(unit_test_step, &.{
+        &run_source_transaction_tests.step,
         &run_common_http_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,
@@ -8809,7 +10130,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // onward) shares one clone of antfly_test_mod, full_cluster_vopr_consumer_mod;
         // registering any one of its compiles here links the storage-kernel,
         // enrichment-compute, and inference provider archives onto that whole family.
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, standalone_restore_tests, system_catalog_standalone_tests, vopr_cli, vopr_runtime_regression_tests } }) catch @panic("OOM"),
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, native_schema_submission_tests.executable, standalone_restore_tests, system_catalog_standalone_tests, vopr_cli, vopr_runtime_regression_tests } }) catch @panic("OOM"),
     };
 }
 

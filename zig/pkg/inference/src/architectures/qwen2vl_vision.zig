@@ -36,6 +36,57 @@ pub fn encodePreparedImageTokens(
     return cb.toFloat32(projected, allocator);
 }
 
+const ImageGeometry = struct {
+    embed_dim: usize,
+    num_layers: usize,
+    num_heads: usize,
+    patch_size: usize,
+    temporal_patch_size: usize,
+    merge_size: usize,
+    seq_len: usize,
+    merged_tokens: usize,
+    head_dim: usize,
+    output_dim: usize,
+    fn init(cfg: gpt_mod.Config, prep_cfg: qwen2vl.PreprocessorConfig, prepared: qwen2vl.PreparedImage) !ImageGeometry {
+        const embed_dim: usize = if (cfg.vision_embed_dim > 0) cfg.vision_embed_dim else return error.InvalidMultimodalConfig;
+        const num_layers: usize = if (cfg.vision_num_hidden_layers > 0) cfg.vision_num_hidden_layers else return error.InvalidMultimodalConfig;
+        const num_heads: usize = if (cfg.vision_num_attention_heads > 0) cfg.vision_num_attention_heads else return error.InvalidMultimodalConfig;
+        const patch_size: usize = if (cfg.vision_patch_size > 0) cfg.vision_patch_size else prep_cfg.patch_size;
+        const temporal_patch_size: usize = if (cfg.vision_temporal_patch_size > 0) cfg.vision_temporal_patch_size else prep_cfg.temporal_patch_size;
+        const merge_size: usize = if (cfg.vision_spatial_merge_size > 0) cfg.vision_spatial_merge_size else prep_cfg.merge_size;
+        if (merge_size == 0 or patch_size == 0 or temporal_patch_size == 0) return error.InvalidMultimodalConfig;
+        var seq_len: usize = 1;
+        for (prepared.image_grid_thw) |dimension| {
+            const extent = std.math.cast(usize, dimension) orelse return error.InvalidPatchMergeFactor;
+            if (extent == 0) return error.InvalidPatchMergeFactor;
+            seq_len = try std.math.mul(usize, seq_len, extent);
+        }
+        const merge_tokens = try std.math.mul(usize, merge_size, merge_size);
+        if (seq_len % merge_tokens != 0) return error.InvalidPatchMergeFactor;
+        const merged_tokens = seq_len / merge_tokens;
+        if (merged_tokens != prepared.image_token_count) return error.ImageTokenLengthMismatch;
+        const head_dim = embed_dim / num_heads;
+        if (head_dim == 0 or head_dim % 2 != 0) return error.InvalidMultimodalConfig;
+        const output_dim: usize = if (cfg.hidden_size > 0) cfg.hidden_size else if (cfg.vision_hidden_size > 0) cfg.vision_hidden_size else return error.InvalidMultimodalConfig;
+        _ = try std.math.mul(usize, try std.math.mul(usize, merged_tokens, output_dim), @sizeOf(f32));
+        return .{ .embed_dim = embed_dim, .num_layers = num_layers, .num_heads = num_heads, .patch_size = patch_size, .temporal_patch_size = temporal_patch_size, .merge_size = merge_size, .seq_len = seq_len, .merged_tokens = merged_tokens, .head_dim = head_dim, .output_dim = output_dim };
+    }
+};
+
+/// Canonical ordinary producer fact, not payload or capture authority. The
+/// original final linear returns one owned dense F32 [rows,width] allocation;
+/// existing borrowed row-copy custody permits its immediate caller retirement.
+pub const OutputLayout = struct { rows: usize, width: usize };
+pub fn streamingOutputLayout(cb: *const ComputeBackend, cfg: gpt_mod.Config, prep_cfg: qwen2vl.PreprocessorConfig, prepared: qwen2vl.PreparedImage) !?OutputLayout {
+    const available = cb.vtable == &@import("../ops/native_compute.zig").vtable_impl or
+        (if (comptime @import("build_options").enable_metal) try @import("../ops/metal_compute.zig").MetalCompute.ordinaryF32RowProducerAvailable(cb) else false) or
+        (if (comptime @import("build_options").enable_cuda) try @import("../ops/cuda/cuda_compute.zig").CudaCompute.ordinaryF32RowProducerAvailable(cb) else false);
+    if (!available) return null;
+    const geometry = try ImageGeometry.init(cfg, prep_cfg, prepared);
+    if (geometry.merged_tokens > std.math.maxInt(i32) or geometry.output_dim > std.math.maxInt(i32)) return error.InvalidShape;
+    return .{ .rows = geometry.merged_tokens, .width = geometry.output_dim };
+}
+
 pub fn encodePreparedImageTokensTensor(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -52,22 +103,15 @@ pub fn encodePreparedImageTokensTensor(
             .{ prepared.resized_width, prepared.resized_height, prepared.image_grid_thw[0], prepared.image_grid_thw[1], prepared.image_grid_thw[2] },
         );
     }
-    const embed_dim: usize = if (cfg.vision_embed_dim > 0) cfg.vision_embed_dim else return error.InvalidMultimodalConfig;
-    const num_layers: usize = if (cfg.vision_num_hidden_layers > 0) cfg.vision_num_hidden_layers else return error.InvalidMultimodalConfig;
-    const num_heads: usize = if (cfg.vision_num_attention_heads > 0) cfg.vision_num_attention_heads else return error.InvalidMultimodalConfig;
-    const patch_size: usize = if (cfg.vision_patch_size > 0) cfg.vision_patch_size else prep_cfg.patch_size;
-    const temporal_patch_size: usize = if (cfg.vision_temporal_patch_size > 0) cfg.vision_temporal_patch_size else prep_cfg.temporal_patch_size;
-    const merge_size: usize = if (cfg.vision_spatial_merge_size > 0) cfg.vision_spatial_merge_size else prep_cfg.merge_size;
-    if (merge_size == 0 or num_heads == 0 or patch_size == 0 or temporal_patch_size == 0) return error.InvalidMultimodalConfig;
-
-    const patch_grid_t: usize = @intCast(prepared.image_grid_thw[0]);
-    const patch_grid_h: usize = @intCast(prepared.image_grid_thw[1]);
-    const patch_grid_w: usize = @intCast(prepared.image_grid_thw[2]);
-    const seq_len = patch_grid_t * patch_grid_h * patch_grid_w;
-    const merge_tokens = merge_size * merge_size;
-    if (merge_tokens == 0 or (seq_len % merge_tokens) != 0) return error.InvalidPatchMergeFactor;
-    const merged_tokens = seq_len / merge_tokens;
-    if (merged_tokens != prepared.image_token_count) return error.ImageTokenLengthMismatch;
+    const geometry = try ImageGeometry.init(cfg, prep_cfg, prepared);
+    const embed_dim = geometry.embed_dim;
+    const num_layers = geometry.num_layers;
+    const num_heads = geometry.num_heads;
+    const patch_size = geometry.patch_size;
+    const temporal_patch_size = geometry.temporal_patch_size;
+    const merge_size = geometry.merge_size;
+    const seq_len = geometry.seq_len;
+    const merged_tokens = geometry.merged_tokens;
 
     const patch_rows = try buildPatchRows(allocator, prepared, patch_size, temporal_patch_size, merge_size);
     defer allocator.free(patch_rows);
@@ -87,8 +131,7 @@ pub fn encodePreparedImageTokensTensor(
         stage_start_ns = try nowNs();
     }
 
-    const head_dim = embed_dim / num_heads;
-    if (head_dim == 0 or (head_dim % 2) != 0) return error.InvalidMultimodalConfig;
+    const head_dim = geometry.head_dim;
     const rotary = try buildVisionRotaryPosEmb(allocator, prepared.image_grid_thw, merge_size, head_dim);
     defer allocator.free(rotary);
     if (trace_enabled) {
@@ -290,6 +333,8 @@ fn encoderBlock(
     const attn_out = try selfAttention(cb, allocator, normed1, seq_len, embed_dim, num_heads, rotary, layer, &buf);
     defer cb.free(attn_out);
     const res1 = try cb.add(input, attn_out);
+    var res1_live = true;
+    errdefer if (res1_live) cb.free(res1);
     if (trace_enabled) {
         std.debug.print("vision_trace stage=encoder_block.attn layer={d} elapsed_ms={d}\n", .{ layer, nsToMs(try elapsedSince(stage_start_ns)) });
         stage_start_ns = try nowNs();
@@ -331,6 +376,7 @@ fn encoderBlock(
 
     const res2 = try cb.add(res1, fc2);
     cb.free(res1);
+    res1_live = false;
     if (trace_enabled) {
         std.debug.print("vision_trace stage=encoder_block.residual layer={d} elapsed_ms={d}\n", .{ layer, nsToMs(try elapsedSince(stage_start_ns)) });
     }
@@ -630,10 +676,6 @@ fn getVisionWeightFmt2(cb: *const ComputeBackend, buf: *[160]u8, comptime primar
 
 fn quickGelu(x: f32) f32 {
     return x / (1.0 + @exp(-1.702 * x));
-}
-
-fn geluApprox(x: f32) f32 {
-    return 0.5 * x * (1.0 + std.math.tanh(@sqrt(2.0 / std.math.pi) * (x + 0.044715 * x * x * x)));
 }
 
 fn dot(a: []const f32, b: []const f32) f32 {
