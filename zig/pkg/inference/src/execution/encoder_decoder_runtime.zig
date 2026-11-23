@@ -116,7 +116,7 @@ pub fn encodeForIncrementalWithPermit(allocator: std.mem.Allocator, encoder: bac
 pub const EncoderIntent = enum { resident, incremental, vocabulary_row };
 
 const EncoderRoute = struct {
-    dispatched: bool,
+    dispatcher: ?@import("tensor_dispatch.zig").Dispatch = null,
     incremental: ?Incremental.Receiver = null,
     placement: PlacementReason,
 
@@ -125,20 +125,21 @@ const EncoderRoute = struct {
     }
 };
 fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, intent: EncoderIntent) EncoderRoute {
-    const dispatched = if (comptime @TypeOf(dispatch) == @TypeOf(null)) false else if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) dispatch != null else true;
+    const stages = @import("tensor_dispatch.zig");
     if (intent == .vocabulary_row and outputVocabulary(decoder) == null) {
-        return .{ .dispatched = dispatched, .placement = .unknown_decoder_vocabulary };
+        return .{ .placement = .unknown_decoder_vocabulary };
     }
-    if (!supportsResidentDispatch(dispatch) or (dispatched and @import("tensor_dispatch.zig").stageDispatcher(dispatch) == null)) {
-        return .{ .dispatched = dispatched, .placement = .dispatcher_host_only };
+    const dispatcher = stages.stageDispatcher(dispatch);
+    if (stages.hasDispatcher(dispatch) and (dispatcher == null or !dispatcher.?.supportsResident())) {
+        return .{ .placement = .dispatcher_host_only };
     }
     if (intent == .incremental) {
         if (Incremental.qualify(encoder, decoder)) |receiver| {
-            return .{ .dispatched = dispatched, .incremental = receiver, .placement = .resident_incremental };
+            return .{ .dispatcher = dispatcher, .incremental = receiver, .placement = .resident_incremental };
         }
     }
     const placement = residentPairPlacement(encoder, decoder, control != null);
-    return .{ .dispatched = dispatched, .placement = placement };
+    return .{ .dispatcher = dispatcher, .placement = placement };
 }
 
 /// The owning task calls this before its model/provider lane. Qualification is
@@ -148,27 +149,26 @@ fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: 
 pub fn prepareEncoderPermit(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, intent: EncoderIntent, permit: *session_mod.RunPermit) !void {
     if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
     const selected = encoderRoute(encoder, decoder, dispatch, control, intent);
-    if (selected.isResident() and !selected.dispatched) try permit.prepareResidentOutputRetirement();
+    if (selected.isResident() and selected.dispatcher == null) try permit.prepareResidentOutputRetirement();
 }
 
 fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit, intent: EncoderIntent) !EncoderOutputs {
     if (supplied) |permit| if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
     const selected = encoderRoute(encoder, decoder, dispatch, control, intent);
     observePlacement(encoder, decoder, selected.placement);
-    const dispatched = selected.dispatched;
     const incremental = selected.incremental;
     if (selected.isResident()) {
         var own_permit: ?session_mod.RunPermit = null;
         defer if (own_permit) |*owned| owned.deinit();
-        const permit: ?*session_mod.RunPermit = if (dispatched) supplied else supplied orelse blk: {
+        const permit: ?*session_mod.RunPermit = if (selected.dispatcher != null) supplied else supplied orelse blk: {
             own_permit = try encoder.admitInputs(inputs, allocator, control);
             break :blk &own_permit.?;
         };
-        if (!dispatched) if (permit) |owner| {
+        if (selected.dispatcher == null) if (permit) |owner| {
             if (own_permit != null) try owner.prepareResidentOutputRetirement() else try owner.validateResidentOutputRetirement();
         };
-        var values = if (dispatched)
-            (try callResidentDispatch(dispatch, allocator, encoder, permit, inputs, control)) orelse return error.UnexpectedResidentStageDecline
+        var values = if (selected.dispatcher) |dispatcher|
+            (try dispatcher.runResident(allocator, encoder, permit, null, inputs, control)) orelse return error.UnexpectedResidentStageDecline
         else
             (try permit.?.runResidentWithControl(inputs, allocator, control)) orelse return error.UnexpectedResidentStageDecline;
         errdefer values.deinit();
@@ -197,26 +197,6 @@ noinline fn publishPlacement(publisher: *@import("diagnostics.zig").Diagnostics,
         .operation = .encoder,
         .stage_placement = .{ .source_backend = source, .destination_backend = destination, .reason = reason },
     });
-}
-
-/// A custom dispatcher without the typed capability chooses the existing
-/// host route before encoder work. Its public scheduling policy is never bypassed.
-fn supportsResidentDispatch(dispatch: anytype) bool {
-    const T = @TypeOf(dispatch);
-    if (comptime T == @TypeOf(null)) return true;
-    if (comptime @typeInfo(T) == .optional) return if (dispatch) |selected| supportsResidentDispatch(selected) else true;
-    const Receiver = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
-    if (comptime @hasDecl(Receiver, "supportsResident") and @hasDecl(Receiver, "runResident")) return dispatch.supportsResident();
-    return false;
-}
-
-fn callResidentDispatch(dispatch: anytype, allocator: std.mem.Allocator, encoder: backends.Session, permit: ?*session_mod.RunPermit, inputs: []const backends.Tensor, control: ?Control) !?session_mod.ResidentOutputs {
-    const T = @TypeOf(dispatch);
-    if (comptime T == @TypeOf(null)) return null;
-    if (comptime @typeInfo(T) == .optional) return if (dispatch) |selected| callResidentDispatch(selected, allocator, encoder, permit, inputs, control) else null;
-    const Receiver = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
-    if (comptime @hasDecl(Receiver, "runResident")) return dispatch.runResident(allocator, encoder, permit, null, inputs, control);
-    return error.UnsupportedResidentDispatch;
 }
 
 fn encodeHost(allocator: std.mem.Allocator, encoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit) !EncoderOutputs {
@@ -449,6 +429,30 @@ test "encoder decoder resident stages retain hidden state and materialize only t
         bad_table.inputInfo = Mismatched.inputInfo;
         bad_decoder.vtable = &bad_table;
         try std.testing.expectEqual(PlacementReason.unsupported_decoder_signature, residentPairPlacement(encoder, bad_decoder, true));
+        const Broker = struct {
+            calls: usize = 0,
+            encoder_calls: usize = 0,
+            fn resident(raw: *anyopaque, _: @import("tensor_dispatch.zig").Task, work: std.mem.Allocator, _: backends.Session, supplied: ?*session_mod.RunPermit, _: ?*std.atomic.Mutex, inputs: []const backends.Tensor, active: ?Control) !?session_mod.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.encoder_calls += 1;
+                const permit = supplied orelse return error.InvalidStagePermit;
+                try permit.prepareResidentOutputRetirement();
+                return permit.runResidentWithControl(inputs, work, active);
+            }
+            fn host(_: *anyopaque, _: @import("tensor_dispatch.zig").Task, _: std.mem.Allocator, _: backends.Session, _: ?*session_mod.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) ![]backends.Tensor {
+                return error.UnexpectedHostDecoder;
+            }
+            fn stage(raw: *anyopaque, _: @import("tensor_dispatch.zig").Task, work: std.mem.Allocator, target: backends.Session, bindings: []const session_mod.StageInput, active: ?Control) !session_mod.ResidentOutputs {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                for (bindings) |binding| if (binding == .resident) {
+                    return (try target.runStageInputsWithControl(bindings, work, active)) orelse error.UnexpectedResidentStageDecline;
+                };
+                return error.ExpectedResidentEncoder;
+            }
+        };
+        var broker = Broker{};
+        const dispatch = @import("tensor_dispatch.zig").Dispatch{ .ptr = &broker, .task = .generate, .run_stage_fn = Broker.stage, .run_resident_fn = Broker.resident, .run_fn = Broker.host };
         var encoded = blk: {
             var audit = audit_mod.Audit{ .forbid_activation_readbacks = true };
             try audit_mod.begin(&audit);
@@ -466,6 +470,16 @@ test "encoder decoder resident stages retain hidden state and materialize only t
             break :blk result;
         };
         defer encoded.deinit(a);
+        {
+            var permit = try encoder.admitInputs(&.{input}, a, null);
+            defer permit.deinit();
+            try prepareEncoderPermit(encoder, decoder, dispatch, control, .resident, &permit);
+            try std.testing.expect(permit.output_retirement_shell == null);
+            var scheduled = try encodeWithPermit(a, encoder, decoder, &.{input}, dispatch, control, &permit);
+            defer scheduled.deinit(a);
+            try std.testing.expect(scheduled == .resident);
+            try std.testing.expectEqual(@as(usize, 1), broker.encoder_calls);
+        }
         encoder.close();
         encoder_open = false;
         for (0..3) |_| {
@@ -478,22 +492,6 @@ test "encoder decoder resident stages retain hidden state and materialize only t
             try std.testing.expectEqual(@as(i32, 1), token);
             if (kind != .native) try std.testing.expectEqual(@as(u64, 4 * @sizeOf(f32)), audit.download_bytes);
         }
-        const Broker = struct {
-            calls: usize = 0,
-            fn host(_: *anyopaque, _: @import("tensor_dispatch.zig").Task, _: std.mem.Allocator, _: backends.Session, _: ?*session_mod.RunPermit, _: ?*std.atomic.Mutex, _: []const backends.Tensor, _: ?Control) ![]backends.Tensor {
-                return error.UnexpectedHostDecoder;
-            }
-            fn stage(raw: *anyopaque, _: @import("tensor_dispatch.zig").Task, work: std.mem.Allocator, target: backends.Session, bindings: []const session_mod.StageInput, active: ?Control) !session_mod.ResidentOutputs {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                self.calls += 1;
-                for (bindings) |binding| if (binding == .resident) {
-                    return (try target.runStageInputsWithControl(bindings, work, active)) orelse error.UnexpectedResidentStageDecline;
-                };
-                return error.ExpectedResidentEncoder;
-            }
-        };
-        var broker = Broker{};
-        const dispatch = @import("tensor_dispatch.zig").Dispatch{ .ptr = &broker, .task = .generate, .run_stage_fn = Broker.stage, .run_fn = Broker.host };
         var numerical = try @import("decoder_stage.zig").Decoder.initWithOptions(a, decoder, &encoded, 2, &.{ 1, 1 }, 4, control, .{ .allow_native = false });
         defer numerical.deinit();
         var row = try numerical.stepFullPrefix(&.{ 0, 1 }, dispatch);
