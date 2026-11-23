@@ -10947,6 +10947,14 @@ test "WS3 writer lane: a slow fsync forces concurrent writers to share groups" {
 // it continue -- a deterministic window to assert both are actually free,
 // instead of racing real fsync timing.
 test "WS3 writer lane: capi connection locks are free during the primary write's durability wait" {
+    try testWriterLaneDurabilityWait(false);
+}
+
+test "WS3 writer lane: queued sparse publication releases and resumes admission" {
+    try testWriterLaneDurabilityWait(true);
+}
+
+fn testWriterLaneDurabilityWait(indexed: bool) !void {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("ws3-writer-lane-lock-free-wait");
@@ -10958,6 +10966,12 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     const create_options: capi.OpenOptions = .{ .storage_kind = capi.storage_kind_lite };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &create_options, &handle));
     defer antfly_db_close(handle);
+
+    if (indexed) {
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
+            "{\"name\":\"vec\",\"kind\":\"sparse_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"external\\\":true}\"}",
+        )));
+    }
 
     const entry = HandleEntry.capture(handle).?;
     defer entry.release();
@@ -10979,8 +10993,10 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     const Probe = struct {
         released: std.Io.Event = .unset,
         proceed: std.Io.Event = .unset,
+        hook_seen: bool = false,
         fn notify(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.hook_seen = true;
             self.released.set(handleLockIo());
             self.proceed.waitUncancelable(handleLockIo());
         }
@@ -10991,16 +11007,21 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
 
     const Writer = struct {
         handle: ?*anyopaque,
+        probe: *Probe,
+        indexed: bool,
         code: capi.ErrorCode = .invalid_argument,
         fn run(self: *@This()) void {
-            var request_buffer: [128]u8 = undefined;
-            const request = std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k\":{{\"v\":\"probe\"}}}},\"sync_level\":\"write\"}}", .{}) catch unreachable;
+            defer self.probe.released.set(handleLockIo());
+            const request = if (self.indexed)
+                "{\"inserts\":{\"k\":{\"v\":\"probe\",\"_embeddings\":{\"vec\":{\"indices\":[3],\"values\":[1.0]}}}},\"sync_level\":\"full_index\"}"
+            else
+                "{\"inserts\":{\"k\":{\"v\":\"probe\"}},\"sync_level\":\"write\"}";
             var output: capi.Buffer = .{};
             defer antfly_buffer_free(&output);
             self.code = antfly_db_batch_json(self.handle, .{ .ptr = request.ptr, .len = request.len }, &output);
         }
     };
-    var writer: Writer = .{ .handle = handle };
+    var writer: Writer = .{ .handle = handle, .probe = &probe, .indexed = indexed };
     const thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
 
     probe.released.waitUncancelable(handleLockIo());
@@ -11043,6 +11064,7 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     probe.proceed.set(handleLockIo());
     thread.join();
 
+    try std.testing.expect(probe.hook_seen);
     try std.testing.expect(connection_mutex_free);
     try std.testing.expect(gate_mutex_free);
     try std.testing.expectEqual(capi.ErrorCode.ok, writer.code);
