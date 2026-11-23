@@ -7641,7 +7641,7 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
 #define TERMITE_MSL_ABI_CLAMP_ACTIVATION(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_clamp_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {"
 #define TERMITE_MSL_ABI_AUDIO_ROWS(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_gemma4_audio_rows_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {"
 #define TERMITE_MSL_ABI_FLORENCE_WINDOW(Kernel) "kernel void " #Kernel "(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_florence_window_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {"
-#define TERMITE_MSL_ABI_COMPRESSED_KEY_ENCODING(Kernel) "kernel void " #Kernel "(device const float *k [[buffer(0)]], device uchar *encoded_key [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {"
+#define TERMITE_MSL_ABI_COMPRESSED_KEY_ENCODING(Kernel) "kernel void " #Kernel "(device const float *k [[buffer(0)]], device uchar *encoded_key [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], constant uint *block_table [[buffer(3)]], constant uint2 &mapping [[buffer(4)]], uint gid [[thread_position_in_grid]]) {"
 
 // quant-kernel-codegen:begin Metal attention phase owners
 #define TERMITE_MSL_ATTENTION_STAGING \
@@ -13835,12 +13835,12 @@ static NSString *termite_metal_shader_source(void) {
            "inline float termite_random_sign(uint kv_h, uint projection, uint d) { ulong x = (ulong(kv_h + 1u) * 0x9e3779b97f4a7c15UL); x ^= (ulong(projection + 1u) * 0xbf58476d1ce4e5b9UL); x ^= (ulong(d + 1u) * 0x94d049bb133111ebUL); x ^= x >> 30; x *= 0xbf58476d1ce4e5b9UL; x ^= x >> 27; x *= 0x94d049bb133111ebUL; x ^= x >> 31; return ((x & 1UL) == 0UL) ? 1.0f : -1.0f; }\n"
            // tile-codegen:begin elementwise.direct.abi.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_COMPRESSED_KEY_ENCODING(termite_encode_polar4_key) "\n"
-           "    uint row_bytes = p.base_key_row_bytes; uint total = p.rows * row_bytes; if (gid >= total) return; uint row = gid / row_bytes; uint byte_in_row = gid - row * row_bytes; uint row_values = p.num_kv_heads * p.head_dim; uint value0 = byte_in_row * 2u; uint k_base = row * row_values; uint lo = value0 < row_values ? termite_encode_polar4_scalar(k[k_base + value0]) : 0u; uint hi = (value0 + 1u) < row_values ? termite_encode_polar4_scalar(k[k_base + value0 + 1u]) : 0u; encoded_key[row * p.key_row_bytes + byte_in_row] = uchar(lo | (hi << 4));\n"
+           "    uint row_bytes = p.base_key_row_bytes; uint total = p.rows * row_bytes; if (gid >= total) return; uint row = gid / row_bytes; uint byte_in_row = gid - row * row_bytes; uint row_values = p.num_kv_heads * p.head_dim; uint value0 = byte_in_row * 2u; ulong k_base = ulong(row) * row_values; uint lo = value0 < row_values ? termite_encode_polar4_scalar(k[k_base + value0]) : 0u; uint hi = (value0 + 1u) < row_values ? termite_encode_polar4_scalar(k[k_base + value0 + 1u]) : 0u; uint logical = mapping.x + row; uint physical = mapping.y == 0u ? row : block_table[logical / mapping.y] + logical % mapping.y; encoded_key[ulong(physical) * p.key_row_bytes + byte_in_row] = uchar(lo | (hi << 4));\n"
            "}\n"
            // tile-codegen:end elementwise.direct.abi.6 family
            // tile-codegen:begin elementwise.direct.abi.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            TERMITE_MSL_ABI_COMPRESSED_KEY_ENCODING(termite_encode_turbo3_key) "\n"
-           "    uint base_bytes = p.base_key_row_bytes; uint residual_bytes = (p.num_kv_heads * 32u + 7u) / 8u; uint row_work = base_bytes + residual_bytes; uint total = p.rows * row_work; if (gid >= total) return; uint row = gid / row_work; uint local = gid - row * row_work; uint row_values = p.num_kv_heads * p.head_dim; uint k_base = row * row_values; uint encoded_base = row * p.key_row_bytes;\n"
+           "    uint base_bytes = p.base_key_row_bytes; uint residual_bytes = (p.num_kv_heads * 32u + 7u) / 8u; uint row_work = base_bytes + residual_bytes; uint total = p.rows * row_work; if (gid >= total) return; uint row = gid / row_work; uint local = gid - row * row_work; uint row_values = p.num_kv_heads * p.head_dim; ulong k_base = ulong(row) * row_values; uint logical = mapping.x + row; uint physical = mapping.y == 0u ? row : block_table[logical / mapping.y] + logical % mapping.y; ulong encoded_base = ulong(physical) * p.key_row_bytes;\n"
            "    if (local < base_bytes) { uint out = 0u; uint bit_base = local * 8u; for (uint bit = 0; bit < 8u; ++bit) { uint packed_bit = bit_base + bit; uint value_index = packed_bit / 3u; if (value_index >= row_values) continue; uint code_bit = packed_bit - value_index * 3u; uint code = termite_encode_turbo3_scalar(k[k_base + value_index]); out |= ((code >> code_bit) & 1u) << bit; } encoded_key[encoded_base + local] = uchar(out); return; }\n"
            "    uint residual_byte = local - base_bytes; uint out = 0u; for (uint bit = 0; bit < 8u; ++bit) { uint residual_bit = residual_byte * 8u + bit; if (residual_bit >= p.num_kv_heads * 32u) continue; uint kv_h = residual_bit / 32u; uint projection = residual_bit - kv_h * 32u; uint head_base = kv_h * p.head_dim; float projected_residual = 0.0f; for (uint d = 0; d < p.head_dim; ++d) { float value = k[k_base + head_base + d]; uint code = termite_encode_turbo3_scalar(value); float decoded = termite_decode_turbo3_scalar(code); projected_residual += termite_random_sign(kv_h, projection, d) * (value - decoded); } if (projected_residual >= 0.0f) out |= 1u << bit; } encoded_key[encoded_base + base_bytes + residual_byte] = uchar(out);\n"
            "}\n"
@@ -16346,9 +16346,9 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            // tile-codegen:end convolution.direct.4 family
            // tile-codegen:begin kv.storage.direct.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "kernel void termite_encode_int8_per_head(device const float *in [[buffer(0)]], device uchar *out [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint2 gid [[thread_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]], uint2 tg_size [[threads_per_threadgroup]]) {\n"
+           "kernel void termite_encode_int8_per_head(device const float *in [[buffer(0)]], device uchar *out [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], constant uint *block_table [[buffer(3)]], constant uint2 &mapping [[buffer(4)]], uint2 gid [[thread_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]], uint2 tg_size [[threads_per_threadgroup]]) {\n"
            "    uint head_dim = p.head_dim; uint num_kv_heads = p.num_kv_heads; uint total_heads = p.rows * num_kv_heads; if (gid.y >= total_heads) return;\n"
-           "    uint row = gid.y / num_kv_heads; uint head = gid.y - row * num_kv_heads; uint d = gid.x; uint row_values = num_kv_heads * head_dim; uint in_base = row * row_values + head * head_dim; uint out_base = row * p.key_row_bytes + head * (head_dim + 4u);\n"
+           "    uint row = gid.y / num_kv_heads; uint head = gid.y - row * num_kv_heads; uint d = gid.x; uint row_values = num_kv_heads * head_dim; ulong in_base = ulong(row) * row_values + head * head_dim; uint logical = mapping.x + row; uint physical = mapping.y == 0u ? row : block_table[logical / mapping.y] + logical % mapping.y; ulong out_base = ulong(physical) * p.key_row_bytes + head * (head_dim + 4u);\n"
            "    float val = (d < head_dim) ? in[in_base + d] : 0.0f; float abs_val = (d < head_dim) ? fabs(val) : 0.0f;\n"
            "    threadgroup float tg_max[256];\n"
            "    tg_max[tid.x] = abs_val;\n"
@@ -64517,31 +64517,36 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->paged_f16_kv_seed_pipeline, total), 1, 1));
     } else {
 
-        termite_metal_encode_key_params key_params = {
-            .rows = 1u,
+        const size_t residual_bytes = num_kv_heads * 4u;
+        const size_t work_per_row = format == 4u ? num_kv_heads : base_key_row_bytes + (format == 1u ? residual_bytes : 0u);
+        if (work_per_row > UINT32_MAX / suffix_tokens) return failure_code;
+        size_t int8_group = 1u;
+        while (int8_group < head_dim && int8_group < 256u) int8_group <<= 1u;
+        if (format == 4u && int8_group < head_dim) return failure_code;
+        const termite_metal_encode_key_params key_params = {
+            .rows = (uint32_t)suffix_tokens,
             .num_kv_heads = (uint32_t)num_kv_heads,
             .head_dim = (uint32_t)head_dim,
             .key_row_bytes = (uint32_t)key_row_bytes,
             .base_key_row_bytes = (uint32_t)base_key_row_bytes,
         };
-        size_t int8_tg_size = 1u;
-        while (int8_tg_size < head_dim && int8_tg_size < 256u) int8_tg_size <<= 1u;
-        if (format == 4u && int8_tg_size < head_dim) return failure_code;
-        const size_t residual_bytes = (num_kv_heads * 32u + 7u) / 8u;
-        const size_t compressed_work_items = format == 0u ? base_key_row_bytes : (base_key_row_bytes + residual_bytes);
+        const uint32_t mapping[2] = { (uint32_t)suffix_start, (uint32_t)page_size };
+        if (block_table_bytes > 4096u) {
+            block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+            if (block_table_buffer == nil) return failure_code;
+            if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
+        }
 
-        for (size_t logical = suffix_start; logical < total_tokens; logical++) {
-            const size_t logical_block = logical / page_size;
-            const size_t token_in_block = logical - logical_block * page_size;
-            const size_t physical_token = (size_t)block_table[logical_block] + token_in_block;
-            const size_t source_row = logical - suffix_start;
-            antfly_metal_set_compute_pipeline(encoder, (key_pipeline));
-            termite_metal_bind_two_buffers(encoder, k_buffer, (k_offset + source_row * raw_source_row_bytes), runtime->attention_span_encoded_key_buffers[slot], (physical_token * key_row_bytes), &key_params, sizeof(key_params));
-            if (format == 4u) {
-                antfly_metal_dispatch_threads(encoder, MTLSizeMake(int8_tg_size, num_kv_heads, 1), MTLSizeMake(int8_tg_size, 1, 1));
-            } else {
-                antfly_metal_dispatch_threads(encoder, MTLSizeMake(compressed_work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(key_pipeline, compressed_work_items), 1, 1));
-            }
+        antfly_metal_set_compute_pipeline(encoder, key_pipeline);
+        termite_metal_bind_two_buffers(encoder, k_buffer, k_offset, runtime->attention_span_encoded_key_buffers[slot], 0, &key_params, sizeof(key_params));
+        if (block_table_buffer != nil) [encoder setBuffer:block_table_buffer offset:0 atIndex:3];
+        else [encoder setBytes:block_table length:block_table_bytes atIndex:3];
+        [encoder setBytes:mapping length:sizeof(mapping) atIndex:4];
+        const size_t work = suffix_tokens * work_per_row;
+        if (format == 4u) {
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(int8_group, work, 1), MTLSizeMake(int8_group, 1, 1));
+        } else {
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(work, 1, 1), MTLSizeMake(termite_metal_thread_width(key_pipeline, work), 1, 1));
         }
 
         termite_metal_paged_f32_kv_seed_params v_params = {
@@ -64554,14 +64559,8 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         };
         antfly_metal_set_compute_pipeline(encoder, (runtime->paged_f32_v_seed_pipeline));
         termite_metal_bind_two_buffers_only(encoder, v_buffer, v_offset, runtime->attention_span_v_buffers[slot], 0);
-        if (block_table_bytes <= 4096u) {
-            [encoder setBytes:block_table length:block_table_bytes atIndex:2];
-        } else {
-            block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-            if (block_table_buffer == nil) return failure_code;
-            if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
-            [encoder setBuffer:block_table_buffer offset:0 atIndex:2];
-        }
+        if (block_table_buffer != nil) [encoder setBuffer:block_table_buffer offset:0 atIndex:2];
+        else [encoder setBytes:block_table length:block_table_bytes atIndex:2];
         [encoder setBytes:&v_params length:sizeof(v_params) atIndex:3];
         const size_t v_total = suffix_tokens * v_row_stride;
         antfly_metal_dispatch_threads(encoder, MTLSizeMake(v_total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->paged_f32_v_seed_pipeline, v_total), 1, 1));
@@ -65153,6 +65152,9 @@ static int termite_metal_encode_compressed_span_keys(
     if (encoder == nil) return -11;
     antfly_metal_set_compute_pipeline(encoder, pipeline);
     termite_metal_bind_two_buffers(encoder, input, input_offset, output, output_offset, params, sizeof(*params));
+    const uint32_t direct_mapping[2] = { 0u, 0u };
+    [encoder setBytes:direct_mapping length:sizeof(uint32_t) atIndex:3];
+    [encoder setBytes:direct_mapping length:sizeof(direct_mapping) atIndex:4];
     antfly_metal_dispatch_threads(encoder, grid, group);
     [encoder endEncoding];
     return 0;
