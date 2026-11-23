@@ -60,6 +60,9 @@ fn runExportGguf(allocator: Allocator, io: std.Io, opts: options.Options, base_a
     if (opts.quantize_exclude_prefixes) |value| try argv.appendSlice(allocator, &.{ "--quantize-exclude", value });
     if (opts.projector_output_path) |value| try argv.appendSlice(allocator, &.{ "--projector-output", value });
     if (opts.projector_format) |value| try argv.appendSlice(allocator, &.{ "--projector-format", value });
+    if (opts.quantize_plan_path) |value| try argv.appendSlice(allocator, &.{ "--quantize-plan", value });
+    if (opts.sensitivity_output_path) |value| try argv.appendSlice(allocator, &.{ "--quantize-sensitivity", value });
+    if (opts.sensitivity_formats) |value| try argv.appendSlice(allocator, &.{ "--sensitivity-formats", value });
     if (opts.dry_run) try argv.append(allocator, "--dry-run");
 
     try native_export_gguf.main(allocator, io, argv.items);

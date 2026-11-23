@@ -39,6 +39,7 @@ const tokenizer_mod = @import("inference_tokenizer");
 const multimodal_reranker_mod = @import("pipelines/multimodal_reranker.zig");
 const qwen2vl_multimodal_mod = @import("pipelines/qwen2vl_multimodal.zig");
 const variants_manifest = @import("quantize/variants_manifest.zig");
+const mixed_plan = @import("quantize/mixed_plan.zig");
 
 const print = std.debug.print;
 const io_compat = compat.testingIo;
@@ -79,7 +80,14 @@ const Options = struct {
     quantization: QuantizationMode = .none,
     quantize_include_prefixes: ?[]const u8 = null,
     quantize_exclude_prefixes: ?[]const u8 = null,
+    quantize_plan_path: ?[]const u8 = null,
+    sensitivity_output_path: ?[]const u8 = null,
+    sensitivity_formats: ?[]const u8 = null,
     dry_run: bool = false,
+
+    fn usesMixedPrecision(self: Options) bool {
+        return self.quantize_plan_path != null or self.sensitivity_output_path != null or self.sensitivity_formats != null;
+    }
 };
 
 const QuantizationFilter = struct {
@@ -199,9 +207,24 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         .include_prefixes_csv = opts.quantize_include_prefixes,
         .exclude_prefixes_csv = opts.quantize_exclude_prefixes,
     };
+    if (opts.usesMixedPrecision() and opts.quantization == .none) {
+        print("--quantize-plan and --quantize-sensitivity refine a base --format; pass one such as --format q4_k\n", .{});
+        return error.InvalidArguments;
+    }
+    if (opts.quantize_plan_path != null and opts.sensitivity_output_path != null) {
+        print("--quantize-plan and --quantize-sensitivity are separate steps; pass one\n", .{});
+        return error.InvalidArguments;
+    }
     {
         var manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
         defer manifest.deinit();
+        if (opts.usesMixedPrecision() and
+            (isGlinerBundleExportManifest(manifest) or isClipclapExportManifest(manifest) or
+                (isFlorence2ExportManifest(manifest) and !std.mem.endsWith(u8, output_path, ".gguf"))))
+        {
+            print("mixed-precision plans support single-file GGUF exports; this model exports as a bundle\n", .{});
+            return error.UnsupportedArgumentsForGgufExport;
+        }
         if (isGlinerBundleExportManifest(manifest)) {
             if (opts.dry_run) {
                 const report = try formatGlinerBundleDryRunReport(allocator, opts.model_dir, output_path, opts.quantization, filter);
@@ -265,6 +288,20 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         else => return err,
     };
     defer planned.deinit(allocator);
+
+    if (opts.sensitivity_output_path) |sensitivity_path| {
+        const formats = try parseSensitivityFormats(allocator, opts.sensitivity_formats orelse default_sensitivity_formats);
+        defer allocator.free(formats);
+        try writeWeightSensitivity(allocator, opts.model_dir, &planned.plan, formats, sensitivity_path);
+        return;
+    }
+    if (opts.quantize_plan_path) |plan_path| {
+        const plan_bytes = try std.Io.Dir.cwd().readFileAlloc(io_compat(), plan_path, allocator, .limited(64 * 1024 * 1024));
+        defer allocator.free(plan_bytes);
+        var quant_plan = try mixed_plan.parsePlan(allocator, plan_bytes);
+        defer quant_plan.deinit();
+        try applyQuantizationPlanToModel(allocator, opts.model_dir, &planned.plan, &quant_plan);
+    }
 
     const projector_output_path = if (planned.projector_source_path != null or planned.projector_plan != null)
         if (opts.projector_output_path) |value|
@@ -5350,6 +5387,15 @@ fn parseArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, args[i], "--quantize-exclude") and i + 1 < args.len) {
             opts.quantize_exclude_prefixes = args[i + 1];
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--quantize-plan") and i + 1 < args.len) {
+            opts.quantize_plan_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--quantize-sensitivity") and i + 1 < args.len) {
+            opts.sensitivity_output_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--sensitivity-formats") and i + 1 < args.len) {
+            opts.sensitivity_formats = args[i + 1];
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--dry-run")) {
             opts.dry_run = true;
         } else {
@@ -5357,16 +5403,20 @@ fn parseArgs(args: []const []const u8) !Options {
             return error.InvalidArguments;
         }
     }
+    if (opts.sensitivity_formats != null and opts.sensitivity_output_path == null) {
+        printUsage();
+        return error.InvalidArguments;
+    }
     return opts;
 }
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference export <model-dir> --target gguf [--output <path>] [--projector-output <path>] [--projector-format auto|antfly|clip] [--format q1_0|q2_k|q3_k|q4_0|q4_1|q5_0|q5_1|q4_k|q5_k|q6_k|q8_k|q8_0|q8_1] [--quantize-include <csv-prefixes>] [--quantize-exclude <csv-prefixes>] [--dry-run]
+        \\usage: antfly inference export <model-dir> --target gguf [--output <path>] [--projector-output <path>] [--projector-format auto|antfly|clip] [--format q1_0|q2_k|q3_k|q4_0|q4_1|q5_0|q5_1|q4_k|q5_k|q6_k|q8_k|q8_0|q8_1] [--quantize-include <csv-prefixes>] [--quantize-exclude <csv-prefixes>] [--quantize-plan <plan.json> | --quantize-sensitivity <out.json> [--sensitivity-formats <csv>]] [--dry-run]
         \\
         \\Exports a native model directory to a serialized GGUF file.
         \\Dense export is currently implemented for bert, t5, whisper, clip, clap, florence, layoutlmv3, and deberta plus gpt2, gpt_neo, gpt_neox, gptj, llama, mistral, qwen2, gemma, bitnet, and phi families. GPT-2 export applies the same hybrid quantization policy as other dense families, with Conv1D tensors quantized on their transformed GGUF row layout; GPT-NeoX split query_key_value export currently keeps those split tensors dense while other eligible tensors may quantize.
-        \\Current scope: dense safetensors export, optional hybrid q1_0/q2_k/q3_k/q4_0/q4_1/q5_0/q5_1/q4_k/q5_k/q6_k/q8_k/q8_0/q8_1 quantization, prefix-based quantize include/exclude filters, dry-run planning, raw GGUF passthrough, multimodal split export with projector target selection, and GLiNER2 split-bundle export as encoder GGUF plus gliner_head.gguf. ColQwen2 currently rides the Qwen2 decoder path rather than a dedicated multimodal GGUF family.
+        \\Current scope: dense safetensors export, optional hybrid q1_0/q2_k/q3_k/q4_0/q4_1/q5_0/q5_1/q4_k/q5_k/q6_k/q8_k/q8_0/q8_1 quantization, prefix-based quantize include/exclude filters, per-tensor mixed-precision plans over the tensors the base format quantizes (--quantize-plan, measured with --quantize-sensitivity and chosen with `antfly inference quantize-plan`), dry-run planning, raw GGUF passthrough, multimodal split export with projector target selection, and GLiNER2 split-bundle export as encoder GGUF plus gliner_head.gguf. ColQwen2 currently rides the Qwen2 decoder path rather than a dedicated multimodal GGUF family.
         \\
     , .{});
 }
@@ -5517,6 +5567,284 @@ fn writeDenseRecordTransposed2d(
         }
     }
     try file.writeStreamingAll(io, transposed);
+}
+
+/// The formats Metal's fused decode block accepts
+/// (`directQuantizedBlockFormatForKind`), so default candidates never leave a
+/// layer without a fast route there.
+const default_sensitivity_formats = "q4_0,q4_k,q5_k,q6_k,q8_0";
+
+fn parseSensitivityFormats(allocator: std.mem.Allocator, csv: []const u8) ![]QuantizationMode {
+    var formats = std.ArrayListUnmanaged(QuantizationMode).empty;
+    errdefer formats.deinit(allocator);
+    var it = std.mem.tokenizeScalar(u8, csv, ',');
+    while (it.next()) |raw| {
+        const name = std.mem.trim(u8, raw, " ");
+        const mode = parseQuantizationMode(name) orelse {
+            print("unknown sensitivity format: {s}\n", .{name});
+            return error.InvalidArguments;
+        };
+        if (mode == .none) {
+            print("sensitivity formats must be quantized formats; dense tensors are outside the plan\n", .{});
+            return error.InvalidArguments;
+        }
+        if (std.mem.indexOfScalar(QuantizationMode, formats.items, mode) == null) try formats.append(allocator, mode);
+    }
+    if (formats.items.len == 0) return error.InvalidArguments;
+    return formats.toOwnedSlice(allocator);
+}
+
+/// A plan entry may only re-target a tensor the base --format already
+/// quantizes, so per-architecture policy (norms, biases, split tensors,
+/// multimodal towers kept dense) stays in force. "none" keeps it dense.
+fn planEligible(tensor: TensorPlan) bool {
+    return tensor.quantization != .none and tensor.source_byte_range == null;
+}
+
+fn applyQuantizationPlanToModel(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    plan: *ExportPlan,
+    quant_plan: *const mixed_plan.Plan,
+) !void {
+    var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    var access = try tensor_access_mod.openFromManifest(allocator, manifest);
+    defer access.deinit();
+    try applyQuantizationPlan(allocator, access, plan, quant_plan);
+}
+
+fn applyQuantizationPlan(
+    allocator: std.mem.Allocator,
+    access: tensor_access_mod.TensorAccess,
+    plan: *ExportPlan,
+    quant_plan: *const mixed_plan.Plan,
+) !void {
+    // Validate every entry before changing anything, so a bad plan never
+    // produces a partially applied export.
+    const targets = try allocator.alloc(usize, quant_plan.entries.len);
+    defer allocator.free(targets);
+    const modes = try allocator.alloc(QuantizationMode, quant_plan.entries.len);
+    defer allocator.free(modes);
+    for (quant_plan.entries, 0..) |entry, e| {
+        const index = for (plan.tensors, 0..) |tensor, t| {
+            if (std.mem.eql(u8, tensor.output_name, entry.name)) break t;
+        } else {
+            print("quantization plan names a tensor this export does not write: {s}\n", .{entry.name});
+            return error.QuantizationPlanTensorNotFound;
+        };
+        const tensor = plan.tensors[index];
+        if (!planEligible(tensor)) {
+            print("quantization plan names a tensor the base format keeps dense: {s}\n", .{entry.name});
+            return error.QuantizationPlanTensorNotEligible;
+        }
+        const mode = parseQuantizationMode(entry.format) orelse {
+            print("quantization plan has an unknown format for {s}: {s}\n", .{ entry.name, entry.format });
+            return error.InvalidQuantizationPlanFormat;
+        };
+        if (mode != .none) {
+            var record = try access.getRecord(allocator, tensor.source_name);
+            defer record.deinit();
+            if (supportedQuantizationForDescriptor(false, mode, record.descriptor, tensor.transform) != mode) {
+                print("{s} cannot be stored as {s}: its rows do not divide into that format's blocks\n", .{ entry.name, entry.format });
+                return error.QuantizationPlanFormatUnsupported;
+            }
+        }
+        targets[e] = index;
+        modes[e] = mode;
+    }
+    for (targets, modes) |index, mode| {
+        const tensor = &plan.tensors[index];
+        if (mode == .none) {
+            var record = try access.getRecord(allocator, tensor.source_name);
+            defer record.deinit();
+            tensor.tensor_type = switch (record.descriptor.encoding) {
+                .dense => |dtype| try denseTensorType(dtype),
+                else => return error.QuantizationPlanTensorNotEligible,
+            };
+        } else {
+            tensor.tensor_type = tensorTypeForQuantizationMode(mode);
+        }
+        tensor.quantization = mode;
+    }
+    warnSplitFusedGroups(plan);
+}
+
+fn writeWeightSensitivity(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    plan: *const ExportPlan,
+    formats: []const QuantizationMode,
+    output_path: []const u8,
+) !void {
+    var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    var access = try tensor_access_mod.openFromManifest(allocator, manifest);
+    defer access.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const items = try measureWeightSensitivity(arena.allocator(), allocator, access, plan, formats, true);
+    const groups = try fusedTensorGroups(arena.allocator(), items);
+    const json = try mixed_plan.writeSensitivityJson(allocator, weight_sensitivity_metric, items, groups);
+    defer allocator.free(json);
+    try std.Io.Dir.cwd().writeFile(io_compat(), .{ .sub_path = output_path, .data = json });
+    print("wrote weight sensitivity for {d} tensors in {d} fused groups to {s}\n", .{ items.len, groups.len, output_path });
+}
+
+/// Tensors that runtimes execute as one fused kernel, found by GGUF name
+/// (llama.cpp naming: blk.N.ffn_gate*/ffn_up*, blk.N.attn_q/k/v). Which
+/// format combinations each runtime fuses lives in
+/// `mixed_plan.fusionRule`; plans keep these groups on them unless
+/// `quantize-plan --untied` is used.
+const FusedGroupKind = mixed_plan.FusionKind;
+
+fn fusedGroupSiblings(buffer: *[3][256]u8, name: []const u8) ?struct { kind: FusedGroupKind, members: [3][]const u8, len: usize } {
+    if (!std.mem.startsWith(u8, name, "blk.")) return null;
+    if (std.mem.indexOf(u8, name, ".ffn_gate")) |at| {
+        const suffix = name[at + ".ffn_gate".len ..];
+        const up = std.fmt.bufPrint(&buffer[1], "{s}.ffn_up{s}", .{ name[0..at], suffix }) catch return null;
+        return .{ .kind = .gate_up, .members = .{ name, up, "" }, .len = 2 };
+    }
+    if (std.mem.endsWith(u8, name, ".attn_q.weight")) {
+        const prefix = name[0 .. name.len - ".attn_q.weight".len];
+        const k = std.fmt.bufPrint(&buffer[1], "{s}.attn_k.weight", .{prefix}) catch return null;
+        const v = std.fmt.bufPrint(&buffer[2], "{s}.attn_v.weight", .{prefix}) catch return null;
+        return .{ .kind = .qkv, .members = .{ name, k, v }, .len = 3 };
+    }
+    return null;
+}
+
+fn fusedTensorGroups(arena: std.mem.Allocator, items: []const mixed_plan.Item) ![]mixed_plan.Group {
+    var names = std.StringHashMapUnmanaged(void).empty;
+    for (items) |item| try names.put(arena, item.name, {});
+    var groups = std.ArrayListUnmanaged(mixed_plan.Group).empty;
+    var buffer: [3][256]u8 = undefined;
+    for (items) |item| {
+        const siblings = fusedGroupSiblings(&buffer, item.name) orelse continue;
+        const members = try arena.alloc([]const u8, siblings.len);
+        var complete = true;
+        for (siblings.members[0..siblings.len], members) |member, *slot| {
+            const key = names.getKey(member) orelse {
+                complete = false;
+                break;
+            };
+            slot.* = key;
+        }
+        if (!complete) continue;
+        const group_name = switch (siblings.kind) {
+            .gate_up => blk: {
+                const at = std.mem.indexOf(u8, item.name, ".ffn_gate").?;
+                break :blk try std.fmt.allocPrint(arena, "{s}.ffn_gate_up{s}", .{ item.name[0..at], item.name[at + ".ffn_gate".len ..] });
+            },
+            .qkv => try std.fmt.allocPrint(arena, "{s}.attn_qkv", .{item.name[0 .. item.name.len - ".attn_q.weight".len]}),
+        };
+        try groups.append(arena, .{
+            .name = group_name,
+            .members = members,
+            .kind = siblings.kind,
+        });
+    }
+    return groups.toOwnedSlice(arena);
+}
+
+/// Report planned formats that leave a fused kernel on Metal or CUDA; the
+/// export still works but runs those tensors as separate matmuls.
+fn warnSplitFusedGroups(plan: *const ExportPlan) void {
+    var buffer: [3][256]u8 = undefined;
+    for (plan.tensors) |tensor| {
+        const siblings = fusedGroupSiblings(&buffer, tensor.output_name) orelse continue;
+        var formats: [3][]const u8 = undefined;
+        for (siblings.members[0..siblings.len], 0..) |member, i| {
+            formats[i] = for (plan.tensors) |other| {
+                if (std.mem.eql(u8, other.output_name, member)) break @tagName(other.quantization);
+            } else return;
+        }
+        const combo = formats[0..siblings.len];
+        const metal = mixed_plan.fusedComboAllowed(siblings.kind, .metal, combo);
+        const cuda = mixed_plan.fusedComboAllowed(siblings.kind, .cuda, combo);
+        if (metal and cuda) continue;
+        print("warning: {s} and its fused siblings use {s}/{s}{s}{s}; not fused on {s}\n", .{
+            tensor.output_name,
+            formats[0],
+            formats[1],
+            if (siblings.len == 3) "/" else "",
+            if (siblings.len == 3) formats[2] else "",
+            if (!metal and !cuda) "Metal or CUDA" else if (!metal) "Metal" else "CUDA",
+        });
+    }
+}
+
+const weight_sensitivity_metric = "weight_sse";
+
+/// For every tensor the base format quantizes, encode it in each candidate
+/// format and record the summed squared reconstruction error. This is a
+/// data-free proxy; an output-space measurement (embedding cosine, token KL,
+/// WER) can replace each candidate's `loss` in the same file.
+fn measureWeightSensitivity(
+    arena: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+    access: tensor_access_mod.TensorAccess,
+    plan: *const ExportPlan,
+    formats: []const QuantizationMode,
+    report_progress: bool,
+) ![]mixed_plan.Item {
+    var items = std.ArrayListUnmanaged(mixed_plan.Item).empty;
+    for (plan.tensors) |tensor| {
+        if (!planEligible(tensor)) continue;
+        var record = try access.getRecord(allocator, tensor.source_name);
+        defer record.deinit();
+        const row_width = quantizedRowWidth(record.descriptor.shape, tensor.transform) orelse continue;
+        const row_count = quantizedRowCount(record.descriptor.shape, tensor.transform, row_width) orelse continue;
+
+        var candidates = std.ArrayListUnmanaged(mixed_plan.Candidate).empty;
+        for (formats) |mode| {
+            if (supportedQuantizationForDescriptor(false, mode, record.descriptor, tensor.transform) != mode) continue;
+            const tensor_type = tensorTypeForQuantizationMode(mode);
+            const bytes = gguf_mod.tensor_types.byteLen(tensor_type, tensor.dimensions) orelse continue;
+            const loss = try tensorReconstructionError(allocator, record, tensor.transform, mode, row_width, row_count);
+            try candidates.append(arena, .{ .format = formatName(mode), .bytes = bytes, .loss = loss });
+        }
+        if (candidates.items.len == 0) continue;
+        try items.append(arena, .{
+            .name = try arena.dupe(u8, tensor.output_name),
+            .elements = @as(u64, row_width) * row_count,
+            .candidates = try candidates.toOwnedSlice(arena),
+        });
+        if (report_progress) print("measured {s} ({d} x {d})\n", .{ tensor.output_name, row_count, row_width });
+    }
+    return items.toOwnedSlice(arena);
+}
+
+fn tensorReconstructionError(
+    allocator: std.mem.Allocator,
+    record: tensor_access_mod.Record,
+    transform: TensorTransform,
+    mode: QuantizationMode,
+    row_width: usize,
+    row_count: usize,
+) !f64 {
+    const row = try allocator.alloc(f32, row_width);
+    defer allocator.free(row);
+    const decoded = try allocator.alloc(f32, row_width);
+    defer allocator.free(decoded);
+    const tensor_type = tensorTypeForQuantizationMode(mode);
+    var total: f64 = 0;
+    for (0..row_count) |row_index| {
+        try decodeDenseRowToF32(record, transform, row_index, row_width, row);
+        const encoded = try quantizeDenseRow(allocator, mode, row);
+        defer allocator.free(encoded);
+        try gguf_mod.quant_codec.dequantizeRow(tensor_type, encoded, row_width, 0, decoded);
+        for (row, decoded) |want, got| {
+            const diff: f64 = @as(f64, want) - @as(f64, got);
+            total += diff * diff;
+        }
+    }
+    return total;
+}
+
+fn formatName(mode: QuantizationMode) []const u8 {
+    return @tagName(mode);
 }
 
 fn quantizeDenseRow(allocator: std.mem.Allocator, quantization: QuantizationMode, row: []const f32) ![]u8 {
@@ -9032,4 +9360,230 @@ fn expectMixedKFamilyExport(
     try std.testing.expectEqual(expected_wide_tensor_type, wide_tensor.tensor_type);
     const narrow_tensor = catalog.find("blk.0.attn_norm.weight").?;
     try std.testing.expectEqual(gguf_mod.tensor_types.TensorType{ .known = .F32 }, narrow_tensor.tensor_type);
+}
+
+fn readExportedTensorType(allocator: std.mem.Allocator, path: []const u8, name: []const u8) !gguf_mod.tensor_types.TensorType {
+    const raw = try c_file.readFile(allocator, path);
+    defer allocator.free(raw);
+    var parsed = try gguf_mod.format.parse(allocator, raw);
+    defer parsed.deinit(allocator);
+    const catalog = gguf_mod.tensor_catalog.Catalog.init(&parsed);
+    return (catalog.find(name) orelse return error.TestTensorMissing).tensor_type;
+}
+
+test "quantization plan re-targets planned tensors and leaves the rest at the base format" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "native-export-gguf-mixed-plan");
+    defer {
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    try writeWideQuantFixture(allocator, dir_path);
+
+    var planned = try buildPlannedExport(allocator, dir_path, .q4_k, .auto, .{});
+    defer planned.deinit(allocator);
+    var quant_plan = try mixed_plan.parsePlan(allocator,
+        \\{"schema":"antfly-quant-plan/v1","tensors":{"token_embd.weight":"q8_0","blk.0.attn_q.weight":"none","blk.0.ffn_down.weight":"q6_k"}}
+    );
+    defer quant_plan.deinit();
+    try applyQuantizationPlanToModel(allocator, dir_path, &planned.plan, &quant_plan);
+
+    const out_path = try std.fs.path.join(allocator, &.{ dir_path, "mixed.gguf" });
+    defer allocator.free(out_path);
+    try writePlannedExport(allocator, dir_path, out_path, null, &planned);
+
+    const T = gguf_mod.tensor_types.TensorType;
+    try std.testing.expectEqual(T{ .known = .Q8_0 }, try readExportedTensorType(allocator, out_path, "token_embd.weight"));
+    try std.testing.expectEqual(T{ .known = .F32 }, try readExportedTensorType(allocator, out_path, "blk.0.attn_q.weight"));
+    try std.testing.expectEqual(T{ .known = .Q6_K }, try readExportedTensorType(allocator, out_path, "blk.0.ffn_down.weight"));
+    try std.testing.expectEqual(T{ .known = .Q4_K }, try readExportedTensorType(allocator, out_path, "blk.0.attn_k.weight"));
+    try std.testing.expectEqual(T{ .known = .F32 }, try readExportedTensorType(allocator, out_path, "output_norm.weight"));
+}
+
+test "quantization plan fails closed on bad entries without changing the export" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "native-export-gguf-mixed-plan-reject");
+    defer {
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    try writeWideQuantFixture(allocator, dir_path);
+
+    var planned = try buildPlannedExport(allocator, dir_path, .q4_k, .auto, .{});
+    defer planned.deinit(allocator);
+    var manifest = try manifest_mod.loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+    var access = try tensor_access_mod.openFromManifest(allocator, manifest);
+    defer access.deinit();
+
+    const cases = [_]struct { json: []const u8, err: anyerror }{
+        .{ .json = "{\"schema\":\"antfly-quant-plan/v1\",\"tensors\":{\"token_embd.weight\":\"q8_0\",\"blk.9.attn_q.weight\":\"q8_0\"}}", .err = error.QuantizationPlanTensorNotFound },
+        .{ .json = "{\"schema\":\"antfly-quant-plan/v1\",\"tensors\":{\"token_embd.weight\":\"q8_0\",\"output_norm.weight\":\"q8_0\"}}", .err = error.QuantizationPlanTensorNotEligible },
+        .{ .json = "{\"schema\":\"antfly-quant-plan/v1\",\"tensors\":{\"token_embd.weight\":\"q8_0\",\"blk.0.attn_k.weight\":\"q9_9\"}}", .err = error.InvalidQuantizationPlanFormat },
+    };
+    for (cases) |case| {
+        var quant_plan = try mixed_plan.parsePlan(allocator, case.json);
+        defer quant_plan.deinit();
+        try std.testing.expectError(case.err, applyQuantizationPlan(allocator, access, &planned.plan, &quant_plan));
+        for (planned.plan.tensors) |tensor| {
+            if (tensor.quantization != .none) try std.testing.expectEqual(QuantizationMode.q4_k, tensor.quantization);
+        }
+    }
+}
+
+test "weight sensitivity measures each candidate and feeds the allocator" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "native-export-gguf-sensitivity");
+    defer {
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    try writeWideQuantFixture(allocator, dir_path);
+
+    var planned = try buildPlannedExport(allocator, dir_path, .q4_k, .auto, .{});
+    defer planned.deinit(allocator);
+    var manifest = try manifest_mod.loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+    var access = try tensor_access_mod.openFromManifest(allocator, manifest);
+    defer access.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const formats = try parseSensitivityFormats(allocator, "q4_k, q6_k,q8_0,q4_k");
+    defer allocator.free(formats);
+    try std.testing.expectEqual(@as(usize, 3), formats.len);
+    const items = try measureWeightSensitivity(arena.allocator(), allocator, access, &planned.plan, formats, false);
+
+    var eligible: usize = 0;
+    for (planned.plan.tensors) |tensor| {
+        if (planEligible(tensor)) eligible += 1;
+    }
+    try std.testing.expectEqual(eligible, items.len);
+    for (items) |item| {
+        try std.testing.expectEqual(@as(u64, 256 * 256), item.elements);
+        try std.testing.expectEqual(@as(usize, 3), item.candidates.len);
+        const q4 = item.candidates[0];
+        const q6 = item.candidates[1];
+        const q8 = item.candidates[2];
+        try std.testing.expectEqualStrings("q4_k", q4.format);
+        try std.testing.expectEqual(gguf_mod.tensor_types.byteLen(.{ .known = .Q4_K }, &.{ 256, 256 }).?, q4.bytes);
+        try std.testing.expect(q4.bytes < q6.bytes and q6.bytes < q8.bytes);
+        try std.testing.expect(q4.loss > q6.loss and q6.loss > q8.loss);
+        try std.testing.expect(q8.loss > 0);
+    }
+
+    // Plan at the midpoint between all-q4_k and all-q8_0, then export it.
+    var low: u64 = 0;
+    var high: u64 = 0;
+    for (items) |item| {
+        low += item.candidates[0].bytes;
+        high += item.candidates[2].bytes;
+    }
+    const groups = try fusedTensorGroups(arena.allocator(), items);
+    var selection = try mixed_plan.select(allocator, items, groups, (low + high) / 2, .{});
+    defer selection.deinit();
+    try std.testing.expect(selection.total_bytes <= (low + high) / 2);
+    const plan_json = try mixed_plan.writePlanJson(allocator, weight_sensitivity_metric, (low + high) / 2, items, selection);
+    defer allocator.free(plan_json);
+    var quant_plan = try mixed_plan.parsePlan(allocator, plan_json);
+    defer quant_plan.deinit();
+    try applyQuantizationPlan(allocator, access, &planned.plan, &quant_plan);
+
+    const out_path = try std.fs.path.join(allocator, &.{ dir_path, "planned.gguf" });
+    defer allocator.free(out_path);
+    try writePlannedExport(allocator, dir_path, out_path, null, &planned);
+    var planned_bytes: u64 = 0;
+    for (items, selection.formats) |item, format| {
+        const want = tensorTypeForQuantizationMode(parseQuantizationMode(format).?);
+        try std.testing.expectEqual(want, try readExportedTensorType(allocator, out_path, item.name));
+        for (item.candidates) |candidate| {
+            if (std.mem.eql(u8, candidate.format, format)) planned_bytes += candidate.bytes;
+        }
+    }
+    try std.testing.expectEqual(selection.total_bytes, planned_bytes);
+}
+
+test "fused tensor groups follow GGUF names and keep plans on fused kernels" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // q is very sensitive, k/v and gate are not, up is: untied plans would split both groups.
+    const Spec = struct { name: []const u8, q4: f64, q5: f64, q8: f64 };
+    const specs = [_]Spec{
+        .{ .name = "blk.0.attn_q.weight", .q4 = 50, .q5 = 5, .q8 = 0.1 },
+        .{ .name = "blk.0.attn_k.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.0.attn_v.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.0.ffn_gate.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.0.ffn_up.weight", .q4 = 30, .q5 = 3, .q8 = 0.1 },
+        .{ .name = "blk.0.ffn_down.weight", .q4 = 2, .q5 = 1, .q8 = 0.01 },
+        .{ .name = "blk.1.ffn_gate_exps.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.1.ffn_up_exps.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 },
+        .{ .name = "blk.2.ffn_gate.weight", .q4 = 1, .q5 = 0.5, .q8 = 0.01 }, // no up: not grouped
+    };
+    var items: [specs.len]mixed_plan.Item = undefined;
+    for (specs, &items) |spec, *item| {
+        const candidates = try a.alloc(mixed_plan.Candidate, 3);
+        candidates[0] = .{ .format = "q4_k", .bytes = 144, .loss = spec.q4 };
+        candidates[1] = .{ .format = "q5_k", .bytes = 176, .loss = spec.q5 };
+        candidates[2] = .{ .format = "q8_0", .bytes = 272, .loss = spec.q8 };
+        item.* = .{ .name = spec.name, .elements = 256, .candidates = candidates };
+    }
+    const groups = try fusedTensorGroups(a, &items);
+    try std.testing.expectEqual(@as(usize, 3), groups.len);
+    try std.testing.expectEqualStrings("blk.0.attn_qkv", groups[0].name);
+    try std.testing.expectEqual(@as(usize, 3), groups[0].members.len);
+    try std.testing.expectEqual(mixed_plan.FusionKind.qkv, groups[0].kind.?);
+    try std.testing.expectEqual(mixed_plan.FusionKind.gate_up, groups[1].kind.?);
+    try std.testing.expectEqualStrings("blk.0.ffn_gate_up.weight", groups[1].name);
+    try std.testing.expectEqualStrings("blk.1.ffn_gate_up_exps.weight", groups[2].name);
+    try std.testing.expectEqualStrings("blk.1.ffn_up_exps.weight", groups[2].members[1]);
+
+    // Room for two q5_k upgrades: untied puts them on q and up alone.
+    const budget: u64 = 9 * 144 + 2 * 32;
+    var untied = try mixed_plan.select(allocator, &items, groups, budget, .{ .untied = true });
+    defer untied.deinit();
+    try std.testing.expectEqualStrings("q5_k", untied.formats[0]);
+    try std.testing.expectEqualStrings("q4_k", untied.formats[1]);
+    try std.testing.expectEqualStrings("q4_k", untied.formats[3]);
+    try std.testing.expectEqualStrings("q5_k", untied.formats[4]);
+
+    // Tied for Metal: q takes the fused q5_k/q4_k/q4_k combination, and up cannot move without gate.
+    var tied = try mixed_plan.select(allocator, &items, groups, budget, .{ .fusion_target = .metal });
+    defer tied.deinit();
+    try std.testing.expectEqualStrings("q5_k", tied.formats[0]);
+    try std.testing.expectEqualStrings("q4_k", tied.formats[1]);
+    try std.testing.expectEqualStrings("q4_k", tied.formats[2]);
+    try std.testing.expectEqualStrings(tied.formats[3], tied.formats[4]);
+    try std.testing.expectEqualStrings(tied.formats[6], tied.formats[7]);
+
+    // With room for everything, Q/K/V still take a fused combination (q8_0),
+    // never uniform q5_k/q6_k.
+    var roomy = try mixed_plan.select(allocator, &items, groups, 9 * 272, .{ .fusion_target = .metal });
+    defer roomy.deinit();
+    for (roomy.formats[0..3]) |format| try std.testing.expectEqualStrings("q8_0", format);
+
+    // Portable (the default): CUDA does not fuse q5_k/q4_k/q4_k, so q keeps
+    // q4_k and every group stays fused on both runtimes.
+    var portable = try mixed_plan.select(allocator, &items, groups, budget, .{});
+    defer portable.deinit();
+    for (groups) |group| {
+        var combo: [3][]const u8 = undefined;
+        for (group.members, 0..) |member, m| {
+            for (items, portable.formats) |item, format| {
+                if (std.mem.eql(u8, item.name, member)) combo[m] = format;
+            }
+        }
+        try std.testing.expect(mixed_plan.fusedComboAllowed(group.kind.?, .metal, combo[0..group.members.len]));
+        try std.testing.expect(mixed_plan.fusedComboAllowed(group.kind.?, .cuda, combo[0..group.members.len]));
+    }
+}
+
+test "mixed-precision flags parse and require a sensitivity target for formats" {
+    const opts = try parseArgs(&.{ "/tmp/model", "--format", "q4_k", "--quantize-sensitivity", "/tmp/s.json", "--sensitivity-formats", "q4_k,q8_0" });
+    try std.testing.expectEqualStrings("/tmp/s.json", opts.sensitivity_output_path.?);
+    try std.testing.expect(opts.usesMixedPrecision());
+    const plan_opts = try parseArgs(&.{ "/tmp/model", "--format", "q4_k", "--quantize-plan", "/tmp/p.json" });
+    try std.testing.expectEqualStrings("/tmp/p.json", plan_opts.quantize_plan_path.?);
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "/tmp/model", "--sensitivity-formats", "q4_k" }));
 }

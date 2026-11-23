@@ -245,6 +245,136 @@ their file layouts and metadata rules differ. They are implementation details,
 not separate public commands. The public CLI should stay centered on
 `antfly inference export` and `antfly inference quantize`.
 
+## Mixed-Precision GGUF Plans
+
+A single `--format` gives every eligible tensor the same width. Tensors are not
+equally sensitive: the token table, attention projections and the last layers
+usually hurt the output more per lost bit than the FFN layers do. A
+mixed-precision plan gives each tensor its own format so the whole file meets a
+size budget with the least damage. This follows the measure-then-allocate
+approach of quantization compilers such as LookAtMyQuant, restricted to formats
+Antfly already runs, so no new kernels are needed.
+
+The workflow has three steps:
+
+```text
+# 1. Measure: per tensor, per candidate format, encoded bytes and a loss.
+antfly inference export <model-dir> --target gguf --format q4_k \
+  --quantize-sensitivity sensitivity.json [--sensitivity-formats q4_0,q4_k,q5_k,q6_k,q8_0]
+
+# 2. Allocate: one format per tensor, least summed loss within the budget.
+antfly inference quantize-plan --sensitivity sensitivity.json \
+  --bits-per-weight 5.0 --output plan.json        # or --budget-bytes <n>
+  # [--fusion-target portable|metal|cuda] [--untie qkv] [--untied] [--formats q4_k,q6_k,q8_0]
+
+# 3. Export with the plan.
+antfly inference export <model-dir> --target gguf --format q4_k \
+  --quantize-plan plan.json --output model.mixed.gguf
+```
+
+Rules:
+
+- The plan refines the base `--format`. It may only re-target tensors that
+  format already quantizes, so per-architecture policy (norms, biases, split
+  tensors, multimodal towers kept dense) still applies. `"none"` keeps a
+  planned tensor dense. The budget covers only the planned tensors. A K-family
+  base (256-value blocks) leaves tensors whose rows are not a multiple of 256
+  dense and outside the plan; a 32-value base such as `q8_0` makes more tensors
+  eligible, and candidates whose blocks do not fit a tensor are skipped for it.
+- A plan fails closed: a tensor the export does not write, a tensor the base
+  format keeps dense, an unknown format, or a format whose blocks do not divide
+  the tensor's rows is an error, and nothing is changed.
+- Plans apply to single-file GGUF exports. GLiNER, ClipClap and Florence-2
+  bundle exports reject the flags for now.
+
+Fused-kernel groups keep plans on fast routes. A mixed file needs no new
+kernels: every tensor runs its own format's matmul, and Metal's fused decode
+block already takes a separate format for attention output, FFN gate/up, FFN
+down and PLE. Two fusions constrain formats across tensors:
+
+| Group | Metal fuses | CUDA fuses |
+|---|---|---|
+| FFN gate + up | one shared `q4_0`/`q4_k`/`q5_k`/`q6_k`/`q8_0`; otherwise the layer leaves the fused block | both `q4_0`, `q4_k` or `q8_0`; otherwise two matmuls |
+| Attention Q/K/V | all `q4_0`, `q4_k` or `q8_0`, or `q5_k`/`q4_k`/`q4_k`; otherwise three matmuls | all `q4_0`, `q4_k` or `q8_0`; otherwise three matmuls |
+
+`--quantize-sensitivity` writes these as `groups` (found by GGUF name,
+including `ffn_gate_exps`/`ffn_up_exps`), and `quantize-plan` gives each group
+one combination its `--fusion-target` fuses: `portable` (default, fused on both
+runtimes), `metal` or `cuda`. `--untie qkv` (or `gate_up`) ignores one kind
+of group and `--untied` ignores all. `--quantize-plan`
+prints a warning for every group a plan leaves unfused on Metal or CUDA. The
+rules and their dispatch-code sources are in `mixed_plan.fusionRule`; the
+design, measurements and qualification plan are in
+`docs/design/inference/mixed-precision-quantization.md`.
+
+Loss sources:
+
+- `--quantize-sensitivity` writes a data-free proxy, `weight_sse`: the summed
+  squared reconstruction error of each tensor in each format. It needs no data
+  or runtime, but it does not see activations, so it over-weights large tensors
+  whose inputs are small and cannot tell which layers the output depends on.
+- An output-space metric replaces each candidate's `loss` in the same file.
+  `scripts/quant_plan/embedding_sensitivity.py measure` does this for
+  embedders: it exports one tensor at a time in each candidate format (every
+  other planned tensor dense) and records the mean `1 - cos` against the dense
+  model over a corpus. Its `evaluate` command compares plans with uniform
+  formats by cosine loss and nearest-neighbor recall at equal file size.
+  `scripts/quant_plan/torch_lm_sensitivity.py` does the same for decoders with
+  next-token KL against the dense model; Whisper (WER) and GLiNER (span F1)
+  would follow the same pattern. `scripts/quant_plan/bench_variants.py`
+  exports uniform and planned variants and reports decode speed, greedy
+  agreement and fusion fallback counters on Metal, CUDA or CPU.
+
+`scripts/quant_plan/torch_embedding_sensitivity.py` is the faster equivalent:
+it exports each candidate format once, uniformly, and swaps Antfly's
+dequantized tensors one at a time inside a PyTorch reference model, so the
+quantized values are Antfly's and only the forward pass differs.
+
+Measured on BAAI/bge-base-en-v1.5 (76 planned tensors, base `q4_k`,
+candidates `q4_0,q4_k,q5_k,q6_k,q8_0`), calibrated on 64 paragraphs from
+`docs/` and evaluated on 300 different ones. Bits per weight and bytes cover
+the planned tensors; recall is top-10 neighbor overlap with the dense model.
+Details are in `scripts/quant_plan/results/bge-base-en-v1.5.json`.
+
+| Variant | bits/weight | 1 - cos | recall@10 |
+|---|---:|---:|---:|
+| uniform q4_k | 4.50 | 0.01950 | 0.846 |
+| cosine plan | 4.50 | 0.01635 | 0.855 |
+| weight_sse plan | 5.00 | 0.01192 | 0.873 |
+| cosine plan | 5.00 | 0.00345 | 0.920 |
+| uniform q5_k | 5.50 | 0.00548 | 0.914 |
+| weight_sse plan | 5.50 | 0.00548 | 0.914 |
+| cosine plan | 5.50 | 0.00173 | 0.934 |
+| cosine plan | 6.00 | 0.00091 | 0.957 |
+| uniform q6_k | 6.56 | 0.00103 | 0.959 |
+
+At the size of uniform `q5_k`, the cosine-measured plan cuts embedding loss
+3.2x; at 5.0 bits it beats `q5_k` with 9% fewer bytes, and at 6.0 bits it
+matches `q6_k` with about 9% fewer. The data-free `weight_sse` proxy is much weaker
+(at 5.5 bits it chose all `q5_k`), so measure in output space when the model
+can run. Summed single-tensor losses predicted the held-out loss of every
+cosine plan within 4%. Antfly's own runtime agrees: through
+`antfly inference embed`, the 5.5-bit plan had 3.1x lower loss than uniform
+`q5_k` on a spot check of four texts.
+
+The allocator (`src/quantize/mixed_plan.zig`) treats losses as additive across
+tensors. It walks each tensor's lower convex hull of (bytes, loss) in order of
+loss saved per byte, fills leftover budget, repairs gaps with pairwise
+exchanges, and runs a dynamic program over bytes rounded up to 1/65536 of the
+budget beside it; the better plan wins and always fits the real budget.
+
+File formats:
+
+```json
+{"schema": "antfly-quant-sensitivity/v1", "metric": "weight_sse", "tensors": [
+  {"name": "blk.0.attn_q.weight", "elements": 589824, "candidates": [
+    {"format": "q4_k", "bytes": 331776, "loss": 0.81},
+    {"format": "q8_0", "bytes": 626688, "loss": 0.01}]}]}
+
+{"schema": "antfly-quant-plan/v1", "budget_bytes": 0, "planned_bytes": 0,
+ "bits_per_weight": 0, "total_loss": 0, "tensors": {"blk.0.attn_q.weight": "q8_0"}}
+```
+
 ## Code Organization
 
 The command is organized as a small dispatcher plus target-specific
@@ -259,6 +389,8 @@ implementations:
 - `src/quantize/safetensors_export.zig` maps `quantize --target safetensors`
   requests onto the safetensors exporter.
 - `src/quantize/constants.zig` owns shared CLI defaults used by all targets.
+- `src/quantize/mixed_plan.zig` owns sensitivity and plan files, the
+  allocator, and the `antfly inference quantize-plan` command.
 - `src/quantize/variants_manifest.zig` owns ClipClap variant file naming and
   `antfly_inference_variants.json` generation.
 - `src/native_export_gguf.zig` remains the GGUF-specific exporter and

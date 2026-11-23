@@ -31,5 +31,8 @@ pub const Options = struct {
     quantize_exclude_prefixes: ?[]const u8 = null,
     projector_output_path: ?[]const u8 = null,
     projector_format: ?[]const u8 = null,
+    quantize_plan_path: ?[]const u8 = null,
+    sensitivity_output_path: ?[]const u8 = null,
+    sensitivity_formats: ?[]const u8 = null,
     dry_run: bool = false,
 };

@@ -20,6 +20,12 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     return quantize.main(allocator, io, args);
 }
 
+/// `antfly inference quantize-plan`: choose per-tensor formats from a
+/// sensitivity file under a size budget.
+pub fn planMain(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    return quantize.mixed_plan.main(allocator, io, args);
+}
+
 test {
     _ = quantize;
 }
