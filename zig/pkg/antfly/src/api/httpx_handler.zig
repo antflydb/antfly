@@ -23617,8 +23617,9 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             return error.TestUnexpectedFullRead;
         }
         fn readScope(a: std.mem.Allocator, ptr: *anyopaque) !erased.ReadScope {
+            const Parent = @This();
             const Scope = struct {
-                fixture: *Fixture,
+                fixture: *Parent,
                 pub fn probePrefix(self: *@This(), _: []const u8, length: usize) ![]const u8 {
                     return self.fixture.prefix[0..length];
                 }
