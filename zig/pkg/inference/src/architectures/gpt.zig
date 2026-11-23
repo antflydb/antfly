@@ -7139,7 +7139,7 @@ fn decoderBlockImpl(
             defer freeTensorWithCleanup(cb, reshaped, raw_overrides.cleanup);
             if (try cb.rmsNormBare(reshaped, v_dim, config.norm_eps)) |normed_flat| {
                 defer freeTensorWithCleanup(cb, normed_flat, raw_overrides.cleanup);
-                const result = try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total, kv_dim, raw_overrides.cleanup);
+                const result = try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total, kv_dim, decode_context, raw_overrides.cleanup);
                 if (!v_omitted) freeTensorWithCleanup(cb, V, raw_overrides.cleanup); // V = K when omitted, don't double-free
                 break :blk result;
             }
@@ -7157,7 +7157,7 @@ fn decoderBlockImpl(
             defer freeTensorWithCleanup(cb, reshaped, raw_overrides.cleanup);
             const normed_flat = try cb.rmsNorm(reshaped, ones_ct, v_dim, config.norm_eps);
             defer freeTensorWithCleanup(cb, normed_flat, raw_overrides.cleanup);
-            const result = try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total, kv_dim, raw_overrides.cleanup);
+            const result = try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total, kv_dim, decode_context, raw_overrides.cleanup);
             if (!v_omitted) freeTensorWithCleanup(cb, V, raw_overrides.cleanup); // V = K when omitted, don't double-free
             break :blk result;
         }
@@ -7202,7 +7202,7 @@ fn decoderBlockImpl(
         Q
     else if (fused_q_rope) |roped_q|
         roped_q
-    else if (try maybeApplyQKHeadNormWithCleanup(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf, raw_overrides.cleanup)) |normed_q|
+    else if (try maybeApplyQKHeadNormWithCleanup(cb, allocator, config, Q, total, num_heads * head_dim, layer, "q", head_dim, &name_buf, decode_context, raw_overrides.cleanup)) |normed_q|
         normed_q
     else
         Q;
@@ -7214,7 +7214,7 @@ fn decoderBlockImpl(
     else if (fused_k_rope) |roped_k|
         roped_k
     else if (!shares_kv)
-        if (try maybeApplyQKHeadNormWithCleanup(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf, raw_overrides.cleanup)) |normed_k|
+        if (try maybeApplyQKHeadNormWithCleanup(cb, allocator, config, K, total, num_kv_heads * head_dim, layer, "k", head_dim, &name_buf, decode_context, raw_overrides.cleanup)) |normed_k|
             normed_k
         else
             K
@@ -8020,10 +8020,10 @@ pub fn maybeApplyQKHeadNorm(
     head_dim: u32,
     buf: *[256]u8,
 ) !?CT {
-    return maybeApplyQKHeadNormWithCleanup(cb, allocator, config, tensor, total_rows, total_dim, layer, proj, head_dim, buf, null);
+    return maybeApplyQKHeadNormWithCleanup(cb, allocator, config, tensor, total_rows, total_dim, layer, proj, head_dim, buf, null, null);
 }
 
-pub fn maybeApplyQKHeadNormWithCleanup(
+fn maybeApplyQKHeadNormWithCleanup(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
@@ -8034,6 +8034,7 @@ pub fn maybeApplyQKHeadNormWithCleanup(
     proj: []const u8,
     head_dim: u32,
     buf: *[256]u8,
+    decode_context: ?*const DecodeContext,
     cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
 ) !?CT {
     switch (config.family) {
@@ -8056,7 +8057,7 @@ pub fn maybeApplyQKHeadNormWithCleanup(
         defer freeTensorWithCleanup(cb, reshaped, cleanup);
         const normed_flat = try cb.rmsNorm(reshaped, adjusted_weight, head_dim, config.norm_eps);
         defer freeTensorWithCleanup(cb, normed_flat, cleanup);
-        return try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total_rows, total_dim, cleanup);
+        return try reshape2dOwnedWithCleanup(cb, allocator, normed_flat, total_rows, total_dim, decode_context, cleanup);
     }
 
     // CPU fallback (native — rmsNorm handles chunked dim natively).
@@ -8836,18 +8837,19 @@ fn maybeDebugTensorLastRowDiff(
 }
 
 pub fn reshape2dOwned(cb: *const ComputeBackend, allocator: std.mem.Allocator, tensor: CT, rows: usize, cols: usize) !CT {
-    return reshape2dOwnedWithCleanup(cb, allocator, tensor, rows, cols, null);
+    return reshape2dOwnedWithCleanup(cb, allocator, tensor, rows, cols, null, null);
 }
 
-pub fn reshape2dOwnedWithCleanup(
+fn reshape2dOwnedWithCleanup(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     tensor: CT,
     rows: usize,
     cols: usize,
+    decode_context: ?*const DecodeContext,
     cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
 ) !CT {
-    try validateForwardCleanup(cb, cleanup);
+    try validateDecoderForwardCleanup(cb, cleanup, decode_context);
     const shape = [_]i32{ @intCast(rows), @intCast(cols) };
     if (try cb.cloneTensorShape(tensor, &shape)) |cloned| return cloned;
 
