@@ -900,7 +900,10 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const external_results = decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders) or
         (if (bound.having) |*program| decision.hasExternal(program) else false);
     const source_ordered = grouped.finalized != null and bound.ordered.len == 0 and bound.collections.len == 0 and (statement.order_by.len == 0 or grouped.finalized.?.ordered);
-    const direct_delivery = source_ordered and !external_results;
+    // An unordered child consumed to completion needs no stabilization sort.
+    // Ordered consumers retain the existing ordering contract and TopK path.
+    const unordered_drain = context.sink != null and statement.order_by.len == 0 and statement.limit == null and statement.offset == null;
+    const direct_delivery = (source_ordered or unordered_drain) and !external_results;
     var top: ?operators.TopK = if (direct_delivery) null else try operators.TopK.initWithSpill(context.alloc, @min(capacity, grouped.groupCount()), orders, context.limits.retained_bytes, context.spill);
     defer if (top) |*owner| owner.deinit();
     var direct: std.ArrayList(operators.Row) = .empty;

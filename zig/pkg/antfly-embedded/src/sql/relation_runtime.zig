@@ -2710,9 +2710,13 @@ fn Engine(comptime Context: type) type {
             fn prepareSetCapacity(self: *Iterator, values: []const Datum, set: @FieldType(@FieldType(binding.Node, "operation"), "set")) !void {
                 if (self.set_external != null) return;
                 const manager = self.engine.context.spill orelse return;
-                // Keep headroom for run construction while transferring the
-                // hash state. Account for actual arena capacity, not row count.
-                const limit = self.engine.context.limits.retained_bytes / 4;
+                // Hash state, spill construction and surrounding operators
+                // share a single budget. Promote before shared headroom is
+                // exhausted even when this set is below its local allowance.
+                const alloc = self.engine.context.alloc;
+                const workspace = self.engine.context.limits.retained_bytes / 4;
+                const available = @import("memory_budget.zig").headroom(alloc) orelse workspace * 2;
+                const limit = @min(workspace, available / 2);
                 var needed: usize = @sizeOf(SetEntry) + 128;
                 for (values) |value| needed +|= try operators.datumBytes(value);
                 const retained = self.arena.queryCapacity() +| (self.set_entries.capacity *| @sizeOf(SetEntry)) +| (self.set_heads.capacity() *| 32);
@@ -4037,7 +4041,13 @@ fn Engine(comptime Context: type) type {
                     self.ordinal += 1;
                     const id = try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal});
                     try rows.append(alloc, try catalog.Row.fromDatums(alloc, id, layout, values));
-                    if (bytes >= self.engine.context.limits.page_bytes) {
+                    const statement_alloc = self.engine.context.alloc;
+                    const available = @import("memory_budget.zig").headroom(statement_alloc) orelse std.math.maxInt(usize);
+                    // The parent must still bind/evaluate this decoded page.
+                    // Yield a prefix instead of retaining an oversized page
+                    // while a blocking child owns most of the statement quota.
+                    const parent_workspace = 4096 +| (bytes +| rows.items.len *| @sizeOf(catalog.Row)) *| 2;
+                    if (bytes >= self.engine.context.limits.page_bytes or available <= parent_workspace) {
                         stopped_for_bytes = true;
                         break;
                     }

@@ -2934,10 +2934,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_connection_admission_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL connection command admission"});
     sql_connection_admission_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-connection-admission-test", "Verify public SQL rejects overlapping connection commands before mutating their owners").dependOn(&sql_connection_admission_run.step);
-    const sql_role_defaults_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "mounted SQL original database defaults", "SQL database defaults read authority", "HTTP role default timeout retains hard limits and includes connection lookup time" });
+    const role_default_filters = [_][]const u8{ "mounted SQL original role defaults retain old logins admit future defaults and recover cold connections", "HTTP role default timeout retains hard limits and includes connection lookup time" };
+    const sql_role_defaults_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &role_default_filters);
     sql_role_defaults_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-role-defaults-test", "Run original role default DDL with login baselines and cold metadata/session recovery").dependOn(&sql_role_defaults_run.step);
-    b.step("antfly-api-sql-setting-defaults-test", "Verify shared role and database defaults through public login, reset and cold recovery boundaries").dependOn(&sql_role_defaults_run.step);
+    const sql_setting_defaults_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &(role_default_filters ++ [_][]const u8{ "mounted SQL original database defaults", "SQL database defaults read authority" }));
+    sql_setting_defaults_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-setting-defaults-test", "Verify shared role and database defaults through public login, reset and cold recovery boundaries").dependOn(&sql_setting_defaults_run.step);
     const sql_primary_key_rewrite_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL ADD PRIMARY KEY publishes only validated fresh generation"});
     sql_primary_key_rewrite_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite publication and failure cases")

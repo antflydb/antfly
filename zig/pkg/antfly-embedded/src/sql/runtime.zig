@@ -1396,7 +1396,13 @@ pub const Context = struct {
                 var decision_page = std.heap.ArenaAllocator.init(self.alloc);
                 defer decision_page.deinit();
                 const scratch = decision_page.allocator();
-                const chunk_cells = try @import("decision_eval.zig").rowPage(scratch, self.binding.scalars, page.rows[first..], self.limits.page_rows, self.limits.page_bytes);
+                // Input pages can stay pinned while a blocking producer and
+                // output sink hold the rest of the statement's memory.
+                const width = self.binding.scalars.columns.len + fields.items.len + self.binding.scalars.orders.len;
+                const row_workspace = 256 +| width *| (@sizeOf(Datum) * 4);
+                const available = MemoryBudget.headroom(self.alloc) orelse std.math.maxInt(usize);
+                const row_limit = @min(self.limits.page_rows, @max(1, available / 2 / row_workspace));
+                const chunk_cells = try @import("decision_eval.zig").rowPage(scratch, self.binding.scalars, page.rows[first..], row_limit, self.limits.page_bytes);
                 const chunk_rows = page.rows[first..][0..chunk_cells.len];
                 const page_cells = chunk_cells;
                 const predicate_values = if (self.binding.scalars.predicate) |*predicate|

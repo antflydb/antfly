@@ -475,14 +475,12 @@ pub const Grouped = struct {
             const index = self.partition_index;
             self.partition_index += 1;
             if (self.partitions[index] == null and self.partition_inputs[index].items.len == 0) continue;
-            var retained = self.bytes / 2;
-            for (self.specs) |spec| if (spec.input_element == .numeric) {
-                // Exact finalization can own a coefficient, a rendered result
-                // and downstream sort payload simultaneously. Reserve shared
-                // headroom for delivery before retaining this hash partition.
-                if (@import("memory_budget.zig").headroom(self.a)) |available| retained = @min(retained, available / 4);
-                break;
-            };
+            // Partition reduction, spill handoff and downstream delivery
+            // all charge the same statement budget. Admit hash state against
+            // live headroom even for fixed-width reducers nested in a plan.
+            const workspace = self.bytes / 2;
+            const available = @import("memory_budget.zig").headroom(self.a) orelse self.bytes *| 2;
+            const retained = @min(workspace, available / 4);
             self.local = try operators.Grouped.create(self.a, self.specs, .{ .bytes = retained, .groups = std.math.maxInt(usize) });
             if (self.partitions[index]) |*file| {
                 try self.loadFile(file, 0);

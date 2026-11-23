@@ -2461,14 +2461,11 @@ pub const Grouped = struct {
         if (self.failed or self.finished) return error.InvalidSqlBackendResponse;
         if (inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         self.key_count = keys.len;
-        const disk_patterns = for (self.specs) |spec| {
-            if (spec.kind == .pattern_set or spec.kind == .array_agg) break true;
-        } else false;
         if (self.external == null and self.limits.spill != null) {
-            if (disk_patterns) try self.startSpill();
-        }
-        if (self.external == null and self.limits.spill != null) {
-            if (!try self.canRetain(keys, inputs)) try self.startSpill();
+            const disk_patterns = for (self.specs) |spec| {
+                if (spec.kind == .pattern_set) break true;
+            } else false;
+            if (disk_patterns or !try self.canRetain(keys, inputs)) try self.startSpill();
         }
         if (self.external) |external| {
             try external.add(keys, inputs, self.source_ordinal orelse self.rows_seen);
@@ -3263,6 +3260,15 @@ pub const Grouped = struct {
         needed +|= (try self.key_columns.appendBytes(keys)) *| 4;
         for (inputs) |input| needed +|= (try datumBytes(input)) *| 4;
         needed +|= try self.numericGrowth(keys, inputs);
+        const uses_collection = for (self.specs) |spec| {
+            if (spec.kind == .array_agg) break true;
+        } else false;
+        if (uses_collection) if (try self.findGroup(keys)) |slot| {
+            for (self.state_columns) |column| if (column.spec.kind == .array_agg) {
+                const existing = column.values.dynamic.items[slot].collection.?;
+                needed +|= MemoryBudget.arrayListGrowthBytes(existing.values, 1);
+            };
+        };
         for (self.state_columns, inputs) |*column, input| needed +|= column.updateGrowth(input, 1);
         return self.budget.live <= self.budget.limit / 2 and needed <= self.budget.limit -| self.budget.live;
     }
