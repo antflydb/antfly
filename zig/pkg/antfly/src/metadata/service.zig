@@ -4990,12 +4990,15 @@ pub fn ensureQueryPopulationCapabilityWithContext(service: anytype, context: api
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_population_version);
 }
 
-pub fn ensureRestoreStagingDecoderWithContext(service: anytype, action: @import("restore_staging.zig").Command.Action, command_json: []const u8, context: api_operation.RequestContext) !void {
-    // Admission, cutover and publication all participate in the source pin guard.
-    const guards_replacement = switch (action) {
+fn restoreActionRequiresSourceGuard(action: @import("restore_staging.zig").Command.Action) bool {
+    return switch (action) {
         .reserve, .freeze_rewrite, .begin_cutover, .begin_activation, .publish => true,
         else => false,
     };
+}
+
+pub fn ensureRestoreStagingDecoderWithContext(service: anytype, action: @import("restore_staging.zig").Command.Action, command_json: []const u8, context: api_operation.RequestContext) !void {
+    const guards_replacement = restoreActionRequiresSourceGuard(action);
     const command: metadata_storage.TransitionCommand = .{ .apply_restore_staging = command_json };
     if (@import("schema_reader_wire.zig").requiresRestoreReservationOutcome(command_json)) {
         try context.ensureActive();
@@ -5013,11 +5016,14 @@ pub fn ensureCatalogAtomicAdmissionDecoderWithContext(service: anytype, context:
     try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_catalog_atomic_admission_version);
 }
 
-pub fn ensureCatalogRestoreDecoderWithContext(service: anytype, context: api_operation.RequestContext, progress: bool) !void {
-    return ensureDurableDecoderActivation(service, context, @max(
-        metadata_topology_protocol.source_restore_guard_version,
-        if (progress) metadata_topology_protocol.sql_catalog_progress_version else metadata_topology_protocol.sql_catalog_reservation_version,
-    ));
+pub fn ensureCatalogRestoreDecoderWithContext(service: anytype, context: api_operation.RequestContext, progress: ?@import("restore_staging.zig").Command.Action) !void {
+    // An already-admitted restore must continue to record receipts and cancel
+    // while a rolling upgrade is still installing the replacement guard.
+    const required = if (restoreActionRequiresSourceGuard(progress orelse .reserve))
+        metadata_topology_protocol.source_restore_guard_version
+    else
+        metadata_topology_protocol.sql_catalog_progress_version;
+    return ensureDurableDecoderActivation(service, context, required);
 }
 
 /// Capability observation alone does not install the apply-side barrier. Own
@@ -27028,6 +27034,9 @@ test "source control requires its coordinated decoder floor before metadata prop
         contract.checkpoint_authority.successor_protocol_version,
         metadata_topology_protocol.source_successor_retirement_guard_version,
         contract.payload_prewrite_protocol_version,
+        contract.epoch_attempt_retirement_protocol_version,
+        contract.epoch_attempt_progress_protocol_version,
+        metadata_topology_protocol.source_restore_guard_version,
     };
     for (floors[0 .. floors.len - 1], floors[1..]) |previous, next|
         try std.testing.expect(previous < next);

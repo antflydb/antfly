@@ -3159,7 +3159,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .sql_restore_progress => |command| {
             if (!context.setting_admin) return error.Forbidden;
             const control = @import("../metadata/restore_coordinator_control.zig");
-            try @import("../metadata/service.zig").ensureCatalogRestoreDecoderWithContext(svc, context, true);
+            try @import("../metadata/service.zig").ensureCatalogRestoreDecoderWithContext(svc, context, command.action);
 
             try control.acceptCatalogProgress(svc, alloc, command, context);
             return alloc.dupe(u8, "true");
@@ -3167,7 +3167,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .sql_restore_reserve => |request| {
             if (!context.setting_admin) return error.Forbidden;
             const control = @import("../metadata/restore_coordinator_control.zig");
-            try @import("../metadata/service.zig").ensureCatalogRestoreDecoderWithContext(svc, context, false);
+            try @import("../metadata/service.zig").ensureCatalogRestoreDecoderWithContext(svc, context, null);
 
             var job = try control.reserveCatalog(svc, alloc, request.plan, request.participant, context);
             defer job.deinit();
