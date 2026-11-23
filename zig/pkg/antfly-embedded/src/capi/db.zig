@@ -1500,7 +1500,13 @@ pub fn beginWithIdAndParticipants(
     for (participants, 0..) |*entry, i| {
         entry.* = participants_ptr.?[i].bytes();
     }
-    _ = try handle.database().*.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, participants);
+    // Preserve the raw C API's policy barrier. The shared producer BEGIN
+    // allows metadata-only admission for authenticated serving paths.
+    var raw_policy_lease = try handle.database().local_execution.row_policy_gate.enterRaw();
+    defer raw_policy_lease.release();
+    // The exported local C API is trusted ordinary ingress. Preserve its
+    // original follower role and terminal-retention behavior.
+    _ = try handle.database().*.beginProducerTransactionScoped(txn_id, timestamp_ns, timestamp_ns, participants, false, false, null, .ordinary);
 }
 
 pub fn writeIntentsInternal(
@@ -1539,6 +1545,7 @@ pub fn writeIntentsInternal(
     }
 
     try handle.database().*.writeTransaction(txn_id, .{
+        .completion_ordinary_producer = true,
         .writes = writes[0..write_len],
         .deletes = deletes.items,
         .predicates = predicates,
@@ -1633,11 +1640,14 @@ pub fn trackedBatchWithWriterLaneHook(
     table_name: ?[]const u8,
     writer_lane_release_before_wait: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
 ) anyerror!void {
+    if ((req.source_producer != .unlabelled and req.source_producer != .ordinary) or req.transaction != null or req.online_source != null) return error.SourceTransactionIdentityConflict;
+    var ordinary = req;
+    ordinary.source_producer = .ordinary;
     const receipts = @import("outcome_receipts.zig");
-    const writer = receipts.activeWriter() orelse return database.batchTrackedWithMarkerAndWriterLaneHook(req, primary_committed, null, writer_lane_release_before_wait);
+    const writer = receipts.activeWriter() orelse return database.batchTrackedWithMarkerAndWriterLaneHook(ordinary, primary_committed, null, writer_lane_release_before_wait);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
-    database.batchTrackedWithMarkerAndWriterLaneHook(req, primary_committed, marker, writer_lane_release_before_wait) catch |err| {
+    database.batchTrackedWithMarkerAndWriterLaneHook(ordinary, primary_committed, marker, writer_lane_release_before_wait) catch |err| {
         if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;

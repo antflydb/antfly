@@ -93,6 +93,7 @@ pub const SplitReplicationCheckpoint = struct {
     range_start: []const u8 = "",
     range_end: []const u8 = "",
     delta_sequence: u64,
+    history_policy: ?@import("../committed_history.zig").Policy = null,
 };
 
 /// Identity inherited by an unpublished split destination. Every replicated
@@ -212,6 +213,8 @@ pub const TransactionMutation = union(enum) {
         document_revision_scope: ?@import("../document_revision_reservation.zig").Scope = null,
         sql_locks: ?@import("../pessimistic_lock/transaction.zig").Ref = null,
         external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
+        ordinary_producer: bool = false,
+        legacy_producer: bool = false,
         txn_id: TxnId,
         begin_timestamp: u64,
         created_at_ns: u64,
@@ -221,6 +224,13 @@ pub const TransactionMutation = union(enum) {
         /// use the shorter ordinary recovery retention.
         retain_terminal: bool = false,
         participants: []const []const u8,
+        /// Exact checksummed frozen plan; encoded only as begin_completion_v1.
+        completion_admission: ?[]const u8 = null,
+        completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
+        source_purpose: ?[32]u8 = null,
+        source_scope: ?@import("../source_scope.zig").Reference = null,
+        source_checkpoint: bool = false,
+        source_checkpoint_receipts: bool = false,
     },
     prepare: struct {
         replication_source_permit: ?@import("../../api/replication_source_apply.zig").Permit = null,
@@ -230,13 +240,28 @@ pub const TransactionMutation = union(enum) {
         topology_epoch: u64,
         external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
         external_activation: bool = false,
+        ordinary_producer: bool = false,
+        legacy_producer: bool = false,
+        completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
+        source_purpose: ?[32]u8 = null,
+        source_scope: ?@import("../source_scope.zig").Reference = null,
+        source_checkpoint: ?@import("../source_checkpoint.zig").Command = null,
     },
     resolve: struct {
         replication_source_permit: ?@import("../../api/replication_source_apply.zig").Permit = null,
+        completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
+        source_purpose: ?[32]u8 = null,
+        source_scope: ?@import("../source_scope.zig").Reference = null,
         txn_id: TxnId,
         status: TxnStatus,
         commit_version: u64,
         external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
+    },
+    /// Private complete-certificate publication, isolated from row effects.
+    publish_completion: struct {
+        txn_id: TxnId,
+        completion_owner: @import("../transaction_completion.zig").RoutedOwner,
+        certificate: []const u8,
     },
     /// Coordinator-side acknowledgement that one participant has durably
     /// learned the terminal decision. This must be ordered by coordinator
@@ -272,6 +297,9 @@ pub const BatchRequest = struct {
     graph_preparation: ?@import("prepared_graph_effects.zig").Admission = null,
     /// Private owner-leader checked lock control; never public batch JSON.
     sql_lock: ?@import("../pessimistic_lock/control.zig").Command = null,
+    /// Trusted origin carried by a separate private versioned envelope.
+    /// Public mutation promotion and older transport preserve unlabelled.
+    source_producer: @import("../source_producer_policy.zig").Producer = .unlabelled,
     /// Private ordered curator decision; never accepted from public batch JSON.
     resolver_review: ?@import("resolver_review.zig").Command = null,
     /// Trusted ingress attaches a signed write principal and the admission
@@ -437,6 +465,7 @@ pub const BatchRequest = struct {
     }
 
     fn hasNoExternalControlEffects(self: @This()) bool {
+        if (self.source_producer != .unlabelled) return false;
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
             // The scheme only interprets row effects, all of which this guard
             // independently rejects. Control-only retries cannot change the
@@ -444,6 +473,7 @@ pub const BatchRequest = struct {
             if (comptime std.mem.eql(u8, name, "document_version_scheme")) continue;
             if (comptime std.mem.eql(u8, name, "transaction") or
                 std.mem.eql(u8, name, "timestamp_ns") or std.mem.eql(u8, name, "sync_level")) continue;
+            if (comptime std.mem.eql(u8, name, "source_producer")) continue;
             const value = @field(self, name);
             switch (@typeInfo(@TypeOf(value))) {
                 .optional => if (value != null) return false,
@@ -461,8 +491,10 @@ pub const BatchRequest = struct {
 
     pub fn requireAtomicIntentShape(self: @This()) !void {
         if (!self.reject_graph_transform_projections or self.restore_staging_scope != null or self.restore_staging_plan_id != null) return error.InvalidBatchRequest;
+        if (self.source_producer != .unlabelled and self.source_producer != .ordinary) return error.InvalidBatchRequest;
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
             if (comptime @hasField(TransactionIntentRequest, name) or std.mem.eql(u8, name, "sync_level") or std.mem.eql(u8, name, "reject_graph_transform_projections")) continue;
+            if (comptime std.mem.eql(u8, name, "source_producer")) continue;
             const value = @field(self, name);
             switch (@typeInfo(@TypeOf(value))) {
                 .optional => if (value != null) return error.InvalidBatchRequest,
@@ -1952,6 +1984,19 @@ pub const TransactionIntentRequest = struct {
     timestamp_ns: u64 = 0,
     external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
     external_activation: bool = false,
+    /// Trusted private origin. Missing labels on older requests stay absent.
+    completion_ordinary_producer: bool = false,
+    completion_legacy_producer: bool = false,
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
+    /// Trusted digest computed from canonical private PREPARE before native
+    /// materialization. A frozen v2 plan rejects omission or substitution.
+    completion_input_digest: ?[32]u8 = null,
+    /// Whole-source ownership only; root-local checkpoint admission stays separate.
+    completion_source_purpose: ?[32]u8 = null,
+    completion_source_scope: ?@import("../source_scope.zig").Reference = null,
+    completion_source_checkpoint: ?@import("../source_checkpoint.zig").Command = null,
+    /// Trusted source transaction metadata; public mutation JSON never sets it.
+    source_admission: ?@import("../source_admission.zig").Command = null,
     commit_requires: ?CommitRequires = null,
     prepared_enrichments_json: ?[]const u8 = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,
@@ -2003,10 +2048,10 @@ pub const TransactionIntentRequest = struct {
 
     /// new field lacks a mapping, exactly as the prepare transport does.
     pub fn asAtomicBatch(self: @This()) !BatchRequest {
-        if (self.replication_source_permit != null or self.document_revision_handoff != null or self.external_decision_owner != null or self.external_activation or self.publication_capture != null) return error.InvalidTxnRequest;
+        if (self.replication_source_permit != null or self.document_revision_handoff != null or self.external_decision_owner != null or self.external_activation or self.publication_capture != null or self.completion_owner != null or self.completion_ordinary_producer or self.completion_legacy_producer or self.completion_source_purpose != null or self.completion_source_scope != null or self.completion_source_checkpoint != null or self.source_admission != null or self.completion_input_digest != null) return error.InvalidTxnRequest;
         var batch: BatchRequest = .{};
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture")) continue;
+            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
             if (!@hasField(BatchRequest, name)) @compileError("atomic intent field requires batch transport: " ++ name);
             @field(batch, name) = @field(self, name);
         }
@@ -2018,7 +2063,7 @@ pub const TransactionIntentRequest = struct {
         try batch.requireAtomicIntentShape();
         var request: @This() = .{};
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture")) continue;
+            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
             if (!@hasField(BatchRequest, name)) @compileError("atomic intent field requires batch transport: " ++ name);
             @field(request, name) = @field(batch, name);
         }
@@ -2026,9 +2071,9 @@ pub const TransactionIntentRequest = struct {
     }
 
     pub fn asBatch(self: @This(), txn_id: TxnId, topology_epoch: u64) BatchRequest {
-        var batch: BatchRequest = .{ .transaction = .{ .prepare = .{ .replication_source_permit = self.replication_source_permit, .txn_id = txn_id, .topology_epoch = topology_epoch, .external_decision_owner = self.external_decision_owner, .external_activation = self.external_activation, .document_revision_handoff = self.document_revision_handoff, .publication_capture = self.publication_capture } } };
+        var batch: BatchRequest = .{ .transaction = .{ .prepare = .{ .replication_source_permit = self.replication_source_permit, .txn_id = txn_id, .topology_epoch = topology_epoch, .external_decision_owner = self.external_decision_owner, .external_activation = self.external_activation, .document_revision_handoff = self.document_revision_handoff, .publication_capture = self.publication_capture, .completion_owner = self.completion_owner, .ordinary_producer = self.completion_ordinary_producer, .legacy_producer = self.completion_legacy_producer, .source_purpose = self.completion_source_purpose, .source_scope = self.completion_source_scope, .source_checkpoint = self.completion_source_checkpoint } } };
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture")) continue;
+            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
             if (!@hasField(BatchRequest, name)) @compileError("transaction intent field requires batch transport: " ++ name);
             @field(batch, name) = @field(self, name);
         }
@@ -2038,12 +2083,51 @@ pub const TransactionIntentRequest = struct {
     pub fn fromBatch(batch: BatchRequest) !@This() {
         const transaction = batch.transaction orelse return error.InvalidBatchRequest;
         if (transaction != .prepare) return error.InvalidBatchRequest;
-        var request: @This() = .{ .replication_source_permit = transaction.prepare.replication_source_permit, .external_decision_owner = transaction.prepare.external_decision_owner, .external_activation = transaction.prepare.external_activation, .document_revision_handoff = transaction.prepare.document_revision_handoff, .publication_capture = transaction.prepare.publication_capture };
+        var request: @This() = .{ .replication_source_permit = transaction.prepare.replication_source_permit, .external_decision_owner = transaction.prepare.external_decision_owner, .external_activation = transaction.prepare.external_activation, .document_revision_handoff = transaction.prepare.document_revision_handoff, .publication_capture = transaction.prepare.publication_capture, .completion_owner = transaction.prepare.completion_owner, .completion_ordinary_producer = transaction.prepare.ordinary_producer, .completion_legacy_producer = transaction.prepare.legacy_producer, .completion_source_purpose = transaction.prepare.source_purpose, .completion_source_scope = transaction.prepare.source_scope, .completion_source_checkpoint = transaction.prepare.source_checkpoint };
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture")) continue;
+            if (comptime std.mem.eql(u8, name, "replication_source_permit") or std.mem.eql(u8, name, "external_decision_owner") or std.mem.eql(u8, name, "external_activation") or std.mem.eql(u8, name, "document_revision_handoff") or std.mem.eql(u8, name, "publication_capture") or std.mem.eql(u8, name, "completion_owner") or std.mem.eql(u8, name, "completion_ordinary_producer") or std.mem.eql(u8, name, "completion_legacy_producer") or std.mem.eql(u8, name, "completion_source_purpose") or std.mem.eql(u8, name, "completion_source_scope") or std.mem.eql(u8, name, "completion_source_checkpoint") or std.mem.eql(u8, name, "source_admission") or std.mem.eql(u8, name, "completion_input_digest")) continue;
             if (!@hasField(BatchRequest, name)) @compileError("transaction intent field requires batch transport: " ++ name);
             @field(request, name) = @field(batch, name);
         }
+        return request;
+    }
+
+    pub fn sourcePurpose(self: @This()) !?[32]u8 {
+        if ((self.completion_ordinary_producer and self.completion_legacy_producer) or ((self.completion_ordinary_producer or self.completion_legacy_producer) and (self.completion_source_purpose != null or self.completion_source_scope != null or self.completion_source_checkpoint != null or self.source_admission != null))) return error.SourceTransactionIdentityConflict;
+        if (self.completion_source_scope) |scope| {
+            try scope.validate();
+            if (self.completion_source_purpose == null or self.completion_owner == null or self.source_admission != null) return error.InvalidSourceAdmission;
+            if (self.completion_source_checkpoint) |checkpoint| {
+                if (checkpoint.receipt_window == 0 or !std.mem.eql(u8, &scope.binding, &checkpoint.binding) or scope.sequence != checkpoint.sequence) return error.SourceTransactionIdentityConflict;
+            }
+        }
+        if (self.completion_source_checkpoint) |checkpoint| {
+            try checkpoint.validate();
+            const purpose = self.completion_source_purpose orelse return error.InvalidSourceAdmission;
+            if (!std.mem.eql(u8, &checkpoint.purpose, &purpose)) return error.SourceTransactionIdentityConflict;
+        }
+        if (self.completion_source_purpose) |purpose| {
+            if (self.source_admission != null or self.completion_owner == null or std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+            return purpose;
+        }
+        return if (self.source_admission) |command| command.fingerprint() else null;
+    }
+
+    /// Compile the complete authenticated intent before freezing its input
+    /// digest. A source command requires its global checkpoint participant;
+    /// dropping it into a root-local PREPARE would lose acknowledgement safety.
+    pub fn completionBatch(self: @This(), txn_id: TxnId, begin_timestamp: u64, topology_epoch: u64) !BatchRequest {
+        if (self.source_admission != null) return error.UnsupportedOperation;
+        _ = try self.sourcePurpose();
+        if (self.completion_input_digest != null) return error.InvalidBatchRequest;
+        if (self.restore_staging_scope != null or self.restore_staging_plan_id != null or self.external_decision_owner != null or self.external_activation) return error.UnsupportedOperation;
+        const owner = self.completion_owner orelse return error.InvalidBatchRequest;
+        try owner.validate();
+        if (begin_timestamp == 0 or topology_epoch != owner.topology_epoch) return error.TopologyChanged;
+        var request = self.asBatch(txn_id, topology_epoch);
+        request.timestamp_ns = begin_timestamp;
+        request.sync_level = .write;
+        request.document_version_scheme = .revision_v1;
         return request;
     }
 };

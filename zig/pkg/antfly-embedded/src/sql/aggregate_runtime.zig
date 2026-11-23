@@ -520,7 +520,7 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner
 fn supportsWeights(bound: *const binding.Bound) bool {
     if (bound.ordered.len != 0) return false;
     for (bound.specs) |spec| {
-        if (spec.kind == .pattern_set) return false;
+        if (spec.kind == .pattern_set or spec.kind == .array_agg) return false;
         if (!spec.distinct and (spec.kind == .sum or spec.kind == .avg) and spec.input_type != .integer and spec.input_element != .numeric) {
             // AVG can retain an exact weighted binary64 total. SUM keeps its
             // ordered overflow behavior and REAL keeps its own rounding rules.

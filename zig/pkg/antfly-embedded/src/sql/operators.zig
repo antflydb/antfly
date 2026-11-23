@@ -877,6 +877,7 @@ pub const Aggregate = struct {
                 if (self.selected) |*old| old.deinit();
                 self.selected = selected;
             },
+            .array_agg => unreachable,
             .pattern_set => {
                 // DISTINCT owns the string; the JSON array borrows that stable
                 // copy until the grouped operator releases both together.
@@ -2462,7 +2463,7 @@ pub const Grouped = struct {
         if (inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         self.key_count = keys.len;
         const disk_patterns = for (self.specs) |spec| {
-            if (spec.kind == .pattern_set) break true;
+            if (spec.kind == .pattern_set or spec.kind == .array_agg) break true;
         } else false;
         if (self.external == null and self.limits.spill != null) {
             if (disk_patterns) try self.startSpill();
@@ -2507,7 +2508,7 @@ pub const Grouped = struct {
             state.distinct = spec.distinct;
             try state.update(input);
             if (spec.distinct or state.count == 0 or Aggregate.presenceOnly(spec.kind)) continue;
-            if (spec.kind == .pattern_set or ((spec.kind == .sum or spec.kind == .avg) and state.numeric == null and spec.input_type != .integer)) return error.InvalidSqlBackendResponse;
+            if (spec.kind == .pattern_set or spec.kind == .array_agg or ((spec.kind == .sum or spec.kind == .avg) and state.numeric == null and spec.input_type != .integer)) return error.InvalidSqlBackendResponse;
             if (state.numeric) |reducer| {
                 reducer.state.count = weight;
                 reducer.state.nan_count *= weight;
@@ -4736,6 +4737,32 @@ test "SQL NUMERIC aggregate exponent gaps spill before row worker and checkpoint
         try std.testing.expect((try group.nextResult(arena.allocator())) == null);
         try std.testing.expect(quota.peak <= quota.limit);
     }
+}
+
+test "SQL array_agg retains ordered nulls across on-disk group replay" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const group = try Grouped.create(a, &.{.{ .kind = .array_agg, .input_type = .integer, .input_element = .int32 }}, .{ .bytes = 128 * 1024, .spill = &manager });
+    defer group.deinit();
+    for (0..4000) |index| {
+        const value = if (index % 11 == 0) Datum{} else Datum.json(.{ .integer = @intCast(index) });
+        try group.add(&.{}, &.{value});
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = (try group.nextResult(arena.allocator())).?.aggregates[0].array.?;
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.int32, result.element_type);
+    try std.testing.expectEqual(@as(usize, 4000), result.cardinality());
+    for (0..4000) |index| {
+        const cell = result.flatCell(index);
+        if (index % 11 == 0) try std.testing.expect(cell.sql_null) else try std.testing.expectEqual(@as(i64, @intCast(index)), cell.value.integer);
+    }
+    try std.testing.expect(manager.written_bytes > 0);
 }
 
 test "SQL pattern sets spill distinct state and preserve reusable quantified null semantics" {

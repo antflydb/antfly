@@ -17,6 +17,15 @@
 //! arena for every describe/execute call; returned slices must use that arena.
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
+pub const replication_commands = @import("replication_commands.zig");
+pub const pgoutput = @import("pgoutput.zig");
+
+const sql_session = @import("antfly_local_sources").sql_session;
+const callback_abi = @import("antfly_local_sources").runtime_callback_abi;
+pub const TransactionOptions = struct {
+    isolation: ?sql_session.Isolation = null,
+    mode: ?sql_session.ReadMode = null,
+};
 
 pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration, bytea, void };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
@@ -308,6 +317,16 @@ pub const Cells = struct {
 pub const Backend = struct {
     context: *anyopaque,
     vtable: *const VTable,
+    replication_dispatch: ReplicationBoundary.Dispatch = ReplicationBoundary.local_dispatch,
+
+    const ReplicationBoundary = callback_abi.Boundary(struct {
+        open_replication_session: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!ReplicationSession,
+    });
+
+    pub fn openReplicationSession(self: Backend, a: std.mem.Allocator, identity: Identity, request: Request) !ReplicationSession {
+        const open = self.vtable.open_replication_session orelse return error.UnsupportedReplicationMode;
+        return ReplicationBoundary.callRemote("open_replication_session", self.replication_dispatch, open, .{ self.context, a, identity, request });
+    }
 
     pub const VTable = struct {
         native_parameters: bool = false,
@@ -329,6 +348,11 @@ pub const Backend = struct {
         /// Compare resolved targets across compatible schema versions of a bound portal.
         same_binding_targets: ?*const fn ([]const u8, []const u8) bool = null,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
+        /// Attach a qualified cut to the existing SQL transaction. The owner
+        /// checks isolation, prior transaction work and import eligibility.
+        import_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const u8) anyerror!void = null,
+        /// Change transaction characteristics before any readings or writes.
+        set_transaction_options: ?*const fn (*anyopaque, Identity, Request, TransactionOptions) anyerror!void = null,
         /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
         load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("antfly_local_sources").sql_setting_catalog.RawSnapshot = null,
         validate_namespace: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
@@ -352,6 +376,11 @@ pub const Backend = struct {
         reserve_completion: ?*const fn (*anyopaque, *@import("completion.zig").Completion, usize) anyerror!void = null,
         pin_completion: ?*const fn (*anyopaque, std.mem.Allocator, *@import("completion.zig").Completion) void = null,
         completion_safe: ?*const fn (*anyopaque, Identity) bool = null,
+        /// Authenticate explicit replication privilege and runtime capability;
+        /// a SQL identity or SELECT grant alone is insufficient. The returned
+        /// owner borrows this connection's identity until close. Missing
+        /// capability refuses logical startup, before any replication command.
+        open_replication_session: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!ReplicationSession = null,
     };
 };
 
@@ -371,3 +400,131 @@ pub const ReadStream = struct {
     validate: ?*const fn (*anyopaque, std.mem.Allocator, Request) anyerror!void = null,
 };
 pub const StreamPage = struct { result: Result, exhausted: bool };
+
+/// Connection-owned replication authority. Each operation must revalidate live
+/// credential, immutable database/table scope and publication/slot ownership.
+/// authorize runs at startup (null command), before execution and before reply.
+/// Commands and results borrow their caller arena. close releases connection
+/// leases/exported snapshots; durable recovery owns ambiguous metadata effects.
+pub const ReplicationSession = struct {
+    context: *anyopaque,
+    authorize: *const fn (*anyopaque, std.mem.Allocator, Request, ?replication_commands.Command) anyerror!void,
+    command: *const fn (*anyopaque, std.mem.Allocator, Request, replication_commands.Command) anyerror!Result,
+    close: *const fn (*anyopaque) void,
+    /// Absent until the owner can retain/spool complete projected transactions
+    /// and map their serialized positions durably. Never opens a SQL cursor.
+    open_stream: ?*const fn (*anyopaque, std.mem.Allocator, Request, replication_commands.Start) anyerror!ReplicationStream = null,
+    boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+
+    const Boundary = callback_abi.Boundary(struct {
+        authorize: @FieldType(ReplicationSession, "authorize"),
+        command: @FieldType(ReplicationSession, "command"),
+        open_stream: @typeInfo(@FieldType(ReplicationSession, "open_stream")).optional.child,
+    });
+
+    pub fn authorizeRequest(self: ReplicationSession, a: std.mem.Allocator, request: Request, command: ?replication_commands.Command) !void {
+        return Boundary.callRemote("authorize", self.boundary_dispatch, self.authorize, .{ self.context, a, request, command });
+    }
+
+    pub fn executeCommand(self: ReplicationSession, a: std.mem.Allocator, request: Request, command: replication_commands.Command) !Result {
+        return Boundary.callRemote("command", self.boundary_dispatch, self.command, .{ self.context, a, request, command });
+    }
+
+    pub fn openStream(self: ReplicationSession, a: std.mem.Allocator, request: Request, start: replication_commands.Start) !ReplicationStream {
+        const open = self.open_stream orelse return error.UnsupportedReplicationMode;
+        return Boundary.callRemote("open_stream", self.boundary_dispatch, open, .{ self.context, a, request, start });
+    }
+};
+
+/// All methods run serially on the connection coordinator. poll returns a
+/// bounded batch of whole pgoutput messages from durable committed spooling at
+/// the exact requested byte frontier. It must not retain an entire transaction in
+/// connection RAM or advance an acknowledgement. No-data returns immediately.
+/// feedback validates the slot fence and maps only complete issued intervals
+/// to durable acknowledgement. close runs after all reader/writer tasks join.
+pub const ReplicationStream = struct {
+    context: *anyopaque,
+    initial_lsn: pgoutput.Lsn,
+    /// Validated reconnect position; it can exceed initial_lsn when replay
+    /// rewinds an interior requested LSN to the transaction's Begin.
+    resume_lsn: pgoutput.Lsn,
+    initial_end_lsn: pgoutput.Lsn,
+    poll: *const fn (*anyopaque, std.mem.Allocator, Request, pgoutput.Lsn, u32) anyerror!ReplicationPoll,
+    feedback: *const fn (*anyopaque, std.mem.Allocator, Request, pgoutput.Feedback) anyerror!void,
+    close: *const fn (*anyopaque) void,
+    boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+
+    const Boundary = callback_abi.Boundary(struct {
+        poll: @FieldType(ReplicationStream, "poll"),
+        feedback: @FieldType(ReplicationStream, "feedback"),
+    });
+
+    pub fn readMessage(self: ReplicationStream, a: std.mem.Allocator, request: Request, after: pgoutput.Lsn, max_bytes: u32) !ReplicationPoll {
+        return Boundary.callRemote("poll", self.boundary_dispatch, self.poll, .{ self.context, a, request, after, max_bytes });
+    }
+
+    pub fn applyFeedback(self: ReplicationStream, a: std.mem.Allocator, request: Request, value: pgoutput.Feedback) !void {
+        return Boundary.callRemote("feedback", self.boundary_dispatch, self.feedback, .{ self.context, a, request, value });
+    }
+};
+pub const ReplicationChunk = struct { start_lsn: pgoutput.Lsn, bytes: []const u8 };
+pub const ReplicationPoll = struct {
+    end_lsn: pgoutput.Lsn,
+    chunk: ?ReplicationChunk = null,
+    chunks: []const ReplicationChunk = &.{},
+    owner: ?struct { context: *anyopaque, release: *const fn (*anyopaque) void } = null,
+    pub fn deinit(self: *@This()) void {
+        if (self.owner) |owner| owner.release(owner.context);
+        self.* = undefined;
+    }
+};
+
+test "replication transport preserves deferred errors through boundary dispatch" {
+    const Remote = struct {
+        fn poll(_: *anyopaque, _: std.mem.Allocator, _: Request, _: pgoutput.Lsn, _: u32) anyerror!ReplicationPoll {
+            return error.ReplicationReadDeferred;
+        }
+        fn feedback(_: *anyopaque, _: std.mem.Allocator, _: Request, _: pgoutput.Feedback) anyerror!void {
+            return error.ReplicationFeedbackDeferred;
+        }
+        fn close(_: *anyopaque) void {}
+
+        fn dispatch(
+            contract: *const @import("antfly_runtime_abi").native_abi.CallContract,
+            callback: *const anyopaque,
+            args: *const anyopaque,
+            output: ?*anyopaque,
+        ) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return ReplicationStream.Boundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    var context: u8 = 0;
+    const stream: ReplicationStream = .{
+        .context = &context,
+        .initial_lsn = @fromBackingInt(1),
+        .resume_lsn = @fromBackingInt(1),
+        .initial_end_lsn = @fromBackingInt(1),
+        .poll = Remote.poll,
+        .feedback = Remote.feedback,
+        .close = Remote.close,
+        .boundary_dispatch = Remote.dispatch,
+    };
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const request: Request = .{
+        .statement = "",
+        .io = std.testing.io,
+        .parameters = &.{},
+        .parameter_types = &.{},
+        .limit = 1,
+        .deadline = .{ .raw = std.Io.Clock.awake.now(std.testing.io), .clock = .awake },
+        .cancel_requested = &canceled,
+    };
+    try std.testing.expectError(error.ReplicationReadDeferred, stream.readMessage(std.testing.allocator, request, @fromBackingInt(1), 64));
+    try std.testing.expectError(error.ReplicationFeedbackDeferred, stream.applyFeedback(std.testing.allocator, request, .{
+        .written = @fromBackingInt(1),
+        .flushed = @fromBackingInt(1),
+        .applied = @fromBackingInt(1),
+        .client_time = 0,
+        .request_reply = false,
+    }));
+}

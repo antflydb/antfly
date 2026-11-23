@@ -23,6 +23,7 @@ pub const test_sources = [_][]const u8{
     "kernel_owner_provisioned_source_test.zig",
     "enrichment_compute_test.zig",
     "kernel_owner_handoff_reopen_test.zig",
+    "kernel_owner_legacy_terminal_test.zig",
 };
 
 /// Exercise the same storage archive linked by serving and embedded consumers.
@@ -97,6 +98,8 @@ pub fn add(
             tests.executable.root_module.addObject(test_metadata.object);
             if (index == 1) @import("../../../build_support/antfly/test_support.zig").addTestCheckStep(b, tests.object, "antfly-storage-owner-source-check", "Type-check the owning provisioned source tests without emitting their binary");
             runs[index] = tests.run(b);
+            if (index == 0) b.step("history-resolution-owner-test", "Verify compiled immutable resolution reads and qualified cuts").dependOn(&runs[index].step);
+            if (index == 1) b.step("history-resolution-routed-test", "Verify frozen routed completion receipt reads").dependOn(&runs[index].step);
             if (index == 2) {
                 b.step("enrichment-compute-owner-test", "Run the compiled media owner contract regressions").dependOn(&runs[index].step);
                 tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
@@ -233,7 +236,7 @@ pub fn add(
     const handoff_tests = @import("linked_tests.zig").add(b, .{
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = physical_module,
-        .filters = &.{ "storage owner handoff receipt survives shared-context hidden to public reopen", "storage owner Raft schema controls cross the checked archive", "storage owner native schema controls cross the checked archive", "storage owner durable catalog cold open" },
+        .filters = &.{ "storage owner handoff receipt survives shared-context hidden to public reopen", "storage owner Raft schema controls cross the checked archive", "storage owner native schema controls cross the checked archive", "storage owner durable catalog cold open", "storage owner legacy terminal resolution" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
@@ -242,6 +245,8 @@ pub fn add(
     const run_physical_owners = handoff_tests.run(b);
     runs[0].step.dependOn(&run_physical_owners.step);
     b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner receipt and schema-control reopen regressions")
+        .dependOn(&run_physical_owners.step);
+    b.step("antfly-storage-owner-legacy-terminal-test", "Run original terminal recovery through the native opaque owner and physical reopen")
         .dependOn(&run_physical_owners.step);
     return .{ .runs = std.mem.concat(b.allocator, *std.Build.Step.Run, &.{ &runs, additional_runs.items }) catch @panic("OOM"), .benchmark = benchmark };
 }

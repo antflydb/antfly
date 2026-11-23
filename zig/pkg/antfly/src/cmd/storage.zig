@@ -34,6 +34,20 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
         printUsage();
         return;
     }
+    if (std.mem.eql(u8, kind, "provision-pgwire-spool")) {
+        const directory = iterator.next() orelse return error.InvalidArguments;
+        if (!std.fs.path.isAbsolute(directory) or iterator.next() != null) return error.InvalidArguments;
+        const volume = try std.Io.Dir.cwd().openDir(init.io, directory, .{ .follow_symlinks = false });
+        volume.close(init.io);
+        var files = try @import("../serverless/artifacts/fs_store.zig").FsStore.initExisting(init.gpa, directory);
+        defer files.deinit();
+        const store = try files.spoolArtifactStore(.{});
+        var buffer: [128]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+        try stdout.interface.print("{s}\n", .{std.fmt.bytesToHex(&store.namespace_identity.?, .lower)});
+        try stdout.interface.flush();
+        return;
+    }
     if (!std.mem.eql(u8, kind, "migrate")) return error.InvalidArguments;
     const alloc = init.arena.allocator();
     var arguments: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -166,6 +180,7 @@ fn printProgress(_: ?*anyopaque, raw: []const u8) !void {
 }
 
 fn printUsage() void {
+    std.debug.print("Usage: antfly storage provision-pgwire-spool <absolute-directory>\n", .{});
     std.debug.print(
         \\usage: antfly storage migrate --table NAME --to vector-store --job ID [options]
         \\

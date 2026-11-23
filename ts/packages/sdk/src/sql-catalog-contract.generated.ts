@@ -33,6 +33,7 @@ export const sqlCatalogObjectKinds = [
   "view",
   "extension",
   "collation",
+  "publication",
   "subscription",
 ] as const;
 

@@ -656,6 +656,8 @@ pub const SchemaChange = union(enum) {
 
     /// Provenance is internal compiler data, never inferred from the spelling
     /// of an identifier or persisted as an editable public-schema attribute.
+    replica_identity: enum { default, full },
+
     pub fn generatedConstraintName(self: SchemaChange) ?[]const u8 {
         return switch (self) {
             .add_unique => |rule| if (rule.name_generated) rule.name else null,

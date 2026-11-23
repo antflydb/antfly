@@ -602,6 +602,7 @@ const Builder = struct {
                             break :sum .{ .cast = .{ .operand = argument, .type = output.kind.?, .element_type = output.element_type } };
                         },
                         .bool_and, .bool_or => .{ .cast = .{ .operand = argument, .type = .boolean } },
+                        .array_agg => .{ .call = .{ .name = "$array", .args = try self.alloc.dupe(*const ast.Scalar, &.{argument}) } },
                         .pattern_set => .{ .cast = .{ .operand = try self.scalarNode(.{ .cast = .{ .operand = argument, .type = .string } }), .type = .json } },
                         else => argument.*,
                     };
@@ -1034,7 +1035,9 @@ const Builder = struct {
             // Compiler-owned mutation metadata names themselves begin with
             // NUL. Match the complete bound column suffix before splitting
             // qualification; splitting at the last NUL would lose provenance.
-            if (!std.mem.eql(u8, column.name, name)) {
+            if (std.mem.eql(u8, column.name, name)) {
+                if (!column.unqualified_visible) continue;
+            } else {
                 if (name.len <= column.name.len or !std.mem.endsWith(u8, name, column.name)) continue;
                 const separator = name.len - column.name.len - 1;
                 if (name[separator] != 0 or !qualifierMatches(column, name[0..separator])) continue;
@@ -1245,7 +1248,19 @@ const Builder = struct {
         }
         result.predicate = if (text.residual) |input| try self.predicate(source.columns, input) else null;
         const groups = try self.alloc.alloc(*const ast.Scalar, statement.group_by.len);
-        for (statement.group_by, groups) |input, *out| out.* = try self.expression(source.columns, input, if (input.* == .column) result.columns else &.{});
+        for (statement.group_by, groups) |input, *out| {
+            out.* = self.expression(source.columns, input, &.{}) catch |err| fallback: {
+                if (err != error.UndefinedColumn or input.* != .column) return err;
+                var found: ?*const ast.Scalar = null;
+                for (result.columns) |projection| {
+                    if (!std.mem.eql(u8, projection.alias orelse projection.field, input.column)) continue;
+                    const candidate = projection.expression orelse try self.scalarNode(.{ .column = projection.field });
+                    if (found) |prior| if (!@import("aggregate_binding.zig").same(prior, candidate)) return error.AmbiguousSqlColumn;
+                    found = candidate;
+                }
+                break :fallback found orelse return err;
+            };
+        }
         result.group_by = groups;
         result.having = if (statement.having) |input| try self.expression(source.columns, input, &.{}) else null;
         const window_orders = @import("window_binding.zig").accepts(statement);

@@ -214,8 +214,8 @@ pub fn addressWalRow(a: A, scope: [32]u8, relation: Relation, change: foreign.Re
         .insert => .{ .before_key = null, .after_key = key, .after = row },
         .delete => .{ .before_key = key, .after_key = null, .after = null },
         .update => .{
-            .before_key = if (change.old_row) |old|
-                (try replicaKey(a, scope, relation, .{ .value = old, .json_null_fields = change.old_json_null_fields })) orelse return error.UnsupportedReplicationType
+            .before_key = if (change.before) |old|
+                (try replicaKey(a, scope, relation, .{ .value = old, .json_null_fields = change.before_json_null_fields })) orelse return error.UnsupportedReplicationType
             else
                 key,
             .after_key = key,
@@ -305,7 +305,7 @@ test "subscription capture WAL key moves preserve omitted values and null proven
         .relation = .{ .id = 15, .namespace = @constCast("public"), .name = @constCast("t") },
         .checkpoint = @constCast("0/20"),
         .row = patch,
-        .old_row = old_key,
+        .before = old_key,
     };
     const scope: [32]u8 = @splat(3);
     const addressed = try addressWalRow(a, scope, relation, change);
@@ -418,7 +418,7 @@ test "subscription capture WAL key moves preserve omitted values and null proven
     mutation.operation.replication_admit.wal_access = null;
     try std.testing.expectError(error.InvalidCatalogMutation, mutation.validate());
     try std.testing.expectEqual(@as(usize, 0), empty.permits.len);
-    change.old_row = null;
+    change.before = null;
     const unchanged = try addressWalRow(a, scope, relation, change);
     try std.testing.expectEqualStrings(unchanged.before_key.?, unchanged.after_key.?);
     change.relation.?.id += 1;

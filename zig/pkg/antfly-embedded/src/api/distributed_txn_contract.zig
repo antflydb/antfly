@@ -44,6 +44,7 @@ pub const PreDecisionContext = struct {
     document_revision_scope: ?@import("../storage/document_revision_reservation.zig").Scope = null,
     sql_locks: ?@import("../storage/pessimistic_lock/transaction.zig").Ref = null,
     external_decision_owner: ?@import("../storage/transactions.zig").ExternalDecisionOwner = null,
+    source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
     route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
@@ -87,6 +88,9 @@ pub const TableCommitRequest = struct {
     /// replacement native generation by supplying a table name alone.
     relation_owner_minter: ?@import("../common/relation_owner_authority.zig").Minter = null,
     sql_persistence: ?@import("../common/relation_persistence.zig").Descriptor = null,
+    /// Explicit trusted transaction origin. Older callers remain unlabelled.
+    source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
+    source_admission: ?@import("../storage/source_admission.zig").Command = null,
     bound_catalog_incarnation: ?[16]u8 = null,
     commit_requires: ?db_types.CommitRequires = null,
     /// Coordinator planning context, retained until cascade expansion finishes.
@@ -130,9 +134,19 @@ pub const TableCommitRequest = struct {
         return std.mem.eql(u8, field, "relation_owner_minter") or std.mem.eql(u8, field, "trigger_minter");
     }
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or ((comptime std.mem.eql(u8, field, "document_revision_handoffs")) and self.document_revision_handoffs.len == 0) or ((comptime std.mem.eql(u8, field, "graph_preparation")) and self.graph_preparation == null) or (comptime nativeJsonSkipFieldComptime(field)) or ((comptime std.mem.eql(u8, field, "sql_persistence")) and self.sql_persistence == null) or ((comptime std.mem.eql(u8, field, "graph_writes")) and self.graph_writes.len == 0) or ((comptime std.mem.eql(u8, field, "graph_deletes")) and self.graph_deletes.len == 0);
+        return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or ((comptime std.mem.eql(u8, field, "document_revision_handoffs")) and self.document_revision_handoffs.len == 0) or ((comptime std.mem.eql(u8, field, "graph_preparation")) and self.graph_preparation == null) or (comptime nativeJsonSkipFieldComptime(field)) or ((comptime std.mem.eql(u8, field, "sql_persistence")) and self.sql_persistence == null) or ((comptime std.mem.eql(u8, field, "graph_writes")) and self.graph_writes.len == 0) or ((comptime std.mem.eql(u8, field, "graph_deletes")) and self.graph_deletes.len == 0) or
+            (std.mem.eql(u8, field, "source_producer") and self.source_producer == .unlabelled);
     }
 };
+
+/// One transaction has one origin, including read-only and empty participants.
+/// Mixed/unknown authority cannot be filled in by routing or table identity.
+pub fn transactionProducer(tables: []const TableCommitRequest) !@FieldType(db_types.BatchRequest, "source_producer") {
+    const producer = if (tables.len == 0) .unlabelled else tables[0].source_producer;
+    if (producer == .scoped_source) return error.InvalidSourceAdmission;
+    for (tables) |table| if (table.source_producer != producer) return error.SourceTransactionIdentityConflict;
+    return producer;
+}
 
 pub const CommitConflict = struct {
     table_name: []const u8,

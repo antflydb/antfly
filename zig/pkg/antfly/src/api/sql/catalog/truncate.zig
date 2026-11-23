@@ -364,7 +364,7 @@ pub fn executeWithAdapterBound(root: *@import("../execution/execution.zig").Adap
     const principal = server_mod.storedDestinationPrincipal(identity);
     try server.requireEmptyGenerationAuthority(principal, names);
     var random: [16]u8 = undefined;
-    try (server.sharedApiIo() orelse return error.AsyncRestoreUnavailable).randomSecure(&random);
+    try (server.sharedApiIo() orelse return error.SqlTruncateCoordinatorRequired).randomSecure(&random);
     const key = std.fmt.bytesToHex(random, .lower);
     const idempotency_namespace = try std.fmt.allocPrint(a, "sql-truncate:{s}", .{principal});
     const job_id = try jobs.jobIdForIdempotency(a, idempotency_namespace, &key);

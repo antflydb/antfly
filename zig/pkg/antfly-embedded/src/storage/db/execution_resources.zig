@@ -1174,6 +1174,9 @@ pub const BatchExecutionOptions = struct {
     replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
     ordered_apply_receipt: ?OrderedApplyReceipt = null,
+    ordered_history_commit_time_ns: i64 = 0,
+    /// Trusted native ingress classification; missing old transport stays unlabelled.
+    source_producer: @import("../source_producer_policy.zig").Producer = .unlabelled,
     /// Metadata-authorized native hidden-child receipt identity. Never
     /// writes the data-Raft watermark into a native source-authority root.
     native_initial_child_entry: ?OrderedApplyReceipt = null,
@@ -1232,6 +1235,11 @@ pub const TransactionResolution = struct {
     document_revision_references: []const @import("../document_revision_reservation.zig").Reference = &.{},
     prepared_graph_effects_checked: bool = false,
     external_decision_owner: ?transactions_mod.ExternalDecisionOwner = null,
+    legacy_terminal: ?transactions_mod.LegacyTerminalResolution = null,
+    legacy_outcome_write: ?@import("../docstore.zig").KVPair = null,
+    source_scope: ?@import("../source_scope.zig").Reference = null,
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
+    source_purpose: ?[32]u8 = null,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
     commit_version: u64,

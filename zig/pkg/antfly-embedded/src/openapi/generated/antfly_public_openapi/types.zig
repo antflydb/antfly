@@ -8633,12 +8633,13 @@ pub const Permission = struct {
     }
 };
 
-/// Type of permission.
+/// Type of permission. replicate explicitly permits authorized changefeed and PostgreSQL logical replication access to the selected resource. It does not grant ordinary read, write, or administrative access. read, write, and curator do not imply replicate. admin includes replicate. Replication still requires current row/field policies and feed, slot, and publication ownership checks; a replication position is not an access credential.
 pub const PermissionType = enum {
     read,
     write,
     curator,
     admin,
+    replicate,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -8646,6 +8647,7 @@ pub const PermissionType = enum {
             .write => "write",
             .curator => "curator",
             .admin => "admin",
+            .replicate => "replicate",
         };
         try jw.write(s);
     }
@@ -8660,6 +8662,7 @@ pub const PermissionType = enum {
             .{ "write", .write },
             .{ "curator", .curator },
             .{ "admin", .admin },
+            .{ "replicate", .replicate },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

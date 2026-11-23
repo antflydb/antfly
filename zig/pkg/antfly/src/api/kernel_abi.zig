@@ -28,20 +28,28 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-// Combines the current control contract with retained document capabilities.
-// Stable relation identities change typed scope-manifest Resource elements.
-// Native range activation carries body-bound owner signers in request contexts.
-// Lookup callbacks carry borrowed native owner minters through checked preparation.
-// Captured schema publication carries the authenticated optional policy pair.
-// Combined privacy callbacks/options and native owner policy contracts.
-// Required core callback drains durable SQL sources before native close.
-// Main privacy fields plus the required native SQL shutdown callback.
-// Config callbacks add exact reserved-retirement owner preparation.
-// Main privacy fields compose with exact reserved-retirement capture.
-// Borrowed StatusSource adds exact native node/store endpoint discovery.
-// Fixed native TEMP maintenance callback and published restore control selection.
-// Neither operation grants row execution capability.
-pub const abi_version: u32 = 36;
+// Version 25 includes qualified source-plan callback ports in server config.
+// Version 26 changes routed batch callbacks with source checkpoint mutations.
+// Version 27 adds bounded source checkpoint receipt-window batch layouts.
+// Version 28 includes qualified checkpoint observation callback ports.
+// Version 30 adds the qualified source-scope observation callback.
+// Version 31 adds the authenticated source-scope lifecycle control port.
+// Version 32 adds the owned authenticated source retirement control port.
+// Version 33 fences routed batches with explicit ordinary transaction origin.
+// Version 34 fences routed batch producer origin layouts.
+// Version 35 fences routed legacy completion producer layouts.
+// Version 36 fences table transaction origin layouts and capability guards.
+// Version 37 fences producer pre-decision context layouts.
+// Version 38 includes the qualified producer-closure observation port.
+// Version 39 includes the producer-close submission callback.
+// Version 40 includes authenticated original-terminal recovery callbacks.
+// Version 41 includes authenticated bounded legacy inventory reads.
+// Version 42 includes the optional authenticated pgwire replication factory.
+// Version 43 includes the fenced PostgreSQL publication metadata port.
+// Version 44 includes the pgwire publication scope for native startup.
+// Version 45 adds the artifact history read provider to API configuration.
+// Version 46 combines CDC capabilities with SQL native relation and shutdown contracts.
+pub const abi_version: u32 = 46;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -201,6 +209,7 @@ pub const Capability = struct {
     pub const route_manifest: u64 = 1 << 3;
     pub const inference_admission_stats: u64 = 1 << 4;
     pub const internal_service_ingress: u64 = 1 << 5;
+    pub const lake_stream_owner: u64 = 1 << 6;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -239,6 +248,7 @@ pub const FunctionTable = extern struct {
     query_population_job: *const fn (*const CallContext) callconv(.c) Status,
     authorize_sql_lock: *const fn (*const CallContext) callconv(.c) Status,
     drain_sql_connections: *const fn (*const CallContext) callconv(.c) Status,
+    lake_stream_owner_options: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -260,7 +270,7 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     const known = Capability.core |
         Capability.route_manifest |
         Capability.inference_admission_stats |
-        Capability.internal_service_ingress;
+        Capability.internal_service_ingress | Capability.lake_stream_owner;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -271,6 +281,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("inference_admission_stats"));
     if (required_capabilities & Capability.internal_service_ingress != 0)
         required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
+    if (required_capabilities & Capability.lake_stream_owner != 0)
+        required = @max(required, functionTableFieldEnd("lake_stream_owner_options"));
     return required;
 }
 

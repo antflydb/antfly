@@ -106,6 +106,7 @@ fn cloneTableMode(alloc: std.mem.Allocator, record: TableRecord, publication: bo
         .schema_reader_requirements = record.schema_reader_requirements,
         .full_text_read_index = full_text_read_index,
         .storage = record.storage,
+        .routing_storage_binding = record.routing_storage_binding,
         .object_storage_generation = record.object_storage_generation,
         .object_storage_identity = record.object_storage_identity,
         .lake_index_catalog_json = lake_index_catalog_json,

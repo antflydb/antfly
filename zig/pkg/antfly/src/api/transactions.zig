@@ -546,6 +546,7 @@ pub const OwnedTransactionCommitRequest = struct {
                     if (std.mem.eql(u8, binding.logical, table.table_name) or std.mem.eql(u8, binding.physical, table.table_name)) break binding.sql_persistence;
                 } else null,
 
+                .source_producer = .ordinary,
                 .bound_catalog_incarnation = self.bound_catalog_incarnation,
                 .commit_requires = db_mod.types.CommitRequires.strongest(table.commit_requires_floor, table.batch.req.commit_requires orelse self.commit_requires),
                 .default_commit_requires = self.commit_requires,
@@ -4818,6 +4819,47 @@ pub const SessionRegistry = struct {
         var record = (try store.load(alloc, txn_id)) orelse return error.SessionLeaseLost;
         defer lease_mod.deinitRecord(alloc, &record);
         try requireReaderLease(record, owner);
+    }
+
+    pub fn setSqlTransactionOptions(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        guard: Mutation,
+        scope: @import("antfly_local_sources").sql_session.Scope,
+        isolation: ?@import("antfly_local_sources").sql_session.Isolation,
+        mode: ?@import("antfly_local_sources").sql_session.ReadMode,
+    ) !void {
+        const session_lock = self.sessionLock(guard.id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, guard.id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (!principalsEqual(candidate.principal, scope.principal) or candidate.connection_id != null)
+            return error.SqlTransactionNotActive;
+        const expected = try guard.version(candidate);
+        try self.checkTenure(alloc, guard);
+        if (candidate.terminal_commit != null or candidate.terminal_abort) return error.SqlTransactionNotActive;
+        const metadata = if (candidate.sql) |*sql| sql else return error.SqlTransactionNotActive;
+        if (!std.mem.eql(u8, metadata.database, scope.database) or !std.mem.eql(u8, metadata.namespace, scope.namespace))
+            return error.SqlTransactionNotActive;
+        if (metadata.failed) return error.InFailedSqlTransaction;
+        if (candidate.commit_execution_started or candidate.commit_body_digest != null or candidate.staged != null or
+            candidate.next_savepoint_id != 1 or candidate.read_snapshots.count() != 0 or candidate.lake_cuts.count() != 0)
+            return error.ActiveSqlTransaction;
+        const next_isolation = isolation orelse metadata.isolation;
+        const next_mode = mode orelse metadata.mode;
+        if (next_isolation == metadata.isolation and next_mode == metadata.mode) {
+            candidate.deinit(alloc);
+            return;
+        }
+        metadata.isolation = next_isolation;
+        metadata.mode = next_mode;
+        touchSession(&candidate);
+        try self.persistMutation(candidate, expected, guard);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const publish_target = self.sessions.getPtr(guard.id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, publish_target, &candidate);
     }
 
     pub fn mutation(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, owner: u64) !Mutation {
@@ -13121,6 +13163,34 @@ test "transaction session named savepoints shadow release and roll back nested s
     try std.testing.expectEqual(@as(usize, 0), (try registry.getStatus(alloc, session.txn_id)).?.savepoint_count);
 }
 
+test "SQL transaction options update only the untouched owner session" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const session = try registry.beginForPrincipal(alloc, .{ .sql = .{
+        .database = "app",
+        .namespace = "public",
+        .isolation = .read_committed,
+        .mode = .read_write,
+    } }, 9, "alice");
+    const scope: @import("antfly_local_sources").sql_session.Scope = .{ .database = "app", .principal = "alice" };
+    const guard = try registry.mutation(alloc, session.txn_id, 9);
+    var invalid_guard = guard;
+    invalid_guard.owner = 10;
+    var wrong_scope = scope;
+    wrong_scope.principal = "bob";
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.setSqlTransactionOptions(alloc, guard, wrong_scope, .repeatable_read, .read_only));
+    try std.testing.expectError(error.SessionLeaseLost, registry.setSqlTransactionOptions(alloc, invalid_guard, scope, .repeatable_read, .read_only));
+    try registry.setSqlTransactionOptions(alloc, guard, scope, .repeatable_read, .read_only);
+    try registry.setSqlTransactionOptions(alloc, guard, scope, null, .read_only);
+    var state = (try registry.getSqlState(alloc, session.txn_id)).?;
+    defer state.deinit(alloc);
+    try std.testing.expect(state.metadata.isolation == .repeatable_read);
+    try std.testing.expect(state.metadata.mode == .read_only);
+    _ = (try registry.createNamedSavepoint(alloc, guard, "started")).?;
+    try std.testing.expectError(error.ActiveSqlTransaction, registry.setSqlTransactionOptions(alloc, guard, scope, null, .read_write));
+}
+
 test "durable SQL session rejects duplicate savepoint ids without double freeing overlays" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(null);
@@ -15008,6 +15078,19 @@ test "SQL relation lifetime ordinary execution plans omit native owner extension
     var plan = try parseExecutionPlan(a, body);
     defer plan.deinit();
     try std.testing.expect(plan.value[0].sql_persistence == null);
+}
+
+test "distributed txn fresh public execution plans assign ordinary origin without changing older sealed plans" {
+    const a = std.testing.allocator;
+    var request = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"row\":{}}}},\"source_producer\":\"legacy_cdc\"}");
+    defer request.deinit(a);
+    const view = try request.distributedTables(a);
+    defer view.deinit();
+    try std.testing.expectEqual(@as(usize, 1), view.tables.len);
+    try std.testing.expectEqual(@FieldType(distributed_txn.TableCommitRequest, "source_producer").ordinary, view.tables[0].source_producer);
+    var old = try parseExecutionPlan(a, "[{\"table_name\":\"docs\"}]");
+    defer old.deinit();
+    try std.testing.expectEqual(@FieldType(distributed_txn.TableCommitRequest, "source_producer").unlabelled, old.value[0].source_producer);
 }
 
 test "commit requirements survive transaction session cloning persistence and statement merging" {

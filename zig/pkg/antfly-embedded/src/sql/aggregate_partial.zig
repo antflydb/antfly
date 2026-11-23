@@ -500,7 +500,7 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
 /// identical to scalar restore; extrema borrow their winning payload until merge.
 pub const Fixed = struct { count: u64, sum: i128, boolean: bool, selected: Datum, numeric: ?@import("numeric/aggregate.zig").State = null };
 pub fn fixedEligible(spec: operators.AggregateSpec) bool {
-    return !spec.distinct and operators.exactMergeable(spec) and spec.kind != .pattern_set;
+    return !spec.distinct and operators.exactMergeable(spec) and spec.kind != .pattern_set and spec.kind != .array_agg;
 }
 pub fn decodeFixed(a: A, value: Datum, spec: operators.AggregateSpec) !?Fixed {
     if (!fixedEligible(spec)) return null;

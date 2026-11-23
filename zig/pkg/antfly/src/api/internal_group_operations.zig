@@ -49,13 +49,14 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
     std.log.warn("private transition failed group_id={} action={s} err={s}", .{ group_id, @tagName(action), @errorName(err) });
 }
 
-pub const Error = @import("external_transaction_errors.zig").Error || operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+pub const Error = @import("external_transaction_errors.zig").Error || @import("source_transaction_errors.zig").Error || operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
     SqlRelationOwnerChanged,
     SqlTemporaryRelationNotOwned,
     SqlRelationRecoveryIncomplete,
     InvalidSqlRelationPersistence,
     ResourceBudgetExceeded,
     RetainedEffectsFull,
+    HistoryFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
     IdentityReadGenerationChanged,
@@ -73,6 +74,11 @@ pub const Error = @import("external_transaction_errors.zig").Error || operation.
     GraphExploredEdgesBudgetExceeded,
     GraphExploredEdgeBytesBudgetExceeded,
     GroupLeaderUnavailable,
+    TransitionOperationBusy,
+    TransactionTopologyBusy,
+    SplitSourceProjectionNotReady,
+    SplitSourceProjectionAdvanced,
+    DurableRootIncarnationUnavailable,
     PreDecisionDeadlineExceeded,
     TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
@@ -438,24 +444,33 @@ pub const Operations = struct {
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
-            error.LeaderUnavailable,
-            error.GroupLeaderUnavailable,
-            error.MetadataSnapshotUnavailable,
+            error.TransitionOperationBusy,
+            error.TransactionTopologyBusy,
             error.SplitSourceProjectionNotReady,
             error.SplitSourceProjectionAdvanced,
             error.DurableRootIncarnationUnavailable,
+            => |retry| return retry,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
             error.AutoBulkIngestBusy,
             error.ApplyStoreGroupRetired,
             error.ApplyStoreShuttingDown,
             error.BackgroundOwnerClosing,
             error.BackgroundOwnerClosed,
-            error.TransitionOperationBusy,
             error.MergeTransitionNotReady,
             error.MergeReceiverProjectionNotReady,
             error.MergeSourceProjectionNotReady,
             error.MergeSourceProjectionAdvanced,
             error.StorageBusy,
-            => return error.GroupLeaderUnavailable,
+            => {
+                std.log.debug("transition temporarily unavailable group_id={} action={s} err={s}", .{
+                    group_id,
+                    @tagName(action),
+                    @errorName(err),
+                });
+                return error.GroupLeaderUnavailable;
+            },
             else => {
                 logUnknownTransitionFailure(group_id, action, err);
                 return error.Internal;
@@ -530,6 +545,7 @@ pub const Operations = struct {
             error.OnlineMergeArtifactCatalogUncoordinated => return error.OnlineMergeArtifactCatalogUncoordinated,
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
+            error.HistoryFull => return if (input.transaction == null) error.HistoryFull else retainedBatchPressure(input),
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
@@ -659,6 +675,7 @@ pub const Operations = struct {
                     if (ack.participants.len == 0 or ack.participants.len > 64) return error.InvalidArgument;
                     for (ack.participants) |participant| if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidArgument;
                 },
+                .publish_completion => |publication| if (publication.completion_owner.group_id != group_id) return error.InvalidArgument,
                 .cleanup => {},
             }
             break :transaction .transaction;
@@ -722,6 +739,7 @@ pub const Operations = struct {
             error.RetainedEffectsFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,
+            error.HistoryFull => return if (input.transaction == null) error.HistoryFull else retainedBatchPressure(input),
             error.DecisionNotProposed => return error.DecisionNotProposed,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
@@ -744,6 +762,7 @@ pub const Operations = struct {
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable, error.Unavailable => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch failed group_id={} table={s} err={s}", .{
@@ -773,13 +792,14 @@ pub const Operations = struct {
             .external_decision_owner = input.external_decision_owner,
             .sql_locks = input.sql_locks,
             .route_fence = input.route_fence,
+            .source_producer = input.source_producer,
             .restore_staging_scope = input.restore_staging_scope,
             .restore_staging_plan_id = input.restore_staging_plan_id,
             .deadline_ns = request.deadline_ns,
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
-            error.RetainedEffectsFull => return error.RetainedEffectsFull,
+            error.RetainedEffectsFull, error.HistoryFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,
@@ -816,6 +836,7 @@ pub const Operations = struct {
             => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;
             },
@@ -850,6 +871,7 @@ pub const Operations = struct {
                 error.Canceled, error.Cancelled => return error.Canceled,
                 else => {
                     if (@import("external_transaction_errors.zig").classify(err)) |reason| return reason;
+                    if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                     if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                     return error.Internal;
                 },
@@ -862,7 +884,7 @@ pub const Operations = struct {
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
-            error.RetainedEffectsFull => return error.RetainedEffectsFull,
+            error.RetainedEffectsFull, error.HistoryFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
             error.InvalidBatchRequest => return error.InvalidArgument,
@@ -891,6 +913,7 @@ pub const Operations = struct {
             error.CatalogRoutingSnapshotTimeout,
             => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 // One registry drives Raft terminal results and participant
                 // transport; adding a lifecycle fence must not silently turn
                 // its recoverable typed rejection into an HTTP 500.
@@ -908,7 +931,7 @@ pub const Operations = struct {
         const writes = self.writes orelse return error.NotFound;
         _ = (distributed_txn.resolveGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
             error.OnlineSourcePinPending => return error.EnrichmentRetryInProgress,
-            error.RetainedEffectsFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
+            error.RetainedEffectsFull, error.HistoryFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
             error.DecisionNotProposed => return error.DecisionNotProposed,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
@@ -1212,7 +1235,10 @@ pub const Operations = struct {
                 const deadline: Deadline = .{ .context = request };
                 const json = ops.topologyRead(alloc, input.group_id, input.table_name, scoped.value, .{ .ptr = &deadline, .is_cancelled_fn = Deadline.canceled }) catch |err| {
                     try request.ensureActive();
-                    const mapped = mapCommonReadError(err) orelse mapLookupError(err);
+                    const mapped = switch (err) {
+                        error.IntegrityTopologyBusy, error.TransactionTopologyBusy => error.StorageReadTemporarilyUnavailable,
+                        else => mapCommonReadError(err) orelse mapLookupError(err),
+                    };
                     if (mapped == error.Internal) {
                         const now = platform_time.monotonicNs();
                         const next = next_unknown_topology_read_log_ns.load(.monotonic);

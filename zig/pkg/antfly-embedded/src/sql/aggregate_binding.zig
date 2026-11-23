@@ -371,7 +371,9 @@ const Builder = struct {
             if ((call.star and (!std.mem.eql(u8, functionName(call.name), "count") or call.args.len != 0)) or (!call.star and call.args.len != 1)) return error.InvalidSqlParameters;
             for (call.args) |arg| if (contains(arg)) return error.SqlGroupingError;
             if (call.filter) |filter| if (contains(filter)) return error.SqlGroupingError;
+            if (aggregateKind(call.name).? == .array_agg and (call.distinct or call.filter != null)) return error.UnsupportedSqlShape;
             if (self.inference) return switch (aggregateKind(call.name).?) {
+                .array_agg => self.node(.{ .call = .{ .name = "$array", .args = call.args } }),
                 .count => self.node(.{ .literal = .{ .integer = 0 } }),
                 .avg => self.node(.{ .cast = .{ .operand = call.args[0], .type = .number } }),
                 .bool_and, .bool_or => self.node(.{ .cast = .{ .operand = call.args[0], .type = .boolean } }),

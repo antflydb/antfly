@@ -2218,6 +2218,7 @@ pub const ResolveMany = struct {
     include_partition_families: bool = false,
     /// Opt-in indexed physical identities, aligned with storage_names.
     include_storage_bindings: bool = false,
+    publication_database: ?[]const u8 = null,
     /// Request the tracked physical relation source cut alongside the logical
     /// revision. A missing epoch cannot validate a cached binding.
     include_source_epoch: bool = false,
@@ -2242,6 +2243,8 @@ pub const ResolveMany = struct {
         if (self.sql_sources.len != 0) return jw.write(.{ .include_source_epoch = self.include_source_epoch, .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .sql_sources = self.sql_sources });
         if (self.cursor_bindings.len != 0) {
             try jw.write(.{ .cursor_bindings = self.cursor_bindings, .cursor_catalog_cut = self.cursor_catalog_cut, .include_source_epoch = true, .expected_revision = self.expected_revision });
+        } else if (self.publication_database != null) {
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch, .publication_database = self.publication_database, .include_source_epoch = self.include_source_epoch });
         } else if (self.include_source_epoch) {
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .include_source_epoch = true, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else if (self.relations.len != 0 or self.expected_relation_epoch != null) {
@@ -2253,12 +2256,21 @@ pub const ResolveMany = struct {
     }
 };
 
+pub const PublicationCatalogCut = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: [32]u8,
+    database_id: u64,
+    /// One storage-generation binding per forward target, from this read.
+    bindings: []const ?[32]u8,
+};
+
 pub const ResolvedMany = struct {
     sql_authority: ?@import("privileges.zig").Authority = null,
     sql_sources: []const ?SqlSource = &.{},
     sql_sources_resolved: bool = false,
     revision: u64,
     tables: []const ?ResolvedTable,
+    publication_cut: ?PublicationCatalogCut = null,
     logical_names: []const ?[]const u8 = &.{},
     storage_tables: []const ?ResolvedTable = &.{},
     cursor_policies: ?CursorPolicies = null,
@@ -2272,6 +2284,9 @@ pub const ResolvedMany = struct {
     relation_names_only: bool = false,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.publication_cut != null) {
+            return jw.write(.{ .revision = self.revision, .tables = self.tables, .publication_cut = self.publication_cut, .logical_names = self.logical_names, .source_epoch = self.source_epoch, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .cursor_policies = self.cursor_policies });
+        }
         if (self.storage_tables.len != 0) return jw.write(.{ .sql_authority = self.sql_authority, .revision = self.revision, .tables = self.tables, .source_epoch = self.source_epoch, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .sql_sources = self.sql_sources, .sql_sources_resolved = self.sql_sources_resolved, .storage_tables = self.storage_tables });
         if (self.sql_authority != null) return jw.write(.{ .sql_authority = self.sql_authority, .revision = self.revision, .tables = self.tables, .source_epoch = self.source_epoch, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .sql_sources = self.sql_sources, .sql_sources_resolved = self.sql_sources_resolved });
         if (self.sql_sources_resolved) return jw.write(.{ .revision = self.revision, .tables = self.tables, .source_epoch = self.source_epoch, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only, .sql_sources = self.sql_sources, .sql_sources_resolved = true });
@@ -2311,6 +2326,28 @@ pub const ResolvedMany = struct {
         if (table.sql_access) |value| if ((value.rights | value.grant_options) & ~@as(u16, 255) != 0) return error.InvalidSqlBackendResponse;
     }
 
+    /// An older peer may return ordinary table resolution. Require the
+    /// publication capability and correlate its per-target storage proof.
+    pub fn requirePublicationCut(self: @This(), request: ResolveMany) !PublicationCatalogCut {
+        if (request.publication_database == null or !request.include_query_definitions)
+            return error.InvalidCatalogMutation;
+        const cut = self.publication_cut orelse return error.TableTopologyUpgradeRequired;
+        if (cut.metadata_group_id == 0 or cut.database_id == 0 or
+            !@import("../metadata/incarnation.zig").isValid(cut.metadata_incarnation) or
+            self.tables.len != request.targets.len or cut.bindings.len != self.tables.len)
+            return error.InvalidCatalogRecord;
+        if (request.expected_revision) |revision| if (revision != self.revision) return error.CatalogGenerationChanged;
+        for (self.tables, cut.bindings) |table, binding| {
+            if ((table == null) != (binding == null)) return error.InvalidCatalogRecord;
+            if (table) |resolved| {
+                const definition = resolved.query_definition orelse return error.InvalidCatalogRecord;
+                if (resolved.table_id == 0 or definition.table_id != resolved.table_id or
+                    std.mem.allEqual(u8, &binding.?, 0)) return error.InvalidCatalogRecord;
+            }
+        }
+        return cut;
+    }
+
     /// Validate the optional capability before consuming a peer's answers.
     /// In particular, an old receiver's empty default is not a negative lookup.
     pub fn validateRelations(self: @This(), request: ResolveMany) !void {
@@ -2341,6 +2378,7 @@ pub const ResolvedMany = struct {
         alloc.free(self.storage_tables);
         for (self.tables) |table| if (table) |value| value.deinit(alloc);
         alloc.free(self.tables);
+        if (self.publication_cut) |cut| alloc.free(cut.bindings);
         for (self.logical_names) |name| if (name) |value| alloc.free(value);
         alloc.free(self.logical_names);
         for (self.relations) |relation| if (relation) |value| value.deinit(alloc);
@@ -2445,7 +2483,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.CatalogPublicationProofPending => 503,
         error.Forbidden => 403,
         error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
-        error.StoreRootEnrollmentChanged, error.ResolverCurationConflict, error.IndexOwnerReceiptChanged => 409,
+        error.StoreRootEnrollmentChanged, error.ResolverCurationConflict, error.ConstraintRetirementRequired, error.TableTransitionActive, error.IndexOwnerReceiptChanged => 409,
         error.InvalidIndexOwnerReceipt => 400,
         error.InvalidStoreRootEnrollment, error.InvalidInitialFkRetirementAck => 400,
         error.InitialChildRootReceiptChanged, error.InitialFkRetirementReporterChanged, error.InitialFkRetirementWorkChanged, error.InitialFkRetirementPublicationChanged, error.InitialFkRetirementReservationChanged => 409,

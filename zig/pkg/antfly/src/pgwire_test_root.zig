@@ -17,6 +17,7 @@
 // the anonymous reachability test itself.
 comptime {
     _ = @import("pgwire/mod.zig");
+    _ = @import("api/pgwire_catalog.zig");
 }
 
 /// Server fixtures retain this compilation root's source and type identity.
