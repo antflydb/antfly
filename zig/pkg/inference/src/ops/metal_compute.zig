@@ -13148,7 +13148,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     const ProjectionPack = @import("../backends/dense_projection_pack.zig");
-    extern fn antfly_metal_packed_projection_release_owner(entry: *anyopaque) callconv(.c) void;
     const PackedProjectionEntry = ProjectionPack.Cache.Entry;
 
     pub fn projectionPackCache(self: *MetalCompute) *ProjectionPack.Cache {
@@ -13243,7 +13242,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const node = funded.node;
         // Keep the funded owner private until the SDK accepts its bindings.
         // On rejection the funding object still owns both roots and the charge.
-        owner.init(funded.data.allocator, entry.handle, funded.charge, antfly_metal_packed_projection_release_owner);
+        owner.init(funded.data.allocator, entry.handle, funded.charge, metal_runtime.antfly_metal_packed_projection_release_owner);
         if (metal_runtime.antfly_metal_packed_projection_publish(entry.runtime, entry.handle, owner) != 0) return error.PackedProjectionPublicationFailed;
         node.* = .{ .request = entry.request, .owner = owner, .next = null };
         platform.sync.lockYielding(&cache.mutex);
@@ -13340,7 +13339,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const cache = self.projectionPackCache();
         var recording: ?*anyopaque = null;
         var encoder: ?*anyopaque = null;
-        defer for (pending) |entry| if (entry.encoded) |encoded| antfly_metal_packed_projection_release_owner(encoded.handle);
+        defer for (pending) |entry| if (entry.encoded) |encoded| metal_runtime.antfly_metal_packed_projection_release_owner(encoded.handle);
         defer if (recording) |command| metal_runtime.antfly_metal_projection_pack_release(command);
         defer metal_runtime.antfly_metal_projection_pack_end_encoding(encoder);
         for (requests, pending) |request, *entry| {

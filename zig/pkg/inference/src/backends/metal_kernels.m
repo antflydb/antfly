@@ -21289,7 +21289,6 @@ static int antfly_metal_encode_projection_pack(
 }
 
 typedef struct {
-    _Atomic(size_t) references;
     CFTypeRef weight;
     CFTypeRef bias;
     termite_metal_decode_runtime *provider;
@@ -21303,20 +21302,10 @@ typedef struct {
     size_t widths[3];
 } AntflyMetalPackedProjection;
 size_t antfly_metal_packed_projection_metadata_bytes(void) { return sizeof(AntflyMetalPackedProjection); }
-void *antfly_metal_packed_projection_retain(void *handle) {
-    if (!handle) return NULL;
-    AntflyMetalPackedProjection *entry = handle;
-    size_t refs = atomic_load_explicit(&entry->references, memory_order_relaxed);
-    do { if (!refs || refs == SIZE_MAX) abort(); }
-    while (!atomic_compare_exchange_weak_explicit(&entry->references, &refs, refs + 1, memory_order_relaxed, memory_order_relaxed));
-    return handle;
-}
-void antfly_metal_packed_projection_release(void *handle) {
+// The managed Zig owner retains every live use of this native entry.
+void antfly_metal_packed_projection_release_owner(void *handle) {
     if (!handle) return;
     AntflyMetalPackedProjection *entry = handle;
-    size_t previous = atomic_fetch_sub_explicit(&entry->references, 1, memory_order_acq_rel);
-    if (!previous) abort();
-    if (previous != 1) return;
     CFTypeRef weight = entry->weight;
     CFTypeRef bias = entry->bias;
     antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)weight, entry, true);
@@ -21327,19 +21316,8 @@ void antfly_metal_packed_projection_release(void *handle) {
     if (weight) CFRelease(weight);
     if (bias) CFRelease(bias);
 }
-// Creator retirement revokes the borrowed endpoint even when an explicitly
-// retained cold native handle outlives it. Such a handle may retire SDK roots,
-// but can never launch through a dead Zig Owner.
-void antfly_metal_packed_projection_release_owner(void *handle) {
-    if (!handle) return;
-    AntflyMetalPackedProjection *entry = handle;
-    entry->owner_context = NULL;
-    antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->weight, entry, true);
-    antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->bias, entry, true);
-    antfly_metal_packed_projection_release(handle);
-}
 static void antfly_metal_packed_projection_cleanup(AntflyMetalPackedProjection **entry) {
-    if (*entry) antfly_metal_packed_projection_release(*entry);
+    antfly_metal_packed_projection_release_owner(*entry);
 }
 
 int antfly_metal_bind_packed_use_service(termite_metal_decode_runtime *runtime, void *context, uint64_t nonce,
@@ -21384,13 +21362,6 @@ int antfly_metal_packed_projection_matches(termite_metal_decode_runtime *runtime
             antfly_metal_prepared_declaration(runtime, 1, slot) != entry->declarations[i]) return 0;
     }
     return 1;
-}
-int antfly_metal_packed_projection_buffers(void *handle, void **weight, void **bias) {
-    if (!handle || !weight || !bias) return -1;
-    AntflyMetalPackedProjection *entry = handle;
-    *weight = (void *)entry->weight;
-    *bias = (void *)entry->bias;
-    return 0;
 }
 // Physical compatibility retains are independent of logical slot generations.
 // Keep the creator alive until every exact alias is gone; clearing a source's
@@ -21460,7 +21431,6 @@ int antfly_metal_packed_projection_create(
     @autoreleasepool {
         AntflyMetalPackedProjection *entry __attribute__((cleanup(antfly_metal_packed_projection_cleanup))) = calloc(1, sizeof(*entry));
         if (!entry) return -2;
-        atomic_init(&entry->references, 1);
         entry->provider = runtime;
         entry->origin = atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire);
         entry->count = count;

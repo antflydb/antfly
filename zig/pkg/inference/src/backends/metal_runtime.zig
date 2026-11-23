@@ -50973,7 +50973,7 @@ pub const PackedProjectionEntry = struct {
         var entry: ?*anyopaque = null;
         const status = antfly_metal_packed_projection_create(runtime, recording, request.count, &request.slots, &request.generations, &request.declarations, request.width, &request.widths, roots[0], roots[1], &entry);
         if (status != 0) {
-            if (entry) |partial| antfly_metal_packed_projection_release(partial);
+            if (entry) |partial| antfly_metal_packed_projection_release_owner(partial);
             return error.PackedProjectionPreparationFailed;
         }
         return .{ .runtime = runtime, .handle = entry orelse return error.PackedProjectionPreparationFailed, .request = request };
@@ -50981,21 +50981,6 @@ pub const PackedProjectionEntry = struct {
     pub fn matches(self: *const PackedProjectionEntry, runtime: ?*RawMetalDecodeRuntime) bool {
         return runtime == self.runtime and antfly_metal_packed_projection_matches(self.runtime, self.handle) != 0;
     }
-    pub fn retain(self: PackedProjectionEntry) !PackedProjectionEntry {
-        var retained = self;
-        retained.handle = antfly_metal_packed_projection_retain(self.handle) orelse return error.PackedProjectionUnavailable;
-        return retained;
-    }
-    pub fn release(self: PackedProjectionEntry) void {
-        antfly_metal_packed_projection_release(self.handle);
-    }
-    pub fn buffers(self: *const PackedProjectionEntry) ![2]*anyopaque {
-        var weight: ?*anyopaque = null;
-        var bias: ?*anyopaque = null;
-        if (antfly_metal_packed_projection_buffers(self.handle, &weight, &bias) != 0) return error.PackedProjectionUnavailable;
-        return .{ weight orelse return error.PackedProjectionUnavailable, bias orelse return error.PackedProjectionUnavailable };
-    }
-
     /// The prepared selection already committed. No decline/replay is legal
     /// after entering the original native packed matmul/split body.
     pub fn applyAssigned(self: *const PackedProjectionEntry, frame: *const AssignedDenseFrame, input: MetalTensor, rows: usize, outputs: []const MetalTensor, workspace: MetalTensor) !void {
@@ -51038,11 +51023,9 @@ pub extern fn antfly_metal_projection_pack_end_encoding(encoder: ?*anyopaque) vo
 pub extern fn antfly_metal_projection_pack_finish(recording: *anyopaque) c_int;
 pub extern fn antfly_metal_projection_pack_release(recording: *anyopaque) void;
 pub extern fn antfly_metal_packed_projection_create(runtime: *RawMetalDecodeRuntime, recording: *anyopaque, count: usize, slots: [*]const usize, generations: [*]const u64, declarations: [*]const u64, width: usize, widths: [*]const usize, weight: ?*anyopaque, bias: ?*anyopaque, entry: *?*anyopaque) c_int;
-pub extern fn antfly_metal_packed_projection_retain(entry: *anyopaque) ?*anyopaque;
-pub extern fn antfly_metal_packed_projection_release(entry: *anyopaque) void;
+pub extern fn antfly_metal_packed_projection_release_owner(entry: *anyopaque) callconv(.c) void;
 pub extern fn antfly_metal_packed_projection_matches(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
 pub extern fn antfly_metal_packed_projection_is_cached(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
-pub extern fn antfly_metal_packed_projection_buffers(entry: *anyopaque, weight: *?*anyopaque, bias: *?*anyopaque) c_int;
 pub extern fn antfly_metal_apply_packed_projection_assigned(runtime: *RawMetalDecodeRuntime, entry: *anyopaque, input: ?*anyopaque, input_offset: usize, rows: usize, outputs: [*]const ?*anyopaque, offsets: [*]const usize, workspace: ?*anyopaque, workspace_offset: usize) c_int;
 
 pub fn tryApplyDenseRuntimeLinearPairAssigned(self: anytype, slot_a: usize, slot_b: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, first: MetalTensor, second: MetalTensor, workspace: ?MetalTensor) !bool {
