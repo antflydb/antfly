@@ -9094,8 +9094,8 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
             var request: [512]u8 = undefined;
             const json = try std.fmt.bufPrint(
                 &request,
-                "{{\"inserts\":{{\"{s}\":{{\"_embeddings\":{{\"vec\":{s}}}}}}},\"sync_level\":\"full_index\"}}",
-                .{ key, vector },
+                "{{\"inserts\":{{\"{s}\":{{\"title\":\"{s}\",\"_embeddings\":{{\"vec\":{s}}}}}}},\"sync_level\":\"full_index\"}}",
+                .{ key, key, vector },
             );
             var response: h.capi.Buffer = .{};
             defer api.antfly_buffer_free_zero(&response);
@@ -9212,6 +9212,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
     var parent_open = true;
     defer if (parent_open) api.antfly_db_close(id);
     try Dense.write(id, "seed", "[8,0,0,0,0,0,0,0]");
+    try Dense.expectHit(id, "\"seed\"", "[8,0,0,0,0,0,0,0]");
     const runtime_before = owner.current.?;
     try std.testing.expect(runtime_before.db.core.index_manager.densePostingWalAuthoritativeByName("vec"));
     const count_before = owner.test_in_place_refresh_count.load(.acquire);
