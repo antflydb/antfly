@@ -31,7 +31,7 @@ const marker_prefix = ".aflite-lease-";
 const ArtifactIdentity = struct {
     path: []const u8,
     key: []const u8,
-    inode: u64,
+    file_identity: @import("inode_lock.zig").FileIdentity,
     root: u64,
     length: u64,
     inline_bytes: []const u8,
@@ -39,14 +39,15 @@ const ArtifactIdentity = struct {
         var h = std.hash.Wyhash.init(0);
         h.update(key.path);
         h.update(key.key);
-        h.update(std.mem.asBytes(&key.inode));
+        h.update(std.mem.asBytes(&key.file_identity.device));
+        h.update(std.mem.asBytes(&key.file_identity.inode));
         h.update(std.mem.asBytes(&key.root));
         h.update(std.mem.asBytes(&key.length));
         h.update(key.inline_bytes);
         return h.final();
     }
     pub fn eql(_: @This(), a: ArtifactIdentity, b: ArtifactIdentity) bool {
-        return a.inode == b.inode and a.root == b.root and a.length == b.length and std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.key, b.key) and std.mem.eql(u8, a.inline_bytes, b.inline_bytes);
+        return std.meta.eql(a.file_identity, b.file_identity) and a.root == b.root and a.length == b.length and std.mem.eql(u8, a.path, b.path) and std.mem.eql(u8, a.key, b.key) and std.mem.eql(u8, a.inline_bytes, b.inline_bytes);
     }
 };
 
@@ -308,7 +309,7 @@ pub const Registry = struct {
         const file = try pin.readFile();
         var value = try file.openIndexValue(self.allocator, key, pin.checkpoint);
         defer value.deinit(self.allocator);
-        const identity: ArtifactIdentity = .{ .path = self.path, .key = key, .inode = (try file.file.stat(file.runtime())).inode, .root = value.root, .length = value.length, .inline_bytes = value.inline_bytes };
+        const identity: ArtifactIdentity = .{ .path = self.path, .key = key, .file_identity = file.dataIdentity() orelse return null, .root = value.root, .length = value.length, .inline_bytes = value.inline_bytes };
         return retainPooled(identity);
     }
 
@@ -366,7 +367,7 @@ pub const Registry = struct {
             defer wal_trace_scope.end();
             try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
         }
-        const captured_inode = (try reader.file.stat(reader.runtime())).inode;
+        const captured_identity = reader.dataIdentity();
         state.* = .{
             .registry = self,
             .reader = reader,
@@ -385,8 +386,8 @@ pub const Registry = struct {
         self.first = state;
         _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        if (marker != null and owner.artifactPoolLookupAllowed()) {
-            const identity: ArtifactIdentity = .{ .path = self.path, .key = artifact_key, .inode = captured_inode, .root = state.value.root, .length = state.value.length, .inline_bytes = state.value.inline_bytes };
+        if (marker != null and owner.artifactPoolLookupAllowed()) if (captured_identity) |file_identity| {
+            const identity: ArtifactIdentity = .{ .path = self.path, .key = artifact_key, .file_identity = file_identity, .root = state.value.root, .length = state.value.length, .inline_bytes = state.value.inline_bytes };
             @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
             // A closed old source can remain referenced by a weak LSM cache.
             // Replace its map key too, before its final close frees the bytes.
@@ -399,7 +400,7 @@ pub const Registry = struct {
             };
             state.pool_identity = identity;
             source_pool_mutex.unlock();
-        }
+        };
         owner.recordArtifactSourceOpen(false);
         return state.source();
     }
