@@ -4313,6 +4313,9 @@ pub const ApiHttpServer = struct {
     sql_settlement_active: std.atomic.Value(bool) = .init(false),
     sql_completion_owner_active: std.atomic.Value(bool) = .init(false),
     sql_completion_recovery_after: u64 = 0,
+    sql_completion_pending_after: u64 = 0,
+    sql_completion_cold_scan_done: bool = false,
+    sql_completion_cold_scan_retry: bool = false,
     sql_observation_retirement_after: ?[]u8 = null,
     sql_completion_consumer_active: std.atomic.Value(bool) = .init(false),
     write_admission: RequestAdmission,
@@ -11600,9 +11603,14 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         req: transactions_api.OwnedTransactionCommitRequest,
     ) !?transactions_api.CommitConflict {
+        return self.validateCommitReadSetControlled(req, .{});
+    }
+
+    pub fn validateCommitReadSetControlled(self: *ApiHttpServer, req: transactions_api.OwnedTransactionCommitRequest, context: api_operation.RequestContext) !?transactions_api.CommitConflict {
         const source = self.table_reads orelse return null;
         for (req.read_set) |item| {
-            var lookup = (try source.lookup(self.alloc, req.physicalName(item.table_name), item.key, .{}, .read_index)) orelse {
+            try context.ensureActive();
+            var lookup = (try source.lookup(self.alloc, req.physicalName(item.table_name), item.key, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation }, .read_index)) orelse {
                 if (readSetVersionMatches(item.expected_version, null)) continue;
                 return transactions_api.readSetConflict(req, item, 0);
             };
@@ -15779,7 +15787,7 @@ pub const ApiHttpServer = struct {
 
     pub fn authorizeHttpCommit(self: *ApiHttpServer, id: db_mod.types.TxnId, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) !?transactions_api.Mutation {
         const principal = transactionPrincipal(identity);
-        var details = (try self.txn_sessions.getAuthorizationDetailsControlled(self.alloc, id, principal, context)) orelse return null;
+        var details = (try self.txn_sessions.getHttpCommitAuthorizationDetails(self.alloc, id, principal, context)) orelse return null;
         defer details.deinit(self.alloc);
         try context.ensureActive();
         if (!directTransactionRouteEligible(details, false) or !try self.transactionSessionDetailsAuthorizedControlled(identity, details, context)) return null;

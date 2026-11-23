@@ -1353,7 +1353,8 @@ pub const AntflyApiHandler = struct {
             owned.reserve_on_prepare = true;
             return null;
         }
-        @import("sql/session/completion.zig").reserveJoined(self.api_server, completion, 3, ctx.io) catch {
+        @import("sql/session/completion.zig").reserveJoinedControlled(self.api_server, completion, 3, ctx.io, owned.control) catch |err| {
+            if (err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled) return try sessionInspectionFailure(ctx, err);
             var response = try ctx.status(429).text("SQL completion capacity unavailable; retry after existing work completes");
             errdefer response.deinit();
             try attachSQLCompletion(&response, completion.*);
@@ -7901,8 +7902,13 @@ pub const AntflyApiHandler = struct {
                 error.Canceled, error.Cancelled => return textResponse(ctx, 408, "request canceled"),
                 else => return err,
             };
-            if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
-                if (!(self.api_server.txn_sessions.retireBeforeExecution(alloc, guard, commit_req.session_version.?, false) catch false)) {
+            const read_conflict = self.api_server.validateCommitReadSetControlled(commit_req, commit_request) catch |err| return sessionInspectionFailure(ctx, err);
+            if (read_conflict) |conflict| {
+                const retired = self.api_server.txn_sessions.retireHttpCommitConflict(guard, commit_req.session_version.?, commit_request) catch |err| switch (err) {
+                    error.DeadlineExceeded, error.Canceled, error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
+                    else => false,
+                };
+                if (!retired) {
                     execution_plan = (self.api_server.txn_sessions.getExecutionPlanControlled(alloc, guard, commit_request) catch |err| switch (err) {
                         error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
                         error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
@@ -18223,6 +18229,15 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         const prior_source = server.table_writes;
         server.table_writes = .{ .ptr = undefined, .vtable = undefined };
         defer server.table_writes = prior_source;
+        const publication = try durable.createUnpublishedRegistration(@splat(17), .{ .transaction_id = &generic_hex }, false, .{});
+        try std.testing.expect(!try durable.claimAbandonedRegistration(publication, false, .{}));
+        try std.testing.expect(try durable.claimAbandonedRegistration(publication, true, .{}));
+        try std.testing.expect(!try durable.joinRegistration(publication));
+        try durable.removeRegistration(publication);
+        const published = try durable.createUnpublishedRegistration(@splat(17), .{ .transaction_id = &generic_hex }, false, .{});
+        try std.testing.expect(try durable.joinRegistration(published));
+        try std.testing.expect(!try durable.claimAbandonedRegistration(published, true, .{}));
+        try durable.removeRegistration(published);
         const capacity = @import("completion_outbox.zig").max_window;
         try durable.reserveRegistrations(capacity);
         defer durable.releaseRegistrations(capacity);

@@ -80,28 +80,39 @@ fn releaseReservation(raw: *anyopaque, count: usize) void {
 }
 
 pub fn reserveJoined(server: *server_mod.ApiHttpServer, completion: *wire.Completion, desired: usize, network: std.Io) !void {
+    return reserveJoinedControlled(server, completion, desired, network, .{});
+}
+
+pub fn reserveJoinedControlled(server: *server_mod.ApiHttpServer, completion: *wire.Completion, desired: usize, network: std.Io, context: operation.RequestContext) !void {
+    try context.ensureActive();
     if (completion.capacity.remaining >= desired) return;
     const io = server_mod.ApiHttpServer.configuredDurableIo(server.cfg) orelse return error.SqlWriteCapacityUnavailable;
-    const store = try registrationStore(server);
     const Job = struct {
-        store: *@import("../../transactions.zig").DurableSessionStore,
+        server: *server_mod.ApiHttpServer,
+        context: operation.RequestContext,
+        store: ?*@import("../../transactions.zig").DurableSessionStore = null,
         count: usize,
         network: std.Io,
         failure: ?anyerror = null,
         done: std.Io.Event = .unset,
         fn run(job: *@This()) void {
             defer job.done.set(job.network);
-            job.store.reserveRegistrations(job.count) catch |err| {
+            const store = registrationStoreControlled(job.server, job.context) catch |err| {
+                job.failure = err;
+                return;
+            };
+            job.store = store;
+            store.reserveRegistrationsControlled(job.count, job.context) catch |err| {
                 job.failure = err;
             };
         }
     };
-    var job = Job{ .store = store, .count = desired - completion.capacity.remaining, .network = network };
+    var job = Job{ .server = server, .context = context, .count = desired - completion.capacity.remaining, .network = network };
     var future = try io.concurrent(Job.run, .{&job});
     job.done.waitUncancelable(network);
     @import("../../protected_future.zig").wait(io, &future);
     if (job.failure) |err| return err;
-    completion.capacity = .{ .context = store, .remaining = desired, .release = releaseReservation };
+    completion.capacity = .{ .context = job.store.?, .remaining = desired, .release = releaseReservation };
 }
 // Persist the issuer intent and the target proof before the coordinator may
 // seal its plan. A failed/ambiguous preparation never admits the mutation.
@@ -404,7 +415,7 @@ pub fn pinJoinedControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.All
                         return;
                     };
                     const reserved = job.completion.capacity.remaining > 0;
-                    const reference = (if (reserved) store.createReservedRegistrationControlled(seed, outcome.*, job.context) else store.createRegistrationControlled(seed, outcome.*, job.context)) catch {
+                    const reference = store.createUnpublishedRegistration(seed, outcome.*, reserved, job.context) catch {
                         job.alloc.free(encoded);
                         job.completion.unknown = true;
                         return;
@@ -418,6 +429,10 @@ pub fn pinJoinedControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.All
                     job.completion.unknown = true;
                     return;
                 };
+                if (!(store.joinRegistrationControlled(reference, job.context) catch false)) {
+                    job.completion.unknown = true;
+                    return;
+                }
                 _ = consumerActionControlled(job.server, job.alloc, .{ .reference_id = reference, .consumer_node_id = outcome.registration_node_id, .action = .pin }, true, job.context) catch {
                     outcome.registration_pending = true;
                     continue;
@@ -546,7 +561,7 @@ fn consumerActionControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Al
     const hex = std.fmt.bytesToHex(request.reference_id, .lower);
     outcome.reference_id = &hex;
     outcome.registration_node_id = null;
-    if (record.value.prepared and !record.value.joined) return false;
+    if (record.value.phase == .discarding or (record.value.prepared and !record.value.joined)) return false;
     // This durable phase is a positive terminal witness, including when an
     // issuer-side delete failed after remote retirement before publication.
     if (record.value.phase == .acknowledging and request.action == .status) return true;
@@ -744,33 +759,57 @@ pub fn retireSettledObservations(server: *server_mod.ApiHttpServer, alloc: std.m
 
 pub fn recoverUnpublished(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize) !void {
     if (server.txn_sessions.durable == null) return;
-    const store = try registrationStore(server);
+    const context = try settlementContext(.{});
+    const store = try registrationStoreControlled(server, context);
+    const pending = try store.pendingRegistrationPage(alloc, server.sql_completion_pending_after, limit, context);
+    defer alloc.free(pending.references);
+    for (pending.references) |reference| {
+        try context.ensureActive();
+        server.sql_completion_pending_after = @import("../../completion_retirement.zig").sequence(reference);
+        try recoverAbandonedRegistration(server, store, alloc, reference, false, context);
+    }
+    server.sql_completion_pending_after = pending.after;
+
+    // Keep the cold scan for prepared registrations created by older writers.
+    if (server.sql_completion_cold_scan_done) return;
     const page = try store.registrationRecoveryPage(alloc, server.sql_completion_recovery_after, limit);
     defer alloc.free(page.references);
-    const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
+    var failure: ?anyerror = null;
     for (page.references) |reference| {
-        if (@import("antfly_platform").time.monotonicNs() >= deadline) return;
+        try context.ensureActive();
         server.sql_completion_recovery_after = @import("../../completion_retirement.zig").sequence(reference);
-        const lock = store.lockRegistration(reference);
-        defer lock.unlock();
-        var record = (try store.loadRegistration(alloc, reference)) orelse continue;
-        defer record.deinit();
-        if (!record.value.prepared or record.value.joined or (record.value.observation orelse false)) continue;
-        if (record.value.phase != .discarding) {
-            record.value.phase = .discarding;
-            try store.putRegistration(reference, record.value);
-        }
-        const floor = try store.registrationFloor();
-        if (record.value.outcome.ddl_receipt_json) |json| {
-            var parsed = try std.json.parseFromSlice(catalog.DdlReceipt, alloc, json, .{});
-            defer parsed.deinit();
-            change(server, alloc, reference, try owner(parsed.value), .forget, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s }, true, floor) catch continue;
-        } else {
-            if (!(ownerAction(server, alloc, .{ .transaction_id = try parseId(record.value.outcome.transaction_id.?), .reference_id = reference, .action = .forget, .managed = true, .retired_through = floor }, true) catch false)) continue;
-        }
-        try store.removeRegistration(reference);
+        recoverAbandonedRegistration(server, store, alloc, reference, true, context) catch |err| {
+            server.sql_completion_cold_scan_retry = true;
+            if (failure == null) failure = err;
+        };
     }
     server.sql_completion_recovery_after = page.after;
+    if (page.after == 0) {
+        server.sql_completion_cold_scan_done = !server.sql_completion_cold_scan_retry;
+        server.sql_completion_cold_scan_retry = false;
+    }
+    if (failure) |err| return err;
+}
+
+fn recoverAbandonedRegistration(server: *server_mod.ApiHttpServer, store: *@import("../../transactions.zig").DurableSessionStore, alloc: std.mem.Allocator, reference: [16]u8, cold: bool, context: operation.RequestContext) !void {
+    const lock = try store.lockRegistrationControlled(reference, context);
+    defer lock.unlock();
+    var record = (try store.loadRegistrationControlled(alloc, reference, context)) orelse {
+        if (!cold) _ = try store.claimAbandonedRegistration(reference, false, context);
+        return;
+    };
+    defer record.deinit();
+    if ((cold and record.value.joined) or !try store.claimAbandonedRegistration(reference, cold, context)) return;
+    const floor = try store.registrationFloorControlled(reference, context);
+    if (record.value.outcome.ddl_receipt_json) |json| {
+        var parsed = try std.json.parseFromSlice(catalog.DdlReceipt, alloc, json, .{});
+        defer parsed.deinit();
+        try change(server, alloc, reference, try owner(parsed.value), .forget, context, true, floor);
+    } else {
+        const id = try parseId(record.value.outcome.transaction_id orelse return error.InvalidTransactionSessionRecord);
+        if (!try ownerActionControlled(server, alloc, .{ .transaction_id = id, .reference_id = reference, .action = .forget, .managed = true, .retired_through = floor }, true, context)) return error.CompletionUnavailable;
+    }
+    try store.removeRegistrationControlled(reference, context);
 }
 pub fn capableJoined(server: *server_mod.ApiHttpServer, network: std.Io) bool {
     if (server.txn_sessions.durable == null or !server.source.vtable.tracks_sql_submission) return false;
