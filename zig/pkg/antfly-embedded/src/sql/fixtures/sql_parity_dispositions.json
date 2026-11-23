@@ -4787,9 +4787,10 @@
       "command": [
         "uv",
         "run",
-        "--project",
-        "scripts",
-        "--locked",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
         "python",
         "scripts/generate_sql_phonetic_reference.py",
         "--check"
@@ -18843,6 +18844,16 @@
       "status": "superseded",
       "reason": "The exact original multi-action ALTER uses SQL-standard ADD PERIOD FOR grammar that PostgreSQL 18 rejects with 42601. Native compilation validates the entire unsupported ALTER before publication and preserves that syntax diagnostic rather than executing its supported ADD COLUMN prefix or hiding the error behind a feature rejection. Mounted native owners verify unchanged table definitions and complete primary row identities, versions, digests and values before and after independent cold catalog/session/data recovery. This closes the invalid original, not temporal exclusion enforcement or the other range originals.",
       "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql/testing/document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql/testing/document_root_test.zig",
+          "test": "httpx SQL original PostgreSQL invalid grammar rejects before catalog access",
+          "gate": "sql-original-grammar-postgres"
+        },
         {
           "path": "zig/pkg/antfly/src/api/sql/testing/lifecycle/sql_document_mutation_lifecycle_integration_test.zig",
           "test": "mounted SQL range values preserve native bytes typed results and cold owners",

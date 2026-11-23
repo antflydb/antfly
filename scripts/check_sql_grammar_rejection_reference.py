@@ -29,8 +29,17 @@ def main():
     anchor = 'test "httpx SQL original PostgreSQL invalid grammar rejects before catalog access"'
     section = source.split(anchor, 1)[1].split("\ntest ", 1)[0]
     ids = re.findall(r'"(sql-\d{4})"', section)
-    if len(ids) != 34 or len(set(ids)) != 34:
-        raise ValueError("explicit original syntax cohort changed")
+    dispositions = json.loads((FIXTURES / "sql_parity_dispositions.json").read_text())
+    expected = {
+        entry["id"]
+        for entry in dispositions["entries"]
+        if any(witness["gate"] == "sql-original-grammar-postgres" for witness in entry.get("evidence", ()))
+    }
+    if not expected or len(ids) != len(set(ids)) or set(ids) != expected:
+        raise ValueError(
+            f"explicit original syntax cohort changed: "
+            f"missing {sorted(expected - set(ids))}, extra {sorted(set(ids) - expected)}"
+        )
     inventory = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())
     cases = {entry["id"]: entry for entry in inventory["entries"]}
     with postgres() as db:
