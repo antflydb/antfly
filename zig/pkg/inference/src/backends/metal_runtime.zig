@@ -9633,7 +9633,7 @@ fn decoderRequestOutput(request: anytype) ?*MetalTensor {
     return if (@hasField(@TypeOf(request), "output")) request.output else null;
 }
 
-const DecoderOutputKind = enum(c_int) { add, add_scale, scaled_add_scale, multiply_add, multiply_add2 };
+const DecoderOutputKind = enum(c_int) { add, add_scale, scaled_add_scale, multiply_add, multiply_add2, add_mul_scalar };
 extern fn antfly_metal_decoder_output_available(runtime: *RawMetalDecodeRuntime, kind: c_int) c_int;
 
 fn decoderOutputBuffer(runtime: *RawMetalDecodeRuntime, request: anytype, inputs: []const MetalTensor, dim: usize, kind: DecoderOutputKind) !?MetalTensor {
@@ -9763,6 +9763,30 @@ pub fn decoderRuntimeApplyMultiplyAdd(self: anytype, request: anytype, stats: an
     output_device.deinit();
     if (decoderRequestOutput(request) != null and device_rc != -2) return error.CommandBufferFailed;
     return null;
+}
+
+pub fn assignedAddMulScalarAvailable(self: anytype) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    return antfly_metal_decoder_output_available(runtime, @backingInt(DecoderOutputKind.add_mul_scalar)) != 0;
+}
+
+pub fn decoderRuntimeApplyAddMulScalarInto(self: anytype, lhs: MetalTensor, rhs: MetalTensor, scale: MetalTensor, output: MetalTensor, scale_before_add: bool) !bool {
+    if (!assignedAddMulScalarAvailable(self)) return false;
+    const rc = termite_metal_decode_runtime_apply_add_mul_scalar_device(
+        self.raw_decode_runtime,
+        lhs.deviceHandle(),
+        lhs.deviceByteOffset(),
+        rhs.deviceHandle(),
+        rhs.deviceByteOffset(),
+        scale.deviceHandle(),
+        scale.deviceByteOffset(),
+        output.elemCount(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+        scale_before_add,
+    );
+    if (rc != 0) return error.CommandBufferFailed;
+    return true;
 }
 
 pub fn decoderRuntimeApplyMultiplyAdd2(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
@@ -23681,6 +23705,19 @@ pub extern fn termite_metal_decode_runtime_apply_multiply_add_device(
     dim: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
+) c_int;
+extern fn termite_metal_decode_runtime_apply_add_mul_scalar_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    lhs_handle: ?*anyopaque,
+    lhs_offset: usize,
+    rhs_handle: ?*anyopaque,
+    rhs_offset: usize,
+    scale_handle: ?*anyopaque,
+    scale_offset: usize,
+    dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    scale_before_add: bool,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_multiply_add2_device(
     runtime: ?*RawMetalDecodeRuntime,
