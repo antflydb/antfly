@@ -13217,28 +13217,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn buildProjectionPack(cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph, request: ProjectionPack.Request, roots: [2]*anyopaque, owner: *ProjectionPack.Owner, node: *PackedProjectionEntry, charge: *@import("../execution/resource_retirement.zig").Charge, published: *bool, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
         var active = try operation_mod.enter(cb.*, graph, null, .managed);
         defer active.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
-        if (active.token() == null) return error.PreparedMetadataAuthorityUnavailable;
+        const token = active.token() orelse return error.PreparedMetadataAuthorityUnavailable;
         if (cleanup.boundary) |epoch| if (!try active.bindCleanupEpoch(epoch)) return error.BackendOperationCleanupUnavailable;
+        try publishFundedProjectionPack(cb, graph, token, request, roots, owner, node, charge, published);
+        // Closing the operation can itself acquire the slot index lock.
+        try active.finish();
+    }
+
+    fn publishFundedProjectionPack(cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph, token: operation_mod.Borrowed, request: ProjectionPack.Request, roots: [2]*anyopaque, owner: *ProjectionPack.Owner, node: *PackedProjectionEntry, charge: *@import("../execution/resource_retirement.zig").Charge, published: *bool) !void {
+        try token.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph, .mode = .managed });
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         // The numerical Gate excludes other execution, but residency can
         // independently reclaim source slots under this actual index lock.
         // Keep source reads, terminal packing and alias publication in that
         // same exclusion; no supplier or quota callback occurs here.
         if (!self.provider_impl.linear_slot_index_mutex.tryLock()) return error.QueueFull;
-        var index_locked = true;
-        defer if (index_locked) self.provider_impl.linear_slot_index_mutex.unlock();
+        defer self.provider_impl.linear_slot_index_mutex.unlock();
         // Funding ran outside all execution gates. Another cold caller may
         // have published this exact request in the meantime. Recheck under
         // the real source/index and creator-map exclusion before any packing.
         platform.sync.lockYielding(&self.packed_projection_mutex);
         const already_published = self.packedProjection(request) != null;
         self.packed_projection_mutex.unlock();
-        if (already_published) {
-            self.provider_impl.linear_slot_index_mutex.unlock();
-            index_locked = false;
-            try active.finish();
-            return;
-        }
+        if (already_published) return;
         const entry = try metal_runtime.PackedProjectionEntry.create(self.provider_impl.raw_decode_runtime, request, roots);
         // No fallible operation separates initialization and creator publication.
         // A later cache-publication/operation error leaves a valid cache creator,
@@ -13251,10 +13252,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.packed_projection_mutex.unlock();
         published.* = true;
         if (metal_runtime.antfly_metal_packed_projection_publish(self.provider_impl.raw_decode_runtime, entry.handle, owner) != 0) return error.PackedProjectionPublicationFailed;
-        // Terminal operation cleanup may itself acquire the index lock.
-        self.provider_impl.linear_slot_index_mutex.unlock();
-        index_locked = false;
-        try active.finish();
     }
 
     /// Called only by the actual Session BeforeExecution service, with the
