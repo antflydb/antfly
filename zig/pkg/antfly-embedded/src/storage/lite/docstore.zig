@@ -2914,6 +2914,7 @@ pub const CreateOptions = struct {
 const MutationRequest = struct {
     context: *anyopaque,
     apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void,
+    complete: ?Store.MutationPlan.Completion = null,
     next: ?*MutationRequest = null,
     done: bool = false,
     durable: bool = true,
@@ -5659,6 +5660,10 @@ pub const Store = struct {
     pub const MutationPlan = struct {
         context: *anyopaque,
         apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void,
+        /// The queue leader calls this once in enqueue order before waking
+        /// tickets. Callbacks run outside the store and queue mutexes and
+        /// must not wait for this coordinator or submit to it synchronously.
+        complete: ?Completion = null,
         durable: bool = true,
         index_only: bool = false,
         artifact_lease: bool = false,
@@ -5670,6 +5675,8 @@ pub const Store = struct {
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
         estimated_bytes: usize = 0,
+
+        pub const Completion = *const fn (*anyopaque, anyerror!u64) void;
     };
 
     pub const Ticket = struct {
@@ -5826,6 +5833,7 @@ pub const Store = struct {
         request.* = .{
             .context = plan.context,
             .apply = plan.apply,
+            .complete = plan.complete,
             // A ride-along member is never itself the reason a group
             // becomes durable; it only ever rides a foreground member's
             // durability, or `forceDrainDurable`'s forced one (WS2).
@@ -6488,28 +6496,21 @@ pub const Store = struct {
                 _ = self.test_group_members_total.fetchAdd(batch.size, .monotonic);
             }
             const result = self.applyMutationGroup(head, force_durable);
+            var completed: ?*MutationRequest = head;
+            while (completed) |item| : (completed = item.next) {
+                // A group failure supersedes every per-member result.
+                result catch |err| {
+                    item.result = err;
+                };
+                if (item.complete) |complete| {
+                    const outcome: anyerror!u64 = if (item.result) |_| item.committed_sequence else |err| err;
+                    complete(item.context, outcome);
+                }
+            }
 
             self.commit_mutex.lockUncancelable(io);
             var current: ?*MutationRequest = head;
-            if (result) |_| {
-                // A member that failed its own apply already has its
-                // specific error in `item.result`; one that was admitted
-                // keeps its default success. Nothing to overwrite.
-            } else |err| {
-                // The shared commit (admission, transaction open, or the
-                // final fsync) failed: every member's durability is equally
-                // unknown, including one that had already failed its own
-                // apply and rolled back.
-                while (current) |item| {
-                    item.result = err;
-                    current = item.next;
-                }
-                current = head;
-            }
-            while (current) |item| {
-                item.done = true;
-                current = item.next;
-            }
+            while (current) |item| : (current = item.next) item.done = true;
             // `own_request` is a member of some batch this same call
             // already drained (this one, or an earlier iteration's), since
             // it was queued before this call was ever entered -- so by the
@@ -6874,7 +6875,7 @@ pub const Store = struct {
                 .empty => if (head.scope_delete_only) {
                     // An earlier ride-along may be the reason this scope
                     // is empty. Honor the durable request even without edits.
-                    if (force_durable or head.durable or self.writer_admission != null) try self.file.sync();
+                    if (force_durable or head.durable or head.complete != null or self.writer_admission != null) try self.file.sync();
                     head.committed_sequence = self.file.committedSequence();
                     return;
                 },
@@ -6898,7 +6899,7 @@ pub const Store = struct {
         var durable = force_durable or self.writer_admission != null;
         var admitted_any = false;
         while (current) |item| {
-            durable = durable or item.durable;
+            durable = durable or item.durable or item.complete != null;
             const savepoint = try self.file.beginTransactionSavepoint();
             if (item.apply(item.context, &self.file)) |_| {
                 self.file.releaseTransactionSavepoint(savepoint);
@@ -20099,4 +20100,57 @@ test "lite native docstore retires a planned replay prefix across hint lanes" {
     const ledger = internal_keys.JournalCreditLedger.decode(journal_credit) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 2), ledger.records);
     try std.testing.expectEqual(@as(u64, 2 * internal_keys.replay_key_len + second.len), ledger.bytes);
+}
+
+test "lite group commit completes members in queue order before tickets resolve" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ordered-completion.aflite");
+    defer alloc.free(path);
+    var store = try Store.create(alloc, path, true);
+    defer store.close();
+    const Recorder = struct {
+        calls: [2]usize = undefined,
+        count: usize = 0,
+        sequence: u64 = 0,
+        saw_failure: bool = false,
+    };
+    const Member = struct {
+        recorder: *Recorder,
+        id: usize,
+
+        fn apply(ctx: *anyopaque, file: *native.NativeFile) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.id == 1) return error.InjectedMemberFailure;
+            try file.putDocument("first", "value");
+        }
+
+        fn complete(ctx: *anyopaque, outcome: anyerror!u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.recorder.calls[self.recorder.count] = self.id;
+            self.recorder.count += 1;
+            if (outcome) |sequence| {
+                self.recorder.sequence = sequence;
+            } else |err| {
+                self.recorder.saw_failure = err == error.InjectedMemberFailure;
+            }
+        }
+
+        fn plan(self: *@This()) Store.MutationPlan {
+            return .{ .context = self, .apply = apply, .complete = complete };
+        }
+    };
+    var recorder: Recorder = .{};
+    var first: Member = .{ .recorder = &recorder, .id = 0 };
+    var second: Member = .{ .recorder = &recorder, .id = 1 };
+    const staged_first = try store.enqueue(first.plan());
+    const staged_second = try store.enqueue(second.plan());
+    staged_first.drive();
+    const sequence = try staged_first.ticket().waitSequence();
+    try std.testing.expectError(error.InjectedMemberFailure, staged_second.ticket().wait());
+    try std.testing.expectEqual(@as(usize, 2), recorder.count);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, &recorder.calls);
+    try std.testing.expectEqual(sequence, recorder.sequence);
+    try std.testing.expect(recorder.saw_failure);
 }
