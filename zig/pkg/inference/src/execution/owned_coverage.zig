@@ -165,7 +165,7 @@ fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: rou
     return count == needed.auxiliaries.count;
 }
 
-fn nativeInputPlan(pool: *const physical.Pool, plan: anytype, target: ops.ComputeBackend) bool {
+pub fn nativeInputPlan(pool: *const physical.Pool, plan: anytype, target: ops.ComputeBackend) bool {
     const selected = if (pool.selection) |*value| value else return false;
     if (plan.backend_index >= pool.backends.len or plan.epoch != selected.epoch or plan.requirements.host_bytes != 0 or plan.requirements.host_backing_bytes != 0) return false;
     const backend = pool.backends[plan.backend_index];

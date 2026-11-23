@@ -1081,6 +1081,16 @@ pub const Pool = struct {
         return found;
     }
 
+    fn attestsTransferIngress(self: *const Pool, slot: buffers.LogicalSlot, source: ops.ComputeBackend, bytes: u64) bool {
+        // The native ingress owns a dense F32 Frame bank. Borrowed request
+        // packets and foreign resident handles need an independent proof.
+        if (source.kind() != .native) return false;
+        const index = self.hostInputIndex(slot.node_id) orelse return false;
+        const input = self.host_input_plans[index];
+        return !input.borrowed and input.requirements.bytes == bytes and
+            @import("owned_coverage.zig").nativeInputPlan(self, input, source);
+    }
+
     /// Check that every cross-provider edge binds a dedicated destination
     /// bank and can read the selected producer without materializing storage
     /// outside the physical plan. Executing an admitted schedule also requires
@@ -1120,8 +1130,7 @@ pub const Pool = struct {
                     if (!isDenseTransferPlane(primary, source.kind(), shape, edge.byte_size, selected.epoch)) return false;
                 },
                 .view => if (!self.attestsTransferView(slot.*, edge.byte_size)) return false,
-                // Runtime ingress must attest the backing of the actual input.
-                .runtime_input => return false,
+                .runtime_input => if (!self.attestsTransferIngress(slot.*, source, edge.byte_size)) return false,
             }
         }
         return has_copy;
@@ -5539,9 +5548,11 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     var builder = ml.graph.Builder.init(&graph);
     const shape = ml.graph.Shape.init(.f32, &.{4});
     const literal = try builder.tensorConst(&.{ 1, -2, 3, -4 }, shape);
+    const packet_shape = ml.graph.Shape.init(.f32, &.{ 2, 2 });
+    const packet = try builder.parameter("packet", packet_shape);
     const producer = try builder.neg(literal);
-    const upload = try builder.reshape(producer, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
-    const on_device = try builder.absOp(upload);
+    const upload = try builder.reshape(producer, packet_shape);
+    const on_device = try builder.add(upload, packet);
     const download = try builder.reshape(on_device, shape);
     const on_host = try builder.add(download, literal);
     const output = try builder.absOp(on_host);
@@ -5554,16 +5565,16 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     var native = Native.initBorrowed(a, &graph, &host);
     const native_executor = native.partitionExecutor();
     var parts = [_]partition.Partition{
-        .{ .backend = .native, .node_ids = &.{ literal, producer, upload }, .external_inputs = &.{}, .executor = native_executor },
-        .{ .backend = target_kind, .node_ids = &.{ on_device, download }, .external_inputs = &.{.{ .node_id = upload, .source_partition = 0 }} },
+        .{ .backend = .native, .node_ids = &.{ literal, packet, producer, upload }, .external_inputs = &.{}, .executor = native_executor },
+        .{ .backend = target_kind, .node_ids = &.{ on_device, download }, .external_inputs = &.{ .{ .node_id = upload, .source_partition = 0 }, .{ .node_id = packet, .source_partition = 0 } } },
         .{ .backend = .native, .node_ids = &.{on_host}, .external_inputs = &.{ .{ .node_id = download, .source_partition = 1 }, .{ .node_id = literal, .source_partition = 0 } }, .executor = native_executor },
         .{ .backend = target_kind, .node_ids = &.{output}, .external_inputs = &.{.{ .node_id = on_host, .source_partition = 2 }} },
     };
     const placement: partition.PartitionPlan = .{
         .allocator = a,
         .partitions = &parts,
-        .node_assignment = &.{ 0, 0, 0, 1, 1, 2, 3 },
-        .node_operator_plans = &.{ null, null, null, null, null, null, null },
+        .node_assignment = &.{ 0, 0, 0, 0, 1, 1, 2, 3 },
+        .node_operator_plans = &.{ null, null, null, null, null, null, null, null },
         .owns_executors = false,
     };
     var layout = try buffers.build(a, &graph, &placement, .{});
@@ -5579,7 +5590,7 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     root.cuda_frame_dispatch = target_kind == .cuda;
     root.mixed_frame_dispatch = true;
     try root.configureRoutes(&.{});
-    const routes = (try root.prepareRoutes(&.{})) orelse return error.MissingPreparedKernelRoute;
+    const routes = (try root.prepareRoutes(&.{.{ .node_id = packet, .value = .{ .imported_host = .{ .logical = packet_shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedKernelRoute;
     defer routes.release();
     try std.testing.expect(routes.pool.attestsOwnedTransfers(reached));
     const retained = routes.pool.plan.transfer_index.get(buffers.transferKey(literal, 2)) orelse return error.MissingPartitionDependency;
@@ -5609,21 +5620,34 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     const frame = try Frame.create(routes.pool);
     defer frame.deinit();
     try frame.begin();
+    var values_in = [_]f32{ 8, 8, 8, 8 };
+    const packet_input = @import("../backends/tensor.zig").Tensor{
+        .data = std.mem.sliceAsBytes(&values_in),
+        .dtype = .f32,
+        .shape = &.{ 2, 2 },
+        .name = "packet",
+        .allocator = a,
+        .owns_data = false,
+        .owns_shape = false,
+    };
+    const bound = try frame.bindHostInputs(&.{.{ .node_id = packet, .value = &packet_input }});
+    defer frame.releaseHostInputs();
     var actual = try multi.executeMultiDevice(a, &graph, &plan, &mesh, .{
         .physical_frame = frame,
+        .runtime_inputs = bound,
         .require_assigned_kernels = true,
         .planned_device_execution = target_kind == .metal,
         .collect_partition_stats = true,
     });
     defer actual.deinit(&mesh);
     const receipt = try frame.finish();
-    try std.testing.expectEqual(@as(u64, 3), receipt.transfers);
-    try std.testing.expectEqual(@as(u64, 48), receipt.transfer_bytes);
+    try std.testing.expectEqual(@as(u64, 4), receipt.transfers);
+    try std.testing.expectEqual(@as(u64, 64), receipt.transfer_bytes);
     try std.testing.expectEqual(@as(u64, 4), receipt.dispatches);
     try std.testing.expectEqualSlices(device.DeviceId, &.{0}, actual.output_devices);
     const values = try target.toFloat32(actual.outputs[0], a);
     defer a.free(values);
-    try std.testing.expectEqualSlices(f32, &.{ 2, 0, 6, 0 }, values);
+    try std.testing.expectEqualSlices(f32, &.{ 8, 8, 8, 8 }, values);
 }
 
 test "Metal to Native partition transfer preserves a held download" {
