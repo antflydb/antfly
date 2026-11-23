@@ -23,6 +23,10 @@ mount, then set `pgwire.replication_spool.directory` and
 `pgwire.replication_spool.namespace` in those nodes' config. The intake worker
 uses the spool even when the pgwire listener is disabled.
 
+An existing scoped source can continue using its original delivery path during
+a rolling upgrade or until a shared spool is configured. An attempt already
+retained in a spool requires that same namespace for recovery.
+
 Keep the payload and fencing inventory on the same mount. The filesystem must
 support cross-node advisory locking, atomic rename, and durable file and
 directory synchronization. The metadata worker writes the frozen delivery

@@ -1509,6 +1509,10 @@ pub fn readOnService(svc: anytype, a: A, table_id: u64, source_id: Digest, reque
     return store.getSourceControl(a, svc.metadata_group_id, table_id, source_id);
 }
 pub fn mutateOnService(svc: anytype, a: A, write: Write, request: anytype) !void {
+    _ = try mutateOnServiceConfirmed(svc, a, write, request, false);
+}
+
+pub fn mutateOnServiceConfirmed(svc: anytype, a: A, write: Write, request: anytype, comptime return_state: bool) !?std.json.Parsed(State) {
     try write.validate();
     try request.ensureActive();
     _ = try svc.ensureTableTopologyProtocolReadyWithContext(request, requiredProtocol(write.mutation));
@@ -1540,6 +1544,7 @@ pub fn mutateOnService(svc: anytype, a: A, write: Write, request: anytype) !void
     const observed = try store.getSourceControl(a, svc.metadata_group_id, write.table_id, write.source_id);
     defer a.free(observed);
     if (!std.mem.eql(u8, expected, observed)) return error.MetadataMutationOutcomeUnknown;
+    return if (return_state) try parse(a, observed) else null;
 }
 
 test "source control proposal acknowledgments never grant unobserved progress or bypass decoder fencing" {

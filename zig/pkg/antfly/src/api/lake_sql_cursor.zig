@@ -113,8 +113,11 @@ pub fn lookupSnapshotRows(
     context: operation.RequestContext,
     options: configured.BindingObjectStoreOpenOptions,
 ) !?[]?std.json.Value {
-    return (try lookupDynamicRows(a, table, snapshot_id, metadata, keys, requested, keys_only, context, options)) orelse
-        try lookupTypedRows(a, table, snapshot_id, metadata, keys, requested, keys_only, context, options);
+    const dynamic = lookupDynamicRows(a, table, snapshot_id, metadata, keys, requested, keys_only, context, options) catch |err| switch (err) {
+        error.LakeRowsScanBudgetExceeded => return null,
+        else => return err,
+    };
+    return dynamic orelse try lookupTypedRows(a, table, snapshot_id, metadata, keys, requested, keys_only, context, options);
 }
 
 fn freeLookupRows(a: std.mem.Allocator, rows: []?std.json.Value) void {
@@ -123,6 +126,14 @@ fn freeLookupRows(a: std.mem.Allocator, rows: []?std.json.Value) void {
         if (row.*) |*image| deinit(a, image);
     }
     a.free(rows);
+}
+
+fn lookupSpeculation(keys: usize) @FieldType(catalog.Scan, "lake_speculation") {
+    return .{
+        .max_rows_after_first_group = @max(1024, keys *| 64),
+        .max_files = @max(2, keys),
+        .max_group_probes = @max(8, keys *| 4),
+    };
 }
 
 fn lookupDynamicRows(
@@ -176,7 +187,11 @@ fn lookupDynamicRows(
         for (table.columns, all) |column, *field| field.* = column.name;
         break :columns all;
     };
-    const cursor = try openSnapshot(scratch, table, snapshot_id, metadata, .{ .fields = fields, .limit = 4 }, context, options);
+    const cursor = try openSnapshot(scratch, table, snapshot_id, metadata, .{
+        .fields = fields,
+        .limit = 4,
+        .lake_speculation = lookupSpeculation(requested.len),
+    }, context, options);
     defer cursor.close(cursor.ptr);
     const apply = cursor.set_dynamic_filter orelse return null;
     if (!try apply(cursor.ptr, filter)) return null;
@@ -267,11 +282,7 @@ fn lookupTypedRows(
         .fields = fields,
         .conditions = ranges,
         .limit = 4,
-        .lake_speculation = .{
-            .max_rows_after_first_group = @max(1024, requested.len *| 64),
-            .max_files = @max(2, requested.len),
-            .max_group_probes = @max(8, requested.len *| 4),
-        },
+        .lake_speculation = lookupSpeculation(requested.len),
     }, context, options);
     defer cursor.close(cursor.ptr);
     var row_arena = std.heap.ArenaAllocator.init(a);

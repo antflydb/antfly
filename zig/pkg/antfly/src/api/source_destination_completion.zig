@@ -307,6 +307,17 @@ fn mutate(svc: anytype, a: std.mem.Allocator, scope: source.Scope, catalog_diges
     }, context);
 }
 
+fn mutateConfirmed(svc: anytype, a: std.mem.Allocator, scope: source.Scope, catalog_digest: source.Digest, state: source.State, mutation: source.Mutation, context: Context) !std.json.Parsed(source.State) {
+    return (try source.mutateOnServiceConfirmed(svc, a, .{
+        .table_id = scope.table_id,
+        .source_id = scope.source_id,
+        .expected_revision = state.revision,
+        .expected_binding = scope.identity(),
+        .expected_catalog_digest = catalog_digest,
+        .mutation = mutation,
+    }, context, true)).?;
+}
+
 /// Persist an exact native plan before uploading its bytes. A replay of the
 /// provider batch can finish an interrupted upload with the original identity.
 /// Rebuild physical routing from the authenticated effects of an attempt
@@ -537,22 +548,36 @@ fn stageBound(
     const commit_version = std.math.add(u64, accepted_at, 1) catch return error.InvalidTxnRecord;
     var frozen = try @import("source_destination_plan.zig").Frozen.init(a, &prepared.plan, authority, quota, commit_version);
     defer frozen.deinit();
-    var retained = admission.retained_payload_store orelse return error.SourcePayloadStorageUnavailable;
-    const spool_token = std.math.add(u64, current.revision, 1) catch return error.SourceReceiptExpired;
-    try frozen.bindRetention(&retained, spool_token);
-    const plan = try frozen.manifest.deliveryPlan(a, frozen.encoded_manifest);
-    try mutate(svc, a, binding, catalog_digest, current, .{
-        .pin_payload_prewrite = .{ .digest = plan.digest, .bytes = plan.manifest },
-    }, context);
-    const pinned_raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
-    defer a.free(pinned_raw);
-    var pinned = try source.parse(a, pinned_raw);
-    defer pinned.deinit();
-    const prewrite = pinned.value.payload_prewrite orelse return error.SourceOutcomeUnresolved;
-    if (pinned.value.revision != spool_token or prewrite.discarding or
-        !std.meta.eql(prewrite.manifest.digest, plan.digest)) return error.SourceOutcomeUnresolved;
-    const cancellation: @import("source_payload_retention.zig").Cancellation = .{ .context = context };
-    try frozen.manifest.retained_payload.?.put(&retained, frozen.bytes, cancellation.token());
+    // Existing scoped sources can keep using their original delivery
+    // contract until their deployment has a shared spool. Replans always
+    // retain the replacement payload.
+    var retained = admission.retained_payload_store;
+    if (replanning and retained == null) return error.SourcePayloadStorageUnavailable;
+    var pinned: ?std.json.Parsed(source.State) = null;
+    defer if (pinned) |*pin| pin.deinit();
+    var selected_plan: ?@import("../metadata/source_delivery.zig").Plan = null;
+    if (retained) |*store| {
+        const legacy_manifest = frozen.manifest;
+        const legacy_encoded = frozen.encoded_manifest;
+        const spool_token = std.math.add(u64, current.revision, 1) catch return error.SourceReceiptExpired;
+        try frozen.bindRetention(store, spool_token);
+        const retained_plan = try frozen.manifest.deliveryPlan(a, frozen.encoded_manifest);
+        pinned = mutateConfirmed(svc, a, binding, catalog_digest, current, .{
+            .pin_payload_prewrite = .{ .digest = retained_plan.digest, .bytes = retained_plan.manifest },
+        }, context) catch |err| switch (err) {
+            error.TableTopologyProtocolUpgradeRequired => if (replanning) return err else null,
+            else => return err,
+        };
+        if (pinned != null) {
+            const cancellation: @import("source_payload_retention.zig").Cancellation = .{ .context = context };
+            try frozen.manifest.retained_payload.?.put(store, frozen.bytes, cancellation.token());
+            selected_plan = retained_plan;
+        } else {
+            frozen.manifest = legacy_manifest;
+            frozen.encoded_manifest = legacy_encoded;
+        }
+    }
+    const plan = selected_plan orelse try frozen.manifest.deliveryPlan(a, frozen.encoded_manifest);
     const mutation: source.Mutation = if (replanning) .{ .replan = .{
         .reservation_digest = original_id.?,
         .plan_digest = plan.digest,
@@ -561,7 +586,7 @@ fn stageBound(
         .not_admitted_receipt = replan_receipt.?,
         .artifact = plan.artifact,
         .retain_manifest = true,
-        .retain_payload = true,
+        .retain_payload = pinned != null,
     } } else .{ .reserve = .{
         .sequence = sequence,
         .batch_id = input.batch_id,
@@ -575,13 +600,9 @@ fn stageBound(
         .delivery_manifest = plan.manifest,
         .artifact = plan.artifact,
         .retain_manifest = true,
-        .retain_payload = true,
+        .retain_payload = pinned != null,
     } };
-    try mutate(svc, a, binding, catalog_digest, pinned.value, mutation, context);
-
-    const reserved_raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
-    defer a.free(reserved_raw);
-    var reserved = try source.parse(a, reserved_raw);
+    var reserved = try mutateConfirmed(svc, a, binding, catalog_digest, if (pinned) |pin| pin.value else current, mutation, context);
     defer reserved.deinit();
     if (reserved.value.closing or reserved.value.retired or
         !std.meta.eql(reserved.value.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;

@@ -33340,6 +33340,26 @@ pub const RaftApplyStore = struct {
             // its current catalog CAS and original source binding still fence it.
             .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_unsealed_delivery_attempt, .fence_delivery_attempt, .reclaim_superseded_payload, .checkpoint_payload_cleanup, .discard_fenced_pending, .discard_payload_prewrite, .clear_payload_prewrite, .checkpoint_payload_prewrite, .fence_checkpoint, .close => {},
         }
+        if (write.mutation == .pin_payload_prewrite) {
+            const prewrite = write.mutation.pin_payload_prewrite;
+            var manifest = @import("../../api/source_destination_plan.zig").parse(a, prewrite.bytes, prewrite.digest) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return,
+            };
+            defer manifest.deinit();
+            const reference = manifest.value.retained_payload orelse return;
+            const authority = state.checkpoint_authority orelse return;
+            const revision = std.math.add(u64, state.revision, 1) catch return;
+            const ledger = state.artifact_control orelse return;
+            const token = std.math.add(u64, ledger.next_token, 1) catch return;
+            const sequence = std.math.add(u64, state.accepted.sequence, 1) catch return;
+            if (!authority.sameAuthority(manifest.value.checkpoint_authority) or
+                !std.meta.eql(scope.identity(), manifest.value.source_scope.binding) or
+                manifest.value.source_scope.generation != scope.generation or
+                manifest.value.source_scope.token != token or
+                manifest.value.source_scope.sequence != sequence or
+                reference.upload.fencingToken() != revision) return;
+        }
         const new_authority = switch (write.mutation) {
             .bind_checkpoint => |authority| authority,
             .begin_checkpoint_transfer => |transfer| transfer.target,

@@ -87,6 +87,15 @@ pub fn run(a: A) !void {
     const authority: control.checkpoint_authority.Spec = .{ .binding = source.identity(), .table_name = "checkpoint", .owner = .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .namespace = @splat(1), .table_binding = @splat(4), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
     try actor.apply(.{ .bind_checkpoint = authority });
     try actor.apply(.{ .enable_scope_fencing = {} });
+    {
+        var before = try actor.read();
+        defer before.deinit();
+        try actor.apply(.{ .pin_payload_prewrite = .{ .digest = @splat(3), .bytes = "{}" } });
+        var after = try actor.read();
+        defer after.deinit();
+        try std.testing.expectEqual(before.value.revision, after.value.revision);
+        try std.testing.expect(after.value.payload_prewrite == null);
+    }
     try actor.expectWork(1);
     try actor.apply(.{ .enable_scope_fencing = {} });
     try actor.expectWork(1);
