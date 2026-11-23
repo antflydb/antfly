@@ -132,7 +132,7 @@ fn literalIndex(pool: *const physical.Pool, slot: buffers.LogicalSlot) ?usize {
     if (index == ml.graph.null_node or index >= store.literals.len or index >= selected.literal_enabled.len or !selected.literal_enabled[index]) return null;
     const item = store.literals[index];
     const bytes = logicalBytes(item.shape) orelse return null;
-    if (item.node != slot.node_id or !item.shape.eq(slot.desc.shape) or item.data.len != bytes / 4 or item.backend_index >= pool.backends.len or item.backend_index >= store.backends.len) return null;
+    if (item.node != slot.node_id or !item.shape.eq(slot.desc.shape) or item.data.len != bytes or item.backend_index >= pool.backends.len or item.backend_index >= store.backends.len) return null;
     const backend = pool.backends[item.backend_index];
     const owner = store.backends[item.backend_index];
     if (!canonical(backend) or owner.ptr != backend.ptr or owner.vtable != backend.vtable or !allocation(pool, item.allocation, bytes, .constant_binding)) return null;
