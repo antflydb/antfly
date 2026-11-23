@@ -390,7 +390,7 @@ export class Mailbox extends R2CommitCoordinator {
     let cursor = null;
     const signal = AbortSignal.timeout(30000);
     do {
-      const page = await this.run({ op: "search", text, limit: 32, search_ids_only: true, cursor }, signal);
+      const page = await this.run({ op: "search", text, limit: 32, fresh: true, search_ids_only: true, cursor }, signal);
       const ids = (page.hits ?? []).map(({ doc_id }) => {
         if (!doc_id?.startsWith("message/") || !uuid(doc_id.slice(8))) throw Error("InvalidMailSearchResult");
         return doc_id.slice(8);

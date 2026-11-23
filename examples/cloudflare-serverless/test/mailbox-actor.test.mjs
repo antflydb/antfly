@@ -301,6 +301,35 @@ test("a restore that commits before the retention transaction preserves the mess
   assert.ok(await m.actor.message(m.id, id));
 });
 
+test("retention marks the whole batch before starting irreversible purges", async () => {
+  const m = mailbox();
+  const oldest = await deliver(m, "Oldest");
+  await m.actor.ingest(m.id, oldest);
+  await m.actor.trash(m.id, oldest);
+  m.clock.now++;
+  const next = await deliver(m, "Next");
+  await m.actor.ingest(m.id, next);
+  await m.actor.trash(m.id, next);
+  m.clock.now += 31 * DAY_MS;
+
+  const started = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  m.search.hooks.beforeMutate = async ({ operation_id }) => {
+    if (operation_id !== "mail/delete/" + oldest + "/0") return;
+    started.resolve();
+    await resume.promise;
+  };
+  const expiring = m.actor.expire(m.id);
+  await started.promise;
+  try {
+    await assert.rejects(m.actor.restore(m.id, next), /UnknownMessage/);
+  } finally {
+    resume.resolve();
+    await expiring;
+  }
+  assert.deepEqual(await expiring, { deleted: 2, done: true });
+});
+
 test("an older purge cannot clear a re-armed generation", async () => {
   const m = mailbox();
   const id = await deliver(m, "In flight");
