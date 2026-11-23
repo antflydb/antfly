@@ -22728,16 +22728,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         return error.AudioScheduleUnknownOperand;
     }
+    const persistent_tensor_alignment = @max(@alignOf(Buf), @alignOf(i64));
+    const persistent_tensor_shape_offset = std.mem.alignForward(usize, @sizeOf(Buf), @alignOf(i64));
+
+    fn persistentTensorBytes(rank: usize) usize {
+        return persistent_tensor_shape_offset + rank * @sizeOf(i64);
+    }
+
     fn dropMetalPersistentTensor(ct: CT) void {
         const buf = toBuf(ct);
         std.debug.assert(buf.weight_handle_name == null and buf.lazy_entry == null);
         if (buf.metal_tensor) |*mt| mt.deinit();
-        if (buf.logical_shape) |shape| buf.allocator.free(shape);
-        buf.allocator.destroy(buf);
+        const rank = buf.logical_shape.?.len;
+        const block: [*]align(persistent_tensor_alignment) u8 = @ptrCast(@alignCast(buf));
+        buf.allocator.free(block[0..persistentTensorBytes(rank)]);
     }
     fn metalPersistentTensor(self: *MetalCompute, storage_owner: *PreparedTensorStorage, tensor: MetalTensor) !CT {
         const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
-        const bytes = @sizeOf(Buf) + tensor.shape().len * @sizeOf(i64);
+        const bytes = persistentTensorBytes(tensor.shape().len);
         self.data.prefetch.lock();
         cache.reserve(.host, bytes) catch |err| {
             self.data.prefetch.unlock();
@@ -22750,9 +22758,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.data.prefetch.unlock();
         }
         const a = std.heap.c_allocator;
-        const buf = try a.create(Buf);
-        errdefer a.destroy(buf);
-        const shape = try a.alloc(i64, tensor.shape().len);
+        const block = try a.alignedAlloc(u8, .fromByteUnits(persistent_tensor_alignment), bytes);
+        const buf: *Buf = @ptrCast(block.ptr);
+        const shape_data: [*]i64 = @ptrCast(@alignCast(block[persistent_tensor_shape_offset..].ptr));
+        const shape = shape_data[0..tensor.shape().len];
         for (tensor.shape(), shape) |d, *dest| dest.* = d;
         buf.* = .{ .cache_identity = nextPreparedValueIdentity(), .data = @as([*]f32, @ptrFromInt(@alignOf(f32)))[0..0], .allocator = a, .owned = false, .logical_shape = shape, .metal_tensor = tensor, .integer_storage = tensor.dtype != .f32 };
         storage_owner.host_bytes += bytes;
