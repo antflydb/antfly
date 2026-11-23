@@ -5791,18 +5791,11 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     const shared_lookup = domain != null and schedule.sharedBackingSupported(arch.allocator);
     var preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_definitions else null, &header, &source, domain, current);
     defer preparation.deinit(current);
-    // Short Metal prompts can write directly into the planned Q/K/V
-    // destinations with their existing slots. The schedule still has to
-    // prove every route before it can replace the ordinary prefill.
-    const scheduled_initial_rows = if (initial_rows) |rows|
-        if (cb.kind() != .metal or rows < 128 or try self.weights.?.hasPackedInitialProjections(cb, config)) rows else null
-    else
-        null;
     var initial_preparation = schedule.Preparation{ .key = @splat(0) };
     defer initial_preparation.deinit(current);
     var initial_source: ?@TypeOf(source) = null;
     var initial_header: ?schedule.ProgramSpec = null;
-    if (scheduled_initial_rows) |query_rows| {
+    if (initial_rows) |query_rows| {
         initial_source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, query_rows, true)) orelse return false;
         initial_header = initial_source.?.header();
         initial_preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_initial_definitions else null, &initial_header.?, &initial_source.?, domain, current);
@@ -5837,7 +5830,7 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     if (preparation.cached == null) if (definition.shared) |shared| {
         try shared.sealBeforeExecution();
     };
-    if (scheduled_initial_rows) |query_rows| initial_phase: {
+    if (initial_rows) |query_rows| initial_phase: {
         if (domain != null and schedule.sharedBackingSupported(arch.allocator) and initial_preparation.cached == null) initial_preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
         var owned_initial_spec: ?schedule.ProgramSpecStorage = null;
         defer if (owned_initial_spec) |*storage| storage.deinit();
@@ -11582,8 +11575,14 @@ test "native incremental borrowed provider retires pending command callbacks bef
 }
 
 fn incrementalMetalFixtureSession(a: std.mem.Allocator) !Session {
+    return incrementalMetalFixtureSessionWithCapacity(a, @import("testing/incremental_encoder_decoder.zig").config.max_target_positions);
+}
+
+fn incrementalMetalFixtureSessionWithCapacity(a: std.mem.Allocator, comptime capacity: usize) !Session {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    var config = @import("testing/incremental_encoder_decoder.zig").config;
+    config.max_target_positions = capacity;
     var native_weights = NativeData{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
     defer native_weights.deinitOwned();
     try @import("testing/incremental_encoder_decoder.zig").populate(&native_weights);
@@ -11595,13 +11594,18 @@ fn incrementalMetalFixtureSession(a: std.mem.Allocator) !Session {
         errdefer a.free(key);
         const reference_name = try a.dupe(u8, entry.key_ptr.*);
         errdefer a.free(reference_name);
-        var value = try Tensor.initFloat32(a, key, entry.value_ptr.tensor.shape, entry.value_ptr.tensor.asFloat32());
+        var value = if (std.mem.eql(u8, key, "model.decoder.embed_positions.weight")) expanded: {
+            var values: [capacity * 4]f32 = undefined;
+            const original = entry.value_ptr.tensor.asFloat32();
+            for (&values, 0..) |*item, index| item.* = original[index % original.len];
+            break :expanded try Tensor.initFloat32(a, key, &.{ @intCast(capacity), 4 }, &values);
+        } else try Tensor.initFloat32(a, key, entry.value_ptr.tensor.shape, entry.value_ptr.tensor.asFloat32());
         errdefer value.deinit();
         try hosted.lazy_weights.put(a, key, .{ .tensor_ref = .{ .name = reference_name }, .host_loaded = .{ .tensor = value } });
     }
     try @import("../backends/compute_factory.zig").initializeMetalWeightPrefetch(a, &hosted, false);
     const owner = try a.create(ArchSession);
-    owner.* = .{ .allocator = a, .arch_config = .{ .whisper = @import("testing/incremental_encoder_decoder.zig").config }, .backend_type = .metal, .backend_data = .{ .metal = hosted } };
+    owner.* = .{ .allocator = a, .arch_config = .{ .whisper = config }, .backend_type = .metal, .backend_data = .{ .metal = hosted } };
     owner.model_lifetime.prepareFinalResources() catch |err| {
         a.destroy(owner);
         return err;
@@ -11612,7 +11616,7 @@ fn incrementalMetalFixtureSession(a: std.mem.Allocator) !Session {
 test "native incremental actual Metal owned provider preserves source lease and two KV steps across retries" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const session = try incrementalMetalFixtureSession(a);
+    const session = try incrementalMetalFixtureSessionWithCapacity(a, 132);
     defer session.close();
     try std.testing.expect(session.configureExecutionDiagnostics(true));
     const control = InferenceExecutionControl{ .native_call_policy = .in_process };
@@ -11635,6 +11639,17 @@ test "native incremental actual Metal owned provider preserves source lease and 
     defer a.free(second);
     reference.deinit();
     reference_open = false;
+    var long_prompt: [128]i64 = undefined;
+    for (&long_prompt, 0..) |*token, index| token.* = @intCast(index % 2);
+    var long_reference = (try whisperNativeDecoder(host_session, a, control, host[0].asFloat32(), 2)).?;
+    var long_reference_open = true;
+    defer if (long_reference_open) long_reference.deinit();
+    const long_first = try long_reference.step(&long_prompt);
+    defer a.free(long_first);
+    const long_second = try long_reference.step(&.{2});
+    defer a.free(long_second);
+    long_reference.deinit();
+    long_reference_open = false;
     var encoder_permit = try session.admitInputs(&features, a, control);
     defer encoder_permit.deinit();
     try encoder_permit.prepareResidentOutputRetirement();
@@ -11656,7 +11671,7 @@ test "native incremental actual Metal owned provider preserves source lease and 
     defer source.deinit();
     outputs.deinit();
     outputs_open = false;
-    for ([_]usize{ 2, 1 }) |initial_rows| {
+    for ([_]usize{ 2, 1, long_prompt.len }) |initial_rows| {
         const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(source_cb);
         var observation = WhisperConstructionObservation{};
         var decoder = try createResidentIncrementalDecoderObserved(host_session, a, control, try source.retained(), &observation, .{ .expected_initial_query_rows = initial_rows });
@@ -11687,13 +11702,13 @@ test "native incremental actual Metal owned provider preserves source lease and 
             const initial_logits = try decoder.step(&.{0});
             a.free(initial_logits);
             break :first_output try decoder.step(&.{1});
-        } else try decoder.step(&.{ 0, 1 });
+        } else try decoder.step(if (initial_rows == long_prompt.len) &long_prompt else &.{ 0, 1 });
         defer a.free(actual_first);
         const actual_second = try decoder.step(&.{2});
         defer a.free(actual_second);
-        for (first, actual_first) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
-        for (second, actual_second) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
-        try std.testing.expectEqual(@as(usize, 3), decoder.positions());
+        for (if (initial_rows == long_prompt.len) long_first else first, actual_first) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+        for (if (initial_rows == long_prompt.len) long_second else second, actual_second) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.0001);
+        try std.testing.expectEqual(@max(initial_rows, 2) + 1, decoder.positions());
         decoder.deinit();
         decoder_open = false;
         // Nested compute retirement must leave the real source lease held;

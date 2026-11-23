@@ -1082,14 +1082,6 @@ pub const PreparedDecoderWeights = struct {
             try prepareScheduleLinear(cb, .{ .w = w.lm_head, .b = null }, width, config.vocab_size);
     }
 
-    pub fn hasPackedInitialProjections(self: *const PreparedDecoderWeights, cb: *const ComputeBackend, config: Config) !bool {
-        for (self.weights.layers) |layer| {
-            const slots = layer.qkv_slots orelse return false;
-            if (!try dense_backend.hasPackedQkv(cb, slots, config.d_model)) return false;
-        }
-        return true;
-    }
-
     fn prepareScheduleNorm(cb: *const ComputeBackend, norm: Norm, width: usize) !bool {
         return (try cb.decoderRuntimeEnsureLayerNormSlot(&.{ .weight = norm.w, .bias = norm.b, .hidden_size = width })) != null;
     }

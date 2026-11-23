@@ -56963,8 +56963,7 @@ const PreparedDenseRegionFixture = struct {
             expected[index] = try reference.toFloat32(product, a);
             compared += 1;
         }
-        {
-            const rows = 3;
+        inline for (.{ 3, 128 }) |rows| {
             var matrix: [rows * 64]f32 = undefined;
             for (0..rows) |row| for (0..64) |column| {
                 matrix[row * 64 + column] = x[column] + @as(f32, @floatFromInt(row)) * 0.025;

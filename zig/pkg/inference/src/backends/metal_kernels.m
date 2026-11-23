@@ -42759,13 +42759,27 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
     }
 }
 
-// The short F32 tile schedule uses the receiving output directly. Keep
-// vendor/MPS and reduced-format schedules under their own workspace owners.
+static bool termite_metal_dense_linear_uses_mps(
+    termite_metal_decode_runtime *runtime, size_t slot, size_t rows,
+    size_t in_dim, size_t out_dim
+) {
+    const uint8_t dtype = runtime->linear_weight_dtypes[slot];
+    const bool prefer_mps = dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS ||
+        dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16;
+    return in_dim >= 64 && out_dim >= 64 &&
+        runtime->linear_weight_buffers[slot] != nil && runtime->linear_bias_buffers[slot] != nil &&
+        (prefer_mps || (dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 &&
+            rows >= 128 && termite_metal_dense_mps_linear_enabled()));
+}
+
+// The F32 row-reduce and tiled schedules can write directly into the plan.
+// Vendor/MPS and reduced formats retain their separate workspace contracts.
 int antfly_metal_dense_linear_direct_rows_ready(termite_metal_decode_runtime *runtime, size_t slot, size_t rows) {
-    return runtime != NULL && rows > 1 && rows < 128 &&
+    return runtime != NULL && rows > 1 && rows <= UINT32_MAX &&
         antfly_metal_linear_slot_prepared(runtime, slot) != 0 &&
         runtime->linear_weight_dtypes[slot] == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 &&
         !runtime->linear_glide_tensor_ops[slot] && !runtime->lighton_vision_mpp_required &&
+        !termite_metal_dense_linear_uses_mps(runtime, slot, rows, runtime->linear_in_dims[slot], runtime->linear_out_dims[slot]) &&
         runtime->linear_multi_row_pipeline != nil && runtime->linear_multi_row_reduce_pipeline != nil &&
         runtime->linear_bf16_multi_row_pipeline != nil && runtime->linear_bf16_multi_row_reduce_pipeline != nil &&
         runtime->linear_f16_multi_row_pipeline != nil && runtime->linear_f16_multi_row_reduce_pipeline != nil;
@@ -42863,20 +42877,7 @@ static int termite_metal_decode_runtime_encode_linear_multi_row_device(
             .row_blocks = 0u,
         };
         const uint8_t mps_weight_dtype = runtime->linear_weight_dtypes[slot];
-        if ((termite_metal_dense_mps_linear_enabled() ||
-             mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS ||
-             mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16) &&
-             (mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
-             mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS ||
-             mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16) &&
-            runtime->linear_weight_buffers[slot] != nil &&
-            runtime->linear_bias_buffers[slot] != nil &&
-            (rows >= 128 ||
-             mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ||
-             mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS) &&
-            in_dim >= 64 &&
-            out_dim >= 64)
-        {
+        if (termite_metal_dense_linear_uses_mps(runtime, slot, rows, in_dim, out_dim)) {
             const size_t weight_element_bytes = mps_weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ? sizeof(uint16_t) : sizeof(float);
             const size_t weight_bytes = out_dim * in_dim * weight_element_bytes;
             const size_t bias_bytes = out_dim * sizeof(float);
