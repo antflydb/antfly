@@ -2247,6 +2247,31 @@ pub const MetalPartitionExecutor = struct {
 
             if (graph.node(node_id).op == .fused_from_float32) continue;
 
+            if (owned_frame) {
+                const frame = options.physical_frame.?;
+                if (try @import("../execution/region_dispatch.zig").execute(frame, cb, node_id, values)) |installed| {
+                    if (installed.owner.entry_node == node_id) {
+                        for (installed.outputs) |output| value_device[output.slot.node] = device_id;
+                        if (options.execution_control) |control| try control.check();
+                        if (exec_ctx.stats) |stats| {
+                            stats.runtime_region_plan_dispatches += 1;
+                            stats.runtime_region_plan_active_regions += 1;
+                            stats.runtime_region_plan_covered_nodes += installed.owner.covered_nodes.len;
+                            stats.runtime_region_plan_elided_nodes += installed.owner.covered_nodes.len - 1;
+                        }
+                        for (installed.owner.input_nodes) |input| {
+                            if (last_use[input] != node_id) continue;
+                            if (rt_map.contains(input) and !donated.contains(input) and !ownedRuntimeTransferContains(effective_exec_ctx, input)) continue;
+                            if (values[input]) |value| {
+                                cb.free(value);
+                                values[input] = null;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // Defer heuristics may not skip override-protected nodes (graph
             // outputs / scalar-tail producers): the loop never revisits a
             // node's position, so a protected node deferred here would rely

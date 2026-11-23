@@ -106,6 +106,8 @@ pub const Validate = struct {
     /// Present only after pre-admission stabilization. Cache availability may
     /// change while this invocation's exact pinned payload remains usable.
     payload_claim: ?*const PayloadClaim = null,
+    /// Actual receiving Frame operation. Cold planning never supplies this.
+    operation: ?@import("backend_operation.zig").Borrowed = null,
 };
 pub const Assigned = struct {
     tensor: ops.CT,

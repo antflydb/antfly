@@ -12076,7 +12076,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         fn supportedRegion(raw: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
             const self: *MetalCompute = @ptrCast(@alignCast(raw));
             if (descriptor.operation != .linear or !supportsAssignedDescriptor(descriptor)) return false;
-            return if (descriptor.operation.linear.rows == 1) DenseProjectionProfile.noFrame(self) and supported(raw, descriptor) else self.packed_projection_profile != null and self.projectionScopeValid();
+            return if (descriptor.operation.linear.rows == 1) supported(raw, descriptor) else self.packed_projection_profile != null and self.projectionScopeValid();
         }
         fn bindingKey(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding) ?DynamicLinearSlotKey {
             // Activation inputs may be planned, but the prepared immutable
@@ -12371,6 +12371,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         linears: [3]route.Owned,
         packed_request: ?ProjectionPack.Request = null,
         scratch_bytes: usize = 0,
+        frame_program: ?*const ml.graph.Graph = null,
 
         fn candidate(graph: *const ml.graph.Graph, node: ml.graph.NodeId) ?ops.kernel_descriptor.Descriptor {
             const descriptor = ops.kernel_descriptor.lower(graph, node) orelse return null;
@@ -12395,9 +12396,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             return true;
         }
+        fn scopeValid(self: *const @This(), operation: ?operation_mod.Borrowed) bool {
+            if (self.compute.projectionScopeValid()) return true;
+            const program = self.frame_program orelse return false;
+            const current = operation orelse return false;
+            current.validate(.{ .implementation = self.linears[0].implementation, .program = program, .mode = .managed }) catch return false;
+            return self.compute.audio_capture == null and metal_runtime.hasActiveFrame(self.compute.provider_impl.raw_decode_runtime);
+        }
         fn matches(raw: *anyopaque, request: region.Validate) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (!self.compute.projectionScopeValid() or !self.slotsSupported() or request.inputs.len != self.input_count or request.outputs.len != self.count) return false;
+            if (!self.scopeValid(request.operation) or !self.slotsSupported() or request.inputs.len != self.input_count or request.outputs.len != self.count) return false;
             if (self.packed_request) |expected| {
                 const profile = self.compute.packed_projection_profile orelse return false;
                 const actual = profile.packed_request orelse return false;
@@ -12610,8 +12618,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const route = @import("../execution/kernel_route.zig");
         if (comptime !build_options.enable_metal) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (request.implementation.context != ctx or !acceptsPhysicalImplementation(request.implementation.table) or (request.policy_key != 1 and request.policy_key != 2) or request.execution_profile != .synchronous or !self.projectionScopeValid()) return null;
+        if (request.implementation.context != ctx or !acceptsPhysicalImplementation(request.implementation.table) or !self.projectionScopeValid()) return null;
+        const ordinary = request.execution_profile == .unknown;
+        if (ordinary) {
+            if (request.policy_key != 1 or !self.ownsMetadataIndex()) return null;
+        } else if (request.execution_profile != .synchronous) return null;
         if (request.policy_key == 2) return prepareSemanticProjectionRegions(self, request);
+        if (request.policy_key != 1) return null;
         const partition_nodes = request.partition_nodes;
         const table: *const ops.ComputeBackend.VTable = @ptrCast(@alignCast(request.implementation.table));
         const positions = try request.allocator.alloc(u32, request.graph.nodeCount());
@@ -12701,6 +12714,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var transferred = false;
             defer if (!transferred) DenseProjectionRegion.deinit(owner);
             owner.inputs[0] = input;
+            if (ordinary) owner.frame_program = request.graph;
             for (members, 0..) |node, index| {
                 const descriptor = DenseProjectionRegion.candidate(request.graph, node).?;
                 const operands = request.graph.node(node).getInputs();
@@ -12722,7 +12736,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 continue;
             }
             // Slices point into their stable heap owner, never this call frame.
-            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0..owner.input_count], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table });
+            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0..owner.input_count], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .requires_execution_profile = !ordinary, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table });
             transferred = true;
             cursor = member_positions[count - 1] + 1;
         }
@@ -12742,7 +12756,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 break;
             }
         }
-        if (!complete) {
+        if (!complete and !ordinary) {
             for (result.items) |*owner| owner.deinit();
             result.clearRetainingCapacity();
         }
@@ -40856,7 +40870,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return (descriptor.operation == .slice or descriptor.operation == .broadcast) and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -55694,7 +55708,7 @@ const PreparedDenseRegionFixture = struct {
         try std.testing.expectEqual(references, physical.device.?.ref.ref_count.load(.acquire));
         try std.testing.expectEqualDeep(identity, MetalCompute.parameterIdentity(MetalCompute.toBuf(source)));
     }
-    fn runInstalled(cb: ops.ComputeBackend, graph: *const ml.graph.Graph, nodes: []const ml.graph.NodeId, values: []const CT, expected: []const []f32, expect_region: bool) !void {
+    fn runInstalled(cb: ops.ComputeBackend, graph: *const ml.graph.Graph, nodes: []const ml.graph.NodeId, values: []const CT, expected: []const []f32, expect_region: bool, mixed_fusion: bool) !void {
         const a = std.testing.allocator;
         const interpreter = @import("../graph/interpreter.zig");
         const route = @import("../execution/kernel_route.zig");
@@ -55744,7 +55758,15 @@ const PreparedDenseRegionFixture = struct {
             }
             const wrong = [_]interpreter.RuntimeInput{.{ .node_id = nodes[0], .value = values[1], .source_backend = &cb }};
             try std.testing.expectError(error.PreparedRegionBindingChanged, selected.validateRuntimeInputs(&wrong, &cb));
-            var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
+            try std.testing.expectEqual(@as(usize, if (mixed_fusion) 1 else 0), selected.pool.regions.len);
+            var claims = switch (try selected.claimRegions(a, null, &.{activation})) {
+                .ready => |owned| owned,
+                .no_regions => null,
+                .reprepare => return error.MissingPreparedRegionClaims,
+            };
+            defer if (claims) |*owned| owned.releaseUnsubmitted();
+            var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_claims = if (claims) |*owned| owned else null, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
+            try std.testing.expectEqual(@as(u64, if (mixed_fusion) 1 else 0), result.stats.runtime_region_plan_dispatches);
             defer result.deinit(&executable.runtime);
             try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
             try std.testing.expectEqual(expected.len, result.outputs.len);
@@ -55932,12 +55954,14 @@ const PreparedDenseRegionFixture = struct {
                     for (actual, wanted) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
                 }
             }
-            try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..count], true);
+            try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..count], true, false);
             if (count == 2) {
-                graph.outputs.items.len = 1;
-                graph.outputs.items[0] = try builder.neg(graph.outputs.items[0]);
+                const outputs = graph.outputs.items;
+                outputs[0] = try builder.neg(outputs[0]);
                 for (expected[0]) |*value| value.* = -value.*;
-                try runInstalled(cb, &graph, nodes[0..3], values[0..3], expected[0..1], false);
+                try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..2], false, true);
+                graph.outputs.items.len = 1;
+                try runInstalled(cb, &graph, nodes[0..3], values[0..3], expected[0..1], false, false);
             }
         }
     }
@@ -56099,7 +56123,7 @@ const PreparedDenseRegionFixture = struct {
             selected.deinit();
             selected_live = false;
             try profile.finishSubmission();
-            try runInstalled(cb, &graph, nodes[0..count], values[0 .. projection_count + 1], expected[0..projection_count], true);
+            try runInstalled(cb, &graph, nodes[0..count], values[0 .. projection_count + 1], expected[0..projection_count], true, false);
             // Actual assigned output ownership survives the selected slot pins,
             // and the following whole public execution of this same graph.
             for (0..projection_count) |index| {

@@ -876,6 +876,7 @@ pub const Pool = struct {
     }
     pub fn requiresManagedExecution(self: *const Pool) bool {
         if (!self.metal_frame_dispatch) return false;
+        if (self.region_execution_profile == .unknown and self.regions.len != 0) return true;
         for (self.host_input_plans) |plan| if (plan.requirements.requires_managed_operation) return true;
         return false;
     }
@@ -1196,11 +1197,13 @@ pub const Pool = struct {
         }
         defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         const child = try root.cloneVariant();
-        errdefer child.deinit();
-        // This later defer runs before child errdefer; callbacks never execute
-        // under the snapshot gate, including candidate-allocation failures.
+        var transferred = false;
+        defer if (!transferred) child.deinit();
+        // Leave the snapshot gate before cleanup on either refusal or error.
         defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        return finishPreparedVariant(child, .{ .slice = inputs }, policy, profile, metadata.token());
+        const selected = (try finishPreparedVariant(child, .{ .slice = inputs }, policy, profile, metadata.token())) orelse return null;
+        transferred = true;
+        return selected;
     }
 
     // One finalizer owns selection, resource recipes, ingress and coverage for
@@ -1235,6 +1238,7 @@ pub const Pool = struct {
             @import("device_owned_coverage.zig").assess(child, child.coverage_backend.?, authority)
         else
             @import("owned_coverage.zig").assess(child);
+        if (profile == .unknown and child.metal_frame_dispatch and child.regions.len != 0 and child.payload_coverage != .complete) return null;
         if (child.metal_projection_region_candidate and child.payload_coverage != .complete) child.metal_frame_dispatch = false;
         const immutable = child.immutable_bindings orelse return error.MissingImmutableKernelBindings;
         // Epoch is identity, not a hash of equivalent metadata. Every cache hit
@@ -1350,6 +1354,7 @@ pub const Pool = struct {
 
     fn prepareRegionsWithAuthority(self: *Pool, authority: ?@import("backend_operation.zig").Borrowed) !void {
         if (self.region_execution_profile == .unknown) {
+            if (self.coverage_backend) |backend| if (backend.kind() == .metal and !self.metal_frame_dispatch) return;
             var ordinary = false;
             for (self.backends) |backend| if (backend.vtable.kernels) |functions| {
                 ordinary = ordinary or (functions.accepts(backend.vtable) and functions.regionRoutesInOrdinaryFrame);
@@ -2999,11 +3004,20 @@ pub const Frame = struct {
         if (!self.in_use or self.claimed or index >= self.region_claims.len) return error.InvalidPreparedRegionClaim;
         const claim: ?*const region.PayloadClaim = if (self.region_claims[index]) |*value| value else null;
         if (installed.owner.requirements.payload_claim_required and claim == null) return error.PreparedRegionClaimRequired;
-        const policy = try self.pool.currentRegionPolicy(installed.backend_index);
+        const managed_metal = backend.kind() == .metal and self.pool.region_execution_profile == .unknown and self.pool.requiresManagedExecution();
+        const policy = policy: {
+            if (managed_metal) {
+                const current = self.scope_cleanup.operation orelse return error.RegionExecutionProfileChanged;
+                if (current.mode != .managed) return error.RegionExecutionProfileChanged;
+                break :policy installed.owner.policy_key;
+            }
+            break :policy try self.pool.currentRegionPolicy(installed.backend_index);
+        };
         var bound = try self.acquireRegionOutputs(&backend, installed, facts, policy);
         errdefer bound.deinit();
         var invocation = bound.invocation(.{ .context = backend.ptr, .table = backend.vtable }, policy, facts, inputs);
         invocation.validation.payload_claim = claim;
+        invocation.validation.operation = self.scope_cleanup.operation;
         // Preparing resources can itself submit packing/probe work. A thrown
         // error from here therefore requires checked drain before releasing pins.
         self.region_started[index] = true;
@@ -3077,7 +3091,7 @@ pub const Frame = struct {
         }
         // No backing allocation, metadata CT, command encoder or driver call may
         // happen until all selected semantic/input/output facts have validated.
-        try installed.owner.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .policy_key = policy_key, .inputs = facts, .outputs = result.slots[0..installed.outputs.len], .payload_claim = if (self.region_claims[region_index]) |*claim| claim else null });
+        try installed.owner.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .policy_key = policy_key, .inputs = facts, .outputs = result.slots[0..installed.outputs.len], .payload_claim = if (self.region_claims[region_index]) |*claim| claim else null, .operation = self.scope_cleanup.operation });
         for (installed.outputs, 0..) |output, index| {
             const lease = (try self.storageFor(cb, installed.backend_index, output.slot.allocation)) orelse return error.PreparedRegionStorageUnavailable;
             var authority: ?route.AssignedOutput = null;
