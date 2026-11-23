@@ -8314,12 +8314,20 @@ pub const GraphIndex = struct {
     /// publishes the in-memory counters -- the step after which a
     /// synchronous graph-visible write's ack may return.
     pub fn installInlineEdgePublication(self: *GraphIndex, publication: *InlineEdgePublication) !void {
-        try self.outgoing_owner.native_catalog.applyExternallyCommittedMutations(publication.forward_mutations);
-        try self.reverse_owner.native_catalog.applyExternallyCommittedMutations(publication.reverse_mutations);
+        try self.applyInlinePublicationToServing(publication);
+        publication.abort();
+    }
+
+    pub fn applyInlinePublicationToServing(self: *GraphIndex, publication: *const InlineEdgePublication) !void {
+        const forward = self.outgoing_owner.native_catalog;
+        const reverse = self.reverse_owner.native_catalog;
+        errdefer {
+            forward.invalidateMirror();
+            reverse.invalidateMirror();
+        }
+        try forward.applyExternallyCommittedMutations(publication.forward_mutations);
+        try reverse.applyExternallyCommittedMutations(publication.reverse_mutations);
         self.publishCounters(publication.counters);
-        freeOwnedMutations(self.alloc, publication.forward_mutations);
-        freeOwnedMutations(self.alloc, publication.reverse_mutations);
-        publication.* = undefined;
     }
 
     /// The forward (outgoing-adjacency) store's `.native_catalog` scope --

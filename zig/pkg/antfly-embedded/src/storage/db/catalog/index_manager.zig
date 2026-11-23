@@ -3358,6 +3358,7 @@ pub const IndexManager = struct {
         max_edges_per_document: u32 = 0,
         ttl_duration_ns: u64 = 0,
         rebuild_root_path: []u8,
+        inline_writer: @import("../../commit_participant.zig").WriterViewQueue(graph_mod.GraphIndex.InlineWriterView) = .{},
         index: graph_mod.GraphIndex,
 
         pub fn invalidateNeighborSource(self: *@This()) void {

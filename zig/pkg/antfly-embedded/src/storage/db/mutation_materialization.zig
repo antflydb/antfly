@@ -3690,6 +3690,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             forward_scope: []const u8,
             reverse_scope: []const u8,
             progress: apply_state.Progress,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
 
             fn reset(_: *anyopaque) void {}
             fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
@@ -3702,33 +3704,67 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
             }
 
-            /// Call only once the host transaction's commit has actually
-            /// returned successfully (see `InlineTextPublication.install`'s
-            /// identical warning).
-            pub fn participant(self: *InlineGraphPublication) commit_participant.Participant {
-                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
             }
 
-            pub fn install(self: *InlineGraphPublication) void {
-                std.debug.assert(self.apply_guard.locked());
-                self.entry.index.installInlineEdgePublication(&self.publication) catch |err| {
-                    std.log.err("inline graph publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineGraphPublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.applyInlinePublicationToServing(&self.publication) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                    self.entry.invalidateNeighborSource();
+                } else |_| {}
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineGraphPublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
                 };
-                // Matches `applyGraphMutationsEntryMode`'s own
-                // `entry.invalidateNeighborSource()` call whenever a write
-                // actually lands -- purely in-memory bookkeeping (not part
-                // of `publication`'s durable mutations), safe to run here
-                // unconditionally since this type only ever represents
-                // exactly one edge write.
-                self.entry.invalidateNeighborSource();
-                self.apply_guard.unlock();
-                self.alloc.destroy(self);
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineGraphPublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.advance(&self.publication) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineGraphPublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
             }
 
             pub fn abort(self: *InlineGraphPublication) void {
-                std.debug.assert(self.apply_guard.locked());
                 self.publication.abort();
-                self.apply_guard.unlock();
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
                 self.alloc.destroy(self);
             }
         };
@@ -3762,7 +3798,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var apply_guard = try index_manager.lockManagedIndexApply(index_ref);
             errdefer apply_guard.unlock();
 
-            const publication = entry.index.prepareInlineEdgePublication(.{
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            var publication = entry.index.prepareInlineEdgePublicationFrom(&queue.view.?, .{
                 .source = write.source,
                 .target = write.target,
                 .edge_type = write.edge_type,
@@ -3779,6 +3819,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 else => return err,
             };
 
+            errdefer publication.abort();
             const result = try alloc.create(InlineGraphPublication);
             result.* = .{
                 .alloc = alloc,
