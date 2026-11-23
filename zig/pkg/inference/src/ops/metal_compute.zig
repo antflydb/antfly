@@ -22757,6 +22757,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             cache.noteRelease(.host, bytes);
             self.data.prefetch.unlock();
         }
+        const wrapped = try wrapMetalPersistentTensor(tensor);
+        storage_owner.host_bytes += bytes;
+        storage_owner.drop_ct = dropMetalPersistentTensor;
+        return wrapped;
+    }
+
+    fn wrapMetalPersistentTensor(tensor: MetalTensor) !CT {
+        const bytes = persistentTensorBytes(tensor.shape().len);
         const a = std.heap.c_allocator;
         const block = try a.alignedAlloc(u8, .fromByteUnits(persistent_tensor_alignment), bytes);
         const buf: *Buf = @ptrCast(block.ptr);
@@ -22764,8 +22772,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const shape = shape_data[0..tensor.shape().len];
         for (tensor.shape(), shape) |d, *dest| dest.* = d;
         buf.* = .{ .cache_identity = nextPreparedValueIdentity(), .data = @as([*]f32, @ptrFromInt(@alignOf(f32)))[0..0], .allocator = a, .owned = false, .logical_shape = shape, .metal_tensor = tensor, .integer_storage = tensor.dtype != .f32 };
-        storage_owner.host_bytes += bytes;
-        storage_owner.drop_ct = dropMetalPersistentTensor;
         return @ptrCast(buf);
     }
     fn audioPlanAllocationBound(self: *MetalCompute, bytes: usize, shared: bool) ?usize {
@@ -22890,15 +22896,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 staged.refundLocked(cache);
             }
         }
+        // Quote every wrapper before touching the SDK. A denied host
+        // reservation leaves both the old arena and the driver untouched.
+        var wrapper_bytes = persistentTensorBytes(1);
+        for (plan.nodes[0..plan.count]) |*node| if (try plan.arena_recipe.workspaceView(node, .separate)) |view| {
+            wrapper_bytes = try std.math.add(usize, wrapper_bytes, persistentTensorBytes(view.shape.len));
+        };
+        const cache = if (self.data.tier_cache) |*value| value else return error.AudioScheduleAdmission;
+        {
+            self.data.prefetch.lock();
+            defer self.data.prefetch.unlock();
+            try cache.reserve(.host, wrapper_bytes);
+        }
+        staged.host_bytes = wrapper_bytes;
+        staged.drop_ct = dropMetalPersistentTensor;
+
         const bank = (try self.metalPersistentBuffer(&staged, bytes, false)) orelse return error.AudioScheduleAdmission;
-        staged_bank = self.metalPersistentTensor(&staged, bank) catch |err| {
+        staged_bank = wrapMetalPersistentTensor(bank) catch |err| {
             var owned = bank;
             owned.deinit();
             return err;
         };
         for (plan.nodes[0..plan.count], 0..) |*node, i| if (try plan.arena_recipe.workspaceView(node, .separate)) |region| {
             const view = try bank.retainedView(region.offset, region.bytes, &region.shape);
-            staged.outputs[i] = self.metalPersistentTensor(&staged, view) catch |err| {
+            staged.outputs[i] = wrapMetalPersistentTensor(view) catch |err| {
                 var owned = view;
                 owned.deinit();
                 return err;
@@ -62097,8 +62118,8 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
     const old_backend = cache.backend_bytes;
     plan.selection = .{ .eager_count = 5, .replay_count = 5 };
     const selection = plan.selection;
-    // Let SDK allocation succeed, then refuse its first persistent wrapper.
-    // The staged owner must retire only its own delta, never the old bank.
+    // Refuse the complete wrapper reservation before SDK allocation.
+    // The existing output bank remains usable under the narrower allowance.
     cache.budget.host_limit_bytes = old_host + metal_tensor_mod.device_buffer_ref_bytes;
     compute.provider_impl.audio_schedule_clock = plan.retry_after;
     {
