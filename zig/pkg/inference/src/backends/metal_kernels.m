@@ -16766,6 +16766,7 @@ static NSString *termite_metal_shader_source(void) {
            "    uint query_pos = p.query_position_offset + qi;\n"
            "    for (uint ki = 0u; ki < p.kv_len; ++ki) {\n"
            "        uint key_pos = p.kv_position_offset + ki;        bool allowed = key_pos <= query_pos && (p.sliding_window == 0u || (query_pos - key_pos) < p.sliding_window);\n"
+           "        if (p.reserved0 != 0u) allowed = mask[b * p.kv_len + ki] != 0u;\n"
            "\n"
            "        float score = -3.402823466e+38f;\n"
            "        if (allowed) {\n"
@@ -16781,6 +16782,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float sum = 0.0f;\n"
            "    for (uint ki = 0u; ki < p.kv_len; ++ki) {\n"
            "        uint key_pos = p.kv_position_offset + ki;        bool allowed = key_pos <= query_pos && (p.sliding_window == 0u || (query_pos - key_pos) < p.sliding_window);\n"
+           "        if (p.reserved0 != 0u) allowed = mask[b * p.kv_len + ki] != 0u;\n"
            "\n"
            "        if (!allowed) continue;\n"
            "        uint k_base = kv_batch_base + ki * kv_stride + kv_head_off;\n"
@@ -36958,7 +36960,7 @@ int antfly_metal_dense_attention_planned(termite_metal_decode_runtime *runtime,
         out, oo, true, workspace, workspace_offset, workspace_bytes);
 }
 
-int termite_metal_decode_runtime_apply_attention_f32_device_batched(
+static int antfly_metal_apply_attention_f32_device_batched(
     termite_metal_decode_runtime *runtime,
     void *q_handle,
     size_t q_offset,
@@ -36977,7 +36979,9 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
     size_t sliding_window,
     size_t total_sequence_len,
     void *output_handle,
-    size_t output_offset
+    size_t output_offset,
+    const uint8_t *key_mask,
+    size_t key_mask_bytes
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || output_handle == NULL) return -1;
     if (runtime->attention_f32_pipeline == nil) return -2;
@@ -37012,6 +37016,16 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
             !termite_metal_buffer_range_valid(v_buffer, v_offset, kv_bytes) ||
             !termite_metal_buffer_range_valid(output_buffer, output_offset, q_bytes)) return -7;
 
+        id<MTLBuffer> key_mask_buffer = nil;
+        if (key_mask) {
+            size_t required;
+            if (!termite_metal_size_mul(batch, kv_len, &required) || required != key_mask_bytes) return -7;
+            if (required > 4096u) {
+                key_mask_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:key_mask length:required options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+                if (key_mask_buffer == nil) return -7;
+            }
+        } else if (key_mask_bytes != 0) return -7;
+
         const float zero_bias = 0.0f;
         const uint8_t zero_mask = 0;
         termite_metal_attention_f32_params params = {
@@ -37027,20 +37041,22 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
             .has_bias = 0u,
             .has_mask = 0u,
             .batch = (uint32_t)batch,
-            .reserved0 = 0u,
+            .reserved0 = key_mask != NULL ? 1u : 0u,
         };
         const bool frame_owned = (runtime->active_frame_cb == nil);
         id<MTLCommandBuffer> command_buffer = frame_owned
             ? termite_metal_new_command_buffer(runtime->queue, __func__)
             : runtime->active_frame_cb;
         if (command_buffer == nil) return -8;
+        if (!frame_owned && key_mask_buffer != nil &&
+            termite_metal_decode_runtime_retain_frame_resource(runtime, key_mask_buffer) != 0) return -8;
         // Join the frame's open planned encoder so a decode step stays one
         // command sequence; only open a private encoder when none is active.
         id<MTLComputeCommandEncoder> encoder = frame_owned ? nil : runtime->active_planned_compute_encoder;
         const BOOL planned_encoder = (encoder != nil);
         if (!planned_encoder) encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
         if (encoder == nil) return -9;
-        const BOOL use_decode_1x_hd64 = runtime->florence_attention_1x_enabled != 0 &&
+        const BOOL use_decode_1x_hd64 = key_mask == NULL && runtime->florence_attention_1x_enabled != 0 &&
             runtime->attention_f32_decode_1x_hd64_pipeline != nil &&
             q_len == 1u && head_dim == 64u && kv_len <= 2048u;
         const size_t split_chunk = 128u;
@@ -37062,7 +37078,7 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
         // resident K/V: run the split-K single-query kernel once per query
         // row, each with its own partials region. The generic kernel would
         // walk every key serially per query row.
-        const BOOL use_split_multi = !use_decode_1x_hd64 && batch == 1u &&
+        const BOOL use_split_multi = key_mask == NULL && !use_decode_1x_hd64 && batch == 1u &&
             runtime->florence_attention_1x_enabled != 0 && runtime->attention_1x_split_enabled != 0 &&
             runtime->attention_f32_decode_1x_hd64_split_stage_pipeline != nil &&
             runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline != nil &&
@@ -37132,7 +37148,13 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
             : runtime->attention_f32_pipeline;
         antfly_metal_set_compute_pipeline(encoder, (pipeline));
         termite_metal_bind_four_buffers(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, output_buffer, output_offset, &zero_bias, sizeof(zero_bias));
-        [encoder setBytes:&zero_mask length:sizeof(zero_mask) atIndex:5];
+        if (key_mask_buffer != nil) {
+            [encoder setBuffer:key_mask_buffer offset:0 atIndex:5];
+        } else if (key_mask != NULL) {
+            [encoder setBytes:key_mask length:key_mask_bytes atIndex:5];
+        } else {
+            [encoder setBytes:&zero_mask length:sizeof(zero_mask) atIndex:5];
+        }
         [encoder setBytes:&params length:sizeof(params) atIndex:6];
         if (use_decode_1x_hd64) {
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((kv_len + 4u) * sizeof(float)) atIndex:0];
@@ -37154,6 +37176,40 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
         }
         return 0;
     }
+}
+
+int termite_metal_decode_runtime_apply_attention_f32_device_batched(
+    termite_metal_decode_runtime *runtime,
+    void *q_handle,
+    size_t q_offset,
+    void *k_handle,
+    size_t k_offset,
+    void *v_handle,
+    size_t v_offset,
+    size_t batch,
+    size_t q_len,
+    size_t kv_len,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t query_position_offset,
+    size_t kv_position_offset,
+    size_t sliding_window,
+    size_t total_sequence_len,
+    void *output_handle,
+    size_t output_offset
+) {
+    return antfly_metal_apply_attention_f32_device_batched(runtime, q_handle, q_offset, k_handle, k_offset,
+        v_handle, v_offset, batch, q_len, kv_len, num_heads, num_kv_heads, head_dim,
+        query_position_offset, kv_position_offset, sliding_window, total_sequence_len, output_handle, output_offset, NULL, 0);
+}
+
+int antfly_metal_masked_cross_attention(termite_metal_decode_runtime *runtime,
+    void *q, size_t qo, void *k, size_t ko, void *v, size_t vo, size_t batch, size_t queries, size_t keys,
+    size_t heads, size_t head_dim, void *out, size_t oo, const uint8_t *key_mask, size_t key_mask_bytes) {
+    if (key_mask == NULL) return -7;
+    return antfly_metal_apply_attention_f32_device_batched(runtime, q, qo, k, ko, v, vo, batch,
+        queries, keys, heads, heads, head_dim, 0, 0, 0, keys, out, oo, key_mask, key_mask_bytes);
 }
 
 int termite_metal_decode_runtime_florence_window_pack_f32_device(

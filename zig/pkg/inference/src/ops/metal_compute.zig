@@ -16389,9 +16389,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (batch == 0 or dec_seq == 0 or enc_seq == 0 or num_heads == 0 or head_dim == 0) return null;
         const mask_len = std.math.mul(usize, batch, enc_seq) catch return null;
         if (enc_mask.len < mask_len) return null;
-        for (enc_mask[0..mask_len]) |value| {
-            if (value == 0) return null;
-        }
+        const use_mask = std.mem.indexOfScalar(i64, enc_mask[0..mask_len], 0) != null;
         const q_buf = toBuf(q_ct);
         const k_buf = toBuf(k_ct);
         const v_buf = toBuf(v_ct);
@@ -16424,6 +16422,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const total_sequence_len = std.math.add(usize, enc_seq, dec_seq) catch return null;
 
+        var inline_mask: [4096]u8 = undefined;
+        const heap_mask = if (use_mask and mask_len > inline_mask.len) try self.allocator.alloc(u8, mask_len) else null;
+        defer if (heap_mask) |memory| self.allocator.free(memory);
+        const key_mask = if (use_mask) heap_mask orelse inline_mask[0..mask_len] else null;
+        if (key_mask) |packed_mask| {
+            for (packed_mask, enc_mask[0..mask_len]) |*destination, source| destination.* = @intFromBool(source != 0);
+        }
+
         if (try metal_runtime.decoderRuntimeApplyAttentionF32DeviceBatched(self.provider_impl, .{
             .q = q_mt,
             .k = k_mt,
@@ -16438,6 +16444,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .kv_position_offset = 0,
             .sliding_window = 0,
             .total_sequence_len = total_sequence_len,
+            .key_mask = @as(?[]const u8, key_mask),
         })) |tensor| {
             if (traceFlorence2ResidentMetal()) {
                 std.debug.print(
@@ -55054,6 +55061,36 @@ test "Metal canonical owned facade preserves assigned route numerics and rejects
     const actual = try cb.toFloat32(output, a);
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, actual);
+}
+
+test "Metal cross attention with arbitrary key masks keeps activations resident" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.metal_hosted.compute.ownedComputeBackend();
+    const q_data: [8]f32 = @splat(0);
+    const k_data: [12]f32 = @splat(0);
+    const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&q_data, &.{ 4, 2 }));
+    defer cb.free(q);
+    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&k_data, &.{ 6, 2 }));
+    defer cb.free(k);
+    const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 100, 200, 5, 6, 7, 8, 9, 10, 11, 12 }, &.{ 6, 2 }));
+    defer cb.free(v);
+    const audit_mod = @import("../execution/transfer_audit.zig");
+    var audit: audit_mod.Audit = .{ .forbid_device_host_access = true };
+    const result = blk: {
+        try audit_mod.begin(&audit);
+        defer audit_mod.end();
+        break :blk try cb.crossAttention(q, k, v, &.{ 1, 0, -1, 0, 0, 0 }, 2, 2, 3, 1, 2);
+    };
+    defer cb.free(result);
+    try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+    try std.testing.expectEqual(@as(u64, 6), audit.upload_bytes);
+    const values = try cb.toFloat32(result, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 3, 4, 0, 0, 0, 0 }, values);
 }
 
 test "Metal assigned suffix attention preserves causal positions and sliding window" {

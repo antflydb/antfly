@@ -3799,6 +3799,10 @@ fn applyAttentionF32DeviceBatched(comptime device_only: bool, self: anytype, req
         return null;
     }
 
+    const key_mask: ?[]const u8 = if (@hasField(@TypeOf(request), "key_mask")) request.key_mask else null;
+    if (key_mask) |mask| {
+        if (request.num_heads != request.num_kv_heads or mask.len != kv_rows) return null;
+    }
     const shape = [_]i32{ @intCast(q_rows), @intCast(attention_width) };
     const output_byte_len = std.math.mul(usize, q_elem_count, @sizeOf(f32)) catch return null;
     var output = try MetalTensor.deviceAllocate(
@@ -3809,6 +3813,28 @@ fn applyAttentionF32DeviceBatched(comptime device_only: bool, self: anytype, req
     );
     errdefer output.deinit();
 
+    if (key_mask) |mask| {
+        try attentionDeviceCompleted(antfly_metal_masked_cross_attention(
+            runtime,
+            request.q.deviceHandle(),
+            request.q.deviceByteOffset(),
+            request.k.deviceHandle(),
+            request.k.deviceByteOffset(),
+            request.v.deviceHandle(),
+            request.v.deviceByteOffset(),
+            request.batch,
+            request.q_len,
+            request.kv_len,
+            request.num_heads,
+            request.head_dim,
+            output.deviceHandle(),
+            output.deviceByteOffset(),
+            mask.ptr,
+            mask.len,
+        ));
+        @import("../execution/transfer_audit.zig").upload(mask.len);
+        return output;
+    }
     const rc = termite_metal_decode_runtime_apply_attention_f32_device_batched(
         runtime,
         request.q.deviceHandle(),
@@ -21365,6 +21391,7 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32_device(
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
+extern fn antfly_metal_masked_cross_attention(runtime: *RawMetalDecodeRuntime, q: ?*anyopaque, qo: usize, k: ?*anyopaque, ko: usize, v: ?*anyopaque, vo: usize, batch: usize, queries: usize, keys: usize, heads: usize, head_dim: usize, out: ?*anyopaque, oo: usize, key_mask: [*]const u8, key_mask_bytes: usize) c_int;
 pub extern fn termite_metal_decode_runtime_apply_attention_f32_device_batched(
     runtime: ?*RawMetalDecodeRuntime,
     q_handle: ?*anyopaque,
