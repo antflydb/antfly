@@ -2172,6 +2172,7 @@ pub const DurableSessionStore = struct {
         try self.rejectReferencedResurrection(txn, session);
         try self.preserveCompletionTxn(txn, session, false);
         try self.putConnectionExecutionTxn(txn, session);
+        try self.putAuthorizationProjection(txn, session, session_value.len);
         try txn.put(session_key, session_value);
         try txn.put(expiry_key, &.{});
         try self.putTaggedSqlExpiryTxn(txn, session);
@@ -3004,7 +3005,7 @@ pub const DurableSessionStore = struct {
         return std.mem.eql(u8, &(try self.registrationMutationControlled(.{ .discard = .{ .reference = reference, .cold = cold } }, context)), &reference);
     }
 
-    pub fn pendingRegistrationPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize, context: RoutingContext) !Outbox.RecoveryPage {
+    pub fn pendingRegistrationPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: ?Outbox.Namespace.PublicationCursor, limit: usize, context: RoutingContext) !Outbox.Namespace.PublicationPage {
         return switch (self.backend) {
             .docstore => |store| result: {
                 try context.ensureActive();
@@ -3727,6 +3728,7 @@ pub const DurableSessionStore = struct {
         try self.rejectReferencedResurrection(txn, session);
         try self.preserveCompletionTxn(txn, session, false);
         try self.putConnectionExecutionTxn(txn, session);
+        try self.putAuthorizationProjection(txn, session, value.len);
         try txn.put(key, value);
         try txn.put(expiry_key, &.{});
         try self.putTaggedSqlExpiryTxn(txn, session);
@@ -3912,6 +3914,47 @@ pub const DurableSessionStore = struct {
         if (sql_commit) |committed| if (previous.prepared_completion_only) try self.putSqlCommitDecision(txn, previous, committed);
     }
 
+    fn putAuthorizationProjection(self: *DurableSessionStore, txn: anytype, session: Session, session_bytes: usize) !void {
+        if (!authorizationProjectionEligible(session) or sessionContainsNativePayload(session)) return;
+        const a = self.alloc;
+        const key = try authorizationProjectionKey(a, session.txn_id);
+        defer a.free(key);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const budget = @min(32 << 10, self.graphRecordLimit() -| (session_bytes +| 256));
+        var estimated: usize = 512;
+        var read_snapshots = session.read_snapshots.valueIterator();
+        while (read_snapshots.next()) |snapshot| {
+            const document_bytes = if (snapshot.document_json) |document| document.len else 0;
+            estimated +|= 64 +| 6 *| (snapshot.table_name.len +| snapshot.key.len +| document_bytes);
+            if (estimated > budget) break;
+        }
+        if (session.staged) |staged| {
+            if (session.listing_summary_tail == null and (staged.tables.len > 128 or staged.read_set.len > 1024 or staged.catalog_bindings.items.len > 128)) estimated = std.math.maxInt(usize);
+        }
+        if (estimated > budget) {
+            txn.delete(key) catch |err| if (err != error.NotFound) return err;
+            return;
+        }
+        const tables = try sessionTableDetails(scratch, session.staged, false);
+        const snapshots = try scratch.alloc(SessionReadSnapshot, session.read_snapshots.count());
+        var it = session.read_snapshots.valueIterator();
+        for (snapshots) |*snapshot| snapshot.* = it.next().?.*;
+        const value = try std.json.Stringify.valueAlloc(scratch, AuthorizationProjection{
+            .principal = session.principal,
+            .status = sessionStatusSnapshot(&session, true),
+            .tables = tables,
+            .read_snapshots = snapshots,
+            .catalog_bindings = if (session.staged) |staged| staged.catalog_bindings.items else &.{},
+        }, .{});
+        if (value.len <= budget) {
+            try txn.put(key, value);
+        } else {
+            txn.delete(key) catch |err| if (err != error.NotFound) return err;
+        }
+    }
+
     fn deleteLoadedSessionTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, previous: Session, expected: Version, cutoff: ?u64, guard: ?Mutation) !void {
         const txn_id = previous.txn_id;
         if (!std.meta.eql(expected, Version.of(previous))) return error.SessionLeaseLost;
@@ -3942,6 +3985,9 @@ pub const DurableSessionStore = struct {
         try self.clearTaggedSqlExpiryTxn(txn, previous);
         try updateSessionCount(txn, false, null);
         try txn.delete(key);
+        const authorization_key = try authorizationProjectionKey(self.alloc, txn_id);
+        defer self.alloc.free(authorization_key);
+        txn.delete(authorization_key) catch |err| if (err != error.NotFound) return err;
         try self.clearSessionLeaseTxn(txn, txn_id);
         const recovery_key = try makeSessionRecoveryKey(self.alloc, txn_id);
         defer self.alloc.free(recovery_key);
@@ -6108,8 +6154,8 @@ pub const SessionRegistry = struct {
         if (try parseSqlPrefix(raw, sql_field)) |payload| return payload[0] & 4 != 0;
         if (try parseReaderPrefix(raw) != null) {
             const offset = sessionRecordHeader(raw).len + reader_field.len + 2 * reader_payload_len + 2;
-            if (std.mem.startsWith(u8, raw[offset..], http_terminal_field ++ "0,")) return false;
-            if (std.mem.startsWith(u8, raw[offset..], http_terminal_field ++ "1,")) return true;
+            if (std.mem.startsWith(u8, raw[offset..], http_terminal_field ++ "0,") or std.mem.startsWith(u8, raw[offset..], http_terminal_field ++ "2,")) return false;
+            if (std.mem.startsWith(u8, raw[offset..], http_terminal_field ++ "1,") or std.mem.startsWith(u8, raw[offset..], http_terminal_field ++ "3,")) return true;
         }
         return null;
     }
@@ -7324,13 +7370,14 @@ pub const SessionRegistry = struct {
     fn readAuthorizationCut(self: *SessionRegistry, read: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8, context: RoutingContext) !?SessionDetails {
         const key = try makeSessionKey(alloc, id);
         defer alloc.free(key);
+        var has_projection = false;
         prefix: {
             var scope = read.openReadScope(alloc) catch |err| switch (err) {
                 error.Unsupported => break :prefix,
                 else => return err,
             };
             defer scope.close();
-            const raw = scope.probePrefix(key, @max(graph_status_read_len, connection_prefix_len)) catch |err| switch (err) {
+            const raw = scope.probePrefix(key, @max(graph_status_read_len, @max(http_terminal_prefix_len, connection_prefix_len + http_authorization_field.len))) catch |err| switch (err) {
                 error.NotFound => return null,
                 error.Unsupported, error.EndOfStream => break :prefix,
                 else => return err,
@@ -7338,16 +7385,57 @@ pub const SessionRegistry = struct {
             const header = sessionRecordHeader(raw);
             if (std.mem.startsWith(u8, raw, prepared_session_header)) return null;
             if (std.mem.startsWith(u8, raw[header.len..], graph_status_field) or try parseConnectionPrefix(raw) != null) return null;
+            if (try parseReaderPrefix(raw) != null) {
+                const offset = header.len + reader_field.len + 2 * reader_payload_len + 2;
+                has_projection = std.mem.startsWith(u8, raw[offset..], http_terminal_field ++ "2,") or std.mem.startsWith(u8, raw[offset..], http_terminal_field ++ "3,");
+            } else if (try parseSqlPrefix(raw, sql_field) != null) {
+                const offset = header.len + sql_field.len + encoded_len + 2;
+                has_projection = std.mem.startsWith(u8, raw[offset..], http_authorization_field);
+            }
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(principal orelse "", &digest, .{});
             if (try sessionPrincipalMatchesPrefix(raw, principal, &digest)) |matches| if (!matches) return null;
         }
         try context.ensureActive();
+        if (has_projection) if (try readAuthorizationProjection(read, alloc, id, principal)) |details| return details;
         var snapshot = (try self.detailsFromTxn(read, alloc, key, id, .{ .principal = principal }, .authorization, false)) orelse return null;
         defer snapshot.session.deinit(alloc);
         defer if (snapshot.summary) |summary| summary.deinit();
         try context.ensureActive();
         return try projectDetails(alloc, &snapshot.session, snapshot.status, .authorization, if (snapshot.summary) |summary| summary.value else null);
+    }
+
+    fn readAuthorizationProjection(read: anytype, alloc: std.mem.Allocator, id: [16]u8, principal: ?[]const u8) !?SessionDetails {
+        const key = try authorizationProjectionKey(alloc, id);
+        defer alloc.free(key);
+        const bytes = read.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        var parsed = try std.json.parseFromSlice(AuthorizationProjection, alloc, bytes, .{});
+        defer parsed.deinit();
+        if (!principalsEqual(parsed.value.principal, principal) or !std.mem.eql(u8, &parsed.value.status.txn_id, &id)) return error.InvalidTransactionSessionRecord;
+        var details: SessionDetails = .{
+            .status = parsed.value.status,
+            .tables = &.{},
+            .read_snapshots = &.{},
+            .savepoint_ids = &.{},
+        };
+        errdefer details.deinit(alloc);
+        details.tables = try cloneTableDetails(alloc, parsed.value.tables);
+        const snapshots = try alloc.alloc(SessionReadSnapshot, parsed.value.read_snapshots.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (snapshots[0..initialized]) |*snapshot| snapshot.deinit(alloc);
+            alloc.free(snapshots);
+        }
+        for (parsed.value.read_snapshots, snapshots) |snapshot, *owned| {
+            owned.* = try snapshot.clone(alloc);
+            initialized += 1;
+        }
+        try cloneDetailBindings(alloc, &details, parsed.value.catalog_bindings);
+        details.read_snapshots = snapshots;
+        return details;
     }
 
     pub fn getListingDetailsForPrincipal(self: *SessionRegistry, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: ?[]const u8) !?SessionDetails {
@@ -8080,7 +8168,8 @@ pub const SessionRegistry = struct {
         if (current.graph_receipt or current.connection_id != null or current.commit_execution_started or current.terminal_commit != null or current.terminal_abort) return false;
         try context.ensureActive();
         if (self.durable) |durable| try durable.deleteControlled(guard.id, expected, null, guard, null, context);
-        if (!self.hasColocatedLease()) self.releaseLease(guard.id, current.owner_node_id) catch {};
+        // A separate lease cannot change this durable deletion. Let its
+        // existing TTL expire instead of running network cleanup on the stripe.
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.sessions.fetchRemove(guard.id)) |removed| {
@@ -10827,6 +10916,24 @@ fn checkSqlReader(session: *const Session, principal: []const u8, owner: u64) !v
 // rewrite semantics. An older writer drops the field and selects legacy decode.
 const reader_field = "\"reader_v1\":\"";
 const reader_payload_len = 41;
+const http_authorization_field = "\"a1\":1,";
+
+fn authorizationProjectionEligible(session: Session) bool {
+    return !session.graph_receipt and !session.prepared_completion_only and session.connection_id == null and session.volatile_payload == null;
+}
+
+fn authorizationProjectionKey(alloc: std.mem.Allocator, id: [16]u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__api_session_authorization__:{s}", .{&std.fmt.bytesToHex(id, .lower)});
+}
+
+const AuthorizationProjection = struct {
+    principal: ?[]const u8,
+    status: SessionStatus,
+    tables: []const SessionTableDetail,
+    read_snapshots: []const SessionReadSnapshot,
+    catalog_bindings: []const CatalogBinding,
+};
+
 const http_terminal_field = "\"h1\":";
 const prepared_session_header = session_record.prepared_session_header;
 
@@ -10860,7 +10967,7 @@ const payload_len = 65;
 const encoded_len = std.base64.standard.Encoder.calcSize(payload_len);
 const connection_prefix_len = session_record.bound_session_header.len + connection_field.len + encoded_len + 2;
 comptime {
-    std.debug.assert(connection_prefix_len <= session_record.cached_prefix_bytes);
+    std.debug.assert(connection_prefix_len + http_authorization_field.len <= session_record.cached_prefix_bytes);
 }
 
 pub const ConnectionLifecycle = struct {
@@ -11243,8 +11350,14 @@ fn encodeSessionRecordWithListingLimit(alloc: std.mem.Allocator, session: Sessio
         try out.appendSlice(alloc, &std.fmt.bytesToHex(readerPayload(&session), .lower));
     }
     if (!session.graph_receipt) try out.appendSlice(alloc, "\",");
-    if (!session.graph_receipt and session.sql == null and session.connection_id == null)
-        try out.appendSlice(alloc, if (session.terminal_commit != null) http_terminal_field ++ "1," else http_terminal_field ++ "0,");
+    if (!session.graph_receipt and session.sql == null and session.connection_id == null) {
+        try out.appendSlice(alloc, if (authorizationProjectionEligible(session))
+            (if (session.terminal_commit != null) http_terminal_field ++ "3," else http_terminal_field ++ "2,")
+        else
+            (if (session.terminal_commit != null) http_terminal_field ++ "1," else http_terminal_field ++ "0,"));
+    } else if (session.sql != null and authorizationProjectionEligible(session)) {
+        try out.appendSlice(alloc, http_authorization_field);
+    }
     if (session.graph_receipt) {
         try out.appendSlice(alloc, "\"graph_receipt\":true,");
         if (session.terminal_abort) {

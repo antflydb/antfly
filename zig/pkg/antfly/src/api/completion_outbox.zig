@@ -99,11 +99,25 @@ pub const Namespace = struct {
         return std.fmt.bufPrint(buf, "{s}{x:0>16}", .{ try self.publicationPrefix(&prefix_buf), localSequence(reference) });
     }
 
+    pub const PublicationCursor = struct { expires_ns: u64, sequence: u64 };
+    pub const PublicationEntry = struct { reference: [16]u8, cursor: PublicationCursor };
+    pub const PublicationPage = struct { entries: []PublicationEntry, next: ?PublicationCursor };
+
+    fn duePrefix(self: Namespace, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__sql_completion_due__:{x:0>16}:", .{self.issuer});
+    }
+
+    fn dueKey(self: Namespace, buf: []u8, cursor: PublicationCursor) ![]const u8 {
+        var prefix_buf: [96]u8 = undefined;
+        return std.fmt.bufPrint(buf, "{s}{x:0>16}:{x:0>16}", .{ try self.duePrefix(&prefix_buf), cursor.expires_ns, cursor.sequence });
+    }
+
     pub fn stagePublication(self: Namespace, txn: anytype, reference: [16]u8, expires_ns: u64) !void {
         var key_buf: [128]u8 = undefined;
         var value: [8]u8 = undefined;
         std.mem.writeInt(u64, &value, expires_ns, .little);
         try txn.put(try self.publicationKey(&key_buf, reference), &value);
+        try txn.put(try self.dueKey(&key_buf, .{ .expires_ns = expires_ns, .sequence = localSequence(reference) }), &.{});
     }
 
     pub fn publicationExpiry(self: Namespace, txn: anytype, reference: [16]u8) !?u64 {
@@ -118,42 +132,44 @@ pub const Namespace = struct {
     }
 
     pub fn finishPublication(self: Namespace, txn: anytype, reference: [16]u8) !void {
-        if (self.observation or try self.publicationExpiry(txn, reference) == null) return;
+        const expires_ns = (try self.publicationExpiry(txn, reference)) orelse return;
         var key_buf: [128]u8 = undefined;
         try txn.delete(try self.publicationKey(&key_buf, reference));
+        txn.delete(try self.dueKey(&key_buf, .{ .expires_ns = expires_ns, .sequence = localSequence(reference) })) catch |err| if (err != error.NotFound) return err;
     }
 
-    pub fn publicationPage(self: Namespace, txn: anytype, alloc: std.mem.Allocator, after: u64, limit: usize, now_ns: u64) !RecoveryPage {
+    pub fn publicationPage(self: Namespace, txn: anytype, alloc: std.mem.Allocator, after: ?PublicationCursor, limit: usize, now_ns: u64) !PublicationPage {
+        if (limit == 0) return .{ .entries = &.{}, .next = after };
         var prefix_buf: [96]u8 = undefined;
-        const entry_prefix = try self.publicationPrefix(&prefix_buf);
+        const entry_prefix = try self.duePrefix(&prefix_buf);
         const state = try self.producer(txn, alloc, @splat(0));
-        var references: std.ArrayList([16]u8) = .empty;
-        errdefer references.deinit(alloc);
+        var entries: std.ArrayList(PublicationEntry) = .empty;
+        errdefer entries.deinit(alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
+        cursor.setKeysOnly();
         var buf: [128]u8 = undefined;
-        const lower = try std.fmt.bufPrint(&buf, "{s}{x:0>16}", .{ entry_prefix, after +| 1 });
+        const lower = if (after) |position| try self.dueKey(&buf, position) else entry_prefix;
         var row = try cursor.seekAtOrAfter(lower);
-        var scanned: usize = 0;
-        var last: u64 = after;
-        var next: u64 = 0;
+        if (after != null and row != null and std.mem.eql(u8, row.?.key, lower)) row = try cursor.next();
+        var next: ?PublicationCursor = null;
         while (row) |entry| : (row = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, entry_prefix)) break;
-            if (scanned >= limit) {
-                next = last;
+            const suffix = entry.key[entry_prefix.len..];
+            if (suffix.len != 33 or suffix[16] != ':') return error.InvalidTransactionSessionRecord;
+            const expires_ns = try std.fmt.parseInt(u64, suffix[0..16], 16);
+            if (expires_ns > now_ns) break;
+            if (entries.items.len == limit) {
+                next = entries.items[limit - 1].cursor;
                 break;
             }
-            if (entry.value.len != 8) return error.InvalidTransactionSessionRecord;
-            const seq = try std.fmt.parseInt(u64, entry.key[entry_prefix.len..], 16);
-            scanned += 1;
-            last = seq;
-            if (std.mem.readInt(u64, entry.value[0..8], .little) > now_ns) continue;
+            const sequence = try std.fmt.parseInt(u64, suffix[17..], 16);
             var reference: [16]u8 = undefined;
             reference[0..8].* = state.id;
-            std.mem.writeInt(u64, reference[8..16], seq, .big);
-            try references.append(alloc, reference);
+            std.mem.writeInt(u64, reference[8..16], sequence, .big);
+            try entries.append(alloc, .{ .reference = reference, .cursor = .{ .expires_ns = expires_ns, .sequence = sequence } });
         }
-        return .{ .references = try references.toOwnedSlice(alloc), .after = next };
+        return .{ .entries = try entries.toOwnedSlice(alloc), .next = next };
     }
 
     pub fn key(self: Namespace, buf: []u8, reference: [16]u8) ![]const u8 {

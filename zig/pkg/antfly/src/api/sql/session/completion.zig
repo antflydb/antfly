@@ -344,9 +344,17 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
                 continue;
             } else |_| {}
         }
-        if (!try store.joinRegistrationControlled(reference, context)) {
-            if (!@import("../../completion_outbox.zig").isObservation(reference)) return error.CompletionUnavailable;
-            discardOutcome(completion, alloc, index);
+        const joined = store.joinRegistrationControlled(reference, context) catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown, error.DeadlineExceeded, error.Canceled => false,
+            else => return err,
+        };
+        if (!joined) {
+            if (@import("../../completion_outbox.zig").isObservation(reference)) {
+                discardOutcome(completion, alloc, index);
+                continue;
+            }
+            completion.outcomes.items[index].registration_pending = true;
+            index += 1;
             continue;
         }
         const request: OwnerRequest = .{ .reference_id = reference, .consumer_node_id = outcome.registration_node_id, .action = .status };
@@ -367,6 +375,16 @@ pub fn pinJoined(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, co
     pinJoinedControlled(server, alloc, completion, network, .{});
 }
 
+fn deferKnownPublications(completion: *wire.Completion) void {
+    for (completion.outcomes.items) |*outcome| {
+        if (outcome.reference_id == null or outcome.registration_node_id == null) {
+            completion.unknown = true;
+        } else {
+            outcome.registration_pending = true;
+        }
+    }
+}
+
 pub fn pinJoinedControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, network: std.Io, request: operation.RequestContext) void {
     if (completion.unknown or completion.outcomes.items.len == 0) return;
     const fresh = for (completion.outcomes.items) |outcome| {
@@ -375,11 +393,11 @@ pub fn pinJoinedControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.All
     const has_prepared = completion.join_begin != null;
     if (!fresh and !has_prepared) return;
     const context = settlementContext(request) catch {
-        completion.unknown = true;
+        deferKnownPublications(completion);
         return;
     };
     const io = server_mod.ApiHttpServer.configuredDurableIo(server.cfg) orelse {
-        completion.unknown = true;
+        deferKnownPublications(completion);
         return;
     };
     const Job = struct {
@@ -392,11 +410,11 @@ pub fn pinJoinedControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.All
         fn run(job: *@This()) void {
             defer job.done.set(job.network);
             const store = registrationStoreControlled(job.server, job.context) catch {
-                job.completion.unknown = true;
+                deferKnownPublications(job.completion);
                 return;
             };
             joinPrepared(job.server, job.alloc, job.completion, job.context) catch {
-                job.completion.unknown = true;
+                deferKnownPublications(job.completion);
                 return;
             };
             for (job.completion.outcomes.items) |*outcome| {
@@ -430,8 +448,8 @@ pub fn pinJoinedControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.All
                     return;
                 };
                 if (!(store.joinRegistrationControlled(reference, job.context) catch false)) {
-                    job.completion.unknown = true;
-                    return;
+                    outcome.registration_pending = true;
+                    continue;
                 }
                 _ = consumerActionControlled(job.server, job.alloc, .{ .reference_id = reference, .consumer_node_id = outcome.registration_node_id, .action = .pin }, true, job.context) catch {
                     outcome.registration_pending = true;
@@ -443,7 +461,7 @@ pub fn pinJoinedControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.All
     };
     var job = Job{ .server = server, .alloc = alloc, .completion = completion, .network = network, .context = context };
     var future = io.concurrent(Job.run, .{&job}) catch {
-        completion.unknown = true;
+        deferKnownPublications(completion);
         return;
     };
     job.done.waitUncancelable(network);
@@ -464,7 +482,7 @@ pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, rece
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
         if (outcome.registration_node_id) |node| {
-            if (!try consumerActionControlled(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .status }, true, context)) return false;
+            if (!try consumerActionControlled(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .status, .resume_publication = if (outcome.registration_pending) true else null }, true, context)) return false;
             continue;
         }
         if (outcome.ddl_receipt_json) |encoded| {
@@ -504,7 +522,7 @@ pub fn acknowledge(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
         if (outcome.registration_node_id) |node| {
-            if (!try consumerActionControlled(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .acknowledge }, true, context)) return false;
+            if (!try consumerActionControlled(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .acknowledge, .resume_publication = if (outcome.registration_pending) true else null }, true, context)) return false;
             continue;
         }
         if (outcome.ddl_receipt_json) |encoded| {
@@ -533,7 +551,7 @@ pub fn remaining(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, re
     return .{ .outcomes = try pending.toOwnedSlice(alloc) };
 }
 
-pub const OwnerRequest = struct { transaction_id: [16]u8 = @splat(0), reference_id: [16]u8, action: enum { pin, prepare, observe, quiesce, abandon, status, acknowledge, forget }, consumer_node_id: ?u64 = null, managed: bool = false, retired_through: u64 = 0 };
+pub const OwnerRequest = struct { transaction_id: [16]u8 = @splat(0), reference_id: [16]u8, action: enum { pin, prepare, observe, quiesce, abandon, status, acknowledge, forget }, consumer_node_id: ?u64 = null, resume_publication: ?bool = null, managed: bool = false, retired_through: u64 = 0 };
 // The originating node serializes registration, probing, and acknowledgement.
 // Remote stores retain compact retirement checkpoints, so delayed retries cannot
 // recreate acknowledged proofs, including across process restarts.
@@ -561,7 +579,11 @@ fn consumerActionControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Al
     const hex = std.fmt.bytesToHex(request.reference_id, .lower);
     outcome.reference_id = &hex;
     outcome.registration_node_id = null;
-    if (record.value.phase == .discarding or (record.value.prepared and !record.value.joined)) return false;
+    if (record.value.phase == .discarding) return false;
+    if (!record.value.joined and (record.value.prepared or request.resume_publication == true)) {
+        if (request.resume_publication != true or !try store.joinRegistrationControlled(request.reference_id, context)) return false;
+        record.value.joined = true;
+    }
     // This durable phase is a positive terminal witness, including when an
     // issuer-side delete failed after remote retirement before publication.
     if (record.value.phase == .acknowledging and request.action == .status) return true;
@@ -762,13 +784,17 @@ pub fn recoverUnpublished(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
     const context = try settlementContext(.{});
     const store = try registrationStoreControlled(server, context);
     const pending = try store.pendingRegistrationPage(alloc, server.sql_completion_pending_after, limit, context);
-    defer alloc.free(pending.references);
-    for (pending.references) |reference| {
+    defer alloc.free(pending.entries);
+    var live_failure: ?anyerror = null;
+    for (pending.entries) |entry| {
         try context.ensureActive();
-        server.sql_completion_pending_after = @import("../../completion_retirement.zig").sequence(reference);
-        try recoverAbandonedRegistration(server, store, alloc, reference, false, context);
+        server.sql_completion_pending_after = entry.cursor;
+        recoverAbandonedRegistration(server, store, alloc, entry.reference, false, context) catch |err| {
+            if (live_failure == null) live_failure = err;
+        };
     }
-    server.sql_completion_pending_after = pending.after;
+    server.sql_completion_pending_after = pending.next;
+    if (live_failure) |err| return err;
 
     // Keep the cold scan for prepared registrations created by older writers.
     if (server.sql_completion_cold_scan_done) return;
