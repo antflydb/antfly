@@ -10360,7 +10360,7 @@ test "Source physical transaction PREPARE atomically retains the exact frozen in
             const applied = (try source_apply.readApplied(arena.allocator(), &read, input.permit)).?;
             try std.testing.expectEqual(@as(u64, 5), applied.position.raft.index);
             try std.testing.expectEqual(TxnStatus.committed, record.status);
-            const acked = (try source_apply.readAcknowledged(arena.allocator(), &read, completion)).?;
+            const acked = (try source_apply.readAcknowledged(arena.allocator(), &read, source_ack)).?;
             try std.testing.expectEqual(@as(u64, 6), acked.position.raft.index);
             const resolved = try manager.getResolvedParticipants(a, id);
             defer freeParticipantList(a, resolved);
