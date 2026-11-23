@@ -9553,6 +9553,11 @@ pub const HBCIndex = struct {
             index.finishPublishedSearchStateRefresh();
             index.closeExperimentalPostingWalWriter();
             index.discardExperimentalPostingDeltaBaseState();
+            if (next.overlay_depth >= managedPostingMaxLiveOverlayDepth) {
+                _ = index.collapseExperimentalPostingReadOverlays() catch |err| {
+                    std.log.warn("dense peer posting overlay consolidation deferred err={s}", .{@errorName(err)});
+                };
+            }
         }
     };
 
