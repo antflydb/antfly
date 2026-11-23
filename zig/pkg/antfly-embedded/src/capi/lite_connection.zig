@@ -3174,6 +3174,8 @@ pub const Owner = struct {
             0x01, 0x03 => true,
             0x02 => !(key.len >= 3 and key[1] == 0xff and key[2] == 0x40),
             0x00 => {
+                if (@import("../storage/artifact_footprint.zig").isKey(key) or
+                    std.mem.startsWith(u8, key, h.db_mod.DB.dense_artifact_target_counter_prefix)) return true;
                 const metadata = "\x00\x00__metadata__:";
                 if (std.mem.startsWith(u8, key, metadata)) {
                     const name = key[metadata.len..];
