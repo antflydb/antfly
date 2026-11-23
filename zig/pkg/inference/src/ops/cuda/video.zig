@@ -65,6 +65,7 @@ fn openDecoderOwned(out: *?*anyopaque, stream: ?*anyopaque, user: *anyopaque, ca
 pub const EmbeddingProbe = struct { sequence: Sequence, samples: u6 = 0, unique_frames: u6 = 0, display_width: u32 = 0, display_height: u32 = 0, raster_width: u32 = 0, raster_height: u32 = 0 };
 
 pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !Sequence {
+    if (comptime !has_nvdec_backend) return error.UnsupportedVideoBackend;
     try validateProbe(ctx, control, preparation);
     if (bytes.len > packet_sampling.reference_max_input_bytes) return error.VideoInputTooLarge;
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video-probe", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
@@ -78,6 +79,7 @@ pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext,
 }
 
 pub fn probeEmbeddingMp4(allocator: std.mem.Allocator, ctx: *context.CudaContext, prepared: *const PreparedEmbedding, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !EmbeddingProbe {
+    if (comptime !has_nvdec_backend) return error.UnsupportedVideoBackend;
     try validateProbe(ctx, control, preparation);
     var source = media.source.Source{ .allocator = allocator, .storage = prepared.source.storage, .identity = prepared.source.identity, .limits = prepared.source.limits, .control = control };
     var reader = prepared.reader;
@@ -87,7 +89,6 @@ pub fn probeEmbeddingMp4(allocator: std.mem.Allocator, ctx: *context.CudaContext
 }
 
 fn validateProbe(ctx: *context.CudaContext, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !void {
-    if (!build_options.enable_cuda or builtin.os.tag != .linux) return error.UnsupportedVideoBackend;
     try preparation.validate(ctx);
     try control.check();
     if (ctx.driver.fns.cuStreamIsCapturing == null) return error.UnsupportedCudaStageCaptureQuery;
