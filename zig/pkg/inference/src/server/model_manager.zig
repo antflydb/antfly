@@ -13250,12 +13250,23 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
         pair.generations[2] = 0;
         pair.declarations[2] = 0;
         pair.widths[2] = 0;
-        try MetalCompute.prepareProjectionPacksOutsideExecution(&target.cb, null, &.{ request, pair }, a, &pin, .{ .outside_execution = true });
+        var kv = pair;
+        for (0..2) |i| {
+            kv.slots[i] = request.slots[i + 1];
+            kv.generations[i] = request.generations[i + 1];
+            kv.declarations[i] = request.declarations[i + 1];
+            kv.widths[i] = request.widths[i + 1];
+        }
+        try MetalCompute.prepareProjectionPacksOutsideExecution(&target.cb, null, &.{ request, kv, pair, kv }, a, &pin, .{ .outside_execution = true });
         const packed_pair = compute.projectionPackCache().entries orelse return error.MissingPackedProjectionEntry;
-        try std.testing.expect(packed_pair != qkv);
+        const packed_kv = packed_pair.next orelse return error.MissingPackedProjectionEntry;
+        try std.testing.expectEqualDeep(pair, packed_pair.request);
+        try std.testing.expectEqualDeep(kv, packed_kv.request);
+        try std.testing.expectEqual(qkv, packed_kv.next.?);
         const current_runtime = compute.provider_impl.raw_decode_runtime;
         try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, qkv.owner.entry));
         try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, packed_pair.owner.entry));
+        try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, packed_kv.owner.entry));
     }
     // A second genuine component loader shares this manager's Domain and
     // actual compute context. The same binding is reported by both Models;

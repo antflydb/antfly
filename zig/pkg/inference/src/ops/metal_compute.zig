@@ -13238,33 +13238,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     };
 
-    fn publishFundedProjectionPack(cb: *const ops.ComputeBackend, graph: ?*const ml.graph.Graph, token: operation_mod.Borrowed, request: ProjectionPack.Request, funded: *FundedProjectionPack) !void {
-        try token.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph, .mode = .managed });
-        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        // The numerical Gate excludes other execution, but residency can
-        // independently reclaim source slots under this actual index lock.
-        // Keep source reads, terminal packing and alias publication in that
-        // same exclusion; no supplier or quota callback occurs here.
-        if (!self.provider_impl.linear_slot_index_mutex.tryLock()) return error.QueueFull;
-        defer self.provider_impl.linear_slot_index_mutex.unlock();
-        // Funding ran outside all execution gates. Another cold caller may
-        // have published this exact request in the meantime. Recheck under
-        // the real source/index and creator-map exclusion before any packing.
-        const cache = self.projectionPackCache();
-        platform.sync.lockYielding(&cache.mutex);
-        const already_published = self.packedProjection(cache, request) != null;
-        cache.mutex.unlock();
-        if (already_published) return;
-        if (funded.published or funded.data != self.data or funded.provider != self.provider_impl or !std.meta.eql(funded.layout, try request.layout())) return error.PreparedPackedProjectionChanged;
-        const entry = try metal_runtime.PackedProjectionEntry.create(self.provider_impl.raw_decode_runtime, request, funded.roots);
+    fn publishFundedProjectionPack(cache: *ProjectionPack.Cache, entry: metal_runtime.PackedProjectionEntry, funded: *FundedProjectionPack) !void {
         const owner = funded.owner;
         const node = funded.node;
         // Keep the funded owner private until the SDK accepts its bindings.
         // On rejection the funding object still owns both roots and the charge.
-        errdefer antfly_metal_packed_projection_release_owner(entry.handle);
         owner.init(funded.data.allocator, entry.handle, funded.charge, antfly_metal_packed_projection_release_owner);
-        if (metal_runtime.antfly_metal_packed_projection_publish(self.provider_impl.raw_decode_runtime, entry.handle, owner) != 0) return error.PackedProjectionPublicationFailed;
-        node.* = .{ .request = request, .owner = owner, .next = null };
+        if (metal_runtime.antfly_metal_packed_projection_publish(entry.runtime, entry.handle, owner) != 0) return error.PackedProjectionPublicationFailed;
+        node.* = .{ .request = entry.request, .owner = owner, .next = null };
         platform.sync.lockYielding(&cache.mutex);
         node.next = cache.entries;
         cache.entries = node;
@@ -13275,6 +13256,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const PendingProjectionPack = struct {
         cold: bool,
         funded: ?FundedProjectionPack = null,
+        encoded: ?metal_runtime.PackedProjectionEntry = null,
     };
 
     /// Called before any Model/lane/profile entry, with the retained model's
@@ -13308,9 +13290,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             platform.sync.lockYielding(&cache.mutex);
             defer cache.mutex.unlock();
             var any_cold = false;
-            for (requests, pending) |request, *entry| {
+            for (requests, pending, 0..) |request, *entry, index| {
                 _ = try request.layout();
-                const cold = self.packedProjection(cache, request) == null;
+                const cold = self.packedProjection(cache, request) == null and unique: {
+                    for (requests[0..index]) |prior| if (std.meta.eql(prior, request)) break :unique false;
+                    break :unique true;
+                };
                 entry.* = .{ .cold = cold };
                 any_cold = any_cold or cold;
             }
@@ -13331,9 +13316,48 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer active.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
         const token = active.token() orelse return error.PreparedMetadataAuthorityUnavailable;
         if (cleanup.boundary) |epoch| if (!try active.bindCleanupEpoch(epoch)) return error.BackendOperationCleanupUnavailable;
-        for (requests, pending) |request, *entry| if (entry.funded) |*funded| try publishFundedProjectionPack(cb, graph, token, request, funded);
+        try self.encodeAndPublishProjectionPacks(cb, graph, token, requests, pending);
         // Closing the operation can itself acquire the slot index lock.
         try active.finish();
+    }
+
+    fn encodeAndPublishProjectionPacks(self: *MetalCompute, cb: *const ops.ComputeBackend, graph: ?*const ml.graph.Graph, token: operation_mod.Borrowed, requests: []const ProjectionPack.Request, pending: []PendingProjectionPack) !void {
+        try token.validate(.{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph, .mode = .managed });
+        // Residency can independently reclaim source slots. Keep the index
+        // held through encoding, terminal completion and alias publication.
+        if (!self.provider_impl.linear_slot_index_mutex.tryLock()) return error.QueueFull;
+        defer self.provider_impl.linear_slot_index_mutex.unlock();
+        const raw_runtime = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        // Reuse the provider's process-unique retirement identity.
+        {
+            var origin: u64 = 0;
+            const status = metal_runtime.antfly_metal_output_retirement_begin(raw_runtime, &origin, @import("../execution/resource_retirement.zig").Queue.createIdentity);
+            if (status < 0) return error.InvalidResourceRetirement;
+            defer metal_runtime.antfly_metal_output_retirement_end(raw_runtime);
+            if (status != 0 or origin == 0) return error.AssignedDenseExternalFrame;
+        }
+
+        const cache = self.projectionPackCache();
+        var recording: ?*anyopaque = null;
+        defer for (pending) |entry| if (entry.encoded) |encoded| antfly_metal_packed_projection_release_owner(encoded.handle);
+        defer if (recording) |command| metal_runtime.antfly_metal_projection_pack_release(command);
+        for (requests, pending) |request, *entry| {
+            const funded = if (entry.funded) |*value| value else continue;
+            // Another cold caller can publish while supplier work runs.
+            platform.sync.lockYielding(&cache.mutex);
+            const exists = self.packedProjection(cache, request) != null;
+            cache.mutex.unlock();
+            if (exists) continue;
+            if (funded.published or funded.data != self.data or funded.provider != self.provider_impl or !std.meta.eql(funded.layout, try request.layout())) return error.PreparedPackedProjectionChanged;
+            if (recording == null) recording = metal_runtime.antfly_metal_projection_pack_begin(raw_runtime) orelse return error.PackedProjectionPreparationFailed;
+            entry.encoded = try metal_runtime.PackedProjectionEntry.encode(raw_runtime, recording.?, request, funded.roots);
+        }
+        const command = recording orelse return;
+        if (metal_runtime.antfly_metal_projection_pack_finish(command) != 0) return error.PackedProjectionPreparationFailed;
+        for (pending) |*entry| if (entry.encoded) |encoded| {
+            try publishFundedProjectionPack(cache, encoded, &entry.funded.?);
+            entry.encoded = null;
+        };
     }
 
     fn fundProjectionPackOutsideExecution(self: *MetalCompute, layout: ProjectionPack.Layout, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !FundedProjectionPack {

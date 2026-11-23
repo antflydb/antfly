@@ -21407,14 +21407,32 @@ int antfly_metal_packed_projection_is_cached(termite_metal_decode_runtime *runti
 // The caller owns independent funding for BOTH supplied roots. This function
 // never allocates SDK payload. After terminal packing the compatibility cache
 // retains these same funded roots, rather than creating another physical pack.
+void *antfly_metal_projection_pack_begin(termite_metal_decode_runtime *runtime) {
+    if (!runtime || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return NULL;
+    id<MTLCommandBuffer> cb = termite_metal_new_command_buffer(runtime->queue, "prepared_projection_pack");
+    return cb == nil ? NULL : (void *)CFBridgingRetain(cb);
+}
+
+int antfly_metal_projection_pack_finish(void *recording) {
+    if (!recording) return -1;
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)recording;
+    antfly_metal_commit(cb);
+    antfly_metal_wait(cb);
+    return cb.status == MTLCommandBufferStatusCompleted ? 0 : -1;
+}
+
+void antfly_metal_projection_pack_release(void *recording) {
+    if (recording) CFRelease(recording);
+}
+
 int antfly_metal_packed_projection_create(
-    termite_metal_decode_runtime *runtime, size_t count, const size_t *slots,
+    termite_metal_decode_runtime *runtime, void *recording, size_t count, const size_t *slots,
     const uint64_t *generations, const uint64_t *declarations,
     size_t width, const size_t *widths, void *weight_handle, void *bias_handle,
     void **result
 ) {
     if (result) *result = NULL;
-    if (!runtime || !result || !slots || !generations || !declarations || !widths ||
+    if (!runtime || !recording || !result || !slots || !generations || !declarations || !widths ||
         !weight_handle || !bias_handle || count < 2 || count > 3 || width == 0 || width > UINT32_MAX ||
         atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire) == 0 || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
     @autoreleasepool {
@@ -21437,14 +21455,9 @@ int antfly_metal_packed_projection_create(
         }
         if ((count == 2 && widths[0] != widths[1]) || (count == 3 && widths[1] != widths[2]) ||
             !antfly_metal_packed_projection_matches(runtime, entry)) return -1;
-        id<MTLCommandBuffer> cb = termite_metal_new_command_buffer(runtime->queue, "prepared_projection_pack");
-        if (cb == nil) return -2;
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)recording;
         const int encoded = antfly_metal_encode_projection_pack(runtime, cb, count, slots, width, widths, sizeof(float), (__bridge id<MTLBuffer>)entry->weight, (__bridge id<MTLBuffer>)entry->bias);
         if (encoded != 0) return encoded;
-        antfly_metal_commit(cb);
-        antfly_metal_wait(cb);
-        if (cb.status != MTLCommandBufferStatusCompleted) return -4;
-        if (!antfly_metal_packed_projection_matches(runtime, entry)) return -1;
         *result = entry;
         entry = NULL;
         return 0;

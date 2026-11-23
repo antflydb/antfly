@@ -50965,31 +50965,18 @@ pub const PackedProjectionEntry = struct {
     handle: *anyopaque,
     request: @import("dense_projection_pack.zig").Request,
 
-    /// Only the accepted cold receiver may supply these independently funded
-    /// standalone SDK roots. Native create validates actual device/extents and
-    /// retains them; no temporary MetalTensor/header allocation is introduced.
-    pub fn create(runtime: ?*RawMetalDecodeRuntime, request: @import("dense_projection_pack.zig").Request, roots: [2]*anyopaque) !PackedProjectionEntry {
-        const current = runtime orelse return error.RuntimeUnavailable;
+    /// Encode into the caller's cold batch. Keep the entry private until
+    /// the shared command buffer completes successfully.
+    pub fn encode(runtime: *RawMetalDecodeRuntime, recording: *anyopaque, request: @import("dense_projection_pack.zig").Request, roots: [2]*anyopaque) !PackedProjectionEntry {
         _ = try request.layout();
-        if (hasActiveFrame(current) or hasSubmittedFrame(current)) return error.AssignedDenseExternalFrame;
         if (roots[0] == roots[1]) return error.InvalidPackedProjectionRoot;
-        // The immutable entry can outlive this provider. Reuse the existing
-        // process-unique retirement identity so a recycled runtime address
-        // cannot attest an old retained entry. End publication before packing.
-        {
-            var origin: u64 = 0;
-            const pending = antfly_metal_output_retirement_begin(current, &origin, @import("../execution/resource_retirement.zig").Queue.createIdentity);
-            if (pending < 0) return error.InvalidResourceRetirement;
-            defer antfly_metal_output_retirement_end(current);
-            if (pending != 0 or origin == 0) return error.AssignedDenseExternalFrame;
-        }
         var entry: ?*anyopaque = null;
-        const status = antfly_metal_packed_projection_create(current, request.count, &request.slots, &request.generations, &request.declarations, request.width, &request.widths, roots[0], roots[1], &entry);
+        const status = antfly_metal_packed_projection_create(runtime, recording, request.count, &request.slots, &request.generations, &request.declarations, request.width, &request.widths, roots[0], roots[1], &entry);
         if (status != 0) {
             if (entry) |partial| antfly_metal_packed_projection_release(partial);
             return error.PackedProjectionPreparationFailed;
         }
-        return .{ .runtime = current, .handle = entry orelse return error.PackedProjectionPreparationFailed, .request = request };
+        return .{ .runtime = runtime, .handle = entry orelse return error.PackedProjectionPreparationFailed, .request = request };
     }
     pub fn matches(self: *const PackedProjectionEntry, runtime: ?*RawMetalDecodeRuntime) bool {
         return runtime == self.runtime and antfly_metal_packed_projection_matches(self.runtime, self.handle) != 0;
@@ -51046,7 +51033,10 @@ pub extern fn antfly_metal_bind_packed_use_service(runtime: ?*RawMetalDecodeRunt
 pub extern fn antfly_metal_unbind_packed_use_service(runtime: ?*RawMetalDecodeRuntime, context: *anyopaque, nonce: u64) c_int;
 pub extern fn antfly_metal_packed_projection_publish(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque, owner: *anyopaque) c_int;
 pub extern fn antfly_metal_packed_projection_forget(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
-pub extern fn antfly_metal_packed_projection_create(runtime: *RawMetalDecodeRuntime, count: usize, slots: [*]const usize, generations: [*]const u64, declarations: [*]const u64, width: usize, widths: [*]const usize, weight: ?*anyopaque, bias: ?*anyopaque, entry: *?*anyopaque) c_int;
+pub extern fn antfly_metal_projection_pack_begin(runtime: *RawMetalDecodeRuntime) ?*anyopaque;
+pub extern fn antfly_metal_projection_pack_finish(recording: *anyopaque) c_int;
+pub extern fn antfly_metal_projection_pack_release(recording: *anyopaque) void;
+pub extern fn antfly_metal_packed_projection_create(runtime: *RawMetalDecodeRuntime, recording: *anyopaque, count: usize, slots: [*]const usize, generations: [*]const u64, declarations: [*]const u64, width: usize, widths: [*]const usize, weight: ?*anyopaque, bias: ?*anyopaque, entry: *?*anyopaque) c_int;
 pub extern fn antfly_metal_packed_projection_retain(entry: *anyopaque) ?*anyopaque;
 pub extern fn antfly_metal_packed_projection_release(entry: *anyopaque) void;
 pub extern fn antfly_metal_packed_projection_matches(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
