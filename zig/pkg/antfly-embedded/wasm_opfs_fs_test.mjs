@@ -124,18 +124,27 @@ function readAll(fs, path) {
     assert.equal(fs.rename("/db/source", "/db/destination"), status.io);
     assert.equal(readAll(fs, "/db/source"), "source payload and append");
     assert.equal(readAll(fs, "/db/destination"), "destination payload");
-    assert.equal(fs.write("/db/empty", bytes("cannot write"), false), status.io);
-    assert.equal(fs.size("/db/empty"), status.notFound);
-
     faults.writeAllowance = Infinity;
+    assert.equal(fs.remove("/db/destination", false), status.io, "an uncertain namespace must be reopened");
+
     const recoveredDir = crashed(dir);
     const reopened = await openOpfsFileSystem(recoveredDir, { initialSlots: 4, reserve: 2 });
     assert.equal(readAll(reopened, "/db/source"), "source payload and append");
     assert.equal(readAll(reopened, "/db/destination"), "destination payload");
-    assert.equal(reopened.rename("/db/source", "/db/destination"), 0);
+    // The new name commits, then a partial tombstone leaves the old slot
+    // intact. Reopen chooses the new owner before further mutations.
+    faults.writeAllowance = 2048 + 7;
+    assert.equal(reopened.rename("/db/source", "/db/destination"), status.io);
+    assert.equal(reopened.remove("/db/destination", false), status.io);
+    faults.writeAllowance = Infinity;
     const renamed = await openOpfsFileSystem(crashed(recoveredDir), { initialSlots: 4, reserve: 2 });
     assert.equal(readAll(renamed, "/db/destination"), "source payload and append");
     assert.equal(renamed.size("/db/source"), status.notFound);
+    faults.writeAllowance = 0;
+    assert.equal(renamed.write("/db/empty", bytes("cannot write"), false), status.io);
+    assert.equal(renamed.size("/db/empty"), status.notFound);
+    faults.writeAllowance = Infinity;
+    assert.equal(renamed.remove("/db/destination", false), 0);
     fs.close();
     reopened.close();
     renamed.close();

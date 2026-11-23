@@ -133,6 +133,7 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
     let generation = 0;
     let lastNow = 0n;
     let closed = false;
+    let namespaceFailed = false;
     let growing = Promise.resolve();
     // Demand tracking: one database call can create (and delete) many files,
     // and slots can only be added between calls. Track the deepest dip below
@@ -174,9 +175,17 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
     function writeRecord(slot, path) {
         const target = slot.record === 0 ? 1 : 0;
         const record = encodeRecord(++generation, path ?? "");
-        if (slot.handle.getSize() < HEADER) slot.handle.truncate(HEADER);
-        writeAll(slot.handle, record, target * RECORD);
-        slot.handle.flush();
+        try {
+            if (slot.handle.getSize() < HEADER) slot.handle.truncate(HEADER);
+            writeAll(slot.handle, record, target * RECORD);
+            slot.handle.flush();
+        } catch (error) {
+            // A failed flush can leave either record durable. A replacing
+            // rename may also have two valid owners until reopen reconciles
+            // them. Block further namespace writes until that recovery.
+            namespaceFailed = true;
+            throw error;
+        }
         slot.record = target;
         slot.generation = generation;
         slot.path = path;
@@ -256,6 +265,9 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
         lowestFree = Math.min(lowestFree, free.length);
         return slot;
     }
+    function requireWritable() {
+        if (namespaceFailed) throw new FsError(status.io, "OPFS namespace requires reopening");
+    }
     function lookup(path) {
         const slot = byPath.get(path);
         if (!slot) throw new FsError(status.notFound, "not found");
@@ -289,6 +301,7 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
         /** Replace or append, creating the file (durably named) if missing. */
         write: (path, bytes, append) =>
             guard(() => {
+                requireWritable();
                 let slot = byPath.get(path);
                 if (slot) {
                     if (!append) slot.handle.truncate(HEADER);
@@ -317,6 +330,7 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
             }),
         rename: (oldPath, newPath) =>
             guard(() => {
+                requireWritable();
                 const slot = lookup(oldPath);
                 if (oldPath === newPath) return 0;
                 if (encoder.encode(newPath).length > MAX_PATH) throw new FsError(status.io, "path too long");
@@ -334,6 +348,7 @@ export async function openOpfsFileSystem(directory, { initialSlots = 512, reserv
             }),
         remove: (path, tree) =>
             guard(() => {
+                requireWritable();
                 if (!tree) {
                     const slot = lookup(path);
                     release(slot);

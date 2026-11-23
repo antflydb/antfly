@@ -313,9 +313,9 @@ export class Mailbox extends R2CommitCoordinator {
   }
   async purgeObjects(mailbox, id) {
     const prefix = this.scope(mailbox);
-    if (this.ingests?.has(id)) return false;
     const receipt = await this.deletion.purging(id);
     if (!receipt) return null;
+    if (this.ingests?.has(id)) return false;
     const attempt = receipt.purge_attempt ?? 0;
     await this.run({
       op: "mutate",
