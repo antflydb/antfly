@@ -3561,6 +3561,10 @@ pub fn decoderRuntimeApplyAttentionF32DeviceOnly(self: anytype, request: Attenti
 
 const DenseAttentionRows = @import("../ops/kernel_descriptor.zig").DenseAttentionRows;
 
+fn denseAttentionKvHeads(geometry: DenseAttentionRows) u32 {
+    return if (geometry.num_kv_heads == 0) geometry.num_heads else geometry.num_kv_heads;
+}
+
 pub fn denseAttentionPrefixWorkspaceBytes(runtime: *RawMetalDecodeRuntime, geometry: @import("../ops/kernel_descriptor.zig").DenseAttentionPrefix) !usize {
     var bytes: usize = 0;
     if (antfly_metal_cross_attention_workspace(runtime, 1, geometry.max_key_rows, geometry.num_heads, geometry.head_dim, true, &bytes) != 0)
@@ -3573,7 +3577,7 @@ pub fn denseAttentionWorkspaceBytes(runtime: *RawMetalDecodeRuntime, geometry: D
     const status = if (geometry.kind == .cross)
         antfly_metal_cross_attention_workspace(runtime, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.head_dim, false, &bytes)
     else
-        antfly_metal_dense_attention_workspace(runtime, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.num_kv_heads, geometry.head_dim, geometry.sliding_window, &bytes);
+        antfly_metal_dense_attention_workspace(runtime, geometry.query_rows, geometry.key_rows, geometry.num_heads, denseAttentionKvHeads(geometry), geometry.head_dim, geometry.sliding_window, &bytes);
     if (status != 0) return error.InvalidAttentionShape;
     return bytes;
 }
@@ -3636,7 +3640,7 @@ pub fn decoderRuntimeDenseAttentionInto(
         geometry.query_rows,
         geometry.key_rows,
         geometry.num_heads,
-        geometry.num_kv_heads,
+        denseAttentionKvHeads(geometry),
         geometry.head_dim,
         geometry.sliding_window,
         out.deviceHandle(),

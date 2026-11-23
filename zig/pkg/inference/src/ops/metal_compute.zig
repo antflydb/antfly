@@ -43,7 +43,7 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
         .dense_attention_rows => |attention| {
             if (!attention.valid(descriptor)) return false;
             switch (attention.kind) {
-                .causal => if (attention.num_kv_heads == 0) return false,
+                .causal => {},
                 .cross => if (!attention.all_keys_visible) return false,
             }
             for (descriptor.input_shapes[0..3]) |shape| {
@@ -13013,11 +13013,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
-        if (request.descriptor.output_shape.dtype != .f32) return false;
-        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (self.audio_capture != null or !self.provider_impl.hasDecoderRuntime()) return false;
         const descriptor = request.descriptor;
         if (!supportsAssignedDescriptor(descriptor)) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.audio_capture != null or !self.provider_impl.hasDecoderRuntime()) return false;
         if (descriptor.operation == .add_mul_scalar and !metal_runtime.assignedAddMulScalarAvailable(self.provider_impl)) return false;
         const dense_attention = descriptor.operation == .dense_attention_rows or descriptor.operation == .dense_attention_prefix;
         var attention_geometry: ?ops.kernel_descriptor.DenseAttentionRows = null;
@@ -55237,6 +55236,14 @@ test "Metal assigned suffix attention preserves causal positions and sliding win
 }
 
 test "Metal planned full prompt attention consumes assigned F16 KV staging" {
+    try qualifyPlannedMetalCausalAttention(false);
+}
+
+test "Metal planned equal-head causal attention keeps the exact causal extent" {
+    try qualifyPlannedMetalCausalAttention(true);
+}
+
+fn qualifyPlannedMetalCausalAttention(comptime equal_heads: bool) !void {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -55244,31 +55251,32 @@ test "Metal planned full prompt attention consumes assigned F16 KV staging" {
     defer context.deinit(a);
     const cb = context.metal_hosted.compute.ownedComputeBackend();
     const functions = cb.vtable.kernels.?;
-    const rows = 16;
+    const rows = if (equal_heads) 3 else 16;
     const dim = 32;
     const width = 2 * dim;
+    const kv_width = if (equal_heads) width else dim;
     const q_values: [rows * width]f32 = @splat(0);
-    const k_values: [rows * dim]f32 = @splat(0);
-    var v_values: [rows * dim]f32 = undefined;
+    const k_values: [rows * kv_width]f32 = @splat(0);
+    var v_values: [rows * kv_width]f32 = undefined;
     for (&v_values, 0..) |*value, index| value.* = @floatFromInt(index % 11);
     const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&q_values, &.{ rows, width }));
     defer cb.free(q);
-    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&k_values, &.{ rows, dim }));
+    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&k_values, &.{ rows, kv_width }));
     defer cb.free(k);
-    const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&v_values, &.{ rows, dim }));
+    const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&v_values, &.{ rows, kv_width }));
     defer cb.free(v);
 
     const route = @import("../execution/kernel_route.zig");
     const Shape = @import("ml").graph.Shape;
     const query = Shape.init(.f32, &.{ rows, width });
-    const key = Shape.init(.f32, &.{ rows, dim });
+    const key = Shape.init(.f32, &.{ rows, kv_width });
     const bindings = [_]route.Binding{
         .{ .imported_host = .{ .logical = query, .target = .metal } },
         .{ .imported_host = .{ .logical = key, .target = .metal } },
         .{ .imported_host = .{ .logical = key, .target = .metal } },
     };
     const descriptor: ops.kernel_descriptor.Descriptor = .{
-        .operation = .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = rows, .key_rows = rows, .num_heads = 2, .num_kv_heads = 1, .head_dim = dim } },
+        .operation = .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = rows, .key_rows = rows, .num_heads = 2, .num_kv_heads = if (equal_heads) 0 else 1, .head_dim = dim } },
         .input_count = 3,
         .input_shapes = .{ query, key, key },
         .output_shape = query,
@@ -55283,18 +55291,18 @@ test "Metal planned full prompt attention consumes assigned F16 KV staging" {
     })) orelse return error.MissingOwnedPreparedRoute;
     defer selected.deinit();
     const scratch_bytes = selected.requirements.workspace.byte_size;
-    if (scratch_bytes == 0) return error.SkipZigTest;
-    try std.testing.expectEqual(@as(usize, 2 * rows * dim * @sizeOf(u16)), scratch_bytes);
+    if (!equal_heads and scratch_bytes == 0) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, if (equal_heads) 0 else 2 * rows * kv_width * @sizeOf(u16)), scratch_bytes);
     const lease = (try ops.physical_storage.Lease.create(a, cb, out_bytes)).?;
     defer lease.release();
-    const scratch_lease = (try ops.physical_storage.Lease.create(a, cb, scratch_bytes)).?;
-    defer scratch_lease.release();
+    const scratch_lease = if (scratch_bytes != 0) (try ops.physical_storage.Lease.create(a, cb, scratch_bytes)).? else null;
+    defer if (scratch_lease) |storage| storage.release();
     const output = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = &.{ rows, width } })).?;
     defer cb.free(output);
-    const scratch = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = scratch_lease, .shape = &.{@intCast(scratch_bytes / @sizeOf(f32))} })).?;
-    defer cb.free(scratch);
+    const scratch = if (scratch_lease) |storage| (try functions.physicalTensorView.?(cb.ptr, .{ .storage = storage, .shape = &.{@intCast(scratch_bytes / @sizeOf(f32))} })).? else null;
+    defer if (scratch) |value| cb.free(value);
     var invocation: ops.kernel_descriptor.Invocation = .{ .descriptor = &descriptor, .inputs = &.{ q, k, v }, .output = output, .prepared_route = &selected };
-    try std.testing.expectError(error.InvalidAssignedWorkspace, functions.runAssignedKernel.?(cb.ptr, invocation));
+    if (scratch != null) try std.testing.expectError(error.InvalidAssignedWorkspace, functions.runAssignedKernel.?(cb.ptr, invocation));
     invocation.workspace = scratch;
     try std.testing.expect(try functions.runAssignedKernel.?(cb.ptr, invocation));
     const actual = try cb.toFloat32(output, a);
@@ -55302,7 +55310,7 @@ test "Metal planned full prompt attention consumes assigned F16 KV staging" {
     for (0..rows) |row| {
         for (0..width) |column| {
             var sum: f32 = 0;
-            for (0..row + 1) |i| sum += v_values[i * dim + column % dim];
+            for (0..row + 1) |i| sum += v_values[i * kv_width + column % kv_width];
             try std.testing.expectApproxEqAbs(sum / @as(f32, @floatFromInt(row + 1)), actual[row * width + column], 0.005);
         }
     }
@@ -60335,10 +60343,10 @@ test "Metal ordinary host linear fallback owns complete readable F32 rows withou
     try helper.onMetal(helper.noWeights, Case.run);
 }
 
-test "Metal refuses Native declared multiquery attention before opaque provider or tensor access" {
+test "Metal refuses malformed causal attention before opaque provider or tensor access" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const Shape = @import("ml").graph.Shape;
-    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = 3, .key_rows = 3, .num_heads = 2, .head_dim = 2 } }, .input_count = 3, .input_shapes = .{ Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 3, 4 }) }, .output_shape = Shape.init(.f32, &.{ 3, 4 }) };
+    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = 3, .key_rows = 2, .num_heads = 2, .head_dim = 2 } }, .input_count = 3, .input_shapes = .{ Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 3, 4 }) }, .output_shape = Shape.init(.f32, &.{ 3, 4 }) };
     const foreign_context: *anyopaque = @ptrFromInt(16);
     const functions = MetalCompute.vtable_impl.kernels.?;
     try std.testing.expect(!try functions.runAssignedKernel.?(foreign_context, .{ .descriptor = &descriptor, .inputs = &.{} }));
