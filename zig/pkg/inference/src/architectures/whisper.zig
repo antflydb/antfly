@@ -1568,6 +1568,11 @@ pub const DecodeCache = struct {
         // output; on Metal they share a single submission.
         var frame_active = try beginWhisperMetalFrame(cb, .prefill);
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        // Assigned projections share the active encoder when their Metal
+        // schedule supports it. Vendor GEMM can close it before encoding on
+        // the same command buffer, and the caller still owns the terminal wait.
+        const scope_active = native != null and frame_active and (cb.decoderRuntimeBeginPlannedComputeScope() catch false);
+        defer if (scope_active) cb.decoderRuntimeEndPlannedComputeScope();
         for (0..config.decoder_layers) |layer| {
             prepared.fetcher.cb = cb;
             var buf: [256]u8 = undefined;
