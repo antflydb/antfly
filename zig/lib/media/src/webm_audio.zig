@@ -608,6 +608,8 @@ pub const DirectoryBuilder = struct {
         discard: ?Webm.ObservedDiscard,
         prefix: [12]u8,
         prefix_len: u8,
+        packet_index: usize,
+        padding_index: usize,
         ticks: u64,
         scale: u64,
     };
@@ -646,28 +648,56 @@ pub const DirectoryBuilder = struct {
         const track = self.track orelse return error.UnsupportedAudioFormat;
         const number = try @import("ebml.zig").readVint(prefix, 0);
         if (number.value != track.number) return;
-        if (self.deferred.items.len == 0) {
-            const before = self.packets.items.len;
-            self.collectBlock(input, elem, discard, prefix, ticks, scale, true) catch |err| {
-                if (err != error.AudioDirectoryNeedsRead) return err;
-                self.packets.shrinkRetainingCapacity(before);
+        const before = self.packets.items.len;
+        self.collectBlock(input, elem, discard, prefix, ticks, scale, true) catch |err| {
+            if (err != error.AudioDirectoryNeedsRead) return err;
+            self.packets.shrinkRetainingCapacity(before);
+            if (self.deferred.items.len >= self.limits.max_packets -| before) return error.AudioTooLarge;
+            var entry = DeferredBlock{
+                .element = elem,
+                .discard = discard,
+                .prefix = undefined,
+                .prefix_len = @intCast(prefix.len),
+                .packet_index = before,
+                .padding_index = self.padding.items.len,
+                .ticks = ticks,
+                .scale = scale,
             };
-            if (self.packets.items.len != before) return;
-        }
-        if (self.deferred.items.len >= self.limits.max_packets -| self.packets.items.len) return error.AudioTooLarge;
-        var entry = DeferredBlock{ .element = elem, .discard = discard, .prefix = undefined, .prefix_len = @intCast(prefix.len), .ticks = ticks, .scale = scale };
-        @memcpy(entry.prefix[0..prefix.len], prefix);
-        try self.deferred.append(self.allocator, entry);
+            @memcpy(entry.prefix[0..prefix.len], prefix);
+            try self.deferred.append(self.allocator, entry);
+        };
+        if (self.packets.items.len > self.limits.max_packets -| self.deferred.items.len) return error.AudioTooLarge;
     }
 
-    /// Complete the recorded suffix without revisiting segment or cluster metadata.
-    pub fn resolve(self: *DirectoryBuilder, input: *Source, resident_only: bool) !void {
+    /// Merge the missing blocks into the resident packet order.
+    pub fn resolve(self: *DirectoryBuilder, input: *Source) !void {
         if (self.failure) |err| return err;
+        if (self.deferred.items.len == 0) return;
+        var resident_packets = self.packets;
+        defer resident_packets.deinit(self.allocator);
+        var resident_padding = self.padding;
+        defer resident_padding.deinit(self.allocator);
+        self.packets = .empty;
+        self.padding = .empty;
+        var packet_cursor: usize = 0;
+        var padding_cursor: usize = 0;
         for (self.deferred.items) |entry| {
             try input.checkControl();
-            try self.collectBlock(input, entry.element, entry.discard, entry.prefix[0..entry.prefix_len], entry.ticks, entry.scale, resident_only);
+            try self.appendResident(resident_packets.items[packet_cursor..entry.packet_index], resident_padding.items[padding_cursor..entry.padding_index], packet_cursor);
+            packet_cursor = entry.packet_index;
+            padding_cursor = entry.padding_index;
+            try self.collectBlock(input, entry.element, entry.discard, entry.prefix[0..entry.prefix_len], entry.ticks, entry.scale, false);
         }
+        try self.appendResident(resident_packets.items[packet_cursor..], resident_padding.items[padding_cursor..], packet_cursor);
         self.deferred.clearAndFree(self.allocator);
+    }
+
+    fn appendResident(self: *DirectoryBuilder, packets: []const Packet, padding: []const BlockPadding, original_start: usize) !void {
+        const limit = @min(self.limits.max_packets, self.limits.max_index_bytes / @sizeOf(Packet));
+        if (packets.len > limit -| self.packets.items.len) return error.AudioTooLarge;
+        const added = self.packets.items.len - original_start;
+        try self.packets.appendSlice(self.allocator, packets);
+        for (padding) |entry| try self.padding.append(self.allocator, .{ .first = entry.first + added, .end = entry.end + added, .ns = entry.ns });
     }
 
     fn collectBlock(self: *DirectoryBuilder, input: *Source, elem: Webm.Element, discard: ?Webm.ObservedDiscard, prefix: []const u8, ticks: u64, scale: u64, resident_only: bool) !void {
@@ -909,7 +939,7 @@ test "WebM joint video and audio index reuses the block prefix" {
     const audio_entry = "\xae" ++ [_]u8{0x80 | audio_fields.len} ++ audio_fields;
     const track_bytes = video_entry ++ audio_entry;
     const cluster = "\xe7\x81\x00\xa3\x85\x81\x00\x00\x80\x01" ++
-        "\xa0\x95\xa1\x86\x82\x00\x01\x00\xf8\xff\x75\xa2\x20\x00\x08\xff\xff\xff\xff\xff\xff\xff\xff";
+        "\xa0\x95\xa1\x86\x82\x00\x01\x00\xf8\xff\x75\xa2\x20\x00\x08\xff\xff\xff\xff\xff\xff\xff\xff" ++ "\xa3\x86\x82\x00\x02\x00\xf8\xff";
     const segment = "\x16\x54\xae\x6b" ++ [_]u8{0x80 | track_bytes.len} ++ track_bytes ++
         "\x1f\x43\xb6\x75" ++ [_]u8{0x80 | cluster.len} ++ cluster;
     const bytes = "\x1a\x45\xdf\xa3\x87\x42\x82\x84webm" ++
@@ -960,8 +990,10 @@ test "WebM joint video and audio index reuses the block prefix" {
     try std.testing.expectEqualSlices(Webm.Packet, video.packets, uncached_video.packets);
     try std.testing.expectEqual(plain.reads, uncached.reads);
     try std.testing.expectError(error.AudioDirectoryNeedsRead, deferred.borrowDirectory());
+    try std.testing.expectEqual(@as(usize, 1), deferred.deferred.items.len);
+    try std.testing.expectEqual(@as(usize, 1), deferred.packets.items.len);
     uncached.limits = .{};
-    try deferred.resolve(&uncached, false);
+    try deferred.resolve(&uncached);
     const resolved = try deferred.borrowDirectory();
     try std.testing.expectEqualSlices(Packet, baseline.packets, resolved.packets);
     try std.testing.expectEqualSlices(BlockPadding, baseline.padding, resolved.padding);

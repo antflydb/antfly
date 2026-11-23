@@ -221,10 +221,23 @@ const WebmFlac = struct {
     tail_group_start: usize,
     working_bytes: usize,
     frame_directory: *FrameDirectory,
+    reservation: media.admission.Token = .{},
 
-    fn init(a: std.mem.Allocator, directory: media.webm_audio.Directory, input: *media.source.Source, budget: usize, temporary: usize, admission: ?Index.Admission) !WebmFlac {
+    fn init(backing: std.mem.Allocator, directory: media.webm_audio.Directory, input: *media.source.Source, budget: usize, temporary: usize, admission: ?Index.Admission) !WebmFlac {
         const retained = directory.packets.len *| @sizeOf(Extent) +| directory.padding.len *| @sizeOf(Cut) +| @sizeOf(FrameDirectory);
         if (retained > budget -| temporary) return error.AudioTooLarge;
+        var memory = media.admission.TrackedAllocator{
+            .backing = backing,
+            .reservation = if (input.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            .limit = budget -| temporary,
+        };
+        errdefer memory.reservation.deinit();
+        return build(backing, &memory, directory, input, budget, temporary, retained, admission) catch |err|
+            return if (err == error.OutOfMemory and memory.denied != null) error.AudioTooLarge else err;
+    }
+
+    fn build(backing: std.mem.Allocator, memory: *media.admission.TrackedAllocator, directory: media.webm_audio.Directory, input: *media.source.Source, budget: usize, temporary: usize, retained: usize, admission: ?Index.Admission) !WebmFlac {
+        const a = memory.allocator();
         const parsed = try audio.flac.parseStream(directory.track.codec_private);
         if (parsed.data_offset != directory.track.codec_private.len) return error.UnsupportedAudioFormat;
         const info = parsed.stream_info;
@@ -308,7 +321,7 @@ const WebmFlac = struct {
         const owned_gaps = try gaps.toOwnedSlice(a);
         errdefer a.free(owned_gaps);
         const owned_cuts = try a.realloc(cuts, cut_count);
-        return .{ .allocator = a, .info = info, .extents = extents, .leading = leading, .gaps = owned_gaps, .sample_count = samples_with_gaps, .cuts = owned_cuts, .tail_trim = tail_trim, .tail_group_start = tail_group_start, .working_bytes = budget - retained - gap_bytes, .frame_directory = frame_directory };
+        return .{ .allocator = backing, .reservation = memory.reservation, .info = info, .extents = extents, .leading = leading, .gaps = owned_gaps, .sample_count = samples_with_gaps, .cuts = owned_cuts, .tail_trim = tail_trim, .tail_group_start = tail_group_start, .working_bytes = budget - retained - gap_bytes, .frame_directory = frame_directory };
     }
 
     fn rawAt(self: WebmFlac, playback: usize, comptime start: bool) usize {
@@ -405,6 +418,7 @@ const WebmFlac = struct {
     fn copy(self: WebmFlac, a: std.mem.Allocator) !WebmFlac {
         var result = self;
         result.allocator = a;
+        result.reservation = .{};
         result.extents = try a.dupe(Extent, self.extents);
         errdefer a.free(result.extents);
         result.cuts = try a.dupe(Cut, self.cuts);
@@ -419,6 +433,7 @@ const WebmFlac = struct {
         self.allocator.free(self.extents);
         self.allocator.free(self.cuts);
         self.allocator.free(self.gaps);
+        self.reservation.deinit();
     }
 
     fn rawSamples(self: WebmFlac) ?usize {
@@ -1127,9 +1142,15 @@ test "model aware media range WebM audio preserves FLAC clocks with absent strea
     for ([_]bool{ false, true }) |unknown_total| {
         const webm = try audio.webm.buildFlacTestFileAlloc(a, encoded, unknown_total);
         defer a.free(webm);
-        var source = media.source.Source{ .allocator = a, .identity = "webm-flac", .storage = .{ .borrowed = webm } };
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+        var source = media.source.Source{ .allocator = a, .identity = "webm-flac", .storage = .{ .borrowed = webm }, .admission_pool = &pool };
         var index = try Index.initWebmSource(a, &source, 1024, 1024 * 1024, null);
         defer index.deinit();
+        try std.testing.expect(pool.snapshot().host_bytes > 0);
+        try std.testing.expectEqual(index.webm_flac.reservation.resources.host_bytes, pool.snapshot().host_bytes);
+        var snapshot = try index.copy(a);
+        snapshot.deinit();
+        try std.testing.expectEqual(index.webm_flac.reservation.resources.host_bytes, pool.snapshot().host_bytes);
         try std.testing.expectEqual(expected.sample_rate, index.rate());
         if (!unknown_total) try std.testing.expectEqual(expected.samples.len, index.samples());
         var reader = Reader{ .index = &index, .source = &source };

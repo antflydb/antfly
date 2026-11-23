@@ -23,6 +23,7 @@ pub const Control = struct {
     check_fn: ?*const fn (?*const anyopaque) anyerror!void = null,
     /// A range callback can report the valid prefix when it returns an error.
     failed_prefix: ?*usize = null,
+    optional_range: bool = false,
     pub fn check(self: Control) !void {
         if (self.check_fn) |callback| try callback(self.context);
     }
@@ -121,6 +122,7 @@ pub const Source = struct {
     allocator_gate: Gate = .{},
     physical: ?*Source = null,
     upstream_control: ?*const Source = null,
+    optional_range: bool = false,
     mutex: std.Io.Mutex = .init,
 
     /// A worker keeps its allocator, cancellation and local statistics. All
@@ -131,7 +133,7 @@ pub const Source = struct {
         // Preserve adapter synchronization when a worker passes the same raw
         // backing allocator. A distinct worker allocator keeps its own ownership.
         const a = RangeAllocator.forWorker(root.allocator, allocator);
-        return .{ .allocator = a, .storage = self.storage, .identity = self.identity, .limits = self.limits, .control = control, .admission_pool = pool, .physical = self.physical orelse self };
+        return .{ .allocator = a, .storage = self.storage, .identity = self.identity, .limits = self.limits, .control = control, .admission_pool = pool, .physical = self.physical orelse self, .optional_range = self.optional_range };
     }
     /// Check cancellation even when a consumer can serve from cached data.
     pub fn checkControl(self: *const Source) !void {
@@ -288,6 +290,7 @@ pub const Source = struct {
             var failed_prefix: usize = 0;
             var range_control = control;
             range_control.failed_prefix = &failed_prefix;
+            range_control.optional_range = self.optional_range;
             const read_result = if (mode == .sparse and range.sparse_read_preferring != null and target > minimum)
                 range.sparse_read_preferring.?(range.context, offset + done, owned[done..target], minimum - done, range_control)
             else

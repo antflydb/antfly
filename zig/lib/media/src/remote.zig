@@ -128,6 +128,8 @@ pub const ReadAhead = struct {
     charged_bytes: u64 = 0,
     reads: usize = 0,
     hits: usize = 0,
+    optional_reads: usize = 0,
+    optional_bytes: u64 = 0,
     prefetch_limited: bool = false,
     sparse_pressure: u2 = 0,
     sparse_miss: ?u64 = null,
@@ -142,6 +144,7 @@ pub const ReadAhead = struct {
     }
     pub fn readAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
+        if (control.optional_range) return readIsolatedAt(context, offset, out, control);
         self.sparse_pressure = 0;
         self.sparse_miss = null;
         return self.readWindow(offset, out, out.len, control, self.window_bytes);
@@ -152,6 +155,7 @@ pub const ReadAhead = struct {
 
     fn readSparsePreferring(context: *anyopaque, offset: u64, out: []u8, minimum: usize, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
+        if (control.optional_range) return readIsolatedAt(context, offset, out[0..minimum], control);
         const may_prefetch = self.upstream.sparse_read_preferring != null or self.upstream.accepts_full_read_size;
         if (!may_prefetch) return self.readWindow(offset, out, minimum, control, minimum);
         // A cache hit is not an independent upstream miss. A partial hit
@@ -201,6 +205,11 @@ pub const ReadAhead = struct {
 
     fn fetchAt(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, control: source.Control) !usize {
         if (self.reads >= self.max_reads) return error.RemoteRequestBudgetExceeded;
+        if (control.optional_range) {
+            try self.checkOptional(out.len, 1);
+            self.optional_reads += 1;
+            self.optional_bytes += out.len;
+        }
         self.reads += 1;
         self.charged_bytes += out.len;
         var child_prefix: usize = 0;
@@ -250,10 +259,20 @@ pub const ReadAhead = struct {
 
     // Required bytes can exceed the cache capacity. Read directly into the
     // caller's admitted buffer without evicting the existing window.
+    fn checkOptional(self: *const ReadAhead, size: usize, requests: usize) !void {
+        const request_share = @max(1, self.max_reads / 4);
+        const byte_share = @max(1, self.max_bytes / 4);
+        if (requests > @min(request_share -| self.optional_reads, (self.max_reads -| self.reads) -| request_share) or
+            size > @min(byte_share -| self.optional_bytes, (self.max_bytes -| self.charged_bytes) -| byte_share))
+            return error.OptionalAudioBudgetExceeded;
+    }
+
     fn readRequired(self: *ReadAhead, offset: u64, out: []u8, limit: usize, control: source.Control) !usize {
         if (out.len > self.max_bytes -| self.charged_bytes) return error.RemoteReadBudgetExceeded;
         if (limit == 0) return error.RemoteReadBudgetExceeded;
-        if (1 + (out.len - 1) / limit > self.max_reads -| self.reads) return error.RemoteRequestBudgetExceeded;
+        const requests = 1 + (out.len - 1) / limit;
+        if (control.optional_range) try self.checkOptional(out.len, requests);
+        if (requests > self.max_reads -| self.reads) return error.RemoteRequestBudgetExceeded;
         var done: usize = 0;
         errdefer if (control.failed_prefix) |prefix| {
             prefix.* += done;
@@ -984,4 +1003,31 @@ test "short reads stop after satisfying demand without fetching speculative suff
     try std.testing.expectEqualStrings("ab", &bytes);
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
     try std.testing.expectEqual(@as(usize, 3), ahead.valid);
+}
+
+test "optional ranges spend only their share and preserve the video window" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            for (out, 0..) |*byte, i| byte.* = @intCast(offset + i);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var ahead = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 64 },
+        .window_bytes = 4,
+        .max_bytes = 16,
+        .max_reads = 4,
+    };
+    defer ahead.deinit();
+    var out: [2]u8 = undefined;
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&ahead, 0, &out, .{}));
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&ahead, 16, &out, .{ .optional_range = true }));
+    try std.testing.expectEqualSlices(u8, &.{ 16, 17 }, &out);
+    try std.testing.expectError(error.OptionalAudioBudgetExceeded, ReadAhead.readAt(&ahead, 18, &out, .{ .optional_range = true }));
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&ahead, 0, &out, .{}));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, &out);
+    try std.testing.expectEqual(@as(usize, 2), ahead.reads);
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&ahead, 18, &out, .{}));
 }
