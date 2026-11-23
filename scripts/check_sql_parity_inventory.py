@@ -161,7 +161,9 @@ def validate(inventory_bytes, ledger, root=ROOT, source_bytes=None):
             )
             location = (name, anchor)
             if location not in evidence_sections:
-                evidence_sections[location] = zig_test_section(evidence_sources[name], anchor)
+                evidence_sections[location] = zig_test_section(
+                    evidence_sources[name], anchor
+                )
             anchored = anchored or case_id in evidence_sections[location]
             gate_id = proof["gate"]
             require(gate_id in gates, f"{case_id}: evidence gate missing")
@@ -337,7 +339,9 @@ def run_gate(command, *, cwd, timeout):
                 while not terminated:
                     # Observe the leader without reaping it. Its PID pins the
                     # group ID until cleanup, even if only descendants remain.
-                    if os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
+                    if os.waitid(
+                        os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+                    ):
                         break
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:

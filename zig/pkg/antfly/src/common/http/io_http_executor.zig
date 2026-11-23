@@ -29,6 +29,7 @@ pub const IoHttpExecutorConfig = struct {
     read_timeout_ms: u64 = 30_000,
     write_timeout_ms: u64 = 30_000,
     keep_alive: bool = false,
+    cache_resolved_addresses: bool = true,
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
 };
@@ -58,7 +59,7 @@ pub const IoHttpExecutor = struct {
             .keep_alive = cfg.keep_alive,
             .pool_max_connections = cfg.pool_max_connections,
             .pool_max_per_host = cfg.pool_max_per_host,
-            .cache_resolved_addresses = true,
+            .cache_resolved_addresses = cfg.cache_resolved_addresses,
             .cancel_in_flight_on_shutdown = true,
         };
         return .{
