@@ -4670,7 +4670,9 @@ test "SQL DISTINCT ON chooses ordered representatives before pagination" {
     try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
     try std.testing.expectEqualStrings("b", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("7", result.output.rows[0][1].string);
-    try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(a, "SELECT DISTINCT ON (k) k, v" ++ source ++ "ORDER BY v, k", .{}));
+    var invalid = try compiler.compile(a, "SELECT DISTINCT ON (k) k, v" ++ source ++ "ORDER BY v, k", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.SqlDistinctOnOrderMismatch, execute(a, backend.coordinated(), &invalid, &.{}, .{}));
 }
 
 test "SQL CTE aliases feed hash joins and grouped projection without stringifying rows" {
@@ -8702,6 +8704,24 @@ test "SQL EXPLAIN execution releases every allocation failure" {
     };
     try Check.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "SQL transaction timestamp uses the owned clock without capturing settings" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var backend = fixture.iface();
+    var compiled = try compiler.compile(a, "SELECT CURRENT_TIMESTAMP, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(0)", .{});
+    defer compiled.deinit();
+    try std.testing.expect(!compiled.uses_current_setting);
+    const transaction = try catalog.Clock.Instant.fromUnixMicroseconds(1_999_501);
+    const statement = try catalog.Clock.Instant.fromUnixMicroseconds(3_000_000);
+    backend.statement_clock = .{ .source = .{ .io = std.testing.io }, .transaction = transaction, .statement = statement };
+    var result = try execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    const times = result.output.rows[0];
+    try std.testing.expectEqualStrings("1970-01-01 00:00:01.999501+00", times[0].string);
+    try std.testing.expectEqualStrings("1970-01-01 00:00:02+00", times[1].string);
+    try std.testing.expectEqualStrings("1970-01-01 00:00:02+00", times[2].string);
 }
 
 test "SQL EXPLAIN PostgreSQL options custom plans and complete execution matrix" {

@@ -366,7 +366,6 @@ pub const Compiled = struct {
     uses_current_schemas: bool = false,
     uses_snapshot_lsn: bool = false,
     uses_transaction_xid: bool = false,
-    uses_transaction_timestamp: bool = false,
     uses_sequences: bool = false,
     uses_advisory: bool = false,
     uses_row_locks: bool = false,
@@ -481,7 +480,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
             else => error.UnsupportedSqlShape,
         }, "unexpected trailing SQL; only one supported statement is allowed");
     }
-    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_sequences = parser.uses_sequences, .uses_advisory = parser.uses_advisory, .uses_row_locks = parser.uses_row_locks, .uses_current_schemas = parser.uses_current_schemas, .uses_snapshot_lsn = parser.uses_snapshot_lsn, .uses_transaction_xid = parser.uses_transaction_xid, .uses_transaction_timestamp = parser.uses_transaction_timestamp };
+    return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting, .uses_sequences = parser.uses_sequences, .uses_advisory = parser.uses_advisory, .uses_row_locks = parser.uses_row_locks, .uses_current_schemas = parser.uses_current_schemas, .uses_snapshot_lsn = parser.uses_snapshot_lsn, .uses_transaction_xid = parser.uses_transaction_xid };
 }
 
 fn lexicalError(kind: lexer.LexErrorKind) Error {
@@ -702,7 +701,6 @@ const Parser = struct {
     uses_current_schemas: bool = false,
     uses_snapshot_lsn: bool = false,
     uses_transaction_xid: bool = false,
-    uses_transaction_timestamp: bool = false,
     relation_depth: usize = 0,
     into_target: ?*?ast.RelationPopulation = null,
 
@@ -1029,8 +1027,6 @@ const Parser = struct {
             if (self.peek(.lparen)) return self.fail(error.InvalidSqlSyntax, "CURRENT_DATE does not take parentheses");
             left = try self.scalarNode(.{ .call = .{ .name = "$current_date", .args = &.{} } });
         } else if (self.keyword(.current_timestamp)) {
-            self.uses_current_setting = true;
-            self.uses_transaction_timestamp = true;
             var precision: i64 = 6;
             if (self.take(.lparen)) {
                 if (!self.peek(.number)) return self.fail(error.InvalidSqlSyntax, "CURRENT_TIMESTAMP precision requires an integer literal");
@@ -1071,6 +1067,7 @@ const Parser = struct {
         } else if (self.peek(.identifier) and self.pos + 1 < self.tokens.len and (self.tokens[self.pos + 1].kind == .lparen or
             (self.pos + 3 < self.tokens.len and self.tokens[self.pos + 1].kind == .dot and self.tokens[self.pos + 2].kind == .identifier and self.tokens[self.pos + 3].kind == .lparen)))
         {
+            const compatibility_catalog_function = self.qualifiedCatalogFunction();
             const namespace = if (self.tokens[self.pos + 1].kind == .dot) blk: {
                 const scope_name = try self.identifier();
                 try self.expect(.dot);
@@ -1083,7 +1080,10 @@ const Parser = struct {
             if (std.mem.startsWith(u8, function_name, "$")) return self.fail(error.UnsupportedSqlShape, "compiler-owned helper functions cannot be called from SQL");
             // Preserve namespace identity: a quoted single identifier containing
             // a dot must never impersonate a schema-qualified builtin.
-            const name_value = if (namespace) |scope| try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ scope, function_name }) else function_name;
+            const name_value = if (namespace != null and !compatibility_catalog_function)
+                try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ namespace.?, function_name })
+            else
+                function_name;
             if ((namespace == null or std.mem.eql(u8, namespace.?, "pg_catalog")) and std.mem.eql(u8, function_name, "current_setting")) self.uses_current_setting = true;
             if (namespace == null or std.mem.eql(u8, namespace.?, "pg_catalog")) {
                 if (@import("advisory_effects.zig").function(function_name) != null) self.uses_advisory = true;
@@ -1635,91 +1635,7 @@ const Parser = struct {
     }
 
     fn select(self: *Parser) Error!ast.Select {
-        if (!self.keyword(.distinct)) return self.selectFinish(try self.selectCore());
-        if (!self.keyword(.on)) return self.fail(error.UnsupportedSqlShape, "SELECT DISTINCT requires a distinct projection operator");
-        try self.expect(.lparen);
-        var keys: std.ArrayList(*const ast.Scalar) = .empty;
-        while (true) {
-            try keys.append(self.alloc, try self.scalar(0, 0));
-            if (!self.take(.comma)) break;
-        }
-        try self.expect(.rparen);
-        return self.lowerDistinctOn(try self.selectFinish(try self.selectCore()), keys.items);
-    }
-
-    /// Choose the first row of each distinct partition with the existing
-    /// ordered window operator. Apply pagination after selecting those rows.
-    fn lowerDistinctOn(self: *Parser, source: ast.Select, keys: []const *const ast.Scalar) Error!ast.Select {
-        if (source.columns.len == 0 or source.set_operation != null) return self.fail(error.UnsupportedSqlShape, "DISTINCT ON requires explicit result columns");
-        for (source.columns) |column| if (column.wildcard) return self.fail(error.UnsupportedSqlShape, "DISTINCT ON requires explicit result columns");
-        const normalized = @import("order_aliases.zig").normalize(self.alloc, source) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.AmbiguousSqlColumn => return self.fail(error.InvalidSqlSyntax, "ambiguous DISTINCT ON order label"),
-            else => return self.fail(error.SqlLimitExceeded, "DISTINCT ON order budget exceeded"),
-        };
-        const inner_columns = try self.alloc.alloc(ast.Projection, source.columns.len + source.order_by.len + 1);
-        const outer_columns = try self.alloc.alloc(ast.Projection, source.columns.len);
-        for (source.columns, outer_columns, 0..) |column, *outer, i| {
-            const label = try std.fmt.allocPrint(self.alloc, "$project_{d}", .{i});
-            inner_columns[i] = column;
-            inner_columns[i].alias = label;
-            const last = std.mem.lastIndexOfScalar(u8, column.field, 0);
-            outer.* = .{ .field = label, .alias = column.alias orelse if (column.field.len == 0) "?column?" else column.field[(if (last) |end| end + 1 else 0)..] };
-        }
-
-        const window_order = try self.alloc.dupe(ast.Order, normalized.order_by);
-        const outer_order = try self.alloc.dupe(ast.Order, normalized.order_by);
-        const matched = try self.alloc.alloc(bool, keys.len);
-        @memset(matched, false);
-        var passed_prefix = false;
-        for (window_order, outer_order, 0..) |*inner, *outer, i| {
-            const expression = if (inner.position) |ordinal| blk: {
-                if (ordinal > source.columns.len) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON order position exceeds projection");
-                const column = source.columns[ordinal - 1];
-                break :blk column.expression orelse try self.scalarNode(.{ .column = column.field });
-            } else inner.expression.?;
-            const same = @import("aggregate_binding.zig").same;
-            var key_order = false;
-            for (keys, matched) |key, *found| if (same(key, expression)) {
-                key_order = true;
-                found.* = true;
-            };
-            if (!key_order) {
-                for (matched) |found| if (!found) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON expressions must match initial ORDER BY keys");
-                passed_prefix = true;
-            } else if (passed_prefix) return self.fail(error.InvalidSqlSyntax, "DISTINCT ON expressions must match initial ORDER BY keys");
-            inner.position = null;
-            inner.field = "";
-            inner.expression = expression;
-            const label = try std.fmt.allocPrint(self.alloc, "$sort_{d}", .{i});
-            inner_columns[source.columns.len + i] = .{ .expression = expression, .alias = label };
-            outer.position = null;
-            outer.field = label;
-            outer.expression = null;
-        }
-        const rank_name = "$distinct_rank";
-        inner_columns[inner_columns.len - 1] = .{ .alias = rank_name, .expression = try self.scalarNode(.{ .call = .{
-            .name = "row_number",
-            .args = &.{},
-            .window = .{ .partition = keys, .order = window_order },
-        } }) };
-        const inner = try self.alloc.create(ast.Select);
-        inner.* = source;
-        inner.columns = inner_columns;
-        inner.order_by = &.{};
-        inner.limit = null;
-        inner.offset = null;
-        const rank = try self.scalarNode(.{ .column = rank_name });
-        const first = try self.scalarNode(.{ .literal = .{ .integer = 1 } });
-        return .{
-            .source = try self.relationNode(.{ .derived = .{ .query = inner, .alias = "$distinct_source" } }),
-            .columns = outer_columns,
-            .predicate = try self.predicateNode(.{ .scalar = try self.scalarNode(.{ .binary = .{ .op = .eq, .left = rank, .right = first } }) }),
-            .order_by = outer_order,
-            .order_aliases_expanded = true,
-            .limit = source.limit,
-            .offset = source.offset,
-        };
+        return self.selectFinish(try self.selectCore());
     }
 
     // VALUES shares the flat, bounded row-source representation used by
@@ -4389,7 +4305,7 @@ const Parser = struct {
             },
             .cast => |part| try self.persistentExpression(part.operand, generated),
             .call => |part| {
-                if (std.mem.eql(u8, part.name, "current_schemas") or std.mem.eql(u8, part.name, "pg_current_wal_lsn") or std.mem.eql(u8, part.name, "pg_current_xact_id") or std.mem.eql(u8, part.name, "$current_timestamp")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture session state");
+                if (std.mem.eql(u8, part.name, "current_schemas") or std.mem.eql(u8, part.name, "pg_current_wal_lsn") or std.mem.eql(u8, part.name, "pg_current_xact_id")) return self.fail(error.UnsupportedSqlShape, "schema expressions cannot capture session state");
                 if (part.subquery != null or part.star or part.distinct or part.filter != null or part.window != null or part.within_group != null)
                     return self.fail(error.UnsupportedSqlShape, "subqueries, aggregates and windows are not allowed in schema expressions");
                 for (part.args) |arg| try self.persistentExpression(arg, generated);

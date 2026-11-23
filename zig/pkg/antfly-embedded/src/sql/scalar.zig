@@ -3916,10 +3916,10 @@ test "SQL array subscripts select typed cells using PostgreSQL bounds" {
     const a = std.testing.allocator;
     var compiled = try @import("compiler.zig").compileScalar(a,
         \\ ('[0:1]={first,second}'::text[])[0] = 'first'
-        \\ AND ARRAY[[1,2],[3,4]][2][1] = 3
-        \\ AND ARRAY[1][2] IS NULL
-        \\ AND ARRAY[1][NULL] IS NULL
-        \\ AND ARRAY[NULL,1][1] IS NULL
+        \\ AND (ARRAY[[1,2],[3,4]])[2][1] = 3
+        \\ AND (ARRAY[1])[2] IS NULL
+        \\ AND (ARRAY[1])[NULL] IS NULL
+        \\ AND (ARRAY[NULL,1])[1] IS NULL
         \\ AND (NULL::int[])[1] IS NULL
     , .{});
     defer compiled.deinit();

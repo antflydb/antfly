@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const antfly_sources = @import("source_owner_physical.zig");
+
 test {
     _ = @import("antfly_local_sources").system_catalog_privileges;
     _ = @import("api/sql/execution/statistics_cache.zig");

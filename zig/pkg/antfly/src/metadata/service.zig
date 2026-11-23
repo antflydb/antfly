@@ -4623,9 +4623,10 @@ test "relational index publication admission requires its own coordinated decode
 test "system catalog USING rewrite decoder barrier precedes lower schema reader requirements" {
     const bytes = "{\"plan\":{\"targets\":[{\"table\":{\"schema_reader_requirements\":{}},\"rewrite\":{\"column_transforms\":[{}]}}]}}";
     try std.testing.expectEqual(metadata_topology_protocol.sql_column_transform_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = bytes })));
-    // A malformed envelope must retain the strongest possible requirement,
-    // not let a weaker transform projection bypass text-generation binding.
-    try std.testing.expectEqual(metadata_topology_protocol.restore_reservation_outcome_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = "{" })));
+    // Both projections treat malformed envelopes as requiring support.
+    // Admission must retain the stronger document-view index proof floor.
+    const malformed_floor = @max(metadata_topology_protocol.restore_reservation_outcome_version, metadata_topology_protocol.sql_document_view_indexes_version);
+    try std.testing.expectEqual(malformed_floor, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_restore_staging = "{" })));
 }
 
 test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {
@@ -26359,17 +26360,17 @@ test "FK historical reference decoder protects new writers without widening lega
 }
 
 test "system catalog resource comments require decoder activation for annotation removal too" {
-    try std.testing.expectEqual(metadata_topology_protocol.sql_resource_comments_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_system_catalog = "{\"mutation\":{\"action\":\"comment\",\"description\":null}}" })));
-    try std.testing.expect((try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_system_catalog = "{\"mutation\":{\"action\":\"rename\",\"description\":null}}" })) < metadata_topology_protocol.sql_resource_comments_version);
+    try std.testing.expectEqual(metadata_topology_protocol.sql_resource_comments_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"table\",\"action\":\"comment\",\"description\":null}}" })));
+    try std.testing.expect((try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"table\",\"action\":\"rename\",\"description\":null}}" })) < metadata_topology_protocol.sql_resource_comments_version);
 }
 
 test "system catalog merged service ownership retains independent SQL and resolver decoder floors" {
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows" };
-    const owned: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"mutation\":{\"native_service\":\"memory\"}}" };
+    const owned: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"table\",\"native_service\":\"memory\"}}" };
     try std.testing.expectEqual(@as(u16, 0), (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .upsert_table = plain })));
     try std.testing.expectEqual(metadata_topology_protocol.native_service_tables_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, owned)));
     try std.testing.expectEqual(metadata_topology_protocol.resolver_records_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_resolver_authority = "{}" })));
-    try std.testing.expectEqual(metadata_topology_protocol.sql_resource_comments_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_system_catalog = "{\"mutation\":{\"action\":\"comment\",\"description\":null}}" })));
+    try std.testing.expectEqual(metadata_topology_protocol.sql_resource_comments_version, (try transitionRequiredCoordinatedDecoderVersion(std.heap.page_allocator, .{ .apply_system_catalog = "{\"mutation\":{\"kind\":\"table\",\"action\":\"comment\",\"description\":null}}" })));
 }
 
 test "runtime status source authority merge preserves negotiated media and explicit older projection" {

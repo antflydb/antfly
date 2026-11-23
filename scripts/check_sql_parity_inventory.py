@@ -53,10 +53,10 @@ def zig_test_section(source, anchor):
         flags=re.MULTILINE,
     )
     require(declaration is not None, f"evidence test anchor missing: {anchor}")
-    next_test = re.search(
-        r'^\s*test\s+"', source[declaration.end() :], flags=re.MULTILINE
+    next_test = re.compile(r'^\s*test\s+"', re.MULTILINE).search(
+        source, declaration.end()
     )
-    end = declaration.end() + next_test.start() if next_test else len(source)
+    end = next_test.start() if next_test else len(source)
     return source[declaration.start() : end]
 
 
@@ -117,6 +117,8 @@ def validate(inventory_bytes, ledger, root=ROOT, source_bytes=None):
     gates = ledger["gates"]
     require(isinstance(gates, dict), "gates must be an object")
     used_gates = set()
+    evidence_sources = {}
+    evidence_sections = {}
     for entry in entries:
         case_id = entry["id"]
         status = entry["status"]
@@ -143,16 +145,21 @@ def validate(inventory_bytes, ledger, root=ROOT, source_bytes=None):
             )
         anchored = False
         for proof in evidence:
-            path = repository_path(root, proof["path"])
-            require(path.is_file(), f"{case_id}: evidence file missing")
-            evidence_text = path.read_text()
+            name = proof["path"]
+            require(isinstance(name, str) and bool(name), "missing repository path")
+            if name not in evidence_sources:
+                path = repository_path(root, name)
+                require(path.is_file(), f"{case_id}: evidence file missing")
+                evidence_sources[name] = path.read_text()
             anchor = proof.get("test", "")
             require(
                 isinstance(anchor, str) and bool(anchor.strip()),
                 f"{case_id}: evidence test anchor missing",
             )
-            section = zig_test_section(evidence_text, anchor)
-            anchored = anchored or case_id in section
+            location = (name, anchor)
+            if location not in evidence_sections:
+                evidence_sections[location] = zig_test_section(evidence_sources[name], anchor)
+            anchored = anchored or case_id in evidence_sections[location]
             gate_id = proof["gate"]
             require(gate_id in gates, f"{case_id}: evidence gate missing")
             used_gates.add(gate_id)

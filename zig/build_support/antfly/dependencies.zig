@@ -386,12 +386,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     run_prepared_control_tests.addArg("--require-no-skips");
     b.step("sql-prepared-control-test", "Verify prepared transaction syntax and literal identities in the SQL compiler owner")
         .dependOn(&run_prepared_control_tests.step);
-    // The native SQL contract corpus is larger than the parser-only owner but
-    // remains below the full database compilation and integration test roots.
-    // ReleaseFast macOS compilation of the scalar-domain/window contracts
-    // reached 6.65 GB. Eight GiB retains at least 25% scheduling headroom;
-    // leave the unmeasured Linux claim unchanged.
-    sql_tests.step.max_rss = (if (target.result.os.tag == .macos) @as(usize, 8) else 3) * 1024 * 1024 * 1024;
+    // The grouped Debug evidence build peaked just below 10 GiB on macOS
+    // after the physical DB fixtures were linked into the local test owner.
+    sql_tests.step.max_rss = (if (target.result.os.tag == .macos) @as(usize, 12) else 3) * 1024 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
@@ -505,7 +502,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .root_module = pgwire_test_mod,
         .filters = buildArguments(b) orelse &.{"pgwire"},
     });
-    const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
+    const run_pgwire_tests = addFilteredTestRunArtifact(b, pgwire_tests);
     // Honor stripped CI builds: cold framing/array compiles fit the original
     // 1 GiB reservation. Debugger builds exceeded it, so reserve their larger
     // working set separately.
@@ -1589,24 +1586,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const ordinal_bench = b.addExecutable(.{ .name = "storage-ordinal-bench", .root_module = ordinal_bench_mod });
     b.step("storage-ordinal-core-bench", "Compare bulk ordinal calls with inline storage algorithms")
         .dependOn(&b.addRunArtifact(ordinal_bench).step);
-    // SQL shape fixtures reach native schema and storage contracts, but do not
-    // need the inference/API module graph of a full storage owner.
     antfly_imports.configureRuntimeContracts(usermgr_mod);
-    // Shared scheduling's memory admission reaches named native callbacks in
-    // both the SQL contract root and its extracted local-source test owner.
-    sql_test_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
-    sql_test_mod.addImport("antfly_cancellation", cancellation_mod);
-    antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
-    antfly_imports.configureLocalDatabaseContracts(sql_test_mod);
-    sql_test_mod.addImport("sql_parser", sql_parser_mod);
-    sql_test_mod.addImport("antfly_casbin", casbin_mod);
-    sql_test_mod.addImport("cypher", cypher_mod);
-    sql_test_mod.addImport("antfly-json", json_mod);
-    sql_test_mod.addImport("antfly_vector", vector_mod);
-    sql_test_mod.addImport("antfly_platform", platform_mod);
-    sql_test_mod.addImport("antfly_generating", generating_mod);
-    sql_test_mod.addImport("antfly_structured", structured_mod);
-    sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    // Some SQL fixtures open the physical DB. Bind the same local dependencies
+    // as the embedded owner without pulling in server coordination or routers.
+    antfly_imports.configureEmbedded(b, sql_test_mod, link_libc);
     const sequence_binding_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/sequence_binding_test_root.zig"),
         .target = target,
@@ -1619,10 +1602,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     b.step("system-catalog-sequence-binding-test", "Verify canonical typed sequence references and allocation-failure ownership").dependOn(&run_sequence_binding_tests.step);
     run_sql_tests.step.dependOn(&run_sequence_binding_tests.step);
 
-    sql_test_mod.addImport("objectstore", objectstore_mod);
-    sql_test_mod.addImport("httpx", httpx_mod);
-    sql_test_mod.addImport("antfly_credentials", credentials_mod);
-    sql_test_mod.addOptions("build_options", build_options);
     pgwire_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     pgwire_test_mod.addImport("antfly-json", json_mod);
     pgwire_test_mod.addImport("antfly_regex", regex_mod);
@@ -1631,21 +1610,12 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     pgwire_test_mod.addImport("antfly_vector", vector_mod);
     pgwire_test_mod.addImport("antfly_resolver", resolver_mod);
     pgwire_test_mod.addImport("bloom", bloom_mod);
-    sql_test_mod.addImport("antfly_regex", regex_mod);
-    sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     // Native wire parameter frames share the SQL scalar/type owner.
     pgwire_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     pgwire_test_mod.addImport("antfly_hash", hash_mod);
-    sql_test_mod.addImport("antfly_hash", hash_mod);
-    sql_test_mod.addImport("bloom", bloom_mod);
-    sql_test_mod.addImport("antfly_resolver", resolver_mod);
-    sql_test_mod.addImport("antfly_vector", vector_mod);
     // The SQL memory budget borrows the storage resource manager's host
     // admission, which imports the shared cache budget.
-    sql_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
-    sql_test_mod.addImport("antfly_compress", antfly_imports.compress);
     pgwire_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
-    sql_test_mod.link_libc = link_libc;
     const refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/sql_refinement_bench_root.zig"),
         .target = target,

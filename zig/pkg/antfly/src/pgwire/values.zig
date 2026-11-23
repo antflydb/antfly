@@ -688,6 +688,8 @@ test "pgwire retained ordinal numeric encodes an exact replication value" {
     const schema: HistorySchema.TableSchema = .{
         .version = 1,
         .storage_mode = .relational,
+        .requires_public_schema = true,
+        .requires_numeric_modifiers = true,
         .relational_columns = &.{.{
             .name = "amount",
             .path = "amount",

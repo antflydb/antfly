@@ -18,6 +18,7 @@ import copy
 import io
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from check_sql_parity_inventory import (
@@ -62,12 +63,9 @@ class ParityInventoryTest(unittest.TestCase):
     def test_completed_status_needs_executable_evidence(self):
         for status in ("implemented", "rejected", "superseded"):
             ledger = copy.deepcopy(self.ledger)
-            unresolved = next(
-                entry
-                for entry in ledger["entries"]
-                if entry["status"] == "unresolved" and not entry.get("evidence")
-            )
-            unresolved["status"] = status
+            entry = ledger["entries"][0]
+            entry.pop("evidence", None)
+            entry["status"] = status
             with self.assertRaisesRegex(ValueError, "executable evidence"):
                 validate(self.inventory, ledger)
 
@@ -205,7 +203,23 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertIn("still block release", output.getvalue())
 
     def test_family_report_does_not_turn_release_into_a_subset_gate(self):
+        inventory = json.loads(self.inventory)
+        outside_family = next(
+            case for case in inventory["entries"] if case["family"] != "read"
+        )
+        ledger = copy.deepcopy(self.ledger)
+        next(entry for entry in ledger["entries"] if entry["id"] == outside_family["id"])[
+            "status"
+        ] = "unresolved"
+        read_bytes = Path.read_bytes
+
+        def read_fixture(path):
+            if path == FIXTURES / "sql_parity_dispositions.json":
+                return json.dumps(ledger).encode()
+            return read_bytes(path)
+
         with (
+            patch.object(Path, "read_bytes", read_fixture),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()) as errors,
             patch("check_sql_parity_inventory.run_evidence") as run,
@@ -260,10 +274,12 @@ class ParityInventoryTest(unittest.TestCase):
             validate(self.inventory, self.ledger, source_bytes=b"{}")
 
     def test_referenced_evidence_can_run_before_release_is_ready(self):
-        _, entries, gate_ids = validate(self.inventory, self.ledger)
+        ledger = copy.deepcopy(self.ledger)
+        ledger["entries"][0]["status"] = "unresolved"
+        _, entries, gate_ids = validate(self.inventory, ledger)
         self.assertGreater(len(release_blockers(entries)), 0)
         self.assertTrue(gate_ids)
-        runs = evidence_runs(gate_ids, self.ledger["gates"])
+        runs = evidence_runs(gate_ids, ledger["gates"])
         self.assertLess(len(runs), len(gate_ids))
         self.assertEqual(
             gate_ids, sorted(gate for run in runs for gate in run["gate_ids"])

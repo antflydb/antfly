@@ -496,7 +496,7 @@ pub const Session = struct {
                         if (!accepted) return error.SqlBackendPidInUse;
                     }
                     if (self.replication_mode == .logical and self.replication == null) {
-                        const open = self.source.vtable.open_replication orelse return error.UnsupportedStartupOption;
+                        const open = self.source.vtable.open_replication orelse return error.UnsupportedReplicationMode;
                         self.logical = try open(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{}));
                     }
                     try self.message('R', &.{ 0, 0, 0, 0 });
@@ -768,7 +768,7 @@ pub const Session = struct {
         const types = try alloc.dupe(backend.Type, original.parameter_types);
         const descriptors = try alloc.dupe(backend.Parameter, original.parameter_descriptors);
         const current = try self.describeTyped(alloc, statement, types, descriptors);
-        if (!cachedColumnsEqual(original.columns, current.columns) or
+        if (!columnsEqual(original.columns, current.columns) or
             (original.copy_out == null) != (current.copy_out == null) or
             (original.copy_in == null) != (current.copy_in == null) or
             original.parameter_types.len != current.parameter_types.len)
@@ -1676,12 +1676,6 @@ pub const Session = struct {
                 portal.* = .{ .arena = .init(self.alloc), .statement = "", .parameters = &.{}, .types = &.{}, .formats = &.{}, .description = .{ .columns = &.{} } };
                 errdefer if (!transferred) portal.arena.deinit();
                 const a = portal.arena.allocator();
-                const previous_namespace = self.request_namespace;
-                const previous_search_path = self.request_search_path;
-                self.request_namespace = statement.namespace;
-                defer self.request_namespace = previous_namespace;
-                self.request_search_path = statement.search_path;
-                defer self.request_search_path = previous_search_path;
                 const current = try self.preparedDescription(statement, a);
                 self.executing.store(true, .release);
                 defer self.executing.store(false, .release);
@@ -3189,12 +3183,6 @@ fn formatAt(formats: []const u16, index: usize) u16 {
 fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]const backend.Column {
     return backend.cloneColumnsLeaky(alloc, columns);
 }
-fn cachedColumnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| if (!backend.sameColumnType(left, right)) return false;
-    return true;
-}
-
 fn columnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| if (!backend.sameColumnType(left, right) or !std.mem.eql(u8, left.name, right.name)) return false;
@@ -3330,6 +3318,18 @@ fn sqlstate(err: anyerror) []const u8 {
 fn sqlMessage(err: anyerror) []const u8 {
     if (err == error.InvalidCopyData) return "Invalid COPY input: check column count, quoting, and binary framing.";
     if (err == error.CopyAborted) return "COPY input was canceled by the client.";
+    switch (err) {
+        error.ChangefeedResynchronizationRequired, error.HistoryResynchronizationRequired => return "The retained position is no longer available. Resume from a fresh snapshot.",
+        error.ChangefeedLeaseExpired => return "The changefeed lease expired. Reopen the feed before resuming.",
+        error.ChangefeedConflict, error.HistoryCheckpointConflict, error.HistoryConsumerConflict => return "The retained replication state changed. Reopen the feed and verify the acknowledged position.",
+        error.HistoryAuthorityRequired => return "The retained history owner could not authorize this request.",
+        error.HistoryPreparedTransactionsPresent => return "Prepared transactions still own history required by this replication operation.",
+        error.ChangefeedBackpressure, error.HistoryFull, error.HistoryConsumerLimit => return "Replication capacity is exhausted. Retry when retained history or consumer capacity becomes available.",
+        error.HistoryTooLarge => return "The requested replication history exceeds the configured size limit.",
+        error.MetadataMutationOutcomeUnknown, error.SourceOutcomeUnresolved => return "The replication operation outcome is unknown. Inspect its state before retrying.",
+        error.HistoryCorrupt => return "The retained replication history failed an integrity check.",
+        else => {},
+    }
     const diagnostic = @import("antfly_local_sources").sql_errors.describe(err);
     const code = sqlstate(err);
     if (std.mem.eql(u8, diagnostic.code, code)) return diagnostic.message;
@@ -3348,7 +3348,6 @@ test "pgwire cursor prepared and page identities fence all precise temporal kind
         const a = [_]backend.Column{.{ .name = "t", .type = .datetime, .temporal_kind = left }};
         const b = [_]backend.Column{.{ .name = "t", .type = .datetime, .temporal_kind = right }};
         try std.testing.expectEqual(left == right, columnsEqual(&a, &b));
-        try std.testing.expectEqual(left == right, cachedColumnsEqual(&a, &b));
     };
     const implicit = [_]backend.Column{.{ .name = "t", .type = .datetime }};
     const explicit = [_]backend.Column{.{ .name = "t", .type = .datetime, .temporal_kind = .timestamp_tz }};

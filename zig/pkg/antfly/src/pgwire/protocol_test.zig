@@ -3564,7 +3564,9 @@ test "pgwire PostgreSQL cursor oracle preserves binary scroll hold and Bind form
         try oracle.verify(a, output.written(), profile);
         try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
         try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
-        try std.testing.expectEqual(@as(usize, @intFromBool(profile.scroll or profile.hold)), mock.stream_detaches);
+        // Every profile drains its rows, releasing snapshot resources while
+        // retaining cursor authority to validate the next FETCH.
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_detaches);
     }
 }
 
@@ -4490,7 +4492,7 @@ test "pgwire replication owner failures preserve actionable SQLSTATEs without re
         @memcpy(expected[1..6], case.code);
         expected[6] = 0;
         try std.testing.expect(std.mem.indexOf(u8, out.written(), &expected) != null);
-        try std.testing.expect(std.mem.indexOf(u8, out.written(), @errorName(case.failure)) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), @errorName(case.failure)) == null);
         try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") == null);
         try std.testing.expectEqual(@as(usize, 2), mock.replication_commands);
         try std.testing.expectEqual(@as(usize, 0), mock.executions);

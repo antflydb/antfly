@@ -1571,8 +1571,7 @@
         "pgwire-test",
         "-Doptimize=Debug",
         "-j1",
-        "-Dtest-filter=COPY",
-        "-Dtest-filter=SQL exact original rejection contracts"
+        "-Dtest-filter=COPY"
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
