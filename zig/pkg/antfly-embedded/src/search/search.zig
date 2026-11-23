@@ -2735,6 +2735,10 @@ fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEnt
         segment: *const index_mod.SegmentEntry,
         offset: u32,
         gate: CandidateGate,
+        control: query_mod.ExecutionControl,
+        pub fn checkActive(self: *@This()) !void {
+            try self.control.check();
+        }
         pub fn nextCandidate(self: *@This(), first: u32) u64 {
             return self.base.nextAllowed(&self.gate, first);
         }
@@ -2754,7 +2758,7 @@ fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEnt
             if (!isSegmentDocDeleted(self.segment, hit.doc_id - self.offset)) try self.base.collect(hit.doc_id, hit.score);
         }
     };
-    var live: Collector = .{ .base = collector, .segment = seg, .offset = offset, .gate = gate };
+    var live: Collector = .{ .base = collector, .segment = seg, .offset = offset, .gate = gate, .control = request.control };
     seg.shared.lockDeletionShared();
     defer seg.shared.unlockDeletionShared();
     try wand.executeInto(&live);

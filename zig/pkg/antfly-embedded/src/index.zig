@@ -4437,6 +4437,14 @@ pub const IndexWriter = struct {
         return snap;
     }
 
+    /// Read the published epoch without pinning the snapshot or running
+    /// mapped-residency maintenance.
+    pub fn snapshotEpoch(self: *IndexWriter) u64 {
+        self.lockSnapshotMutex();
+        defer self.snapshot_mu.unlock();
+        return self.snapshot().epoch;
+    }
+
     fn acquireSnapshotRaw(self: *IndexWriter) *IndexSnapshot {
         self.lockSnapshotMutex();
         defer self.snapshot_mu.unlock();
