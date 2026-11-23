@@ -4138,6 +4138,7 @@ pub const ApiHttpServer = struct {
     sql_observation_retirement_after: ?[]u8 = null,
     sql_completion_consumer_active: std.atomic.Value(bool) = .init(false),
     write_admission: RequestAdmission,
+    sql_forward_admission: RequestAdmission = RequestAdmission.init(16),
     inference_admission: RequestAdmission,
     source: StatusSource,
     metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
@@ -4560,6 +4561,10 @@ pub const ApiHttpServer = struct {
 
     /// Imported views preserve the owning archive's executor state. Rebuilding
     /// Threaded's vtable from a foreign runtime pointer splits wakeup/TLS state.
+    pub fn sqlForwardIo(self: *const ApiHttpServer) ?std.Io {
+        return configuredApiNetworkIo(self.cfg);
+    }
+
     pub fn configuredDurableIo(cfg: ApiHttpServerConfig) ?std.Io {
         if (cfg.imported_runtime_io) |views| return views.durable;
         const runtime = cfg.backend_runtime orelse return null;
@@ -14331,6 +14336,30 @@ pub const ApiHttpServer = struct {
         resolved: ?u64,
     };
 
+    const sql_forward_max_timeout_ms: u32 = 10 * 60 * 1000;
+
+    pub const SQLForwardControl = struct {
+        deadline_ns: ?u64,
+        cancellation: *const http_common.RequestCancellation,
+
+        fn timeoutMs(self: SQLForwardControl) !u32 {
+            if (self.deadline_ns) |deadline| {
+                const remaining = deadline -| platform_time.monotonicNs();
+                if (remaining == 0) return error.DeadlineExceeded;
+                if (self.cancellation.isCancelled()) return error.Canceled;
+                return @intCast(@min(sql_forward_max_timeout_ms, @max(1, remaining / std.time.ns_per_ms)));
+            }
+            if (self.cancellation.isCancelled()) return error.Canceled;
+            return sql_forward_max_timeout_ms;
+        }
+    };
+
+    pub const SQLSessionForwardState = struct {
+        control: SQLForwardControl,
+        attempted: bool = false,
+        needs_adoption: bool = false,
+    };
+
     pub const SessionForwardRequest = struct {
         method: contextual_operations.Method,
         target: []const u8,
@@ -14338,6 +14367,7 @@ pub const ApiHttpServer = struct {
         trusted_principal: ?[]const u8 = null,
         sql_fence: ?[]const u8 = null,
         owner: SessionForwardOwner = .lookup,
+        sql: ?*SQLSessionForwardState = null,
         content_type: ?[]const u8,
         body: []const u8,
     };
@@ -14378,7 +14408,7 @@ pub const ApiHttpServer = struct {
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,
-        }, request.owner)) orelse return null;
+        }, request.owner, request.sql)) orelse return null;
         defer response.deinit(self.alloc);
 
         return try self.cloneForwardedResponse(response);
@@ -14410,10 +14440,10 @@ pub const ApiHttpServer = struct {
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
         if (self.txn_sessions.durable) |store| if (try routing.ownsLocal(store, id, kind, router.localNodeId())) return null;
-        return self.forwardSQLResourceToOwner(owner, request, forwarded);
+        return self.forwardSQLResourceToOwner(owner, request, forwarded, null);
     }
 
-    pub fn forwardSQLResourceToOwner(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest, forwarded: *bool) !?contextual_operations.OwnedResponse {
+    pub fn forwardSQLResourceToOwner(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest, forwarded: *bool, control: ?SQLForwardControl) !?contextual_operations.OwnedResponse {
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
         const executor = self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
@@ -14432,7 +14462,10 @@ pub const ApiHttpServer = struct {
         // Resource close is bodyless. The handler's synthetic decoding body
         // must not be sent on DELETE (std.http.Client forbids that framing).
         if (outgoing.method == .DELETE) outgoing.body = "";
-        outgoing.timeout_ms = 10 * 60 * 1000;
+        if (control) |value| {
+            outgoing.timeout_ms = try value.timeoutMs();
+            outgoing.cancellation = value.cancellation;
+        } else outgoing.timeout_ms = sql_forward_max_timeout_ms;
         forwarded.* = true;
         var response = try executor.execute(self.alloc, outgoing);
         defer response.deinit(self.alloc);
@@ -14450,7 +14483,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest, route: SessionForwardOwner) !?http_common.HttpResponse {
+    fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest, route: SessionForwardOwner, sql: ?*SQLSessionForwardState) !?http_common.HttpResponse {
         // A replicated receipt read has its own linearizable barrier. Its
         // availability must not depend on the original execution owner's life.
         if (req.method == .GET and self.txn_sessions.durableMissIsAuthoritative()) return null;
@@ -14460,7 +14493,6 @@ pub const ApiHttpServer = struct {
             .lookup => try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id),
             .resolved => |owner| owner,
         };
-        const bounded_owner_lookup = route == .resolved;
         const owner_node_id = owner orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null
@@ -14469,34 +14501,32 @@ pub const ApiHttpServer = struct {
         if (owner_node_id == 0) return null;
         if (owner_node_id == router.localNodeId()) return null;
         const base_uri = (try router.nodeBaseUri(self.alloc, owner_node_id)) orelse {
-            if (try self.adoptRoutedSession(txn_id, bounded_owner_lookup)) return null;
+            if (sql) |state| {
+                state.needs_adoption = true;
+            } else _ = try self.tryAdoptSession(txn_id);
             return null;
         };
         defer self.alloc.free(base_uri);
         const uri = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ base_uri, req.uri });
         defer self.alloc.free(uri);
-        return session_executor.execute(self.alloc, .{
-            .method = req.method,
-            .uri = uri,
-            .headers = req.headers,
-            .authorization = req.authorization,
-            .content_type = req.content_type,
-            .body = req.body,
-        }) catch |err| {
-            const adopted = self.adoptRoutedSession(txn_id, bounded_owner_lookup) catch |adopt_error| switch (adopt_error) {
-                // The remote execution may have started. Preserve the
-                // transport error when local recovery cannot be admitted.
-                error.SqlWriteCapacityUnavailable => return err,
-                else => return adopt_error,
-            };
-            if (adopted) return null;
+        var outgoing = req;
+        outgoing.uri = uri;
+        if (sql) |state| {
+            outgoing.timeout_ms = try state.control.timeoutMs();
+            outgoing.cancellation = state.control.cancellation;
+            state.attempted = true;
+        }
+        return session_executor.execute(self.alloc, outgoing) catch |err| {
+            if (sql) |state| {
+                state.needs_adoption = true;
+            } else if (try self.tryAdoptSession(txn_id)) return null;
             return err;
         };
     }
 
-    fn adoptRoutedSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, bounded_owner_lookup: bool) !bool {
-        var read = if (bounded_owner_lookup) try self.acquireSqlExecution(false) else null;
-        defer if (read) |*lease| lease.release();
+    pub fn adoptRoutedSQLSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !bool {
+        var read = try self.acquireSqlExecution(false);
+        defer read.release();
         return self.tryAdoptSession(txn_id);
     }
 
