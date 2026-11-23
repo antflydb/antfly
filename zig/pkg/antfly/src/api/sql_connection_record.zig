@@ -27,9 +27,10 @@ pub const ttl_ms: u64 = 60 * 60 * 1000;
 pub const State = enum { idle, beginning, active, uncertain };
 
 pub const Record = struct {
+    // Keep the routing fields first for bounded ownership reads.
     id: [32]u8,
-    principal: []const u8,
     owner_node_id: u64,
+    principal: []const u8,
     expires_at_ms: u64,
     generation: u64 = 1,
     revision: u64 = 1,

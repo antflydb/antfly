@@ -157,8 +157,14 @@ test "replicated session bounded probe skips a full read on a cache miss" {
     try std.testing.expectEqual(@as(usize, 1), scope.full_reads);
 }
 
+fn cachesPrefix(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, session_prefix) or
+        std.mem.startsWith(u8, key, "\x00sql-connection-v1/") or
+        std.mem.startsWith(u8, key, "\x00sql-prepared-v1/");
+}
+
 pub fn cachedRange(scope: anytype, a: std.mem.Allocator, group: u64, key: []const u8, offset: u64, length: usize) !?[]const u8 {
-    if (!std.mem.startsWith(u8, key, session_prefix) or offset > cached_prefix_bytes or length > cached_prefix_bytes - offset) return null;
+    if (!cachesPrefix(key) or offset > cached_prefix_bytes or length > cached_prefix_bytes - offset) return null;
     const gen = (try cachedPrefixGeneration(scope, a, group)) orelse return null;
     return cachedRangeForGeneration(scope, a, group, key, offset, length, gen);
 }
@@ -176,7 +182,7 @@ pub fn cachedPrefixGeneration(scope: anytype, a: std.mem.Allocator, group: u64) 
 
 /// The caller must obtain the generation from this same immutable read cut.
 pub fn cachedRangeForGeneration(scope: anytype, a: std.mem.Allocator, group: u64, key: []const u8, offset: u64, length: usize, gen: u64) !?[]const u8 {
-    if (!std.mem.startsWith(u8, key, session_prefix) or offset > cached_prefix_bytes or length > cached_prefix_bytes - offset) return null;
+    if (!cachesPrefix(key) or offset > cached_prefix_bytes or length > cached_prefix_bytes - offset) return null;
     const entry_key = try cacheKey(a, group, key);
     defer a.free(entry_key);
     const entry = (try optionalGet(scope, entry_key)) orelse return null;
@@ -351,7 +357,7 @@ pub fn apply(txn: anytype, a: std.mem.Allocator, group: u64, bytes: []const u8) 
         if (replacement) |value| try txn.put(key, value) else txn.delete(key) catch |err| {
             if (err != error.NotFound) return err;
         };
-        if (std.mem.startsWith(u8, change.key, session_prefix)) {
+        if (cachesPrefix(change.key)) {
             const entry_key = try cacheKey(a, group, change.key);
             defer a.free(entry_key);
             if (replacement) |value| {

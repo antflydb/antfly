@@ -60,9 +60,10 @@ pub const Binding = struct {
 };
 
 pub const Resource = struct {
+    // Keep the routing fields first for bounded ownership reads.
     id: [32]u8,
-    principal: []const u8,
     owner_node_id: u64,
+    principal: []const u8,
     expires_at_ms: u64,
     database: []const u8,
     namespace: []const u8,

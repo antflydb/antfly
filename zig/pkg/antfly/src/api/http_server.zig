@@ -14443,6 +14443,7 @@ pub const ApiHttpServer = struct {
 
     pub const SQLSessionForwardState = struct {
         control: SQLForwardControl,
+        propagate_execution_deadline: bool = false,
         attempted: bool = false,
         needs_adoption: bool = false,
     };
@@ -14510,23 +14511,27 @@ pub const ApiHttpServer = struct {
     }
 
     fn cloneForwardedResponse(self: *ApiHttpServer, response: http_common.HttpResponse) !contextual_operations.OwnedResponse {
-        const headers = try self.alloc.alloc(contextual_operations.Header, response.headers.len);
+        const headers = try self.alloc.alloc(contextual_operations.Header, response.headers.len + @intFromBool(response.content_type != null));
         errdefer self.alloc.free(headers);
         var initialized: usize = 0;
         errdefer for (headers[0..initialized]) |*header| header.deinit(self.alloc);
-        for (response.headers, headers) |source, *target| {
+        for (response.headers, headers[0..response.headers.len]) |source, *target| {
             target.* = try ownedContextualHeader(self.alloc, source.name, source.value);
             initialized += 1;
         }
-        return .{
-            .status = response.status,
-            .content_type = response.content_type orelse if (response.status >= 200 and response.status < 300)
-                "application/json"
-            else
-                "text/plain; charset=utf-8",
-            .body = try self.alloc.dupe(u8, response.body),
-            .headers = headers,
-        };
+        const body = try self.alloc.dupe(u8, response.body);
+        errdefer self.alloc.free(body);
+        const content_type = if (response.content_type) |value| copied: {
+            // OwnedResponse releases header strings. Keep its content type in
+            // that same storage until the handler has copied the header.
+            headers[initialized] = try ownedContextualHeader(self.alloc, "content-type", value);
+            initialized += 1;
+            break :copied headers[initialized - 1].value;
+        } else if (response.status >= 200 and response.status < 300)
+            "application/json"
+        else
+            "text/plain; charset=utf-8";
+        return .{ .status = response.status, .content_type = content_type, .body = body, .headers = headers };
     }
 
     pub fn forwardSQLResourceOperation(self: *ApiHttpServer, id: []const u8, kind: @import("sql_resource_routing.zig").Kind, request: http_common.HttpRequest, forwarded: *bool) !?contextual_operations.OwnedResponse {
@@ -14580,8 +14585,9 @@ pub const ApiHttpServer = struct {
         outgoing.delivery_tracker = &delivery;
         forwarded.* = true;
         var response = executor.execute(self.alloc, outgoing) catch |err| {
-            forwarded.* = delivery.load() != .not_sent;
-            return err;
+            const delivery_state = delivery.load();
+            forwarded.* = delivery_state != .not_sent;
+            return sqlForwardFailure(err, delivery_state);
         };
         defer response.deinit(self.alloc);
         return try self.cloneForwardedResponse(response);
@@ -14618,7 +14624,9 @@ pub const ApiHttpServer = struct {
         const base_uri = (try router.nodeBaseUri(self.alloc, owner_node_id)) orelse {
             if (sql) |state| {
                 state.needs_adoption = true;
-            } else _ = try self.tryAdoptSession(txn_id);
+                return error.SqlPeerUnavailable;
+            }
+            _ = try self.tryAdoptSession(txn_id);
             return null;
         };
         defer self.alloc.free(base_uri);
@@ -14627,10 +14635,20 @@ pub const ApiHttpServer = struct {
         var outgoing = req;
         outgoing.uri = uri;
         var delivery: http_common.RequestDeliveryTracker = .{};
+        var budget_headers: [4]http_common.RequestHeader = undefined;
+        var budget_buffer: [20]u8 = undefined;
         if (sql) |state| {
             outgoing.timeout_ms = try state.control.timeoutMs();
             outgoing.cancellation = state.control.cancellation;
             outgoing.delivery_tracker = &delivery;
+            if (state.propagate_execution_deadline) {
+                @memcpy(budget_headers[0..req.headers.len], req.headers);
+                budget_headers[req.headers.len] = .{
+                    .name = @import("antfly_public_limits").Execution.timeout_header,
+                    .value = try std.fmt.bufPrint(&budget_buffer, "{d}", .{outgoing.timeout_ms.?}),
+                };
+                outgoing.headers = budget_headers[0 .. req.headers.len + 1];
+            }
         }
         defer if (sql) |state| {
             state.attempted = outgoing.delivery_tracker != null and delivery.load() != .not_sent;
@@ -14638,8 +14656,17 @@ pub const ApiHttpServer = struct {
         return session_executor.execute(self.alloc, outgoing) catch |err| {
             if (sql) |state| {
                 state.needs_adoption = true;
+                return sqlForwardFailure(err, delivery.load());
             } else if (try self.tryAdoptSession(txn_id)) return null;
             return err;
+        };
+    }
+
+    fn sqlForwardFailure(err: anyerror, delivery: http_common.RequestDeliveryTracker.State) anyerror {
+        if (delivery != .not_sent) return err;
+        return switch (err) {
+            error.Canceled, error.Cancelled, error.OutOfMemory => err,
+            else => error.SqlPeerUnavailable,
         };
     }
 
@@ -64139,7 +64166,9 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
             }
             const headers = try alloc.alloc(http_common.Header, 1);
             headers[0] = .{ .name = try alloc.dupe(u8, "X-Antfly-SQL-Completion"), .value = try alloc.dupe(u8, "owner-witness") };
-            return .{ .status = 200, .body = try alloc.dupe(u8, "{}"), .headers = headers };
+            const content_type = try alloc.dupe(u8, "application/vnd.antfly.sql+json");
+            errdefer alloc.free(content_type);
+            return .{ .status = 200, .content_type = content_type, .body = try alloc.dupe(u8, "{}"), .headers = headers };
         }
     };
     var fixture: Fixture = .{};
@@ -64151,6 +64180,7 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
     var response = (try server.forwardSQLResourceOperation(&handle, .connection, req, &forwarded)).?;
     defer response.deinit(a);
     try std.testing.expect(forwarded);
+    try std.testing.expectEqualStrings("application/vnd.antfly.sql+json", response.content_type);
     try std.testing.expectEqualStrings("X-Antfly-SQL-Completion", response.headers[0].name);
     try std.testing.expectEqualStrings("owner-witness", response.headers[0].value);
     var loop = req;
