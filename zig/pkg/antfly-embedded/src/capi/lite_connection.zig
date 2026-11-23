@@ -9156,7 +9156,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
 
         fn peerWrite(child_path: []const u8, key: []const u8, vector: []const u8, mode: PeerMode) !void {
             const allocator = std.testing.allocator;
-            const io = h.handleLockIo();
+            const io = std.testing.io;
             const executable = try std.process.executablePathAlloc(io, allocator);
             defer allocator.free(executable);
             var environment = std.process.Environ.Map.init(allocator);
@@ -9166,7 +9166,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
             try environment.put(peer_vector_env, vector);
             try environment.put(peer_mode_env, @tagName(mode));
             var child = try std.process.spawn(io, .{
-                .argv = &.{ executable, "capi Lite physical v2 peer ANN" },
+                .argv = &.{ executable, "--timeout-ms=120000", "capi Lite physical v2 peer ANN" },
                 .environ_map = &environment,
             });
             defer child.kill(io);

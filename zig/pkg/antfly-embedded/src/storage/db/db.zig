@@ -5825,7 +5825,9 @@ pub const DB = struct {
             .snapshot_replay_admission = async_resources.snapshot_replay_admission,
             .repair_replay_mutex = async_resources.repair_replay_mutex,
             .io = self.backend_runtime.io(),
-            .native_projection_owner = .{ .enabled = self.start_index_workers },
+            // Externally managed Lite runtimes publish projection files in
+            // their detached maintenance turn through the path writer lane.
+            .native_projection_owner = .{ .enabled = self.start_index_workers and self.start_independent_maintenance },
             .require_graph_resolution_contract = true,
             .visibility_observer = .{},
             .text_merge_runtime = null,
