@@ -4210,8 +4210,15 @@ test "compatibility backend candidates honor required policy" {
     );
 
     session_manager.required_backend = .pjrt;
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.pjrt},
+        try compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+
+    session_manager.required_backend_invalid = true;
     try std.testing.expectError(
-        error.RequiredBackendUnavailable,
+        error.InvalidRequiredBackend,
         compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
     );
 }
@@ -30276,9 +30283,9 @@ test "gliner boundary microbatch capacity rejoins the caller with its original b
         \\{"schema_version":2,"model":"m","schema":{"entities":["person"]},"inputs":[{"content":"Ada"}]}
     , .{});
     defer request.deinit();
-    // Default limits admit both heaps but refuse the output reservation; a
-    // smaller explicit limit refuses the second heap itself. Neither case
-    // reaches a model, and neither may turn a valid serial request into 507.
+    // Request an output reservation larger than the host budget, including
+    // its owner overhead. A smaller scratch limit can refuse the second heap
+    // first. Neither case reaches a model or turns a serial request into 507.
     for ([_]usize{ 0, 256 * 1024 * 1024 }) |scratch_limit| {
         var node = try Node.init(a, .{
             .generation_budget_overrides = .{ .scratch_limit_bytes = scratch_limit },
@@ -30290,7 +30297,12 @@ test "gliner boundary microbatch capacity rejoins the caller with its original b
         defer caller.release();
         const before = node.model_manager.currentAdmissionAmounts();
         // The capacity refusal must precede any access to the model.
-        const ticket = Node.BoundaryRequestTicket{ .model = undefined, .request = &request, .options = .{}, .working_bytes = working_bytes };
+        const ticket = Node.BoundaryRequestTicket{
+            .model = undefined,
+            .request = &request,
+            .options = .{ .max_response_bytes = limits.host_limit_bytes },
+            .working_bytes = working_bytes,
+        };
         var output: Node.BoundaryReply = undefined;
         var slot = executor_microbatch.ResultSlot{ .output = &output };
         Node.executeBoundaryRequestMicrobatch(&node, &.{.{ .allocator = a, .identity = .{}, .payload = &ticket, .slot = &slot }});
@@ -50586,7 +50598,7 @@ test "audio read rejects non-audio bytes before resolving a model and releases a
     try std.testing.expect(node.tryAcquireRequestSlot());
     defer node.releaseRequestSlot();
     for (0..8) |_| {
-        try std.testing.expectError(error.UnsupportedInferenceMimeType, node.readAudioJsonWithControl(a, body, .{}));
+        try std.testing.expectError(error.UnsupportedInferenceMimeType, node.readAudioJsonWithControl(a, body, .{ .request_slot_admitted = true }));
         try std.testing.expectEqual(@as(usize, 1), node.inference_admission.stats().in_flight_requests);
         try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     }
