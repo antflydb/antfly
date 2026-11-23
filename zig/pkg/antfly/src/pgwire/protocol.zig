@@ -1676,7 +1676,11 @@ pub const Session = struct {
                 portal.* = .{ .arena = .init(self.alloc), .statement = "", .parameters = &.{}, .types = &.{}, .formats = &.{}, .description = .{ .columns = &.{} } };
                 errdefer if (!transferred) portal.arena.deinit();
                 const a = portal.arena.allocator();
-                const current = try self.preparedDescription(statement, a);
+                const current = description: {
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    break :description try self.preparedDescription(statement, scratch.allocator());
+                };
                 self.executing.store(true, .release);
                 defer self.executing.store(false, .release);
                 var admission_request = self.request(statement.statement, &.{}, &.{});
@@ -1750,13 +1754,13 @@ pub const Session = struct {
                 const text = try a.dupe(u8, statement.statement);
                 const description = backend.Description{
                     .cursor_readable = current.cursor_readable,
-                    .copy_out = current.copy_out,
-                    .copy_in = current.copy_in,
+                    .copy_out = if (current.copy_out) |options| try options.clone(a) else null,
+                    .copy_in = if (current.copy_in) |input| try input.cloneLeaky(a) else null,
                     .stamp = current.stamp,
                     .is_select = current.is_select,
                     .columns = try cloneColumns(a, current.columns),
                     .parameter_types = types,
-                    .parameter_descriptors = try a.dupe(backend.Parameter, current.parameter_descriptors),
+                    .parameter_descriptors = try backend.cloneParametersLeaky(a, current.parameter_descriptors),
                     .binding_guard = if (current.binding_guard) |guard| try a.dupe(u8, guard) else null,
                     .setting_epoch = current.setting_epoch,
                 };

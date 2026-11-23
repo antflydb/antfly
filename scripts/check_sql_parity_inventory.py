@@ -19,7 +19,9 @@
 import argparse
 import hashlib
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 from collections import Counter
@@ -319,14 +321,28 @@ def evidence_runs(gate_ids, gates):
     return runs
 
 
+def run_gate(command, *, cwd, timeout):
+    with subprocess.Popen(command, cwd=cwd, start_new_session=True) as child:
+        try:
+            status = child.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+            raise
+        if status:
+            raise subprocess.CalledProcessError(status, command)
+
+
 def run_evidence(gate_ids, gates, root=ROOT):
     for run in evidence_runs(gate_ids, gates):
         print(f"Running evidence gates: {', '.join(run['gate_ids'])}", flush=True)
-        subprocess.run(
+        run_gate(
             run["command"],
             cwd=repository_path(root, run["cwd"]),
             timeout=run["timeout_seconds"],
-            check=True,
         )
 
 

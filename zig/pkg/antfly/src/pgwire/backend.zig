@@ -225,7 +225,72 @@ pub const CopyInput = struct {
     table: @import("antfly_local_sources").sql_ast.Name,
     columns: []const Column,
     options: @import("antfly_local_sources").sql_ast.CopyOptions,
+
+    pub fn cloneLeaky(self: CopyInput, a: std.mem.Allocator) !CopyInput {
+        return .{
+            .freeze_admitted = self.freeze_admitted,
+            .source_statement = if (self.source_statement) |sql| try a.dupe(u8, sql) else null,
+            .table = .{
+                .database = if (self.table.database) |name| try a.dupe(u8, name) else null,
+                .namespace = if (self.table.namespace) |name| try a.dupe(u8, name) else null,
+                .table = try a.dupe(u8, self.table.table),
+            },
+            .columns = try cloneColumnsLeaky(a, self.columns),
+            .options = try self.options.clone(a),
+        };
+    }
 };
+
+pub fn cloneParametersLeaky(a: std.mem.Allocator, input: []const Parameter) ![]Parameter {
+    const scalar = @import("antfly_local_sources").sql_scalar;
+    const output = try a.dupe(Parameter, input);
+    var enums: std.AutoHashMapUnmanaged(*const scalar.EnumValues.View, *const scalar.EnumValues.View) = .empty;
+    var domains: scalar.DomainViews = .empty;
+    defer enums.deinit(a);
+    defer domains.deinit(a);
+    for (output) |*descriptor| {
+        descriptor.enum_view = try scalar.ownEnumView(a, &enums, descriptor.enum_view);
+        if (descriptor.enum_reference) |reference| {
+            const owned = try a.create(scalar.EnumReference);
+            owned.* = reference.*;
+            descriptor.enum_reference = owned;
+        }
+        if (try scalar.ownDomainView(a, &domains, descriptor.domainView())) |view| {
+            descriptor.domain_binding = &view.type_binding;
+        } else if (descriptor.domain_binding) |binding| {
+            const owned = try a.create(@TypeOf(binding.*));
+            owned.* = binding.*;
+            descriptor.domain_binding = owned;
+        }
+    }
+    return output;
+}
+
+test "pgwire portal metadata survives release of the prepared arena" {
+    var prepared = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer prepared.deinit();
+    var portal = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer portal.deinit();
+    const a = prepared.allocator();
+    const scalar = @import("antfly_local_sources").sql_scalar;
+    const reference = try a.create(scalar.EnumReference);
+    reference.* = .{ .id = 17, .origin_id = @splat(1), .generation = 2 };
+    const parameters = try cloneParametersLeaky(portal.allocator(), &.{.{ .kind = .enumeration, .enum_reference = reference }});
+    const input: CopyInput = .{
+        .source_statement = try a.dupe(u8, "COPY sample FROM STDIN"),
+        .table = .{ .table = try a.dupe(u8, "sample") },
+        .columns = &.{.{ .name = try a.dupe(u8, "value"), .type = .string }},
+        .options = .{ .null_string = try a.dupe(u8, "missing") },
+    };
+    const copied = try input.cloneLeaky(portal.allocator());
+    try std.testing.expect(parameters[0].enum_reference.? != reference);
+    _ = prepared.reset(.free_all);
+    try std.testing.expectEqual(@as(u64, 17), parameters[0].enum_reference.?.id);
+    try std.testing.expectEqualStrings("COPY sample FROM STDIN", copied.source_statement.?);
+    try std.testing.expectEqualStrings("sample", copied.table.table);
+    try std.testing.expectEqualStrings("value", copied.columns[0].name);
+    try std.testing.expectEqualStrings("missing", copied.options.null_string.?);
+}
 
 pub const Result = struct {
     /// Captured from the executed binding into the caller's cursor arena.

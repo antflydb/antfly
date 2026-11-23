@@ -17,6 +17,8 @@ import contextlib
 import copy
 import io
 import json
+import signal
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,12 +30,29 @@ from check_sql_parity_inventory import (
     main,
     release_blockers,
     run_evidence,
+    run_gate,
     select_evidence_gates,
     validate,
 )
 
 
 class ParityInventoryTest(unittest.TestCase):
+    def test_timed_out_gate_kills_its_process_group_and_waits(self):
+        command = ["zig", "build"]
+        timeout = subprocess.TimeoutExpired(command, 1)
+        with (
+            patch("check_sql_parity_inventory.subprocess.Popen") as spawn,
+            patch("check_sql_parity_inventory.os.killpg") as kill_group,
+        ):
+            child = spawn.return_value.__enter__.return_value
+            child.pid = 123
+            child.wait.side_effect = [timeout, -signal.SIGKILL]
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_gate(command, cwd=Path("."), timeout=1)
+        spawn.assert_called_once_with(command, cwd=Path("."), start_new_session=True)
+        kill_group.assert_called_once_with(123, signal.SIGKILL)
+        self.assertEqual(child.wait.call_count, 2)
+
     @classmethod
     def setUpClass(cls):
         cls.inventory = (FIXTURES / "sql_parity_inventory.json").read_bytes()
@@ -244,7 +263,7 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertIn(partial, release_blockers(entries))
         self.assertIn("sql-original-prepared-cte-runtime", gate_ids)
         self.assertIn("pgwire-original-prepared-cte", gate_ids)
-        with patch("check_sql_parity_inventory.subprocess.run") as run:
+        with patch("check_sql_parity_inventory.run_gate") as run:
             run_evidence(
                 sorted({proof["gate"] for proof in partial["evidence"]}),
                 ledger["gates"],
@@ -284,13 +303,12 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertEqual(
             gate_ids, sorted(gate for run in runs for gate in run["gate_ids"])
         )
-        with patch("check_sql_parity_inventory.subprocess.run") as run:
+        with patch("check_sql_parity_inventory.run_gate") as run:
             run_evidence(gate_ids, self.ledger["gates"])
         self.assertEqual(len(runs), run.call_count)
         for planned, call in zip(runs, run.call_args_list, strict=True):
             self.assertEqual(planned["command"], call.args[0])
             self.assertEqual(planned["timeout_seconds"], call.kwargs["timeout"])
-            self.assertTrue(call.kwargs["check"])
 
     def test_evidence_grouping_preserves_distinct_filters_and_isolation(self):
         gates = {
