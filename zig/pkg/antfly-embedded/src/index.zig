@@ -631,6 +631,12 @@ fn publishReplacementMissingLiveCounts(
     }
 }
 
+/// Level-0 segment ids (`persistent.zig` `l0SegmentId`) carry the high bit
+/// and never advance the writer's segment id counter.
+pub fn isLevel0SegmentId(seg_id: u64) bool {
+    return seg_id & (@as(u64, 1) << 63) != 0;
+}
+
 pub const SegmentEntry = struct {
     id: u64,
     data: SegmentData,
@@ -4155,7 +4161,9 @@ pub const IndexWriter = struct {
         fork.current.release();
         fork.current = snapshot_ref;
         fork.next_epoch = snapshot_ref.epoch + 1;
-        for (snapshot_ref.segments) |segment| fork.next_segment_id = @max(fork.next_segment_id, segment.id + 1);
+        for (snapshot_ref.segments) |segment| {
+            if (!isLevel0SegmentId(segment.id)) fork.next_segment_id = @max(fork.next_segment_id, segment.id + 1);
+        }
         return fork;
     }
 
@@ -4744,7 +4752,7 @@ pub const IndexWriter = struct {
             .shared = shared,
         };
 
-        if (seg_id >= self.next_segment_id) self.next_segment_id = seg_id + 1;
+        if (!isLevel0SegmentId(seg_id) and seg_id >= self.next_segment_id) self.next_segment_id = seg_id + 1;
 
         var global_field_lens = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
         errdefer global_field_lens.deinit(self.alloc);
@@ -4964,7 +4972,7 @@ pub const IndexWriter = struct {
         cells_created = 0;
         var next_segment_id = self.next_segment_id;
         for (replacements) |replacement| {
-            if (replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
+            if (!isLevel0SegmentId(replacement.id) and replacement.id >= next_segment_id) next_segment_id = replacement.id + 1;
         }
         return .{
             .writer = self,
@@ -5178,6 +5186,31 @@ pub const IndexWriter = struct {
             }
         }
         return try delete_infos.toOwnedSlice(alloc);
+    }
+
+    /// Sets committed tombstones on this writer's copy of `seg_id`, if it is
+    /// loaded. Used once a write's deletes are durable: queries never see a
+    /// delete before it is.
+    pub fn applyCommittedDeletes(self: *IndexWriter, seg_id: u64, local_ids: []const u32) !void {
+        self.lockMutex();
+        defer self.mu.unlock();
+        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        for (snap.segments) |*seg| {
+            if (seg.id != seg_id) continue;
+            seg.shared.lockDeletionExclusive();
+            defer seg.shared.unlockDeletionExclusive();
+            if (seg.shared.deleted == null) seg.shared.deleted = roaring.RoaringBitmap.init(self.alloc);
+            var added: u32 = 0;
+            for (local_ids) |local_id| {
+                if (local_id >= seg.reader.doc_count) continue;
+                if (seg.shared.deleted.?.contains(local_id)) continue;
+                try seg.shared.deleted.?.add(local_id);
+                updateMissingLiveCountsForDeletedDocs(seg.shared, &.{local_id}, true);
+                added += 1;
+            }
+            _ = seg.shared.deleted_count.fetchAdd(added, .acq_rel);
+            return;
+        }
     }
 
     /// Update a document by its external ID: deletes the old version and indexes the new one.
