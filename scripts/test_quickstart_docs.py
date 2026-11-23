@@ -142,8 +142,7 @@ def check_export_preserves_files() -> None:
     # A syntax-only check cannot catch an overwrite after a failed mkdir.
     script = (
         '_quickstart_test_started="$PWD/server-started"\n'
-        'antfly() { printf started > "$_quickstart_test_started"; }\n'
-        + blocks[0]
+        'antfly() { printf started > "$_quickstart_test_started"; }\n' + blocks[0]
     )
     for case in ("existing-directory", "missing-download", "fresh-copy"):
         with tempfile.TemporaryDirectory(prefix="antfly-doc-export-") as directory:
