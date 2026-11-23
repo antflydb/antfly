@@ -1126,11 +1126,7 @@ pub fn searchComposed(
     // hydrates its final winners under the same pinned read authority. Keep
     // eager payloads where named graph inputs, highlights or hierarchy output
     // require those component-local bodies.
-    const defer_component_bodies = req.include_stored and
-        composedTextSourceCount(req) + composedEmbeddingSourceCount(req) > 1 and
-        req.graph_queries.len == 0 and req.highlight == null and !req.hasHitEvaluation() and
-        req.return_mode == .parent and !req.hierarchy_include_source and !req.hierarchy_include_unit and
-        !req.hierarchy_grouped_matches and req.aggregations_json.len == 0;
+    const defer_component_bodies = composedDefersComponentBodies(req);
     var shared_req = req;
     if (defer_component_bodies) shared_req.include_stored = false;
     if (shared_filter) |*filter| {
@@ -1719,6 +1715,14 @@ fn validateSortPageOptions(req: types.SearchRequest) !void {
         return error.UnsupportedQueryRequest;
     }
     try validateSortCursorContract(req);
+}
+
+pub fn composedDefersComponentBodies(req: types.SearchRequest) bool {
+    return req.include_stored and
+        composedTextSourceCount(req) + composedEmbeddingSourceCount(req) > 1 and
+        req.graph_queries.len == 0 and req.highlight == null and !req.hasHitEvaluation() and
+        req.return_mode == .parent and !req.hierarchy_include_source and !req.hierarchy_include_unit and
+        !req.hierarchy_grouped_matches and req.aggregations_json.len == 0;
 }
 
 fn composedTextSourceCount(req: types.SearchRequest) usize {
