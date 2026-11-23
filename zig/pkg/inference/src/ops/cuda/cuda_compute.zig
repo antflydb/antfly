@@ -3851,7 +3851,7 @@ pub const CudaCompute = struct {
             std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
             if (owner.head.ptr == 0 or self.compute.execution_scope == null)
                 return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
-            return linearNoBiasWithDestination(self.compute, input_ct, weight, owner.rows, owner.hidden, owner.vocab, false, owner.head);
+            return cb.observeBackendEntry(.linear_no_bias, &linearNoBiasWithDestination, .{ self.compute, input_ct, weight, owner.rows, owner.hidden, owner.vocab, false, @as(?buffer_mod.DeviceBuffer, owner.head) });
         }
         pub fn setInput(self: *@This(), input_ct: CT) !void {
             const owner = &self.compute.bounded_decode_graph;
@@ -45060,7 +45060,29 @@ test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
     defer cb.free(weight);
     var backing = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4 * @sizeOf(f32));
     defer backing.free(&compute.ctx);
-    const projected = try linearNoBiasWithDestination(&compute, input, weight, 2, 2, 2, false, backing);
+    const owner = &compute.bounded_decode_graph;
+    owner.head = backing;
+    defer owner.head = .{};
+    owner.rows = 2;
+    owner.hidden = 2;
+    owner.vocab = 2;
+    var plan: @import("../../execution/stream_workspace.zig").Plan = .{};
+    var workspace = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan };
+    try std.testing.expect(owner.mutex.tryLock());
+    owner.active = true;
+    compute.execution_scope = &workspace;
+    var claim = CudaCompute.BoundedDecodeClaim{ .compute = &compute, .future_tokens = 0 };
+    defer claim.deinit();
+    var observation = @import("../../execution/runtime_observation.zig").Scope.init();
+    defer observation.deinit();
+    const projected = try claim.projectHead(&cb, input, weight);
+    const entries = observation.snapshot().backend_entries;
+    for (entries.records[0..entries.count]) |entry| {
+        if (entry.family == .linear_no_bias and entry.backend == .cuda) {
+            try std.testing.expectEqual(@as(u64, 1), entry.successful_returns);
+            break;
+        }
+    } else return error.TestUnexpectedResult;
     const tensor = tensorFromCt(projected);
     defer cb.free(projected);
     try std.testing.expectEqual(backing.ptr, tensor.buffer.ptr);

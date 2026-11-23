@@ -4146,7 +4146,7 @@ pub const ComputeBackend = struct {
         return null;
     }
 
-    inline fn observeBackendEntry(self: *const ComputeBackend, comptime family: @import("../execution/runtime_observation.zig").Entry, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
+    pub inline fn observeBackendEntry(self: *const ComputeBackend, comptime family: @import("../execution/runtime_observation.zig").Entry, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
         if (!@import("../execution/runtime_observation.zig").enabled()) return @call(.auto, callback, args);
         return self.observeBackendEntryEnabled(family, callback, args);
     }
