@@ -1831,7 +1831,7 @@ fn stepAdd(cb: *const ComputeBackend, profile: ?*StepProfile, a: CT, b: CT) !CT 
 }
 fn stepEmbedding(cb: *const ComputeBackend, profile: *StepProfile, weight: CT, ids: []const i64, rows: usize, width: usize) !CT {
     if (profile.assigned) |schedule| {
-        const node = schedule.graph.node(schedule.steps[schedule.cursor]);
+        const node = try schedule.nextNode();
         if (rows != ids.len or node.op != .gather or node.output_shape.dims[0] != rows) return error.DenseScheduleOrderChanged;
         return schedule.execute(&.{ weight, schedule.values[node.inputs[1]] orelse return error.MissingValue }, null);
     }
@@ -1849,8 +1849,8 @@ fn validatePrefixRows(cb: *const ComputeBackend, actual: CT, whole: CT, bytes: u
 
 fn stepPrefix(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, live: usize, heads: usize, dim: usize) !CT {
     if (profile.assigned) |schedule| {
-        if (schedule.descriptors[schedule.steps[schedule.cursor]].?.operation == .dense_attention_rows) return stepCrossRows(cb, profile, q, k, v, 1, live, heads, dim);
-        const node = schedule.graph.node(schedule.steps[schedule.cursor]);
+        if ((try schedule.nextDescriptor()).operation == .dense_attention_rows) return stepCrossRows(cb, profile, q, k, v, 1, live, heads, dim);
+        const node = try schedule.nextNode();
         const whole_k = schedule.values[node.inputs[1]] orelse return error.MissingValue;
         const whole_v = schedule.values[node.inputs[2]] orelse return error.MissingValue;
         for ([_]CT{ k, v }, [_]CT{ whole_k, whole_v }) |actual, whole| try validatePrefixRows(cb, actual, whole, live * heads * dim * 4);

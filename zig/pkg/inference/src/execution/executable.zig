@@ -2834,10 +2834,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
             }
             if (targets != 1) return;
             const Executor = @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor;
-            const projection_head = if (ops.kernel_descriptor.projectionHead(graph)) |head|
-                head.linears[0].operation.linear.rows > 1 or head.form == .independent
-            else
-                false;
+            const projection_head = ops.kernel_descriptor.metalRowProjectionHead(graph) or
+                if (ops.kernel_descriptor.projectionHead(graph)) |head| head.linears[0].operation.linear.rows > 1 else false;
             const operation = @import("backend_operation.zig");
             var metadata: operation.Scope = .{};
             defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();

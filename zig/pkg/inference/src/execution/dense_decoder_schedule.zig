@@ -882,9 +882,18 @@ pub const Schedule = struct {
     pub fn releaseTemporary(self: *const Schedule, cb: *const ops.ComputeBackend, value: CT) void {
         if (!self.borrowed.contains(value)) cb.free(value);
     }
-    pub fn execute(self: *Schedule, inputs: []const CT, attention: ?*const ops.AttentionContext) !CT {
+    fn nextNodeId(self: *const Schedule) !Node {
         if (self.cursor >= self.steps.len) return error.DenseScheduleOrderChanged;
-        const id = self.steps[self.cursor];
+        return self.steps[self.cursor];
+    }
+    pub fn nextNode(self: *const Schedule) !*const ml.graph.Node {
+        return self.graph.node(try self.nextNodeId());
+    }
+    pub fn nextDescriptor(self: *const Schedule) !*const ops.kernel_descriptor.Descriptor {
+        return if (self.descriptors[try self.nextNodeId()]) |*descriptor| descriptor else error.DenseScheduleOrderChanged;
+    }
+    pub fn execute(self: *Schedule, inputs: []const CT, attention: ?*const ops.AttentionContext) !CT {
+        const id = try self.nextNodeId();
         const node = self.graph.node(id);
         if (inputs.len != node.num_inputs) return error.DenseScheduleOrderChanged;
         for (node.getInputs(), inputs) |source, value| self.values[source] = value;

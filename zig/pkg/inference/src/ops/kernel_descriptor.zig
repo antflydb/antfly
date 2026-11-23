@@ -576,22 +576,47 @@ pub fn headNormRope(graph: *const ml.graph.Graph, output: ml.graph.NodeId) ?Head
 /// widths; every source retains its own projection/rounding contract. Callers
 /// prove partition membership and availability, rather than guessing adjacency.
 pub fn independentProjections(graph: *const ml.graph.Graph, outputs: []const ml.graph.NodeId) ?ProjectionHead {
+    return independentProjectionHead(graph, outputs, false);
+}
+
+/// Metal's prepared row kernels bind each optional bias as part of the
+/// immutable slot recipe. Callers that only bind weights opt out.
+pub fn independentProjectionHead(graph: *const ml.graph.Graph, outputs: []const ml.graph.NodeId, allow_bias: bool) ?ProjectionHead {
     if (outputs.len < 2 or outputs.len > 3) return null;
     var head = ProjectionHead{ .form = .independent, .count = @intCast(outputs.len), .input = ml.graph.null_node, .entry = outputs[0] };
     for (outputs, 0..) |output, index| {
         if (output >= graph.nodeCount()) return null;
         const node = graph.node(output);
         const descriptor = lower(graph, output) orelse return null;
-        if (descriptor.operation != .linear or descriptor.operation.linear.bias or node.getInputs().len != 2) return null;
+        if (descriptor.operation != .linear or node.getInputs().len != descriptor.input_count) return null;
+        if (descriptor.operation.linear.bias) {
+            if (!allow_bias or node.getInputs().len != 3) return null;
+            const bias = graph.node(node.inputs[2]);
+            if (bias.op != .parameter or bias.output_shape.dtype != .f32 or bias.output_shape.rank() != 1 or
+                bias.output_shape.dim(0) != descriptor.operation.linear.out_dim) return null;
+        } else if (node.getInputs().len != 2) return null;
         if (index == 0) head.input = node.inputs[0] else if (node.inputs[0] != head.input) return null;
         const dims = descriptor.operation.linear;
         if (!head.source(graph, index, node.inputs[1], output, dims.rows, dims.in_dim, dims.out_dim, true) or !head.append(output)) return null;
+        head.linears[index] = descriptor;
         if (descriptor.output_shape.dtype != .f32 or descriptor.input_shapes[0].dtype != .f32 or descriptor.input_shapes[1].dtype != .f32) return null;
         if (index != 0 and (dims.rows != head.linears[0].operation.linear.rows or dims.in_dim != head.linears[0].operation.linear.in_dim)) return null;
         for (head.weights[0..index]) |prior| if (prior == head.weights[index]) return null;
         for (outputs[0..index]) |prior| if (prior == output) return null;
     }
     return head;
+}
+
+/// A complete one-row head eligible for the pair or QKV region. Slot
+/// readiness and precise input bindings are checked by the region owner.
+pub fn metalRowProjectionHead(graph: *const ml.graph.Graph) bool {
+    const head = independentProjectionHead(graph, graph.outputs.items, true) orelse return false;
+    if (graph.node(head.input).op != .parameter or head.linears[0].operation.linear.rows != 1) return false;
+    const ops = head.linears;
+    return if (head.count == 2)
+        ops[0].operation.linear.out_dim == ops[1].operation.linear.out_dim
+    else
+        ops[1].operation.linear.out_dim == ops[2].operation.linear.out_dim;
 }
 
 /// Complete parameter-fed projection head only. Mixed graphs keep their
@@ -1248,4 +1273,26 @@ test "head-major attention preserves independent query rows and broadcast bias" 
     try std.testing.expect(!transposed_program.key_contract_last);
     try std.testing.expectEqual(transposed, transposed_program.inputs[1]);
     try std.testing.expectEqual(program.key_rows, transposed_program.key_rows);
+}
+
+test "Metal row projection head preserves optional bias operands" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 1, 32 }));
+    const bias = try b.parameter("bias", ml.graph.Shape.init(.f32, &.{64}));
+    const w0 = try b.parameter("w0", ml.graph.Shape.init(.f32, &.{ 64, 32 }));
+    const w1 = try b.parameter("w1", ml.graph.Shape.init(.f32, &.{ 64, 32 }));
+    const first = try b.linear(x, w0, bias, 1, 32, 64);
+    const second = try b.linearNoBias(x, w1, 1, 32, 64);
+    try graph.markOutput(first);
+    try graph.markOutput(second);
+    try std.testing.expect(metalRowProjectionHead(&graph));
+    try std.testing.expect(projectionHead(&graph) == null);
+    const head = independentProjectionHead(&graph, graph.outputs.items, true) orelse return error.MissingIndependentProjection;
+    try std.testing.expect(head.linears[0].operation.linear.bias);
+    try std.testing.expect(!head.linears[1].operation.linear.bias);
+    graph.nodeMut(bias).output_shape.dtype = .bf16;
+    try std.testing.expect(!metalRowProjectionHead(&graph));
 }

@@ -4484,8 +4484,8 @@ fn stepTriple(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense
 }
 fn stepEmbedding(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, weight: CT, ids: []const i64, rows: usize, width: usize) !CT {
     if (assigned) |schedule| {
-        if (rows != 1 or ids.len != 1 or schedule.cursor >= schedule.steps.len) return error.DenseScheduleOrderChanged;
-        const node = schedule.graph.node(schedule.steps[schedule.cursor]);
+        if (rows != 1 or ids.len != 1) return error.DenseScheduleOrderChanged;
+        const node = try schedule.nextNode();
         if (node.op != .gather) return error.DenseScheduleOrderChanged;
         return schedule.execute(&.{ weight, schedule.values[node.inputs[1]] orelse return error.MissingValue }, null);
     }
@@ -4493,8 +4493,8 @@ fn stepEmbedding(cb: *const ComputeBackend, assigned: ?*@import("../execution/de
 }
 fn stepPrefix(cb: *const ComputeBackend, assigned: ?*@import("../execution/dense_decoder_schedule.zig").Schedule, q: CT, k: CT, v: CT, mask: []const i64, batch: usize, live: usize, heads: usize, dim: usize) !CT {
     if (assigned) |schedule| {
-        if (batch != 1 or schedule.cursor >= schedule.steps.len) return error.DenseScheduleOrderChanged;
-        const node = schedule.graph.node(schedule.steps[schedule.cursor]);
+        if (batch != 1) return error.DenseScheduleOrderChanged;
+        const node = try schedule.nextNode();
         if (schedule.values[node.inputs[1]] != k or schedule.values[node.inputs[2]] != v) return error.PreparedDensePrefixBindingChanged;
         const attention = ops.AttentionContext{ .total_sequence_len = live, .query_sequence_len = 1, .kv_sequence_len = live, .dense_attention_prefix = .{ .live_key_rows = live, .mask = mask } };
         return schedule.execute(&.{ q, k, v }, &attention);

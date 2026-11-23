@@ -12336,7 +12336,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         compute: *MetalCompute,
         count: usize,
         nodes: [6]ml.graph.NodeId,
-        inputs: [4]ml.graph.NodeId,
+        inputs: [7]ml.graph.NodeId,
+        input_count: usize = 1,
         outputs: [3]region.Output,
         linears: [3]route.Owned,
         packed_request: ?ProjectionPack.Request = null,
@@ -12344,11 +12345,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         fn candidate(graph: *const ml.graph.Graph, node: ml.graph.NodeId) ?ops.kernel_descriptor.Descriptor {
             const descriptor = ops.kernel_descriptor.lower(graph, node) orelse return null;
-            if (descriptor.operation != .linear or descriptor.operation.linear.bias or !supportsAssignedDescriptor(&descriptor)) return null;
+            if (descriptor.operation != .linear or !supportsAssignedDescriptor(&descriptor)) return null;
             return descriptor;
         }
         fn hasCandidates(graph: *const ml.graph.Graph) bool {
-            return hasProjectionHead(graph, true);
+            return ops.kernel_descriptor.metalRowProjectionHead(graph);
         }
         fn hasProjectionHead(graph: *const ml.graph.Graph, row_one: bool) bool {
             const head = ops.kernel_descriptor.projectionHead(graph) orelse return false;
@@ -12367,16 +12368,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         fn matches(raw: *anyopaque, request: region.Validate) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (!self.compute.projectionScopeValid() or !self.slotsSupported() or request.inputs.len != self.count + 1 or request.outputs.len != self.count) return false;
+            if (!self.compute.projectionScopeValid() or !self.slotsSupported() or request.inputs.len != self.input_count or request.outputs.len != self.count) return false;
             if (self.packed_request) |expected| {
                 const profile = self.compute.packed_projection_profile orelse return false;
                 const actual = profile.packed_request orelse return false;
                 if (!std.meta.eql(expected, actual)) return false;
             }
-            for (self.linears[0..self.count], 0..) |linear, index| {
+            var operand_index: usize = 1;
+            for (self.linears[0..self.count]) |linear| {
                 const owner: *PreparedDenseLinear = @ptrCast(@alignCast(linear.context));
-                const facts = [_]route.Binding{ request.inputs[0], request.inputs[index + 1] };
-                if (!owner.matchesInputs(&facts)) return false;
+                const operands = owner.descriptor.input_count - 1;
+                var facts: [3]route.Binding = undefined;
+                facts[0] = request.inputs[0];
+                @memcpy(facts[1..][0..operands], request.inputs[operand_index..][0..operands]);
+                if (!owner.matchesInputs(facts[0 .. operands + 1])) return false;
+                operand_index += operands;
             }
             return true;
         }
@@ -12558,7 +12564,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const output = route.OutputSlot{ .allocation = 0, .node = output_node, .epoch = 0, .logical = descriptor.output_shape, .writable_bytes = bytes };
             owner.linears[index] = (try PreparedDenseLinear.prepareRegion(self, .{ .allocator = request.allocator, .implementation = request.implementation, .descriptor = &descriptor, .inputs = &facts, .output = output }, table)) orelse return null;
             owner.count += 1;
-            owner.inputs[index + 1] = weight;
+            owner.inputs[owner.input_count] = weight;
+            owner.input_count += 1;
             owner.outputs[index] = .{ .node = output_node, .logical = descriptor.output_shape, .bytes = bytes };
             const prepared: *PreparedDenseLinear = @ptrCast(@alignCast(owner.linears[index].context));
             actual.widths[index] = descriptor.operation.linear.out_dim;
@@ -12570,7 +12577,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         owner.packed_request = expected;
         owner.scratch_bytes = try (try expected.layout()).outputBytes(semantic.linears[0].operation.linear.rows);
         const items = try request.allocator.alloc(region.Owned, 1);
-        items[0] = .{ .context = owner, .implementation = request.implementation, .key = entry, .policy_key = 2, .covered_nodes = owner.nodes[0..covered_count], .input_nodes = owner.inputs[0 .. owner.count + 1], .entry_node = entry, .requirements = .{ .outputs = owner.outputs[0..owner.count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes, .alignment = @alignOf(f32) }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table };
+        items[0] = .{ .context = owner, .implementation = request.implementation, .key = entry, .policy_key = 2, .covered_nodes = owner.nodes[0..covered_count], .input_nodes = owner.inputs[0..owner.input_count], .entry_node = entry, .requirements = .{ .outputs = owner.outputs[0..owner.count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes, .alignment = @alignOf(f32) }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table };
         transferred = true;
         return .{ .allocator = request.allocator, .items = items };
     }
@@ -12602,7 +12609,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (request.node_facts[weight] != .tensor) continue;
             const known = request.node_facts[weight].tensor;
             if (known.implementation.context != ctx or !acceptsPhysicalImplementation(known.implementation.table)) continue;
-            const key = self.assignedDenseLinearKey(descriptor.operation.linear, known.value, null) orelse continue;
+            const bias: ?CT = if (descriptor.operation.linear.bias) bias: {
+                const fact = request.node_facts[request.graph.node(node).inputs[2]];
+                if (fact != .tensor or fact.tensor.implementation.context != ctx or !acceptsPhysicalImplementation(fact.tensor.implementation.table)) continue;
+                break :bias fact.tensor.value;
+            } else null;
+            const key = self.assignedDenseLinearKey(descriptor.operation.linear, known.value, bias) orelse continue;
             const slot = self.assignedDenseLinearSlot(key);
             try watched.append(request.allocator, .{ .key = key, .slot = slot, .declaration = if (slot) |value| self.provider_impl.privateSlotDeclaration(.linear, value) else 0 });
         }
@@ -12667,14 +12679,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             owner.inputs[0] = input;
             for (partition_nodes[cursor..][0..count], 0..) |node, index| {
                 const descriptor = DenseProjectionRegion.candidate(request.graph, node).?;
-                const weight = request.graph.node(node).inputs[1];
-                const facts = [_]route.Binding{ request.node_facts[input], request.node_facts[weight] };
+                const operands = request.graph.node(node).getInputs();
+                if (operands.len != descriptor.input_count) break;
+                var facts: [3]route.Binding = undefined;
+                for (operands, facts[0..operands.len]) |source, *fact| fact.* = request.node_facts[source];
                 const bytes = try std.math.mul(usize, descriptor.elements(), @sizeOf(f32));
                 const output = route.OutputSlot{ .allocation = 0, .node = node, .epoch = 0, .logical = descriptor.output_shape, .writable_bytes = bytes };
-                owner.linears[index] = (try PreparedDenseLinear.prepareRegion(self, .{ .allocator = request.allocator, .implementation = request.implementation, .descriptor = &descriptor, .inputs = &facts, .output = output }, table)) orelse break;
+                owner.linears[index] = (try PreparedDenseLinear.prepareRegion(self, .{ .allocator = request.allocator, .implementation = request.implementation, .descriptor = &descriptor, .inputs = facts[0..operands.len], .output = output }, table)) orelse break;
                 owner.count += 1;
                 owner.nodes[index] = node;
-                owner.inputs[index + 1] = weight;
+                const parameter_nodes = operands[1..];
+                @memcpy(owner.inputs[owner.input_count..][0..parameter_nodes.len], parameter_nodes);
+                owner.input_count += parameter_nodes.len;
                 owner.outputs[index] = .{ .node = node, .logical = descriptor.output_shape, .bytes = bytes };
             }
             if (owner.count != count or !owner.slotsSupported()) {
@@ -12682,7 +12698,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 continue;
             }
             // Slices point into their stable heap owner, never this call frame.
-            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0 .. count + 1], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table });
+            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0..owner.input_count], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table });
             transferred = true;
             cursor += count;
         }
