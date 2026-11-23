@@ -97,7 +97,7 @@ pub fn finishPhysical(a: A, block: @import("spill.zig").ColumnarBlock, row: usiz
 /// or signature is repeated for every group; the enclosing recipe binds it.
 pub const physical_width = 9;
 pub fn physicalEligible(spec: operators.AggregateSpec) bool {
-    return !spec.distinct and spec.kind != .pattern_set;
+    return !spec.distinct and spec.kind != .pattern_set and spec.kind != .array_agg;
 }
 pub fn physicalColumns(spec: operators.AggregateSpec) []const u8 {
     return switch (spec.kind) {
@@ -106,7 +106,7 @@ pub fn physicalColumns(spec: operators.AggregateSpec) []const u8 {
         .avg => if (spec.input_element == .numeric) &.{ 0, 8 } else &.{ 0, 5 },
         .min, .max => &.{ 0, 7 },
         .bool_and, .bool_or => &.{ 0, 6 },
-        .pattern_set => &.{},
+        .pattern_set, .array_agg => &.{},
     };
 }
 pub fn physicalWidth(inputs: anytype) usize {
@@ -268,6 +268,7 @@ fn kindId(kind: operators.Aggregate.Kind) u8 {
         .bool_and => 6,
         .bool_or => 7,
         .pattern_set => 8,
+        .array_agg => 9,
     };
 }
 fn typeId(type_: ?@import("ast.zig").ColumnType) u8 {
@@ -465,7 +466,7 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
 /// identical to scalar restore; extrema borrow their winning payload until merge.
 pub const Fixed = struct { count: u64, sum: i128, boolean: bool, selected: Datum, numeric: ?@import("numeric_aggregate.zig").State = null };
 pub fn fixedEligible(spec: operators.AggregateSpec) bool {
-    return !spec.distinct and operators.exactMergeable(spec) and spec.kind != .pattern_set;
+    return !spec.distinct and operators.exactMergeable(spec) and spec.kind != .pattern_set and spec.kind != .array_agg;
 }
 pub fn decodeFixed(a: A, value: Datum, spec: operators.AggregateSpec) !?Fixed {
     if (!fixedEligible(spec)) return null;
@@ -828,7 +829,7 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
         .bool_and => target.boolean = target.boolean and source.boolean,
         .bool_or => target.boolean = target.boolean or source.boolean,
         .min, .max => try target.update(source.selected.?.row.values[0]),
-        .pattern_set => return error.InvalidSqlSpill,
+        .pattern_set, .array_agg => return error.InvalidSqlSpill,
     }
     target.count = total;
 }

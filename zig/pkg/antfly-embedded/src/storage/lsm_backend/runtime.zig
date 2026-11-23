@@ -1278,6 +1278,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn setKeysOnly(self: *@This()) void {
+            // The remote cursor repeats its mode on every operation. Only
+            // the initial selection must precede cursor positioning.
+            if (self.keys_only) return;
             self.keys_only = true;
             self.record_scan_value_stats = false;
             self.boundPersistedRunBlockResidency();
@@ -13378,6 +13381,7 @@ test "public graph metric borrowed wire LSM write presence and key cursor preser
         }
     };
     try Check.entry(try cursor.first(), "a");
+    cursor.setKeysOnly();
     try Check.entry(try cursor.next(), "c");
     try Check.entry(try cursor.last(), "c");
     try Check.entry(try cursor.prev(), "a");

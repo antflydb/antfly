@@ -212,6 +212,7 @@ pub const Relation = union(enum) {
         left: *const Relation,
         right: *const Relation,
         condition: ?*const Scalar = null,
+        using_columns: []const []const u8 = &.{},
         /// Compiler-only left-domain demand. A masked LEFT LATERAL producer
         /// is not opened or evaluated for an undemanded row.
         demand: ?*const Scalar = null,
@@ -339,6 +340,7 @@ pub const SchemaChange = union(enum) {
     drop_column: []const u8,
     set_default: struct { column: []const u8, expression: *const Scalar },
     drop_default: []const u8,
+    replica_identity: enum { default, full },
 };
 pub const PolicyDdl = struct {
     action: enum { create, alter, drop, enable, disable },

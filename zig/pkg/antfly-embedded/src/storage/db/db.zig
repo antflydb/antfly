@@ -664,6 +664,9 @@ pub const OpenOptions = struct {
     /// schema predates the durable root. Historical Raft apply may retain the
     /// newer schema while replaying an older entry's mutation.
     reject_stale_schema_before_index_load: bool = false,
+    /// Replaying a descriptor with the installed version must not attempt
+    /// another schema publication on a topology-fenced physical owner.
+    preserve_same_version_schema_before_index_load: bool = false,
     identity_namespace: ?doc_identity.Namespace = null,
     /// Immutable authenticated deployment ownership, not selected by a source
     /// request. Decoders/library opens may leave this unset.
@@ -4272,6 +4275,10 @@ pub const DB = struct {
                     std.log.debug("owner open retains newer durable schema path={s} durable_version={d} descriptor_version={d}", .{
                         path, db.core.schema.?.version, prepared_schema.runtime_schema.version,
                     });
+                } else if (opts.preserve_same_version_schema_before_index_load and db.core.schema != null and
+                    db.core.schema.?.version == prepared_schema.runtime_schema.version)
+                {
+                    // The ordered mutation borrows the installed schema.
                 } else if (try childGenerationSourcePinsSchema(db.core, prepared_schema.runtime_schema.version)) {
                     // Parent ACKs precede the metadata child descriptor cut.
                     // A cold owner may reopen in that interval, but the
@@ -8054,12 +8061,35 @@ pub const DB = struct {
     /// share a store transaction; server replay policy is supplied by the caller.
     pub fn applyOrderedCommittedMutation(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, bypass_write_gate: bool) anyerror!void {
         if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedCommittedMutation", .{ self, request, identity, bypass_write_gate });
+        return self.applyOrderedCommittedMutationWithProducer(request, .unlabelled, identity, bypass_write_gate);
+    }
+
+    pub fn applyOrderedCommittedMutationWithProducer(self: *DB, request: types.BatchRequest, producer: @import("../source_producer_policy.zig").Producer, identity: OrderedApplyReceipt, bypass_write_gate: bool) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedCommittedMutationWithProducer", .{ self, request, producer, identity, bypass_write_gate });
+        if (producer == .scoped_source) return error.InvalidSourceAdmission;
         if (request.graph_endpoint_cleanup and !request.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
         try self.batchInternal(request, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_replication_write_gate = bypass_write_gate,
             .ordered_apply_receipt = identity,
+            .source_producer = producer,
+        });
+    }
+
+    /// Apply a root-local row mutation with the exact clock from the ordered
+    /// entry. Only a protocol-qualified native owner may select this entry point.
+    pub fn applyOrderedTimestampedMutation(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, committed_at_ns: i64, bypass_write_gate: bool) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedTimestampedMutation", .{ self, request, identity, committed_at_ns, bypass_write_gate });
+        if (committed_at_ns <= 0 or request.transaction != null or request.source_producer != .ordinary) return error.InvalidBatchRequest;
+        if (request.graph_endpoint_cleanup and !request.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
+        try self.batchInternal(request, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_replication_write_gate = bypass_write_gate,
+            .ordered_apply_receipt = identity,
+            .ordered_history_commit_time_ns = committed_at_ns,
+            .source_producer = .ordinary,
         });
     }
 
@@ -8234,6 +8264,35 @@ pub const DB = struct {
         const range: types.ByteRange = .{ .start = start, .end = end };
         const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, range);
         defer self.alloc.free(range_value);
+        const history = @import("../committed_history.zig");
+        const history_cut: ?[history.SplitCut.encoded_size]u8 = if (identity) |entry| cut: {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            const boundary = history.frame.digest(transition.split_key);
+            if (try history.SplitCut.load(&read, transition.transition_id, transition.attempt_epoch)) |previous| {
+                if (!std.mem.eql(u8, &namespace, &previous.namespace) or
+                    previous.successor_group != transition.destination_group_id or
+                    !std.mem.eql(u8, &boundary, &previous.boundary))
+                    return error.HistoryResynchronizationRequired;
+                break :cut null;
+            }
+            const frontier = (try history.load(&read)) orelse break :cut null;
+            if (!std.mem.eql(u8, &namespace, &frontier.namespace)) return error.HistoryResynchronizationRequired;
+            break :cut (history.SplitCut{
+                .namespace = namespace,
+                .transition = transition.transition_id,
+                .attempt = transition.attempt_epoch,
+                .successor_group = transition.destination_group_id,
+                .term = entry.term,
+                .index = entry.index,
+                .latest = frontier.latest,
+                .reclaimed = frontier.reclaimed,
+                .boundary = boundary,
+                .root_generation = self.core.root_generation,
+                .reserved_bytes = frontier.reserved_bytes,
+            }).encode();
+        } else null;
         // Publish graph source ownership before acknowledging the transition.
         // Physical retirement is a durable maintenance task, not Raft apply
         // work. Reverse reads use the same source fence; old metric jobs are
@@ -8258,6 +8317,12 @@ pub const DB = struct {
         defer metadata_writes.deinit(self.alloc);
         try metadata_writes.append(self.alloc, .{ .key = range_state_mod.range_key, .value = range_value });
         if (identity) |entry| try metadata_writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
+        const history_cut_key = history.SplitCut.key(transition.transition_id, transition.attempt_epoch);
+        const history_successor_key = history.SplitCut.successorKey(transition.destination_group_id, history.frame.digest(transition.split_key));
+        if (history_cut != null) {
+            try metadata_writes.append(self.alloc, .{ .key = &history_cut_key, .value = &history_cut.? });
+            try metadata_writes.append(self.alloc, .{ .key = &history_successor_key, .value = &history_cut.? });
+        }
         if (replication_lsn) |lsn| try metadata_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_marker_buf));
         if (replication_payload) |payload| {
             const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
@@ -26344,6 +26409,18 @@ pub const DB = struct {
 
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope });
+        return self.beginTransactionProducerInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, .unlabelled);
+    }
+
+    /// Trusted native-only origin admission. Raft owners use the separate
+    /// applying-entry method; an origin label supplies no replication authority.
+    pub fn beginProducerTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, producer: @import("../source_producer_policy.zig").Producer) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginProducerTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, producer });
+        if (producer != .ordinary and producer != .legacy_cdc) return error.InvalidSourceAdmission;
+        return self.beginTransactionProducerInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, producer);
+    }
+
+    fn beginTransactionProducerInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, producer: @import("../source_producer_policy.zig").Producer) !transactions_mod.TxnId {
         // BEGIN records participant metadata without reading or changing user
         // rows. PREPARE retains authenticated policy admission for every row
         // intent. Restore-scoped BEGIN keeps its stronger raw admission gate.
@@ -26355,18 +26432,30 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (producer != .unlabelled) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const authority = @import("../source_authority.zig");
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            if (producer == .ordinary) {
+                try authority.requireNativeOrUnbound(&read, namespace);
+            } else {
+                _ = try authority.require(&read, .native, namespace);
+            }
+        }
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, scope);
         }
-        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
             txn_id,
             timestamp_ns,
             created_at_ns,
             participants,
             coordinator,
             retain_terminal,
+            .{ .ordinary_producer = producer == .ordinary, .legacy_producer = producer == .legacy_cdc },
         );
     }
 
@@ -26384,13 +26473,135 @@ pub const DB = struct {
         return self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, null);
     }
 
-    pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8) !transactions_mod.TxnId {
-        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope });
+    /// Private applying path. The caller supplies the actual ordinary Raft
+    /// entry, after protocol/route admission; this method establishes no leader
+    /// authority on its own. Plan, BEGIN, completion credits and applied marker
+    /// are committed in the same native transaction.
+    pub fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity });
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null, null, false, false);
+    }
+
+    /// Private protocol-42 path. Only an explicitly classified new request may
+    /// use it; ordinary completion v1 remains unclassified on replay.
+    pub fn beginReplicatedOrdinaryCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedOrdinaryCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity });
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null, null, true, false);
+    }
+
+    /// Protocol 44 preserves an explicit legacy origin without upgrading old
+    /// unclassified BEGIN records. Closed roots refuse new legacy admission.
+    pub fn beginReplicatedLegacyCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedLegacyCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity });
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null, null, false, true);
+    }
+
+    pub fn beginReplicatedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: OrderedApplyReceipt, purpose: [32]u8) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedSourceCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose });
+        if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose, null, false, false);
+    }
+
+    pub fn beginReplicatedScopedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: OrderedApplyReceipt, purpose: [32]u8, scope: @import("../source_scope.zig").Reference) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedScopedSourceCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose, scope });
+        try scope.validate();
+        if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose, scope, false, false);
+    }
+
+    fn beginReplicatedCompletionTransactionInternal(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt, purpose: ?[32]u8, scope: ?@import("../source_scope.zig").Reference, ordinary_producer: bool, legacy_producer: bool) !transactions_mod.TxnId {
+        const completion = @import("../transaction_completion.zig");
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var parsed = try completion.parseAdmission(self.alloc, encoded_plan);
+        defer parsed.deinit();
+        const plan = parsed.value.admission;
+        if ((ordinary_producer and legacy_producer) or ((ordinary_producer or legacy_producer) and (purpose != null or scope != null))) return error.SourceTransactionIdentityConflict;
+        if ((ordinary_producer or legacy_producer or purpose != null) and plan.version < 3) return error.ChangefeedCapabilityUnsupported;
+        if (purpose != null) {
+            var checkpoints: usize = 0;
+            for (plan.participants) |member| if (member.roles & completion.Roles.checkpoint != 0) {
+                checkpoints += 1;
+            };
+            if (checkpoints != 1) return error.InvalidSourceAdmission;
+        }
         lockApply(self);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (plan.version >= 2) {
+            const binding = owner orelse return error.InvalidHistoryAdmission;
+            try plan.requireRoutedOwner(binding);
+            if (!std.mem.eql(u8, &binding.namespace, &namespace) or binding.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+        } else {
+            if (owner != null) return error.ChangefeedCapabilityUnsupported;
+            _ = try plan.member(namespace);
+        }
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const persisted = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.HistoryResynchronizationRequired;
+            if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+            _ = try @import("../source_authority.zig").require(&read, .raft, namespace);
+            _ = (try @import("../committed_history.zig").load(&read)) orelse return error.HistoryResynchronizationRequired;
+        }
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
-            .already_applied => return txn_id,
+            .already_applied => {
+                var saved = (try manager.getCompletionAdmission(self.alloc, plan.transaction_id)) orelse return error.InvalidTxnRecord;
+                defer saved.deinit();
+                if (!std.mem.eql(u8, &saved.value.digest, &parsed.value.digest)) return error.DecisionConflict;
+                if (!std.meta.eql(try manager.getSourcePurpose(plan.transaction_id), purpose)) return error.SourceTransactionIdentityConflict;
+                if (!std.meta.eql(try manager.getSourceScope(plan.transaction_id), scope) or try manager.isOrdinaryProducer(plan.transaction_id) != ordinary_producer or try manager.isLegacyProducer(plan.transaction_id) != legacy_producer) return error.SourceTransactionIdentityConflict;
+                return plan.transaction_id;
+            },
+            .apply => {},
+        }
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
+        const extra: transactions_mod.MutationExtraBatch = .{ .ordinary_producer = ordinary_producer, .legacy_producer = legacy_producer, .writes = &.{marker}, .completion_owner = owner, .source_purpose = purpose, .source_scope = scope };
+        const is_coordinator = if (owner) |binding| std.mem.eql(u8, &binding.digest(), &plan.coordinator_fence) else std.mem.eql(u8, &namespace, &plan.coordinator_namespace);
+        if (is_coordinator)
+            try manager.initTransactionWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra)
+        else
+            try manager.initParticipantWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra);
+        return plan.transaction_id;
+    }
+
+    pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope });
+        return self.beginReplicatedTransactionProducerInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, .unlabelled);
+    }
+
+    /// Protocol 45. Actual data-Raft entry, origin and BEGIN metadata commit
+    /// together; no completion admission is invented on a non-history root.
+    pub fn beginReplicatedProducerTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8, producer: @import("../source_producer_policy.zig").Producer) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedProducerTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, producer });
+        if (producer != .ordinary and producer != .legacy_cdc) return error.InvalidSourceAdmission;
+        return self.beginReplicatedTransactionProducerInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, producer);
+    }
+
+    fn beginReplicatedTransactionProducerInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8, producer: @import("../source_producer_policy.zig").Producer) !transactions_mod.TxnId {
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (producer != .unlabelled) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .raft, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+        }
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+            .already_applied => {
+                if (producer != .unlabelled) {
+                    var manager = try self.core.initTxnManager();
+                    defer manager.deinit();
+                    const ordinary = manager.isOrdinaryProducer(txn_id) catch |err| return if (err == error.TxnNotFound) error.SourceOutcomeUnresolved else err;
+                    if (ordinary != (producer == .ordinary) or try manager.isLegacyProducer(txn_id) != (producer == .legacy_cdc)) return error.SourceTransactionIdentityConflict;
+                }
+                return txn_id;
+            },
             .apply => {},
         }
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
@@ -26407,7 +26618,7 @@ pub const DB = struct {
             participants,
             coordinator,
             retain_terminal,
-            .{ .writes = &.{marker} },
+            .{ .ordinary_producer = producer == .ordinary, .legacy_producer = producer == .legacy_cdc, .writes = &.{marker} },
         );
     }
 
@@ -26495,6 +26706,946 @@ pub const DB = struct {
             .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
             .index_span_digests = index_spans,
         });
+    }
+
+    pub fn sourceAdmissionReceipt(self: *DB, command: @import("../source_admission.zig").Command) !?@import("../source_admission.zig").Receipt {
+        return switch (try self.sourceAdmissionStatus(command)) {
+            .committed => |receipt| receipt,
+            .absent, .prepared => null,
+        };
+    }
+
+    /// Install immutable source purpose with BEGIN, before any source rows can
+    /// be prepared. A legacy/session transaction with this ID cannot upgrade.
+    pub fn beginSourceTransaction(self: *DB, command: @import("../source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) !types.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginSourceTransaction", .{ self, command, created_at_ns, participants });
+        try command.validate();
+        if (participants.len != 1 or participants[0].len == 0) return error.InvalidSourceAdmission;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            if (self.core.identity_namespace.table_id != command.table_id) return error.SourceTableMismatch;
+            if (try @import("../source_admission.zig").lookupStatus(&read, self.core.identity_namespace.table_id, command) == .committed) return error.SourceAlreadyCommitted;
+            if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, null);
+        }
+        return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(command.transactionId(), command.accepted_at_ns, created_at_ns, participants, true, true, .{ .source_purpose = command.fingerprint() });
+    }
+
+    /// Irrevocably close an unadmitted attempt without advancing its checkpoint.
+    /// The fence survives journal GC. A prepared vote must resolve positively;
+    /// only an empty source BEGIN may be aborted as part of this operation.
+    pub fn retireSourceAttempt(self: *DB, command: @import("../source_admission.zig").Command) ![@import("../source_admission.zig").fence_size]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("retireSourceAttempt", .{ self, command });
+        const admission = @import("../source_admission.zig");
+        try command.validate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        const fence = blk: {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, null);
+            break :blk try admission.planAttemptRetirement(&read, self.core.identity_namespace.table_id, command);
+        };
+        const bytes = fence.encode();
+        const key = admission.fenceKey(command);
+        const writes = [_]docstore_mod.KVPair{.{ .key = &key, .value = &bytes }};
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        const status = manager.getTransactionStatus(command.transactionId()) catch |err| switch (err) {
+            error.TxnNotFound => null,
+            else => return err,
+        };
+        if (status) |known| {
+            if (try manager.getSourcePurpose(command.transactionId())) |purpose| {
+                if (!std.mem.eql(u8, &purpose, &command.fingerprint())) return error.SourceTransactionIdentityConflict;
+                if (known == .committed) return error.SourceOutcomeUnresolved;
+                if (known == .pending) try manager.requireUnpreparedSource(command.transactionId(), purpose);
+                if (try manager.hasIntents(command.transactionId())) return error.SourcePendingWork;
+                const participants = try manager.getParticipants(self.alloc, command.transactionId());
+                defer transactions_mod.freeParticipantList(self.alloc, participants);
+                if (participants.len != 1) return error.SourceAdmissionCorrupt;
+                _ = try manager.resolveIntentsWithExtraBatch(command.transactionId(), .aborted, command.accepted_at_ns + 1, .{ .source_purpose = purpose, .completion_writes = &writes, .resolved_participant = participants[0] });
+                if (!try manager.cleanupRetiredSourceAttempt(command)) return error.SourcePendingWork;
+                return bytes;
+            }
+            // An ordinary transaction-ID collision is not source admission.
+            // Fence the source grant without aborting unrelated session work.
+        }
+        try self.core.store.putBatch(&writes, &.{});
+        return bytes;
+    }
+
+    pub const source_plan_control = @import("../source_plan_control.zig");
+
+    fn requireSourcePlanAvailable(self: *DB) !void {
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+    }
+
+    /// The trusted serving owner independently qualifies the full catalog fence.
+    /// Native storage checks the physical namespace/generation and durable mode
+    /// from the same transaction that observes or changes the artifact.
+    fn requireSourcePlanPhysicalRoot(self: *DB, root: source_plan_control.storage.Root) !void {
+        try root.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &root.namespace) or root.generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+    }
+
+    fn requireSourcePlanRoot(self: *DB, txn: anytype, root: source_plan_control.storage.Root) !@import("../source_authority.zig").State {
+        try self.requireSourcePlanPhysicalRoot(root);
+        const namespace = root.namespace;
+        const persisted = (try doc_identity.loadNamespaceTxn(txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        return @import("../source_authority.zig").require(txn, if (root.authority == .native) .native else .raft, namespace);
+    }
+
+    fn applySourcePlanControlInTxn(self: *DB, txn: anytype, request: source_plan_control.Request, position: [32]u8) !source_plan_control.storage.Status {
+        try request.validate();
+        if (request.action == .begin and !(try source_plan_control.storage.inspect(self.alloc, txn, request.root, request.spec)).present)
+            try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+        return source_plan_control.apply(self.alloc, txn, request, position);
+    }
+
+    pub fn nativeSourcePlanControl(self: *DB, request: source_plan_control.Request) !source_plan_control.storage.Status {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeSourcePlanControl", .{ self, request });
+        try request.validate();
+        if (request.root.authority != .native) return error.HistoryAuthorityRequired;
+        try self.requireSourcePlanAvailable();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, request.root);
+        const sequence = try @import("../source_authority.zig").advance(&txn, request.root.namespace, null);
+        var position: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, position[0..8], sequence, .little);
+        position[31] = 2;
+        const result = try self.applySourcePlanControlInTxn(&txn, request, position);
+        try txn.commit();
+        return result;
+    }
+
+    /// Every deterministic rejection commits with the actual Raft apply marker.
+    /// Failed reducers are aborted before the rejection is written separately.
+    pub fn applyOrderedSourcePlanControl(self: *DB, request: source_plan_control.Request, entry: OrderedApplyReceipt, bypass_write_gate: bool) !source_plan_control.Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedSourcePlanControl", .{ self, request, entry, bypass_write_gate });
+        if (request.root.authority != .raft) return error.HistoryAuthorityRequired;
+        try self.requireSourcePlanAvailable();
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+            .already_applied => {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                _ = try self.requireSourcePlanRoot(&read, request.root);
+                return source_plan_control.replay(self.alloc, &read, request, .{ .term = entry.term, .index = entry.index });
+            },
+            .apply => {},
+        }
+        var rejection: ?source_plan_control.Rejection = null;
+        while (true) {
+            var txn = try self.core.store.beginWriteTxn();
+            var txn_open = true;
+            defer if (txn_open) txn.abort();
+            try self.requireSourcePlanPhysicalRoot(request.root);
+            if (try doc_identity.loadNamespaceTxn(&txn)) |persisted| {
+                if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+            } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+            try @import("../source_authority.zig").bind(&txn, .raft, request.root.namespace);
+            _ = try self.requireSourcePlanRoot(&txn, request.root);
+            var position: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, position[0..8], entry.term, .little);
+            std.mem.writeInt(u64, position[8..16], entry.index, .little);
+            position[31] = 1;
+            const outcome: source_plan_control.Outcome = if (rejection) |reason| .{ .rejected = reason } else .{
+                .applied = self.applySourcePlanControlInTxn(&txn, request, position) catch |err| {
+                    rejection = source_plan_control.Rejection.fromError(err) orelse return err;
+                    continue;
+                },
+            };
+            try source_plan_control.stageOutcome(self.alloc, &txn, request, .{ .term = entry.term, .index = entry.index }, outcome);
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            txn_open = false;
+            return outcome;
+        }
+    }
+
+    fn sourcePlanObservationInTxn(self: *DB, txn: anytype, query: source_plan_control.Query) !source_plan_control.Observation {
+        try query.validate();
+        const authority = try self.requireSourcePlanRoot(txn, query.root);
+        var position: [32]u8 = @splat(0);
+        if (query.root.authority == .raft) {
+            const cut = try orderedHistoryReadCut(txn, query.minimum_applied_index);
+            std.mem.writeInt(u64, position[0..8], cut.term, .little);
+            std.mem.writeInt(u64, position[8..16], cut.index, .little);
+            position[31] = 1;
+        } else {
+            if (authority.sequence < query.minimum_native_sequence) return error.StorageReadTemporarilyUnavailable;
+            std.mem.writeInt(u64, position[0..8], authority.sequence, .little);
+            position[31] = 2;
+        }
+        return .{ .root = query.root, .cut = position, .quota = try source_plan_control.storage.readQuota(txn, query.root), .status = if (query.spec) |spec| try source_plan_control.storage.inspect(self.alloc, txn, query.root, spec) else null };
+    }
+
+    /// Trusted data-Raft control only. The serving owner obtains fresh metadata
+    /// authorization and the all-member decoder barrier before proposing. This
+    /// layer owns physical identity, exact replay and atomic rejection markers.
+    pub fn applyOrderedSourceScopeControl(self: *DB, command: @import("../source_scope_control.zig").Command, entry: OrderedApplyReceipt, bypass_write_gate: bool) !@import("../source_scope_ordered.zig").Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedSourceScopeControl", .{ self, command, entry, bypass_write_gate });
+        const control = @import("../source_scope_control.zig");
+        const ordered = @import("../source_scope_ordered.zig");
+        try command.validate();
+        try self.requireSourcePlanAvailable();
+        const owner = command.intent.owner;
+        const root: source_plan_control.storage.Root = .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() };
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        try self.requireSourcePlanPhysicalRoot(root);
+        const cut: control.scope.Cut = .{ .term = entry.term, .index = entry.index };
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+            .already_applied => {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                _ = try self.requireSourcePlanRoot(&read, root);
+                return ordered.replay(self.alloc, &read, command, cut);
+            },
+            .apply => {},
+        }
+        // Version one retains its historical rejection on first bind. The
+        // new command checks the durable closure and transaction records in
+        // this exact writer, independently of the metadata authorization.
+        const Handover = struct {
+            alloc: Allocator,
+            command_version: u8,
+
+            pub fn requireLegacyDrained(gate: @This(), writer: anytype, basis: control.scope.Basis) !void {
+                if (gate.command_version != 2) return error.SourcePendingWork;
+                try transactions_mod.TxnManager.requireLegacyDrainedInWriter(gate.alloc, writer, basis);
+            }
+        };
+        var rejection: ?ordered.Rejection = null;
+        while (true) {
+            var txn = try self.core.store.beginWriteTxn();
+            var txn_open = true;
+            defer if (txn_open) txn.abort();
+            if (try doc_identity.loadNamespaceTxn(&txn)) |persisted| {
+                if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+            } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+            try @import("../source_authority.zig").bind(&txn, .raft, root.namespace);
+            _ = try self.requireSourcePlanRoot(&txn, root);
+            const outcome: ordered.Outcome = if (rejection) |reason| .{ .rejected = reason } else .{
+                .applied = control.apply(self.alloc, &txn, Handover{ .alloc = self.alloc, .command_version = command.version }, command, cut) catch |err| {
+                    rejection = ordered.Rejection.fromError(err) orelse return err;
+                    continue;
+                },
+            };
+            try ordered.stage(self.alloc, &txn, command, cut, outcome);
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            txn_open = false;
+            return outcome;
+        }
+    }
+
+    /// Private ordered ingress closure. This proves only cumulative producer
+    /// admission closure, never old transaction drainage or source activation.
+    pub fn applyOrderedSourceProducerClosure(self: *DB, owner: @import("../transaction_completion.zig").RoutedOwner, entry: OrderedApplyReceipt, bypass_write_gate: bool) !@import("../source_producer_policy.zig").Closure {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedSourceProducerClosure", .{ self, owner, entry, bypass_write_gate });
+        const policy = @import("../source_producer_policy.zig");
+        const basis = try @import("../source_scope.zig").Basis.fromOwner(owner);
+        const root: source_plan_control.storage.Root = .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() };
+        try self.requireSourcePlanAvailable();
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        try self.requireSourcePlanPhysicalRoot(root);
+        const disposition = try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry);
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, root);
+        if (disposition == .already_applied) {
+            const closed = (try policy.Store.read(self.alloc, &txn, basis)) orelse return error.SourceOutcomeUnresolved;
+            if (closed.first_closed_at.index > entry.index or closed.first_closed_at.term > entry.term) return error.SourceOutcomeUnresolved;
+            if (closed.first_closed_at.index == entry.index and closed.first_closed_at.term != entry.term) return error.ConflictingOrderedApplyReceipt;
+            txn.abort();
+            return closed;
+        }
+        const closed = try policy.Store.close(self.alloc, &txn, basis, .{ .term = entry.term, .index = entry.index });
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+        return closed;
+    }
+
+    /// Ordered local retirement authorized by the original positive coordinator
+    /// ABORT. Success/fencing, outcome and apply marker share one native commit.
+    pub fn applyOrderedSourceRetirement(self: *DB, command: @import("../source_scope_retirement.zig").Command, entry: OrderedApplyReceipt, bypass_write_gate: bool) !@import("../source_scope_retirement_ordered.zig").Recovery {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedSourceRetirement", .{ self, command, entry, bypass_write_gate });
+        const ordered = @import("../source_scope_retirement_ordered.zig");
+        _ = try command.proof();
+        try self.requireSourcePlanAvailable();
+        const owner = command.intent.owner;
+        const root: source_plan_control.storage.Root = .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() };
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        try self.requireSourcePlanPhysicalRoot(root);
+        const cut: @import("../source_scope.zig").Cut = .{ .term = entry.term, .index = entry.index };
+        const disposition = try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry);
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try self.requireSourcePlanRoot(&read, root);
+            switch (disposition) {
+                .already_applied => return ordered.replay(self.alloc, &read, command, cut),
+                .apply => {},
+            }
+        }
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+        defer manager.deinit();
+        const reply = manager.retireScopedSourceAttempt(command, cut, &.{marker}) catch |err| {
+            const reason = ordered.Rejection.fromError(err) orelse return err;
+            // The failed transaction manager operation aborts staged mutations.
+            // Persist only a narrow deterministic rejection and its real marker.
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try self.requireSourcePlanRoot(&txn, root);
+            try ordered.stageRejected(self.alloc, &txn, command, cut, reason);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            return .{ .rejected = reason };
+        };
+        return .{ .applied = reply };
+    }
+
+    pub fn orderedSourceRetirementOutcome(self: *DB, recovery: @import("../source_scope_retirement_ordered.zig").Query) !@import("../source_scope_retirement_ordered.zig").Recovery {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedSourceRetirementOutcome", .{ self, recovery });
+        try recovery.validate();
+        try self.requireSourcePlanAvailable();
+        const owner = recovery.command.intent.owner;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, recovery.minimum_applied_index);
+        if (cut.index == recovery.entry.index and cut.term != recovery.entry.term) return error.ConflictingOrderedApplyReceipt;
+        return @import("../source_scope_retirement_ordered.zig").replay(self.alloc, &txn, recovery.command, recovery.entry);
+    }
+
+    pub fn orderedSourceScopeOutcome(self: *DB, recovery: @import("../source_scope_ordered.zig").Recovery) !@import("../source_scope_ordered.zig").Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedSourceScopeOutcome", .{ self, recovery });
+        try recovery.validate();
+        try self.requireSourcePlanAvailable();
+        const owner = recovery.command.intent.owner;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, recovery.minimum_applied_index);
+        if (cut.index == recovery.entry.index and cut.term != recovery.entry.term) return error.ConflictingOrderedApplyReceipt;
+        return @import("../source_scope_ordered.zig").replay(self.alloc, &txn, recovery.command, recovery.entry);
+    }
+
+    /// The serving owner establishes and revalidates ReadIndex and the complete
+    /// catalog owner. Native identity, real apply cut and registry share a read.
+    /// The serving owner independently qualifies ReadIndex/catalog ownership.
+    /// Native root, apply cut and closure state share this read-only snapshot.
+    pub fn sourceProducerClosureObservation(self: *DB, query: @import("../source_producer_policy.zig").Query) !@import("../source_producer_policy.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceProducerClosureObservation", .{ self, query });
+        try query.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = query.owner.namespace, .generation = query.owner.root_generation, .fence = query.owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        return @import("../source_producer_policy.zig").observe(self.alloc, &txn, query, .{ .term = cut.term, .index = cut.index });
+    }
+
+    pub fn sourceScopeObservation(self: *DB, query: @import("../source_scope_control.zig").Query) !@import("../source_scope_control.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceScopeObservation", .{ self, query });
+        try query.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = query.owner.namespace, .generation = query.owner.root_generation, .fence = query.owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        return @import("../source_scope_control.zig").observe(self.alloc, &txn, query, .{ .term = cut.term, .index = cut.index });
+    }
+
+    /// Serving Raft owners establish ReadIndex before this snapshot is opened.
+    /// A native root may return sequence zero before its first staging write.
+    /// The serving owner establishes and revalidates ReadIndex and the full
+    /// catalog owner. Native identity, mode, cut and receipts share one snapshot.
+    pub fn sourceCheckpointObservation(self: *DB, request: @import("../source_checkpoint_read.zig").Request) !@import("../source_checkpoint_read.zig").Reply {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceCheckpointObservation", .{ self, request });
+        try request.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = request.source_owner.namespace, .generation = request.source_owner.root_generation, .fence = request.source_owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, request.minimum_applied_index);
+        return @import("../source_checkpoint_read.zig").read(&txn, request, .{ .term = cut.term, .index = cut.index });
+    }
+
+    pub fn sourcePlanObservation(self: *DB, query: source_plan_control.Query) !source_plan_control.Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourcePlanObservation", .{ self, query });
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return self.sourcePlanObservationInTxn(&txn, query);
+    }
+
+    pub fn sourcePlanChunk(self: *DB, allocator: Allocator, request: source_plan_control.ReadRequest) !source_plan_control.Read {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourcePlanChunk", .{ self, allocator, request });
+        try request.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const observation = try self.sourcePlanObservationInTxn(&txn, request.query);
+        return .{ .observation = observation, .bytes = try source_plan_control.storage.readSealedChunkAlloc(allocator, &txn, request.query.root, request.query.spec.?, request.seal, request.ordinal) };
+    }
+
+    pub fn orderedSourcePlanOutcome(self: *DB, recovery: source_plan_control.Recovery) !source_plan_control.Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedSourcePlanOutcome", .{ self, recovery });
+        try self.requireSourcePlanAvailable();
+        if (recovery.request.root.authority != .raft or recovery.entry.term == 0 or recovery.entry.index == 0 or recovery.minimum_applied_index < recovery.entry.index) return error.InvalidSourceAdmission;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, recovery.request.root);
+        const cut = try orderedHistoryReadCut(&txn, recovery.minimum_applied_index);
+        if (cut.index == recovery.entry.index and cut.term != recovery.entry.term) return error.ConflictingOrderedApplyReceipt;
+        return source_plan_control.replay(self.alloc, &txn, recovery.request, recovery.entry);
+    }
+
+    pub const HistoryConsumerGrant = @import("../history_consumer.zig").Grant;
+    pub const HistoryConsumerReference = @import("../history_consumer.zig").Reference;
+    pub const ordered_history = @import("../history_ordered.zig");
+    pub const OrderedHistoryOutcome = ordered_history.Outcome;
+
+    /// Trusted data-Raft apply only. Consumer effects, deterministic rejection
+    /// results and the ordinary ordered-entry marker commit atomically. Public
+    /// request admission and the all-member decoder barrier belong to the owner.
+    pub fn applyOrderedHistoryConsumerControl(self: *DB, command: @import("../history_consumer.zig").Command, entry: OrderedApplyReceipt, bypass_write_gate: bool) !OrderedHistoryOutcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedHistoryConsumerControl", .{ self, command, entry, bypass_write_gate });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        // Mirrored native/standby retention requires an explicit durable
+        // envelope. This ordered primitive cannot drop that mirror silently.
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        const ordered = @import("../history_ordered.zig");
+        const fingerprint = try ordered.fingerprint(self.alloc, command);
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (self.core.identity_namespace.table_id == 0) return error.HistoryAuthorityRequired;
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+            .already_applied => {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                _ = try @import("../source_authority.zig").require(&read, .raft, namespace);
+                return ordered.replay(&read, namespace, .{ .term = entry.term, .index = entry.index }, fingerprint);
+            },
+            .apply => {},
+        }
+        var rejection: ?ordered.Rejection = if (!std.mem.eql(u8, &namespace, &command.namespace())) .resynchronization else null;
+        while (true) {
+            var txn = try self.core.store.beginWriteTxn();
+            var txn_open = true;
+            defer if (txn_open) txn.abort();
+            if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &txn, null);
+            if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
+                if (!stored.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+            } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+            try @import("../source_authority.zig").bind(&txn, .raft, namespace);
+            const outcome: OrderedHistoryOutcome = if (rejection) |reason| .{ .rejected = reason } else .{
+                .applied = @import("../history_consumer.zig").apply(self.alloc, &txn, command) catch |err| {
+                    rejection = ordered.Rejection.fromError(err) orelse return err;
+                    // A reducer may have staged writes before rejecting. Abort
+                    // everything before recording that terminal outcome separately.
+                    continue;
+                },
+            };
+            const record: ordered.Record = .{ .namespace = namespace, .entry = .{ .term = entry.term, .index = entry.index }, .command = fingerprint, .outcome = outcome };
+            try txn.put(ordered.key, &(try record.encode()));
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            txn_open = false;
+            return outcome;
+        }
+    }
+
+    /// Private ordered publication of a certificate assembled from qualified
+    /// participant reads. Authorization and all-member protocol admission belong
+    /// to the serving Raft leader; native ownership and accounting remain here.
+    pub fn publishReplicatedCompletionCertificate(self: *DB, raw: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, entry: OrderedApplyReceipt) !@import("../committed_history.zig").CompletionPublication {
+        if (comptime storage_engine.enabled) return storage_engine.call("publishReplicatedCompletionCertificate", .{ self, raw, owner, entry });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        const disposition = try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry);
+        var txn = try self.core.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        const result = try @import("../committed_history.zig").publishCompletion(self.alloc, &txn, namespace, self.core.root_generation, owner, raw, .{ .term = entry.term, .index = entry.index }, disposition == .apply);
+        if (disposition == .already_applied) {
+            txn.abort();
+            txn_open = false;
+            return result;
+        }
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+        txn_open = false;
+        return result;
+    }
+
+    /// Qualify completion admission from one read snapshot. The caller must
+    /// establish and revalidate the original catalog/leader authority. This
+    /// neither initializes history nor reserves any promised completion bytes.
+    pub fn historyAdmission(self: *DB, query: @import("../history_admission_wire.zig").Query) !@import("../history_admission_wire.zig").Reply {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyAdmission", .{ self, query });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        try query.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &query.owner.namespace) or query.owner.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const state = (try @import("../committed_history.zig").load(&txn)) orelse return error.ChangefeedCapabilityUnsupported;
+        if (!std.mem.eql(u8, &namespace, &state.namespace)) return error.HistoryResynchronizationRequired;
+        const persisted = (try doc_identity.loadNamespaceTxn(&txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        return @import("../history_admission_wire.zig").Reply.init(query, .{ .term = cut.term, .index = cut.index }, state.limit);
+    }
+
+    /// Owned bounded JSON. Decision record, original admission and actual cut
+    /// come from one native snapshot opened after the caller's quorum barrier.
+    pub fn historyCompletionDecision(self: *DB, allocator: std.mem.Allocator, query: @import("../history_decision_wire.zig").Query) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyCompletionDecision", .{ self, allocator, query });
+        const wire = @import("../history_decision_wire.zig");
+        const completion = wire.completion;
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        try query.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &query.owner.namespace) or query.owner.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const state = (try @import("../committed_history.zig").load(&txn)) orelse return error.ChangefeedCapabilityUnsupported;
+        if (!std.mem.eql(u8, &namespace, &state.namespace)) return error.HistoryResynchronizationRequired;
+        const persisted = (try doc_identity.loadNamespaceTxn(&txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        var reply: wire.Reply = .{ .request_digest = query.digest(), .cut = .{ .term = cut.term, .index = cut.index }, .decision = null };
+        const admission_key = completion.admission_prefix.* ++ query.transaction_id;
+        const admission_raw = txn.get(&admission_key) catch |err| switch (err) {
+            error.NotFound => return wire.encodeReply(allocator, query, reply),
+            else => return err,
+        };
+        var admission = try completion.parseAdmission(allocator, admission_raw);
+        defer admission.deinit();
+        const record_key = completion.record_prefix.* ++ query.transaction_id;
+        const record_raw = txn.get(&record_key) catch |err| return if (err == error.NotFound) error.HistoryCorrupt else err;
+        var record = try transactions_mod.completionCoordinatorRecord(record_raw);
+        if (record.status != .pending) record.acknowledgments_pending = try transactions_mod.completionAcknowledgmentsPending(&txn, admission.value.admission, record.retain_terminal);
+        reply.decision = .{ .record = record, .admission = admission.value };
+        return wire.encodeReply(allocator, query, reply);
+    }
+
+    /// ReadIndex must already be established by the serving owner. Publication,
+    /// ledger, local receipt and actual cut are verified in one read snapshot.
+    pub fn historyCompletionPublication(self: *DB, allocator: std.mem.Allocator, query: @import("../committed_history.zig").CompletionPublicationQuery) !@import("../committed_history.zig").CompletionPublicationObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyCompletionPublication", .{ self, allocator, query });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        try query.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const identity = (try doc_identity.loadNamespaceTxn(&txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!identity.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        return @import("../committed_history.zig").readCompletionPublication(allocator, &txn, namespace, self.core.root_generation, query);
+    }
+
+    /// Authenticated native owner provisioning for a resident managed writer.
+    /// The serving owner must already have resolved this exact namespace from
+    /// its linearizable catalog. This cannot convert a Raft-owned artifact.
+    pub fn provisionNativeHistoryAuthority(self: *DB, expected_namespace: [24]u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("provisionNativeHistoryAuthority", .{ self, expected_namespace });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (self.core.identity_namespace.table_id == 0 or !std.mem.eql(u8, &namespace, &expected_namespace)) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &txn, null);
+        const stored_identity = try doc_identity.loadNamespaceTxn(&txn);
+        if (stored_identity) |stored| {
+            if (!stored.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        }
+        const authority = @import("../source_authority.zig");
+        const existing_authority = try authority.load(&txn);
+        if (existing_authority != null) _ = try authority.require(&txn, .native, namespace);
+        if (stored_identity != null and existing_authority != null) {
+            txn.abort();
+            return;
+        }
+        if (stored_identity == null) try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+        if (existing_authority == null) try authority.bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+
+    /// Private single-root consumer control. Raft-owned roots must use their
+    /// ordered apply path; a local DB handle cannot mutate their retention pins.
+    pub fn nativeHistoryConsumerControl(self: *DB, command: @import("../history_consumer.zig").Command) !@import("../history_consumer.zig").Result {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeHistoryConsumerControl", .{ self, command });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &command.namespace())) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, .native, namespace);
+        if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &txn, null);
+        // Native DBs initialize the persisted identity lazily on their first
+        // primary write. Empty-table enrollment must publish that same trusted
+        // identity atomically, rather than requiring a synthetic document.
+        if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
+            if (!stored.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+        const result = try @import("../history_consumer.zig").apply(self.alloc, &txn, command);
+        try txn.commit();
+        return result;
+    }
+
+    pub const HistoryPageRequest = @import("../history_page.zig").Request;
+    pub const HistoryPage = @import("../history_page.zig").Page;
+    /// Private committed-history read with an authenticated persisted lease.
+    /// Returned bytes belong to the page and survive read-transaction teardown.
+    pub fn nativeHistoryPage(self: *DB, allocator: std.mem.Allocator, request: HistoryPageRequest) !HistoryPage {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeHistoryPage", .{ self, allocator, request });
+        return self.historyPageForAuthority(allocator, request, .native, 0);
+    }
+
+    /// Trusted Raft owner read. The caller first establishes a leader ReadIndex
+    /// barrier; this method verifies that cut against the same storage snapshot
+    /// used for the lease and frame, never a separate watermark observation.
+    pub fn orderedHistoryPage(self: *DB, allocator: std.mem.Allocator, request: HistoryPageRequest, minimum_applied_index: u64) !HistoryPage {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedHistoryPage", .{ self, allocator, request, minimum_applied_index });
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        return self.historyPageForAuthority(allocator, request, .raft, minimum_applied_index);
+    }
+
+    const SplitHistoryCut = @import("../committed_history.zig").SplitCut;
+
+    /// Observe the split cut using the predecessor's frozen Raft ReadIndex.
+    /// A missing cut at that barrier is distinct from an invalid proof.
+    pub fn orderedSplitHistoryCut(self: *DB, request: SplitHistoryCut.Request, minimum_applied_index: u64) !?SplitHistoryCut {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedSplitHistoryCut", .{ self, request, minimum_applied_index });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (minimum_applied_index == 0 or !request.validSelector())
+            return error.InvalidHistoryAdmission;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.namespace) or request.root_generation != self.core.root_generation)
+            return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const applied = try orderedHistoryReadCut(&txn, minimum_applied_index);
+        const observed = if (request.bySuccessor())
+            try SplitHistoryCut.loadSuccessor(&txn, request.successor_group, request.boundary)
+        else
+            try SplitHistoryCut.load(&txn, request.transition, request.attempt);
+        const cut = observed orelse return null;
+        if (!request.matches(cut)) return error.HistoryResynchronizationRequired;
+        if (cut.index > applied.index or cut.term > applied.term) return error.HistoryCorrupt;
+        return cut;
+    }
+
+    const MergeHistoryCut = @import("../committed_history.zig").MergeCut;
+
+    /// Observe the merge cut using the donor's frozen Raft ReadIndex.
+    /// A missing cut at that barrier is distinct from an invalid proof.
+    pub fn orderedMergeHistoryCut(self: *DB, request: MergeHistoryCut.Request, minimum_applied_index: u64) !?MergeHistoryCut {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedMergeHistoryCut", .{ self, request, minimum_applied_index });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (minimum_applied_index == 0 or request.transition == 0 or request.receiver_group == 0)
+            return error.InvalidHistoryAdmission;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.namespace) or request.root_generation != self.core.root_generation)
+            return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const applied = try orderedHistoryReadCut(&txn, minimum_applied_index);
+        var cut = (try MergeHistoryCut.load(&txn, request.transition)) orelse return null;
+        const state = (try @import("../committed_history.zig").load(&txn)) orelse return error.HistoryCorrupt;
+        if (!std.mem.eql(u8, &state.namespace, &namespace) or state.latest != cut.latest)
+            return error.HistoryCorrupt;
+        var active: u8 = 0;
+        for (state.consumers) |consumer| {
+            if (consumer.epoch != 0) active += 1;
+        }
+        cut.floor = state.floor();
+        cut.active_consumers = active;
+        cut.outstanding_reservations = state.reserved_bytes;
+        if (!request.matches(cut)) return error.HistoryResynchronizationRequired;
+        if (cut.index > applied.index or cut.term > applied.term) return error.HistoryCorrupt;
+        return cut;
+    }
+
+    /// The Raft owner supplies a frozen ReadIndex. Standalone readers use the
+    /// same namespace and physical generation checks without a Raft barrier.
+    pub fn artifactPublicationHistory(self: *DB, allocator: Allocator, request: @import("artifact_publication.zig").HistoryRead, minimum_applied_index: ?u64) !@import("artifact_publication.zig").HistoryObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("artifactPublicationHistory", .{ self, allocator, request, minimum_applied_index });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.namespace) or request.root_generation != self.core.root_generation)
+            return error.HistoryResynchronizationRequired;
+        if (try doc_identity.loadNamespaceTxn(&txn)) |persisted| {
+            if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        }
+        _ = try @import("../source_authority.zig").require(&txn, if (minimum_applied_index == null) .native else .raft, namespace);
+        const applied_index = if (minimum_applied_index) |index| (try orderedHistoryReadCut(&txn, index)).index else null;
+        const publication = @import("artifact_publication.zig");
+        const latest = try publication.historyHead(&txn);
+        const event = if (request.after) |after| try publication.historyAfter(allocator, &txn, after) else null;
+        const observed: publication.HistoryObservation = .{ .namespace = namespace, .root_generation = self.core.root_generation, .latest = latest, .applied_index = applied_index, .event = event };
+        try request.validateObservation(observed, minimum_applied_index);
+        return observed;
+    }
+
+    fn historyPageForAuthority(self: *DB, allocator: std.mem.Allocator, request: HistoryPageRequest, kind: @import("../source_authority.zig").Kind, minimum_applied_index: u64) !HistoryPage {
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, kind, namespace);
+        if (kind == .raft) _ = try orderedHistoryReadCut(&txn, minimum_applied_index);
+        return @import("../history_page.zig").readWithCompletion(allocator, &txn, request, if (kind == .raft) self.core.root_generation else null);
+    }
+
+    /// With a positive ReadIndex, verify the Raft cut inside the same read
+    /// transaction as the pin. A null cut is reserved for standalone roots.
+    pub fn historyBootstrapPage(self: *DB, allocator: std.mem.Allocator, request: @import("../history_page.zig").BootstrapRequest, minimum_applied_index: ?u64) !@import("../history_page.zig").BootstrapPage {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyBootstrapPage", .{ self, allocator, request, minimum_applied_index });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, if (minimum_applied_index == null) .native else .raft, namespace);
+        if (minimum_applied_index) |index| _ = try orderedHistoryReadCut(&txn, index);
+        return @import("../history_page.zig").readBootstrap(allocator, &txn, request);
+    }
+
+    pub fn nativeHistoryGrant(self: *DB, requested: @import("../history_consumer.zig").GrantIdentity) !@import("../history_consumer.zig").GrantObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeHistoryGrant", .{ self, requested });
+        return self.historyGrantForAuthority(requested, .native, 0);
+    }
+
+    /// The owner must establish ReadIndex first. The persisted cut, authority
+    /// and lease observation are checked in the same read transaction.
+    pub fn orderedHistoryGrant(self: *DB, requested: @import("../history_consumer.zig").GrantIdentity, minimum_applied_index: u64) !@import("../history_consumer.zig").GrantObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedHistoryGrant", .{ self, requested, minimum_applied_index });
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        return self.historyGrantForAuthority(requested, .raft, minimum_applied_index);
+    }
+
+    fn historyGrantForAuthority(self: *DB, requested: @import("../history_consumer.zig").GrantIdentity, kind: @import("../source_authority.zig").Kind, minimum_applied_index: u64) !@import("../history_consumer.zig").GrantObservation {
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        try requested.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &requested.namespace)) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, kind, namespace);
+        if (kind == .raft) _ = try orderedHistoryReadCut(&txn, minimum_applied_index);
+        return @import("../history_consumer.zig").observeGrant(&txn, requested);
+    }
+
+    /// Read-only immutable participant receipt. Raft callers establish a
+    /// leader ReadIndex first; identity, authority, cut and receipt are read
+    /// from one snapshot. No primary coordinator record is needed after GC.
+    pub fn historyResolution(self: *DB, allocator: std.mem.Allocator, request: @import("../history_resolution_wire.zig").Request) !@import("../history_resolution_wire.zig").Reply {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyResolution", .{ self, allocator, request });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        try request.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.namespace)) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const identity = (try doc_identity.loadNamespaceTxn(&txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!identity.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        const kind: @import("../source_authority.zig").Kind = switch (request.authority) {
+            .native => .native,
+            .raft => .raft,
+        };
+        const owner = try @import("../source_authority.zig").require(&txn, kind, namespace);
+        var cut: @import("../history_resolution_wire.zig").Cut = .{};
+        if (kind == .raft) {
+            const applied = try orderedHistoryReadCut(&txn, request.minimum_applied_index);
+            cut = .{ .term = applied.term, .index = applied.index };
+        } else {
+            if (owner.sequence < request.minimum_native_sequence) return error.StorageReadTemporarilyUnavailable;
+            cut.native_sequence = owner.sequence;
+        }
+        return @import("../history_resolution_wire.zig").read(allocator, &txn, request, cut);
+    }
+
+    fn orderedHistoryReadCut(txn: anytype, minimum_applied_index: u64) !OrderedApplyReceipt {
+        const marker = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| switch (err) {
+            error.NotFound => return error.StorageReadTemporarilyUnavailable,
+            else => return err,
+        };
+        if (marker.len != ordered_apply_receipt_value_len) return error.CorruptOrderedApplyReceipt;
+        const cut: OrderedApplyReceipt = .{ .term = std.mem.readInt(u64, marker[0..8], .little), .index = std.mem.readInt(u64, marker[8..16], .little) };
+        if (cut.term == 0 or cut.index == 0) return error.CorruptOrderedApplyReceipt;
+        if (cut.index < minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+        return cut;
+    }
+
+    /// Recover a typed receipt without reapplying a command or advancing a
+    /// marker. Missing/superseded outcomes never certify successful admission.
+    pub fn orderedHistoryOutcome(self: *DB, allocator: std.mem.Allocator, recovery: ordered_history.Lookup) !OrderedHistoryOutcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedHistoryOutcome", .{ self, allocator, recovery });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (recovery.entry.term == 0 or recovery.entry.index == 0) return error.InvalidOrderedApplyReceipt;
+        if (recovery.minimum_applied_index < recovery.entry.index) return error.InvalidHistoryAdmission;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &recovery.command.namespace())) return error.HistoryResynchronizationRequired;
+        const fingerprint = try ordered_history.fingerprint(allocator, recovery.command);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const cut = try orderedHistoryReadCut(&txn, recovery.minimum_applied_index);
+        if (cut.index == recovery.entry.index and cut.term != recovery.entry.term) return error.ConflictingOrderedApplyReceipt;
+        return ordered_history.replay(&txn, namespace, recovery.entry, fingerprint);
+    }
+
+    /// Capability probe for the single-root native destination adapter. Raft
+    /// roots must use their ordered owner; a local handle cannot bypass it.
+    pub fn nativeSourceAdmissionNamespace(self: *DB) ![24]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeSourceAdmissionNamespace", .{self});
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.core.identity_namespace.table_id == 0) return error.OnlineSourceScopeChanged;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        _ = try @import("../source_authority.zig").require(&read, .native, namespace);
+        return namespace;
+    }
+
+    pub fn sourceAdmissionStatus(self: *DB, command: @import("../source_admission.zig").Command) !@import("../source_admission.zig").Status {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceAdmissionStatus", .{ self, command });
+        if (self.isClosed()) return error.StorageUnavailable;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return try @import("../source_admission.zig").lookupStatus(&read, self.core.identity_namespace.table_id, command);
     }
 
     fn transactionPreparationRequest(req: types.TransactionIntentRequest) types.BatchRequest {
@@ -26642,6 +27793,67 @@ pub const DB = struct {
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !backend_erased_mod.Ticket {
         var req = incoming_req;
+        const source_purpose = try req.sourcePurpose();
+        if (req.completion_source_purpose != null and ordered_receipt == null) return error.ChangefeedCapabilityUnsupported;
+        {
+            // Serialize this observation with decisions and prepared writes.
+            // An actual already-applied Raft entry is immutable and must stay
+            // replayable even after its transaction has committed or retired.
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (ordered_receipt) |identity| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+                .already_applied => return backend_erased_mod.Ticket.alreadyDurable(),
+                .apply => {},
+            };
+            if (req.completion_owner) |owner| {
+                try owner.validate();
+                if (ordered_receipt == null) return error.ChangefeedCapabilityUnsupported;
+                const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+                if (!std.mem.eql(u8, &owner.namespace, &namespace) or owner.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+            }
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            if (try manager.completionPrepareProducerStatus(txn_id, req.completion_input_digest, source_purpose, req.completion_owner, req.completion_source_scope, req.completion_ordinary_producer, req.completion_legacy_producer)) |prepared| {
+                if (ordered_receipt == null) {
+                    var read = try self.core.store.beginReadTxn();
+                    defer read.abort();
+                    _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+                }
+                if (prepared) {
+                    // Keep first materialized images; only this actual entry's
+                    // applied marker advances on a fresh ordered retry.
+                    if (ordered_receipt) |identity| {
+                        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+                        const marker = orderedApplyReceiptWrite(identity, &value_buf);
+                        try self.core.store.putBatch(&.{marker}, &.{});
+                    }
+                    return backend_erased_mod.Ticket.alreadyDurable();
+                }
+            }
+        }
+        const source_admission_mod = @import("../source_admission.zig");
+        if (req.source_admission) |command| {
+            try command.validate();
+            if (!std.mem.eql(u8, &command.participant_digest, &source_admission_mod.operationsDigest(req))) return error.SourcePayloadConflict;
+            if (!std.mem.eql(u8, &txn_id, &command.transactionId())) return error.SourceTransactionIdentityConflict;
+            // A durable source vote owns its prepared images. An exact retry
+            // must not re-expand transforms, defaults or identity allocation.
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            try manager.requireSourcePurpose(txn_id, command.fingerprint());
+            switch (try source_admission_mod.lookupStatus(&read, self.core.identity_namespace.table_id, command)) {
+                .committed => return error.SourceAlreadyCommitted,
+                .prepared => return backend_erased_mod.Ticket.alreadyDurable(),
+                .absent => {},
+            }
+        }
+        var source_arena = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer source_arena.deinit();
         var packet = if (req.prepared_enrichments_json) |json|
             try std.json.parseFromSlice(execution_resources.PreparedEnrichments, preparation_alloc, json, .{ .allocate = .alloc_always })
         else
@@ -26693,7 +27905,7 @@ pub const DB = struct {
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
                 req.relational_activation != null or req.relational_retirement != null or
-                req.relational_repair or req.restore_staging_scope != null)) return error.InvalidBatchRequest;
+                req.relational_repair or req.restore_staging_scope != null or req.source_admission != null)) return error.InvalidBatchRequest;
         const schema_namespace = self.core.schemaNamespaceGeneration();
         // Parse and expand transforms from one optimistic read snapshot before
         // entering the serialized commit section. The commit fence below
@@ -26905,6 +28117,25 @@ pub const DB = struct {
             try self.validatePreparedEnrichments(preparation_alloc, value.value, plan.plan());
         }
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
+        if (req.source_admission) |command| {
+            var source_read = try self.core.store.beginProbeTxn();
+            defer source_read.abort();
+            // This command owns one root-local source head. An ordered Raft
+            // participant needs the distinct distributed source protocol.
+            _ = try @import("../source_authority.zig").require(&source_read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            const source_plan = try source_admission_mod.prepare(source_arena.allocator(), &source_read, self.core.identity_namespace.table_id, txn_id, command);
+            for (source_plan.writes) |write| try intents.append(preparation_alloc, .{ .key = write.key, .value = write.value });
+            for (source_plan.deletes) |key| try intents.append(preparation_alloc, .{ .key = key, .value = null });
+            try predicates.append(preparation_alloc, .{ .key = source_plan.head_key, .comparison = .exact_value, .expected_value = source_plan.head_before });
+        }
+        if (req.completion_source_checkpoint) |checkpoint| {
+            var checkpoint_read = try self.core.store.beginProbeTxn();
+            defer checkpoint_read.abort();
+            const checkpoint_plan = try @import("../source_checkpoint.zig").prepare(source_arena.allocator(), &checkpoint_read, txn_id, source_purpose.?, checkpoint);
+            try intents.append(preparation_alloc, .{ .key = checkpoint_plan.key, .value = checkpoint_plan.value });
+            if (checkpoint_plan.receipt_key) |receipt_key| try intents.append(preparation_alloc, .{ .key = receipt_key, .value = checkpoint_plan.value });
+            try predicates.append(preparation_alloc, .{ .key = checkpoint_plan.key, .comparison = .exact_value, .expected_value = checkpoint_plan.before });
+        }
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
             try self.enforceRowPolicyIntentsLocked(view, intents.items, graph_sources, principal, graph_alloc, &predicates, preparation_alloc);
@@ -27027,7 +28258,21 @@ pub const DB = struct {
                 if (operation.kind != .guard) try intents.append(preparation_alloc, .{ .key = operation.key, .value = operation.value });
             }
         }
-        try self.validateTransformReadSnapshot(transform_snapshot);
+        // A concurrent exact retry may find this transaction's own prepared
+        // intents. They are not competing writers; validate the committed read
+        // versions while excluding only this durable transaction identity.
+        if (transform_snapshot.entries.len != 0) {
+            const transform_predicates = try preparation_alloc.alloc(transactions_mod.VersionPredicate, transform_snapshot.entries.len);
+            defer preparation_alloc.free(transform_predicates);
+            for (transform_snapshot.entries, transform_predicates) |entry, *predicate| predicate.* = .{
+                .key = entry.key,
+                .expected_version = entry.expected_version,
+            };
+            self.core.checkVersionPredicates(transform_predicates, txn_id) catch |err| switch (err) {
+                error.VersionConflict => return error.PreparedReadSetChanged,
+                else => return err,
+            };
+        }
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         const index_spans = try self.collectIndexSpanReservations(preparation_alloc, intents.items, prepared_schema_view);
         defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
@@ -27071,13 +28316,19 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .prepared_enrichments_json = req.prepared_enrichments_json, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .prepared_enrichments_json = req.prepared_enrichments_json, .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer, .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .source_purpose = source_purpose, .source_scope = req.completion_source_scope, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
             try ticket.wait();
             return backend_erased_mod.Ticket.alreadyDurable();
         } else {
             const ticket = try self.core.writeIntentsExtraBatchStaged(txn_id, intents.items, predicates.items, .{
                 .prepared_enrichments_json = req.prepared_enrichments_json,
+                .ordinary_producer = req.completion_ordinary_producer,
+                .legacy_producer = req.completion_legacy_producer,
+                .completion_owner = req.completion_owner,
+                .completion_input_digest = req.completion_input_digest,
+                .source_purpose = source_purpose,
+                .source_scope = req.completion_source_scope,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
@@ -27462,6 +28713,14 @@ pub const DB = struct {
         try self.resolveTransactionIntents(txn_id, .committed, timestamp_ns);
     }
 
+    pub fn resolveSourceTransaction(self: *DB, command: @import("../source_admission.zig").Command, status: transactions_mod.TxnStatus, sync_level: types.SyncLevel, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveSourceTransaction", .{ self, command, status, sync_level, cancellation });
+        try command.validate();
+        _ = try self.nativeSourceAdmissionNamespace();
+        if (command.table_id != self.core.identity_namespace.table_id) return error.SourceTableMismatch;
+        try self.resolveTransactionIntentsInternal(command.transactionId(), status, command.accepted_at_ns + 1, sync_level, cancellation, null, null, command.fingerprint(), null);
+    }
+
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("resolveTransactionIntents", .{ self, txn_id, status, commit_version });
         try self.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
@@ -27501,6 +28760,8 @@ pub const DB = struct {
             visibility_cancellation,
             null,
             null,
+            null,
+            null,
         );
     }
 
@@ -27523,7 +28784,141 @@ pub const DB = struct {
             visibility_cancellation,
             identity,
             resolved_participant,
+            null,
+            null,
         );
+    }
+
+    /// Private activated ordered recovery of an already durable local legacy
+    /// decision. This never chooses a pending transaction's outcome.
+    pub fn resolveOrderedClosedLegacyTerminal(self: *DB, owner: @import("../transaction_completion.zig").RoutedOwner, proof: transactions_mod.LegacyTerminalResolution, entry: OrderedApplyReceipt) !@import("../source_legacy_terminal_ordered.zig").Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveOrderedClosedLegacyTerminal", .{ self, owner, proof, entry });
+        const ordered = @import("../source_legacy_terminal_ordered.zig");
+        const command: ordered.policy.LegacyTerminalCommand = .{ .version = 1, .owner = owner, .proof = proof };
+        try command.validate();
+        if (entry.term == 0 or entry.index == 0) return error.InvalidSourceAdmission;
+        try self.requireSourcePlanAvailable();
+        const root: source_plan_control.storage.Root = .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() };
+        const cut: @import("../source_scope.zig").Cut = .{ .term = entry.term, .index = entry.index };
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try self.requireSourcePlanRoot(&read, root);
+            _ = (try ordered.policy.Store.read(self.alloc, &read, proof.root)) orelse return error.SourcePendingWork;
+            switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+                .already_applied => return ordered.replay(self.alloc, &read, command, cut),
+                .apply => {},
+            }
+        }
+        var rejection: ?ordered.Rejection = null;
+        if (self.core.closedLegacyTerminalDecision(proof)) |decision| {
+            const outcome: ordered.Outcome = .{ .applied = .{ .kind = if (decision.status == .committed) .committed else .aborted, .timestamp = decision.timestamp } };
+            const bytes = try ordered.encodeRecord(self.alloc, command, cut, outcome);
+            defer self.alloc.free(bytes);
+            local_mutation.resolveClosedLegacyTerminalInternal(self, proof, entry, owner, .{ .key = ordered.receipt_key, .value = bytes }) catch |err| {
+                rejection = ordered.Rejection.fromError(err) orelse return err;
+            };
+        } else |err| rejection = ordered.Rejection.fromError(err) orelse return err;
+        if (rejection) |reason| {
+            // Only deterministic semantic failures become durable outcomes.
+            // No attempted effects survived their failed native writer.
+            var admission = self.core.snapshot_admission.acquireMutation();
+            defer admission.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const disposition = try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry);
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try self.requireSourcePlanRoot(&txn, root);
+            _ = (try ordered.policy.Store.read(self.alloc, &txn, proof.root)) orelse return error.SourcePendingWork;
+            switch (disposition) {
+                .already_applied => {
+                    const recovered = try ordered.replay(self.alloc, &txn, command, cut);
+                    txn.abort();
+                    return recovered;
+                },
+                .apply => {},
+            }
+            const outcome: ordered.Outcome = .{ .rejected = reason };
+            const bytes = try ordered.encodeRecord(self.alloc, command, cut, outcome);
+            defer self.alloc.free(bytes);
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+            try txn.put(ordered.receipt_key, bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            return outcome;
+        }
+        // A concurrent exact replay can return from preparation without this
+        // call writing. Recover only the bound durable outcome, never infer it.
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        _ = try self.requireSourcePlanRoot(&read, root);
+        _ = try orderedHistoryReadCut(&read, entry.index);
+        return ordered.replay(self.alloc, &read, command, cut);
+    }
+
+    /// Private work discovery only. The caller qualifies ownership and quorum
+    /// ReadIndex; this snapshot binds physical authority, closure, marker and
+    /// records. An empty page is never a migration/drainage certificate.
+    pub fn legacyRecoveryInventory(self: *DB, a: Allocator, query: @import("../source_legacy_inventory.zig").Query) !@import("../source_legacy_inventory.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("legacyRecoveryInventory", .{ self, a, query });
+        const inventory = @import("../source_legacy_inventory.zig");
+        try query.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = query.owner.namespace, .generation = query.owner.root_generation, .fence = query.owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        var result: inventory.Observation = .{ .version = 1, .owner = query.owner, .cut = .{ .term = cut.term, .index = cut.index }, .page = try transactions_mod.TxnManager.legacyRecoveryPageInRead(a, &txn, try @import("../source_scope.zig").Basis.fromOwner(query.owner), query.after, query.max_records) };
+        errdefer result.deinit(a);
+        try result.validate(query);
+        return result;
+    }
+
+    /// Caller first qualifies current ownership and quorum ReadIndex. Native
+    /// closure, receipt and actual applied cut share this read-only snapshot.
+    pub fn legacyTerminalOutcome(self: *DB, query: @import("../source_legacy_terminal_ordered.zig").Query) !@import("../source_legacy_terminal_ordered.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("legacyTerminalOutcome", .{ self, query });
+        const ordered = @import("../source_legacy_terminal_ordered.zig");
+        try query.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = query.owner.namespace, .generation = query.owner.root_generation, .fence = query.owner.digest() });
+        _ = (try ordered.policy.Store.read(self.alloc, &txn, query.command.proof.root)) orelse return error.SourcePendingWork;
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        if (cut.term < query.entry.term or (cut.index == query.entry.index and cut.term != query.entry.term)) return error.ConflictingOrderedApplyReceipt;
+        const result: ordered.Observation = .{ .version = 1, .owner = query.owner, .command_digest = try ordered.fingerprint(self.alloc, query.command), .entry = query.entry, .cut = .{ .term = cut.term, .index = cut.index }, .outcome = try ordered.replay(self.alloc, &txn, query.command, query.entry) };
+        try result.validate(self.alloc, query);
+        return result;
+    }
+
+    /// Ordered resolution with the original physical participant authority.
+    pub fn resolveReplicatedCompletionTransactionAtOrderedReceipt(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        identity: OrderedApplyReceipt,
+        resolved_participant: ?[]const u8,
+        completion_owner: @import("../transaction_completion.zig").RoutedOwner,
+    ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedCompletionTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, identity, resolved_participant, completion_owner });
+        try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .write, .none, identity, resolved_participant, null, completion_owner);
+    }
+
+    pub fn resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, identity: OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("../transaction_completion.zig").RoutedOwner, purpose: [32]u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedSourceCompletionTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, identity, resolved_participant, owner, purpose });
+        if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+        try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .write, .none, identity, resolved_participant, purpose, owner);
+    }
+
+    pub fn resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, identity: OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("../transaction_completion.zig").RoutedOwner, purpose: [32]u8, scope: @import("../source_scope.zig").Reference) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, identity, resolved_participant, owner, purpose, scope });
+        try scope.validate();
+        if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+        try local_mutation.resolveTransactionIntentsInternalScoped(self, txn_id, status, commit_version, .write, .none, identity, resolved_participant, purpose, owner, scope);
     }
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;
@@ -29413,6 +30808,7 @@ pub const DB = struct {
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
+                if (guard.command.mode == .publish) try publication.stageHistory(alloc, txn, guard.command);
                 try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
                 try publication.stageArtifactRevisions(alloc, txn, guard.command, guard.position);
                 if (guard.command.producer_kind == .resolver) try @import("artifact_publication_resolution.zig").stageHandoff(alloc, txn, guard.command);
@@ -57035,7 +58431,16 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
     const ctx: *TtlCleanupContext = @ptrCast(@alignCast(ctx_ptr));
     var view = if (ctx.schema_registry) |registry| registry.acquire() else null;
     defer if (view) |*pinned| pinned.release();
-    if (view) |pinned| if (pinned.hasCoordinatedConstraints()) {
+    const retained_raft_history = blk: {
+        var txn = try ctx.batch.store.runtime_store.beginRead();
+        defer txn.abort();
+        const history = @import("../committed_history.zig");
+        const state = (try history.load(&txn)) orelse break :blk false;
+        if (!state.active() and try history.loadPolicy(&txn) == null) break :blk false;
+        const owner = (try @import("../source_authority.zig").load(&txn)) orelse return error.HistoryAuthorityRequired;
+        break :blk owner.kind == .raft;
+    };
+    if (view) |pinned| if (pinned.hasCoordinatedConstraints() or retained_raft_history) {
         const io = ctx.batch.io orelse std.Options.debug_io;
         ctx.hook_mutex.lockUncancelable(io);
         const port = ctx.coordinated_port;
@@ -57059,10 +58464,13 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
                     error.NotFound => continue,
                     else => return err,
                 };
-                if (timestamp_raw.len != 8) return error.InvalidTimestamp;
-                const timestamp = std.mem.readInt(u64, timestamp_raw[0..8], .little);
-                if (timestamp != candidate.timestamp_ns or
-                    !ttl_mod.isExpiredWithGrace(timestamp, schema.ttl_duration_ns, ctx.grace_period_ns, now)) continue;
+                const timestamp = ttl_mod.decodeTimestamp(timestamp_raw) orelse return error.InvalidTimestamp;
+                if (timestamp.source != candidate.timestamp_ns or
+                    !ttl_mod.isExpiredWithGrace(timestamp.source, schema.ttl_duration_ns, ctx.grace_period_ns, now)) continue;
+                // The callback receives an unsigned timestamp for its
+                // additional age check. Epoch zero is a conservative bound
+                // for a row already proven expired before the epoch.
+                const observed_source_ns = std.math.cast(u64, @max(timestamp.source, 0)) orelse continue;
                 const row_key = if (pinned.storageMode() == .relational)
                     try relational_store.keyAlloc(ctx.batch.alloc, candidate.key)
                 else
@@ -57076,8 +58484,8 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
                 std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                 try prepared.append(ctx.batch.alloc, .{
                     .key = candidate.key,
-                    .row_version = timestamp,
-                    .ttl_timestamp_ns = timestamp,
+                    .row_version = timestamp.version,
+                    .ttl_timestamp_ns = observed_source_ns,
                     .expected_content_digest = digest,
                 });
             }
@@ -57094,6 +58502,7 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
             .candidates = prepared.items,
         });
     };
+    if (retained_raft_history) return error.HistoryAuthorityRequired;
     const loaded_schema = try schema_mod.loadSchema(ctx.batch.store, ctx.batch.alloc);
     defer if (loaded_schema) |schema| schema_mod.freeSchema(ctx.batch.alloc, schema);
 
@@ -133806,6 +135215,12 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
         .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "parent", .schema_version = 1 } } }},
     });
     try db.commitTransaction(transaction, 11);
+    // Revision-aware primary storage can use an independent TTL source time.
+    const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, "parent");
+    defer alloc.free(timestamp_key);
+    const timestamp = try ttl_mod.encodeTimestampAlloc(alloc, 11, 1);
+    defer alloc.free(timestamp);
+    try db.core.store.put(timestamp_key, timestamp);
     const Capture = struct {
         db: *DB,
         seen: bool = false,
@@ -133814,7 +135229,7 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
             try std.testing.expectEqual(@as(u64, 100), request.table_id);
             // The local observation carries table identity; routing is bound by its owner.
             try std.testing.expectEqual(@as(usize, 1), request.candidates.len);
-            try std.testing.expectEqual(@as(u64, 1), request.candidates[0].row_version);
+            try std.testing.expectEqual(@as(u64, 11), request.candidates[0].row_version);
             try std.testing.expectEqual(@as(u64, 1), request.candidates[0].ttl_timestamp_ns);
             try std.testing.expect(self.db.core.apply_mutex.tryLockExclusive());
             self.db.core.apply_mutex.unlockExclusive();
@@ -158874,6 +160289,18 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
     try std.testing.expect(count > 3);
 }
 
+test "db ordered source scope controls fence legacy activation and recover native outcomes" {
+    var directory = try TestDirectory.init("source-scope-control");
+    defer directory.cleanup();
+    try @import("source_scope_control_native_test.zig").run(std.testing.allocator, directory.path());
+}
+
+test "db ordered source scope controls activate after versioned native drainage" {
+    var directory = try TestDirectory.init("source-scope-first-bind");
+    defer directory.cleanup();
+    try @import("source_scope_control_native_test.zig").verifyFirstBind(std.testing.allocator, directory.path());
+}
+
 test "index alias storage fences reject same-name replacement and survive query leases" {
     const a = std.testing.allocator;
     var path_tmp = try TestDirectory.init("alias-fence");
@@ -161325,4 +162752,262 @@ test "optional numeric range graph admission preserves legacy indexed predicates
         .index_name = "ft",
         .filter_query_json = conjunction,
     }, &.{"a"}));
+}
+
+test "db ordered artifact inventory producer history is retained and qualified after reopen" {
+    const alloc = std.testing.allocator;
+    const publication = @import("artifact_publication.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-history-read", .{tmp.sub_path});
+    defer alloc.free(path);
+    const identity: doc_identity.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    const namespace = @import("online_source_contract.zig").namespaceBytes(identity);
+    const options: OpenOptions = .{
+        .identity_namespace = identity,
+        .primary_backend = .{ .lsm = .{} },
+        .lsm_root_generation = 0,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.provisionNativeHistoryAuthority(namespace);
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try publication.stageHistory(alloc, &txn, .{
+            .namespace = namespace,
+            .authority_epoch = 1,
+            .catalog_digest = @splat(2),
+            .producer_name = "fixture",
+            .producer_generation = 3,
+            .sources = &.{.{ .document_key = "doc", .content_digest = @splat(4), .timestamp = 5, .input_position = null }},
+            .mutations = &.{.{ .family = .base_vector, .key = "private", .value = "payload", .source_index = 0 }},
+            .publication_digest = @splat(8),
+        });
+        try txn.commit();
+    }
+    var reopened = try DB.open(alloc, path, options);
+    defer reopened.close();
+    const request: publication.HistoryRead = .{ .namespace = namespace, .root_generation = reopened.core.root_generation, .after = 0 };
+    const observed = try reopened.artifactPublicationHistory(alloc, request, null);
+    try std.testing.expectEqual(@as(u64, 1), observed.latest);
+    try std.testing.expectEqual(@as(u64, 3), observed.event.?.producer_generation);
+    try std.testing.expect(observed.applied_index == null);
+    var wrong = request;
+    wrong.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, reopened.artifactPublicationHistory(alloc, wrong, null));
+    wrong = request;
+    wrong.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, reopened.artifactPublicationHistory(alloc, wrong, null));
+}
+
+test "db split finalization records the predecessor committed history frontier through reopen" {
+    const alloc = std.testing.allocator;
+    const history = @import("../committed_history.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-history", .{tmp.sub_path});
+    defer alloc.free(path);
+    const identity: doc_identity.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    const namespace = @import("online_source_contract.zig").namespaceBytes(identity);
+    const options: OpenOptions = .{
+        .identity_namespace = identity,
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    const entry: OrderedApplyReceipt = .{ .term = 2, .index = 9 };
+    const later: OrderedApplyReceipt = .{ .term = 2, .index = 10 };
+    const second_entry: OrderedApplyReceipt = .{ .term = 2, .index = 11 };
+    const split: types.SplitTransitionMutation = .{
+        .kind = .finalize,
+        .transition_id = 5,
+        .attempt_epoch = 1,
+        .destination_group_id = 7,
+        .split_key = "doc:m",
+    };
+    var second_split = split;
+    second_split.transition_id += 1;
+    second_split.destination_group_id += 1;
+    second_split.split_key = "doc:g";
+    {
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        const policy = try db.applyOrderedHistoryConsumerControl(.{ .configure_policy = .{
+            .namespace = namespace,
+            .authority = @splat(1),
+            .previous_revision = 0,
+            .revision = 1,
+            .limit = history.default_limit,
+        } }, .{ .term = 2, .index = 7 }, false);
+        try std.testing.expect(policy == .applied);
+        try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} }, .{ .term = 2, .index = 8 }, 100, false);
+        try db.applyRangeFinalization(split, entry, null, null);
+        try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:a", .value = "{\"value\":2}" }} }, later, 110, false);
+        try db.applyRangeFinalization(second_split, second_entry, null, null);
+        var admission = try db.core.store.beginWriteTxn();
+        errdefer admission.abort();
+        const consumer = try history.admitAt(&admission, namespace, @splat(2), history.default_limit, 200, 1, 0);
+        try std.testing.expectEqual(@as(u64, 0), consumer.start);
+        try std.testing.expectEqual(@as(u64, 0), consumer.acknowledged);
+        const retry = try history.admitAt(&admission, namespace, @splat(2), history.default_limit, 200, 1, 0);
+        try std.testing.expectEqual(consumer.epoch, retry.epoch);
+        try std.testing.expectError(error.HistoryConsumerConflict, history.admitAt(&admission, namespace, @splat(2), history.default_limit, 200, 1, 1));
+        try std.testing.expectError(error.HistoryResynchronizationRequired, history.admitAt(&admission, namespace, @splat(3), history.default_limit, 200, 1, 3));
+        try admission.commit();
+    }
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    try db.applyRangeFinalization(split, entry, null, null);
+    try std.testing.expectEqualStrings("doc:g", db.getRange().end);
+    try std.testing.expectEqual(second_entry, (try db.orderedApplyReceipt()).?);
+    var request: history.SplitCut.Request = .{
+        .namespace = namespace,
+        .transition = split.transition_id,
+        .attempt = split.attempt_epoch,
+        .successor_group = split.destination_group_id,
+        .root_generation = db.core.root_generation,
+        .boundary = history.frame.digest(split.split_key),
+    };
+    const routed = (try db.orderedSplitHistoryCut(request, second_entry.index)).?;
+    try std.testing.expectEqual(entry.index, routed.index);
+    var successor_request = request;
+    successor_request.transition = 0;
+    successor_request.attempt = 0;
+    const retired = (try db.orderedSplitHistoryCut(successor_request, second_entry.index)).?;
+    try std.testing.expectEqual(routed.encode(), retired.encode());
+    successor_request.successor_group = second_split.destination_group_id;
+    try std.testing.expectEqual(null, try db.orderedSplitHistoryCut(successor_request, second_entry.index));
+    successor_request.boundary = history.frame.digest(second_split.split_key);
+    const second_retired = (try db.orderedSplitHistoryCut(successor_request, second_entry.index)).?;
+    try std.testing.expectEqual(second_entry.index, second_retired.index);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedSplitHistoryCut(request, second_entry.index + 1));
+    request.successor_group += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedSplitHistoryCut(request, second_entry.index));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const cut = (try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch)).?;
+        try std.testing.expectEqual(namespace, cut.namespace);
+        try std.testing.expectEqual(split.transition_id, cut.transition);
+        try std.testing.expectEqual(split.destination_group_id, cut.successor_group);
+        try std.testing.expectEqual(entry.index, cut.index);
+        try std.testing.expectEqual(history.frame.digest(split.split_key), cut.boundary);
+        try std.testing.expectEqual(@as(u64, 1), cut.latest);
+        const successor_cut = (try history.SplitCut.load(&read, second_split.transition_id, second_split.attempt_epoch)).?;
+        try std.testing.expectEqual(second_entry.index, successor_cut.index);
+        try std.testing.expectEqual(@as(u64, 2), successor_cut.latest);
+        try std.testing.expect((try history.SplitCut.load(&read, split.transition_id, split.attempt_epoch + 1)) == null);
+        try std.testing.expectEqual(@as(u64, 2), (try history.load(&read)).?.latest);
+    }
+    const merge: types.MergeSourceTransitionMutation = .{ .kind = .finalize, .transition_id = 20, .receiver_group_id = 10 };
+    try db.applyOrderedCommittedMutation(.{ .merge_source_transition = merge }, .{ .term = 2, .index = 12 }, false);
+    const donor = cut: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :cut (try history.MergeCut.load(&read, merge.transition_id)).?;
+    };
+    try std.testing.expectEqual(merge.receiver_group_id, donor.receiver_group);
+    try std.testing.expectEqual(@as(u64, 12), donor.index);
+    try std.testing.expectEqual(@as(u64, 2), donor.latest);
+    var donor_request: history.MergeCut.Request = .{ .namespace = namespace, .transition = merge.transition_id, .receiver_group = merge.receiver_group_id, .root_generation = donor.root_generation };
+    const observed_donor = (try db.orderedMergeHistoryCut(donor_request, donor.index)).?;
+    try std.testing.expectEqual(donor.encode(), observed_donor.encode());
+    try std.testing.expectEqual(@as(?u64, 0), observed_donor.floor);
+    try std.testing.expectEqual(@as(?u8, 1), observed_donor.active_consumers);
+    try std.testing.expect(!observed_donor.retirementReady());
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedMergeHistoryCut(donor_request, donor.index + 1));
+    donor_request.receiver_group += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedMergeHistoryCut(donor_request, donor.index));
+
+    var retire = try db.core.store.beginWriteTxn();
+    errdefer retire.abort();
+    const native = (try history.load(&retire)).?;
+    const epoch = native.consumers[0].epoch;
+    try history.acknowledge(&retire, namespace, @splat(2), epoch, 0, 2);
+    try history.release(&retire, namespace, @splat(2), epoch);
+    try retire.commit();
+    donor_request.receiver_group = merge.receiver_group_id;
+    const drained = (try db.orderedMergeHistoryCut(donor_request, donor.index)).?;
+    try std.testing.expectEqual(@as(?u64, 2), drained.floor);
+    try std.testing.expectEqual(@as(?u8, 0), drained.active_consumers);
+    try std.testing.expect(drained.retirementReady());
+    const late = try db.applyOrderedHistoryConsumerControl(.{ .enroll = .{
+        .namespace = namespace,
+        .authority = @splat(1),
+        .sequence = 2,
+        .consumer = @splat(4),
+        .definition = @splat(5),
+        .expires_at_seconds = 200,
+        .policy_revision = 1,
+    } }, .{ .term = 2, .index = 13 }, false);
+    try std.testing.expect(late == .rejected and late.rejected == .resynchronization);
+}
+
+test "db ordered empty split destination seeds history before its first write" {
+    const a = std.testing.allocator;
+    const history = @import("../committed_history.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/split-child-history", .{tmp.sub_path});
+    defer a.free(path);
+    const identity: doc_identity.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    const namespace = @import("online_source_contract.zig").namespaceBytes(identity);
+    var db = try DB.open(a, path, .{
+        .identity_namespace = identity,
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    const replication: types.SplitReplicationContext = .{
+        .transition_id = 4,
+        .attempt_epoch = 1,
+        .source_group_id = 2,
+        .destination_group_id = 5,
+        .identity_namespace = identity,
+        .bootstrap_sequence = 0,
+        .operation = .checkpoint,
+    };
+    var checkpoint: types.SplitReplicationCheckpoint = .{
+        .kind = .destination_begin,
+        .transition_id = 4,
+        .attempt_epoch = 1,
+        .source_group_id = 2,
+        .destination_group_id = 5,
+        .range_start = "doc:m",
+        .delta_sequence = 0,
+    };
+    try db.applyOrderedCommittedMutation(.{ .split_replication = replication, .split_checkpoint = checkpoint }, .{ .term = 1, .index = 1 }, false);
+    checkpoint.kind = .destination_complete;
+    checkpoint.history_policy = .{ .namespace = namespace, .authority = @splat(1), .previous_revision = 0, .revision = 1, .limit = history.default_limit };
+    try db.applyOrderedCommittedMutation(.{ .split_replication = replication, .split_checkpoint = checkpoint }, .{ .term = 1, .index = 2 }, false);
+    try db.applyOrderedTimestampedMutation(.{ .source_producer = .ordinary, .writes = &.{.{ .key = "doc:z", .value = "{\"value\":1}" }} }, .{ .term = 1, .index = 3 }, 100, false);
+    try db.clearSplitBootstrapMarker();
+    const consumers = @import("../history_consumer.zig");
+    var grant: consumers.Grant = .{
+        .namespace = namespace,
+        .authority = @splat(1),
+        .sequence = 1,
+        .consumer = @splat(2),
+        .definition = @splat(3),
+        .expires_at_seconds = 200,
+        .policy_revision = 1,
+        .retained_start = 0,
+        .split_origin = .{ .transition = 4, .attempt = 2, .predecessor_group = 2, .successor_group = 5 },
+    };
+    const wrong = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 4 }, false);
+    try std.testing.expect(wrong == .rejected and wrong.rejected == .resynchronization);
+    grant.split_origin.?.attempt = 1;
+    const enrolled = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 5 }, false);
+    try std.testing.expect(enrolled == .applied);
+    try std.testing.expectEqual(@as(u64, 0), enrolled.applied.consumer.?.start);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 1), (try history.load(&read)).?.latest);
+    try std.testing.expectEqual(@as(u64, 1), (try history.loadPolicy(&read)).?.revision);
 }

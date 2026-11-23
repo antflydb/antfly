@@ -40,6 +40,7 @@ const table_participant_v3_prefix = @import("antfly_local_sources").api_local_tr
 pub const group_participant_marker = @import("antfly_local_sources").api_local_transaction_contract.group_participant_marker;
 
 pub const TxnBeginRequest = struct {
+    source_producer: @FieldType(db_mod.types.BatchRequest, "source_producer") = .unlabelled,
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     topology_epoch: u64 = 0,
@@ -215,6 +216,8 @@ pub const PreDecisionContext = @import("antfly_local_sources").api_local_transac
 pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server_response_reserve_ms;
 
 pub const ParticipantWorker = struct {
+    /// Reviewed BEGIN/PREPARE transport retains explicit producer identity.
+    supports_transaction_producers: bool = false,
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -287,10 +290,12 @@ pub const ParticipantWorker = struct {
     };
 
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
+        if (req.source_producer != .unlabelled and !self.supports_transaction_producers) return error.ChangefeedCapabilityUnsupported;
         try self.vtable.begin_group(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn prepareGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
+        if ((req.req.completion_ordinary_producer or req.req.completion_legacy_producer) and !self.supports_transaction_producers) return error.ChangefeedCapabilityUnsupported;
         try self.vtable.prepare_group(self.ptr, alloc, group_id, table_name, req);
     }
 
@@ -453,6 +458,7 @@ pub const HostedParticipantWorker = struct {
 
     pub fn worker(self: *HostedParticipantWorker) ParticipantWorker {
         return .{
+            .supports_transaction_producers = true,
             .ptr = self,
             .vtable = &.{
                 .begin_group = beginGroup,
@@ -492,6 +498,7 @@ pub const HostedParticipantWorker = struct {
                     if (err == error.Timeout) return error.PreDecisionNotProposed;
                     return err;
                 };
+                context.source_producer = req.source_producer;
                 context.restore_staging_scope = req.restore_staging_scope;
                 context.restore_staging_plan_id = req.restore_staging_plan_id;
                 const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
@@ -642,6 +649,7 @@ pub const HostedParticipantWorker = struct {
                 if (err == error.Timeout) return false;
                 return err;
             };
+            context.source_producer = req.source_producer;
             context.restore_staging_scope = req.restore_staging_scope;
             context.restore_staging_plan_id = req.restore_staging_plan_id;
             const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
@@ -1057,6 +1065,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     pub fn worker(self: *LocalTableWriteParticipantWorker) ParticipantWorker {
         return .{
+            .supports_transaction_producers = self.writes.supports_transaction_producer_phases,
             .ptr = self,
             .vtable = &.{
                 .begin_group = beginGroup,
@@ -1074,7 +1083,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id })) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .source_producer = req.source_producer, .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id })) orelse return error.UnknownGroup;
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -1189,6 +1198,8 @@ test "distributed txn local participant prepare preserves the guarded catalog ro
 pub const ExecuteResult = contract.ExecuteResult;
 
 pub const ExecuteOptions = struct {
+    completion: ?@import("completion_admission.zig").Coordinator = null,
+    completion_context: @import("antfly_local_sources").api_operation.RequestContext = .{},
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
@@ -1267,6 +1278,7 @@ pub fn executeCrossGroup(
     req: db_mod.types.TransactionIntentRequest,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !ExecuteResult {
+    if (req.source_admission != null) return error.UnsupportedOperation;
     if (req.range_guards.len != 0) return error.InvalidTxnRequest;
     const tables = [_]TableCommitRequest{.{
         .table_name = table_name,
@@ -1347,7 +1359,289 @@ pub fn executeMultiTableCommitWithOptions(
     trace_writer: ?tracing.AntflyTraceWriter,
     options: ExecuteOptions,
 ) !CommitOutcome {
+    // Root-local source receipts cannot be silently discarded by routing.
+    // The source-head anchor and participant receipts must be compiled first.
+    for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
     return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer, options);
+}
+
+/// Shared read-only partitioning for ordinary transactions and retained source
+/// planning. Payload slices are borrowed until completion preparation owns them.
+fn routeCommitParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest) !std.ArrayListUnmanaged(ParticipantTxn) {
+    const producer = try @import("antfly_local_sources").api_distributed_txn_contract.transactionProducer(tables);
+    for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
+    var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
+    errdefer {
+        for (participants.items) |*participant| participant.deinit(alloc);
+        participants.deinit(alloc);
+    }
+
+    var table_groups: std.StringHashMapUnmanaged(ParticipantGroups) = .empty;
+    defer {
+        var it = table_groups.valueIterator();
+        while (it.next()) |groups| groups.deinit(alloc);
+        table_groups.deinit(alloc);
+    }
+    // Cascades can enlist additional tables after SQL admission. All participants
+    // in a transaction must prepare against the same metadata incarnation.
+    var bound_incarnation: ?[16]u8 = null;
+    for (tables) |table| if (table.bound_catalog_incarnation) |incarnation| {
+        if (bound_incarnation) |bound| if (!std.mem.eql(u8, &bound, &incarnation)) return error.CatalogGenerationChanged;
+        bound_incarnation = incarnation;
+    };
+    for (tables) |table| {
+        var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
+        defer routing.deinit(alloc);
+        const topology_epoch = routing.topology_epoch;
+        const slot = try table_groups.getOrPut(alloc, table.table_name);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        const groups = slot.value_ptr;
+
+        if (bound_incarnation) |incarnation| {
+            const actual = routing.snapshot.status.metadata_incarnation orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &actual, &std.fmt.bytesToHex(incarnation, .lower))) return error.CatalogGenerationChanged;
+        }
+        try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
+        for (table.range_guards) |owner| {
+            const fence = owner.fence;
+            if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
+                !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
+                return error.TopologyChanged;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, fence.route.group_id, topology_epoch);
+            if (participant.route_fence) |*existing| {
+                if (!@import("antfly_local_sources").api_range_read_guards.sameOwner(existing.*, fence)) return error.TopologyChanged;
+                existing.catalog_revision = @max(existing.catalog_revision, fence.catalog_revision);
+            } else participant.route_fence = fence;
+            for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
+        }
+
+        for (table.writes) |write| {
+            const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.writes.append(alloc, write);
+        }
+        for (table.deletes) |key| {
+            const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.deletes.append(alloc, key);
+        }
+        for (table.graph_writes) |edge| {
+            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.graph_writes.append(alloc, edge);
+        }
+        for (table.graph_deletes) |edge| {
+            const group_id = routing.resolveGroupForKey(edge.source) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.graph_deletes.append(alloc, edge);
+        }
+        for (table.predicates) |predicate| {
+            const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.predicates.append(alloc, predicate);
+        }
+        for (table.transforms) |transform| {
+            const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.transforms.append(alloc, transform);
+        }
+        for (table.integrity) |operation| {
+            const group_id = routing.resolveGroupForKey(operation.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.integrity.append(alloc, operation);
+        }
+        for (table.integrity_commands) |command| {
+            const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            try participant.integrity_commands.append(alloc, command);
+        }
+        if (table.relational_activation) |command| {
+            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_activation != null) return error.InvalidTxnRequest;
+            participant.relational_activation = command;
+        }
+        if (table.relational_retirement) |command| {
+            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_retirement != null) return error.InvalidTxnRequest;
+            participant.relational_retirement = command;
+        }
+        if (table.relational_index_maintenance) |command| {
+            const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
+            if (group_id != command.owner_group_id) return error.PreparedGenerationChanged;
+            const participant = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, group_id, topology_epoch);
+            if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
+            participant.relational_index_maintenance = command;
+        }
+        if (table.commit_requires == .direct_enrichments and groups.count() == 0) {
+            _ = try ensureParticipantTxn(alloc, alloc, &participants, groups, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
+        }
+        // Match all enlisted owner proofs in one traversal of this table's
+        // ranges. Guarded reads keep their observed fence and bound writes get
+        // a fence from the same routing snapshot used to choose their group.
+        if (bound_incarnation != null or table.range_guards.len != 0) {
+            var remaining = groups.count();
+            for (routing.ranges) |range| {
+                if (remaining == 0) break;
+                const index = groups.get(range.group_id) orelse continue;
+                const participant = &participants.items[index];
+                const manager = @import("../metadata/table_manager.zig");
+                const range_id = manager.rangeDocIdentityRangeId(range.*);
+                const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
+                    .metadata_group_id = routing.snapshot.status.metadata_group_id,
+                    .metadata_incarnation = routing.snapshot.status.metadata_incarnation,
+                    .catalog_revision = 0,
+                    .table_id = range.table_id,
+                    .topology_epoch = topology_epoch,
+                    .route = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = range.table_id, .shard_id = manager.rangeDocIdentityShardId(range.*), .range_id = range_id } },
+                };
+                if (participant.route_fence) |observed| {
+                    if (observed.table_id != fence.table_id or observed.route.range_id != range_id or
+                        !std.meta.eql(observed.route.identity_namespace, fence.route.identity_namespace)) return error.TopologyChanged;
+                } else if (bound_incarnation != null) {
+                    participant.route_fence = fence;
+                }
+                remaining -= 1;
+            }
+            if (remaining != 0) return error.TopologyChanged;
+        }
+        for (groups.values()) |index| {
+            const participant = &participants.items[index];
+            if (participant.topology_epoch != topology_epoch) return error.TopologyChanged;
+            if (participant.row_policy_principal_proof.len != 0 and
+                (!std.mem.eql(u8, participant.row_policy_principal_proof, table.row_policy_principal_proof) or
+                    !std.mem.eql(u8, participant.row_policy_database, table.row_policy_database) or
+                    participant.row_policy_admitted_at_seconds != table.row_policy_admitted_at_seconds))
+                return error.InvalidTxnRequest;
+            participant.source_producer = producer;
+            participant.row_policy_principal_proof = table.row_policy_principal_proof;
+            participant.row_policy_database = table.row_policy_database;
+            participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
+            participant.normalized_graph_rows = table.normalized_graph_rows;
+            if (participant.commit_requires != null and table.commit_requires != null and participant.commit_requires != table.commit_requires) return error.InvalidTxnRequest;
+            if (table.commit_requires) |requirement| participant.commit_requires = requirement;
+            if (participant.relational_schema_version) |existing| {
+                if (table.relational_schema_version) |requested| {
+                    if (existing != requested) return error.InvalidTxnRequest;
+                }
+            } else participant.relational_schema_version = table.relational_schema_version;
+            if (participant.schema_version) |existing| {
+                if (table.schema_version) |requested| if (existing != requested) return error.CatalogGenerationChanged;
+            } else participant.schema_version = table.schema_version;
+            if (participant.relational_integrity_generation_set) |existing| {
+                const requested = table.relational_integrity_generation_set orelse return error.PreparedGenerationChanged;
+                if (!std.mem.eql(u8, &existing, &requested)) return error.PreparedGenerationChanged;
+            } else participant.relational_integrity_generation_set = table.relational_integrity_generation_set;
+            participant.relational_repair = table.relational_repair;
+            const routed_restore_scope = (try catalog.restoreScopeForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_scope;
+            if (participant.restore_staging_scope) |existing| {
+                const requested = routed_restore_scope orelse return error.RestoreStagingChanged;
+                if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
+            } else participant.restore_staging_scope = routed_restore_scope;
+            const routed_restore_plan = (try catalog.restorePlanForGroup(participant.table_name, participant.group_id)) orelse table.restore_staging_plan_id;
+            if (participant.restore_staging_plan_id) |existing| {
+                const requested = routed_restore_plan orelse return error.RestoreStagingChanged;
+                if (!std.mem.eql(u8, &existing, &requested)) return error.RestoreStagingChanged;
+            } else participant.restore_staging_plan_id = routed_restore_plan;
+            try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
+        }
+    }
+
+    return participants;
+}
+
+pub const SourceGrant = struct {
+    authority: @import("../metadata/source_checkpoint_authority.zig").Spec,
+    reference: @import("antfly_local_sources").storage_source_scope.Reference,
+    checkpoint: @import("antfly_local_sources").storage_source_checkpoint.Command,
+    pub fn validate(self: SourceGrant) !void {
+        try self.authority.validate();
+        try self.reference.validate();
+        try self.checkpoint.validate();
+        if (self.authority.retirement != null or self.checkpoint.receipt_window == 0 or
+            !std.mem.eql(u8, &self.reference.binding, &self.authority.binding) or
+            !std.mem.eql(u8, &self.reference.binding, &self.checkpoint.binding) or
+            self.reference.sequence != self.checkpoint.sequence) return error.SourceBindingConflict;
+    }
+};
+
+/// Compile the same routed effects as ordinary commit, then enlist the stable
+/// checkpoint root even for an empty source transaction. No transaction admission
+/// occurs here: the actor must reserve and seal this frozen plan before admission.
+pub fn prepareSourceCommit(
+    alloc: std.mem.Allocator,
+    coordinator: @import("completion_admission.zig").Coordinator,
+    txn_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    tables: []const TableCommitRequest,
+    grant: SourceGrant,
+    context: @import("antfly_local_sources").api_operation.RequestContext,
+) !@import("completion_admission.zig").Prepared {
+    for (tables) |table| if (table.source_producer != .unlabelled) return error.SourceTransactionIdentityConflict;
+    try context.ensureActive();
+    try grant.validate();
+    var participants = try routeCommitParticipants(alloc, coordinator.recovery.catalog, tables);
+    defer {
+        for (participants.items) |*participant| participant.deinit(alloc);
+        participants.deinit(alloc);
+    }
+    var routing = (try table_catalog.transactionRoutingSnapshot(alloc, coordinator.recovery.catalog, grant.authority.table_name)) orelse return error.TableNotFound;
+    defer routing.deinit(alloc);
+    for (participants.items) |participant| {
+        if (participant.group_id != grant.authority.owner.group_id or
+            !std.mem.eql(u8, participant.table_name, grant.authority.table_name)) continue;
+        if (participant.topology_epoch != routing.topology_epoch) return error.TopologyChanged;
+        break;
+    } else try participants.append(alloc, .{
+        .table_name = grant.authority.table_name,
+        .group_id = grant.authority.owner.group_id,
+        .topology_epoch = routing.topology_epoch,
+    });
+    const inputs = try alloc.alloc(@import("completion_admission.zig").Input, participants.items.len);
+    defer alloc.free(inputs);
+    for (participants.items, inputs) |*participant, *input| {
+        var intent = participant.intentRequest();
+        intent.completion_source_purpose = grant.checkpoint.purpose;
+        intent.completion_source_scope = grant.reference;
+        if (participant.group_id == grant.authority.owner.group_id and std.mem.eql(u8, participant.table_name, grant.authority.table_name)) intent.completion_source_checkpoint = grant.checkpoint;
+        input.* = .{ .table_name = participant.table_name, .group_id = participant.group_id, .topology_epoch = participant.topology_epoch, .intent = intent };
+    }
+    try context.ensureActive();
+    var prepared = (try coordinator.prepare(alloc, txn_id, begin_timestamp, inputs, context)) orelse return error.ChangefeedCapabilityUnsupported;
+    errdefer prepared.deinit();
+    const captured = try prepared.plan.admission.coordinatorOwner();
+    try grant.authority.requireOwner(captured);
+    try context.ensureActive();
+    return prepared;
+}
+
+pub fn prepareRetainedCommit(
+    a: std.mem.Allocator,
+    coordinator: @import("completion_admission.zig").Coordinator,
+    transaction_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    tables: []const TableCommitRequest,
+    context: @import("antfly_local_sources").api_operation.RequestContext,
+) !@import("completion_admission.zig").Prepared {
+    var participants = try routeCommitParticipants(a, coordinator.recovery.catalog, tables);
+    defer {
+        for (participants.items) |*participant| participant.deinit(a);
+        participants.deinit(a);
+    }
+    const inputs = try a.alloc(@import("completion_admission.zig").Input, participants.items.len);
+    defer a.free(inputs);
+    for (participants.items, inputs) |*participant, *input| input.* = .{
+        .table_name = participant.table_name,
+        .group_id = participant.group_id,
+        .topology_epoch = participant.topology_epoch,
+        .intent = participant.intentRequest(),
+    };
+    var result = (try coordinator.prepare(a, transaction_id, begin_timestamp, inputs, context)) orelse
+        return error.ChangefeedCapabilityUnsupported;
+    result.plan.created_at_ns = begin_timestamp;
+    result.plan.retain_terminal = true;
+    return result;
 }
 
 fn executeMultiTableCommitOnce(
@@ -1362,7 +1656,7 @@ fn executeMultiTableCommitOnce(
     trace_writer: ?tracing.AntflyTraceWriter,
     options: ExecuteOptions,
 ) !CommitOutcome {
-    var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
+    var participants: std.ArrayListUnmanaged(ParticipantTxn) = .empty;
     defer {
         for (participants.items) |*participant| participant.deinit(alloc);
         participants.deinit(alloc);
@@ -1393,6 +1687,39 @@ fn executeMultiTableCommitOnce(
         participant_ids_initialized += 1;
     }
 
+    if (options.completion) |completion_coordinator| {
+        const inputs = try alloc.alloc(@import("completion_admission.zig").Input, participants.items.len);
+        defer alloc.free(inputs);
+        for (participants.items, inputs) |*participant, *input| input.* = .{
+            .table_name = participant.table_name,
+            .group_id = participant.group_id,
+            .topology_epoch = participant.topology_epoch,
+            .intent = participant.intentRequest(),
+        };
+        if (try completion_coordinator.commit(alloc, txn_id, begin_timestamp, commit_version, inputs, sync_level, options.retain_terminal, options.completion_context)) |completed| {
+            if (options.report_post_commit_failure) {
+                if (completed.propagation_pending) return error.CommitPropagationIncomplete;
+                if (completed.visibility_retry_pending) return error.CommitVisibilityNotSatisfied;
+                if (completed.visibility_repair_required) return error.EnrichmentWorkerFailed;
+            }
+            return .{ .committed = .{
+                .participant_count = participants.items.len,
+                .coordinator_group_id = completed.coordinator_group_id,
+                .coordinator_table_name = completed.coordinator_table_name,
+                .propagation_pending = completed.propagation_pending,
+                .visibility_pending = completed.visibility_pending,
+                .visibility_retry_pending = completed.visibility_retry_pending,
+                .visibility_repair_required = completed.visibility_repair_required,
+            } };
+        }
+    }
+
+    // Only a reviewed producer-aware worker can use non-history phases.
+    // Unknown adapters retain the pre-BEGIN rejection rather than losing origin.
+    if (!worker.supports_transaction_producers) {
+        for (participants.items) |participant| if (participant.source_producer != .unlabelled) return error.ChangefeedCapabilityUnsupported;
+    }
+
     // Allocate every coordination slot before contacting a participant. No
     // allocator failure may be introduced after the commit decision becomes
     // durable, where returning an ordinary server error would invite an unsafe
@@ -1416,6 +1743,7 @@ fn executeMultiTableCommitOnce(
     if (participants.items.len > 0) coordinator_begin: {
         const participant = participants.items[0];
         worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
+            .source_producer = participant.source_producer,
             .txn_id = txn_id,
             .begin_timestamp = begin_timestamp,
             .topology_epoch = participant.topology_epoch,
@@ -1424,6 +1752,19 @@ fn executeMultiTableCommitOnce(
             .restore_staging_scope = participant.restore_staging_scope,
             .restore_staging_plan_id = participant.restore_staging_plan_id,
         }) catch |err| {
+            // An immutable producer/capability mismatch cannot be repaired by
+            // observing an older committed record with this transaction ID.
+            if (@import("source_transaction_errors.zig").classify(err)) |reason| {
+                abort_on_error = false;
+                return reason;
+            }
+            if (participant.source_producer != .unlabelled and err != error.DecisionConflict) {
+                // An older peer can reject the envelope while still exposing
+                // an unlabelled committed record. Plain status is not origin
+                // evidence. Retry BEGIN until the original class is checked.
+                abort_on_error = false;
+                return error.CommitDecisionUnknown;
+            }
             if (options.retain_terminal or err == error.DecisionConflict) {
                 // A stable transaction ID may be retried after the coordinator
                 // durably committed but before the client observed success.
@@ -1887,6 +2228,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
 }
 
 const ParticipantTxn = struct {
+    source_producer: @FieldType(db_mod.types.BatchRequest, "source_producer") = .unlabelled,
     commit_requires: ?db_mod.types.CommitRequires = null,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
@@ -1915,6 +2257,38 @@ const ParticipantTxn = struct {
     relational_activation: ?integrity_activation.Command = null,
     relational_retirement: ?integrity_retirement.Command = null,
     relational_index_maintenance: ?@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command = null,
+
+    /// One complete intent mapping feeds both legacy participants and the
+    /// immutable retained-history PREPARE compiler.
+    fn intentRequest(self: *const ParticipantTxn) db_mod.types.TransactionIntentRequest {
+        return .{
+            .commit_requires = self.commit_requires,
+            .completion_ordinary_producer = self.source_producer == .ordinary,
+            .completion_legacy_producer = self.source_producer == .legacy_cdc,
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
+            .row_policy_admitted_at_seconds = self.row_policy_admitted_at_seconds,
+            .normalized_graph_rows = self.normalized_graph_rows,
+            .writes = self.writes.items,
+            .deletes = self.deletes.items,
+            .transforms = self.transforms.items,
+            .graph_writes = self.graph_writes.items,
+            .graph_deletes = self.graph_deletes.items,
+            .predicates = self.predicates.items,
+            .integrity = self.integrity.items,
+            .integrity_commands = self.integrity_commands.items,
+            .range_guards = self.range_guards.items,
+            .relational_activation = self.relational_activation,
+            .relational_retirement = self.relational_retirement,
+            .relational_index_maintenance = self.relational_index_maintenance,
+            .relational_schema_version = self.relational_schema_version,
+            .schema_version = self.schema_version,
+            .relational_integrity_generation_set = self.relational_integrity_generation_set,
+            .restore_staging_scope = self.restore_staging_scope,
+            .restore_staging_plan_id = self.restore_staging_plan_id,
+            .relational_repair = self.relational_repair,
+        };
+    }
 
     fn statusRequest(self: ParticipantTxn, txn_id: db_mod.types.TxnId) TxnStatusRequest {
         return .{ .txn_id = txn_id, .restore_staging_scope = self.restore_staging_scope, .restore_staging_plan_id = self.restore_staging_plan_id };
@@ -1947,6 +2321,7 @@ const BeginFanoutTask = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         worker.beginGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+            .source_producer = participant.source_producer,
             .txn_id = txn_id,
             .begin_timestamp = begin_timestamp,
             .topology_epoch = participant.topology_epoch,
@@ -2029,31 +2404,7 @@ const PrepareFanoutTask = struct {
             .route_fence = participant.route_fence,
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
-            .req = .{
-                .commit_requires = participant.commit_requires,
-                .row_policy_principal_proof = participant.row_policy_principal_proof,
-                .row_policy_database = participant.row_policy_database,
-                .row_policy_admitted_at_seconds = participant.row_policy_admitted_at_seconds,
-                .normalized_graph_rows = participant.normalized_graph_rows,
-                .writes = participant.writes.items,
-                .deletes = participant.deletes.items,
-                .transforms = participant.transforms.items,
-                .graph_writes = participant.graph_writes.items,
-                .graph_deletes = participant.graph_deletes.items,
-                .predicates = participant.predicates.items,
-                .integrity = participant.integrity.items,
-                .integrity_commands = participant.integrity_commands.items,
-                .range_guards = participant.range_guards.items,
-                .relational_activation = participant.relational_activation,
-                .relational_retirement = participant.relational_retirement,
-                .relational_index_maintenance = participant.relational_index_maintenance,
-                .relational_schema_version = participant.relational_schema_version,
-                .schema_version = participant.schema_version,
-                .relational_integrity_generation_set = participant.relational_integrity_generation_set,
-                .restore_staging_scope = participant.restore_staging_scope,
-                .restore_staging_plan_id = participant.restore_staging_plan_id,
-                .relational_repair = participant.relational_repair,
-            },
+            .req = participant.intentRequest(),
         }) catch |err| {
             slot.err = err;
         };
@@ -2407,6 +2758,8 @@ fn bindParticipantRoute(participant: *ParticipantTxn, identity: RoutingIdentity,
 
 fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest, participants: *std.ArrayListUnmanaged(ParticipantTxn), retain_terminal: bool, failure: ?*[]const u8) !?RoutingIdentity {
     if (tables.len == 0) return null;
+    const producer = try @import("antfly_local_sources").api_distributed_txn_contract.transactionProducer(tables);
+    for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
     var workspace = std.heap.ArenaAllocator.init(alloc);
     defer workspace.deinit();
     const a = workspace.allocator();
@@ -2595,6 +2948,7 @@ fn routeParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSou
         for (groups.values()) |index| {
             const participant = &participants.items[index];
             participant.decision_epoch = decision_epoch;
+            participant.source_producer = producer;
             participant.row_policy_principal_proof = table.row_policy_principal_proof;
             participant.row_policy_database = table.row_policy_database;
             participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
@@ -2685,11 +3039,66 @@ pub fn parseTxnIdHex(text: []const u8) !db_mod.types.TxnId {
     return out;
 }
 
+const TransactionProducer = @FieldType(db_mod.types.BatchRequest, "source_producer");
+fn requireGenericProducer(producer: TransactionProducer) !void {
+    if (producer == .scoped_source) return error.InvalidTxnRequest;
+}
+fn appendProducerEnvelope(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), tag: []const u8, producer: TransactionProducer) !void {
+    try requireGenericProducer(producer);
+    if (producer == .unlabelled) return;
+    const prefix = try std.fmt.allocPrint(alloc, "[\"{s}\",\"{s}\",", .{ tag, @tagName(producer) });
+    defer alloc.free(prefix);
+    try out.appendSlice(alloc, prefix);
+}
+fn appendProducerMarker(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), producer: TransactionProducer) !void {
+    if (producer == .unlabelled) return;
+    const marker = try std.fmt.allocPrint(alloc, ",\"source_producer\":\"{s}\"", .{@tagName(producer)});
+    defer alloc.free(marker);
+    try out.appendSlice(alloc, marker);
+}
+const ProducerEnvelope = struct { root: std.json.Value, producer: TransactionProducer = .unlabelled };
+fn unwrapProducerEnvelope(value: std.json.Value, tag: []const u8) !ProducerEnvelope {
+    if (value != .array) return .{ .root = value };
+    const entries = value.array.items;
+    if (entries.len == 0 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, tag)) return .{ .root = value };
+    if (entries.len != 3 or entries[1] != .string) return error.InvalidTxnRequest;
+    const producer = std.meta.stringToEnum(TransactionProducer, entries[1].string) orelse return error.InvalidTxnRequest;
+    if (producer != .ordinary and producer != .legacy_cdc) return error.InvalidTxnRequest;
+    return .{ .root = entries[2], .producer = producer };
+}
+fn requireProducerMarker(obj: std.json.ObjectMap, producer: TransactionProducer) !void {
+    if (producer == .unlabelled) {
+        if (obj.contains("source_producer")) return error.InvalidTxnRequest;
+        return;
+    }
+    const marker = obj.get("source_producer") orelse return error.InvalidTxnRequest;
+    if (marker != .string or !std.mem.eql(u8, marker.string, @tagName(producer))) return error.InvalidTxnRequest;
+}
+
+/// A generic 409 is not evidence that a labelled BEGIN checked the original
+/// record. Only the new request form can receive this request-bound response.
+pub fn encodeProducerBeginConflict(a: std.mem.Allocator, request: TxnBeginRequest) ![]u8 {
+    if (request.source_producer != .ordinary and request.source_producer != .legacy_cdc) return error.InvalidTxnRequest;
+    const id = encodeTxnIdHex(request.txn_id);
+    return std.json.Stringify.valueAlloc(a, [_][]const u8{ "producer-begin-conflict-v1", @tagName(request.source_producer), &id }, .{});
+}
+pub fn producerBeginConflictMatches(a: std.mem.Allocator, bytes: []const u8, request: TxnBeginRequest) !bool {
+    if (bytes.len > 4096 or request.source_producer == .unlabelled or request.source_producer == .scoped_source) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch |err| return if (err == error.OutOfMemory) err else false;
+    defer parsed.deinit();
+    if (parsed.value != .array or parsed.value.array.items.len != 3) return false;
+    const values = parsed.value.array.items;
+    for (values) |value| if (value != .string) return false;
+    const id = encodeTxnIdHex(request.txn_id);
+    return std.mem.eql(u8, values[0].string, "producer-begin-conflict-v1") and std.mem.eql(u8, values[1].string, @tagName(request.source_producer)) and std.mem.eql(u8, values[2].string, &id);
+}
+
 pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]u8 {
     try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    try appendProducerEnvelope(alloc, &out, "producer-begin-v1", req.source_producer);
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"begin_timestamp\":");
@@ -2717,15 +3126,21 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
+    try appendProducerMarker(alloc, &out, req.source_producer);
     try out.appendSlice(alloc, "}");
+    if (req.source_producer != .unlabelled) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
 pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest) ![]u8 {
+    if (req.req.completion_owner != null or req.req.completion_input_digest != null or req.req.completion_source_purpose != null or req.req.completion_source_scope != null or req.req.completion_source_checkpoint != null or req.req.source_admission != null) return error.InvalidTxnRequest;
+    if (req.req.completion_ordinary_producer and req.req.completion_legacy_producer) return error.InvalidTxnRequest;
+    const producer: TransactionProducer = if (req.req.completion_ordinary_producer) .ordinary else if (req.req.completion_legacy_producer) .legacy_cdc else .unlabelled;
     try validateRestorePlan(req.req.restore_staging_scope, req.req.restore_staging_plan_id);
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    try appendProducerEnvelope(alloc, &out, "producer-prepare-v1", producer);
     const guarded = req.req.range_guards.len != 0;
     const row_semantics = @import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
     const gated = req.req.commit_requires == .direct_enrichments;
@@ -2861,8 +3276,10 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
+    try appendProducerMarker(alloc, &out, producer);
     try out.append(alloc, '}');
     if (gated or guarded or row_semantics) try out.append(alloc, ']');
+    if (producer != .unlabelled) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2980,12 +3397,14 @@ pub fn encodeTxnStatusResponse(alloc: std.mem.Allocator, response: TxnStatusResp
 }
 
 pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBeginRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
-    const obj = switch (parsed.value) {
+    const envelope = try unwrapProducerEnvelope(parsed.value, "producer-begin-v1");
+    const obj = switch (envelope.root) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    try requireProducerMarker(obj, envelope.producer);
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const begin_timestamp = try requireU64(obj, "begin_timestamp");
     const participants_value = obj.get("participants") orelse return error.InvalidTxnRequest;
@@ -3008,6 +3427,7 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
     }
     const restore_scope = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null;
     return .{
+        .source_producer = envelope.producer,
         .txn_id = txn_id,
         .begin_timestamp = begin_timestamp,
         .restore_staging_scope = restore_scope,
@@ -3028,23 +3448,25 @@ pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void
 }
 
 pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPrepareRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false, .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
-    const wrapped = parsed.value == .array;
+    const envelope = try unwrapProducerEnvelope(parsed.value, "producer-prepare-v1");
+    const wrapped = envelope.root == .array;
     var row_semantics = false;
     var gated = false;
     const root = if (wrapped) blk: {
-        const entries = parsed.value.array.items;
+        const entries = envelope.root.array.items;
         if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
         gated = std.mem.eql(u8, entries[0].string, "prepared-enrichments-prepare-v1");
         row_semantics = gated or std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
         if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
-    } else parsed.value;
+    } else envelope.root;
     const obj = switch (root) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    try requireProducerMarker(obj, envelope.producer);
     var extensions = try std.json.parseFromValue(PrepareExtensions, alloc, root, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer extensions.deinit();
     const ext = extensions.value;
@@ -3102,6 +3524,8 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
+            .completion_ordinary_producer = envelope.producer == .ordinary,
+            .completion_legacy_producer = envelope.producer == .legacy_cdc,
             .commit_requires = ext.commit_requires,
             .row_policy_principal_proof = ext.row_policy_principal_proof,
             .row_policy_database = ext.row_policy_database,
@@ -5927,7 +6351,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 2), fully_begun.acknowledgement_count);
         }
 
-        test "distributed txn coordinator groups by range and commits all participants" {
+        test "data raft ordered history distributed txn coordinator groups by range and commits all participants" {
             const FakeCatalog = struct {
                 var snapshots: usize = 0;
                 fn iface() table_catalog.CatalogSource {
@@ -5964,6 +6388,9 @@ fn consumerTests() type {
             };
 
             const Recorder = struct {
+                reject_origin: bool = false,
+                ambiguous_labelled_begin: bool = false,
+                status_calls: usize = 0,
                 begins: std.ArrayListUnmanaged(u64) = .empty,
                 prepares: std.ArrayListUnmanaged(u64) = .empty,
                 read_only_prepares: usize = 0,
@@ -5990,6 +6417,7 @@ fn consumerTests() type {
 
                 fn worker(self: *@This()) ParticipantWorker {
                     return .{
+                        .supports_transaction_producers = self.ambiguous_labelled_begin,
                         .ptr = self,
                         .vtable = &.{
                             .begin_group = begin,
@@ -6003,6 +6431,8 @@ fn consumerTests() type {
 
                 fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnBeginRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.reject_origin) return error.SourceTransactionIdentityConflict;
+                    if (self.ambiguous_labelled_begin) return error.UnexpectedHttpStatus;
                     try std.testing.expectEqual(@as(usize, if (self.includes_audit) 3 else 2), req.participants.len);
                     if (self.includes_audit) {
                         try std.testing.expectEqualStrings("table2:00000004:docs:7002", req.participants[0]);
@@ -6062,8 +6492,10 @@ fn consumerTests() type {
                     });
                 }
 
-                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
-                    return .pending;
+                fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.status_calls += 1;
+                    return if (self.reject_origin or self.ambiguous_labelled_begin) .committed else .pending;
                 }
 
                 fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -6075,6 +6507,45 @@ fn consumerTests() type {
                     try self.acknowledgements.append(std.testing.allocator, group_id);
                 }
             };
+
+            const a = std.testing.allocator;
+            {
+                var rejected: Recorder = .{ .reject_origin = true };
+                defer rejected.deinit(a);
+                try std.testing.expectError(error.SourceTransactionIdentityConflict, executeMultiTableCommitWithOptions(a, FakeCatalog.iface(), rejected.worker(), @splat(29), 100, 101, &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }}, .write, null, .{ .retain_terminal = true }));
+                try std.testing.expectEqual(@as(usize, 0), rejected.status_calls);
+                try std.testing.expectEqual(@as(usize, 0), rejected.prepares.items.len);
+                try std.testing.expectEqual(@as(usize, 0), rejected.resolves.items.len);
+            }
+            for ([_]@FieldType(db_mod.types.BatchRequest, "source_producer"){ .ordinary, .legacy_cdc }) |producer| {
+                const labelled = [_]TableCommitRequest{.{ .table_name = "docs", .source_producer = producer, .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }};
+                var routed = try routeCommitParticipants(a, FakeCatalog.iface(), &labelled);
+                defer {
+                    for (routed.items) |*participant| participant.deinit(a);
+                    routed.deinit(a);
+                }
+                try std.testing.expectEqual(@as(usize, 2), routed.items.len);
+                for (routed.items) |*participant| {
+                    try std.testing.expectEqual(producer, participant.source_producer);
+                    const intent = participant.intentRequest();
+                    try std.testing.expectEqual(producer == .ordinary, intent.completion_ordinary_producer);
+                    try std.testing.expectEqual(producer == .legacy_cdc, intent.completion_legacy_producer);
+                }
+                {
+                    var ambiguous: Recorder = .{ .ambiguous_labelled_begin = true };
+                    defer ambiguous.deinit(a);
+                    try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(a, FakeCatalog.iface(), ambiguous.worker(), @splat(28), 10, 11, &labelled, .write, null, .{ .retain_terminal = true }));
+                    try std.testing.expectEqual(@as(usize, 0), ambiguous.status_calls);
+                    try std.testing.expectEqual(@as(usize, 0), ambiguous.prepares.items.len);
+                    try std.testing.expectEqual(@as(usize, 0), ambiguous.resolves.items.len);
+                }
+                var untouched = Recorder{};
+                defer untouched.deinit(a);
+                try std.testing.expectError(error.ChangefeedCapabilityUnsupported, executeMultiTableCommitWithOptions(a, FakeCatalog.iface(), untouched.worker(), @splat(2), 10, 11, &labelled, .write, null, .{}));
+                try std.testing.expectEqual(@as(usize, 0), untouched.begins.items.len);
+            }
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, routeCommitParticipants(a, undefined, &.{ .{ .table_name = "docs", .source_producer = .ordinary }, .{ .table_name = "other" } }));
+            try std.testing.expectError(error.InvalidSourceAdmission, routeCommitParticipants(a, undefined, &.{.{ .table_name = "docs", .source_producer = .scoped_source }}));
 
             var recorder = Recorder{};
             defer recorder.deinit(std.testing.allocator);
@@ -7572,4 +8043,75 @@ test "distributed txn prepare retains signed graph mutations and normalized rows
     var decoded = try parseTxnPrepareRequest(alloc, encoded);
     defer freeTxnPrepareRequest(alloc, &decoded);
     try std.testing.expectEqualDeep(request.req, decoded.req);
+}
+
+test "distributed txn producer RPC envelopes preserve origin through nested row semantics and refuse downgrade" {
+    const a = std.testing.allocator;
+    for ([_]TransactionProducer{ .ordinary, .legacy_cdc }) |producer| {
+        const begin: TxnBeginRequest = .{ .source_producer = producer, .txn_id = @splat(19), .begin_timestamp = 100, .topology_epoch = 3, .participants = &.{"participant"}, .restore_staging_scope = @splat(21), .restore_staging_plan_id = @splat(22) };
+        const begin_bytes = try encodeTxnBeginRequest(a, begin);
+        defer a.free(begin_bytes);
+        var begin_decoded = try parseTxnBeginRequest(a, begin_bytes);
+        defer freeTxnBeginRequest(a, &begin_decoded);
+        try std.testing.expectEqualDeep(begin, begin_decoded);
+        const prepare: TxnPrepareRequest = .{ .txn_id = begin.txn_id, .topology_epoch = begin.topology_epoch, .req = .{ .completion_ordinary_producer = producer == .ordinary, .completion_legacy_producer = producer == .legacy_cdc, .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} } };
+        const prepare_bytes = try encodeTxnPrepareRequest(a, prepare);
+        defer a.free(prepare_bytes);
+        var prepare_decoded = try parseTxnPrepareRequest(a, prepare_bytes);
+        defer freeTxnPrepareRequest(a, &prepare_decoded);
+        try std.testing.expectEqual(producer == .ordinary, prepare_decoded.req.completion_ordinary_producer);
+        try std.testing.expectEqual(producer == .legacy_cdc, prepare_decoded.req.completion_legacy_producer);
+        try std.testing.expectEqualDeep(prepare.req.writes[0].json_null_fields, prepare_decoded.req.writes[0].json_null_fields);
+        var empty = prepare;
+        empty.req.writes = &.{};
+        const empty_bytes = try encodeTxnPrepareRequest(a, empty);
+        defer a.free(empty_bytes);
+        var empty_decoded = try parseTxnPrepareRequest(a, empty_bytes);
+        defer freeTxnPrepareRequest(a, &empty_decoded);
+        try std.testing.expectEqual(producer == .ordinary, empty_decoded.req.completion_ordinary_producer);
+        try std.testing.expectEqual(producer == .legacy_cdc, empty_decoded.req.completion_legacy_producer);
+        for ([_][]const u8{ begin_bytes, prepare_bytes }, [_]bool{ true, false }) |bytes, is_begin| {
+            var json = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always });
+            defer json.deinit();
+            const inner_bytes = try std.json.Stringify.valueAlloc(a, json.value.array.items[2], .{});
+            defer a.free(inner_bytes);
+            if (is_begin)
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(a, inner_bytes))
+            else
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(a, inner_bytes));
+            json.value.array.items[1] = .{ .string = if (producer == .ordinary) "legacy_cdc" else "ordinary" };
+            const substituted = try std.json.Stringify.valueAlloc(a, json.value, .{});
+            defer a.free(substituted);
+            if (is_begin)
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(a, substituted))
+            else
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(a, substituted));
+            json.value.array.items[1] = .{ .string = @tagName(producer) };
+            const body = if (is_begin) &json.value.array.items[2] else &json.value.array.items[2].array.items[1];
+            _ = body.object.swapRemove("source_producer");
+            const stripped = try std.json.Stringify.valueAlloc(a, json.value, .{});
+            defer a.free(stripped);
+            if (is_begin)
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(a, stripped))
+            else
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(a, stripped));
+        }
+        var invalid = prepare;
+        invalid.req.completion_input_digest = @splat(1);
+        try std.testing.expectError(error.InvalidTxnRequest, encodeTxnPrepareRequest(a, invalid));
+    }
+    const older: TxnBeginRequest = .{ .txn_id = @splat(1), .begin_timestamp = 10, .participants = &.{"participant"} };
+    const bytes = try encodeTxnBeginRequest(a, older);
+    defer a.free(bytes);
+    try std.testing.expect(bytes[0] == '{');
+    var decoded = try parseTxnBeginRequest(a, bytes);
+    defer freeTxnBeginRequest(a, &decoded);
+    try std.testing.expectEqual(TransactionProducer.unlabelled, decoded.source_producer);
+    var invalid = older;
+    invalid.source_producer = .scoped_source;
+    try std.testing.expectError(error.InvalidTxnRequest, encodeTxnBeginRequest(a, invalid));
+}
+
+test "distributed txn native producers span physical participants" {
+    try @import("transaction_producer_native_test.zig").run(std.testing.allocator);
 }

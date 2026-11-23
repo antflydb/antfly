@@ -56,6 +56,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
     const authority = server.source.lakeIndexLifecycleAuthority(request_context) orelse return error.ExternalLakeIndexUnavailable;
     const state = try authority.readState(scratch, table.table_id);
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    if (request.action == .wal_gc) wal_cut = try ingestion.retainedWalFloor(scratch, root, wal_cut, now, request.retain_ms, request.keep_latest);
     for (try state.gcPublications(scratch)) |publication| {
         const building = if (state.checkpoint) |saved| saved.generation == publication.generation and std.mem.eql(u8, &saved.token, &publication.token) else false;
         const live_reader = for (state.readers) |reader| {
@@ -74,7 +75,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
     if (request.action == .vacuum) {
         const vacuum = @import("../serverless/lake_vacuum.zig");
         const protected_snapshots = try vacuum.protectOverlayAncestry(scratch, root, protected.items);
-        const result = try vacuum.run(a, binding, options, context, .{ .operation_id = request.operation_id, .dry_run = request.dry_run, .exclusive_ownership = request.exclusive_ownership, .retain_ms = request.retain_ms, .keep_latest = request.keep_latest, .max_deleted = request.max_deleted }, protected_snapshots);
+        const result = try vacuum.run(a, binding, options, context, .{ .operation_id = request.operation_id, .dry_run = request.dry_run, .exclusive_ownership = request.exclusive_ownership, .retain_ms = request.retain_ms, .keep_latest = request.keep_latest, .max_deleted = request.max_deleted, .protect_committed_history = true }, protected_snapshots);
         return .{ .body = try std.json.Stringify.valueAlloc(a, result, .{}), .mutated = !request.dry_run and result.expired_snapshots != 0 };
     }
     var opened = try ingestion.openQueue(a, binding, options);
