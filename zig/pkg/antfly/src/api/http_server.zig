@@ -14507,10 +14507,10 @@ pub const ApiHttpServer = struct {
         }, request.owner, request.sql)) orelse return null;
         defer response.deinit(self.alloc);
 
-        return try self.cloneForwardedResponse(response);
+        return try self.takeForwardedResponse(&response);
     }
 
-    fn cloneForwardedResponse(self: *ApiHttpServer, response: http_common.HttpResponse) !contextual_operations.OwnedResponse {
+    fn takeForwardedResponse(self: *ApiHttpServer, response: *http_common.HttpResponse) !contextual_operations.OwnedResponse {
         const headers = try self.alloc.alloc(contextual_operations.Header, response.headers.len + @intFromBool(response.content_type != null));
         errdefer self.alloc.free(headers);
         var initialized: usize = 0;
@@ -14519,8 +14519,6 @@ pub const ApiHttpServer = struct {
             target.* = try ownedContextualHeader(self.alloc, source.name, source.value);
             initialized += 1;
         }
-        const body = try self.alloc.dupe(u8, response.body);
-        errdefer self.alloc.free(body);
         const content_type = if (response.content_type) |value| copied: {
             // OwnedResponse releases header strings. Keep its content type in
             // that same storage until the handler has copied the header.
@@ -14531,6 +14529,12 @@ pub const ApiHttpServer = struct {
             "application/json"
         else
             "text/plain; charset=utf-8";
+        const owner = response.owner_allocator orelse self.alloc;
+        const body = if (owner.ptr == self.alloc.ptr and owner.vtable == self.alloc.vtable) body: {
+            const owned = response.body;
+            response.body = &.{};
+            break :body owned;
+        } else try self.alloc.dupe(u8, response.body);
         return .{ .status = response.status, .content_type = content_type, .body = body, .headers = headers };
     }
 
@@ -14539,7 +14543,7 @@ pub const ApiHttpServer = struct {
         const owner = try routing.owner(id);
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
-        if (self.txn_sessions.durable) |store| if (try routing.ownsLocal(store, id, kind, router.localNodeId())) return null;
+        if (self.txn_sessions.durable) |store| if (try routing.ownsLocal(store, id, kind, router.localNodeId(), &self.query_admission)) return null;
         return self.forwardSQLResourceToOwner(owner, request, forwarded, null);
     }
 
@@ -14547,7 +14551,7 @@ pub const ApiHttpServer = struct {
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
         const executor = (if (control) |value| value.executor else null) orelse self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
-        const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return null;
+        const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return error.SqlPeerUnavailable;
         defer self.alloc.free(base);
         for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, sql_peer_hop_header) and std.mem.eql(u8, header.value, sql_peer_hop_value)) return error.SqlConnectionWrongOwner;
         var headers: std.ArrayList(http_common.RequestHeader) = .empty;
@@ -14590,7 +14594,7 @@ pub const ApiHttpServer = struct {
             return sqlForwardFailure(err, delivery_state);
         };
         defer response.deinit(self.alloc);
-        return try self.cloneForwardedResponse(response);
+        return try self.takeForwardedResponse(&response);
     }
 
     pub fn sessionRoutingOwner(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !?u64 {
@@ -14665,7 +14669,7 @@ pub const ApiHttpServer = struct {
     fn sqlForwardFailure(err: anyerror, delivery: http_common.RequestDeliveryTracker.State) anyerror {
         if (delivery != .not_sent) return err;
         return switch (err) {
-            error.Canceled, error.Cancelled, error.OutOfMemory => err,
+            error.Canceled, error.Cancelled, error.DeadlineExceeded, error.OutOfMemory => err,
             else => error.SqlPeerUnavailable,
         };
     }
@@ -64143,6 +64147,7 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
     const a = std.testing.allocator;
     const Fixture = struct {
         calls: usize = 0,
+        body_ptr: ?[*]u8 = null,
         fn local(_: *anyopaque) u64 {
             return 2;
         }
@@ -64168,7 +64173,9 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
             headers[0] = .{ .name = try alloc.dupe(u8, "X-Antfly-SQL-Completion"), .value = try alloc.dupe(u8, "owner-witness") };
             const content_type = try alloc.dupe(u8, "application/vnd.antfly.sql+json");
             errdefer alloc.free(content_type);
-            return .{ .status = 200, .content_type = content_type, .body = try alloc.dupe(u8, "{}"), .headers = headers };
+            const body = try alloc.dupe(u8, "{}");
+            f.body_ptr = body.ptr;
+            return .{ .status = 200, .content_type = content_type, .body = body, .headers = headers };
         }
     };
     var fixture: Fixture = .{};
@@ -64180,6 +64187,7 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
     var response = (try server.forwardSQLResourceOperation(&handle, .connection, req, &forwarded)).?;
     defer response.deinit(a);
     try std.testing.expect(forwarded);
+    try std.testing.expect(response.body.ptr == fixture.body_ptr.?);
     try std.testing.expectEqualStrings("application/vnd.antfly.sql+json", response.content_type);
     try std.testing.expectEqualStrings("X-Antfly-SQL-Completion", response.headers[0].name);
     try std.testing.expectEqualStrings("owner-witness", response.headers[0].value);
@@ -64441,8 +64449,8 @@ test "SQL pgwire native shared resource routing checks persisted ownership" {
         defer if (response) |*value| value.deinit(a);
         try std.testing.expect(response != null and forwarded and fixture.called);
         fixture.called = false;
-        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 1));
-        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 2));
+        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 1, null));
+        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 2, null));
     }
     try std.testing.expectError(error.SqlConnectionWrongOwner, connections.load(&peer_store, a, connection, "alice", 2, 2));
     try std.testing.expectError(error.SqlPreparedWrongOwner, prepared.load(&peer_store, a, &statement, "alice", 2, 2));
@@ -64454,8 +64462,8 @@ test "SQL pgwire native shared resource routing checks persisted ownership" {
     try prepared.create(&peer_store, .{ .id = legacy_statement, .principal = "alice", .owner_node_id = 2, .expires_at_ms = 1000, .database = "main", .namespace = "public", .statement = "SELECT 1", .parameter_types = &.{}, .bindings = &.{} }, 1);
     for ([_]routing.Kind{ .connection, .prepared }) |kind| {
         const id = if (kind == .connection) legacy_connection else legacy_statement;
-        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 2));
-        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 1));
+        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 2, null));
+        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 1, null));
         var forwarded = false;
         try std.testing.expectEqual(@as(?contextual_operations.OwnedResponse, null), try peer.forwardSQLResourceOperation(&id, kind, .{ .method = .DELETE, .uri = "/db/v1/sql/resource", .body = "" }, &forwarded));
         try std.testing.expect(!forwarded and !fixture.called);

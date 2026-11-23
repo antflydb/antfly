@@ -60,10 +60,12 @@ pub fn loadReconciled(
     owner_node_id: u64,
     now_ms: u64,
     admission: ?*RequestAdmission,
+    mode: enum { reconcile, idle_only },
 ) !Owned {
     var owned = try load(store, alloc, id, principal, owner_node_id, now_ms);
     errdefer owned.deinit();
     if (owned.value.state == .idle) return owned;
+    if (mode == .idle_only) return error.SqlSessionExecutionBudgetUnsupported;
     var lease: ?RequestAdmission.Lease = null;
     defer if (lease) |*held| held.release();
     if (admission) |capacity| {
@@ -527,7 +529,14 @@ test "HTTP connection recovers a durable pre-response BEGIN fence without an esc
     try std.testing.expectEqual(record.State.beginning, fenced.value.state);
     try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .discard = id }, "alice", 7, 2));
     _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
-    var recovered = try loadReconciled(&store, &registry, std.heap.page_allocator, id, "alice", 7, 2, null);
+    try std.testing.expectError(error.SqlSessionExecutionBudgetUnsupported, loadReconciled(&store, &registry, alloc, id, "alice", 7, 2, null, .idle_only));
+    {
+        var pending = try load(&store, alloc, id, "alice", 7, 2);
+        defer pending.deinit();
+        try std.testing.expectEqual(record.State.beginning, pending.value.state);
+        try std.testing.expect(try registry.hasSession(alloc, txn_id));
+    }
+    var recovered = try loadReconciled(&store, &registry, std.heap.page_allocator, id, "alice", 7, 2, null, .reconcile);
     defer recovered.deinit();
     try std.testing.expectEqual(record.State.idle, recovered.value.state);
     try std.testing.expect(recovered.value.active_txn == null);
@@ -767,9 +776,9 @@ test "HTTP connection reconciles a durable aborted coordinator decision" {
     {
         var held = admission.tryAcquireLease().?;
         defer held.release();
-        try std.testing.expectError(error.SqlWriteCapacityUnavailable, loadReconciled(&store, &registry, alloc, id, "alice", 7, 2, &admission));
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, loadReconciled(&store, &registry, alloc, id, "alice", 7, 2, &admission, .reconcile));
     }
-    var reconciled = try loadReconciled(&store, &registry, alloc, id, "alice", 7, 2, &admission);
+    var reconciled = try loadReconciled(&store, &registry, alloc, id, "alice", 7, 2, &admission, .reconcile);
     defer reconciled.deinit();
     try std.testing.expectEqual(record.State.idle, reconciled.value.state);
     _ = try registry.cleanupExpired(alloc, std.math.maxInt(u64));

@@ -16,6 +16,7 @@
 // HTTP SQL handles carry their immutable issuer, independently of transactions.
 const std = @import("std");
 const transactions = @import("transactions.zig");
+const RequestAdmission = @import("antfly_local_sources").common_request_admission.RequestAdmission;
 pub const Kind = enum { prepared, connection };
 pub fn encode(issuer: u64, entropy: [16]u8) [32]u8 {
     var bytes = entropy;
@@ -68,28 +69,34 @@ fn ownsKey(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: []const 
 }
 // Legacy random handles may override their encoded issuer only when the
 // persisted record is owned here. Shared-store visibility does not imply ownership.
-pub fn ownsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64) !bool {
-    return readOwnership(store, id, kind, local_node_id, false);
-}
-
-pub fn probeLocalOwner(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64) !bool {
-    return readOwnership(store, id, kind, local_node_id, true);
-}
-
-fn readOwnership(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64, bounded: bool) !bool {
+pub fn ownsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64, admission: ?*RequestAdmission) !bool {
     return switch (store.backend) {
         .docstore => |backend| blk: {
             var txn = try backend.beginReadTxn();
             defer txn.abort();
-            break :blk try owns(&txn, store.alloc, id, kind, local_node_id, bounded);
+            break :blk try ownsAdmitted(&txn, store.alloc, id, kind, local_node_id, admission);
         },
         .runtime => |backend| blk: {
             var txn = try backend.beginRead();
             defer txn.abort();
-            break :blk try owns(&txn, store.alloc, id, kind, local_node_id, bounded);
+            break :blk try ownsAdmitted(&txn, store.alloc, id, kind, local_node_id, admission);
         },
     };
 }
+fn ownsAdmitted(txn: anytype, alloc: std.mem.Allocator, id: []const u8, kind: Kind, node: u64, admission: ?*RequestAdmission) !bool {
+    if (admission) |capacity| {
+        return owns(txn, alloc, id, kind, node, true) catch |err| switch (err) {
+            error.Unsupported => fallback: {
+                var lease = capacity.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+                defer lease.release();
+                break :fallback try owns(txn, alloc, id, kind, node, false);
+            },
+            else => return err,
+        };
+    }
+    return owns(txn, alloc, id, kind, node, false);
+}
+
 test "SQL pgwire native HTTP handles bind issuer and preserve entropy" {
     const id = encode(7, @splat(0xaa));
     try std.testing.expectEqual(@as(u64, 7), try owner(&id));

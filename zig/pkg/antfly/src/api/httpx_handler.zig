@@ -2252,6 +2252,7 @@ pub const AntflyApiHandler = struct {
             if ((try requestCompletion(ctx)).unknown) return try sqlForwardOutcomeUnknownResponse(ctx);
             if (err == error.SqlWriteCapacityUnavailable) return try sqlRoutingOverloadedResponse(ctx);
             if (err == error.SqlPeerUnavailable) return try sqlPeerUnavailableResponse(ctx);
+            if (err == error.DeadlineExceeded) return try sqlForwardDeadlineResponse(ctx);
             return err;
         };
     }
@@ -2363,6 +2364,7 @@ pub const AntflyApiHandler = struct {
             }
             if (err == error.SqlWriteCapacityUnavailable) return try sqlRoutingOverloadedResponse(ctx);
             if (err == error.SqlPeerUnavailable) return try sqlPeerUnavailableResponse(ctx);
+            if (err == error.DeadlineExceeded) return try sqlForwardDeadlineResponse(ctx);
             if (err == error.SqlConnectionWrongOwner) return try sqlOwnerChangedResponse(ctx);
             return err;
         };
@@ -7886,7 +7888,7 @@ pub const AntflyApiHandler = struct {
             const resource_principal = http_server_mod.transactionPrincipal(self.adapter.identity.*) orelse "";
             if (self.adapter.connection_id) |connection_id| {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
-                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms, &self.adapter.server.query_admission);
+                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms, &self.adapter.server.query_admission, if (self.has_execution_budget) .idle_only else .reconcile);
                 const connection = self.connection_owned.?.value;
                 if (connection.state == .beginning) return error.SqlConnectionBusy;
                 if ((!self.adapter.inherit_session_database and !std.mem.eql(u8, self.adapter.database, connection.database)) or
@@ -7900,7 +7902,6 @@ pub const AntflyApiHandler = struct {
                 self.adapter.connection_generation = connection.generation;
                 self.adapter.connection_revision = connection.revision;
                 if (connection.active_txn) |active| {
-                    if (self.has_execution_budget) return error.SqlSessionExecutionBudgetUnsupported;
                     self.connection_session_hex = std.fmt.bytesToHex(active, .lower);
                     if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) {
                         if (self.prepared_mode != .statement or self.parameters.len != 0 or
@@ -8191,15 +8192,7 @@ pub const AntflyApiHandler = struct {
             if (resolved.handles[i].? == local) continue;
             if (server.txn_sessions.durable) |store| {
                 const kind: routing.Kind = if (i == 0) .prepared else .connection;
-                const local_owner = routing.probeLocalOwner(store, encoded, kind, local) catch |err| switch (err) {
-                    error.Unsupported => legacy: {
-                        var read = try server.acquireSqlExecution(false);
-                        defer read.release();
-                        break :legacy try routing.ownsLocal(store, encoded, kind, local);
-                    },
-                    else => return err,
-                };
-                if (local_owner) resolved.handles[i] = local;
+                if (try routing.ownsLocal(store, encoded, kind, local, &server.query_admission)) resolved.handles[i] = local;
             }
         }
         if (handles[2]) |encoded| {
@@ -8223,6 +8216,13 @@ pub const AntflyApiHandler = struct {
             .code = "08003",
             .message = "SQL resource ownership changed; retry through the current owner.",
             .retryable = true,
+        }));
+    }
+
+    fn sqlForwardDeadlineResponse(ctx: *httpx.Context) !httpx.Response {
+        return rejectBeforeSQLExecution(ctx, try ctx.status(504).json(sql_wire.SQLDiagnostic{
+            .code = "57014",
+            .message = "Request deadline exceeded before forwarding to the SQL owner.",
         }));
     }
 
@@ -8362,7 +8362,7 @@ pub const AntflyApiHandler = struct {
         const connections = @import("sql_connections.zig");
         const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
         const node = server.localSessionNodeId();
-        var connection = try connections.loadReconciled(store, &server.txn_sessions, server.alloc, connection_id, principal, node, now_ms, &server.query_admission);
+        var connection = try connections.loadReconciled(store, &server.txn_sessions, server.alloc, connection_id, principal, node, now_ms, &server.query_admission, .reconcile);
         connection.deinit();
         try cancellation.token().check();
         _ = try connections.mutate(store, .{ .close = connection_id }, principal, node, now_ms);
@@ -8591,6 +8591,7 @@ pub const AntflyApiHandler = struct {
                 if (completion.unknown) return sqlForwardOutcomeUnknownResponse(ctx);
                 if (err == error.SqlWriteCapacityUnavailable) return sqlRoutingOverloadedResponse(ctx);
                 if (err == error.SqlPeerUnavailable) return sqlPeerUnavailableResponse(ctx);
+                if (err == error.DeadlineExceeded) return sqlForwardDeadlineResponse(ctx);
                 return err;
             };
             if (forwarded) |response| {
@@ -25053,6 +25054,17 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     defer invalid.deinit();
     try std.testing.expectEqual(@as(u16, 400), invalid.status.code);
     try std.testing.expectEqual(previous_reads, fixture.owner_reads);
+    try std.testing.expectEqual(@as(usize, 1), fixture.forwards);
+
+    _ = request.headers.remove(@import("antfly_public_limits").Execution.scan_rows_header);
+    _ = request.headers.remove(ApiHttpServer.sql_peer_hop_header);
+    var expired_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer expired_ctx.deinit();
+    @import("../request_deadline.zig").tightenPlatform(&expired_ctx, platform_time.monotonicNs() -| 1);
+    var expired = try handler.executeSQL(&expired_ctx);
+    defer expired.deinit();
+    try std.testing.expectEqual(@as(u16, 504), expired.status.code);
+    try std.testing.expect(expired.headers.get("X-Antfly-SQL-Completion") != null);
     try std.testing.expectEqual(@as(usize, 1), fixture.forwards);
 }
 
