@@ -3469,7 +3469,17 @@ pub const DocStore = struct {
         const seen = self.adopted_epoch.load(.acquire);
         if (seen == epoch) return;
         if (self.adopted_epoch.cmpxchgStrong(seen, epoch, .acq_rel, .acquire) != null) return;
-        self.next_replay_sequence_cached.store(0, .release);
+        // Raise, never lower: a writer of this store may hold a sequence it
+        // reserved from this counter and has not committed yet; reloading
+        // the committed cut beneath it would hand that sequence out again.
+        if (self.next_replay_sequence_cached.load(.acquire) != 0) {
+            const loaded = self.loadReplayNextSequenceFromStore(1);
+            while (true) {
+                const current = self.next_replay_sequence_cached.load(.acquire);
+                if (current >= loaded) break;
+                if (self.next_replay_sequence_cached.cmpxchgWeak(current, loaded, .acq_rel, .acquire) == null) break;
+            }
+        }
         self.committed_replay_next_cached.store(0, .release);
         if (self.replay_index_state.load(.monotonic) == replay_index_missing) self.replay_index_state.store(replay_index_unknown, .monotonic);
         self.retained_effects_cache.store(0, .release);

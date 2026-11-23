@@ -1375,15 +1375,25 @@ pub const WriterLane = struct {
                 // The maintenance snapshot commits index content through
                 // this lane's lease too; its publications bump the serving
                 // file's adoption epoch, and this root must then reload.
+                // Checked and pinned under the gate: a refresh that retires
+                // `likely_root` runs under it, and `collectRetired` frees an
+                // unpinned root.
+                connection.gate.mutex.lockUncancelable(io);
+                // A maintenance turn's forwarded writes and a read's in-place
+                // refresh leave the serving runtime's caches (its replay
+                // sequence among them) behind the file: only `refresh`
+                // reconciles them.
                 const take_fast_path = likely_root != null and likely_root == connection.owner.current and
+                    !connection.owner.foreground_runtime_stale and !connection.owner.writer_reopen_pending and
                     likely_root.?.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch() == likely_root.?.lite_refresh_adoption_epoch and
                     likely_root.?.immutable_query_borrows == 0 and
                     !mightNeedRefreshAdmission(connection, likely_root.?, intent);
+                if (take_fast_path) _ = likely_root.?.lane_pins.fetchAdd(1, .release);
+                connection.gate.mutex.unlock(io);
                 if (take_fast_path) {
                     const root = likely_root.?;
                     connection.current = root;
                     connection.attach(root);
-                    _ = root.lane_pins.fetchAdd(1, .release);
                     self.mutex.lockUncancelable(io);
                     self.held_lease = parked;
                     self.mutex.unlock(io);
