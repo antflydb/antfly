@@ -416,6 +416,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const inference_wasm_build_options = b.addOptions();
     inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
     inference_wasm_build_options.addOption(bool, "enable_cuda", false);
+    inference_wasm_build_options.addOption([]const u8, "cuda_libraries", "off");
     inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
     inference_wasm_build_options.addOption(bool, "enable_metal", false);
     inference_wasm_build_options.addOption(bool, "enable_native", false);
@@ -631,6 +632,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     antfly_wasm.entry = .disabled;
     antfly_wasm.rdynamic = true;
     antfly_wasm.export_memory = true;
+    // Hosted writes can stack the commit, publication, and index-replay
+    // frames in one synchronous call. Reserve their stack separately from
+    // the WebAssembly heap instead of relying on the linker's 1 MiB default.
+    antfly_wasm.stack_size = 4 * 1024 * 1024;
     const install_antfly_wasm = b.addInstallArtifact(antfly_wasm, .{
         .dest_dir = .{ .override = .prefix },
         .dest_sub_path = "antfly-wasm/antfly.wasm",

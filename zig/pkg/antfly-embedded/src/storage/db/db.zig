@@ -4161,6 +4161,7 @@ pub const DB = struct {
                 break :blk_runtime owned_backend_runtime.?.runtime;
             };
             if (opts.require_existing_catalog and opts.physical_root_mode == .filesystem_managed) {
+                if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
                 const io = backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
                 // Check before generation-lock admission can create any path.
                 try std.Io.Dir.cwd().access(io, path, .{});
@@ -52605,7 +52606,7 @@ pub const DB = struct {
         const has_text = req.full_text != null or req.full_text_queries.len != 0 or
             (!db_query_search.isDefaultMatchAll(req.query) and db_query_search.isTextQuery(req.query));
         const has_dense = req.dense != null or req.dense_queries.len != 0;
-        const can_overlap = !req.count_only and req.limit != 0 and req.aggregations_json.len == 0 and
+        const can_overlap = !builtin.single_threaded and !req.count_only and req.limit != 0 and req.aggregations_json.len == 0 and
             (!req.include_stored or db_query_search.composedDefersComponentBodies(req)) and
             has_text and has_dense and req.full_text_queries.len <= 1 and
             req.dense_queries.len <= 1 and req.sparse == null and req.sparse_queries.len == 0 and
@@ -52649,7 +52650,7 @@ pub const DB = struct {
         var executor: db_query_search.ComposedSearchExecutor = .{
             .ctx = self,
             .component_ctx = &hybrid,
-            .search_components = if (hybrid.cut != null) HybridComponents.run else null,
+            .search_components = if (comptime builtin.single_threaded) null else if (hybrid.cut != null) HybridComponents.run else null,
             .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
             .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
             .search_text_query = searchTextQueryCallback,

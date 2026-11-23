@@ -3032,7 +3032,7 @@ pub const IndexSnapshot = struct {
             }
         };
 
-        spill_disabled: bool = false,
+        spill_disabled: bool = builtin.os.tag == .freestanding,
         spill_control: query_mod.ExecutionControl = .{},
         spill_manager: ?spill.Manager = null,
 
@@ -3297,6 +3297,7 @@ pub const IndexSnapshot = struct {
         }
 
         fn buildOrdinalSpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, entry: *const SegmentEntry, offset: u32, control: query_mod.ExecutionControl) !SpillRange {
+            if (comptime builtin.os.tag == .freestanding) return error.SqlProgramLimitExceeded;
             const manager = self.spillManager(alloc, snapshot, control);
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();
@@ -3360,6 +3361,7 @@ pub const IndexSnapshot = struct {
         }
 
         fn buildKeySpill(self: *@This(), alloc: Allocator, snapshot: *const IndexSnapshot, entry: *const SegmentEntry, offset: u32, control: query_mod.ExecutionControl) !KeyRun {
+            if (comptime builtin.os.tag == .freestanding) return error.SqlProgramLimitExceeded;
             const manager = self.spillManager(alloc, snapshot, control);
             var sorter = spill.Sort.init(alloc, manager, &.{.{}}, 512 * 1024);
             defer sorter.deinit();

@@ -3477,7 +3477,7 @@ fn releasePortableWebm(raw: *anyopaque) void {
     const capture: *Capture = @ptrCast(@alignCast(raw));
     if (capture.webm_portable) |owner| owner.deinit();
 }
-fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput, budget: ?video.webm_pictures.ReplayBudget, submitted: *usize) !video.apple_webm.Receipt {
+fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput, budget: ?video.webm_pictures.ReplayBudget, submitted: *usize) anyerror!video.apple_webm.Receipt {
     capture.webm_portable = if (input) |bound| bound.continuation else null;
     if (input) |bound| if (bound.apple_continuation) |owner| {
         if (try owner.decode(reader, indexed, selected, capture, budget, submitted)) |value| return value;
