@@ -219,7 +219,7 @@ pub const ReadAhead = struct {
         const limit = self.max_request_bytes orelse @max(window, required);
         const optional = self.optionalCapacity();
         const fill: usize = @intCast(@min(window, preferred, limit, optional.bytes, self.upstream.length - start));
-        if (fill <= required or optional.requests == 0 or (!self.upstream.accepts_full_read_size and self.upstream.sparse_read_preferring == null))
+        if (fill <= required or optional.requests == 0 or (!self.upstream.accepts_full_read_size and (optional.requests == 1 or self.upstream.sparse_read_preferring == null)))
             return done + try self.readRequired(start, out[done..minimum], limit, control);
         if (self.audio_buffer == null and !self.makeAudioBuffer(window))
             return done + try self.readRequired(start, out[done..minimum], limit, control);
@@ -1136,4 +1136,30 @@ test "optional sparse reads coalesce in a separate admitted window" {
     try std.testing.expectEqual(@as(u64, 64), pool.snapshot().host_bytes);
     ahead.deinit();
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+}
+
+test "the final optional request is exact for an independently quota-limited provider" {
+    const Provider = struct {
+        fn read(_: *anyopaque, _: u64, out: []u8, _: source.Control) !usize {
+            if (out.len > 2) return error.RemoteReadBudgetExceeded;
+            @memset(out, 7);
+            return out.len;
+        }
+        fn preferred(raw: *anyopaque, offset: u64, out: []u8, _: usize, control: source.Control) !usize {
+            return read(raw, offset, out, control);
+        }
+    };
+    var marker: u8 = 0;
+    var ahead = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Provider.read, .sparse_read_preferring = Provider.preferred, .length = 128 },
+        .window_bytes = 32,
+        .max_bytes = 128,
+        .max_reads = 4,
+    };
+    defer ahead.deinit();
+    var bytes: [2]u8 = undefined;
+    try std.testing.expectEqual(bytes.len, try ReadAhead.readSparseAt(&ahead, 0, &bytes, .{ .optional_range = true }));
+    try std.testing.expectEqualSlices(u8, &.{ 7, 7 }, &bytes);
+    try std.testing.expectEqual(@as(usize, 1), ahead.optional_reads);
 }
