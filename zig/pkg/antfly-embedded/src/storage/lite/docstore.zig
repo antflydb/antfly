@@ -20210,10 +20210,12 @@ test "lite group commit rejects primary writes that depend on a rejected member"
     var first: Member = .{ .state = &shared, .fail = true };
     var second: Member = .{ .state = &shared, .fail = false };
     var first_txn = try store.beginWrite();
+    defer first_txn.abort();
     try first_txn.put("first", "value");
     try first_txn.setQueuedParticipant(first.participant());
     const first_staged = try first_txn.commitStaged();
     var second_txn = try store.beginWrite();
+    defer second_txn.abort();
     try second_txn.put("second", "value");
     try second_txn.setQueuedParticipant(second.participant());
     const second_staged = try second_txn.commitStaged();

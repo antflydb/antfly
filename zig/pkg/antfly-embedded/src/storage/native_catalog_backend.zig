@@ -377,6 +377,11 @@ pub const Backend = struct {
     scope: []const u8,
     open_options: backend_types.OpenOptions,
     state: *RcState,
+    /// The index apply guard serializes creation with ordinary writers.
+    /// Once created, the reservation also fences other write entry points
+    /// until the coordinator has completed every dependent publication.
+    writer_view_active: std.atomic.Value(bool) = .init(false),
+    writer_view_parent: ?*Backend = null,
     mutex: std.atomic.Mutex = .unlocked,
     /// Set when an externally committed write could not be applied to the
     /// in-memory mirror (`invalidateMirror`): the mirror no longer matches
@@ -419,6 +424,9 @@ pub const Backend = struct {
     /// nodes are shared with the serving backend until a write changes them.
     /// Only the host transaction may submit mutations to disk.
     pub fn forkWriterView(self: *Backend) !Backend {
+        if (self.writer_view_parent != null) return error.IndexApplyBusy;
+        if (self.writer_view_active.swap(true, .acq_rel)) return error.IndexApplyBusy;
+        errdefer self.writer_view_active.store(false, .release);
         const scope = try self.allocator.dupe(u8, self.scope);
         errdefer self.allocator.free(scope);
         const rc = try self.allocator.create(RcState);
@@ -442,6 +450,7 @@ pub const Backend = struct {
             .scope = scope,
             .open_options = self.open_options,
             .state = rc,
+            .writer_view_parent = self,
         };
     }
 
@@ -506,6 +515,7 @@ pub const Backend = struct {
         releaseState(self.allocator, self.state);
         self.mutex.unlock();
         self.allocator.free(self.scope);
+        if (self.writer_view_parent) |parent| parent.writer_view_active.store(false, .release);
         self.* = undefined;
     }
 
@@ -854,6 +864,7 @@ pub const Backend = struct {
             if (backend.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
             lockBackend(backend);
             defer backend.mutex.unlock();
+            if (!read_only and backend.writer_view_active.load(.acquire)) return error.IndexApplyBusy;
             const current = backend.state;
             const rc: *RcState = if (read_only) blk: {
                 retainState(current);
@@ -1868,6 +1879,8 @@ test "native catalog writer view isolates queued mutations from the serving root
     defer serving.close();
     var writer = try serving.forkWriterView();
     defer writer.close();
+
+    try std.testing.expectError(error.IndexApplyBusy, serving.beginWrite());
 
     try writer.applyExternallyCommittedMutations(&.{.{ .namespace = null, .key = "key", .value = "queued" }});
     var next = try writer.beginWrite();

@@ -286,6 +286,63 @@ pub const Queued = struct {
     complete: *const fn (*anyopaque, anyerror!u64) void,
 };
 
+/// Holds the private write view for one ordered run of queued publications.
+/// The index apply guard serializes preparation and completion. Validation
+/// and rejection run on the queue leader without taking that guard.
+pub fn WriterViewQueue(comptime ViewType: type) type {
+    return struct {
+        const Self = @This();
+
+        view: ?ViewType = null,
+        pending: usize = 0,
+        rejected: std.atomic.Value(bool) = .init(false),
+
+        pub fn validate(self: *const Self) !void {
+            if (self.rejected.load(.acquire)) return error.QueuedDependencyRejected;
+        }
+
+        pub fn reject(self: *Self) void {
+            self.rejected.store(true, .release);
+        }
+
+        /// Install the first view of a run. A prepare that never enqueues
+        /// must call discardIdle to release it.
+        pub fn start(self: *Self, view: ViewType) void {
+            std.debug.assert(self.pending == 0 and self.view == null);
+            std.debug.assert(!self.rejected.load(.monotonic));
+            self.view = view;
+        }
+
+        pub fn enqueued(self: *Self) void {
+            std.debug.assert(self.view != null);
+            self.pending += 1;
+        }
+
+        /// Call after installing any durable result. A failed member
+        /// poisons the remaining run so a later group cannot use its view.
+        pub fn completed(self: *Self, outcome: anyerror!u64) void {
+            std.debug.assert(self.pending != 0);
+            _ = outcome catch {
+                self.reject();
+                return self.finishMember();
+            };
+            self.finishMember();
+        }
+
+        fn finishMember(self: *Self) void {
+            self.pending -= 1;
+            self.discardIdle();
+        }
+
+        pub fn discardIdle(self: *Self) void {
+            if (self.pending != 0) return;
+            if (self.view) |*view| view.close();
+            self.view = null;
+            self.rejected.store(false, .release);
+        }
+    };
+}
+
 pub const Participant = struct {
     ptr: *anyopaque,
     queued: ?Queued = null,
@@ -615,4 +672,32 @@ test "view putIndexCatalog reaches a host transaction that implements putIndexCa
     });
     try std.testing.expectEqualStrings("idx-scope", txn.last_scope);
     try std.testing.expectEqualStrings("bytes", try txn.get("seg:1"));
+}
+
+test "writer view queue keeps a failed dependency poisoned until the run drains" {
+    const ViewType = struct {
+        closes: *usize,
+
+        pub fn close(self: *@This()) void {
+            self.closes.* += 1;
+        }
+    };
+    var closes: usize = 0;
+    var queue: WriterViewQueue(ViewType) = .{};
+    queue.start(.{ .closes = &closes });
+    queue.enqueued();
+    queue.enqueued();
+    try queue.validate();
+
+    queue.reject();
+    queue.completed(error.InjectedMemberFailure);
+    try std.testing.expectError(error.QueuedDependencyRejected, queue.validate());
+    try std.testing.expectEqual(@as(usize, 0), closes);
+
+    queue.completed(error.QueuedDependencyRejected);
+    try queue.validate();
+    try std.testing.expectEqual(@as(usize, 1), closes);
+    queue.start(.{ .closes = &closes });
+    queue.discardIdle();
+    try std.testing.expectEqual(@as(usize, 2), closes);
 }
