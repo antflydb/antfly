@@ -2517,10 +2517,17 @@ pub const CudaCompute = struct {
         roots: ?*CapturedCacheRoots = null,
         restore_prepared: bool = false,
 
+        pub fn checkPendingReadback(expected: *const CudaCompute) error{ResourceTemporarilyUnavailable}!void {
+            // The pinned event belongs to another step while it waits outside
+            // the numerical lane. Let that step reacquire and retire its slot.
+            if (expected.lighton_burst_readback.busy) return error.ResourceTemporarilyUnavailable;
+        }
+
         pub fn park(self: *ReaderEpochPark, cb: *const ops.ComputeBackend, expected: *CudaCompute, roots: *CapturedCacheRoots) !void {
             if (self.compute != null) return error.ReaderEpochAlreadyParked;
             if (cb.vtable != &scoped_run_budget_vtable or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
-            if (expected.shared_operation_owner != null or expected.run_budget == null or expected.audio_execution_active or expected.lighton_burst_readback.busy) return error.ReaderEpochBackendBusy;
+            try checkPendingReadback(expected);
+            if (expected.shared_operation_owner != null or expected.run_budget == null or expected.audio_execution_active) return error.ReaderEpochBackendBusy;
             if (expected.ctx.prepared_cache_funding != null) return error.ReaderEpochFundingStillBound;
             try roots.prepareToPark(cb, expected);
             // No active claim may refer to the module's final address. Step

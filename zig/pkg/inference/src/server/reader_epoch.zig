@@ -886,6 +886,9 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 .cuda => if (comptime build_options.enable_cuda) {
                     const norms = ctx.norm_preparation orelse return error.UnsupportedReaderEpochBackend;
                     const roots = if (ctx.captured_roots) |*value| value else return error.UnsupportedReaderEpochBackend;
+                    // Decline before unbinding or synchronizing another
+                    // step's pending readback. The errdefers release our turn.
+                    try @TypeOf(parked.cuda).checkPendingReadback(norms.expectedCudaCompute());
                     norms.unbind(cb);
                     parked.cuda.park(cb, norms.expectedCudaCompute(), roots) catch |err| {
                         // Failure has not moved backend custody. Prove the
