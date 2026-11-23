@@ -4755,6 +4755,20 @@ pub fn decoderRuntimePrepareRmsNorm(self: anytype, request: anytype) !bool {
     return true;
 }
 
+extern fn antfly_metal_retain_layer_norm_parameters(runtime: *RawMetalDecodeRuntime, slot: usize, dim: usize, weight: *?*anyopaque, bias: *?*anyopaque) bool;
+
+pub fn retainPreparedLayerNormF32(runtime: *RawMetalDecodeRuntime, slot: usize, dim: usize) !?[2]MetalTensor {
+    const shape = [_]i32{std.math.cast(i32, dim) orelse return error.InvalidTensorShape};
+    const bytes = try std.math.mul(usize, dim, @sizeOf(f32));
+    var weight: ?*anyopaque = null;
+    var bias: ?*anyopaque = null;
+    if (!antfly_metal_retain_layer_norm_parameters(runtime, slot, dim, &weight, &bias)) return null;
+    return .{
+        MetalTensor.deviceRetainedExternal(@ptrCast(runtime), weight.?, 0, bytes, &shape),
+        MetalTensor.deviceRetainedExternal(@ptrCast(runtime), bias.?, 0, bytes, &shape),
+    };
+}
+
 pub fn decoderRuntimeLayerNormBuffersInto(self: anytype, input: MetalTensor, weight: MetalTensor, bias: MetalTensor, dim: usize, eps: f32, output: MetalTensor) bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (dim == 0 or input.elemCount() % dim != 0) return false;
@@ -39727,6 +39741,13 @@ test "metal native layer norm device rows match host" {
         output.deviceByteOffset(),
     );
     try std.testing.expectEqual(@as(c_int, 0), rc);
+
+    var retained = (try retainPreparedLayerNormF32(runtime, 0, hidden)) orelse return error.MissingPreparedLayerNorm;
+    defer for (&retained) |*tensor| tensor.deinit();
+    try std.testing.expect((try retainPreparedLayerNormF32(runtime, 0, hidden / 2)) == null);
+    clearRawLayerNormSlot(&provider, 0);
+    try std.testing.expect((try retainPreparedLayerNormF32(runtime, 0, hidden)) == null);
+    try std.testing.expect(decoderRuntimeLayerNormBuffersInto(&provider, input, retained[0], retained[1], hidden, 1e-5, output));
 
     var expected = input_data;
     activations.layerNorm(&expected, &weight, &bias, hidden, 1e-5);

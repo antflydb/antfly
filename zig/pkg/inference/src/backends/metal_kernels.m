@@ -39829,6 +39829,22 @@ int antfly_metal_layer_norm_buffers(
     }
 }
 
+bool antfly_metal_retain_layer_norm_parameters(
+    termite_metal_decode_runtime *runtime, size_t slot, size_t dim, void **weight, void **bias
+) {
+    if (runtime == NULL || slot >= TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY ||
+        weight == NULL || bias == NULL || dim == 0 || dim > SIZE_MAX / sizeof(float) ||
+        antfly_metal_layer_norm_slot_prepared(runtime, slot) == 0 ||
+        runtime->layer_norm_hidden_sizes[slot] != dim) return false;
+    id<MTLBuffer> gamma = runtime->layer_norm_weight_buffers[slot];
+    id<MTLBuffer> beta = runtime->layer_norm_bias_buffers[slot];
+    const size_t bytes = dim * sizeof(float);
+    if (gamma.length < bytes || beta.length < bytes) return false;
+    *weight = (__bridge_retained void *)gamma;
+    *bias = (__bridge_retained void *)beta;
+    return true;
+}
+
 int termite_metal_decode_runtime_apply_layer_norm_device(
     termite_metal_decode_runtime *runtime,
     size_t slot,
