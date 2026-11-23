@@ -11498,7 +11498,10 @@ pub const MetadataHttpService = struct {
         const admission = hosted.sourceAdmission();
         if (state.value.artifact_control.?.current) |record| {
             try ensureCdcWorkPermit(self);
-            try @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), context);
+            @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), context) catch |err| {
+                try self.recordScopedStreamError(a, table, state.value, err, context);
+                return err;
+            };
             if (record.phase != .reserved or state.value.closing) return;
             const after = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
             defer a.free(after);
@@ -11545,16 +11548,7 @@ pub const MetadataHttpService = struct {
         defer if (snapshot) |*captured| captured.deinit(a);
         if (state.value.stream_failure) |failure| if (failure.terminal) return;
         runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, context) catch |err| {
-            if (metadata_replication_backfill.replicationErrorEndsRound(err)) return err;
-            const terminal = std.mem.eql(u8, metadata_replication_backfill.classifyReplicationError(err), "terminal");
-            if (state.value.stream_failure) |previous| {
-                if (previous.terminal == terminal and std.mem.eql(u8, previous.code, @errorName(err))) return err;
-            }
-            try self.observeScopedStreamFailure(a, table, state.value, .{
-                .code = @errorName(err),
-                .terminal = terminal,
-                .observed_at_ms = @max(1, platform_time.realtimeNs() / std.time.ns_per_ms),
-            }, context);
+            try self.recordScopedStreamError(a, table, state.value, err, context);
             return err;
         };
         if (state.value.stream_failure != null) {
@@ -11564,6 +11558,19 @@ pub const MetadataHttpService = struct {
             defer latest.deinit();
             try self.observeScopedStreamFailure(a, table, latest.value, null, context);
         }
+    }
+
+    fn recordScopedStreamError(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, err: anyerror, context: api_operation.RequestContext) !void {
+        if (state.closing or state.retired or metadata_replication_backfill.replicationErrorEndsRound(err)) return;
+        const terminal = std.mem.eql(u8, metadata_replication_backfill.classifyReplicationError(err), "terminal");
+        if (state.stream_failure) |previous| {
+            if (previous.terminal or std.mem.eql(u8, previous.code, @errorName(err))) return;
+        }
+        try self.observeScopedStreamFailure(a, table, state, .{
+            .code = @errorName(err),
+            .terminal = terminal,
+            .observed_at_ms = @max(1, platform_time.realtimeNs() / std.time.ns_per_ms),
+        }, context);
     }
 
     fn observeScopedStreamFailure(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, failure: ?@import("source_control.zig").StreamFailure, context: api_operation.RequestContext) !void {

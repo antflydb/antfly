@@ -1062,6 +1062,7 @@ pub const Session = struct {
         var observed_end = stream.initial_end_lsn;
         var feedback_ceiling = stream.resume_lsn;
         var last_keepalive = self.replicationNow();
+        var idle_poll_ms = limits.replication_poll_ms;
         const Outcome = union(enum) { input: anyerror!replication_input.Input, tick: std.Io.Cancelable!void };
         var outcomes: [2]Outcome = undefined;
         var select = std.Io.Select(Outcome).init(self.io, &outcomes);
@@ -1171,7 +1172,8 @@ pub const Session = struct {
                         last_keepalive = self.replicationNow();
                     }
                     const elapsed_ms: u32 = @intCast(@min(@as(i64, limits.replication_keepalive_ms), @divTrunc(@max(0, self.replicationNow() - last_keepalive), std.time.ns_per_ms)));
-                    const delay: u32 = if (chunks.len != 0) 0 else @min(limits.replication_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
+                    const delay: u32 = if (chunks.len != 0) 0 else @min(idle_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
+                    idle_poll_ms = if (chunks.len != 0) limits.replication_poll_ms else @min(idle_poll_ms *| 2, @max(limits.replication_poll_ms, 1000));
                     try select.concurrent(.tick, replicationTick, .{ self.io, delay });
                 },
             }

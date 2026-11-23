@@ -16034,14 +16034,26 @@ pub const RaftApplyStore = struct {
         if (try stagingGet(&txn, key)) |bytes| {
             const status = try decodeReplicationSourceStatusRecord(a, bytes);
             defer metadata_table_manager.freeReplicationSourceStatus(a, status);
-            if (source_control.isNativeBootstrapPhase(status.phase)) return false;
+            if (source_control.isNativeBootstrapPhase(status.phase) or
+                std.mem.eql(u8, status.phase, source_control.legacy_handover_phase)) return false;
         }
         return @import("../source_legacy_intake.zig").allowed(a, &txn, group_id, table_id, ordinal, definition);
     }
     pub fn nativeSourceRecoveryScope(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !?source_control.Scope {
-        var txn = try self.store.beginReadTxn();
-        defer txn.abort();
-        return @import("../source_legacy_intake.zig").find(a, &txn, group_id, table_id, ordinal, definition, .recovery);
+        const id = source_control.nativeBootstrapSourceId(table_id, ordinal, definition);
+        const raw = try self.getSourceControl(a, group_id, table_id, id);
+        defer a.free(raw);
+        var parsed = try source_control.parse(a, raw);
+        defer parsed.deinit();
+        const state = parsed.value;
+        const scope = state.scope orelse return null;
+        if (!std.meta.eql(scope.source_id, id) or scope.table_id != table_id or
+            scope.source_ordinal != ordinal or !std.meta.eql(scope.definition, definition))
+            return error.SourceBindingConflict;
+        if (scope.destination != .native or !state.scope_fencing) return null;
+        if (state.retired and (state.native_bootstrap_checkpoint == null or
+            state.checkpoint_authority.?.retirement != null)) return null;
+        return scope;
     }
 
     /// The service establishes ReadIndex before calling. Every captured field,
