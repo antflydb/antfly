@@ -45038,6 +45038,28 @@ test "LightOnOCR3 CUDA wide graph head has independent admission and never enter
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
 }
 
+test "LightOnOCR3 CUDA wide graph head projection writes its assigned buffer" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 2, 3, 5, 7 }, &.{ 2, 2 });
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&.{ 1, 0, 0, 1 }, &.{ 2, 2 });
+    defer cb.free(weight);
+    var backing = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4 * @sizeOf(f32));
+    defer backing.free(&compute.ctx);
+    const projected = try linearNoBiasWithDestination(&compute, input, weight, 2, 2, 2, false, backing);
+    const tensor = tensorFromCt(projected);
+    defer cb.free(projected);
+    try std.testing.expectEqual(backing.ptr, tensor.buffer.ptr);
+    try std.testing.expect(!tensor.owns_buffer);
+    const actual = try cb.toFloat32(projected, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 3, 5, 7 }, actual);
+}
+
 test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and refuses capture" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     var compute = try CudaCompute.testing.init(std.testing.allocator);
