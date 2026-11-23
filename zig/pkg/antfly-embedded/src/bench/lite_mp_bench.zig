@@ -25,6 +25,11 @@
 //!
 //!   lite-mp-bench --dir DIR [--workers 8] [--seconds 10] [--slots 16]
 //!                 [--mode process|thread|both] [--indexed yes|no|both]
+//!                 [--index text|sparse|dense]
+//!
+//! `--index sparse|dense` writes an authored vector per document into an
+//! external vector index instead of the full-text index; verification then
+//! checks the file only.
 
 const std = @import("std");
 
@@ -85,6 +90,7 @@ const api = struct {
 };
 
 const Mode = enum { process, thread };
+const IndexKind = enum { text, sparse, dense };
 
 const Config = struct {
     dir: []const u8 = "",
@@ -94,6 +100,7 @@ const Config = struct {
     busy_timeout_ms: u64 = 10_000,
     modes: []const Mode = &.{ .process, .thread },
     indexed: []const bool = &.{ false, true },
+    index: IndexKind = .text,
 };
 
 /// What one writer reports. Fixed size so a forked child can send it whole.
@@ -149,9 +156,12 @@ fn setup(path: [:0]const u8, cfg: Config, indexed: bool) !void {
     var deleted = false;
     _ = api.antfly_db_delete_index(handle, .fromSlice("full_text_index_v0"), &deleted);
     if (indexed) {
-        const code = api.antfly_db_add_index_json(handle, .fromSlice(
-            "{\"name\":\"matched_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
-        ));
+        const config = switch (cfg.index) {
+            .text => "{\"name\":\"matched_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+            .sparse => "{\"name\":\"vec\",\"kind\":\"sparse_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"external\\\":true}\"}",
+            .dense => "{\"name\":\"vec\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"dims\\\":8,\\\"external\\\":true}\"}",
+        };
+        const code = api.antfly_db_add_index_json(handle, .fromSlice(config));
         if (code != .ok) return error.AddIndexFailed;
     }
     var request: std.ArrayList(u8) = .empty;
@@ -181,11 +191,18 @@ fn runWorker(path: [:0]const u8, cfg: Config, indexed: bool, worker: usize) Work
     const started = nowNs();
     const deadline = started + @as(i128, @intFromFloat(cfg.seconds * std.time.ns_per_s));
     var sequence: u64 = 0;
-    var request_buf: [256]u8 = undefined;
+    var request_buf: [512]u8 = undefined;
     var token_buf: [64]u8 = undefined;
     while (nowNs() < deadline) : (sequence += 1) {
         const slot = sequence % cfg.slots;
-        const request = std.fmt.bufPrint(&request_buf, "{{\"inserts\":{{\"w{d}-{d}\":{{\"text\":\"{s}\"}}}},\"sync_level\":\"{s}\"}}", .{ worker, slot, token(&token_buf, worker, sequence), sync_level }) catch unreachable;
+        const t = token(&token_buf, worker, sequence);
+        var vector_buf: [160]u8 = undefined;
+        const embeddings: []const u8 = if (!indexed) "" else switch (cfg.index) {
+            .text => "",
+            .sparse => std.fmt.bufPrint(&vector_buf, ",\"_embeddings\":{{\"vec\":{{\"indices\":[{d},{d}],\"values\":[1.0,0.5]}}}}", .{ worker * 1000 + slot, sparseSequenceDim(sequence) }) catch unreachable,
+            .dense => std.fmt.bufPrint(&vector_buf, ",\"_embeddings\":{{\"vec\":[{d},1,0,0,0,0,0,{d}]}}", .{ worker + 1, sequence % 13 }) catch unreachable,
+        };
+        const request = std.fmt.bufPrint(&request_buf, "{{\"inserts\":{{\"w{d}-{d}\":{{\"text\":\"{s}\"{s}}}}},\"sync_level\":\"{s}\"}}", .{ worker, slot, t, embeddings, sync_level }) catch unreachable;
         const code = batch(handle, request);
         switch (code) {
             .ok => {
@@ -265,9 +282,24 @@ const Verification = struct {
     searches_failed: u64 = 0,
 };
 
+/// The sparse dimension unique to one write's sequence (mod 997).
+fn sparseSequenceDim(sequence: u64) u64 {
+    return 100000 + sequence % 997;
+}
+
 fn found(handle: ?*anyopaque, search_token: []const u8, key: []const u8) !bool {
     var query_buf: [256]u8 = undefined;
     const query = try std.fmt.bufPrint(&query_buf, "{{\"full_text_search\":{{\"match\":{{\"field\":\"text\",\"text\":\"{s}\"}}}},\"limit\":16}}", .{search_token});
+    return responseHasKey(handle, query, key);
+}
+
+fn foundSparse(handle: ?*anyopaque, dim: u64, key: []const u8) !bool {
+    var query_buf: [256]u8 = undefined;
+    const query = try std.fmt.bufPrint(&query_buf, "{{\"embeddings\":{{\"vec\":{{\"indices\":[{d}],\"values\":[1.0]}}}},\"indexes\":[\"vec\"],\"limit\":256}}", .{dim});
+    return responseHasKey(handle, query, key);
+}
+
+fn responseHasKey(handle: ?*anyopaque, query: []const u8, key: []const u8) !bool {
     var response: c.Buffer = .{};
     defer api.antfly_buffer_free_zero(&response);
     if (api.antfly_db_search_json(handle, .fromSlice(query), &response) != .ok) return error.SearchFailed;
@@ -288,6 +320,27 @@ fn verify(path: [:0]const u8, cfg: Config, indexed: bool, results: []const Worke
         if (!out.valid and report.ptr != null) std.debug.print("check report: {s}\n", .{report.ptr.?[0..@min(report.len, 4000)]});
     }
     if (!indexed) return out;
+    if (cfg.index == .dense) {
+        // Every key is a single vector: a stale copy shows up as the key
+        // appearing twice in a query that returns them all.
+        var response: c.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&response);
+        const query = "{\"embeddings\":{\"vec\":[1,1,0,0,0,0,0,0]},\"indexes\":[\"vec\"],\"limit\":1024}";
+        if (api.antfly_db_search_json(handle, .fromSlice(query), &response) != .ok) {
+            out.searches_failed += 1;
+            return out;
+        }
+        const body = response.ptr.?[0..response.len];
+        var key_buf: [32]u8 = undefined;
+        for (results, 0..) |result, worker| for (0..cfg.slots) |slot| {
+            if (result.last[slot] == 0) continue;
+            const key = try std.fmt.bufPrint(&key_buf, "\"w{d}-{d}\"", .{ worker, slot });
+            const count = std.mem.count(u8, body, key);
+            if (count == 0) out.missing += 1;
+            if (count > 1) out.stale += 1;
+        };
+        return out;
+    }
     var key_buf: [32]u8 = undefined;
     var token_buf: [64]u8 = undefined;
     for (results, 0..) |result, worker| {
@@ -296,12 +349,13 @@ fn verify(path: [:0]const u8, cfg: Config, indexed: bool, results: []const Worke
             if (last == 0) continue;
             const key = try std.fmt.bufPrint(&key_buf, "w{d}-{d}", .{ worker, slot });
             const newest = last - 1;
-            if (!(found(handle, token(&token_buf, worker, newest), key) catch blk: {
+            const sparse = cfg.index == .sparse;
+            if (!((if (sparse) foundSparse(handle, sparseSequenceDim(newest), key) else found(handle, token(&token_buf, worker, newest), key)) catch blk: {
                 out.searches_failed += 1;
                 break :blk true;
             })) out.missing += 1;
             if (newest >= cfg.slots) {
-                if (found(handle, token(&token_buf, worker, newest - cfg.slots), key) catch blk: {
+                if ((if (sparse) foundSparse(handle, sparseSequenceDim(newest - cfg.slots), key) else found(handle, token(&token_buf, worker, newest - cfg.slots), key)) catch blk: {
                     out.searches_failed += 1;
                     break :blk false;
                 }) out.stale += 1;
@@ -336,8 +390,8 @@ fn runConfig(cfg: Config, mode: Mode, indexed: bool, ordinal: usize) !bool {
     const passed = v.valid and v.missing == 0 and v.stale == 0 and v.searches_failed == 0 and total.stalled == 0 and total.other == 0 and total.busy == 0;
     const first_error: [*:0]const u8 = if (total.first_error > 0) c.errorCodeName(total.first_error) else if (total.first_error < 0) "WORKER_FAILED" else "";
     std.debug.print(
-        "{{\"mode\":\"{s}\",\"indexed\":{},\"workers\":{d},\"seconds\":{d:.1},\"writes\":{d},\"writes_per_sec\":{d:.0},\"busy\":{d},\"stalled\":{d},\"other\":{d},\"first_error\":\"{s}\",\"valid\":{},\"missing\":{d},\"stale\":{d},\"search_failures\":{d},\"passed\":{}}}\n",
-        .{ @tagName(mode), indexed, cfg.workers, elapsed_s, total.ok, @as(f64, @floatFromInt(total.ok)) / elapsed_s, total.busy, total.stalled, total.other, first_error, v.valid, v.missing, v.stale, v.searches_failed, passed },
+        "{{\"mode\":\"{s}\",\"index\":\"{s}\",\"indexed\":{},\"workers\":{d},\"seconds\":{d:.1},\"writes\":{d},\"writes_per_sec\":{d:.0},\"busy\":{d},\"stalled\":{d},\"other\":{d},\"first_error\":\"{s}\",\"valid\":{},\"missing\":{d},\"stale\":{d},\"search_failures\":{d},\"passed\":{}}}\n",
+        .{ @tagName(mode), @tagName(cfg.index), indexed, cfg.workers, elapsed_s, total.ok, @as(f64, @floatFromInt(total.ok)) / elapsed_s, total.busy, total.stalled, total.other, first_error, v.valid, v.missing, v.stale, v.searches_failed, passed },
     );
     return passed;
 }
@@ -359,6 +413,8 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.slots = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, arg, "--mode")) {
             cfg.modes = if (std.mem.eql(u8, value, "process")) &.{.process} else if (std.mem.eql(u8, value, "thread")) &.{.thread} else &.{ .process, .thread };
+        } else if (std.mem.eql(u8, arg, "--index")) {
+            cfg.index = std.meta.stringToEnum(IndexKind, value) orelse return error.UnknownIndexKind;
         } else if (std.mem.eql(u8, arg, "--indexed")) {
             cfg.indexed = if (std.mem.eql(u8, value, "yes")) &.{true} else if (std.mem.eql(u8, value, "no")) &.{false} else &.{ false, true };
         } else return error.UnknownArgument;

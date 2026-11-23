@@ -3796,8 +3796,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.sparse_embeddings.len == 1 and
                 materialized_derived_batch.?.deleted_keys.len == 0 and
-                materialized_derived_batch.?.overwritten_doc_keys.len == 0 and
-                materialized_derived_batch.?.changed_artifact_keys.len == 0)
+                inlineVectorWriteOnlyTouchesItself(materialized_derived_batch.?, materialized_derived_batch.?.sparse_embeddings[0].doc_key, materialized_derived_batch.?.sparse_embeddings[0].artifact_key))
             {
                 const write = materialized_derived_batch.?.sparse_embeddings[0];
                 const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .sparse_vector };
@@ -3840,8 +3839,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.dense_embeddings.len == 1 and
                 materialized_derived_batch.?.deleted_keys.len == 0 and
-                materialized_derived_batch.?.overwritten_doc_keys.len == 0 and
-                materialized_derived_batch.?.changed_artifact_keys.len == 0)
+                inlineVectorWriteOnlyTouchesItself(materialized_derived_batch.?, materialized_derived_batch.?.dense_embeddings[0].doc_key, materialized_derived_batch.?.dense_embeddings[0].artifact_key))
             {
                 var write = materialized_derived_batch.?.dense_embeddings[0];
                 // `buildDerivedBatch` deliberately zeroes `.vector` whenever
@@ -7023,4 +7021,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
     };
+}
+
+/// An inline vector publication's batch may overwrite its own document and
+/// change its own embedding artifact (an authored vector replacing the
+/// previous one: the publication removes the old copy itself), but touch
+/// nothing else the general path would have to apply.
+fn inlineVectorWriteOnlyTouchesItself(batch: anytype, doc_key: []const u8, artifact_key: ?[]const u8) bool {
+    for (batch.overwritten_doc_keys) |key| if (!std.mem.eql(u8, key, doc_key)) return false;
+    for (batch.changed_artifact_keys) |key| {
+        const own = artifact_key orelse return false;
+        if (!std.mem.eql(u8, key, own)) return false;
+    }
+    return true;
 }
