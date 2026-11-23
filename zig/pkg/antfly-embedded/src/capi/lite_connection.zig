@@ -2921,6 +2921,17 @@ pub const Owner = struct {
     /// writers' commits raised (`SharedRedoOverlay.pageBoundThrough`).
     const in_place_refresh_enabled = true;
 
+    /// Redo history covers changes to the overlay. Physical root changes
+    /// can publish keys without any entries in that history.
+    fn sameRedoReadRoots(a: native.CheckpointSlot, b: native.CheckpointSlot) bool {
+        return a.catalog_root_page == b.catalog_root_page and
+            a.document_root_page == b.document_root_page and
+            a.document_index_root_page == b.document_index_root_page and
+            a.namespace_directory_root_page == b.namespace_directory_root_page and
+            a.index_catalog_root_page == b.index_catalog_root_page and
+            a.redo_folded_through == b.redo_folded_through;
+    }
+
     /// lite-index-write-path.md "Cross-process refresh": catches `root` up
     /// with commits other processes made since it last did, when those are
     /// redo-only and changed only what a runtime reads through the file
@@ -2942,9 +2953,13 @@ pub const Owner = struct {
         defer retained.abort();
         const since = root.lite_runtime_sequence;
         const folded_before = redo.checkpoint_sequence;
+        // Compare before adopting the overlay. Adoption may replace the
+        // local header with the probe's physical roots.
+        if (!sameRedoReadRoots(file.activeCheckpoint(), probe.activeCheckpoint())) return false;
         try file.refreshCrossProcessRedoOverlay();
         // A fold adopts records without decoding them into the overlay.
-        if (redo.checkpoint_sequence != folded_before) return false;
+        if (redo.checkpoint_sequence != folded_before or
+            !sameRedoReadRoots(file.activeCheckpoint(), probe.activeCheckpoint())) return false;
         // A slot another writer published without a fold is only visible
         // to a fresh open.
         if (probe.activeCheckpoint().page_count > file.activeCheckpoint().page_count) return false;
@@ -8854,6 +8869,24 @@ test "capi native separate writer processes keep full-text deletes at full_index
             }
         }
     }
+}
+
+test "capi redo refresh rejects physical index changes at the same page bound" {
+    const before: native.CheckpointSlot = .{
+        .document_root_page = 12,
+        .index_catalog_root_page = 16,
+        .page_count = 32,
+        .redo_folded_through = 8,
+        .commit_sequence = 10,
+    };
+    var after = before;
+    after.commit_sequence += 1;
+    try std.testing.expect(Owner.sameRedoReadRoots(before, after));
+    after.index_catalog_root_page = 17;
+    try std.testing.expect(!Owner.sameRedoReadRoots(before, after));
+    after = before;
+    after.redo_folded_through += 1;
+    try std.testing.expect(!Owner.sameRedoReadRoots(before, after));
 }
 
 // lite-index-write-path.md "Cross-process refresh": another process's
