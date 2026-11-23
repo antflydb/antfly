@@ -35,7 +35,11 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
     switch (descriptor.operation) {
         .paged_attention, .dense_attention_prefix => return false,
         .dense_attention_rows => |attention| {
-            if (attention.kind != .causal or attention.num_kv_heads == 0 or !attention.valid(descriptor)) return false;
+            if (!attention.valid(descriptor)) return false;
+            switch (attention.kind) {
+                .causal => if (attention.num_kv_heads == 0) return false,
+                .cross => if (!attention.all_keys_visible) return false,
+            }
             for (descriptor.input_shapes[0..3]) |shape| {
                 if (shape.numElements().? > std.math.maxInt(u32)) return false;
             }
@@ -11986,7 +11990,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .rms => !(self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) or
                     metal_runtime.antfly_metal_norm_clamp_ready(self.provider_impl.raw_decode_runtime) != 0,
             },
-            .dense_attention_rows => !disableRuntimeAttentionF32() and metal_runtime.antfly_metal_dense_suffix_attention_ready(self.provider_impl.raw_decode_runtime) != 0,
+            .dense_attention_rows => |attention| blk: {
+                if (disableRuntimeAttentionF32()) break :blk false;
+                const runtime = self.provider_impl.raw_decode_runtime orelse break :blk false;
+                if (attention.kind == .cross) {
+                    _ = metal_runtime.denseAttentionWorkspaceBytes(runtime, attention) catch break :blk false;
+                    break :blk true;
+                }
+                break :blk metal_runtime.antfly_metal_dense_suffix_attention_ready(runtime) != 0;
+            },
             .add_mul_scalar => metal_runtime.assignedAddMulScalarAvailable(self.provider_impl),
             .rope => |r| metal_runtime.regularRopeAvailable(self.provider_impl, r),
             else => true,
@@ -55258,6 +55270,85 @@ test "Metal planned full prompt attention consumes assigned F16 KV staging" {
             for (0..row + 1) |i| sum += v_values[i * dim + column % dim];
             try std.testing.expectApproxEqAbs(sum / @as(f32, @floatFromInt(row + 1)), actual[row * width + column], 0.005);
         }
+    }
+}
+
+test "Metal planned cross attention binds split-K workspace for one and several queries" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.metal_hosted.compute.ownedComputeBackend();
+    const functions = cb.vtable.kernels.?;
+    const dim = 64;
+    const keys = 512;
+    const Shape = @import("ml").graph.Shape;
+    const key_shape = Shape.init(.f32, &.{ keys, dim });
+    const route = @import("../execution/kernel_route.zig");
+    const zeros = try a.alloc(f32, keys * dim);
+    defer a.free(zeros);
+    @memset(zeros, 0);
+    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(zeros, &.{ keys, dim }));
+    defer cb.free(k);
+    for (zeros, 0..) |*value, index| value.* = @floatFromInt((index / dim + index % dim) % 11);
+    const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(zeros, &.{ keys, dim }));
+    defer cb.free(v);
+    for ([_]u32{ 1, 3 }) |rows| {
+        const query_shape = Shape.init(.f32, &.{ rows, dim });
+        const queries: [3 * dim]f32 = @splat(0);
+        const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(queries[0 .. rows * dim], &.{ rows, dim }));
+        defer cb.free(q);
+        const descriptor: ops.kernel_descriptor.Descriptor = .{
+            .operation = .{ .dense_attention_rows = .{ .kind = .cross, .query_rows = rows, .key_rows = keys, .num_heads = 1, .head_dim = dim, .all_keys_visible = true } },
+            .input_count = 3,
+            .input_shapes = .{ query_shape, key_shape, key_shape },
+            .output_shape = query_shape,
+        };
+        const out_bytes = rows * dim * @sizeOf(f32);
+        const bindings = [_]route.Binding{
+            .{ .imported_host = .{ .logical = query_shape, .target = .metal } },
+            .{ .imported_host = .{ .logical = key_shape, .target = .metal } },
+            .{ .imported_host = .{ .logical = key_shape, .target = .metal } },
+        };
+        var selected = (try functions.prepareKernelRoute.?(cb.ptr, .{
+            .allocator = a,
+            .implementation = .{ .context = cb.ptr, .table = cb.vtable },
+            .descriptor = &descriptor,
+            .inputs = &bindings,
+            .output = .{ .node = 1, .allocation = 0, .epoch = 0, .logical = query_shape, .writable_bytes = out_bytes },
+        })) orelse return error.MissingOwnedPreparedRoute;
+        defer selected.deinit();
+        const scratch_bytes = selected.requirements.workspace.byte_size;
+        try std.testing.expectEqual(@as(usize, rows) * 4 * 72 * @sizeOf(f32), scratch_bytes);
+        const lease = (try ops.physical_storage.Lease.create(a, cb, out_bytes)).?;
+        defer lease.release();
+        const scratch_lease = (try ops.physical_storage.Lease.create(a, cb, scratch_bytes)).?;
+        defer scratch_lease.release();
+        const output = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = &.{ rows, dim } })).?;
+        defer cb.free(output);
+        const scratch = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = scratch_lease, .shape = &.{@intCast(scratch_bytes / @sizeOf(f32))} })).?;
+        defer cb.free(scratch);
+        var invocation: ops.kernel_descriptor.Invocation = .{ .descriptor = &descriptor, .inputs = &.{ q, k, v }, .output = output, .prepared_route = &selected };
+        try std.testing.expectError(error.InvalidAssignedWorkspace, functions.runAssignedKernel.?(cb.ptr, invocation));
+        const ordinary_scratch = (try cb.allocUninitF32Shape(&.{@intCast(scratch_bytes / @sizeOf(f32))})).?;
+        defer cb.free(ordinary_scratch);
+        invocation.workspace = ordinary_scratch;
+        try std.testing.expectError(error.InvalidAssignedWorkspace, functions.runAssignedKernel.?(cb.ptr, invocation));
+        invocation.workspace = scratch;
+        try std.testing.expect(try functions.runAssignedKernel.?(cb.ptr, invocation));
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        const reference = try cb.crossAttention(q, k, v, null, 1, rows, keys, 1, dim);
+        defer cb.free(reference);
+        const expected = try cb.toFloat32(reference, a);
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+        for (0..rows) |row| for (0..dim) |lane| {
+            var sum: f32 = 0;
+            for (0..keys) |key| sum += zeros[key * dim + lane];
+            try std.testing.expectApproxEqAbs(sum / keys, actual[row * dim + lane], 0.00001);
+        };
     }
 }
 

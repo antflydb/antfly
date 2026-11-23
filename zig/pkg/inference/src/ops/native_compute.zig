@@ -53204,7 +53204,11 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
         if (binding.live_key_rows == 0 or binding.live_key_rows > descriptor.operation.dense_attention_prefix.max_key_rows) return error.InvalidAttentionShape;
         if (binding.mask) |mask| if (descriptor.operation.dense_attention_prefix.all_keys_visible or mask.len != binding.live_key_rows) return error.InvalidAttentionShape;
     }
-    const dense_rows: ?@import("../graph/backend_contracts.zig").DenseAttentionRowsBinding = if (descriptor.operation == .dense_attention_rows) (request.attention orelse return false).dense_attention_rows orelse return false else null;
+    const dense_rows: ?@import("../graph/backend_contracts.zig").DenseAttentionRowsBinding = if (descriptor.operation == .dense_attention_rows) rows: {
+        if (request.attention) |attention| if (attention.dense_attention_rows) |binding| break :rows binding;
+        if (!descriptor.operation.dense_attention_rows.all_keys_visible) return false;
+        break :rows .{};
+    } else null;
     if (dense_rows) |binding| {
         const rows = descriptor.operation.dense_attention_rows;
         if ((rows.kind == .causal or rows.all_keys_visible) and binding.mask != null) return error.InvalidAttentionShape;

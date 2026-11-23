@@ -57,6 +57,7 @@ const CapabilityReason = partition.CapabilityReason;
 /// failing inside a Metal partition.
 pub fn supportsMetalEagerGraph(op: OpCode) bool {
     return switch (op) {
+        .fused_cross_attention => |attrs| attrs.all_keys_visible and attrs.batch == 1,
         .parameter,
         .constant,
         .neg,
@@ -350,6 +351,7 @@ fn metalEagerGraphNodeHasSupportedResidentShape(query: CapabilityQuery) bool {
         .argmax => metalArgmaxHasResidentShape(query),
         .fused_sdpa => metalSdpaHasResidentShape(query),
         .fused_gqa_causal_attention => metalGqaCausalAttentionHasResidentShape(query),
+        .fused_cross_attention => @import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) != null,
         .fused_softmax, .fused_log_softmax => metalSoftmaxHasResidentShape(query),
         .convert_dtype => metalConvertDTypeHasResidentShape(query),
         else => true,

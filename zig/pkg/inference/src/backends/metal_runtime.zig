@@ -3563,8 +3563,11 @@ const DenseAttentionRows = @import("../ops/kernel_descriptor.zig").DenseAttentio
 
 pub fn denseAttentionWorkspaceBytes(runtime: *RawMetalDecodeRuntime, geometry: DenseAttentionRows) !usize {
     var bytes: usize = 0;
-    if (antfly_metal_dense_attention_workspace(runtime, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.num_kv_heads, geometry.head_dim, geometry.sliding_window, &bytes) != 0)
-        return error.InvalidAttentionShape;
+    const status = if (geometry.kind == .cross)
+        antfly_metal_cross_attention_workspace(runtime, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.head_dim, &bytes)
+    else
+        antfly_metal_dense_attention_workspace(runtime, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.num_kv_heads, geometry.head_dim, geometry.sliding_window, &bytes);
+    if (status != 0) return error.InvalidAttentionShape;
     return bytes;
 }
 
@@ -3586,6 +3589,7 @@ pub fn decoderRuntimeDenseAttentionInto(
         if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return error.InvalidTensorShape;
     }
     if (workspace) |tensor| {
+        if (geometry.kind == .cross and tensor.physicalLease() == null) return error.InvalidAssignedWorkspace;
         const device = tensor.device orelse return error.InvalidTensorShape;
         if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or tensor.isReadOnlyPhysical() or
             tensor.deviceByteOffset() != 0 or tensor.deviceByteLen() < workspace_bytes) return error.InvalidTensorShape;
@@ -3594,6 +3598,26 @@ pub fn decoderRuntimeDenseAttentionInto(
                 @import("../ops/kernel_geometry.zig").byteRangesOverlap(@intCast(operand.deviceByteOffset()), operand.deviceByteLen(), @intCast(tensor.deviceByteOffset()), workspace_bytes)) return error.InvalidAssignedAlias;
         }
     } else if (workspace_bytes != 0) return error.InvalidTensorShape;
+    if (geometry.kind == .cross) {
+        if (!geometry.all_keys_visible) return error.InvalidAttentionShape;
+        return attentionDeviceCompleted(antfly_metal_cross_attention_planned(
+            runtime,
+            q.deviceHandle(),
+            q.deviceByteOffset(),
+            k.deviceHandle(),
+            k.deviceByteOffset(),
+            v.deviceHandle(),
+            v.deviceByteOffset(),
+            geometry.query_rows,
+            geometry.key_rows,
+            geometry.num_heads,
+            geometry.head_dim,
+            out.deviceHandle(),
+            out.deviceByteOffset(),
+            if (workspace) |tensor| tensor.deviceHandle() else null,
+            workspace_bytes,
+        ));
+    }
     try attentionDeviceCompleted(antfly_metal_dense_attention_planned(
         runtime,
         q.deviceHandle(),
@@ -21364,6 +21388,8 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32(
     total_sequence_len: usize,
     output: [*c]f32,
 ) c_int;
+extern fn antfly_metal_cross_attention_workspace(runtime: *RawMetalDecodeRuntime, queries: usize, keys: usize, heads: usize, dim: usize, bytes: *usize) c_int;
+extern fn antfly_metal_cross_attention_planned(runtime: *RawMetalDecodeRuntime, q: ?*anyopaque, qo: usize, k: ?*anyopaque, ko: usize, v: ?*anyopaque, vo: usize, queries: usize, keys: usize, heads: usize, dim: usize, output: ?*anyopaque, output_offset: usize, workspace: ?*anyopaque, workspace_bytes: usize) c_int;
 pub extern fn antfly_metal_dense_suffix_attention_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
 extern fn antfly_metal_dense_attention_workspace(runtime: *RawMetalDecodeRuntime, q_rows: usize, k_rows: usize, heads: usize, kv_heads: usize, head_dim: usize, window: usize, bytes: *usize) c_int;
 extern fn antfly_metal_dense_attention_planned(runtime: *RawMetalDecodeRuntime, q: ?*anyopaque, qo: usize, k: ?*anyopaque, ko: usize, v: ?*anyopaque, vo: usize, q_rows: usize, k_rows: usize, heads: usize, kv_heads: usize, head_dim: usize, window: usize, out: ?*anyopaque, oo: usize, workspace: ?*anyopaque, workspace_offset: usize, workspace_bytes: usize) c_int;

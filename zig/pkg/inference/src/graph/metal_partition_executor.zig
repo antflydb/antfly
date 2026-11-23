@@ -21865,14 +21865,20 @@ test "metal partition executor resident zero tensor materializes without fallbac
 }
 
 test "metal partition executor resident gqa attention uses command path" {
-    try qualifyResidentGqaAttention(false);
+    try qualifyResidentAttention(.gqa);
 }
 
 test "Metal partition executes functional GQA suffix into the planned output" {
-    try qualifyResidentGqaAttention(true);
+    try qualifyResidentAttention(.suffix);
 }
 
-fn qualifyResidentGqaAttention(comptime suffix: bool) !void {
+test "Metal partition executes fixed all-valid cross attention into the planned output" {
+    try qualifyResidentAttention(.cross);
+}
+
+fn qualifyResidentAttention(comptime mode: enum { gqa, suffix, cross }) !void {
+    const suffix = mode == .suffix;
+    const cross = mode == .cross;
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -21883,7 +21889,7 @@ fn qualifyResidentGqaAttention(comptime suffix: bool) !void {
 
     const batch: usize = 1;
     const seq_len: usize = if (suffix) 2 else 1;
-    const key_rows: usize = if (suffix) 4 else seq_len;
+    const key_rows: usize = if (suffix or cross) 4 else seq_len;
     const num_heads: usize = if (suffix) 2 else 1;
     const num_kv_heads: usize = 1;
     const head_dim: usize = if (suffix) 2 else 4;
@@ -21893,7 +21899,14 @@ fn qualifyResidentGqaAttention(comptime suffix: bool) !void {
     const k = try b.parameter("k", ml.graph.Shape.init(.f32, &.{ key_rows, kv_dim }));
     const v = try b.parameter("v", ml.graph.Shape.init(.f32, &.{ key_rows, kv_dim }));
     const attn = try g.addNode(.{
-        .op = .{ .fused_gqa_causal_attention = .{
+        .op = if (cross) .{ .fused_cross_attention = .{
+            .batch = batch,
+            .dec_seq = seq_len,
+            .enc_seq = key_rows,
+            .num_heads = num_heads,
+            .head_dim = head_dim,
+            .all_keys_visible = true,
+        } } else .{ .fused_gqa_causal_attention = .{
             .batch = @intCast(batch),
             .seq_len = @intCast(seq_len),
             .kv_seq_len = @intCast(key_rows),
@@ -21938,7 +21951,12 @@ fn qualifyResidentGqaAttention(comptime suffix: bool) !void {
     defer cb.free(q_ct);
     const k_ct = try cb.fromFloat32Shape(&k_values, &.{ key_rows, kv_dim });
     defer cb.free(k_ct);
-    const v_ct = try cb.fromFloat32Shape(if (suffix) &.{ 1, 2, 3, 4, 5, 6, 7, 8 } else &.{ 5, 6, 7, 8 }, &.{ key_rows, kv_dim });
+    const key_values: []const f32 = switch (mode) {
+        .gqa => &.{ 5, 6, 7, 8 },
+        .suffix => &.{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .cross => &.{ 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6, 4, 5, 6, 7 },
+    };
+    const v_ct = try cb.fromFloat32Shape(key_values, &.{ key_rows, kv_dim });
     defer cb.free(v_ct);
     const q_dev = (try makeMetalDeviceResident(&cb, q_ct)) orelse return error.SkipZigTest;
     defer cb.free(q_dev);
@@ -22003,8 +22021,13 @@ fn qualifyResidentGqaAttention(comptime suffix: bool) !void {
 
     const raw = try cb.toFloat32(values[out_index].?, allocator);
     defer allocator.free(raw);
-    if (suffix) try std.testing.expectEqual(@as(u64, 1), exec_stats.assigned_kernel_dispatches);
-    try std.testing.expectEqualSlices(f32, if (suffix) &.{ 4, 5, 4, 5, 6, 7, 6, 7 } else &.{ 5, 6, 7, 8 }, raw);
+    if (suffix or cross) try std.testing.expectEqual(@as(u64, 1), exec_stats.assigned_kernel_dispatches);
+    const expected: []const f32 = switch (mode) {
+        .gqa => &.{ 5, 6, 7, 8 },
+        .suffix => &.{ 4, 5, 4, 5, 6, 7, 6, 7 },
+        .cross => &.{ 2.5, 3.5, 4.5, 5.5 },
+    };
+    try std.testing.expectEqualSlices(f32, expected, raw);
 }
 
 fn putTestQuantizedWeight(

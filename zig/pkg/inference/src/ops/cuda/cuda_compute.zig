@@ -40322,17 +40322,17 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
     var keys = plan.keys;
     var mask: ?[]const i64 = null;
     if (!plan.grouped) {
-        const attention = request.attention orelse return false;
         switch (descriptor.operation) {
             .dense_attention_prefix => {
-                const binding = attention.dense_attention_prefix orelse return false;
+                const binding = (request.attention orelse return false).dense_attention_prefix orelse return false;
                 if (binding.live_key_rows == 0 or binding.live_key_rows > keys) return error.InvalidAttentionShape;
                 if (binding.mask) |values| if (plan.mask_bytes == 0 or values.len != binding.live_key_rows) return error.InvalidAttentionShape;
                 keys = binding.live_key_rows;
                 mask = binding.mask;
             },
-            .dense_attention_rows => {
-                const binding = attention.dense_attention_rows orelse return false;
+            .dense_attention_rows => |geometry| {
+                const provided = if (request.attention) |attention| attention.dense_attention_rows else null;
+                const binding = provided orelse if (geometry.all_keys_visible) .{} else return false;
                 if (plan.mask_bytes == 0 and binding.mask != null) return error.InvalidAttentionShape;
                 if (binding.mask) |values| if (values.len != keys) return error.InvalidAttentionShape;
                 mask = binding.mask;

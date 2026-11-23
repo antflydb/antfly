@@ -36974,6 +36974,45 @@ static void antfly_metal_bind_attention_key_mask(id<MTLComputeCommandEncoder> en
     }
 }
 
+enum { ANTFLY_METAL_ATTENTION_SPLIT_CHUNK = 128, ANTFLY_METAL_ATTENTION_SPLIT_WORDS = 72 };
+
+typedef struct {
+    bool single_query;
+    bool split;
+    bool split_multi;
+    size_t split_count;
+    size_t per_query_bytes;
+    size_t partial_bytes;
+} antfly_metal_short_attention_schedule;
+
+static bool antfly_metal_select_short_attention_schedule(termite_metal_decode_runtime *runtime,
+    size_t batch, size_t queries, size_t keys, size_t heads, size_t dim,
+    antfly_metal_short_attention_schedule *schedule) {
+    *schedule = (antfly_metal_short_attention_schedule){0};
+    if (!runtime->attention_1x_hd64_enabled || dim != 64u || keys > 2048u) return true;
+    schedule->single_query = queries == 1u && runtime->attention_f32_decode_1x_hd64_pipeline != nil;
+    if (!runtime->attention_1x_split_enabled || keys < 256u) return true;
+    schedule->split = schedule->single_query;
+    // A short block of queries uses a distinct partials region per query.
+    schedule->split_multi = queries > 1u && queries <= 32u && batch == 1u &&
+        runtime->attention_f32_decode_1x_hd64_split_stage_pipeline != nil &&
+        runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline != nil;
+    if (!schedule->split && !schedule->split_multi) return true;
+    schedule->split_count = (keys + ANTFLY_METAL_ATTENTION_SPLIT_CHUNK - 1u) / ANTFLY_METAL_ATTENTION_SPLIT_CHUNK;
+    return termite_metal_size_mul(heads, schedule->split_count * ANTFLY_METAL_ATTENTION_SPLIT_WORDS * sizeof(float), &schedule->per_query_bytes) &&
+        termite_metal_size_mul(schedule->per_query_bytes, schedule->split_multi ? queries : batch, &schedule->partial_bytes);
+}
+
+int antfly_metal_cross_attention_workspace(termite_metal_decode_runtime *runtime,
+    size_t queries, size_t keys, size_t heads, size_t dim, size_t *bytes) {
+    if (runtime == NULL || runtime->attention_f32_pipeline == nil || bytes == NULL ||
+        queries == 0 || keys == 0 || heads == 0 || dim == 0) return -1;
+    antfly_metal_short_attention_schedule schedule;
+    if (!antfly_metal_select_short_attention_schedule(runtime, 1, queries, keys, heads, dim, &schedule)) return -10;
+    *bytes = schedule.partial_bytes;
+    return 0;
+}
+
 static int antfly_metal_apply_attention_f32_device_batched(
     termite_metal_decode_runtime *runtime,
     void *q_handle,
@@ -36995,7 +37034,10 @@ static int antfly_metal_apply_attention_f32_device_batched(
     void *output_handle,
     size_t output_offset,
     const uint8_t *key_mask,
-    size_t key_mask_bytes
+    size_t key_mask_bytes,
+    bool planned_storage,
+    void *workspace_handle,
+    size_t workspace_bytes
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || output_handle == NULL) return -1;
     if (runtime->attention_f32_pipeline == nil) return -2;
@@ -37029,6 +37071,18 @@ static int antfly_metal_apply_attention_f32_device_batched(
             !termite_metal_buffer_range_valid(k_buffer, k_offset, kv_bytes) ||
             !termite_metal_buffer_range_valid(v_buffer, v_offset, kv_bytes) ||
             !termite_metal_buffer_range_valid(output_buffer, output_offset, q_bytes)) return -7;
+
+        antfly_metal_short_attention_schedule schedule;
+        if (!antfly_metal_select_short_attention_schedule(runtime, batch, q_len, kv_len, num_heads, head_dim, &schedule)) return -10;
+        id<MTLBuffer> split_partials = nil;
+        if (planned_storage) {
+            if (key_mask != NULL || workspace_bytes != schedule.partial_bytes ||
+                (workspace_handle != NULL) != (workspace_bytes != 0)) return -10;
+            if (workspace_handle != NULL) {
+                split_partials = (__bridge id<MTLBuffer>)workspace_handle;
+                if (!termite_metal_buffer_range_valid(split_partials, 0, workspace_bytes)) return -10;
+            }
+        }
 
         id<MTLBuffer> key_mask_buffer = nil;
         if (key_mask) {
@@ -37069,42 +37123,28 @@ static int antfly_metal_apply_attention_f32_device_batched(
         const BOOL planned_encoder = (encoder != nil);
         if (!planned_encoder) encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
         if (encoder == nil) return -9;
-        const BOOL use_decode_1x_hd64 = runtime->attention_1x_hd64_enabled != 0 &&
-            runtime->attention_f32_decode_1x_hd64_pipeline != nil &&
-            q_len == 1u && head_dim == 64u && kv_len <= 2048u;
-        const size_t split_chunk = 128u;
-        const size_t split_count = (kv_len + split_chunk - 1u) / split_chunk;
-        BOOL use_split = use_decode_1x_hd64 && runtime->attention_1x_split_enabled != 0 && kv_len >= 256u;
-        if (use_split) {
-            const size_t partial_bytes = batch * num_heads * split_count * 72u * sizeof(float);
+        const bool use_decode_1x_hd64 = schedule.single_query;
+        bool use_split = schedule.split;
+        const bool use_split_multi = schedule.split_multi;
+        const size_t split_chunk = ANTFLY_METAL_ATTENTION_SPLIT_CHUNK;
+        const size_t split_count = schedule.split_count;
+        const size_t per_query_bytes = schedule.per_query_bytes;
+        if (!planned_storage && schedule.partial_bytes != 0) {
+            const size_t partial_bytes = schedule.partial_bytes;
             if (runtime->attention_split_partials_buffer == nil || runtime->attention_split_partials_capacity < partial_bytes) {
                 id<MTLBuffer> partials = antfly_observe_metal_buffer([runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
                 if (partials != nil) {
                     runtime->attention_split_partials_buffer = partials;
                     runtime->attention_split_partials_capacity = partial_bytes;
+                } else if (use_split_multi) {
+                    return -10;
                 } else {
                     use_split = NO;
                 }
             }
         }
-        // A short block of queries (the decoder prompt) against a long
-        // resident K/V: run the split-K single-query kernel once per query
-        // row, each with its own partials region. The generic kernel would
-        // walk every key serially per query row.
-        const BOOL use_split_multi = !use_decode_1x_hd64 && batch == 1u &&
-            runtime->attention_1x_hd64_enabled != 0 && runtime->attention_1x_split_enabled != 0 &&
-            runtime->attention_f32_decode_1x_hd64_split_stage_pipeline != nil &&
-            runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline != nil &&
-            q_len > 1u && q_len <= 32u && head_dim == 64u && kv_len >= 256u && kv_len <= 2048u;
+        if (!planned_storage && (use_split || use_split_multi)) split_partials = runtime->attention_split_partials_buffer;
         if (use_split_multi) {
-            const size_t per_query_bytes = num_heads * split_count * 72u * sizeof(float);
-            const size_t partial_bytes = per_query_bytes * q_len;
-            if (runtime->attention_split_partials_buffer == nil || runtime->attention_split_partials_capacity < partial_bytes) {
-                id<MTLBuffer> partials = antfly_observe_metal_buffer([runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
-                if (partials == nil) return -10;
-                runtime->attention_split_partials_buffer = partials;
-                runtime->attention_split_partials_capacity = partial_bytes;
-            }
             const uint32_t chunk32 = (uint32_t)split_chunk;
             const uint32_t splits32 = (uint32_t)split_count;
             const size_t row_bytes = num_heads * head_dim * sizeof(float);
@@ -37114,14 +37154,14 @@ static int antfly_metal_apply_attention_f32_device_batched(
                 qparams.query_position_offset = (uint32_t)(query_position_offset + qi);
                 const size_t part_offset = qi * per_query_bytes;
                 antfly_metal_set_compute_pipeline(encoder, (runtime->attention_f32_decode_1x_hd64_split_stage_pipeline));
-                termite_metal_bind_four_buffers(encoder, q_buffer, q_offset + qi * row_bytes, k_buffer, k_offset, v_buffer, v_offset, runtime->attention_split_partials_buffer, part_offset, &qparams, sizeof(qparams));
+                termite_metal_bind_four_buffers(encoder, q_buffer, q_offset + qi * row_bytes, k_buffer, k_offset, v_buffer, v_offset, split_partials, part_offset, &qparams, sizeof(qparams));
                 [encoder setBytes:&chunk32 length:sizeof(chunk32) atIndex:5];
                 antfly_metal_bind_attention_key_mask(encoder, 6u, key_mask_buffer, key_mask, key_mask_bytes);
                 [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((split_chunk + 8u + 64u) * sizeof(float)) atIndex:0];
                 antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, split_count, 1), MTLSizeMake(128u, 1, 1));
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 antfly_metal_set_compute_pipeline(encoder, (runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline));
-                termite_metal_bind_two_buffers(encoder, runtime->attention_split_partials_buffer, part_offset, output_buffer, output_offset + qi * row_bytes, &qparams, sizeof(qparams));
+                termite_metal_bind_two_buffers(encoder, split_partials, part_offset, output_buffer, output_offset + qi * row_bytes, &qparams, sizeof(qparams));
                 [encoder setBytes:&splits32 length:sizeof(splits32) atIndex:3];
                 antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, 1, 1), MTLSizeMake(64u, 1, 1));
                 if (qi + 1u < q_len) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -37140,14 +37180,14 @@ static int antfly_metal_apply_attention_f32_device_batched(
             const uint32_t chunk32 = (uint32_t)split_chunk;
             const uint32_t splits32 = (uint32_t)split_count;
             antfly_metal_set_compute_pipeline(encoder, (runtime->attention_f32_decode_1x_hd64_split_stage_pipeline));
-            termite_metal_bind_four_buffers(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, runtime->attention_split_partials_buffer, 0, &params, sizeof(params));
+            termite_metal_bind_four_buffers(encoder, q_buffer, q_offset, k_buffer, k_offset, v_buffer, v_offset, split_partials, 0, &params, sizeof(params));
             [encoder setBytes:&chunk32 length:sizeof(chunk32) atIndex:5];
             antfly_metal_bind_attention_key_mask(encoder, 6u, key_mask_buffer, key_mask, key_mask_bytes);
             [encoder setThreadgroupMemoryLength:termite_metal_threadgroup_memory_16((split_chunk + 8u + 64u) * sizeof(float)) atIndex:0];
             antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, split_count, batch), MTLSizeMake(128u, 1, 1));
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             antfly_metal_set_compute_pipeline(encoder, (runtime->attention_f32_decode_1x_hd64_split_reduce_pipeline));
-            termite_metal_bind_two_buffers(encoder, runtime->attention_split_partials_buffer, 0, output_buffer, output_offset, &params, sizeof(params));
+            termite_metal_bind_two_buffers(encoder, split_partials, 0, output_buffer, output_offset, &params, sizeof(params));
             [encoder setBytes:&splits32 length:sizeof(splits32) atIndex:3];
             antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(num_heads, batch, 1), MTLSizeMake(64u, 1, 1));
             if (!planned_encoder) [encoder endEncoding];
@@ -37210,7 +37250,7 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
 ) {
     return antfly_metal_apply_attention_f32_device_batched(runtime, q_handle, q_offset, k_handle, k_offset,
         v_handle, v_offset, batch, q_len, kv_len, num_heads, num_kv_heads, head_dim,
-        query_position_offset, kv_position_offset, sliding_window, total_sequence_len, output_handle, output_offset, NULL, 0);
+        query_position_offset, kv_position_offset, sliding_window, total_sequence_len, output_handle, output_offset, NULL, 0, false, NULL, 0);
 }
 
 int antfly_metal_masked_cross_attention(termite_metal_decode_runtime *runtime,
@@ -37218,7 +37258,16 @@ int antfly_metal_masked_cross_attention(termite_metal_decode_runtime *runtime,
     size_t heads, size_t head_dim, void *out, size_t oo, const uint8_t *key_mask, size_t key_mask_bytes) {
     if (key_mask == NULL) return -7;
     return antfly_metal_apply_attention_f32_device_batched(runtime, q, qo, k, ko, v, vo, batch,
-        queries, keys, heads, heads, head_dim, 0, 0, 0, keys, out, oo, key_mask, key_mask_bytes);
+        queries, keys, heads, heads, head_dim, 0, 0, 0, keys, out, oo, key_mask, key_mask_bytes, false, NULL, 0);
+}
+
+int antfly_metal_cross_attention_planned(termite_metal_decode_runtime *runtime,
+    void *q, size_t qo, void *k, size_t ko, void *v, size_t vo, size_t queries, size_t keys,
+    size_t heads, size_t dim, void *out, size_t oo, void *workspace, size_t workspace_bytes) {
+    size_t total;
+    if (__builtin_add_overflow(keys, queries, &total)) return -5;
+    return antfly_metal_apply_attention_f32_device_batched(runtime, q, qo, k, ko, v, vo, 1,
+        queries, keys, heads, heads, dim, keys, 0, 0, total, out, oo, NULL, 0, true, workspace, workspace_bytes);
 }
 
 int termite_metal_decode_runtime_florence_window_pack_f32_device(

@@ -808,6 +808,17 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
                 else => .mean,
             }, .geometry = geometry } };
         },
+        .fused_cross_attention => |attrs| blk: {
+            if (!attrs.all_keys_visible or attrs.batch != 1 or node.num_inputs != 3) return null;
+            break :blk .{ .dense_attention_rows = .{
+                .kind = .cross,
+                .query_rows = attrs.dec_seq,
+                .key_rows = attrs.enc_seq,
+                .num_heads = attrs.num_heads,
+                .head_dim = attrs.head_dim,
+                .all_keys_visible = true,
+            } };
+        },
         .fused_gqa_causal_attention => |attrs| blk: {
             if (!attrs.functional_kv or attrs.batch != 1 or node.num_inputs != 3) return null;
             break :blk .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = attrs.seq_len, .key_rows = if (attrs.kv_seq_len == 0) attrs.seq_len else attrs.kv_seq_len, .num_heads = attrs.num_heads, .num_kv_heads = attrs.num_kv_heads, .head_dim = attrs.head_dim, .sliding_window = attrs.sliding_window orelse 0 } };
