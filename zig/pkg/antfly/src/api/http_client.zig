@@ -10017,6 +10017,12 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
             }
             if (call != .resolve_many) return error.UnexpectedCatalogCall;
             const request = call.resolve_many;
+            const tables = try alloc.alloc(?domain.ResolvedTable, request.targets.len);
+            defer alloc.free(tables);
+            for (request.targets, tables) |target, *table| {
+                try std.testing.expectEqualStrings("docs", target.table);
+                table.* = .{ .table_id = 7, .name = "docs" };
+            }
             const resolved = try alloc.alloc(?[]const u8, request.storage_names.len);
             defer alloc.free(resolved);
             for (request.storage_names, resolved) |name, *logical| {
@@ -10026,7 +10032,7 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
             const bindings = try alloc.alloc(?domain.ResolvedTable, if (request.include_storage_bindings) resolved.len else 0);
             defer alloc.free(bindings);
             for (bindings) |*binding| binding.* = .{ .table_id = 7, .name = "docs" };
-            return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 1, .tables = &.{}, .logical_names = resolved, .storage_tables = bindings }, .{});
+            return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 1, .tables = tables, .logical_names = resolved, .storage_tables = bindings }, .{});
         }
         fn freeSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
