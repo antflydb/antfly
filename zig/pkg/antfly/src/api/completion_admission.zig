@@ -269,10 +269,19 @@ pub const Coordinator = struct {
             // Every owner, complete payload, and quota reservation size has
             // been checked before the first mutation. Unknown results leave
             // retained recovery ownership; no phase is retried in this pass.
-            for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .begin, context) catch |err| {
-                std.log.debug("retained transaction begin failed group={d} err={s}", .{ item.owner.group_id, @errorName(err) });
+            // A coordinator-side non-admission fence is conclusive only
+            // when no follower can enlist before the coordinator BEGIN.
+            if (mode == .source) self.recovery.participants.submit(a, plan, prepared.coordinator_index, coordinator.fence, .begin, context) catch |err| {
+                std.log.debug("retained source coordinator begin failed group={d} err={s}", .{ coordinator.owner.group_id, @errorName(err) });
                 return error.CommitDecisionUnknown;
             };
+            for (captured, 0..) |item, index| {
+                if (mode == .source and index == prepared.coordinator_index) continue;
+                self.recovery.participants.submit(a, plan, index, item.fence, .begin, context) catch |err| {
+                    std.log.debug("retained transaction begin failed group={d} err={s}", .{ item.owner.group_id, @errorName(err) });
+                    return error.CommitDecisionUnknown;
+                };
+            }
             for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .prepare, context) catch |err| {
                 std.log.debug("retained transaction prepare failed group={d} err={s}", .{ item.owner.group_id, @errorName(err) });
                 return error.CommitDecisionUnknown;

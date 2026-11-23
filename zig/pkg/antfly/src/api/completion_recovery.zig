@@ -326,6 +326,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         omit_admin_ranges: bool = false,
         source_recovery_mode: bool = false,
         begins: usize = 0,
+        first_begin_group: ?u64 = null,
         prepares: usize = 0,
         lose_prepare_once: bool = false,
         cancelled: std.atomic.Value(bool) = .init(false),
@@ -404,6 +405,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                     try std.testing.expectEqualDeep(self.state.source_scope, begin.source_scope);
                     try std.testing.expectEqualDeep(self.state.source_purpose, begin.source_purpose);
                     try std.testing.expectEqual(self.state.created_at_ns, begin.created_at_ns);
+                    if (self.first_begin_group == null) self.first_begin_group = group;
                     self.begins += 1;
                 },
                 .prepare => |prepare| {
@@ -800,6 +802,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     fake.lose_prepare_once = true;
     const source_resolves_before_replay = fake.resolves;
     try std.testing.expectError(error.CommitDecisionUnknown, coordinator.commitSourcePrepared(a, &prepared, 20, .{}));
+    try std.testing.expectEqual(@as(?u64, owners[1].group_id), fake.first_begin_group);
     try std.testing.expectEqual(@as(usize, 2), fake.begins);
     try std.testing.expectEqual(@as(usize, 1), fake.prepares);
     try std.testing.expectEqual(source_resolves_before_replay, fake.resolves);
