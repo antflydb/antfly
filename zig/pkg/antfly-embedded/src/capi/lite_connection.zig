@@ -61,7 +61,7 @@ const PublicationCatalog = struct {
         @import("../storage/db/catalog/resolver_catalog.zig").merge_catalog_key,
         @import("../storage/db/resolver_projection.zig").epoch_key,
     };
-    inode: u64,
+    identity: inode_lock.FileIdentity,
     paths: [metadata_keys.len][]const u8,
     fingerprints: [metadata_keys.len]?[32]u8,
 
@@ -74,7 +74,12 @@ const PublicationCatalog = struct {
             const namespace = try @import("../storage/lite/embedded_catalog.zig").namespaceAlloc(a, database.core.identity_namespace.table_id);
             break :prefix try backend.documentPrefixAlloc(a, namespace);
         };
-        var result: PublicationCatalog = .{ .inode = (try (try pin.readFile()).file.stat((try pin.readFile()).runtime())).inode, .paths = undefined, .fingerprints = undefined };
+        const file = try pin.readFile();
+        var result: PublicationCatalog = .{
+            .identity = file.dataIdentity() orelse return error.EnrichmentSourceChanged,
+            .paths = undefined,
+            .fingerprints = undefined,
+        };
         for (metadata_keys, 0..) |key, i| {
             result.paths[i] = try std.mem.concat(a, u8, &.{ prefix, key });
             result.fingerprints[i] = try pin.valueFingerprint(result.paths[i]);
@@ -85,7 +90,7 @@ const PublicationCatalog = struct {
         var live = try root.owned_lite_backend.?.native_docstore.?.beginRead();
         defer live.abort();
         const file = try live.readFile();
-        if ((try file.file.stat(file.runtime())).inode != self.inode) return error.EnrichmentSourceChanged;
+        if (!std.meta.eql(file.dataIdentity(), @as(@TypeOf(file.dataIdentity()), self.identity))) return error.EnrichmentSourceChanged;
         for (self.paths, self.fingerprints) |path, captured|
             if (!std.meta.eql(captured, try live.valueFingerprint(path))) return error.EnrichmentSourceChanged;
     }
@@ -292,10 +297,7 @@ pub const PreparedPublication = struct {
         var latest = native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.owner.path, .{ .read_only = true, .internal_reader = true }) catch null;
         if (latest) |*file| {
             defer file.close();
-            const live_stat = file.file.stat(file.runtime()) catch null;
-            const captured_stat = snapshot.file.file.stat(snapshot.file.runtime()) catch null;
-            const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
-            if (same_inode) {
+            if (file.sameDataFile(&snapshot.file)) {
                 if (snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
                     const unchanged = self.indexInputsUnchanged(&snapshot.file, file) catch false;
                     if (!unchanged) self.index_inputs_changed = true;
@@ -2525,7 +2527,7 @@ pub const Owner = struct {
 
     fn rememberRedoRecoveryCursor(self: *Owner, candidate: native.RedoRecoveryCursor) void {
         if (self.redo_recovery_cursor) |saved| {
-            if (saved.inode == candidate.inode and
+            if (std.meta.eql(saved.identity, candidate.identity) and
                 saved.checkpoint.commit_sequence > candidate.checkpoint.commit_sequence) return;
         }
         self.redo_recovery_cursor = candidate;
@@ -2543,10 +2545,11 @@ pub const Owner = struct {
             const can_reuse = !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and
                 maintenance_references_clear and !needsOutcomeReconciliation(current) and
                 file.adoptionEpoch() == current.lite_refresh_adoption_epoch;
+            if (fast_only and !can_reuse) return null;
             if (can_reuse and current.lane_pins.load(.acquire) == 0) {
                 if (file.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
-                if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |inode| {
-                    self.reader_coordinator.observeCurrent(inode, file.headerFingerprint());
+                if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |identity| {
+                    self.reader_coordinator.observeCurrent(identity, file.headerFingerprint());
                     if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                         try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                     return current;
@@ -2559,15 +2562,15 @@ pub const Owner = struct {
             });
             defer recovered_probe.close();
             const probe = &recovered_probe;
-            const probe_inode = (try probe.file.stat(probe.runtime())).inode;
+            const probe_identity = probe.dataIdentity() orelse return error.InvalidTransactionState;
             if (self.redo_recovery_cursor) |saved| {
-                if (saved.inode != probe_inode) self.redo_recovery_cursor = null;
+                if (!std.meta.eql(probe_identity, saved.identity)) self.redo_recovery_cursor = null;
             }
             if (probe.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
             // Establish the fenced tip before opening any new read pins.
             // Existing readers of an unknown peer publication remain poisoned.
-            self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
-            const same_inode = probe_inode == (try file.file.stat(file.runtime())).inode;
+            self.reader_coordinator.observeCurrent(probe_identity, probe.headerFingerprint());
+            const same_inode = probe.sameDataFile(file);
             // Under the redo log, an ordinary commit advances the logical
             // commit sequence (`NativeFile.committedSequence()`, whose own
             // doc comment warns about exactly this) without ever touching
@@ -2634,7 +2637,7 @@ pub const Owner = struct {
             if (self.maintenance_snapshot) |snapshot| {
                 const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
                 if (std.meta.eql(probe.header, captured.header) and
-                    (try probe.file.stat(probe.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = snapshot;
+                    probe.sameDataFile(captured)) known_maintenance = snapshot;
             }
             // Protected recovery already applied the missing suffix using
             // the probe's verified frontier. Legacy recovery can still
@@ -2781,7 +2784,7 @@ pub const Owner = struct {
         defer backend.deinit();
         const store = backend.native_docstore orelse return false;
         if (!std.meta.eql(store.file.header, tip.header) or
-            (try store.file.file.stat(store.file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) return false;
+            !store.file.sameDataFile(tip)) return false;
         // Initializing a missing root is a mutation, even with no indexes.
         if (try backend.existingRootIncarnation("root") == null) return false;
         var read = try store.beginRead();
@@ -3323,7 +3326,7 @@ pub const Owner = struct {
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
-        if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+        if (!probe.sameDataFile(file)) return error.EnrichmentWaitCanceled;
         if (!std.meta.eql(probe.header, file.header) and scope == .allocator_service) {
             // Bounded allocator/orphan service computes no detached output.
             // Start it on the current ledger under the fair writer lease;
@@ -3347,7 +3350,7 @@ pub const Owner = struct {
             // be stale. Compare and rebase against the header it produced.
             var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer latest.close();
-            if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+            if (!latest.sameDataFile(file)) return error.EnrichmentWaitCanceled;
             // Replayed redo commits leave the index catalog root in place.
             // The catalog sink fences those per index
             // (`Store.submitIndexMutationForScope`); refusing here on any
@@ -3486,7 +3489,7 @@ pub const Owner = struct {
             // A refused index publication means its cached index catalogs
             // missed commits since it opened (`submitIndexMutationForScope`).
             if (captured_is_current and !snapshot.owned_lite_backend.?.native_docstore.?.index_fence_refused.load(.acquire) and (!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
-                (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode)
+                file.sameDataFile(captured))
             {
                 self.configureRetirementBudget(snapshot.owned_lite_backend.?.native_docstore.?);
                 return snapshot;
@@ -3621,8 +3624,8 @@ pub const Owner = struct {
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (!std.meta.eql(probe.header, maintenance.file.header) or
-            (try probe.file.stat(probe.runtime())).inode != (try store.file.file.stat(store.file.runtime())).inode or
-            (try probe.file.stat(probe.runtime())).inode != (try maintenance.file.file.stat(maintenance.file.runtime())).inode) return;
+            !probe.sameDataFile(&store.file) or
+            !probe.sameDataFile(&maintenance.file)) return;
         var before = store.file.activeCheckpoint();
         var after = probe.activeCheckpoint();
         before.commit_sequence = 0;
@@ -4458,7 +4461,7 @@ pub const Owner = struct {
             var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
             if (std.meta.eql(native.NativeFile.allocatorProofIdentity(file.header), native.NativeFile.allocatorProofIdentity(probe.header)) and
-                (try file.file.stat(file.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
+                file.sameDataFile(&probe))
             {
                 try file.inheritAllocatorProofReceipt(receipt);
                 if (file.free_pages_verified) {
@@ -4542,7 +4545,7 @@ pub const Owner = struct {
             // the whole header, for the same reason as the stashed-receipt
             // check above.
             if (std.meta.eql(native.NativeFile.allocatorProofIdentity(live.header), native.NativeFile.allocatorProofIdentity(probe.header)) and
-                (try live.file.stat(live.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
+                live.sameDataFile(&probe))
             {
                 try live.inheritAllocatorVerification(reader);
                 self.reuse_proofs_lost = 0;
@@ -4603,7 +4606,7 @@ pub const Owner = struct {
                     // this candidate look foreign to `tip` when the free map
                     // it would certify is still exactly the one on disk.
                     if (file.read_only or !std.meta.eql(native.NativeFile.allocatorProofIdentity(file.header), native.NativeFile.allocatorProofIdentity(tip.header)) or
-                        (try file.file.stat(file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) continue;
+                        !file.sameDataFile(&tip)) continue;
                     if (!file.free_pages_verified) {
                         if (self.current == root and !needsOutcomeReconciliation(root) and
                             file.transaction_header == null and file.durable_header == null) can_prove_current = true;
