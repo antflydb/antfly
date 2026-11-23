@@ -376,6 +376,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                 else
                     null;
                 const transferred = planned_transfer orelse fallback: {
+                    if (options.require_assigned_kernels) return error.UnsupportedCompiledGraphRuntime;
                     var static_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
                     const static_shape = try graphShapeDims(graph.node(ext_in.node_id).output_shape, &static_shape_buf);
                     break :fallback try tensor_transfer.copyWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
@@ -1269,6 +1270,18 @@ test "multi-executor preserves a published producer across cross-device fan-out"
         .device_assignment = &.{ 0, 1, 0 },
         .allocator = a,
     };
+    // An existing runtime binding makes the producer available before
+    // dispatch. Strict execution must decline the undeclared copy itself.
+    const bound = try source.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+    defer source.free(bound);
+    var strict_stats: ExecutionStats = .{};
+    try std.testing.expectError(error.UnsupportedCompiledGraphRuntime, executeDeviceOutputs(a, &graph, &plan, &mesh, &.{
+        .runtime_inputs = &.{.{ .node_id = x, .value = bound }},
+        .require_assigned_kernels = true,
+        .collect_partition_stats = true,
+    }, &strict_stats));
+    try std.testing.expectEqual(@as(u64, 0), strict_stats.cross_device_transfers);
+
     var result = try executeMultiDevice(a, &graph, &plan, &mesh, .{ .collect_partition_stats = true });
     defer result.deinit(&mesh);
     try std.testing.expectEqualSlices(DeviceId, &.{ 0, 1, 0 }, result.output_devices);
