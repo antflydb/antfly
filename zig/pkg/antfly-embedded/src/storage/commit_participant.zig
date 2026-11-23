@@ -118,6 +118,10 @@ pub const View = struct {
     /// exactly as `native_catalog_backend.Options.scope`/
     /// `native_catalog_sink.zig`'s `Sink.submit` already use.
     put_index_catalog_fn: ?*const fn (*anyopaque, scope: []const u8, mutations: []const IndexCatalogMutation) anyerror!void = null,
+    /// Reads one index-catalog record at the host transaction's tip: its own
+    /// staged `putIndexCatalog` mutations over the committed root. `null`
+    /// wherever `put_index_catalog_fn` is.
+    get_index_catalog_fn: ?*const fn (*anyopaque, allocator: std.mem.Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
     /// WS4 phase 2 (coverage/repair-issue ride-along) and algebraic inline
     /// apply (see `mutation_materialization.zig`'s
     /// `InlineAlgebraicPublication`): optional delete capability into the
@@ -190,6 +194,14 @@ pub const View = struct {
         return put_index_catalog(self.ptr, scope, mutations);
     }
 
+    /// One index-catalog record as the host transaction sees it (see
+    /// `get_index_catalog_fn`), owned by `allocator`; null when absent.
+    /// `error.IndexCatalogUnsupported` on every backend but Lite.
+    pub fn getIndexCatalogAlloc(self: View, allocator: std.mem.Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+        const get_index_catalog = self.get_index_catalog_fn orelse return error.IndexCatalogUnsupported;
+        return get_index_catalog(self.ptr, allocator, scope, namespace, key);
+    }
+
     /// Writes one derived-coverage or repair-issue record (see
     /// `allowed_replay_kinds`) into the primary keyspace, in the SAME
     /// native transaction as the primary write. These keys are
@@ -229,6 +241,10 @@ pub const View = struct {
                 const typed: T = @ptrCast(@alignCast(ptr));
                 return typed.*.putIndexCatalogBatch(scope, mutations);
             }
+            fn getIndexCatalog(ptr: *anyopaque, allocator: std.mem.Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+                const typed: T = @ptrCast(@alignCast(ptr));
+                return typed.*.getIndexCatalogAlloc(allocator, scope, namespace, key);
+            }
             fn delete(ptr: *anyopaque, key: []const u8) !void {
                 const typed: T = @ptrCast(@alignCast(ptr));
                 return typed.*.delete(key);
@@ -251,6 +267,7 @@ pub const View = struct {
             .get_fn = Bridge.get,
             .put_fn = Bridge.put,
             .put_index_catalog_fn = if (@hasDecl(BaseType(T), "putIndexCatalogBatch")) Bridge.putIndexCatalog else null,
+            .get_index_catalog_fn = if (@hasDecl(BaseType(T), "getIndexCatalogAlloc")) Bridge.getIndexCatalog else null,
             .delete_fn = if (@hasDecl(BaseType(T), "delete")) Bridge.delete else null,
             .open_cursor_fn = if (@hasDecl(BaseType(T), "openCursor")) Bridge.openCursor else null,
             .append_put_fn = if (@hasDecl(BaseType(T), "appendPut")) Bridge.appendPut else null,
