@@ -189,6 +189,17 @@ Plan, in order:
 Lake physical blocks and locators stay off the inline path until they are
 decided at the tip.
 
+Measured 2026-11-22 with `lite-mp-bench --index sparse` (Debug, 8 writers):
+publishing each inline write as a one-document segment with an
+incarnation bump (the bulk-append machinery) ran at 50 writes/s across
+processes and 330 across threads, against 172 and 530 for the existing
+chunk read-modify-write path once inline publication covered authored
+vectors and installed before the fsync. Per-document lookups through
+docmap locators and the growing set of tiny segments cost more than the
+chunk rewrites they replace at this scale, so the chunk path stays; a
+level-0 design for sparse needs a cheaper doc-to-copy lookup (a versioned
+doc map, as full-text has) before it pays.
+
 ## Crash and consistency invariants
 
 - A write's index records share its native commit; an acknowledged write is
@@ -228,9 +239,12 @@ decided at the tip.
    A write still reopens after one (`Owner.writer_reopen_pending`): the
    runtime's free-page allocator and replay-sequence caches did not see those
    commits. Next: reconcile those two in place, then let writes reuse it.
-   Releasing the writer lease before the durability wait stays off: with it,
-   `lite-mp-bench` (8 threads, indexed) closes a retired runtime under live
-   reservations within one 15 s Debug run.
+   Releasing the writer lease before the durability wait stays off: it
+   measured no gain across processes (67 vs 65 writes/s, Debug) and a loss
+   across threads (about 250 vs 380, with stale results), where the writer
+   lane already hands the lease between writers. Letting writes refresh in
+   place gained little (65 to 86) and left stale results across processes,
+   so writes still reopen.
 5. Delete-marker cleanup and the remaining per-type folds.
 
 Each stage keeps the crash sweeps, the multi-process capi tests and the

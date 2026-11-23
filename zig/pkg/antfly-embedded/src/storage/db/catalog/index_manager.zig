@@ -50200,8 +50200,10 @@ test "text merge native admission excludes streamed document coordinate and ordi
     const path_z = try a.dupeSentinel(u8, path, 0);
     defer a.free(path_z);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{ .soft_limit_bytes = 10 * 1024 * 1024, .hard_limit_bytes = 10 * 1024 * 1024 };
-    // Preserve the actual 10 MiB merge-memory ceiling without requiring a
+    // 12 MiB: the native estimate includes each input's inverse ordinal
+    // directory (one u64 pair per live row, #1752), about 0.4 MiB here.
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 12 * 1024 * 1024 };
+    // Preserve an actual merge-memory ceiling without requiring a
     // production-sized free-disk reserve on the compiler's shared volume.
     var resources = resource_manager_mod.ResourceManager.init(.{
         .budgets = budgets,
@@ -50246,11 +50248,11 @@ test "text merge native admission excludes streamed document coordinate and ordi
     try std.testing.expect(entry.persistent.io != null);
     var legacy: u64 = 8 * 1024 * 1024;
     for (snap.segments) |*segment| legacy += try IndexManager.estimateTextMergeWorkingSetBytes(segment, false, false);
-    try std.testing.expect(legacy > 10 * 1024 * 1024);
+    try std.testing.expect(legacy > 12 * 1024 * 1024);
     var reservation = (try manager.reserveTextMergeBuffers(&entry.persistent, snap, &.{ 0, 1 }, .strict)).?;
     defer reservation.release();
 
-    try std.testing.expect(reservation.bytes < 10 * 1024 * 1024);
+    try std.testing.expect(reservation.bytes < 12 * 1024 * 1024);
     std.debug.print("NATIVE_MERGE_ADMISSION documents=100000 native={d} legacy={d}\n", .{ reservation.bytes, legacy });
     reservation.release();
     // Exercise execution and publication under that actual admission, with
