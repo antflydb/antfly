@@ -1987,22 +1987,29 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
         const binding = try owned.acquireBinding(.{ .sequence_id = 91, .layer_index = 0 }, 0, false, true);
         try std.testing.expect(binding.slot >= metal_runtime.paged_kv_slot_base);
         const layout = owned.rowLayout(kv_heads, head_dim);
-        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
-            metal,
-            binding.slot,
-            @backingInt(owned.format),
-            k_handle,
-            0,
-            v_handle,
-            0,
-            rows,
-            kv_heads,
-            head_dim,
-            layout.key_row_bytes,
-            layout.base_key_row_bytes,
-            layout.v_row_stride,
-            0,
-        ));
+        // Exercise F16 seeding and suffix append with nonzero source and slot offsets.
+        const updates: []const usize = if (dtype == .f16) &.{ 2, rows } else &.{rows};
+        var prior_rows: usize = 0;
+        for (updates) |covered_rows| {
+            const suffix_offset = prior_rows * width * @sizeOf(f32);
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_update_attention_span_from_f32_key_device_slot(
+                metal,
+                binding.slot,
+                @backingInt(owned.format),
+                k_handle,
+                suffix_offset,
+                v_handle,
+                suffix_offset,
+                covered_rows,
+                kv_heads,
+                head_dim,
+                layout.key_row_bytes,
+                layout.base_key_row_bytes,
+                layout.v_row_stride,
+                0,
+            ));
+            prior_rows = covered_rows;
+        }
         binding.written_tokens = rows;
         // This fixture writes the native slot directly, bypassing the storage
         // writer that normally publishes contiguous physical-row metadata.
@@ -2021,6 +2028,12 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
             .num_kv_heads = kv_heads,
             .head_dim = head_dim,
         }, &decoded_keys, &decoded_values);
+        if (dtype == .f16) {
+            for (keys, values, decoded_keys, decoded_values) |key, value, decoded_key, decoded_value| {
+                try std.testing.expectEqual(@as(f32, @as(f16, @floatCast(key))), decoded_key);
+                try std.testing.expectEqual(@as(f32, @as(f16, @floatCast(value))), decoded_value);
+            }
+        }
         var gpu_scores: [rows]f32 = undefined;
         const score_memory_0 = @import("metal_telemetry.zig").memorySnapshot(true);
         var score_interval_0: @import("metal_telemetry.zig").BufferInterval = .{};

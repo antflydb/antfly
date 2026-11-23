@@ -13846,8 +13846,11 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            // tile-codegen:end elementwise.direct.abi.7 family
            // tile-codegen:begin convolution.direct.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
-           "kernel void termite_encode_f16_convert(device const float *in [[buffer(0)]], device half *out [[buffer(1)]], constant termite_metal_encode_key_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
-           "    uint total = p.rows * p.num_kv_heads * p.head_dim; if (gid >= total) return; out[gid] = half(in[gid]);\n"
+           "kernel void termite_encode_f16_convert(device const float *key [[buffer(0)]], device half *key_out [[buffer(1)]], device const float *value [[buffer(2)]], device half *value_out [[buffer(3)]], constant termite_metal_encode_key_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    const uint total = p.rows * p.num_kv_heads * p.head_dim;\n"
+           "    if (gid >= total) return;\n"
+           "    key_out[gid] = half(key[gid]);\n"
+           "    value_out[gid] = half(value[gid]);\n"
            "}\n"
            // tile-codegen:end convolution.direct.0 family
            "// Destination precision is static; paging and padded-value ownership are shared.\n"
@@ -36719,6 +36722,20 @@ int antfly_metal_dense_attention_workspace(termite_metal_decode_runtime *runtime
     return 0;
 }
 
+static void antfly_metal_encode_f16_kv(
+    id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipeline,
+    id<MTLBuffer> key, size_t key_offset, id<MTLBuffer> key_out, size_t key_out_offset,
+    id<MTLBuffer> value, size_t value_offset, id<MTLBuffer> value_out, size_t value_out_offset,
+    const termite_metal_encode_key_params *params
+) {
+    const size_t items = (size_t)params->rows * params->num_kv_heads * params->head_dim;
+    antfly_metal_set_compute_pipeline(encoder, pipeline);
+    termite_metal_bind_four_buffers(encoder, key, key_offset, key_out, key_out_offset,
+        value, value_offset, value_out, value_out_offset, params, sizeof(*params));
+    antfly_metal_dispatch_threads(encoder, MTLSizeMake(items, 1, 1),
+        MTLSizeMake(termite_metal_thread_width(pipeline, items), 1, 1));
+}
+
 static int antfly_metal_apply_attention_f32_device(
     termite_metal_decode_runtime *runtime,
     void *q_handle,
@@ -36905,13 +36922,9 @@ static int antfly_metal_apply_attention_f32_device(
                     .key_row_bytes = 0u,
                     .base_key_row_bytes = 0u,
                 };
-                const size_t convert_items = kv_len * num_kv_heads * head_dim;
-                const size_t convert_width = termite_metal_thread_width(runtime->encode_f16_convert_pipeline, convert_items);
-                antfly_metal_set_compute_pipeline(encoder, (runtime->encode_f16_convert_pipeline));
-                termite_metal_bind_two_buffers(encoder, k_buffer, k_offset, stage_k, stage_k_offset, &convert_params, sizeof(convert_params));
-                antfly_metal_dispatch_threads(encoder, MTLSizeMake(convert_items, 1, 1), MTLSizeMake(convert_width, 1, 1));
-                termite_metal_bind_two_buffers_only(encoder, v_buffer, v_offset, stage_v, stage_v_offset);
-                antfly_metal_dispatch_threads(encoder, MTLSizeMake(convert_items, 1, 1), MTLSizeMake(convert_width, 1, 1));
+                antfly_metal_encode_f16_kv(encoder, runtime->encode_f16_convert_pipeline,
+                    k_buffer, k_offset, stage_k, stage_k_offset,
+                    v_buffer, v_offset, stage_v, stage_v_offset, &convert_params);
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
             const BOOL use_gqa2 = (use_f16kv &&
@@ -65467,44 +65480,23 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
                         size:suffix_v_bytes];
         [blit endEncoding];
     } else if (format == 3u) {
-        // f16 path — dispatch the f32→half converter twice (once for keys,
-        // once for values). Slot buffers are sized for `key_row_bytes` and
-        // `v_row_stride * sizeof(half)` respectively; caller is responsible
-        // for passing key_row_bytes = num_kv_heads*head_dim*sizeof(half).
+        // The F16 K/V slots have independent offsets in half units.
         id<MTLComputePipelineState> pipeline = runtime->encode_f16_convert_pipeline;
         if (pipeline == nil) return -8;
-        const size_t values_per_row = num_kv_heads * head_dim;
-        termite_metal_encode_key_params params = {
+        const termite_metal_encode_key_params params = {
             .rows = (uint32_t)suffix_tokens,
             .num_kv_heads = (uint32_t)num_kv_heads,
             .head_dim = (uint32_t)head_dim,
             .key_row_bytes = (uint32_t)key_row_bytes,
             .base_key_row_bytes = (uint32_t)base_key_row_bytes,
         };
-        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (params_buffer == nil) return -10;
-        const size_t work_items = suffix_tokens * values_per_row;
-        const size_t tg_width = termite_metal_thread_width(pipeline, work_items);
-
-        id<MTLComputeCommandEncoder> k_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (k_encoder == nil) return -11;
-        antfly_metal_set_compute_pipeline(k_encoder, (pipeline));
-        [k_encoder setBuffer:k_buffer offset:k_offset atIndex:0];
-        [k_encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:(suffix_start * key_row_bytes) atIndex:1];
-        [k_encoder setBuffer:params_buffer offset:0 atIndex:2];
-        antfly_metal_dispatch_threads(k_encoder, MTLSizeMake(work_items, 1, 1), MTLSizeMake(tg_width, 1, 1));
-        [k_encoder endEncoding];
-
-        // Values: slot holds v_row_stride halfs per row. Suffix write offset
-        // is in *half* units, i.e. v_row_stride * 2 bytes per row.
-        id<MTLComputeCommandEncoder> v_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (v_encoder == nil) return -11;
-        antfly_metal_set_compute_pipeline(v_encoder, (pipeline));
-        [v_encoder setBuffer:v_buffer offset:v_offset atIndex:0];
-        [v_encoder setBuffer:runtime->attention_span_v_buffers[slot] offset:(suffix_start * v_row_stride * sizeof(uint16_t)) atIndex:1];
-        [v_encoder setBuffer:params_buffer offset:0 atIndex:2];
-        antfly_metal_dispatch_threads(v_encoder, MTLSizeMake(work_items, 1, 1), MTLSizeMake(tg_width, 1, 1));
-        [v_encoder endEncoding];
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -11;
+        antfly_metal_encode_f16_kv(encoder, pipeline,
+            k_buffer, k_offset, runtime->attention_span_encoded_key_buffers[slot], suffix_start * key_row_bytes,
+            v_buffer, v_offset, runtime->attention_span_v_buffers[slot], suffix_start * v_row_stride * sizeof(uint16_t),
+            &params);
+        [encoder endEncoding];
     } else {
         id<MTLComputePipelineState> pipeline = nil;
         switch (format) {
