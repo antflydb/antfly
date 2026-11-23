@@ -4061,7 +4061,7 @@ fn archRunResidentWithControl(
     if (self.backend_type == .pjrt) return null;
     if (self.task == .classifier or self.task == .extractor) return null;
     if (self.arch_config == .clip or self.arch_config == .clap) return archRunMediaResident(self, inputs, allocator, control);
-    if (self.arch_config == .whisper) return archRunIncrementalEncoderResident(self, inputs, allocator, control);
+    if (self.arch_config == .whisper) return archRunIncrementalEncoderResident(self, inputs, allocator, control, null);
     const cfg = switch (self.arch_config) {
         .bert => |cfg| cfg,
         // Returning null forces the caller through runWithControl. Never
@@ -4177,7 +4177,17 @@ fn mediaFloatInput(input: Tensor, rank: usize) ![4]usize {
     return shape;
 }
 
-fn archRunIncrementalEncoderResident(self: *ArchSession, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?ResidentOutputs {
+fn selectEagerResidentPublication(ptr: *anyopaque) ?@import("../backends/session.zig").EagerHostRunServices.ResidentPublication {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    return if (self.backend_type == .metal and self.arch_config == .whisper) eagerResidentRunForPublication else null;
+}
+
+fn eagerResidentRunForPublication(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, epoch: *const @import("retirement_sink.zig").Epoch) !?ResidentOutputs {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    return archRunIncrementalEncoderResident(self, inputs, allocator, control, epoch);
+}
+
+fn archRunIncrementalEncoderResident(self: *ArchSession, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, publication_epoch: ?*const @import("retirement_sink.zig").Epoch) !?ResidentOutputs {
     if (self.arch_config != .whisper or inputs.len != 1) return null;
     const first = inputs[0];
     if (first.dtype != .f32 or !std.mem.eql(u8, first.name, "input_features")) return null;
@@ -4191,7 +4201,7 @@ fn archRunIncrementalEncoderResident(self: *ArchSession, inputs: []const Tensor,
     if (first.data.len != bytes) return error.InvalidInputShape;
     const mel_shape = [_]i32{ std.math.cast(i32, batch) orelse return error.ResourceLimitExceeded, std.math.cast(i32, config.num_mel_bins) orelse return error.ResourceLimitExceeded, std.math.cast(i32, frames) orelse return error.ResourceLimitExceeded };
     const rows = (std.math.add(usize, frames, 1) catch return error.ResourceLimitExceeded) / 2;
-    var cleanup = if (self.backend_type == .metal)
+    var cleanup = if (self.backend_type == .metal and publication_epoch == null)
         try @import("cleanup_owner.zig").Owner.beginResidentModel(.metal, &self.model_lifetime)
     else
         @import("cleanup_owner.zig").Owner{};
@@ -4200,7 +4210,10 @@ fn archRunIncrementalEncoderResident(self: *ArchSession, inputs: []const Tensor,
     errdefer allocator.destroy(cb);
     cb.* = try makeComputeBackend(self, allocator, null);
     cb.execution_control = control;
-    errdefer cb.deinit();
+    errdefer if (publication_epoch) |epoch| cb.deinitWithCleanup(.{ .boundary = epoch, .operation = cb.operationToken() }) else cb.deinit();
+    if (publication_epoch) |epoch| {
+        if (!try cb.bindCleanupEpoch(epoch)) return error.BackendOperationCleanupUnavailable;
+    }
     if (control) |active| try active.check();
     const mel = try cb.fromFloat32Shape(first.asFloat32(), &mel_shape);
     defer cb.free(mel);
@@ -4211,7 +4224,7 @@ fn archRunIncrementalEncoderResident(self: *ArchSession, inputs: []const Tensor,
     const outputs = try allocator.alloc(ops.CT, 1);
     errdefer allocator.free(outputs);
     outputs[0] = hidden;
-    if (self.backend_type == .metal and !try cleanup.retainThroughBackend(cb))
+    if (self.backend_type == .metal and publication_epoch == null and !try cleanup.retainThroughBackend(cb))
         return error.BackendOperationCleanupUnavailable;
     return .{ .outputs = outputs, .backend = cb, .allocator = allocator, .backend_owner = cb, .deinit_backend_owner = deinitResidentComputeBackend, .backend_owner_cleanup_services = &resident_compute_cleanup_services };
 }
@@ -4421,7 +4434,7 @@ fn archRunResidentImpl(ptr: *anyopaque, inputs: []const Tensor, allocator: std.m
     if (self.backend_type == .pjrt) return null;
     if (self.task == .classifier or self.task == .extractor) return null;
     if (self.arch_config == .clip or self.arch_config == .clap) return archRunMediaResident(self, inputs, allocator, null);
-    if (self.arch_config == .whisper) return archRunIncrementalEncoderResident(self, inputs, allocator, null);
+    if (self.arch_config == .whisper) return archRunIncrementalEncoderResident(self, inputs, allocator, null, null);
     switch (self.arch_config) {
         .bert, .modern_bert, .nomic_bert, .embedding_gemma2 => {},
         else => return null,
@@ -7986,6 +7999,7 @@ pub fn metalWorkspaceCreatorsOutsideExecution(session: Session, control: ?Infere
 
 const eager_host_services = @import("../backends/session.zig").EagerHostRunServices{
     .run_resident = eagerResidentRunWithContext,
+    .select_resident_publication = selectEagerResidentPublication,
     .accepts = acceptsEagerHostTable,
     .recurrent_layout = eagerHostRecurrentLayout,
     .run = eagerHostRunWithContext,
@@ -12803,6 +12817,30 @@ test "dense stage promotion preserves actual Metal buffer through original Engin
     try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     if (probe.failure) |err| return err;
+}
+
+test "Metal Whisper resident publication binds one provider retirement guard" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const session = try incrementalMetalFixtureSession(allocator);
+    defer session.close();
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+    var features = [_]Tensor{try IncrementalFixture.features(allocator)};
+    defer features[0].deinit();
+
+    var cleanup = try @import("cleanup_owner.zig").Owner.beginResident(session);
+    defer cleanup.finishAfterUnlock();
+    var permit = try session.admitInputs(&features, allocator, control);
+    defer permit.deinitWithCleanup(.{ .boundary = cleanup.epoch() });
+    try permit.prepareResidentOutputRetirement();
+    try permit.preparePhysicalStorage(allocator);
+    const epoch = cleanup.epoch() orelse return error.MissingCurrentCleanupEpoch;
+    try permit.bindPhysicalCleanupEpoch(epoch);
+    var outputs = (try permit.runResidentForPublication(&features, allocator, control)) orelse return error.MissingResidentOutput;
+    defer outputs.deinitWithBoundary(epoch);
+    try std.testing.expect(try cleanup.retainThroughBackend(outputs.backend));
+    try std.testing.expectEqual(ops.BackendKind.metal, outputs.backend.kind());
+    try std.testing.expectEqual(@as(usize, 1), outputs.outputs.len);
 }
 
 test "foreign Metal public Whisper encoder final norm promotes before receiver admission without transport" {

@@ -622,7 +622,7 @@ fn directMode(comptime placement: OutputPlacement, allocator: std.mem.Allocator,
         var outputs = (if (ticket.stage) |mixed|
             try execution.runStageInputsWithControl(mixed, allocator, ticket.control)
         else
-            try execution.runResidentWithControl(ticket.inputs, allocator, ticket.control)) orelse return error.UnexpectedResidentStageDecline;
+            try execution.runResidentForPublication(ticket.inputs, allocator, ticket.control)) orelse return error.UnexpectedResidentStageDecline;
         errdefer outputs.deinitWithBoundary(cleanup_owner.epoch());
         _ = try cleanup_owner.retainThroughBackend(outputs.backend);
         if (owned_execution != null and outputs.resource_lease == null) {
@@ -1032,7 +1032,7 @@ fn executeGroupMode(comptime placement: OutputPlacement, items: []const micro.Ex
         var outputs = (if (gathered) |owned|
             try permit.runStageInputsWithControl(owned.values, alloc, control)
         else
-            try permit.runResidentWithControl(batch_inputs, alloc, control)) orelse return error.UnexpectedResidentStageDecline;
+            try permit.runResidentForPublication(batch_inputs, alloc, control)) orelse return error.UnexpectedResidentStageDecline;
         defer outputs.deinitWithBoundary(cleanup_owner.epoch());
         if (gathered) |owned| outputs.physical_backing_requires_epoch = owned.has_device_storage;
         _ = try cleanup_owner.retainThroughBackend(outputs.backend);

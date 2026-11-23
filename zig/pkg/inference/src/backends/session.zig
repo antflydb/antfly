@@ -1709,9 +1709,14 @@ pub const ModelContract = struct {
 /// Host-only eager owner. Only its complete static table may certify and run
 /// the actual original implementation; copied/forwarded unknown tables decline.
 pub const EagerHostRunServices = struct {
+    pub const ResidentPublication = *const fn (*anyopaque, []const Tensor, std.mem.Allocator, ?InferenceExecutionControl, *const @import("../execution/retirement_sink.zig").Epoch) anyerror!?ResidentOutputs;
+
     /// Synchronous resident producer only; the receiving implementation clears
     /// every borrowed header field before its backend/output owner escapes.
     run_resident: ?*const fn (*anyopaque, []const Tensor, std.mem.Allocator, *const @import("../execution/invocation_context.zig").Context) anyerror!?ResidentOutputs = null,
+    /// Dispatch in a caller-owned publication epoch. The caller attaches the
+    /// provider finish guard before publication.
+    select_resident_publication: ?*const fn (*anyopaque) ?ResidentPublication = null,
     accepts: *const fn (*const Session.VTable) bool,
     recurrent_layout: *const fn (*anyopaque) anyerror!?@import("../execution/recurrent_state_admission.zig").Layout,
     run: *const fn (*anyopaque, []const Tensor, std.mem.Allocator, ?InferenceExecutionControl, *const @import("../execution/invocation_context.zig").Context, ?*@import("../execution/existing_workspace_receipt.zig").Owner) anyerror![]Tensor,
@@ -5687,6 +5692,28 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) !?ResidentOutputs {
+        return self.runResidentWithControlImpl(inputs, allocator, control, false);
+    }
+
+    /// The resident publisher already owns and binds the exact cleanup epoch
+    /// and will retain it through the provider before the result escapes.
+    pub fn runResidentForPublication(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+    ) !?ResidentOutputs {
+        if (self.dispatch_cleanup_epoch == null or self.execution_yielded) return error.MissingCurrentCleanupEpoch;
+        return self.runResidentWithControlImpl(inputs, allocator, control, true);
+    }
+
+    fn runResidentWithControlImpl(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+        publication: bool,
+    ) anyerror!?ResidentOutputs {
         try self.validateResidentDispatch();
         try self.session.validateEagerHostServices();
         try self.resolveGeometry(inputs);
@@ -5705,6 +5732,23 @@ pub const RunPermit = struct {
             return outputs;
         }
         if (try self.executePreparedResident(.{ .host = inputs }, allocator, control)) |outputs| return outputs;
+        if (publication) if (self.session.vtable.eager_host_services) |services| {
+            if (!services.accepts(self.session.vtable)) return error.UnsupportedRecurrentStateTarget;
+            const run_for_publication = if (services.select_resident_publication) |select| select(self.session.ptr) else null;
+            if (run_for_publication) |run_selected| {
+                const epoch = &self.dispatch_cleanup_epoch.?;
+                if (control) |active| try active.check();
+                var hard_cancellation = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
+                defer if (hard_cancellation) |*guard| guard.deinit();
+                if (try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, run_selected, .{ self.session.ptr, inputs, allocator, control, epoch })) |published| {
+                    var outputs = published;
+                    self.pinResident(&outputs);
+                    errdefer self.discardFailedResident(&outputs);
+                    if (control) |active| try active.check();
+                    return outputs;
+                }
+            }
+        };
         const active = control orelse return self.runResident(inputs, allocator);
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.session.interruption());
