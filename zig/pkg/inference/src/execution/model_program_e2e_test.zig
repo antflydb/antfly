@@ -1158,7 +1158,7 @@ test "model program real Whisper resident full-window banks and first decode mat
             defer actual.deinit();
             {
                 const state = decoder.resident.?;
-                for (state.buffers, 0..) |*buffer, index| {
+                for (state.banks(), 0..) |*buffer, index| {
                     const self_attention = index % 4 < 2;
                     const shape = [_]i64{ @intCast(if (self_attention) cfg.max_target_positions else rows), cfg.d_model };
                     const bank = try buffer.toFloat32WithShape(a, &shape);
@@ -1194,7 +1194,7 @@ test "model program real Whisper resident full-window banks and first decode mat
                     try std.testing.expectApproxEqAbs(reference, cached, 1e-4);
                     try std.testing.expectApproxEqAbs(reference, initial, 1e-4);
                 }
-                for (decoder.resident.?.buffers, fresh.resident.?.buffers, 0..) |*updated, *initial, index| {
+                for (decoder.resident.?.banks(), fresh.resident.?.banks(), 0..) |*updated, *initial, index| {
                     const self_attention = index % 4 < 2;
                     const shape = [_]i64{ @intCast(if (self_attention) cfg.max_target_positions else rows), cfg.d_model };
                     const left = try updated.toFloat32WithShape(a, &shape);
@@ -1262,7 +1262,7 @@ test "model program resident decoder qualifies complete logical context with bou
                 for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, @as(f32, 0.003));
                 try std.testing.expectEqual(std.mem.indexOfMax(f32, expected), std.mem.indexOfMax(f32, actual));
             } else reference[step] = try a.dupe(f32, actual);
-            std.debug.print("full context rows={d} query_bound={d} banks={d} bank_bytes={d}\n", .{ rows, chunk, decoder.resident.?.buffers.len, decoder.bank_bytes });
+            std.debug.print("full context rows={d} query_bound={d} banks={d} bank_bytes={d}\n", .{ rows, chunk, decoder.resident.?.banks().len, decoder.bank_bytes });
         }
         try std.testing.expectError(error.InvalidResidentDecodePosition, decoder.text(history, a, DecoderQualification.control));
         try std.testing.expectEqual(maximum, decoder.position);

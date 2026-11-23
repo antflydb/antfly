@@ -1140,11 +1140,11 @@ test "PJRT resident decoder caches attention and recurrent history transactional
             defer ResidentFixture.release(a, &cb, prefill_inputs);
             state.admitted_bytes = 0;
             try std.testing.expectError(error.UnadmittedResidentState, state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, null));
-            try std.testing.expectEqual(@as(usize, 0), state.buffers.len);
+            try std.testing.expectEqual(@as(usize, 0), state.banks().len);
             state.admitted_bytes = std.math.maxInt(usize);
             var cancelled_prefill = ResidentFixture.Cancel{};
             try std.testing.expectError(error.Cancelled, state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, .{ .ptr = &cancelled_prefill, .check_fn = ResidentFixture.Cancel.check }));
-            try std.testing.expectEqual(@as(usize, 0), state.buffers.len);
+            try std.testing.expectEqual(@as(usize, 0), state.banks().len);
             try std.testing.expectEqual(@as(usize, 0), state.position);
             const first = try state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, null);
             defer a.free(first);
@@ -1215,7 +1215,7 @@ test "PJRT resident decoder retains one bank per immutable shared donor" {
         defer state.deinit();
         const actual = try state.run(executable, &cb, inputs, 2, 2, a, null);
         defer a.free(actual);
-        try std.testing.expectEqual(@as(usize, 2), state.buffers.len);
+        try std.testing.expectEqual(@as(usize, 2), state.banks().len);
         try std.testing.expectEqual(@as(usize, 2), state.position);
         for ([_]f32{ 4, 8, 4, 8, 8, 12, 8, 12 }, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
     }
