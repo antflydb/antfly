@@ -105,6 +105,7 @@ pub const SnapshotAdmission = struct {
     /// while another operation owns or is waiting for a snapshot capture.
     pub fn tryAcquireMutation(self: *@This()) ?MutationLease {
         if (!self.lock.tryLockShared()) return null;
+        _ = self.mutation_revision.fetchAdd(1, .monotonic);
         return .{ .admission = self };
     }
 
@@ -132,6 +133,25 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 };
+
+test "storage.db snapshot admission capture revisions include nonblocking mutations" {
+    var admission: SnapshotAdmission = .{};
+    var before = admission.tryAcquireCapture().?;
+    const revision = admission.mutationRevision();
+    try std.testing.expect(admission.tryAcquireMutation() == null);
+    try std.testing.expectEqual(revision, admission.mutationRevision());
+    before.release();
+
+    var mutation = admission.tryAcquireMutation().?;
+    var retained = mutation.retain();
+    mutation.release();
+    try std.testing.expect(admission.tryAcquireCapture() == null);
+    retained.release();
+
+    var after = admission.tryAcquireCapture().?;
+    defer after.release();
+    try std.testing.expectEqual(revision + 1, admission.mutationRevision());
+}
 
 test "storage.db snapshot admission retained mutation survives its original lease" {
     var admission: SnapshotAdmission = .{};
