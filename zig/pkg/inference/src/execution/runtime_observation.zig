@@ -371,11 +371,40 @@ pub const Counters = struct {
     native_assigned_dispatches: u64 = 0,
     backend_entries: Entries = .{},
     cuda_audio: ?CudaAudio = null,
+    cuda_host_waits: ?CudaHostWaits = null,
     metal_encoded_dispatches: ?u64 = null,
     metal_command_submissions: ?u64 = null,
     metal_command_waits: ?u64 = null,
     metal_vendor_encodes: ?u64 = null,
 };
+
+/// Instrumented host wait API returns on the submitting thread.
+pub const CudaHostWaits = struct {
+    stream: u64 = 0,
+    event: u64 = 0,
+    failed: u64 = 0,
+
+    pub fn add(self: CudaHostWaits, other: CudaHostWaits) CudaHostWaits {
+        return .{ .stream = self.stream +| other.stream, .event = self.event +| other.event, .failed = self.failed +| other.failed };
+    }
+
+    fn since(self: CudaHostWaits, before: CudaHostWaits) CudaHostWaits {
+        return .{ .stream = self.stream -| before.stream, .event = self.event -| before.event, .failed = self.failed -| before.failed };
+    }
+};
+
+threadlocal var cuda_host_waits: CudaHostWaits = .{};
+
+pub inline fn cudaHostWait(comptime event: bool, success: bool) void {
+    if (!enabled()) return;
+    if (!success) {
+        cuda_host_waits.failed +|= 1;
+    } else if (event) {
+        cuda_host_waits.event +|= 1;
+    } else {
+        cuda_host_waits.stream +|= 1;
+    }
+}
 
 threadlocal var native_depth: usize = 0;
 threadlocal var native_dispatches: u64 = 0;
@@ -399,6 +428,7 @@ pub const Scope = struct {
     active: bool = false,
     native_start: u64 = 0,
     cuda_audio_start: CudaAudio = .{},
+    cuda_host_wait_start: CudaHostWaits = .{},
     entry_start: [entry_slots]EntryCounts = @splat(.{}),
     metal_start: [4]u64 = @splat(0),
 
@@ -407,11 +437,12 @@ pub const Scope = struct {
     pub fn init() Scope {
         native_depth += 1;
         if (comptime build_options.enable_metal) termite_metal_observation_begin();
-        return .{ .active = true, .native_start = native_dispatches, .cuda_audio_start = cuda_audio, .entry_start = entryStarts(), .metal_start = metalCounters() };
+        return .{ .active = true, .native_start = native_dispatches, .cuda_audio_start = cuda_audio, .cuda_host_wait_start = if (comptime build_options.enable_cuda) cuda_host_waits else .{}, .entry_start = entryStarts(), .metal_start = metalCounters() };
     }
 
     pub fn snapshot(self: Scope) Counters {
         var result = Counters{ .native_assigned_dispatches = native_dispatches -| self.native_start, .backend_entries = entriesSince(self.entry_start), .cuda_audio = cuda_audio.since(self.cuda_audio_start) };
+        if (comptime build_options.enable_cuda) result.cuda_host_waits = cuda_host_waits.since(self.cuda_host_wait_start);
         if (comptime build_options.enable_metal) {
             const after = metalCounters();
             result.metal_encoded_dispatches = after[0] -| self.metal_start[0];

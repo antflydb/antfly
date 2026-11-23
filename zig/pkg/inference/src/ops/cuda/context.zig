@@ -289,11 +289,13 @@ pub const CudaContext = struct {
     /// inside a vendor operation/free or measured CPU blocking time.
     pub inline fn synchronizeStreamResult(self: *CudaContext, stream: CUstream) driver_mod.CUresult {
         const result = self.driver.fns.cuStreamSynchronize(stream);
+        @import("../../execution/runtime_observation.zig").cudaHostWait(false, result == driver_mod.CUDA_SUCCESS);
         if (self.observation.load(.acquire)) |state| state.hostSynchronization(false, result);
         return result;
     }
     pub inline fn synchronizeEventResult(self: *CudaContext, event: CUevent) driver_mod.CUresult {
         const result = self.driver.fns.cuEventSynchronize(event);
+        @import("../../execution/runtime_observation.zig").cudaHostWait(true, result == driver_mod.CUDA_SUCCESS);
         if (self.observation.load(.acquire)) |state| state.hostSynchronization(true, result);
         return result;
     }
@@ -608,6 +610,8 @@ test "CUDA explicit wait helpers preserve arguments statuses and host dependency
     Fake.expected_stream = context.stream;
     Fake.expected_event = @ptrFromInt(2);
     Fake.expected_flags = 7;
+    var invocation = @import("../../execution/runtime_observation.zig").Scope.init();
+    defer invocation.deinit();
     try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.synchronizeStreamResult(context.stream));
     try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.synchronizeEventResult(Fake.expected_event));
     try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, context.waitStreamEventResult(context.stream, Fake.expected_event, 7));
@@ -618,6 +622,12 @@ test "CUDA explicit wait helpers preserve arguments statuses and host dependency
     Fake.result = 1;
     try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.synchronizeEventResult(Fake.expected_event));
     try std.testing.expectEqual(@as(driver_mod.CUresult, 1), context.waitStreamEventResult(Fake.expected_stream, Fake.expected_event, 7));
+    if (comptime @import("build_options").enable_cuda) {
+        const waits = invocation.snapshot().cuda_host_waits.?;
+        try std.testing.expectEqual(@as(u64, 1), waits.stream);
+        try std.testing.expectEqual(@as(u64, 1), waits.event);
+        try std.testing.expectEqual(@as(u64, 1), waits.failed);
+    }
     const counters = state.snapshot().counters.?;
     try std.testing.expectEqual(@as(u64, 1), counters.host_stream_synchronizations);
     try std.testing.expectEqual(@as(u64, 1), counters.host_event_synchronizations);

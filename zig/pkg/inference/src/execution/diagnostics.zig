@@ -97,6 +97,7 @@ pub const PendingInterval = struct {
         metal_command_submissions: ?u64 = null,
         metal_command_waits: ?u64 = null,
         cuda_accepted_launch_calls: ?u64 = null,
+        cuda_host_waits: ?observation.CudaHostWaits = null,
 
         pub fn join(self: *ObservedPhases, transfers: @import("transfer_audit.zig").Measurements, submission: observation.Counters, cuda_launch_calls: ?u64, wall_ns: ?u64) void {
             self.uploads +|= transfers.upload_calls;
@@ -116,6 +117,10 @@ pub const PendingInterval = struct {
             self.metal_command_submissions = sum(self.count, self.metal_command_submissions, submission.metal_command_submissions);
             self.metal_command_waits = sum(self.count, self.metal_command_waits, submission.metal_command_waits);
             self.cuda_accepted_launch_calls = sum(self.count, self.cuda_accepted_launch_calls, cuda_launch_calls);
+            self.cuda_host_waits = if (self.count == 0) submission.cuda_host_waits else if (self.cuda_host_waits) |prior|
+                if (submission.cuda_host_waits) |delta| prior.add(delta) else null
+            else
+                null;
             self.count +|= 1;
         }
 

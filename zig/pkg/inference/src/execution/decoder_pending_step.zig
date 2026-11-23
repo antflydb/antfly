@@ -721,10 +721,15 @@ fn checkCudaPendingObservation(actual: ops.ComputeBackend, _: ops.ComputeBackend
     defer pending.deinit();
     const submitted = diagnostics.snapshot().?;
     try std.testing.expect(submitted.pending_interval.?.completion == .unavailable);
+    try std.testing.expectEqual(@as(u64, 0), submitted.runtime.submission.?.cuda_host_waits.?.event);
     try std.testing.expectEqual(@as(usize, 7), try pending.resolve());
     const ready = diagnostics.snapshot().?;
     try std.testing.expect(ready.outcome == .success and ready.pending_interval.?.completion == .readback_returned);
     try std.testing.expectEqual(submitted.pending_interval.?.identity, ready.pending_interval.?.identity);
+    const waits = ready.pending_interval.?.observed_phases.?.cuda_host_waits.?;
+    try std.testing.expectEqual(@as(u64, 1), waits.event);
+    try std.testing.expectEqual(@as(u64, 0), waits.failed);
+    try std.testing.expectEqual(@as(u64, 1), ready.report.?.cuda_host_waits.?.event);
     pending.deinit();
     var cancelled = (try Readback.begin(context, tensor)) orelse return error.MissingCudaScalarReadback;
     cancelled.deinit();
