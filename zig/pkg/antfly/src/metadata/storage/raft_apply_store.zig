@@ -49480,7 +49480,10 @@ pub const RaftApplyStore = struct {
         const verified = if (query.failed_root) |request| try sqlFailedRootProof(a, &txn, group, scope, participant, request) else null;
         const superseded: ?bool = if (query.retired_connection) |session| blk: {
             if (!context.setting_admin) return error.Forbidden;
-            if (activation.version < query.requiredDecoderVersion()) return error.TableTopologyProtocolUpgradeRequired;
+            // Supersession is optional evidence. Observing it must not
+            // activate a newer protocol or block an ordinary scope read.
+            if (activation.version < topology_protocol.sql_idle_session_reenrollment_version) break :blk null;
+            if (scope != null) break :blk false;
             const current = try SqlLocks.scopes.connection(a, &txn, ns, session.node, session.id) orelse break :blk false;
             break :blk supersedesSqlReceipt(current, query.backend.?, query.database, standalone);
         } else null;

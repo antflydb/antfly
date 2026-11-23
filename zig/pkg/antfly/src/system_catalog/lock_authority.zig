@@ -595,7 +595,6 @@ pub const Query = struct {
         try writer.endObject();
     }
     pub fn requiredDecoderVersion(self: Query) u16 {
-        if (self.retired_connection != null) return @import("../metadata/topology_protocol.zig").sql_idle_session_reenrollment_version;
         if (self.abandoned_private != null) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
         return if (self.database_work != null) @import("../metadata/topology_protocol.zig").sql_scope_retirement_version else decoder_version;
     }
