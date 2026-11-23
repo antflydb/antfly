@@ -52847,6 +52847,13 @@ const MediaOutputExecution = struct {
                         try results.append(a, value);
                         continue;
                     }
+                    if (payload == .video and resolved.speaker_path != null) if (payload.video.speaker_failure) |err| {
+                        if (!allow_partial and target.required) return err;
+                        value.status = .failed;
+                        value.code = @errorName(err);
+                        try results.append(a, value);
+                        continue;
+                    };
                     if (masked_audio != null) return error.InvalidChunkOutput;
                     self.run(a, target, resolved, .{ .pcm = .{ .samples = selected_payload.pcm.samples[window.first..window.last], .sample_rate = selected_payload.pcm.sample_rate } }, &value) catch |err| {
                         if (chunks.abort(err) or (!allow_partial and target.required)) return err;
@@ -53124,6 +53131,45 @@ test "model aware media masked secondary video bypasses execution" {
     consumers.resolved[1] = .{ .path = "", .identity = @splat('4'), .revision = @splat('5'), .recipe_id = @splat('6'), .uses_video = true };
     const values = try MediaOutputExecution.execute(&consumers, a, .{ .video = .{ .bytes = &.{}, .policy = .{} } }, .{ .ordinal = 3, .input_tokens = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 1, .selected_pictures = &.{7} } }, null, null, null, true);
     try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .skipped), values[1].status);
+}
+
+test "model aware media speaker pressure applies only to speaker outputs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const O = lib_chunker.outputs;
+    const targets = [_]O.Target{
+        .{ .name = "boundary", .kind = .embedding, .model = "boundary", .execute = false },
+        .{ .name = "speakers", .kind = .diarize, .model = "speaker" },
+        .{ .name = "text", .kind = .transcribe, .model = "asr", .skip_windows = &.{.{ .ordinal = 3, .sub_index = 0 }} },
+    };
+    var consumers = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "boundary", .targets = &targets }, .initialized = 3, .frame_arena = std.heap.ArenaAllocator.init(a) };
+    const resolved = MediaOutputExecution.Resolved{ .path = "", .identity = @splat('1'), .revision = @splat('2'), .recipe_id = @splat('3') };
+    consumers.resolved[0] = resolved;
+    consumers.resolved[1] = resolved;
+    consumers.resolved[1].uses_audio = true;
+    consumers.resolved[1].speaker_path = "speaker";
+    consumers.resolved[2] = resolved;
+    consumers.resolved[2].uses_audio = true;
+    const values = try MediaOutputExecution.execute(
+        &consumers,
+        a,
+        .{ .video = .{
+            .bytes = &.{},
+            .policy = .{},
+            .audio = .{ .samples = &.{0.25}, .sample_rate = 1 },
+            .audio_start_ns = 0,
+            .speaker_failure = error.OptionalAudioBudgetExceeded,
+        } },
+        .{ .ordinal = 3, .input_tokens = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = std.time.ns_per_s } },
+        null,
+        null,
+        null,
+        true,
+    );
+    try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .failed), values[1].status);
+    try std.testing.expectEqualStrings("OptionalAudioBudgetExceeded", values[1].code.?);
+    try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .skipped), values[2].status);
 }
 
 test "model aware media sparse frame repairs prepare only needed classifier tensors and share equal profiles" {

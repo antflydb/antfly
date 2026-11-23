@@ -130,6 +130,10 @@ pub const ReadAhead = struct {
     hits: usize = 0,
     optional_reads: usize = 0,
     optional_bytes: u64 = 0,
+    audio_buffer: ?[]u8 = null,
+    audio_reservation: @import("admission.zig").Token = .{},
+    audio_start: u64 = 0,
+    audio_valid: usize = 0,
     prefetch_limited: bool = false,
     sparse_pressure: u2 = 0,
     sparse_miss: ?u64 = null,
@@ -139,12 +143,16 @@ pub const ReadAhead = struct {
     pub fn deinit(self: *ReadAhead) void {
         if (self.buffer) |bytes| self.allocator.free(bytes);
         self.reservation.deinit();
+        if (self.audio_buffer) |bytes| self.allocator.free(bytes);
+        self.audio_reservation.deinit();
+        self.audio_buffer = null;
+        self.audio_valid = 0;
         self.buffer = null;
         self.valid = 0;
     }
     pub fn readAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
-        if (control.optional_range) return readIsolatedAt(context, offset, out, control);
+        if (control.optional_range) return self.readOptional(offset, out, out.len, self.window_bytes, control);
         self.sparse_pressure = 0;
         self.sparse_miss = null;
         return self.readWindow(offset, out, out.len, control, self.window_bytes);
@@ -155,7 +163,7 @@ pub const ReadAhead = struct {
 
     fn readSparsePreferring(context: *anyopaque, offset: u64, out: []u8, minimum: usize, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
-        if (control.optional_range) return readIsolatedAt(context, offset, out[0..minimum], control);
+        if (control.optional_range) return self.readOptional(offset, out, minimum, @max(256, out.len), control);
         const may_prefetch = self.upstream.sparse_read_preferring != null or self.upstream.accepts_full_read_size;
         if (!may_prefetch) return self.readWindow(offset, out, minimum, control, minimum);
         // A cache hit is not an independent upstream miss. A partial hit
@@ -189,8 +197,66 @@ pub const ReadAhead = struct {
         const fill = @min(self.window_bytes, @max(256, out.len, dense));
         return self.readWindow(offset, out, minimum, control, @intCast(fill));
     }
+    fn readOptional(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, preferred: usize, control: source.Control) !usize {
+        try control.check();
+        if (offset > self.upstream.length or out.len > self.upstream.length - offset) return error.UnexpectedEndOfSource;
+        if (minimum == 0) return 0;
+        var done = self.copyCached(offset, out);
+        const tail = offset + done;
+        if (done < minimum and tail >= self.audio_start and tail - self.audio_start < self.audio_valid) {
+            const delta: usize = @intCast(tail - self.audio_start);
+            const n = @min(out.len - done, self.audio_valid - delta);
+            @memcpy(out[done..][0..n], self.audio_buffer.?[delta..][0..n]);
+            done += n;
+        }
+        if (done >= minimum) return done;
+        errdefer if (control.failed_prefix) |prefix| {
+            prefix.* += done;
+        };
+        const required = minimum - done;
+        const start = offset + done;
+        const window = @min(self.window_bytes, 4096);
+        const limit = self.max_request_bytes orelse @max(window, required);
+        const optional = self.optionalCapacity();
+        const fill: usize = @intCast(@min(window, preferred, limit, optional.bytes, self.upstream.length - start));
+        if (fill <= required or optional.requests == 0 or (!self.upstream.accepts_full_read_size and self.upstream.sparse_read_preferring == null))
+            return done + try self.readRequired(start, out[done..minimum], limit, control);
+        if (self.audio_buffer == null and !self.makeAudioBuffer(window))
+            return done + try self.readRequired(start, out[done..minimum], limit, control);
+
+        self.audio_valid = 0;
+        var prefix: usize = 0;
+        var fetch_control = control;
+        fetch_control.failed_prefix = &prefix;
+        const count = self.fetchAt(start, self.audio_buffer.?[0..fill], required, fetch_control) catch |err| {
+            const copied = @min(out.len - done, prefix);
+            @memcpy(out[done..][0..copied], self.audio_buffer.?[0..copied]);
+            if (control.failed_prefix) |reported| reported.* += copied;
+            if (err == error.RemoteReadBudgetExceeded and prefix == 0) {
+                return done + try self.readRequired(start, out[done..minimum], limit, control);
+            }
+            return err;
+        };
+        self.audio_start = start;
+        self.audio_valid = count;
+        const copied = @min(out.len - done, count);
+        @memcpy(out[done..][0..copied], self.audio_buffer.?[0..copied]);
+        return done + copied;
+    }
+
+    fn makeAudioBuffer(self: *ReadAhead, window: usize) bool {
+        var reservation = if (self.admission_pool) |pool| pool.acquire(.{ .host_bytes = window }) catch return false else @import("admission.zig").Token{};
+        self.audio_buffer = self.allocator.alloc(u8, window) catch {
+            reservation.deinit();
+            return false;
+        };
+        self.audio_reservation = reservation;
+        return true;
+    }
+
     fn readIsolatedAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ReadAhead = @ptrCast(@alignCast(context));
+        if (control.optional_range) return self.readOptional(offset, out, out.len, out.len, control);
         try control.check();
         if (offset > self.upstream.length or out.len > self.upstream.length - offset) return error.UnexpectedEndOfSource;
         if (out.len == 0) return 0;
@@ -225,11 +291,15 @@ pub const ReadAhead = struct {
                 self.transferred_bytes += child_prefix;
                 if (control.failed_prefix) |prefix| prefix.* += child_prefix;
             }
-            if (err == error.RemoteReadBudgetExceeded) self.charged_bytes -= out.len - child_prefix;
+            if (err == error.RemoteReadBudgetExceeded) {
+                self.charged_bytes -= out.len - child_prefix;
+                if (control.optional_range) self.optional_bytes -= out.len - child_prefix;
+            }
             return err;
         };
         if (n == 0 or n > out.len) return error.InvalidSourceRead;
         self.charged_bytes -= out.len - n;
+        if (control.optional_range) self.optional_bytes -= out.len - n;
         self.transferred_bytes += n;
         return n;
     }
@@ -259,12 +329,18 @@ pub const ReadAhead = struct {
 
     // Required bytes can exceed the cache capacity. Read directly into the
     // caller's admitted buffer without evicting the existing window.
-    fn checkOptional(self: *const ReadAhead, size: usize, requests: usize) !void {
+    fn optionalCapacity(self: *const ReadAhead) struct { bytes: u64, requests: usize } {
         const request_share = @max(1, self.max_reads / 4);
         const byte_share = @max(1, self.max_bytes / 4);
-        if (requests > @min(request_share -| self.optional_reads, (self.max_reads -| self.reads) -| request_share) or
-            size > @min(byte_share -| self.optional_bytes, (self.max_bytes -| self.charged_bytes) -| byte_share))
-            return error.OptionalAudioBudgetExceeded;
+        return .{
+            .requests = @min(request_share -| self.optional_reads, (self.max_reads -| self.reads) -| request_share),
+            .bytes = @min(byte_share -| self.optional_bytes, (self.max_bytes -| self.charged_bytes) -| byte_share),
+        };
+    }
+
+    fn checkOptional(self: *const ReadAhead, size: usize, requests: usize) !void {
+        const remaining = self.optionalCapacity();
+        if (requests > remaining.requests or size > remaining.bytes) return error.OptionalAudioBudgetExceeded;
     }
 
     fn readRequired(self: *ReadAhead, offset: u64, out: []u8, limit: usize, control: source.Control) !usize {
@@ -1030,4 +1106,34 @@ test "optional ranges spend only their share and preserve the video window" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, &out);
     try std.testing.expectEqual(@as(usize, 2), ahead.reads);
     try std.testing.expectEqual(out.len, try ReadAhead.readAt(&ahead, 18, &out, .{}));
+}
+
+test "optional sparse reads coalesce in a separate admitted window" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            for (out, 0..) |*byte, i| byte.* = @truncate(offset + i);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 64 } };
+    var ahead = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 512, .accepts_full_read_size = true },
+        .window_bytes = 32,
+        .max_bytes = 256,
+        .max_reads = 8,
+        .admission_pool = &pool,
+    };
+    var out: [2]u8 = undefined;
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&ahead, 0, &out, .{}));
+    try std.testing.expectEqual(out.len, try ReadAhead.readSparseAt(&ahead, 100, &out, .{ .optional_range = true }));
+    try std.testing.expectEqual(out.len, try ReadAhead.readSparseAt(&ahead, 104, &out, .{ .optional_range = true }));
+    try std.testing.expectEqualSlices(u8, &.{ 104, 105 }, &out);
+    try std.testing.expectEqual(out.len, try ReadAhead.readAt(&ahead, 0, &out, .{}));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, &out);
+    try std.testing.expectEqual(@as(usize, 2), ahead.reads);
+    try std.testing.expectEqual(@as(u64, 64), pool.snapshot().host_bytes);
+    ahead.deinit();
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
 }

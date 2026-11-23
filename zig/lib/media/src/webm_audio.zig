@@ -610,6 +610,8 @@ pub const DirectoryBuilder = struct {
         prefix_len: u8,
         packet_index: usize,
         padding_index: usize,
+        resolved_packets: usize = 0,
+        resolved_padding: usize = 0,
         ticks: u64,
         scale: u64,
     };
@@ -673,31 +675,67 @@ pub const DirectoryBuilder = struct {
     pub fn resolve(self: *DirectoryBuilder, input: *Source) !void {
         if (self.failure) |err| return err;
         if (self.deferred.items.len == 0) return;
-        var resident_packets = self.packets;
-        defer resident_packets.deinit(self.allocator);
-        var resident_padding = self.padding;
-        defer resident_padding.deinit(self.allocator);
-        self.packets = .empty;
-        self.padding = .empty;
-        var packet_cursor: usize = 0;
-        var padding_cursor: usize = 0;
-        for (self.deferred.items) |entry| {
+        const limit = @min(self.limits.max_packets, self.limits.max_index_bytes / @sizeOf(Packet));
+        const trailing = self.deferred.items[0].packet_index == self.packets.items.len;
+        if (trailing) {
+            const packets = self.packets.items.len;
+            const padding = self.padding.items.len;
+            errdefer {
+                self.packets.shrinkRetainingCapacity(packets);
+                self.padding.shrinkRetainingCapacity(padding);
+            }
+            for (self.deferred.items) |entry| {
+                try input.checkControl();
+                try self.collectBlock(input, entry.element, entry.discard, entry.prefix[0..entry.prefix_len], entry.ticks, entry.scale, false);
+            }
+            self.deferred.clearAndFree(self.allocator);
+            return;
+        }
+
+        // Resolve only missing packets into scratch, then merge backward so
+        // every resident run moves at most once.
+        var missing = DirectoryBuilder{ .allocator = self.allocator, .limits = self.limits, .track = self.track };
+        defer {
+            missing.track = null;
+            missing.deinit();
+        }
+        for (self.deferred.items) |*entry| {
             try input.checkControl();
-            try self.appendResident(resident_packets.items[packet_cursor..entry.packet_index], resident_padding.items[padding_cursor..entry.padding_index], packet_cursor);
+            try missing.collectBlock(input, entry.element, entry.discard, entry.prefix[0..entry.prefix_len], entry.ticks, entry.scale, false);
+            if (missing.packets.items.len > limit -| self.packets.items.len) return error.AudioTooLarge;
+            entry.resolved_packets = missing.packets.items.len;
+            entry.resolved_padding = missing.padding.items.len;
+        }
+
+        var packet_cursor = self.packets.items.len;
+        var padding_cursor = self.padding.items.len;
+        try self.packets.ensureTotalCapacityPrecise(self.allocator, packet_cursor + missing.packets.items.len);
+        try self.padding.ensureTotalCapacityPrecise(self.allocator, padding_cursor + missing.padding.items.len);
+        self.packets.items.len = packet_cursor + missing.packets.items.len;
+        self.padding.items.len = padding_cursor + missing.padding.items.len;
+        var index = self.deferred.items.len;
+        while (index != 0) {
+            index -= 1;
+            const entry = self.deferred.items[index];
+            const count = entry.resolved_packets;
+            const pads = entry.resolved_padding;
+            const previous_count = if (index == 0) 0 else self.deferred.items[index - 1].resolved_packets;
+            const previous_pads = if (index == 0) 0 else self.deferred.items[index - 1].resolved_padding;
+            std.mem.copyBackwards(Packet, self.packets.items[entry.packet_index + count .. packet_cursor + count], self.packets.items[entry.packet_index..packet_cursor]);
+            @memcpy(self.packets.items[entry.packet_index + previous_count .. entry.packet_index + count], missing.packets.items[previous_count..count]);
+            var pad = padding_cursor;
+            while (pad > entry.padding_index) {
+                pad -= 1;
+                const resident = self.padding.items[pad];
+                self.padding.items[pad + pads] = .{ .first = resident.first + count, .end = resident.end + count, .ns = resident.ns };
+            }
+            for (missing.padding.items[previous_pads..pads], self.padding.items[entry.padding_index + previous_pads .. entry.padding_index + pads]) |resolved, *out| {
+                out.* = .{ .first = resolved.first + entry.packet_index, .end = resolved.end + entry.packet_index, .ns = resolved.ns };
+            }
             packet_cursor = entry.packet_index;
             padding_cursor = entry.padding_index;
-            try self.collectBlock(input, entry.element, entry.discard, entry.prefix[0..entry.prefix_len], entry.ticks, entry.scale, false);
         }
-        try self.appendResident(resident_packets.items[packet_cursor..], resident_padding.items[padding_cursor..], packet_cursor);
         self.deferred.clearAndFree(self.allocator);
-    }
-
-    fn appendResident(self: *DirectoryBuilder, packets: []const Packet, padding: []const BlockPadding, original_start: usize) !void {
-        const limit = @min(self.limits.max_packets, self.limits.max_index_bytes / @sizeOf(Packet));
-        if (packets.len > limit -| self.packets.items.len) return error.AudioTooLarge;
-        const added = self.packets.items.len - original_start;
-        try self.packets.appendSlice(self.allocator, packets);
-        for (padding) |entry| try self.padding.append(self.allocator, .{ .first = entry.first + added, .end = entry.end + added, .ns = entry.ns });
     }
 
     fn collectBlock(self: *DirectoryBuilder, input: *Source, elem: Webm.Element, discard: ?Webm.ObservedDiscard, prefix: []const u8, ticks: u64, scale: u64, resident_only: bool) !void {
@@ -939,7 +977,7 @@ test "WebM joint video and audio index reuses the block prefix" {
     const audio_entry = "\xae" ++ [_]u8{0x80 | audio_fields.len} ++ audio_fields;
     const track_bytes = video_entry ++ audio_entry;
     const cluster = "\xe7\x81\x00\xa3\x85\x81\x00\x00\x80\x01" ++
-        "\xa0\x95\xa1\x86\x82\x00\x01\x00\xf8\xff\x75\xa2\x20\x00\x08\xff\xff\xff\xff\xff\xff\xff\xff" ++ "\xa3\x86\x82\x00\x02\x00\xf8\xff";
+        "\xa0\x95\xa1\x86\x82\x00\x01\x00\xf8\xff\x75\xa2\x20\x00\x08\xff\xff\xff\xff\xff\xff\xff\xff" ++ "\xa0\x8c\xa1\x86\x82\x00\x02\x00\xf8\xff\x75\xa2\x81\x01";
     const segment = "\x16\x54\xae\x6b" ++ [_]u8{0x80 | track_bytes.len} ++ track_bytes ++
         "\x1f\x43\xb6\x75" ++ [_]u8{0x80 | cluster.len} ++ cluster;
     const bytes = "\x1a\x45\xdf\xa3\x87\x42\x82\x84webm" ++

@@ -233,6 +233,7 @@ pub const Source = struct {
             owner.mutex.lockUncancelable(io);
             defer owner.mutex.unlock(io);
             if (!self.canRead(size) or !owner.canRead(size)) return error.ResourceLimitExceeded;
+            if (self.optional_range and !owner.canSpendOptional(size)) return error.OptionalAudioBudgetExceeded;
             self.chargeBorrowed(size);
             if (owner != self) owner.chargeBorrowed(size);
             return .{ .bytes = self.storage.borrowed[@intCast(offset)..][0..size], .source = self, .reservation = token };
@@ -375,6 +376,7 @@ pub const Source = struct {
         owner.mutex.lockUncancelable(io);
         defer owner.mutex.unlock(io);
         if (!self.canRead(size) or !owner.canRead(size)) return error.ResourceLimitExceeded;
+        if (self.optional_range and !owner.canSpendOptional(size)) return error.OptionalAudioBudgetExceeded;
         self.pending_bytes += size;
         self.reads += 1;
         self.retained_bytes += size;
@@ -389,6 +391,7 @@ pub const Source = struct {
         owner.mutex.lockUncancelable(io);
         defer owner.mutex.unlock(io);
         if (self.reads >= self.limits.max_reads or owner.reads >= owner.limits.max_reads) return error.ResourceLimitExceeded;
+        if (self.optional_range and !owner.canSpendOptional(0)) return error.OptionalAudioBudgetExceeded;
         self.reads += 1;
         if (owner != self) owner.reads += 1;
     }
@@ -415,10 +418,15 @@ pub const Source = struct {
         return .{
             .max_read_bytes = @min(self.limits.max_read_bytes, owner.limits.max_read_bytes),
             .max_retained_bytes = @min(self.limits.max_retained_bytes -| self.retained_bytes, owner.limits.max_retained_bytes -| owner.retained_bytes),
-            .max_total_bytes = @min(self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes, owner.limits.max_total_bytes -| owner.total_bytes -| owner.pending_bytes),
-            .max_reads = @min(self.limits.max_reads -| self.reads, owner.limits.max_reads -| owner.reads),
+            .max_total_bytes = @min(self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes, owner.limits.max_total_bytes -| owner.total_bytes -| owner.pending_bytes -| (if (self.optional_range) @max(1, owner.limits.max_total_bytes / 4) else 0)),
+            .max_reads = @min(self.limits.max_reads -| self.reads, owner.limits.max_reads -| owner.reads -| (if (self.optional_range) @max(1, owner.limits.max_reads / 4) else 0)),
         };
     }
+    fn canSpendOptional(self: *const Source, size: usize) bool {
+        return self.limits.max_reads -| self.reads > @max(1, self.limits.max_reads / 4) and
+            size <= self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes -| @max(1, self.limits.max_total_bytes / 4);
+    }
+
     fn canRead(self: *const Source, size: usize) bool {
         return size <= self.limits.max_read_bytes and size <= self.limits.max_retained_bytes -| self.retained_bytes and
             size <= self.limits.max_total_bytes -| self.total_bytes -| self.pending_bytes and self.reads < self.limits.max_reads;
@@ -775,4 +783,30 @@ test "preferred sparse reads send only demand to a legacy adapter with one attem
     defer lease.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 42, 42 }, lease.bytes);
     try std.testing.expectEqual(@as(usize, 1), source.reads);
+}
+
+test "optional views preserve physical read and byte reserves" {
+    const Provider = struct {
+        fn read(_: *anyopaque, _: u64, out: []u8, _: Control) !usize {
+            @memset(out, 0);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var physical = Source{
+        .allocator = std.testing.allocator,
+        .identity = "shared-budget",
+        .storage = .{ .range = .{ .context = &marker, .read_at = Provider.read, .length = 32 } },
+        .limits = .{ .max_reads = 4, .max_total_bytes = 8 },
+    };
+    for (0..3) |_| {
+        var required = try physical.read(0, 2);
+        required.deinit();
+    }
+    var optional = physical.view(std.testing.allocator, null, .{});
+    optional.optional_range = true;
+    try std.testing.expectError(error.OptionalAudioBudgetExceeded, optional.read(0, 1));
+    try std.testing.expectEqual(@as(usize, 3), physical.reads);
+    var required = try physical.read(0, 2);
+    required.deinit();
 }

@@ -38,7 +38,7 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, masked_audio: ?AudioExtent = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, masked_audio: ?AudioExtent = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, speaker_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
 pub const AudioExtent = struct {
     samples: usize,
@@ -159,6 +159,7 @@ pub const Runner = struct {
     selective_video: bool = false,
     page_box: ?[4]f64 = null,
     page_rotation: ?i32 = null,
+    video_speaker_failure: ?anyerror = null,
     audio_provider: ?@import("media_chunking_audio.zig").Provider = null,
     audio_failure: ?anyerror = null,
     video_audio: ?*VideoAudio = null,
@@ -291,6 +292,7 @@ pub const Runner = struct {
         if (video_needs_audio) {
             try self.prepareVideoAudio();
             output_payload.video.audio_failure = self.audio_failure;
+            output_payload.video.speaker_failure = self.video_speaker_failure;
             if (self.audio_provider) |provider| {
                 if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
                 const start: u128 = @intCast(descriptor.coordinates.start_ns orelse return error.InvalidChunkCoordinates);
@@ -324,11 +326,11 @@ pub const Runner = struct {
         if (self.request.execute_outputs) {
             if (payload != .video or (video_needs_audio and self.audio_provider != null)) if (self.request.speaker_analysis) |analysis| if (analysis.ensure) |ensure| {
                 if (item.descriptor.coordinates.start_ns) |start| {
-                    if (payload != .video or output_payload.video.audio_failure == null) {
+                    if (payload != .video or (output_payload.video.audio_failure == null and output_payload.video.speaker_failure == null)) {
                         ensure(analysis.context, output_arena.allocator(), start, item.descriptor.coordinates.end_ns.?, false) catch |err| {
                             const optional = if (self.video_audio) |owner| owner.audio_source != null else false;
                             if (!optional or !audioRangePressure(err)) return err;
-                            output_payload.video.audio_failure = err;
+                            output_payload.video.speaker_failure = err;
                         };
                     }
                 }
@@ -1086,8 +1088,7 @@ pub const Runner = struct {
         self.restoreAudioFrames(self.audio_provider.?, &owner.frames);
         self.prepareSpeakers(self.audio_provider.?) catch |err| {
             if (!optional or !audioRangePressure(err)) return err;
-            self.audio_failure = err;
-            self.audio_provider = null;
+            self.video_speaker_failure = err;
         };
     }
 
