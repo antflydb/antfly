@@ -334,8 +334,7 @@ pub const Decoder = struct {
         if (initial and chunk != 0) {
             var end = @min(chunk, history.len);
             while (end < history.len) {
-                const intermediate = try self.appendText(history[0..end], false, a, control);
-                a.free(intermediate);
+                _ = try self.appendText(history[0..end], false, a, control);
                 self.prefill_steps += 1;
                 self.prefill_head_skips += 1;
                 end += @min(chunk, history.len - end);
@@ -394,7 +393,17 @@ pub const Decoder = struct {
         const outputs = try self.run(declared[0..count], a, control);
         defer a.free(outputs);
         defer for (outputs) |*output| output.deinit();
-        return a.dupe(f32, outputs[0].asFloat32());
+        if (!publish_logits) return &.{};
+        if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].data.len % @sizeOf(f32) != 0 or
+            !outputs[0].isAlignedFor(f32)) return error.InvalidResidentDecoderOutput;
+        const output = &outputs[0];
+        if (output.owns_data and output.data_alignment == .of(f32) and
+            output.allocator.ptr == a.ptr and output.allocator.vtable == a.vtable)
+        {
+            output.owns_data = false;
+            return output.asFloat32Mut();
+        }
+        return a.dupe(f32, output.asFloat32());
     }
 };
 
@@ -767,6 +776,7 @@ test "resident decoder submits bounded physical chunks and consumes every valid 
     if (comptime !enabled) return error.SkipZigTest;
     const Probe = struct {
         calls: usize = 0,
+        logits_pointer: ?[*]const f32 = null,
         fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
             return .pjrt;
         }
@@ -792,6 +802,7 @@ test "resident decoder submits bounded physical chunks and consumes every valid 
             const outputs = try a.alloc(Tensor, 1);
             errdefer a.free(outputs);
             outputs[0] = try Tensor.initFloat32(a, "logits", &.{1}, &.{0});
+            self.logits_pointer = outputs[0].asFloat32().ptr;
             return outputs;
         }
         const table = Session.VTable{ .run = run, .backend = backend, .inputInfo = info, .outputInfo = info, .close = close, .runCachedDecoder = cached };
@@ -807,11 +818,13 @@ test "resident decoder submits bounded physical chunks and consumes every valid 
     for (&ids, 0..) |*v, i| v.* = @intCast(i);
     const prefill = try decoder.text(ids[0..150], a, control);
     defer a.free(prefill);
+    try std.testing.expectEqual(probe.logits_pointer.?, prefill.ptr);
     try std.testing.expectEqual(@as(usize, 150), decoder.position);
     try std.testing.expectEqual(@as(usize, 3), decoder.prefill_steps);
     try std.testing.expectEqual(@as(usize, 2), decoder.prefill_head_skips);
     const decode = try decoder.text(&ids, a, control);
     defer a.free(decode);
+    try std.testing.expectEqual(probe.logits_pointer.?, decode.ptr);
     try std.testing.expectEqual(@as(usize, 151), decoder.position);
     try std.testing.expectEqual(@as(usize, 4), probe.calls);
 }
