@@ -720,6 +720,19 @@ test "prepared Metal fanout placement preserves outputs and removes an activatio
         defer executable.deinit();
         const placement = &executable.runtime.plan.?.base;
         const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const device_plan = &executable.runtime.plan.?;
+        const mesh = &executable.runtime.mesh.?;
+        try std.testing.expect(attestOwnedDeviceSchedule(pool, device_plan, mesh, &cb, executable.analysis.reachable));
+        // The node order remains unchanged when runtime loses a handoff.
+        // It must no longer share the physical pool's schedule proof.
+        for (device_plan.base.partitions) |*part| {
+            if (part.external_inputs.len == 0) continue;
+            const original = part.external_inputs;
+            defer part.external_inputs = original;
+            part.external_inputs = original[0 .. original.len - 1];
+            try std.testing.expect(!attestOwnedDeviceSchedule(pool, device_plan, mesh, &cb, executable.analysis.reachable));
+            break;
+        } else return error.MissingPartitionTransfer;
         // This caller uses the ordinary assigned physical plan, not a retained
         // input-qualified PreparedRoutes variant. Inspect its actual KernelPlans
         // and the numerical dispatch counters; the root owns no route selection.
@@ -2835,12 +2848,23 @@ fn attestOwnedDeviceSchedule(
     if (default_count != 1) return false;
 
     var ordinal: usize = 0;
+    var transfer_ordinal: usize = 0;
     for (plan.base.partitions, plan.device_assignment, 0..) |part, device_id, partition_index| {
         var active = false;
         for (part.node_ids) |id| {
             if (id >= count or plan.base.node_assignment[id] != partition_index or pool.plan.node_positions[id] != ordinal) return false;
             ordinal += 1;
             active = active or reachable[id];
+        }
+        for (part.external_inputs) |input| {
+            if (input.node_id >= count or input.source_partition >= partition_index or
+                plan.base.node_assignment[input.node_id] != input.source_partition or
+                transfer_ordinal >= pool.plan.transfers.len) return false;
+            const edge = pool.plan.transfers[transfer_ordinal];
+            if (edge.source_node != input.node_id or edge.source_partition != input.source_partition or
+                edge.target_partition != partition_index or edge.target_backend != part.backend or
+                edge.source_backend != plan.base.partitions[input.source_partition].backend) return false;
+            transfer_ordinal += 1;
         }
         if (!active) continue;
         const device = mesh.device(device_id) orelse return false;
@@ -2849,7 +2873,7 @@ fn attestOwnedDeviceSchedule(
             if (backend.ptr == device.backend.ptr and backend.vtable == device.backend.vtable) break;
         } else return false;
     }
-    return ordinal == count;
+    return ordinal == count and transfer_ordinal == pool.plan.transfers.len;
 }
 
 fn attestNativePartition(executable: *const Executable, graph: *const @import("ml").graph.Graph, executor: *const @import("../graph/partition.zig").PartitionExecutor, backend: *const ops.ComputeBackend) bool {
