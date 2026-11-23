@@ -21026,6 +21026,25 @@ static int antfly_metal_prepare_packed_slot_mutation(termite_metal_decode_runtim
     return 0;
 }
 
+static void antfly_metal_clear_dense_qkv_pack(termite_metal_decode_runtime *runtime, size_t i) {
+    runtime->dense_qkv_packed_weight_buffers[i] = nil;
+    runtime->dense_qkv_packed_bias_buffers[i] = nil;
+    runtime->dense_qkv_packed_mps_mm[i] = nil;
+    runtime->dense_qkv_packed_mps_left[i] = nil;
+    runtime->dense_qkv_packed_mps_right[i] = nil;
+    runtime->dense_qkv_packed_mps_result[i] = nil;
+    runtime->dense_qkv_packed_mps_left_buffers[i] = nil;
+    runtime->dense_qkv_packed_mps_result_buffers[i] = nil;
+    runtime->dense_qkv_packed_mps_left_offsets[i] = 0;
+    runtime->dense_qkv_packed_mps_result_offsets[i] = 0;
+    runtime->dense_qkv_packed_k_slots[i] = SIZE_MAX;
+    runtime->dense_qkv_packed_v_slots[i] = SIZE_MAX;
+    runtime->dense_qkv_packed_in_dims[i] = 0;
+    runtime->dense_qkv_packed_q_out_dims[i] = 0;
+    runtime->dense_qkv_packed_kv_out_dims[i] = 0;
+    runtime->dense_qkv_packed_mps_rows[i] = 0;
+}
+
 static void termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(
     termite_metal_decode_runtime *runtime,
     size_t slot
@@ -21034,24 +21053,8 @@ static void termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(
     for (size_t i = 0; i < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY; ++i) {
         if (i == slot ||
             runtime->dense_qkv_packed_k_slots[i] == slot ||
-            runtime->dense_qkv_packed_v_slots[i] == slot)
-        {
-            runtime->dense_qkv_packed_weight_buffers[i] = nil;
-            runtime->dense_qkv_packed_bias_buffers[i] = nil;
-            runtime->dense_qkv_packed_mps_mm[i] = nil;
-            runtime->dense_qkv_packed_mps_left[i] = nil;
-            runtime->dense_qkv_packed_mps_right[i] = nil;
-            runtime->dense_qkv_packed_mps_result[i] = nil;
-            runtime->dense_qkv_packed_mps_left_buffers[i] = nil;
-            runtime->dense_qkv_packed_mps_result_buffers[i] = nil;
-            runtime->dense_qkv_packed_mps_left_offsets[i] = 0;
-            runtime->dense_qkv_packed_mps_result_offsets[i] = 0;
-            runtime->dense_qkv_packed_k_slots[i] = SIZE_MAX;
-            runtime->dense_qkv_packed_v_slots[i] = SIZE_MAX;
-            runtime->dense_qkv_packed_in_dims[i] = 0;
-            runtime->dense_qkv_packed_q_out_dims[i] = 0;
-            runtime->dense_qkv_packed_kv_out_dims[i] = 0;
-            runtime->dense_qkv_packed_mps_rows[i] = 0;
+            runtime->dense_qkv_packed_v_slots[i] == slot) {
+            antfly_metal_clear_dense_qkv_pack(runtime, i);
         }
     }
 }
@@ -21077,6 +21080,16 @@ static void termite_metal_decode_runtime_invalidate_q8_qkv_pack_slot(
     }
 }
 
+static void antfly_metal_clear_dense_pair_pack(termite_metal_decode_runtime *runtime, size_t i) {
+    runtime->dense_pair_packed_weight_buffers[i] = nil;
+    runtime->dense_pair_packed_bias_buffers[i] = nil;
+    runtime->dense_pair_packed_mps_mm[i] = nil;
+    runtime->dense_pair_packed_b_slots[i] = SIZE_MAX;
+    runtime->dense_pair_packed_in_dims[i] = 0;
+    runtime->dense_pair_packed_out_dims[i] = 0;
+    runtime->dense_pair_packed_mps_rows[i] = 0;
+}
+
 static void termite_metal_decode_runtime_invalidate_dense_pair_pack_slot(
     termite_metal_decode_runtime *runtime,
     size_t slot
@@ -21084,13 +21097,7 @@ static void termite_metal_decode_runtime_invalidate_dense_pair_pack_slot(
     if (runtime == NULL) return;
     for (size_t i = 0; i < TERMITE_METAL_LINEAR_SLOT_CAPACITY; ++i) {
         if (i == slot || runtime->dense_pair_packed_b_slots[i] == slot) {
-            runtime->dense_pair_packed_weight_buffers[i] = nil;
-            runtime->dense_pair_packed_bias_buffers[i] = nil;
-            runtime->dense_pair_packed_mps_mm[i] = nil;
-            runtime->dense_pair_packed_b_slots[i] = SIZE_MAX;
-            runtime->dense_pair_packed_in_dims[i] = 0;
-            runtime->dense_pair_packed_out_dims[i] = 0;
-            runtime->dense_pair_packed_mps_rows[i] = 0;
+            antfly_metal_clear_dense_pair_pack(runtime, i);
         }
     }
 }
@@ -21461,10 +21468,20 @@ int antfly_metal_packed_projection_forget(termite_metal_decode_runtime *runtime,
     if (!runtime || !handle) return -1;
     AntflyMetalPackedProjection *entry = handle;
     if (entry->provider != runtime || entry->origin != atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire)) return -1;
-    // Caller preflighted the final current B while excluding future uses.
-    for (size_t i = 0; i < entry->count; ++i) {
-        termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(runtime, entry->slots[i]);
-        termite_metal_decode_runtime_invalidate_dense_pair_pack_slot(runtime, entry->slots[i]);
+    // The lead slot can already refer to a newer pack. Retire only aliases
+    // rooted in this entry, including the MPS views that retain its buffers.
+    const size_t slot = entry->slots[0];
+    id<MTLBuffer> weight = (__bridge id<MTLBuffer>)entry->weight;
+    id<MTLBuffer> bias = (__bridge id<MTLBuffer>)entry->bias;
+    if (entry->count == 2 && slot < TERMITE_METAL_LINEAR_SLOT_CAPACITY &&
+        runtime->dense_pair_packed_weight_buffers[slot] == weight &&
+        runtime->dense_pair_packed_bias_buffers[slot] == bias) {
+        antfly_metal_clear_dense_pair_pack(runtime, slot);
+    }
+    if (entry->count == 3 && slot < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY &&
+        runtime->dense_qkv_packed_weight_buffers[slot] == weight &&
+        runtime->dense_qkv_packed_bias_buffers[slot] == bias) {
+        antfly_metal_clear_dense_qkv_pack(runtime, slot);
     }
     antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->weight, entry, true);
     antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->bias, entry, true);

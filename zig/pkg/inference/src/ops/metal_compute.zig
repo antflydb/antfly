@@ -13269,17 +13269,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const entry = try metal_runtime.PackedProjectionEntry.create(self.provider_impl.raw_decode_runtime, request, funded.roots);
         const owner = funded.owner;
         const node = funded.node;
-        // No fallible operation separates initialization and creator publication.
-        // A later cache-publication/operation error leaves a valid cache creator,
-        // never borrowed endpoints pointing at an error-unwound local Owner.
+        // Keep the funded owner private until the SDK accepts its bindings.
+        // On rejection the funding object still owns both roots and the charge.
+        errdefer antfly_metal_packed_projection_release_owner(entry.handle);
         owner.init(funded.data.allocator, entry.handle, funded.charge, antfly_metal_packed_projection_release_owner);
+        if (metal_runtime.antfly_metal_packed_projection_publish(self.provider_impl.raw_decode_runtime, entry.handle, owner) != 0) return error.PackedProjectionPublicationFailed;
         node.* = .{ .request = request, .owner = owner, .next = null };
         platform.sync.lockYielding(&self.packed_projection_mutex);
         node.next = self.packed_projection_entries;
         self.packed_projection_entries = node;
         self.packed_projection_mutex.unlock();
         funded.published = true;
-        if (metal_runtime.antfly_metal_packed_projection_publish(self.provider_impl.raw_decode_runtime, entry.handle, owner) != 0) return error.PackedProjectionPublicationFailed;
     }
 
     /// Called only by the actual Session BeforeExecution service, with the
