@@ -102,9 +102,11 @@ const MetadataSessions = struct {
     fn create(alloc: std.mem.Allocator, svc: *service.MetadataHttpService) !*@This() {
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
-        self.adapter = .{ .host = .{ .ptr = svc, .read = read, .term = term, .propose = propose }, .group = svc.metadata_group_id };
+        self.adapter = .{ .host = .{ .ptr = svc, .read = read, .controlled_read = readControlled, .term = term, .propose = propose }, .group = svc.metadata_group_id };
         self.store = self.adapter.runtime(alloc);
         self.durable = @import("../api/transactions.zig").DurableSessionStore.initRuntime(alloc, &self.store);
+        const Adapter = @import("transaction_session_store.zig").Store;
+        self.durable.routing_access = .{ .ptr = &self.adapter, .vtable = &.{ .read = Adapter.readControlled, .write = Adapter.writeControlled } };
         return self;
     }
     fn destroy(self: *@This(), alloc: std.mem.Allocator) void {
@@ -112,8 +114,12 @@ const MetadataSessions = struct {
         alloc.destroy(self);
     }
     fn read(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
+        return readControlled(ptr, alloc, .{});
+    }
+    fn readControlled(ptr: *anyopaque, alloc: std.mem.Allocator, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLinearizableReadWithContext(.{});
+        try svc.ensureLinearizableReadWithContext(context);
+        try context.ensureActive();
         const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
         return projected.openSessionRead(alloc, svc.metadata_group_id);
     }

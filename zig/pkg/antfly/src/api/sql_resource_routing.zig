@@ -29,6 +29,38 @@ pub fn owner(id: []const u8) !u64 {
     _ = try std.fmt.hexToBytes(&bytes, id);
     return std.mem.readInt(u64, bytes[0..8], .big);
 }
+const ownership_prefix = "\x00sql-resource-owner-v1/";
+
+fn ownershipKey(kind: Kind, id: []const u8) ![ownership_prefix.len + 1 + 32]u8 {
+    if (id.len != 32) return error.InvalidArgument;
+    var key: [ownership_prefix.len + 1 + 32]u8 = undefined;
+    @memcpy(key[0..ownership_prefix.len], ownership_prefix);
+    key[ownership_prefix.len] = switch (kind) {
+        .prepared => 'p',
+        .connection => 'c',
+    };
+    @memcpy(key[ownership_prefix.len + 1 ..], id);
+    return key;
+}
+
+pub fn putOwnership(txn: anytype, kind: Kind, id: []const u8, node: u64) !void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, node, .big);
+    try txn.put(&(try ownershipKey(kind, id)), &bytes);
+}
+
+pub fn deleteOwnership(txn: anytype, kind: Kind, id: []const u8) !void {
+    txn.delete(&(try ownershipKey(kind, id))) catch |err| if (err != error.NotFound) return err;
+}
+
+fn containsKey(txn: anytype, key: []const u8) !bool {
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    cursor.setKeysOnly();
+    const row = (try cursor.seekAtOrAfter(key)) orelse return false;
+    return std.mem.eql(u8, row.key, key);
+}
+
 fn owns(txn: anytype, alloc: std.mem.Allocator, id: []const u8, kind: Kind, local_node_id: u64, bounded: bool) !bool {
     return switch (kind) {
         .prepared => ownsKey(txn, alloc, &(try @import("sql_prepared.zig").resourceKey(id)), id, local_node_id, @import("sql_prepared.zig").max_resource_bytes, bounded),
@@ -69,7 +101,8 @@ fn ownsKey(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: []const 
 }
 // Legacy random handles may override their encoded issuer only when the
 // persisted record is owned here. Shared-store visibility does not imply ownership.
-pub fn ownsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64, admission: ?*RequestAdmission) !bool {
+pub fn ownsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64, admission: ?*RequestAdmission, context: @import("antfly_local_sources").api_operation.RequestContext) !bool {
+    try context.ensureActive();
     return switch (store.backend) {
         .docstore => |backend| blk: {
             var txn = try backend.beginReadTxn();
@@ -77,13 +110,24 @@ pub fn ownsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind:
             break :blk try ownsAdmitted(&txn, store.alloc, id, kind, local_node_id, admission);
         },
         .runtime => |backend| blk: {
-            var txn = try backend.beginRead();
+            var txn = try store.beginRoutingRead(backend, context);
             defer txn.abort();
             break :blk try ownsAdmitted(&txn, store.alloc, id, kind, local_node_id, admission);
         },
     };
 }
 fn ownsAdmitted(txn: anytype, alloc: std.mem.Allocator, id: []const u8, kind: Kind, node: u64, admission: ?*RequestAdmission) !bool {
+    const key = try ownershipKey(kind, id);
+    if (txn.get(&key)) |owner_bytes| {
+        if (owner_bytes.len != 8) return error.InvalidSqlConnection;
+        if (std.mem.readInt(u64, owner_bytes[0..8], .big) != node) return false;
+        // A reader after a downgrade can see an index row left behind by an
+        // older delete. Never override the encoded route without a live key.
+        return switch (kind) {
+            .prepared => containsKey(txn, &(try @import("sql_prepared.zig").resourceKey(id))),
+            .connection => containsKey(txn, &(try @import("sql_connection_record.zig").key(id))),
+        };
+    } else |err| if (err != error.NotFound) return err;
     if (admission) |capacity| {
         return owns(txn, alloc, id, kind, node, true) catch |err| switch (err) {
             error.Unsupported => fallback: {

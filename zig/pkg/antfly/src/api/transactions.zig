@@ -1216,6 +1216,8 @@ pub const Session = struct {
     }
 };
 
+const RoutingContext = @import("antfly_local_sources").api_operation.RequestContext;
+
 pub const DurableSessionStore = struct {
     alloc: std.mem.Allocator,
     backend: Backend,
@@ -1234,6 +1236,33 @@ pub const DurableSessionStore = struct {
     sql_abort_proof_position: ?SqlAbortProofPosition = null,
     fail_writes_for_test: bool = false,
     fail_lease_transition_after_session_write_for_test: bool = false,
+
+    routing_access: ?RoutingAccess = null,
+
+    pub const RoutingAccess = struct {
+        ptr: *anyopaque,
+        vtable: *const VTable,
+        boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+
+        pub const VTable = struct {
+            read: *const fn (*anyopaque, std.mem.Allocator, RoutingContext) anyerror!backend_erased.ReadTxn,
+            write: *const fn (*anyopaque, std.mem.Allocator, RoutingContext) anyerror!backend_erased.WriteTxn,
+        };
+        const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+
+        fn read(self: RoutingAccess, alloc: std.mem.Allocator, context: RoutingContext) !backend_erased.ReadTxn {
+            return Boundary.call("read", self.boundary_dispatch, self.vtable.read, .{ self.ptr, alloc, context });
+        }
+        fn write(self: RoutingAccess, alloc: std.mem.Allocator, context: RoutingContext) !backend_erased.WriteTxn {
+            return Boundary.call("write", self.boundary_dispatch, self.vtable.write, .{ self.ptr, alloc, context });
+        }
+    };
+
+    pub fn beginRoutingRead(self: *DurableSessionStore, store: *backend_erased.Store, context: RoutingContext) !backend_erased.ReadTxn {
+        try context.ensureActive();
+        if (self.routing_access) |access| return access.read(store.allocator, context);
+        return store.beginRead();
+    }
 
     fn writeSerialization(self: *const DurableSessionStore) backend_erased.WriteSerialization {
         return switch (self.backend) {
@@ -1381,18 +1410,44 @@ pub const DurableSessionStore = struct {
         capacity: ?usize,
         tenure: ?*?u128,
     ) !bool {
+        return self.saveWithLeaseControlled(session, expected, now_ms, ttl_ms, require_expired, max_record_bytes, capacity, tenure, .{});
+    }
+
+    fn saveWithLeaseControlled(
+        self: *DurableSessionStore,
+        session: Session,
+        expected: ?Version,
+        now_ms: u64,
+        ttl_ms: u64,
+        require_expired: bool,
+        max_record_bytes: ?usize,
+        capacity: ?usize,
+        tenure: ?*?u128,
+        context: RoutingContext,
+    ) !bool {
         const mutation = self.mutationMutex();
         platform_sync.lockYielding(mutation);
         defer mutation.unlock();
+        try context.ensureActive();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         return switch (self.backend) {
             .docstore => |store| blk: {
                 var txn = try store.beginWriteTxn();
-                break :blk finishSessionWrite(&txn, saveSessionWithLeaseTxn(self, &txn, session, expected, now_ms, ttl_ms, require_expired, max_record_bytes, capacity, tenure), session.graph_receipt and expected == null);
+                const result = saveSessionWithLeaseTxn(self, &txn, session, expected, now_ms, ttl_ms, require_expired, max_record_bytes, capacity, tenure);
+                context.ensureActive() catch |err| {
+                    txn.abort();
+                    return err;
+                };
+                break :blk finishSessionWrite(&txn, result, session.graph_receipt and expected == null);
             },
             .runtime => |store| blk: {
-                var txn = try store.beginWrite();
-                break :blk finishSessionWrite(&txn, saveSessionWithLeaseTxn(self, &txn, session, expected, now_ms, ttl_ms, require_expired, max_record_bytes, capacity, tenure), session.graph_receipt and expected == null);
+                var txn = if (self.routing_access) |access| try access.write(store.allocator, context) else try store.beginWrite();
+                const result = saveSessionWithLeaseTxn(self, &txn, session, expected, now_ms, ttl_ms, require_expired, max_record_bytes, capacity, tenure);
+                context.ensureActive() catch |err| {
+                    txn.abort();
+                    return err;
+                };
+                break :blk finishSessionWrite(&txn, result, session.graph_receipt and expected == null);
             },
         };
     }
@@ -1522,6 +1577,18 @@ pub const DurableSessionStore = struct {
 
     pub fn load(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !?Session {
         return self.loadWithRecoveryOwner(txn_id, null);
+    }
+
+    fn loadForRouting(self: *DurableSessionStore, id: db_mod.types.TxnId, context: RoutingContext) !?Session {
+        try context.ensureActive();
+        return switch (self.backend) {
+            .docstore => self.load(id),
+            .runtime => |store| result: {
+                var txn = try self.beginRoutingRead(store, context);
+                defer txn.abort();
+                break :result try self.loadSessionTxn(&txn, id);
+            },
+        };
     }
 
     fn loadWithRecoveryOwner(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, recovery_owner: ?u64) !?Session {
@@ -1830,6 +1897,40 @@ pub const DurableSessionStore = struct {
 
     pub fn probeSqlCommitDecision(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, connection: ?[32]u8, principal: []const u8) !SqlCommitProbe {
         return self.lookupSqlCommitDecision(alloc, id, connection, principal, true);
+    }
+
+    pub const RoutedSqlCommit = struct {
+        decision: ?SqlStoredDecision = null,
+        owner: ?u64 = null,
+    };
+
+    pub fn routedSqlCommitDecision(self: *DurableSessionStore, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: []const u8, capacity: *@import("antfly_local_sources").common_request_admission.RequestAdmission, context: RoutingContext) !RoutedSqlCommit {
+        try context.ensureActive();
+        return switch (self.backend) {
+            .docstore => |store| result: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :result try self.routedSqlCommitDecisionTxn(&txn, alloc, id, principal, capacity, context);
+            },
+            .runtime => |store| result: {
+                var txn = try self.beginRoutingRead(store, context);
+                defer txn.abort();
+                break :result try self.routedSqlCommitDecisionTxn(&txn, alloc, id, principal, capacity, context);
+            },
+        };
+    }
+
+    fn routedSqlCommitDecisionTxn(self: *DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId, principal: []const u8, capacity: *@import("antfly_local_sources").common_request_admission.RequestAdmission, context: RoutingContext) !RoutedSqlCommit {
+        const probe = try self.sqlCommitDecisionStatusTxn(txn, alloc, id, null, principal, true);
+        if (probe.decision) |decision| return .{ .decision = decision };
+        if (probe.payload != .none) {
+            try context.ensureActive();
+            var lease = capacity.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+            defer lease.release();
+            if ((try self.sqlCommitDecisionStatusTxn(txn, alloc, id, null, principal, false)).decision) |decision|
+                return .{ .decision = decision };
+        }
+        return .{ .owner = try SessionRegistry.probeOwnerWithFallback(self, txn, id, capacity, context) };
     }
 
     const SqlCommitProbe = struct {
@@ -5641,10 +5742,11 @@ pub const SessionRegistry = struct {
     }
 
     /// Returns Unsupported when a legacy record needs an admitted full read.
-    pub fn probeOwnerNodeId(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?u64 {
+    pub fn probeOwnerNodeId(self: *SessionRegistry, txn_id: db_mod.types.TxnId, capacity: *@import("antfly_local_sources").common_request_admission.RequestAdmission, context: RoutingContext) !?u64 {
         const stripe = self.sessionLock(txn_id);
         stripe.lock();
         defer stripe.unlock();
+        try context.ensureActive();
         if (!self.durableMissIsAuthoritative()) {
             self.mutex.lock();
             const cached = if (self.sessions.getPtr(txn_id)) |session| session.owner_node_id else null;
@@ -5656,13 +5758,27 @@ pub const SessionRegistry = struct {
             .docstore => |store| result: {
                 var read = try store.beginReadTxn();
                 defer read.abort();
-                break :result try probeDurableOwner(&read, durable.alloc, txn_id);
+                break :result try probeOwnerWithFallback(durable, &read, txn_id, capacity, context);
             },
             .runtime => |store| result: {
-                var read = try store.beginRead();
+                var read = try durable.beginRoutingRead(store, context);
                 defer read.abort();
-                break :result try probeDurableOwner(&read, durable.alloc, txn_id);
+                break :result try probeOwnerWithFallback(durable, &read, txn_id, capacity, context);
             },
+        };
+    }
+
+    fn probeOwnerWithFallback(durable: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId, capacity: *@import("antfly_local_sources").common_request_admission.RequestAdmission, context: RoutingContext) !?u64 {
+        return probeDurableOwner(txn, durable.alloc, id) catch |err| switch (err) {
+            error.Unsupported => fallback: {
+                try context.ensureActive();
+                var lease = capacity.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+                defer lease.release();
+                var session = (try durable.loadSessionTxn(txn, id)) orelse break :fallback null;
+                defer session.deinit(durable.alloc);
+                break :fallback session.owner_node_id;
+            },
+            else => return err,
         };
     }
 
@@ -5742,9 +5858,21 @@ pub const SessionRegistry = struct {
         owner_node_id: u64,
         now_ns: ?u64,
     ) !bool {
+        return self.adoptIfLeaseExpiredControlled(alloc, txn_id, owner_node_id, now_ns, .{});
+    }
+
+    pub fn adoptIfLeaseExpiredControlled(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        now_ns: ?u64,
+        context: RoutingContext,
+    ) !bool {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
+        try context.ensureActive();
         const durable = self.durable orelse return false;
         if (self.lease_store == null or self.owner_lease_ttl_ns == null) {
             return false;
@@ -5752,7 +5880,7 @@ pub const SessionRegistry = struct {
         // A routing/principal lookup may have cached an older non-owner copy.
         // Adoption must always fence and transfer the latest durable record or
         // it can overwrite staged work that the previous owner published.
-        var persisted = (try durable.load(txn_id)) orelse return false;
+        var persisted = (try durable.loadForRouting(txn_id, context)) orelse return false;
         defer persisted.deinit(durable.alloc);
         var candidate = try persisted.clone(alloc);
         errdefer candidate.deinit(alloc);
@@ -5765,7 +5893,7 @@ pub const SessionRegistry = struct {
         candidate.owner_node_id = owner_node_id;
         touchSession(&candidate);
         const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
-        if (!(try durable.saveWithLease(candidate, expected, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, null, null))) {
+        if (!(try durable.saveWithLeaseControlled(candidate, expected, effective_now / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes, null, null, context))) {
             candidate.deinit(alloc);
             return false;
         }

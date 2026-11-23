@@ -49,7 +49,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 44 includes the pgwire publication scope for native startup.
 // Version 45 adds the artifact history read provider to API configuration.
 // Version 46 transfers request-forward lane reservations and SQL peer configuration.
-pub const abi_version: u32 = 46;
+// Version 47 adds controlled session-store routing access.
+pub const abi_version: u32 = 47;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

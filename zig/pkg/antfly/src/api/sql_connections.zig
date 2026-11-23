@@ -335,6 +335,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         defer alloc.free(encoded);
         try txn.put(directory_key, encoded);
         try record.putTxn(txn, alloc, value);
+        try @import("sql_resource_routing.zig").putOwnership(txn, .connection, &value.id, value.owner_node_id);
         return 0;
     }
     const id: [32]u8 = switch (action) {
@@ -378,6 +379,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
             } else {
                 const connection_key = try record.key(&id);
                 try txn.delete(&connection_key);
+                try @import("sql_resource_routing.zig").deleteOwnership(txn, .connection, &id);
                 try removeDirectoryEntry(txn, alloc, id, null);
             }
             break :blk removed;

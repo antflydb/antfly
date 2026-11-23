@@ -21,9 +21,11 @@ const erased = local.storage_backend_erased;
 const types = local.storage_backend_types;
 const record = @import("transaction_session_record.zig");
 const A = std.mem.Allocator;
+const RoutingContext = local.api_operation.RequestContext;
 pub const Host = struct {
     ptr: *anyopaque,
     read: *const fn (*anyopaque, A) anyerror!erased.ReadTxn,
+    controlled_read: ?*const fn (*anyopaque, A, RoutingContext) anyerror!erased.ReadTxn = null,
     term: *const fn (*anyopaque) ?u64,
     propose: *const fn (*anyopaque, []const u8, u64, *bool) anyerror!bool,
 };
@@ -42,7 +44,10 @@ pub const Store = struct {
         return .{ .reverse_ranges = true, .max_atomic_compare_write_bytes = record.max_bytes };
     }
     fn beginRead(a: A, ptr: *anyopaque) !erased.ReadTxn {
-        const read = try Read.create(a, cast(ptr));
+        return readControlled(ptr, a, .{});
+    }
+    pub fn readControlled(ptr: *anyopaque, a: A, context: RoutingContext) !erased.ReadTxn {
+        const read = try Read.createControlled(a, cast(ptr), context);
         return .{ .allocator = a, .ptr = read, .vtable = &.{ .abort = Read.abort, .get = Read.get, .open_cursor = Read.cursor, .open_read_scope = Read.scope, .count_prefix = Read.countPrefix, .read_prefix_page = Read.prefixPage } };
     }
     fn beginProbe(a: A, ptr: *anyopaque) !erased.ProbeTxn {
@@ -51,11 +56,24 @@ pub const Store = struct {
     }
 
     fn beginWrite(a: A, ptr: *anyopaque) !erased.WriteTxn {
+        return beginWriteControlled(a, cast(ptr), .{});
+    }
+
+    pub fn writeControlled(ptr: *anyopaque, a: A, context: RoutingContext) !erased.WriteTxn {
         const self = cast(ptr);
+        @import("antfly_platform").sync.lockYielding(&self.gate);
+        errdefer self.gate.unlock();
+        var txn = try beginWriteControlled(a, self, context);
+        txn.write_gate = &self.gate;
+        return txn;
+    }
+
+    fn beginWriteControlled(a: A, self: *Store, context: RoutingContext) !erased.WriteTxn {
+        try context.ensureActive();
         const term = self.host.term(self.host.ptr) orelse return error.NotLeader;
         const write = try a.create(Write);
         errdefer a.destroy(write);
-        const read = try Read.create(a, self);
+        const read = try Read.createControlled(a, self, context);
         errdefer read.destroy(a);
         if (self.host.term(self.host.ptr) != term) return error.NotLeader;
         const raw = read.physical.get(try record.keyAlloc(read.arena.allocator(), self.group, record.epoch_key)) catch |err| switch (err) {
@@ -66,7 +84,7 @@ pub const Store = struct {
             if (value.len != 8) return error.InvalidTransactionSessionRecord;
             break :blk std.mem.readInt(u64, value[0..8], .little);
         } else 0;
-        write.* = .{ .read = read, .term = term, .epoch = epoch };
+        write.* = .{ .read = read, .term = term, .epoch = epoch, .context = context };
         return .{ .allocator = a, .ptr = write, .vtable = &.{ .abort = Write.abort, .commit = Write.commit, .get = Write.get, .put = Write.put, .delete = Write.delete, .open_cursor = Write.cursor, .count_prefix = Write.countPrefix } };
     }
     fn beginBatch(a: A, ptr: *anyopaque) !erased.Batch {
@@ -84,13 +102,17 @@ const Read = struct {
         return @ptrCast(@alignCast(ptr));
     }
     fn create(a: A, store: *Store) !*Read {
+        return createControlled(a, store, .{});
+    }
+    fn createControlled(a: A, store: *Store, context: RoutingContext) !*Read {
+        try context.ensureActive();
         const self = try a.create(Read);
         errdefer a.destroy(self);
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         var buf: [96]u8 = undefined;
         const prefix = try arena.allocator().dupe(u8, try record.prefixForGroup(&buf, store.group));
-        self.* = .{ .store = store, .physical = try store.host.read(store.host.ptr, a), .arena = arena, .prefix = prefix };
+        self.* = .{ .store = store, .physical = if (store.host.controlled_read) |read_controlled| try read_controlled(store.host.ptr, a, context) else try store.host.read(store.host.ptr, a), .arena = arena, .prefix = prefix };
         return self;
     }
     fn destroy(self: *Read, _: A) void {
@@ -196,6 +218,7 @@ const Write = struct {
     read: *Read,
     term: u64,
     epoch: u64,
+    context: RoutingContext,
     refs: std.atomic.Value(usize) = .init(1),
     scanned: bool = false,
     owned_bytes: usize = 0,
@@ -330,6 +353,7 @@ const Write = struct {
                 error.OutOfMemory => error.SessionWriteOutOfMemoryBeforeProposal,
                 else => err,
             };
+            try self.context.ensureActive();
             var submitted = false;
             const applied = store.host.propose(store.host.ptr, bytes, self.term, &submitted) catch |err| {
                 if (submitted) {

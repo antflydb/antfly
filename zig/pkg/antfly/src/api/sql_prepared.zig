@@ -231,12 +231,14 @@ fn accessTxn(txn: anytype, alloc: std.mem.Allocator, action: Action, principal: 
         if (resource.expires_at_ms <= now_ms) {
             const expired_key = try resourceKey(&resource.id);
             try txn.delete(&expired_key);
+            try @import("sql_resource_routing.zig").deleteOwnership(txn, .prepared, &resource.id);
             continue;
         }
         if (std.mem.eql(u8, &resource.id, id)) {
             if (action == .create) return error.SqlPreparedAlreadyExists;
             const deleted_key = try resourceKey(id);
             try txn.delete(&deleted_key);
+            try @import("sql_resource_routing.zig").deleteOwnership(txn, .prepared, id);
             found = true;
             continue;
         }
@@ -269,6 +271,7 @@ fn accessTxn(txn: anytype, alloc: std.mem.Allocator, action: Action, principal: 
             if (encoded_resource.len > max_resource_bytes or total_bytes > max_record_bytes -| encoded_resource.len) return error.SqlProgramLimitExceeded;
             const created_key = try resourceKey(&resource.id);
             try txn.put(&created_key, encoded_resource);
+            try @import("sql_resource_routing.zig").putOwnership(txn, .prepared, &resource.id, resource.owner_node_id);
             total_bytes += encoded_resource.len;
             retained[count] = .{ .id = resource.id, .expires_at_ms = resource.expires_at_ms, .bytes = encoded_resource.len };
             count += 1;
@@ -311,6 +314,7 @@ pub fn discardConnectionTxn(txn: anytype, alloc: std.mem.Allocator, connection_i
         if (resource.value.connection_id) |owner| {
             if (std.mem.eql(u8, &owner, &connection_id)) {
                 try txn.delete(&resource_key);
+                try @import("sql_resource_routing.zig").deleteOwnership(txn, .prepared, &entry.id);
                 removed += 1;
                 continue;
             }

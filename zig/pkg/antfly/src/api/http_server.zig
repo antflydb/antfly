@@ -14543,7 +14543,7 @@ pub const ApiHttpServer = struct {
         const owner = try routing.owner(id);
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
-        if (self.txn_sessions.durable) |store| if (try routing.ownsLocal(store, id, kind, router.localNodeId(), &self.query_admission)) return null;
+        if (self.txn_sessions.durable) |store| if (try routing.ownsLocal(store, id, kind, router.localNodeId(), &self.query_admission, .{})) return null;
         return self.forwardSQLResourceToOwner(owner, request, forwarded, null);
     }
 
@@ -14597,15 +14597,8 @@ pub const ApiHttpServer = struct {
         return try self.takeForwardedResponse(&response);
     }
 
-    pub fn sessionRoutingOwner(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !?u64 {
-        return self.txn_sessions.probeOwnerNodeId(txn_id) catch |err| switch (err) {
-            error.Unsupported => fallback: {
-                var read = try self.acquireSqlExecution(false);
-                defer read.release();
-                break :fallback try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id);
-            },
-            else => return err,
-        };
+    pub fn sessionRoutingOwner(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, context: api_operation.RequestContext) !?u64 {
+        return self.txn_sessions.probeOwnerNodeId(txn_id, &self.query_admission, context);
     }
 
     fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest, route: SessionForwardOwner, sql: ?*SQLSessionForwardState) !?http_common.HttpResponse {
@@ -14674,10 +14667,13 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn adoptRoutedSQLSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !bool {
+    pub fn adoptRoutedSQLSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, context: api_operation.RequestContext) !bool {
+        try context.ensureActive();
         var read = try self.acquireSqlExecution(false);
         defer read.release();
-        return self.tryAdoptSession(txn_id);
+        const node = self.localSessionNodeId();
+        if (node == 0) return false;
+        return self.txn_sessions.adoptIfLeaseExpiredControlled(self.alloc, txn_id, node, null, context);
     }
 
     pub fn extensionRouteMutatesMetadata(method: contextual_operations.Method, path: []const u8) bool {
@@ -64449,8 +64445,8 @@ test "SQL pgwire native shared resource routing checks persisted ownership" {
         defer if (response) |*value| value.deinit(a);
         try std.testing.expect(response != null and forwarded and fixture.called);
         fixture.called = false;
-        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 1, null));
-        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 2, null));
+        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 1, null, .{}));
+        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 2, null, .{}));
     }
     try std.testing.expectError(error.SqlConnectionWrongOwner, connections.load(&peer_store, a, connection, "alice", 2, 2));
     try std.testing.expectError(error.SqlPreparedWrongOwner, prepared.load(&peer_store, a, &statement, "alice", 2, 2));
@@ -64462,8 +64458,8 @@ test "SQL pgwire native shared resource routing checks persisted ownership" {
     try prepared.create(&peer_store, .{ .id = legacy_statement, .principal = "alice", .owner_node_id = 2, .expires_at_ms = 1000, .database = "main", .namespace = "public", .statement = "SELECT 1", .parameter_types = &.{}, .bindings = &.{} }, 1);
     for ([_]routing.Kind{ .connection, .prepared }) |kind| {
         const id = if (kind == .connection) legacy_connection else legacy_statement;
-        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 2, null));
-        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 1, null));
+        try std.testing.expect(try routing.ownsLocal(&peer_store, &id, kind, 2, null, .{}));
+        try std.testing.expect(!try routing.ownsLocal(&peer_store, &id, kind, 1, null, .{}));
         var forwarded = false;
         try std.testing.expectEqual(@as(?contextual_operations.OwnedResponse, null), try peer.forwardSQLResourceOperation(&id, kind, .{ .method = .DELETE, .uri = "/db/v1/sql/resource", .body = "" }, &forwarded));
         try std.testing.expect(!forwarded and !fixture.called);
