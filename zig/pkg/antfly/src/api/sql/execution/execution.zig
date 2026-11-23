@@ -1936,15 +1936,21 @@ pub const Adapter = struct {
         // A narrow definition read pins schema and physical identity in one
         // catalog epoch; never enumerate/clone every table on a SQL request.
         if (!self.server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-        const lookup: system_catalog.ResolveMany = .{ .targets = &.{target}, .include_query_definitions = true, .expected_revision = self.revision, .sql_principal = sql_principal };
+        const lookup: system_catalog.ResolveMany = .{ .targets = &.{target}, .include_query_definitions = true, .expected_revision = self.revision, .sql_principal = sql_principal, .include_source_epoch = self.context.bound_catalog_incarnation != null };
         var private = self.context;
         if (sql_principal != null) private.setting_admin = true;
         const bytes = try self.server.source.systemCatalog(alloc, private, .{ .resolve_many = lookup });
         const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
         try snapshot.validateAuthority(alloc, lookup);
         if (snapshot.sql_authority) |authority| self.sql_authority = authority;
+        try self.context.checkCatalogIncarnation(snapshot.source_epoch);
+        if (self.revision) |revision| if (revision != snapshot.revision) return error.CatalogGenerationChanged;
+        if (self.missing_target_epoch) |epoch| if (snapshot.source_epoch == null or !epoch.eql(snapshot.source_epoch.?)) return error.CatalogGenerationChanged;
         if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
+        // Keep the revision of the actual binding, including a search-path miss.
+        self.revision = snapshot.revision;
         const table = snapshot.tables[0] orelse {
+            self.missing_target_epoch = snapshot.source_epoch;
             if (!native_allowed and !own_temporary_candidate) return error.Forbidden;
             if (action != .read) {
                 const resolved = try @import("view_execution.zig").lookup(self, alloc, target);
