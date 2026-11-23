@@ -42,7 +42,20 @@ pub const Span = struct { start_ns: i64, end_ns: i64, speaker_index: ?u32 = null
 pub const Registry = struct {
     sums: [64][512]f32 = @splat(@splat(0)),
     count: usize = 0,
-    pub fn assign(self: *Registry, embedding: []const f32, config: Config) !?u32 {
+    pub const Assignment = union(enum) {
+        none,
+        update: u32,
+        insert: u32,
+
+        pub fn label(self: Assignment) ?u32 {
+            return switch (self) {
+                .none => null,
+                .update, .insert => |index| index,
+            };
+        }
+    };
+
+    pub fn prepareAssignment(self: *const Registry, embedding: []const f32, config: Config) !Assignment {
         try config.validate();
         if (embedding.len != 512) return error.InvalidSpeakerEmbedding;
         var norm: f64 = 0;
@@ -50,7 +63,7 @@ pub const Registry = struct {
             if (!std.math.isFinite(v)) return error.InvalidSpeakerEmbedding;
             norm += @as(f64, v) * v;
         }
-        if (norm < 1e-12) return null;
+        if (norm < 1e-12) return .none;
         var best: ?usize = null;
         var score: f64 = -1;
         var second: f64 = -1;
@@ -69,17 +82,31 @@ pub const Registry = struct {
             } else second = @max(second, similarity);
         }
         if (score >= config.similarity_threshold) {
-            if (score - second < config.ambiguity_margin) return null;
-            const index = best.?;
-            // Bounded exponential centroid: no counter overflow on long sources.
-            for (&self.sums[index], embedding) |*s, v| s.* = 0.9 * s.* + 0.1 * v;
-            return @intCast(index);
+            if (score - second < config.ambiguity_margin) return .none;
+            return .{ .update = @intCast(best.?) };
         }
-        if (self.count >= config.max_speakers) return null;
-        const index = self.count;
-        @memcpy(&self.sums[index], embedding);
-        self.count += 1;
-        return @intCast(index);
+        if (self.count >= config.max_speakers) return .none;
+        return .{ .insert = @intCast(self.count) };
+    }
+
+    pub fn commitAssignment(self: *Registry, assignment: Assignment, embedding: []const f32) void {
+        switch (assignment) {
+            .none => {},
+            .update => |index| {
+                for (&self.sums[index], embedding) |*s, v| s.* = 0.9 * s.* + 0.1 * v;
+            },
+            .insert => |index| {
+                std.debug.assert(index == self.count);
+                @memcpy(&self.sums[index], embedding);
+                self.count += 1;
+            },
+        }
+    }
+
+    pub fn assign(self: *Registry, embedding: []const f32, config: Config) !?u32 {
+        const assignment = try self.prepareAssignment(embedding, config);
+        self.commitAssignment(assignment, embedding);
+        return assignment.label();
     }
 };
 pub const Timeline = struct {
