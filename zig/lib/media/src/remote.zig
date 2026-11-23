@@ -340,7 +340,7 @@ pub const ReadAhead = struct {
                 return err;
             };
             self.valid += n;
-            if (self.valid >= required and (minimum < out.len or self.upstream.sparse_read_preferring != null)) break;
+            if (self.valid >= required) break;
         }
         try control.check();
         const n = @min(out.len, self.valid - retained);
@@ -470,7 +470,7 @@ test "remote prefetch returns demanded bytes on the last short upstream request"
     try std.testing.expectEqual(@as(usize, 4), cache.valid);
 }
 
-test "remote prefetch tolerates upstream quota only after satisfying demand" {
+test "remote prefetch defers failures to reads that need more bytes" {
     const Provider = struct {
         fn read(raw: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
             const failure: *const anyerror = @ptrCast(@alignCast(raw));
@@ -485,13 +485,9 @@ test "remote prefetch tolerates upstream quota only after satisfying demand" {
         var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = .{ .context = &upstream_error, .read_at = Provider.read, .length = 1024 } };
         defer cache.deinit();
         var out: [4]u8 = undefined;
-        if (failure == error.SourceVersionChanged) {
-            try std.testing.expectError(failure, ReadAhead.readAt(&cache, 0, &out, .{}));
-        } else {
-            try std.testing.expectEqual(out.len, try ReadAhead.readAt(&cache, 0, &out, .{}));
-            try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1 }, &out);
-            try std.testing.expectError(failure, ReadAhead.readAt(&cache, 64, &out, .{}));
-        }
+        try std.testing.expectEqual(out.len, try ReadAhead.readAt(&cache, 0, &out, .{}));
+        try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1 }, &out);
+        try std.testing.expectError(failure, ReadAhead.readAt(&cache, 64, &out, .{}));
     }
 }
 
@@ -962,4 +958,30 @@ test "resident peeks preserve source and transport budgets and the forward windo
     try std.testing.expectEqual(@as(usize, 1), cache.reads);
     try std.testing.expectEqual(@as(u64, 4), cache.charged_bytes);
     try std.testing.expectEqual(@as(usize, 0), cache.hits);
+}
+
+test "short reads stop after satisfying demand without fetching speculative suffixes" {
+    const Provider = struct {
+        calls: usize = 0,
+
+        fn read(raw: *anyopaque, _: u64, out: []u8, _: source.Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls != 1) return error.InputOutput;
+            @memcpy(out[0..3], "abc");
+            return 3;
+        }
+    };
+    var provider = Provider{};
+    var ahead = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &provider, .read_at = Provider.read, .length = 16 },
+        .window_bytes = 8,
+    };
+    defer ahead.deinit();
+    var bytes: [2]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try ReadAhead.readAt(&ahead, 0, &bytes, .{}));
+    try std.testing.expectEqualStrings("ab", &bytes);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(@as(usize, 3), ahead.valid);
 }

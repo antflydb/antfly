@@ -78,8 +78,13 @@ pub const Index = union(enum) {
         };
     }
     pub fn initWebmSource(a: std.mem.Allocator, source: *media.source.Source, max_frames: usize, max_bytes: usize, admission: ?Admission) !Index {
-        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = max_bytes };
-        const scratch = bounded.allocator();
+        var memory = media.admission.TrackedAllocator{
+            .backing = a,
+            .reservation = if (source.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            .limit = max_bytes,
+        };
+        defer memory.reservation.deinit();
+        const scratch = memory.allocator();
         const read_limit = @min(source.limits.max_read_bytes, source.limits.max_retained_bytes);
         const coded_extent_limit = std.math.cast(usize, source.length()) orelse std.math.maxInt(usize);
         const directory = media.webm_audio.Directory.initWithFlacPacketLimit(scratch, source, .{
@@ -87,9 +92,9 @@ pub const Index = union(enum) {
             .max_metadata_bytes = @min(max_bytes, read_limit),
             .max_index_bytes = max_bytes,
             .max_packet_bytes = read_limit,
-        }, coded_extent_limit, error.AudioTooLarge) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
+        }, coded_extent_limit, error.AudioTooLarge) catch |err| return if (err == error.OutOfMemory and memory.denied != null) error.AudioTooLarge else err;
         defer directory.deinit();
-        return initWebmDirectory(a, directory, source, max_frames, max_bytes, bounded.live, admission);
+        return initWebmDirectory(a, directory, source, max_frames, max_bytes, memory.live, admission);
     }
 
     pub fn initWebmDirectory(a: std.mem.Allocator, directory: media.webm_audio.Directory, source: *media.source.Source, max_frames: usize, max_bytes: usize, directory_bytes: usize, admission: ?Admission) !Index {
@@ -102,12 +107,17 @@ pub const Index = union(enum) {
         const available = max_bytes -| directory_bytes;
         if (temporary >= available) return error.AudioTooLarge;
         const index_limit = available - temporary;
-        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = temporary };
-        const scratch = bounded.allocator();
+        var memory = media.admission.TrackedAllocator{
+            .backing = a,
+            .reservation = if (source.admission_pool) |pool| try pool.acquire(.{}) else .{},
+            .limit = temporary,
+        };
+        defer memory.reservation.deinit();
+        const scratch = memory.allocator();
         const owner = try Progressive.createBounded(admission, index_limit);
         var initial = Progressive{ .owner = owner };
         errdefer initial.deinit();
-        var index = Webm.initDirectory(owner.arena.allocator(), scratch, directory, max_frames, Progressive.Builder{ .owner = owner, .range_backed = true }) catch |err| return if (err == error.OutOfMemory and (bounded.denied or owner.bound.?.denied)) error.AudioTooLarge else err;
+        var index = Webm.initDirectory(owner.arena.allocator(), scratch, directory, max_frames, Progressive.Builder{ .owner = owner, .range_backed = true }) catch |err| return if (err == error.OutOfMemory and (memory.denied != null or owner.bound.?.denied)) error.AudioTooLarge else err;
         if (index.codec == .vorbis) index.retained_owner = initial else initial.deinit();
         Progressive.refreshBytes(owner);
         return .{ .webm = index };

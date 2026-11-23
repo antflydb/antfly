@@ -91,10 +91,16 @@ fn segmentChild(id: u32) bool {
 }
 /// An optional second track index receives the same resolved cluster and
 /// block metadata as the video index, before the range window advances.
+pub const ObservedDiscard = struct {
+    element: Element,
+    bytes: [8]u8 = undefined,
+    present: bool = false,
+};
+
 pub const BlockObserver = struct {
     context: *anyopaque,
     tracks: *const fn (*anyopaque, []const u8) void,
-    block: *const fn (*anyopaque, *source.Source, Element, ?Element, []const u8, u64, u64) void,
+    block: *const fn (*anyopaque, *source.Source, Element, ?ObservedDiscard, []const u8, u64, u64) void,
 };
 
 pub const Scan = struct {
@@ -120,6 +126,10 @@ pub const Scan = struct {
         return element;
     }
     pub fn rawHeader(self: *Scan, offset: u64, parent_end: u64) !Element {
+        return self.rawHeaderWithDiscard(offset, parent_end, null);
+    }
+
+    fn rawHeaderWithDiscard(self: *Scan, offset: u64, parent_end: u64, discard: ?*?ObservedDiscard) !Element {
         try self.input.control.check();
         if (offset >= parent_end or parent_end > self.input.length()) return error.MalformedMedia;
         if (self.elements >= self.limits.max_elements) return error.ResourceLimitExceeded;
@@ -131,7 +141,21 @@ pub const Scan = struct {
         const payload = offset + id.len + size.len;
         const end = if (size.is_unknown) parent_end else try std.math.add(u64, payload, size.value);
         if (end > parent_end) return error.MalformedMedia;
-        return .{ .id = @intCast(id.value), .payload = payload, .end = end, .unknown = size.is_unknown };
+        const element = Element{ .id = @intCast(id.value), .payload = payload, .end = end, .unknown = size.is_unknown };
+        if (discard) |field| {
+            if (element.unknown) return error.UnsupportedUnknownElementSize;
+            if (element.id == 0x75a2) {
+                var observed = ObservedDiscard{ .element = element };
+                const start = @as(usize, id.len) + size.len;
+                const len = element.end - element.payload;
+                if (len <= observed.bytes.len and len <= lease.bytes.len - start) {
+                    @memcpy(observed.bytes[0..@intCast(len)], lease.bytes[start..][0..@intCast(len)]);
+                    observed.present = true;
+                }
+                field.* = observed;
+            }
+        }
+        return element;
     }
     fn uint(self: *Scan, element: Element) !u64 {
         if (element.unknown or element.end - element.payload > 8) return error.MalformedMedia;
@@ -277,11 +301,11 @@ pub const Reader = struct {
                 } else if (child.id == 0xa0) {
                     var block: ?Element = null;
                     var duration: ?u64 = null;
-                    var discard: ?Element = null;
+                    var discard: ?ObservedDiscard = null;
                     var referenced = false;
                     var group = child.payload;
                     while (group < child.end) {
-                        const entry = try scan.header(group, child.end);
+                        const entry = if (observer != null) try scan.rawHeaderWithDiscard(group, child.end, &discard) else try scan.header(group, child.end);
                         group = entry.end;
                         switch (entry.id) {
                             0xa1 => {
@@ -290,7 +314,6 @@ pub const Reader = struct {
                             },
                             0x9b => duration = try std.math.mul(u64, try scan.uint(entry), scale),
                             0xfb => referenced = true,
-                            0x75a2 => discard = entry,
                             0xa4 => return error.UnsupportedDynamicVideoConfig,
                             else => {},
                         }
@@ -584,7 +607,7 @@ fn parseColour(bytes: []const u8, limits: Limits, control: source.Control, eleme
     };
     if (colour.range > 3 or colour.siting_h > 2 or colour.siting_v > 2) return error.MalformedMedia;
 }
-fn appendBlock(allocator: std.mem.Allocator, scan: *Scan, packets: *std.ArrayList(Packet), track: Track, element: Element, time: u64, scale: u64, duration: ?u64, group_sync: bool, cluster_offset: u64, discard: ?Element) !void {
+fn appendBlock(allocator: std.mem.Allocator, scan: *Scan, packets: *std.ArrayList(Packet), track: Track, element: Element, time: u64, scale: u64, duration: ?u64, group_sync: bool, cluster_offset: u64, discard: ?ObservedDiscard) !void {
     if (element.unknown or element.end - element.payload < 4) return error.MalformedMedia;
     var lease = try scan.input.readSparse(element.payload, @intCast(@min(12, element.end - element.payload)));
     defer lease.deinit();
