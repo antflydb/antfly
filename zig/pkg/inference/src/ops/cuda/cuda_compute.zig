@@ -7925,8 +7925,10 @@ pub const CudaCompute = struct {
         hash.update(std.mem.asBytes(&self.embedding_gemma2_execution.weight_generation));
         hash.update(std.mem.asBytes(&self.cublaslt_workspace_scratch.buffer.ptr));
         hash.update(std.mem.asBytes(&self.embedding_gemma2_constant_generation));
+        hash.update(std.mem.asBytes(&inputs.len));
         var input_bytes: usize = 0;
         for (inputs, 0..) |input, index| {
+            hash.update(std.mem.asBytes(&input.shape.len));
             hash.update(std.mem.sliceAsBytes(input.shape));
             const bytes = try checkedMul(input.elements, 4);
             hash.update(std.mem.asBytes(&bytes));
@@ -60576,6 +60578,12 @@ test "source bias workspace policy isolates audio warm and arena plan identities
         .{ .shape = &.{3}, .elements = 3 },
         .{ .shape = &shape, .elements = 25 * 1024 },
     };
+    // Equal flattened dimensions and byte counts still describe different input ranks.
+    const rank_one: CudaCompute.AudioCacheInput = .{ .shape = &.{0}, .elements = 0 };
+    const rank_two: CudaCompute.AudioCacheInput = .{ .shape = &.{ 0, 0 }, .elements = 0 };
+    const ranks_a = try compute.audioCacheBase(42, &.{ rank_one, rank_two }, null);
+    const ranks_b = try compute.audioCacheBase(42, &.{ rank_two, rank_one }, null);
+    try std.testing.expect(ranks_a.key != ranks_b.key);
     // Context/driver/allocator remain poisoned: cache metadata has no SDK work.
     var spans: [inputs.len]CudaCompute.AudioInputSpan = undefined;
     const original = try compute.audioCacheBase(42, &inputs, &spans);
