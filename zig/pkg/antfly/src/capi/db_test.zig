@@ -1465,6 +1465,15 @@ test "capi transaction lifecycle" {
     try std.testing.expectEqual(@as(u64, 0), reset_commit_version);
 
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_begin_transaction_with_id(handle_ptr, &txn_id, 1_000, null, 0));
+    {
+        const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        var manager = try guard.handle.database().core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expect(try manager.isOrdinaryProducer(txn_id));
+        try std.testing.expect(!try manager.isLegacyProducer(txn_id));
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, guard.handle.database().beginProducerTransactionScoped(txn_id, 1_000, 1_000, &.{}, false, false, null, .legacy_cdc));
+    }
 
     const writes = [_]capi.WriteIntent{
         .{
@@ -1483,6 +1492,36 @@ test "capi transaction lifecycle" {
     var commit_version: u64 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(handle_ptr, &txn_id, &commit_version));
     try std.testing.expectEqual(@as(u64, 2_000), commit_version);
+    antfly_db_close(handle_ptr);
+    handle_ptr = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    {
+        const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        var manager = try guard.handle.database().core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expect(try manager.isOrdinaryProducer(txn_id));
+        try std.testing.expect(!try manager.isLegacyProducer(txn_id));
+    }
+    // Existing unlabelled records retain their original identity. Fresh public
+    // BEGIN/PREPARE must not promote an old pending transaction on reconnect.
+    const old_id: [16]u8 = @splat(73);
+    {
+        const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        _ = try guard.handle.database().beginTransactionWithIdAndParticipants(old_id, 3_000, &.{});
+    }
+    try std.testing.expect(antfly_db_begin_transaction_with_id(handle_ptr, &old_id, 3_000, null, 0) != .ok);
+    try std.testing.expect(antfly_db_write_transaction(handle_ptr, &old_id, &writes, writes.len, null, 0) != .ok);
+    {
+        const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        var manager = try guard.handle.database().core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expect(!try manager.isOrdinaryProducer(old_id));
+        try std.testing.expect(!try manager.isLegacyProducer(old_id));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try guard.handle.database().getTransactionStatus(old_id));
+    }
 }
 
 test "Lite raw rows fail closed during row-policy owner transition" {
@@ -1501,6 +1540,14 @@ test "Lite raw rows fail closed during row-policy owner transition" {
         const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
         defer guard.leave();
         try guard.handle.db.local_execution.row_policy_gate.beginPreparing(.disabled);
+    }
+
+    const blocked_transaction: [16]u8 = @splat(74);
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_begin_transaction_with_id(handle_ptr, &blocked_transaction, 1_000, null, 0));
+    {
+        const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        try std.testing.expectError(error.TxnNotFound, guard.handle.database().getTransactionStatus(blocked_transaction));
     }
 
     var out: capi.Buffer = .{};
@@ -1644,7 +1691,7 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-integrity");
     defer directory.cleanup();
-    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 501, .shard_id = 502 } });
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .online_source_authority = .native, .identity_namespace = .{ .table_id = 501, .shard_id = 502 } });
     defer database.close();
     const schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
@@ -1704,7 +1751,7 @@ test "capi SQL named composite conflicts select one immediate generation and sur
     defer directory.cleanup();
     const sql = @import("antfly_local_sources").capi_sql;
     for (0..2) |phase| {
-        var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 701, .shard_id = 702 } });
+        var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .online_source_authority = .native, .identity_namespace = .{ .table_id = 701, .shard_id = 702 } });
         defer database.close();
         if (phase == 0) try database.setSchemaJson(alloc,
             \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"Selected Pair","columns":["tenant","id"]},{"name":"equivalent_deferred","columns":["id","tenant"],"deferrable":true},{"name":"n_key","columns":["n"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"tenant":{"type":"integer"},"n":{"type":"integer"}},"additionalProperties":false}}}}
@@ -1748,7 +1795,7 @@ test "capi SQL native expression partial unique claims reject collisions and arb
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("capi-sql-expression-unique");
     defer directory.cleanup();
-    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 601, .shard_id = 602 } });
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .online_source_authority = .native, .identity_namespace = .{ .table_id = 601, .shard_id = 602 } });
     defer database.close();
     try database.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"email_key","keys":[{"expression":{"op":"lower_ascii","args":[{"op":"column","column":"email"}]},"result_type":"string"}],"where":[{"column":"active","op":"eq","value":true}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"active":{"type":"boolean"}},"additionalProperties":false}}}}

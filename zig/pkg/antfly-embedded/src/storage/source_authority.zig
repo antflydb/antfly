@@ -87,6 +87,15 @@ pub fn require(txn: anytype, kind: Kind, namespace: [24]u8) !State {
     return state;
 }
 
+/// Embedded roots without a source binding can admit ordinary local writes.
+/// An existing binding or ordered marker still fences local producer admission.
+pub fn requireNativeOrUnbound(txn: anytype, namespace: [24]u8) !void {
+    if (try load(txn)) |state| {
+        if (state.kind != .native or !std.mem.eql(u8, &state.namespace, &namespace)) return error.OnlineSourceScopeChanged;
+    }
+    try requireNoRaftMarker(txn);
+}
+
 fn requireNoRaftMarker(txn: anytype) !void {
     const marker = txn.get(&keys.ordered_document_applied_entry_key) catch |err| switch (err) {
         error.NotFound => null,
@@ -160,17 +169,22 @@ test "source authority maintenance requirements preserve durable and legacy fenc
     var snapshot: Snapshot = .{};
     try std.testing.expectEqual(MaintenanceMode.local, try maintenanceMode(&snapshot));
     try std.testing.expect((try externalPublicationNamespace(&snapshot)) == null);
+    try requireNativeOrUnbound(&snapshot, @splat(0));
     snapshot.legacy = true;
     try std.testing.expectEqual(MaintenanceMode.ordered, try maintenanceMode(&snapshot));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, requireNativeOrUnbound(&snapshot, @splat(0)));
     snapshot.legacy = false;
     const native = (State{ .kind = .native, .namespace = @splat(1), .sequence = 4 }).encode();
     snapshot.authority = &native;
     try std.testing.expectEqual(MaintenanceMode.local, try maintenanceMode(&snapshot));
     try std.testing.expect((try externalPublicationNamespace(&snapshot)) == null);
+    try requireNativeOrUnbound(&snapshot, @splat(1));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, requireNativeOrUnbound(&snapshot, @splat(2)));
     const ordered = (State{ .kind = .raft, .namespace = @splat(2) }).encode();
     snapshot.authority = &ordered;
     try std.testing.expectEqual(MaintenanceMode.ordered, try maintenanceMode(&snapshot));
     try std.testing.expectEqualDeep(@as([24]u8, @splat(2)), (try externalPublicationNamespace(&snapshot)).?);
+    try std.testing.expectError(error.OnlineSourceScopeChanged, requireNativeOrUnbound(&snapshot, @splat(2)));
     snapshot.authority = "corrupt";
     try std.testing.expectError(error.OnlineSourceCorrupt, maintenanceMode(&snapshot));
     try std.testing.expectError(error.OnlineSourceCorrupt, externalPublicationNamespace(&snapshot));

@@ -1778,6 +1778,7 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, table_catalog.key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
+        std.mem.eql(u8, key, @import("db/catalog/enrichment_execution.zig").key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
         std.mem.eql(u8, key, @import("antfly_resolver").curation.proposal_store_key) or
         std.mem.startsWith(u8, key, @import("db/resolver_authority.zig").lite_prefix) or
@@ -7089,6 +7090,7 @@ test "export and import preserves portable schema and catalog metadata" {
         .{ .key = "\x00\x00__metadata__:schema_v1", .value = runtime_schema },
         .{ .key = "\x00\x00__metadata__:indexes", .value = &empty_index_catalog },
         .{ .key = "\x00\x00__metadata__:enrichments", .value = "[]" },
+        .{ .key = @import("db/catalog/enrichment_execution.zig").key, .value = "{\"version\":1,\"rows\":[]}" },
         .{ .key = "\x00\x00__metadata__:resolvers", .value = "[]" },
     };
     try src.putBatch(&portable_entries, &.{});

@@ -178,6 +178,27 @@ fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []co
     }
 }
 
+test "SQL replica identity uses the relational schema DDL lifecycle" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const compiler = @import("compiler.zig");
+    var schema = try value(alloc, .{ .storage_mode = "relational" });
+    var full = try compiler.compile(alloc, "ALTER TABLE public.records REPLICA IDENTITY FULL", .{});
+    defer full.deinit();
+    try std.testing.expect(try apply(alloc, &schema, full.statement.catalog_ddl));
+    try std.testing.expectEqualStrings("full", schema.object.get("replica_identity").?.string);
+    try std.testing.expect(!try apply(alloc, &schema, full.statement.catalog_ddl));
+
+    var default = try compiler.compile(alloc, "ALTER TABLE public.records REPLICA IDENTITY DEFAULT", .{});
+    defer default.deinit();
+    try std.testing.expect(try apply(alloc, &schema, default.statement.catalog_ddl));
+    try std.testing.expectEqualStrings("default", schema.object.get("replica_identity").?.string);
+
+    var document = try value(alloc, .{ .storage_mode = "document" });
+    try std.testing.expectError(error.UnsupportedSqlShape, apply(alloc, &document, full.statement.catalog_ddl));
+}
+
 pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
     var staging = std.heap.ArenaAllocator.init(alloc);
     defer staging.deinit();
@@ -197,6 +218,16 @@ pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.Catalog
     const change = ddl.schema_change orelse return error.InvalidSqlSyntax;
     if (schema.* != .object) return error.InvalidSqlBackendResponse;
     switch (change) {
+        .replica_identity => |mode| {
+            const storage = schema.object.get("storage_mode") orelse return error.UnsupportedSqlShape;
+            if (storage != .string or !std.mem.eql(u8, storage.string, "relational")) return error.UnsupportedSqlShape;
+            if (schema.object.get("base_source")) |source| if (source != .null) return error.UnsupportedSqlShape;
+            const name = @tagName(mode);
+            if (schema.object.get("replica_identity")) |prior| {
+                if (prior == .string and std.mem.eql(u8, prior.string, name)) return false;
+            }
+            try schema.object.put(alloc, "replica_identity", .{ .string = name });
+        },
         .drop_constraint, .validate_constraint => |constraint_name| {
             for ([_][]const u8{ "unique_constraints", "checks", "foreign_keys" }) |key| {
                 const constraints = try list(schema, alloc, key);

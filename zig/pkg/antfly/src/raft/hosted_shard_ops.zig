@@ -263,6 +263,7 @@ pub const HostedShardOperationAdapter = struct {
                 const local_ops = self.local_ops orelse return error.UnsupportedOperation;
                 local_ops.execute(action) catch |err| {
                     if (!isLeaderRediscoveryError(err)) return err;
+                    logTransitionRouteRetry(group_id, attempted_node_id, action, err);
                     return try self.executeFromCandidates(router, group_id, action, attempted_node_id);
                 };
             },
@@ -270,6 +271,7 @@ pub const HostedShardOperationAdapter = struct {
                 var client = self.httpClient();
                 _ = client.fetchGroupShardExecute(remote.base_uri, group_id, action) catch |err| {
                     if (!isLeaderRediscoveryError(err)) return err;
+                    logTransitionRouteRetry(group_id, attempted_node_id, action, err);
                     return try self.executeFromCandidates(router, group_id, action, attempted_node_id);
                 };
             },
@@ -370,8 +372,9 @@ pub const HostedShardOperationAdapter = struct {
         for (node_ids) |node_id| {
             if (node_id == attempted_node_id) continue;
             self.executeAtNode(router, group_id, action, node_id) catch |err| {
-                if (isLeaderRediscoveryError(err)) continue;
-                return err;
+                if (!isLeaderRediscoveryError(err)) return err;
+                logTransitionRouteRetry(group_id, node_id, action, err);
+                continue;
             };
             return;
         }
@@ -410,6 +413,15 @@ pub const HostedShardOperationAdapter = struct {
         return error.GroupLeaderUnavailable;
     }
 };
+
+fn logTransitionRouteRetry(group_id: u64, node_id: u64, action: metadata_mod.TransitionAction, err: anyerror) void {
+    std.log.debug("transition route retry group_id={} node_id={} action={s} err={s}", .{
+        group_id,
+        node_id,
+        @tagName(action),
+        @errorName(err),
+    });
+}
 
 fn isLeaderRediscoveryError(err: anyerror) bool {
     return switch (err) {

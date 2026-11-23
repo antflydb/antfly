@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.document_artifact_table_reprocess_request_selection import DocumentArtifactTableReprocessRequestSelection
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -20,6 +21,11 @@ class DocumentArtifactTableReprocessRequest:
     """Bounded request for reprocessing a derived artifact across source rows in key order.
 
     Attributes:
+        selection (DocumentArtifactTableReprocessRequestSelection | Unset): all explicitly regenerates selected source
+            records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction
+            artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other
+            producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does
+            not certify inference completion. Default: DocumentArtifactTableReprocessRequestSelection.ALL.
         from_key (str | Unset): Exclusive lower bound source document key. Use the prior response next_key to continue.
             Default: ''.
         to_key (str | Unset): Inclusive upper bound source document key, or empty for the end of the table/range.
@@ -31,6 +37,9 @@ class DocumentArtifactTableReprocessRequest:
             a fresh global key span.
     """
 
+    selection: DocumentArtifactTableReprocessRequestSelection | Unset = (
+        DocumentArtifactTableReprocessRequestSelection.ALL
+    )
     from_key: str | Unset = ""
     to_key: str | Unset = ""
     limit: int | Unset = 100
@@ -38,6 +47,10 @@ class DocumentArtifactTableReprocessRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        selection: str | Unset = UNSET
+        if not isinstance(self.selection, Unset):
+            selection = self.selection.value
+
         from_key = self.from_key
 
         to_key = self.to_key
@@ -54,6 +67,8 @@ class DocumentArtifactTableReprocessRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if selection is not UNSET:
+            field_dict["selection"] = selection
         if from_key is not UNSET:
             field_dict["from_key"] = from_key
         if to_key is not UNSET:
@@ -70,6 +85,13 @@ class DocumentArtifactTableReprocessRequest:
         from ..models.document_artifact_reprocess_shard_cursor import DocumentArtifactReprocessShardCursor
 
         d = dict(src_dict)
+        _selection = d.pop("selection", UNSET)
+        selection: DocumentArtifactTableReprocessRequestSelection | Unset
+        if isinstance(_selection, Unset):
+            selection = UNSET
+        else:
+            selection = DocumentArtifactTableReprocessRequestSelection(_selection)
+
         from_key = d.pop("from_key", UNSET)
 
         to_key = d.pop("to_key", UNSET)
@@ -86,6 +108,7 @@ class DocumentArtifactTableReprocessRequest:
                 shard_cursors.append(shard_cursors_item)
 
         document_artifact_table_reprocess_request = cls(
+            selection=selection,
             from_key=from_key,
             to_key=to_key,
             limit=limit,

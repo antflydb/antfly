@@ -1151,12 +1151,16 @@ pub const BatchExecutionOptions = struct {
     /// retained by asynchronous publication or shared across retries.
     prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
+    force_only_incomplete_assets: bool = false,
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
     bypass_replication_write_gate: bool = false,
     replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
     ordered_apply_receipt: ?OrderedApplyReceipt = null,
+    ordered_history_commit_time_ns: i64 = 0,
+    /// Trusted native ingress classification; missing old transport stays unlabelled.
+    source_producer: @import("../source_producer_policy.zig").Producer = .unlabelled,
     /// Metadata-authorized native hidden-child receipt identity. Never
     /// writes the data-Raft watermark into a native source-authority root.
     native_initial_child_entry: ?OrderedApplyReceipt = null,
@@ -1209,6 +1213,11 @@ pub const BatchExecutionOptions = struct {
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    legacy_terminal: ?transactions_mod.LegacyTerminalResolution = null,
+    legacy_outcome_write: ?@import("../docstore.zig").KVPair = null,
+    source_scope: ?@import("../source_scope.zig").Reference = null,
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
+    source_purpose: ?[32]u8 = null,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
     commit_version: u64,

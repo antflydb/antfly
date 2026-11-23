@@ -59,6 +59,7 @@ pub const JobPhase = enum {
 };
 
 pub const StartRequest = struct {
+    selection: db_mod.types.ArtifactReprocessSelection = .all,
     from_key: []const u8 = "",
     to_key: []const u8 = "",
     limit: u32 = 100,
@@ -66,6 +67,7 @@ pub const StartRequest = struct {
 };
 
 pub const JobState = struct {
+    selection: db_mod.types.ArtifactReprocessSelection = .all,
     job_id: u64,
     attempt_id: u64 = 0,
     table_name: []const u8,
@@ -151,6 +153,7 @@ pub const Store = struct {
             .reprocess_status = "in_progress",
             .from_key = req.from_key,
             .to_key = req.to_key,
+            .selection = req.selection,
             .limit = if (req.limit == 0) 100 else req.limit,
             .cancel_requested = false,
             .created_at_millis = now_ms,
@@ -208,6 +211,7 @@ pub const Store = struct {
             .reprocess_status = reprocessStatusForPhase(phase, previous.pending_shards),
             .from_key = previous.from_key,
             .to_key = previous.to_key,
+            .selection = previous.selection,
             .limit = previous.limit,
             .next_key = previous.next_key,
             .scanned = previous.scanned,
@@ -264,6 +268,7 @@ pub const Store = struct {
             .reprocess_status = reprocessStatusForPhase(final_phase, pending_shards),
             .from_key = previous.from_key,
             .to_key = previous.to_key,
+            .selection = previous.selection,
             .limit = pass.limit,
             .next_key = pass.next_key,
             .scanned = previous.scanned + pass.scanned,
@@ -317,6 +322,7 @@ pub const Store = struct {
             .reprocess_status = reprocessStatusForPhase(.running, current.pending_shards),
             .from_key = current.from_key,
             .to_key = current.to_key,
+            .selection = current.selection,
             .limit = current.limit,
             .next_key = current.next_key,
             .scanned = current.scanned,
@@ -360,6 +366,7 @@ pub const Store = struct {
             .reprocess_status = reprocessStatusForPhase(phase, current.pending_shards),
             .from_key = current.from_key,
             .to_key = current.to_key,
+            .selection = current.selection,
             .limit = current.limit,
             .next_key = current.next_key,
             .scanned = current.scanned,
@@ -492,6 +499,7 @@ pub const Store = struct {
                     .reprocess_status = reprocessStatusForPhase(recovered_phase, parsed.value.pending_shards),
                     .from_key = parsed.value.from_key,
                     .to_key = parsed.value.to_key,
+                    .selection = parsed.value.selection,
                     .limit = parsed.value.limit,
                     .next_key = parsed.value.next_key,
                     .scanned = parsed.value.scanned,
@@ -535,6 +543,7 @@ pub const Store = struct {
             .reprocess_status = reprocessStatusForPhase(.cancelled, current.pending_shards),
             .from_key = current.from_key,
             .to_key = current.to_key,
+            .selection = current.selection,
             .limit = current.limit,
             .next_key = current.next_key,
             .scanned = current.scanned,
@@ -636,11 +645,12 @@ test "artifact reprocess job store starts and updates a job" {
     var store = Store.init(alloc, .{});
     defer store.deinit();
 
-    const started = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 2 });
+    const started = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 2, .selection = .incomplete });
     defer alloc.free(started);
     var parsed_start = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
     defer parsed_start.deinit();
     try std.testing.expectEqualStrings("queued", parsed_start.value.phase);
+    try std.testing.expectEqual(.incomplete, parsed_start.value.selection);
 
     const pass = db_mod.types.DocumentArtifactTableReprocessResult{
         .scanned = 2,
@@ -652,6 +662,7 @@ test "artifact reprocess job store starts and updates a job" {
     var parsed_update = try std.json.parseFromSlice(JobState, alloc, updated, .{ .ignore_unknown_fields = true });
     defer parsed_update.deinit();
     try std.testing.expectEqualStrings("succeeded", parsed_update.value.phase);
+    try std.testing.expectEqual(.incomplete, parsed_update.value.selection);
     try std.testing.expectEqual(@as(usize, 2), parsed_update.value.scanned);
 }
 
@@ -715,7 +726,7 @@ test "artifact reprocess job store recovers durable jobs and reseeds ids" {
         defer store.deinit();
         try store.attachOpenedStore(opened);
 
-        const started = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 1 });
+        const started = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 1, .selection = .incomplete });
         defer alloc.free(started);
         var parsed = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -730,7 +741,7 @@ test "artifact reprocess job store recovers durable jobs and reseeds ids" {
         defer store.deinit();
         try store.attachOpenedStore(opened);
 
-        const second = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 1 });
+        const second = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 1, .selection = .incomplete });
         defer alloc.free(second);
         var parsed_second = try std.json.parseFromSlice(JobState, alloc, second, .{ .ignore_unknown_fields = true });
         defer parsed_second.deinit();
@@ -742,6 +753,7 @@ test "artifact reprocess job store recovers durable jobs and reseeds ids" {
         defer parsed_first.deinit();
         try std.testing.expectEqual(@as(u64, 1), parsed_first.value.job_id);
         try std.testing.expectEqualStrings("queued", parsed_first.value.phase);
+        try std.testing.expectEqual(.incomplete, parsed_first.value.selection);
     }
 }
 

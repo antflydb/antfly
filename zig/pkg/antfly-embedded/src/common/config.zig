@@ -130,6 +130,15 @@ pub const Config = struct {
         bind_port: u16 = 5432,
         max_connections: u16 = 32,
         externally_protected_transport: bool = false,
+        /// Publication selected at slot creation for native no-snapshot mode.
+        /// START_REPLICATION must request the same bound publication.
+        replication_publication: ?[]const u8 = null,
+        replication_spool: ?ReplicationSpool = null,
+
+        pub const ReplicationSpool = struct {
+            directory: []const u8,
+            namespace: [32]u8,
+        };
     };
 
     pub const BackupConfig = struct {
@@ -936,7 +945,7 @@ pub const Config = struct {
         errdefer kernel_jit.deinit(alloc);
         var pgwire: ?PgwireConfig = null;
         if (root.get("pgwire")) |value| {
-            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport" });
+            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport", "replication_publication", "replication_spool" });
             const object = switch (value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
@@ -949,15 +958,46 @@ pub const Config = struct {
                 else => return error.InvalidConfig,
             } else null;
             if (host) |name| if (name.len == 0 or name.len > 253) return error.InvalidConfig;
+            const publication = if (object.get("replication_publication")) |name| switch (name) {
+                .string => |string| string,
+                else => return error.InvalidConfig,
+            } else null;
+            if (publication) |name| {
+                if (name.len == 0 or name.len > 63 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null)
+                    return error.InvalidConfig;
+            }
+            const spool: ?PgwireConfig.ReplicationSpool = if (object.get("replication_spool")) |spool_value| spool_config: {
+                try validateObjectMemberFields(object, "replication_spool", &.{ "directory", "namespace" });
+                const fields = spool_value.object;
+                const directory = fields.get("directory") orelse return error.InvalidConfig;
+                const namespace = fields.get("namespace") orelse return error.InvalidConfig;
+                if (directory != .string or namespace != .string or
+                    !std.fs.path.isAbsolute(directory.string) or directory.string.len > 4096 or
+                    std.mem.indexOfScalar(u8, directory.string, 0) != null or namespace.string.len != 64)
+                    return error.InvalidConfig;
+                var id: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&id, namespace.string) catch return error.InvalidConfig;
+                if (std.mem.allEqual(u8, &id, 0)) return error.InvalidConfig;
+                break :spool_config .{ .directory = try alloc.dupe(u8, directory.string), .namespace = id };
+            } else null;
+            errdefer if (spool) |parsed_spool| alloc.free(parsed_spool.directory);
+            const owned_publication = if (publication) |name| try alloc.dupe(u8, name) else null;
+            errdefer if (owned_publication) |name| alloc.free(name);
             pgwire = .{
                 .enabled = try optionalBoolField(object, "enabled") orelse false,
                 .bind_port = @intCast(port),
                 .max_connections = @intCast(connections_count),
                 .externally_protected_transport = try optionalBoolField(object, "externally_protected_transport") orelse false,
                 .bind_host = if (host) |name| try alloc.dupe(u8, name) else null,
+                .replication_publication = owned_publication,
+                .replication_spool = spool,
             };
         }
-        errdefer if (pgwire) |wire| if (wire.bind_host) |host| alloc.free(host);
+        errdefer if (pgwire) |wire| {
+            if (wire.bind_host) |host| alloc.free(host);
+            if (wire.replication_publication) |publication| alloc.free(publication);
+            if (wire.replication_spool) |spool| alloc.free(spool.directory);
+        };
         return .{
             .pgwire = pgwire,
             .connectors = connectors,
@@ -1231,7 +1271,11 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
-        if (self.pgwire) |wire| if (wire.bind_host) |host| self.registry.allocator.free(host);
+        if (self.pgwire) |wire| {
+            if (wire.bind_host) |host| self.registry.allocator.free(host);
+            if (wire.replication_publication) |publication| self.registry.allocator.free(publication);
+            if (wire.replication_spool) |spool| self.registry.allocator.free(spool.directory);
+        }
         if (self.tls) |*tls| tls.deinit(self.registry.allocator);
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
@@ -3973,19 +4017,28 @@ test "common config parses the hot_standby section and the deprecated ha alias" 
 
 test "common config parses bounded pgwire listener policy" {
     var config = try Config.parseFromSlice(std.testing.allocator,
-        \\{"pgwire":{"enabled":true,"bind_host":"127.0.0.1","bind_port":15432,"max_connections":8}}
+        \\{"pgwire":{"enabled":true,"bind_host":"127.0.0.1","bind_port":15432,"max_connections":8,"replication_publication":"changes","replication_spool":{"directory":"/mnt/cdc","namespace":"4242424242424242424242424242424242424242424242424242424242424242"}}}
     );
     defer config.deinit();
     try std.testing.expect(config.pgwire.?.enabled);
     try std.testing.expectEqualStrings("127.0.0.1", config.pgwire.?.bind_host.?);
     try std.testing.expectEqual(@as(u16, 15432), config.pgwire.?.bind_port);
     try std.testing.expect(!config.pgwire.?.externally_protected_transport);
+    try std.testing.expectEqualStrings("changes", config.pgwire.?.replication_publication.?);
+    try std.testing.expectEqualStrings("/mnt/cdc", config.pgwire.?.replication_spool.?.directory);
+    try std.testing.expectEqual(@as([32]u8, @splat(0x42)), config.pgwire.?.replication_spool.?.namespace);
     for ([_][]const u8{
         \\{"pgwire":{"max_connections":0}}
         ,
         \\{"pgwire":{"bind_port":65536}}
         ,
         \\{"pgwire":{"allow_insecure":true}}
+        ,
+        \\{"pgwire":{"replication_spool":[]}}
+        ,
+        \\{"pgwire":{"replication_spool":{"directory":"/mnt/cdc","namespace":"00"}}}
+        ,
+        \\{"pgwire":{"replication_spool":{"directory":"relative","namespace":"4242424242424242424242424242424242424242424242424242424242424242"}}}
     }) |raw| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
 }
 

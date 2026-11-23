@@ -143,6 +143,11 @@ pub const Catalogs = struct {
         return @import("artifact_semantics.zig").digest(alloc, self.indexes, self.enrichments, self.resolvers);
     }
 
+    pub fn matchesSemanticDigest(self: Catalogs, alloc: std.mem.Allocator, expected: [32]u8) !bool {
+        if (std.meta.eql(expected, try self.semanticDigest(alloc))) return true;
+        return std.meta.eql(expected, try @import("artifact_semantics.zig").legacyDigest(alloc, self.indexes, self.enrichments, self.resolvers));
+    }
+
     pub fn digest(self: Catalogs) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-artifact-catalog-v1");
@@ -176,8 +181,7 @@ pub const Command = struct {
             return error.InvalidArtifactCatalogCommand;
         {
             const semantic = self.binding.semantic_digest;
-            const actual = self.catalogs.semanticDigest(std.heap.page_allocator) catch return error.InvalidArtifactCatalogCommand;
-            if (!std.mem.eql(u8, &semantic, &actual)) return error.InvalidArtifactCatalogCommand;
+            if (!(self.catalogs.matchesSemanticDigest(std.heap.page_allocator, semantic) catch return error.InvalidArtifactCatalogCommand)) return error.InvalidArtifactCatalogCommand;
         }
     }
 };
@@ -404,7 +408,12 @@ pub fn requireReady(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, e
 
 pub fn requireCompatibleReady(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, expected: Binding) !void {
     const observed = try status(alloc, txn, namespace);
-    if (!observed.ready or observed.ordered == null or !observed.ordered.?.compatible(expected)) return error.ArtifactCatalogDrift;
+    if (!observed.ready or observed.ordered == null or !expected.valid() or !observed.ordered.?.valid() or observed.ordered.?.effect_protocol != expected.effect_protocol) return error.ArtifactCatalogDrift;
+    if (observed.ordered.?.compatible(expected)) return;
+    // An existing ordered command may carry the pre-policy digest. Validate
+    // against its exact current catalogs rather than accepting an arbitrary
+    // mismatched digest or rewriting immutable proof bytes.
+    if (!(try (try catalogs(txn)).matchesSemanticDigest(alloc, expected.semantic_digest))) return error.ArtifactCatalogDrift;
 }
 
 /// A new owner must establish its own ordering. Copying a source's seal into a

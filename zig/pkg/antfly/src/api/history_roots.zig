@@ -1,0 +1,1144 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Request-owned discovery for native retained-history owners. One authoritative
+//! compact catalog generation binds all names, base incarnations and ranges.
+//! This discovers candidate roots; successful owner admission still qualifies
+//! the serving protocol. It grants neither public authorization nor a coherent
+//! snapshot/distributed-completion guarantee.
+const std = @import("std");
+const catalog_api = @import("table_catalog.zig");
+const metadata = @import("../metadata/api.zig");
+const tables = @import("../metadata/table_manager.zig");
+const control = @import("../metadata/changefeed_control.zig");
+const Context = @import("antfly_local_sources").api_operation.RequestContext;
+const A = std.mem.Allocator;
+pub const Root = struct {
+    namespace: control.Namespace,
+    physical_range_id: u64 = 0,
+    storage_namespace: ?control.Namespace = null,
+    table_name: []const u8,
+    table_binding: control.Digest,
+    fence: metadata.CatalogRouteFence,
+
+    pub fn storageNamespace(self: Root) control.Namespace {
+        return self.storage_namespace orelse self.namespace;
+    }
+
+    fn physicalIdentity(self: Root) ?control.PhysicalRoot {
+        if (self.physical_range_id == 0) return null;
+        return .{ .group_id = self.fence.route.group_id, .range_id = self.physical_range_id };
+    }
+
+    fn matchesPhysical(self: Root, stored: control.Root) bool {
+        return stored.physical == null or std.meta.eql(stored.physical, self.physicalIdentity());
+    }
+};
+const SplitCut = @import("topology_history_operations.zig").Split.wire;
+const SplitTransition = @import("../metadata/transition_state.zig").SplitTransitionRecord;
+
+/// Bind a finalized catalog transition to the physical predecessor route.
+fn splitCutRequest(predecessor: Root, generation: u64, split: SplitTransition) !SplitCut.Request {
+    const boundary = split.split_key orelse return error.ChangefeedResynchronizationRequired;
+    const identity = predecessor.fence.route.identity_namespace;
+    const contract = split.table_contract;
+    if (split.phase != .finalized or split.transition_id == 0 or split.attempt_epoch == 0 or
+        split.source_group_id != predecessor.fence.route.group_id or split.destination_group_id == 0 or
+        split.destination_group_id == split.source_group_id or boundary.len == 0 or
+        contract.table_id != identity.table_id or contract.source_identity.shard_id != identity.shard_id or
+        contract.source_identity.range_id != identity.range_id or
+        !std.mem.eql(u8, contract.table_name, predecessor.table_name))
+        return error.ChangefeedResynchronizationRequired;
+    return .{
+        .namespace = predecessor.namespace,
+        .root_generation = generation,
+        .transition = split.transition_id,
+        .attempt = split.attempt_epoch,
+        .successor_group = split.destination_group_id,
+        .boundary = @import("antfly_local_sources").storage_committed_history.frame.digest(boundary),
+    };
+}
+
+pub const Captured = struct {
+    allocator: A,
+    session: catalog_api.RoutingSession,
+    roots: []Root,
+    pub fn deinit(self: *Captured) void {
+        self.allocator.free(self.roots);
+        self.session.deinit();
+        self.* = undefined;
+    }
+    pub fn find(self: *const Captured, namespace: control.Namespace) !Root {
+        var low: usize = 0;
+        var high = self.roots.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            switch (std.mem.order(u8, &self.roots[middle].namespace, &namespace)) {
+                .lt => low = middle + 1,
+                .gt => high = middle,
+                .eq => {
+                    if ((middle > 0 and std.mem.eql(u8, &self.roots[middle - 1].namespace, &namespace)) or
+                        (middle + 1 < self.roots.len and std.mem.eql(u8, &self.roots[middle + 1].namespace, &namespace)))
+                        return error.ChangefeedResynchronizationRequired;
+                    return self.roots[middle];
+                },
+            }
+        }
+        return error.ChangefeedResynchronizationRequired;
+    }
+    pub fn findPhysical(self: *const Captured, table_id: u64, group_id: u64, range_id: u64) !Root {
+        for (self.roots) |root| {
+            if (root.fence.table_id == table_id and root.fence.route.group_id == group_id and root.physical_range_id == range_id)
+                return root;
+        }
+        return error.ChangefeedResynchronizationRequired;
+    }
+
+    pub fn findInstalled(self: *const Captured, root: control.Root) !Root {
+        const physical = root.physical orelse return self.find(root.namespace);
+        const table = std.mem.readInt(u64, root.namespace[0..8], .big);
+        var route = try self.findPhysical(table, physical.group_id, physical.range_id);
+        if (!std.mem.eql(u8, &route.storageNamespace(), &root.storageNamespace())) return error.ChangefeedResynchronizationRequired;
+        route.namespace = root.namespace;
+        route.storage_namespace = root.storage_namespace;
+        return route;
+    }
+
+    /// Caller persists this complete vector before any root dispatch. The
+    /// ownership counter belongs to feed metadata, not a hash of topology.
+    pub fn initialPlans(self: *const Captured, a: A) ![]control.RootPlan {
+        const plans = try a.alloc(control.RootPlan, self.roots.len);
+        errdefer a.free(plans);
+        for (self.roots, plans, 0..) |root, *plan, index| {
+            if (index != 0 and std.mem.eql(u8, &self.roots[index - 1].namespace, &root.namespace)) return error.TopologyChanged;
+            plan.* = .{ .namespace = root.namespace, .ownership_epoch = 1, .physical = root.physicalIdentity(), .storage_namespace = root.storage_namespace };
+        }
+        return plans;
+    }
+
+    pub fn validateInstalledRoutes(self: *const Captured, state: control.State) !void {
+        const definition = state.definition orelse return error.ChangefeedResynchronizationRequired;
+        var covered_routes: usize = 0;
+        for (state.roots) |root| {
+            const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
+            const table = for (definition.tables) |candidate| {
+                if (candidate.table_id == table_id) break candidate;
+            } else return error.ChangefeedResynchronizationRequired;
+            if (root.ownership_epoch != 1) return error.ChangefeedResynchronizationRequired;
+            if (root.released) {
+                const drain = root.merge_drain orelse return error.ChangefeedResynchronizationRequired;
+                for (self.roots) |route| {
+                    if (route.fence.route.group_id != drain.donor.group_id) continue;
+                    _ = try self.findInstalled(root);
+                    covered_routes += 1;
+                    break;
+                }
+                continue;
+            }
+            if (table.contract == .writable_iceberg_rows) {
+                if (!std.mem.eql(u8, &root.namespace, &control.catalogRootNamespace(table))) return error.ChangefeedResynchronizationRequired;
+                continue;
+            }
+            _ = try self.findInstalled(root);
+            covered_routes += 1;
+            if (root.split_handoff) |handoff| {
+                const successor = try self.findPhysical(table_id, handoff.successor.group_id, handoff.successor.range_id);
+                if (!std.mem.eql(u8, &successor.namespace, &root.storageNamespace())) return error.ChangefeedResynchronizationRequired;
+                covered_routes += 1;
+            }
+        }
+        if (covered_routes != self.roots.len) return error.ChangefeedResynchronizationRequired;
+    }
+
+    /// Initial ownership only. A replacement root needs a verified handoff
+    /// before a feed can use the new route to advance its retained cursor.
+    pub fn validateInitialRoutes(self: *const Captured, planned: []const control.Root) !void {
+        if (planned.len != self.roots.len) return error.ChangefeedResynchronizationRequired;
+        for (planned, self.roots) |root, route| {
+            if (!std.mem.eql(u8, &root.namespace, &route.namespace) or !std.mem.eql(u8, &root.storageNamespace(), &route.storageNamespace()) or root.ownership_epoch != 1 or root.released or !route.matchesPhysical(root))
+                return error.ChangefeedResynchronizationRequired;
+        }
+    }
+};
+
+test "history root discovery validates the complete installed route vector" {
+    var routes = [_]Root{
+        .{ .namespace = @splat(1), .table_name = "docs", .table_binding = @splat(1), .fence = undefined },
+        .{ .namespace = @splat(2), .table_name = "docs", .table_binding = @splat(1), .fence = undefined },
+    };
+    const captured: Captured = .{ .roots = &routes, .allocator = std.testing.allocator, .session = undefined };
+    var planned = [_]control.Root{
+        .{ .namespace = routes[0].namespace, .ownership_epoch = 1, .grant_sequence = 1 },
+        .{ .namespace = routes[1].namespace, .ownership_epoch = 1, .grant_sequence = 1 },
+    };
+    try captured.validateInitialRoutes(&planned);
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(planned[0..1]));
+    planned[1].released = true;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(&planned));
+    planned[1].released = false;
+    planned[1].ownership_epoch = 2;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(&planned));
+    planned[1].ownership_epoch = 1;
+    routes[1].namespace = @splat(3);
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, captured.validateInitialRoutes(&planned));
+}
+test "history root discovery qualifies the exact finalized split predecessor" {
+    var predecessor: Root = .{ .namespace = @splat(1), .table_name = "docs", .table_binding = @splat(2), .fence = undefined };
+    predecessor.fence.route = .{ .group_id = 7, .range_id = 9, .identity_namespace = .{ .table_id = 5, .shard_id = 8, .range_id = 9 } };
+    var split: SplitTransition = .{
+        .transition_id = 19,
+        .attempt_epoch = 2,
+        .source_group_id = 7,
+        .destination_group_id = 10,
+        .phase = .finalized,
+        .split_key = "m",
+        .table_contract = .{ .table_id = 5, .table_name = "docs", .source_identity = .{ .shard_id = 8, .range_id = 9 } },
+    };
+    const request = try splitCutRequest(predecessor, 3, split);
+    try std.testing.expectEqual(@as(u64, 2), request.attempt);
+    try std.testing.expectEqual(@as(u64, 3), request.root_generation);
+    try std.testing.expectEqual(@as(u64, 10), request.successor_group);
+    split.phase = .prepare;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, splitCutRequest(predecessor, 3, split));
+    split.phase = .finalized;
+    split.table_contract.source_identity.range_id += 1;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, splitCutRequest(predecessor, 3, split));
+}
+
+pub const Source = struct {
+    artifact_owners: ?@import("history_owner_operations.zig").Port = null,
+    split_cut: ?@import("topology_history_operations.zig").Split.Port = null,
+    merge_cut: ?@import("topology_history_operations.zig").Merge.Port = null,
+    artifact_history: ?@import("artifact_history_operations.zig").Port = null,
+    catalog: catalog_api.CatalogSource,
+    controls: @import("history_control_operations.zig").Port,
+    pages: @import("history_page_operations.zig").Port,
+    bootstrap_pages: ?@import("history_page_operations.zig").Bootstrap.Port = null,
+    grants: @import("history_grant_operations.zig").Port,
+    pub fn readSplitCut(self: Source, a: A, predecessor: Root, generation: u64, split: SplitTransition, context: Context) !SplitCut {
+        const port = self.split_cut orelse return error.ChangefeedCapabilityUnsupported;
+        const request = try splitCutRequest(predecessor, generation, split);
+        return (try port.read(a, predecessor.fence, predecessor.table_name, request, context)) orelse
+            error.ChangefeedResynchronizationRequired;
+    }
+
+    /// Prepare a metadata handoff from a current routing generation and the
+    /// durable cut observed on the predecessor's data leader.
+    pub fn prepareSplitHandoff(self: Source, a: A, captured: *const Captured, stored: control.Root, split: SplitTransition, context: Context) !control.Mutation {
+        const physical = stored.physical orelse return error.ChangefeedResynchronizationRequired;
+        const table_id = std.mem.readInt(u64, stored.namespace[0..8], .big);
+        const predecessor = try captured.findPhysical(table_id, physical.group_id, physical.range_id);
+        const successor = try captured.findPhysical(table_id, split.destination_group_id, split.destination_group_id);
+        const boundary = split.split_key orelse return error.ChangefeedResynchronizationRequired;
+        const successor_index = captured.session.group_indexes.get(successor.fence.route.group_id) orelse return error.TopologyChanged;
+        const successor_range = captured.session.snapshot.value.ranges[successor_index];
+        if (!std.mem.eql(u8, &stored.storageNamespace(), &predecessor.namespace) or
+            !std.mem.eql(u8, &predecessor.namespace, &successor.namespace) or
+            !std.mem.eql(u8, boundary, successor_range.start_key))
+            return error.ChangefeedResynchronizationRequired;
+        const owners = self.artifact_owners orelse return error.ChangefeedCapabilityUnsupported;
+        const qualified = try owners.read(a, predecessor.fence, predecessor.table_name, .{
+            .version = 1,
+            .expected_table_binding = predecessor.table_binding,
+        }, context);
+        const cut = try self.readSplitCut(a, predecessor, qualified.owner.root_generation, split, context);
+        return splitHandoff(stored, physical, successor, cut);
+    }
+
+    /// The reconciler may retire the transition before a consumer observes
+    /// its routes. A published successor and a matching ordered predecessor
+    /// cut together still qualify the handoff.
+    pub fn prepareRetiredSplitHandoff(self: Source, a: A, captured: *const Captured, state: control.State, stored: control.Root, context: Context) !?control.Mutation {
+        const physical = stored.physical orelse return null;
+        if (stored.released or stored.split_handoff != null or stored.merge_drain != null) return null;
+        const predecessor = captured.findInstalled(stored) catch return null;
+        const port = self.split_cut orelse return error.ChangefeedCapabilityUnsupported;
+        const owners = self.artifact_owners orelse return error.ChangefeedCapabilityUnsupported;
+        var generation: ?u64 = null;
+        for (captured.roots) |successor| {
+            if (!std.mem.eql(u8, &successor.namespace, &stored.storageNamespace()) or
+                successor.fence.route.group_id == physical.group_id) continue;
+            const successor_identity = successor.physicalIdentity().?;
+            for (state.roots) |root| {
+                if (std.meta.eql(root.physical, @as(?control.PhysicalRoot, successor_identity))) break;
+                if (root.split_handoff) |handoff| if (std.meta.eql(handoff.successor, successor_identity)) break;
+            } else {
+                const index = captured.session.group_indexes.get(successor_identity.group_id) orelse return error.TopologyChanged;
+                const boundary = captured.session.snapshot.value.ranges[index].start_key;
+                if (boundary.len == 0) continue;
+                if (generation == null) {
+                    const qualified = try owners.read(a, predecessor.fence, predecessor.table_name, .{
+                        .version = 1,
+                        .expected_table_binding = predecessor.table_binding,
+                    }, context);
+                    generation = qualified.owner.root_generation;
+                }
+                const cut = (try port.read(a, predecessor.fence, predecessor.table_name, .{
+                    .namespace = stored.storageNamespace(),
+                    .transition = 0,
+                    .attempt = 0,
+                    .successor_group = successor_identity.group_id,
+                    .root_generation = generation.?,
+                    .boundary = @import("antfly_local_sources").storage_committed_history.frame.digest(boundary),
+                }, context)) orelse continue;
+                return splitHandoff(stored, physical, successor, cut);
+            }
+        }
+        return null;
+    }
+
+    fn splitHandoff(stored: control.Root, physical: control.PhysicalRoot, successor: Root, cut: SplitCut) control.Mutation {
+        return .{ .stage_split_handoff = .{
+            .namespace = stored.namespace,
+            .ownership_epoch = stored.ownership_epoch,
+            .handoff = .{
+                .predecessor = physical,
+                .successor = successor.physicalIdentity().?,
+                .cut = .{
+                    .namespace = cut.namespace,
+                    .transition = cut.transition,
+                    .attempt = cut.attempt,
+                    .successor_group = cut.successor_group,
+                    .term = cut.term,
+                    .index = cut.index,
+                    .latest = cut.latest,
+                    .reclaimed = cut.reclaimed,
+                    .root_generation = cut.root_generation,
+                    .reserved_bytes = cut.reserved_bytes,
+                    .boundary = cut.boundary,
+                },
+            },
+        } };
+    }
+
+    pub fn prepareMergeDrain(self: Source, a: A, captured: *const Captured, state: control.State, stored: control.Root, merge: @import("../metadata/transition_state.zig").MergeTransitionRecord, context: Context) !?control.Mutation {
+        // The persisted catalog phase can lag the data-side finalization.
+        // Only the donor's ordered cut can authorize a drain.
+        if (merge.rollback_reason != null or merge.phase == .rolling_back or merge.phase == .rolled_back or merge.phase == .finalized) return null;
+        const donor = try captured.findInstalled(stored);
+        const physical = stored.physical orelse return error.ChangefeedResynchronizationRequired;
+        const contract = merge.table_contract;
+        const identity = donor.fence.route.identity_namespace;
+        if (merge.transition_id == 0 or
+            merge.donor_group_id != physical.group_id or contract.table_id != identity.table_id or
+            contract.source_identity.shard_id != identity.shard_id or contract.source_identity.range_id != identity.range_id or
+            !std.mem.eql(u8, contract.table_name, donor.table_name))
+            return error.ChangefeedResynchronizationRequired;
+        const receiver = for (state.roots) |root| {
+            const route = root.physical orelse continue;
+            if (route.group_id == merge.receiver_group_id and std.mem.eql(u8, root.namespace[0..8], stored.namespace[0..8])) {
+                _ = try captured.findInstalled(root);
+                break route;
+            }
+        } else return error.ChangefeedResynchronizationRequired;
+        const port = self.merge_cut orelse return error.ChangefeedCapabilityUnsupported;
+        const owners = self.artifact_owners orelse return error.ChangefeedCapabilityUnsupported;
+        const qualified = try owners.read(a, donor.fence, donor.table_name, .{ .version = 1, .expected_table_binding = donor.table_binding }, context);
+        const cut = (try port.read(a, donor.fence, donor.table_name, .{
+            .namespace = stored.storageNamespace(),
+            .transition = merge.transition_id,
+            .receiver_group = receiver.group_id,
+            .root_generation = qualified.owner.root_generation,
+        }, context)) orelse return null;
+        if (cut.reclaimed > stored.acknowledged.sequence) return error.ChangefeedResynchronizationRequired;
+        return .{ .stage_merge_drain = .{
+            .namespace = stored.namespace,
+            .ownership_epoch = stored.ownership_epoch,
+            .drain = .{
+                .donor = physical,
+                .receiver = receiver,
+                .transition = cut.transition,
+                .term = cut.term,
+                .index = cut.index,
+                .latest = cut.latest,
+                .root_generation = cut.root_generation,
+            },
+        } };
+    }
+
+    pub fn enrollSplitSuccessor(self: Source, a: A, captured: *const Captured, state: control.State, root: control.Root, context: Context) !control.Mutation {
+        const handoff = root.split_handoff orelse return error.ChangefeedConflict;
+        const grant_sequence = root.split_grant_sequence orelse return error.ChangefeedConflict;
+        const definition = state.definition orelse return error.ChangefeedConflict;
+        const table_id = std.mem.readInt(u64, root.namespace[0..8], .big);
+        const table = for (definition.tables) |candidate| {
+            if (candidate.table_id == table_id) break candidate;
+        } else return error.ChangefeedResynchronizationRequired;
+        const successor = try captured.findPhysical(table_id, handoff.successor.group_id, handoff.successor.range_id);
+        if (!std.mem.eql(u8, &successor.namespace, &root.storageNamespace())) return error.ChangefeedResynchronizationRequired;
+        const wire = @import("history_control_operations.zig").wire;
+        const inspect: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect_policy = .{
+            .namespace = root.storageNamespace(),
+            .authority = state.authority,
+        } } };
+        const observed = try self.controls.execute(a, successor.fence, successor.table_name, inspect, context);
+        if (!observed.confirmed()) return error.RaftBatchWriteOutcomeUnknown;
+        if (observed.outcome.? == .rejected) {
+            const err = observed.outcome.?.rejected.asError();
+            std.log.debug("split successor history control rejected phase=inspect_policy group={} err={s}", .{ successor.fence.route.group_id, @errorName(err) });
+            return err;
+        }
+        const policy = observed.outcome.?.applied.policy orelse return error.HistoryCorrupt;
+        const command: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{
+            .namespace = root.storageNamespace(),
+            .authority = state.authority,
+            .sequence = grant_sequence,
+            .consumer = state.consumerId(),
+            .definition = definition.identity(),
+            .expires_at_seconds = state.expires_at,
+            .policy_revision = table.policy_revision,
+            .limit = policy.limit,
+            .require_commit_clock = table.contract == .native_relational,
+            .retained_start = 0,
+            .split_origin = .{
+                .transition = handoff.cut.transition,
+                .attempt = handoff.cut.attempt,
+                .predecessor_group = handoff.predecessor.group_id,
+                .successor_group = handoff.successor.group_id,
+            },
+        } } };
+        const enrolled = try self.controls.execute(a, successor.fence, successor.table_name, command, context);
+        if (!enrolled.confirmed()) return error.RaftBatchWriteOutcomeUnknown;
+        if (enrolled.outcome.? == .rejected) {
+            const err = enrolled.outcome.?.rejected.asError();
+            std.log.debug("split successor history control rejected phase=enroll group={} err={s}", .{ successor.fence.route.group_id, @errorName(err) });
+            return err;
+        }
+        const consumer = enrolled.outcome.?.applied.consumer orelse return error.HistoryCorrupt;
+        if (consumer.start != 0 or consumer.policy_revision != table.policy_revision or
+            !std.mem.eql(u8, &consumer.id, &command.command.enroll.consumer))
+            return error.HistoryResynchronizationRequired;
+        return .{ .confirm_split_successor = .{ .namespace = root.namespace, .grant_sequence = grant_sequence, .consumer_epoch = consumer.epoch } };
+    }
+
+    /// Authorization must precede capture. Returned locators borrow the owned
+    /// generation, so they remain valid even after the publisher retires it.
+    pub fn capture(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
+        return self.captureRoutes(a, definition, context, .unique);
+    }
+
+    /// Physical topology discovery also includes ranges sharing a document namespace.
+    pub fn capturePhysical(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
+        return self.captureRoutes(a, definition, context, .physical);
+    }
+
+    pub fn captureRetiringRoot(self: Source, a: A, definition: control.Definition, namespace: control.Namespace, context: Context) !Captured {
+        const table_id = std.mem.readInt(u64, namespace[0..8], .big);
+        for (definition.tables, 0..) |table, index| {
+            if (table.table_id != table_id) continue;
+            var single = definition;
+            single.tables = definition.tables[index..][0..1];
+            return self.capturePhysical(a, single, context);
+        }
+        return error.ChangefeedResynchronizationRequired;
+    }
+
+    /// Give a fresh feed one durable logical cursor per physical range.
+    pub fn captureAdmission(self: Source, a: A, definition: control.Definition, context: Context) !Captured {
+        return self.captureRoutes(a, definition, context, .admission);
+    }
+
+    fn captureRoutes(self: Source, a: A, definition: control.Definition, context: Context, mode: enum { unique, physical, admission }) !Captured {
+        try context.ensureActive();
+        try definition.validate();
+        var budget = self.catalog.budget(null);
+        budget.deadline_ns = @min(budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse std.math.maxInt(u64), budget.nowNs() +| 5 * std.time.ns_per_s);
+        budget.cancellation = context.cancellation;
+        var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
+        errdefer session.deinit();
+        var roots: std.ArrayList(Root) = .empty;
+        defer roots.deinit(a);
+        for (definition.tables) |expected| {
+            try budget.checkpoint();
+            const index = session.table_id_indexes.get(expected.table_id) orelse return error.ChangefeedResynchronizationRequired;
+            const table = session.snapshot.value.tables[index];
+            if (!std.mem.eql(u8, &expected.binding, &control.tableBinding(table))) return error.ChangefeedResynchronizationRequired;
+            if (expected.contract == .writable_iceberg_rows) continue;
+            if (table.storage.engine != .local or (expected.contract != .native_document and expected.contract != .native_relational)) return error.ChangefeedCapabilityUnsupported;
+            const view = try session.tableRoutingView(table.name, budget);
+            if (!view.covers_keyspace) return error.TopologyChanged;
+            const ranges = session.table_range_refs.get(table.table_id) orelse return error.TopologyChanged;
+            if (ranges.ranges.len > control.max_roots - roots.items.len) return error.InvalidChangefeed;
+            for (ranges.ranges, 0..) |range, ordinal| {
+                try budget.checkpointIndex(ordinal);
+                const shard = tables.rangeDocIdentityShardId(range.*);
+                const range_id = tables.rangeDocIdentityRangeId(range.*);
+                if (range.group_id == 0 or range.range_id == 0 or shard == 0 or range_id == 0) return error.TopologyChanged;
+                var namespace: control.Namespace = undefined;
+                std.mem.writeInt(u64, namespace[0..8], table.table_id, .big);
+                std.mem.writeInt(u64, namespace[8..16], shard, .big);
+                std.mem.writeInt(u64, namespace[16..24], range_id, .big);
+                const route: catalog_api.CatalogGroupRoute = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = shard, .range_id = range_id } };
+                const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = session.snapshot.value.metadata_group_id, .metadata_incarnation = session.snapshot.value.metadata_incarnation, .catalog_revision = session.snapshot.value.catalog_revision, .table_id = table.table_id, .topology_epoch = view.topology_epoch, .route = route };
+                try fence.validate();
+                try roots.append(a, .{ .namespace = namespace, .physical_range_id = range.range_id, .table_name = table.name, .table_binding = expected.binding, .fence = fence });
+            }
+        }
+        const order = struct {
+            fn less(_: void, left: Root, right: Root) bool {
+                return switch (std.mem.order(u8, &left.namespace, &right.namespace)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => left.fence.route.group_id < right.fence.route.group_id,
+                };
+            }
+        }.less;
+        std.mem.sort(Root, roots.items, {}, order);
+        if (mode != .physical) {
+            var previous: ?control.Namespace = null;
+            for (roots.items) |*root| {
+                const namespace = root.namespace;
+                if (previous != null and std.mem.eql(u8, &previous.?, &namespace)) {
+                    if (mode == .unique) return error.TopologyChanged;
+                    root.storage_namespace = namespace;
+                    root.namespace = control.splitStreamNamespace(namespace, root.physicalIdentity().?);
+                }
+                previous = namespace;
+            }
+            if (mode == .admission) std.mem.sort(Root, roots.items, {}, order);
+        }
+        try budget.checkpoint();
+        try context.ensureActive();
+        return .{ .allocator = a, .session = session, .roots = try a.dupe(Root, roots.items) };
+    }
+    pub const RelationalFrameRead = struct {
+        root_index: usize,
+        position: control.Position,
+        now: u64,
+        max_events_per_page: u32,
+        max_frame_bytes: u32 = @import("history_page_operations.zig").pages.max_source_bytes,
+    };
+
+    /// Assemble one complete participant frame and retain certificate evidence
+    /// projected to the feed's authorized roots.
+    pub fn readRelationalFrame(self: Source, a: A, state: control.State, captured: *const Captured, read: RelationalFrameRead, context: Context) !?@import("history_page_operations.zig").pages.Page {
+        const history = @import("history_page_operations.zig");
+        const frame = @import("antfly_local_sources").storage_committed_history.frame;
+        try context.ensureActive();
+        const definition = state.definition orelse return error.ChangefeedConflict;
+        if (state.phase != .streaming or read.root_index >= state.roots.len or read.position.event != 0 or read.max_events_per_page == 0 or read.max_events_per_page > 1024)
+            return error.ChangefeedCapabilityUnsupported;
+        if (read.now == 0 or read.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+        if (read.max_frame_bytes == 0 or read.max_frame_bytes > history.pages.max_source_bytes) return error.HistoryTooLarge;
+        try captured.validateInstalledRoutes(state);
+        const item = state.roots[read.root_index];
+        if (item.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
+        const root = try captured.findInstalled(item);
+        if (item.transitionLimit()) |limit| {
+            if (read.position.sequence > limit) return error.ChangefeedResynchronizationRequired;
+            if (read.position.sequence == limit) return null;
+        }
+        for (definition.tables) |table| {
+            if (table.table_id != root.fence.table_id) continue;
+            if (table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
+            break;
+        } else return error.ChangefeedResynchronizationRequired;
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const scratch = arena.allocator();
+        const shared_storage = for (state.roots) |position| {
+            if (position.storage_namespace != null) break true;
+        } else false;
+        const projection_count = if (state.roots.len > 1) state.roots.len else 0;
+        if (projection_count > history.pages.max_projection_roots) return error.ChangefeedCapabilityUnsupported;
+        const completion_roots = try scratch.alloc(control.Namespace, projection_count);
+        const completion_groups = try scratch.alloc(u64, if (shared_storage) projection_count else 0);
+        for (completion_roots, state.roots[0..projection_count], 0..) |*namespace, selected, index| {
+            namespace.* = selected.storageNamespace();
+            if (shared_storage) completion_groups[index] = if (selected.physical) |physical| physical.group_id else (try captured.findInstalled(selected)).fence.route.group_id;
+        }
+        var input: history.Request = .{ .version = 1, .request = .{
+            .reference = .{
+                .namespace = item.storageNamespace(),
+                .authority = state.authority,
+                .consumer = state.consumerId(),
+                .epoch = item.consumer_epoch,
+                .grant = item.grant_sequence,
+                .definition = definition.identity(),
+            },
+            .after = .{ .sequence = read.position.sequence },
+            .now_seconds = read.now,
+            .max_events = read.max_events_per_page,
+            .max_bytes = read.max_frame_bytes,
+            .include_completion = true,
+            .completion_roots = completion_roots,
+            .completion_groups = completion_groups,
+            .completion_local_group = if (completion_groups.len != 0) root.fence.route.group_id else 0,
+        } };
+        var header: ?frame.Header = null;
+        var completion: @FieldType(history.pages.Page, "completion") = null;
+        var completion_effects: []const ?history.pages.CompletionEffect = &.{};
+        var effects_digest: control.Digest = undefined;
+        var header_digest: control.Digest = undefined;
+        var events: []frame.Event = &.{};
+        var bytes: usize = 0;
+        var latest: u64 = read.position.sequence;
+        while (true) {
+            try context.ensureActive();
+            var page = try self.pages.read(a, root.fence, root.table_name, input, context);
+            defer page.deinit();
+            try history.wire.validate(page, input.request);
+            if (page.observed_latest < latest) return error.ChangefeedResynchronizationRequired;
+            latest = page.observed_latest;
+            const current = page.header orelse {
+                if (header != null) return error.ChangefeedResynchronizationRequired;
+                arena.deinit();
+                return null;
+            };
+            if (item.transitionLimit()) |limit| {
+                if (current.sequence > limit) return error.ChangefeedResynchronizationRequired;
+                latest = @min(latest, limit);
+            }
+            switch (current.transaction_scope) {
+                .root_local => {},
+                .coordinated => {
+                    if (page.completion == null) return error.ReadUnavailable;
+                },
+                .unknown => return error.ChangefeedCapabilityUnsupported,
+            }
+            const digest = control.hash(current);
+            const projected_digest = control.hash(page.completion_effects);
+            if (header == null) {
+                header = current;
+                completion = page.completion;
+                completion_effects = try scratch.dupe(?history.pages.CompletionEffect, page.completion_effects);
+                effects_digest = projected_digest;
+                header.?.schema_before = try duplicateOptional(scratch, current.schema_before);
+                header.?.schema_after = try duplicateOptional(scratch, current.schema_after);
+                header_digest = digest;
+                events = try scratch.alloc(frame.Event, page.frame_events);
+                bytes = (if (current.schema_before) |value| value.len else 0) +
+                    (if (current.schema_after) |value| value.len else 0);
+            } else if (!std.meta.eql(digest, header_digest) or page.frame_events != events.len or !std.meta.eql(completion, page.completion) or !std.meta.eql(effects_digest, projected_digest)) {
+                return error.ChangefeedResynchronizationRequired;
+            }
+            for (page.events, page.first_ordinal..) |event, index| {
+                if (index > 0 and std.mem.order(u8, events[index - 1].key, event.key) != .lt)
+                    return error.HistoryCorrupt;
+                bytes += event.key.len + (if (event.before) |value| value.len else 0) +
+                    (if (event.after) |value| value.len else 0) + 12;
+                if (bytes > read.max_frame_bytes) return error.HistoryTooLarge;
+                events[index] = .{
+                    .key = try scratch.dupe(u8, event.key),
+                    .before = try duplicateOptional(scratch, event.before),
+                    .after = try duplicateOptional(scratch, event.after),
+                };
+            }
+            if (page.next.event == 0) {
+                _ = try frame.encodedLength(header.?, events);
+                try self.validate(a, state, root.namespace, root.fence, root.table_name, context);
+                return .{ .arena = arena, .header = header, .completion = completion, .completion_effects = completion_effects, .events = events, .frame_events = page.frame_events, .next = page.next, .observed_latest = latest, .caught_up = page.caught_up };
+            }
+            input.request.after = page.next;
+        }
+    }
+
+    /// Validate an existing intent against the current base incarnation/root.
+    /// A changed leader is transport discovery; a changed namespace is resync.
+    pub fn validate(self: Source, a: A, state: control.State, namespace: control.Namespace, frozen: metadata.CatalogRouteFence, table_name: []const u8, context: Context) !void {
+        try state.validate();
+        const item = state.roots[try state.rootIndex(namespace)];
+        var current = if (state.phase == .closing or state.phase == .reset_required)
+            try self.captureRetiringRoot(a, state.definition.?, namespace, context)
+        else
+            try self.capturePhysical(a, state.definition.?, context);
+        defer current.deinit();
+        const root = try current.findInstalled(item);
+        if (!std.mem.eql(u8, root.table_name, table_name) or !std.meta.eql(root.fence.route, frozen.route) or root.fence.table_id != frozen.table_id or root.fence.metadata_group_id != frozen.metadata_group_id or !std.meta.eql(root.fence.metadata_incarnation, frozen.metadata_incarnation) or root.fence.topology_epoch != frozen.topology_epoch) return error.ChangefeedResynchronizationRequired;
+    }
+};
+
+const MetadataClient = @import("changefeed_metadata.zig").Client;
+const enrollment = @import("../metadata/root_control_driver.zig");
+
+/// Two complete scans with unchanged monotonic heads prove an interval shared
+/// by every enrolled root. The first scan also requires each root to have no
+/// unpublished coordinated effects. An advanced head invalidates this round.
+pub fn qualifyEnrollmentCut(a: A, source: Source, policy: anytype, captured: *const Captured, state: control.State, request: Context) !control.Digest {
+    try state.validate();
+    if (state.phase != .enrolling or state.roots.len == 0) return error.ChangefeedConflict;
+    try captured.validateInstalledRoutes(state);
+    const definition = state.definition.?;
+    const identity = definition.identity();
+    var proof = control.hash(.{ .domain = "antfly:coherent-enrollment-cut:v1", .consumer = state.consumerId(), .definition = identity });
+    for (0..2) |scan| {
+        for (captured.roots) |route| {
+            try request.ensureActive();
+            const root = state.roots[try state.rootIndex(route.namespace)];
+            if (root.consumer_epoch == 0 or root.pending_control != null) return error.ChangefeedConflict;
+            const table = for (definition.tables) |table| {
+                if (table.table_id == route.fence.table_id) break table;
+            } else return error.ChangefeedResynchronizationRequired;
+            try policy.authorizeRoot(state, root.namespace, request);
+            try policy.validateRoot(state, root.namespace, route.fence, route.table_name, request);
+            const observation = try source.grants.read(a, route.fence, route.table_name, .{
+                .version = 1,
+                .identity = .{
+                    .namespace = root.storageNamespace(),
+                    .authority = state.authority,
+                    .consumer = state.consumerId(),
+                    .definition = identity,
+                    .sequence = root.grant_sequence,
+                    .policy_revision = table.policy_revision,
+                    .include_bootstrap = root.snapshot != null,
+                    .include_cut = true,
+                },
+            }, request);
+            if (observation != .active) return error.ChangefeedResynchronizationRequired;
+            const grant = observation.active;
+            if (grant.consumer.epoch != root.consumer_epoch or grant.consumer.start != root.start or
+                grant.consumer.acknowledged != root.start or grant.consumer.expires_at_seconds != state.expires_at)
+                return error.ChangefeedResynchronizationRequired;
+            if (root.snapshot) |pin| {
+                const observed = grant.bootstrap orelse return error.ChangefeedResynchronizationRequired;
+                if (!std.meta.eql(observed.digest, pin.digest) or observed.expires_at_seconds != pin.expires_at)
+                    return error.ChangefeedResynchronizationRequired;
+            }
+            const latest = grant.quiescent_latest orelse return error.ReadUnavailable;
+            if (latest != root.start) return error.ChangefeedEnrollmentCutAdvanced;
+            if (scan == 0) proof = control.hash(.{ .proof = proof, .namespace = root.namespace, .grant = root.grant_sequence, .epoch = root.consumer_epoch, .sequence = root.start, .pin = root.snapshot });
+        }
+    }
+    try request.ensureActive();
+    return proof;
+}
+
+/// Reconcile a root to the metadata lease. An interrupted refresh can
+/// resume from the current native grant and the persisted control attempt.
+pub fn renewRoot(client: *MetadataClient, policy: anytype, a: A, expected: control.State, root: Root, request: Context) !void {
+    for (0..4) |_| {
+        const bytes = try client.readChangefeedState(a, expected.id, request);
+        defer a.free(bytes);
+        var parsed = try control.parse(a, bytes);
+        defer parsed.deinit();
+        const state = parsed.value;
+        try policy.authorizeRoot(state, root.namespace, request);
+        if (state.phase != .streaming or state.epoch != expected.epoch or !std.meta.eql(state.authority, expected.authority))
+            return error.ChangefeedResynchronizationRequired;
+        const item = state.roots[try state.rootIndex(root.namespace)];
+        if (item.pending_control != null) {
+            try driveRoot(client, policy, a, state, root.namespace, request);
+            continue;
+        }
+        try policy.validateRoot(state, root.namespace, root.fence, root.table_name, request);
+        const definition = state.definition orelse return error.ChangefeedResynchronizationRequired;
+        const table = for (definition.tables) |candidate| {
+            if (candidate.table_id == root.fence.table_id) break candidate;
+        } else return error.ChangefeedResynchronizationRequired;
+        const query: @import("history_grant_operations.zig").Request = .{ .version = 1, .identity = .{
+            .namespace = item.storageNamespace(),
+            .authority = state.authority,
+            .consumer = state.consumerId(),
+            .definition = definition.identity(),
+            .sequence = item.grant_sequence,
+            .policy_revision = table.policy_revision,
+        } };
+        const identity = query.identity;
+        const observation = try policy.source.grants.read(a, root.fence, root.table_name, query, request);
+        if (observation != .active) return error.ChangefeedResynchronizationRequired;
+        const consumer = observation.active.consumer;
+        if (consumer.epoch != item.consumer_epoch or consumer.start != item.start) return error.ChangefeedResynchronizationRequired;
+        if (consumer.expires_at_seconds > state.expires_at) continue;
+        if (consumer.expires_at_seconds >= expected.expires_at) return;
+        try prepareRoot(client, policy, a, state.id, root, .{
+            .version = 1,
+            .operation = .submit,
+            .command = .{ .renew = .{
+                .reference = .{
+                    .namespace = identity.namespace,
+                    .authority = identity.authority,
+                    .consumer = identity.consumer,
+                    .definition = identity.definition,
+                    .grant = identity.sequence,
+                    .epoch = consumer.epoch,
+                },
+                .previous = consumer.expires_at_seconds,
+                .next = state.expires_at,
+            } },
+        }, request);
+    }
+    return error.MetadataMutationOutcomeUnknown;
+}
+
+/// Propagate whole-frame client ACKs through receipt-qualified owner controls.
+/// Partial-frame cursors can be durable without moving the native floor.
+pub fn flushAcknowledged(client: *MetadataClient, policy: anytype, a: A, confirmed: control.State, root: Root, request: Context) !bool {
+    const target = confirmed.roots[try confirmed.rootIndex(root.namespace)].acknowledged.sequence;
+    for (0..4) |_| {
+        const bytes = try client.readChangefeedState(a, confirmed.id, request);
+        defer a.free(bytes);
+        var parsed = try control.parse(a, bytes);
+        defer parsed.deinit();
+        const state = parsed.value;
+        try policy.authorizeRoot(state, root.namespace, request);
+        if (state.epoch != confirmed.epoch or !std.meta.eql(state.authority, confirmed.authority) or state.phase != .streaming)
+            return error.ChangefeedResynchronizationRequired;
+        const item = state.roots[try state.rootIndex(root.namespace)];
+        const reference: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Reference = .{
+            .namespace = item.storageNamespace(),
+            .authority = state.authority,
+            .consumer = state.consumerId(),
+            .epoch = item.consumer_epoch,
+            .grant = item.grant_sequence,
+            .definition = state.definition.?.identity(),
+        };
+        if (item.reclaimed_through >= target) {
+            const native_http = state.slot == null;
+            if (target == item.start or (native_http and (item.native_collected_through orelse item.start) >= target)) return false;
+            try policy.validateRoot(state, root.namespace, root.fence, root.table_name, request);
+            // Collection operates on the owner's shared ACK floor. Retrying a
+            // lost reply can collect another bounded page, without changing a
+            // cursor or deleting history still pinned by any consumer.
+            const command: @import("history_control_operations.zig").wire.Request = .{
+                .version = 1,
+                .operation = .submit,
+                .command = .{ .reclaim = .{ .reference = reference, .max_frames = 32 } },
+            };
+            const result = try policy.source.controls.execute(a, root.fence, root.table_name, command, request);
+            try result.validate(command);
+            if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
+            if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
+            if (result.outcome.? != .applied) return error.ChangefeedResynchronizationRequired;
+            const more = result.outcome.?.applied.reclaimed_frames == command.command.reclaim.max_frames;
+            if (native_http and !more) {
+                const definition = state.definition.?;
+                try client.mutateChangefeedState(a, .{
+                    .id = state.id,
+                    .authority = state.authority,
+                    .owner = definition.owner,
+                    .authorization = definition.authorization,
+                    .expected_revision = state.revision,
+                    .expected_epoch = state.epoch,
+                    .mutation = .{ .native_collected = .{ .namespace = root.namespace, .consumer_epoch = item.consumer_epoch, .through = target } },
+                }, request);
+            }
+            return more;
+        }
+        if (item.pending_control != null) {
+            try driveRoot(client, policy, a, state, root.namespace, request);
+            continue;
+        }
+        const command: @import("history_control_operations.zig").wire.Request = .{
+            .version = 1,
+            .operation = .submit,
+            .command = .{ .acknowledge = .{
+                .reference = reference,
+                .previous = item.reclaimed_through,
+                .next = target,
+            } },
+        };
+        try prepareRoot(client, policy, a, state.id, root, command, request);
+    }
+    return error.MetadataMutationOutcomeUnknown;
+}
+
+/// Persist or drive the next step of an exact enrollment. The caller owns
+/// the complete root plan and decides when its cut can be sealed.
+pub fn enrollRoot(client: *MetadataClient, policy: anytype, a: A, state: control.State, root: Root, policy_revision: u64, context: Context) !void {
+    const item = state.roots[try state.rootIndex(root.namespace)];
+    if (state.phase != .enrolling or item.consumer_epoch != 0) return error.ChangefeedConflict;
+    if (item.pending_control != null) return driveRoot(client, policy, a, state, root.namespace, context);
+    const definition = state.definition orelse return error.ChangefeedConflict;
+    const table = for (definition.tables) |candidate| {
+        if (candidate.table_id == root.fence.table_id) break candidate;
+    } else return error.ChangefeedResynchronizationRequired;
+    if (table.policy_revision != policy_revision) return error.ChangefeedResynchronizationRequired;
+    const native = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+    const grant: native.Grant = .{
+        .namespace = item.storageNamespace(),
+        .authority = state.authority,
+        .consumer = state.consumerId(),
+        .definition = definition.identity(),
+        .sequence = item.grant_sequence,
+        .expires_at_seconds = state.expires_at,
+        .policy_revision = policy_revision,
+        .require_commit_clock = table.contract == .native_relational,
+        .allow_published_completions = state.slot_lsn_floor != 0,
+    };
+    const command: native.Command = if (definition.start == .snapshot_then_changes)
+        .{ .capture_bootstrap = .{ .grant = grant, .expires_at_seconds = state.bootstrap_expires_at } }
+    else
+        .{ .enroll = grant };
+    try prepareRoot(client, policy, a, state.id, root, .{ .version = 1, .operation = .submit, .command = command }, context);
+}
+
+pub fn prepareRoot(client: *MetadataClient, policy: anytype, a: A, id: control.Id, root: Root, command: @import("history_control_operations.zig").wire.Request, request: Context) !void {
+    const body = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(body);
+    const fence = try std.json.Stringify.valueAlloc(a, root.fence, .{});
+    defer a.free(fence);
+    try enrollment.prepare(client, policy, a, id, root.namespace, .{ .command = body, .fence = fence, .table = root.table_name }, request);
+}
+
+pub fn driveRoot(client: *MetadataClient, policy: anytype, a: A, state: control.State, namespace: control.Namespace, request: Context) !void {
+    const item = state.roots[try state.rootIndex(namespace)];
+    const pending = item.pending_control.?;
+    const driver_outcome = @import("../metadata/root_control_outcome.zig");
+    const command = (try driver_outcome.validateRequest(a, state, namespace, pending.payload)).input.command;
+    const progress = command == .renew or command == .acknowledge;
+    var result = if (pending.stage == .dispatching)
+        try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request)
+    else
+        try enrollment.drive(client, policy, policy.source.controls, a, state.id, namespace, request);
+    if (progress and pending.stage == .dispatching and result.status == .unproven)
+        result = try enrollment.resumeProgress(client, policy, policy.source.controls, a, state.id, namespace, pending.sequence, request);
+    if ((command == .enroll or command == .capture_bootstrap or progress) and (result.status == .accepted or result.status == .superseded))
+        result = try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request);
+    switch (result.status) {
+        .settled => {
+            const effect = result.settlement.?.effect;
+            if (effect == .rejected) {
+                const Rejection = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Rejection;
+                const rejection = std.enums.fromInt(Rejection, effect.rejected) orelse return error.ChangefeedCorrupt;
+                return rejection.asError();
+            }
+        },
+        .reconciled => {},
+        else => return result.deferred_error orelse error.MetadataMutationOutcomeUnknown,
+    }
+}
+
+fn duplicateOptional(a: A, value: ?[]const u8) !?[]const u8 {
+    if (value) |bytes| return try a.dupe(u8, bytes);
+    return null;
+}
+
+pub const test_support = if (@import("builtin").is_test) struct {
+    const Fixture = struct {
+        generation: *catalog_api.RoutingGeneration,
+        captures: usize = 0,
+        admin_calls: usize = 0,
+        fn acquire(raw: *anyopaque, budget: catalog_api.RoutingBudget, authoritative: bool) !*catalog_api.RoutingGeneration {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try budget.checkpoint();
+            try std.testing.expect(authoritative);
+            self.captures += 1;
+            self.generation.retain();
+            return self.generation;
+        }
+        fn admin(raw: *anyopaque) !metadata.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.admin_calls += 1;
+            return error.TestUnexpectedAdminFallback;
+        }
+        fn source(self: *@This()) Source {
+            return .{ .catalog = .{ .ptr = self, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = undefined, .acquire_routing_generation = acquire } }, .controls = undefined, .pages = undefined, .grants = undefined };
+        }
+    };
+    fn snapshot(table_records: []const tables.TableRecord, ranges: []const tables.RangeRecord) metadata.CatalogRoutingSnapshot {
+        return .{ .metadata_group_id = 1, .catalog_revision = 9, .tables = @constCast(table_records), .ranges = @constCast(ranges) };
+    }
+    pub fn contracts() !void {
+        const a = std.testing.allocator;
+        const records = [_]tables.TableRecord{
+            .{ .table_id = 7, .name = "zeta", .schema_json = "{}" },
+            .{ .table_id = 8, .name = "alpha", .schema_json = "{}" },
+        };
+        const ranges = [_]tables.RangeRecord{
+            .{ .table_id = 7, .group_id = 72, .range_id = 72, .start_key = "m", .end_key = null, .doc_identity_shard_id = 70, .doc_identity_range_id = 12 },
+            .{ .table_id = 8, .group_id = 81, .range_id = 81, .start_key = "", .end_key = null },
+            .{ .table_id = 7, .group_id = 71, .range_id = 71, .start_key = "", .end_key = "m", .doc_identity_shard_id = 70, .doc_identity_range_id = 11 },
+        };
+        const selected = [_]control.Table{
+            .{ .table_id = 7, .binding = control.tableBinding(records[0]), .policy_revision = 1, .contract = .native_document },
+            .{ .table_id = 8, .binding = control.tableBinding(records[1]), .policy_revision = 1, .contract = .native_relational },
+        };
+        const definition: control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &selected };
+        const generation = try catalog_api.RoutingGeneration.create(a, snapshot(&records, &ranges), .{});
+        var fixture: Fixture = .{ .generation = generation };
+        var captured = try fixture.source().capture(a, definition, .{});
+        defer captured.deinit();
+        // Release the publisher; the request still owns names, ranges and maps.
+        generation.release();
+        try std.testing.expectEqual(@as(usize, 3), captured.roots.len);
+        try std.testing.expectEqualStrings("zeta", captured.roots[0].table_name);
+        try std.testing.expectEqual(@as(u64, 70), captured.roots[0].fence.route.identity_namespace.shard_id);
+        try std.testing.expectEqual(@as(u64, 11), captured.roots[0].fence.route.identity_namespace.range_id);
+        try std.testing.expectEqual(@as(u64, 72), captured.roots[1].fence.route.group_id);
+        try std.testing.expectEqualStrings("alpha", captured.roots[2].table_name);
+        try std.testing.expectEqual(@as(u64, 9), captured.roots[2].fence.catalog_revision);
+        try std.testing.expectEqualDeep(captured.roots[1], try captured.find(captured.roots[1].namespace));
+        const plans = try captured.initialPlans(a);
+        defer a.free(plans);
+        try std.testing.expectEqual(@as(usize, 3), plans.len);
+        try std.testing.expectEqual(@as(u64, 1), plans[0].ownership_epoch);
+        try std.testing.expectEqual(control.PhysicalRoot{ .group_id = 71, .range_id = 71 }, plans[0].physical.?);
+        const mutation: control.Mutation = .{ .plan_roots = plans };
+        try std.testing.expectEqual(control.physical_history_protocol_version, mutation.requiredProtocol());
+        try std.testing.expectEqual(@as(usize, 0), fixture.admin_calls);
+        var split_ranges = ranges;
+        split_ranges[0].doc_identity_range_id = split_ranges[2].doc_identity_range_id;
+        const split_generation = try catalog_api.RoutingGeneration.create(a, snapshot(&records, &split_ranges), .{});
+        defer split_generation.release();
+        var split_fixture: Fixture = .{ .generation = split_generation };
+        var physical = try split_fixture.source().capturePhysical(a, definition, .{});
+        defer physical.deinit();
+        const parent = try physical.findPhysical(7, 71, 71);
+        const child = try physical.findPhysical(7, 72, 72);
+        try std.testing.expectEqual(parent.namespace, child.namespace);
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, physical.find(parent.namespace));
+        try std.testing.expectError(error.TopologyChanged, physical.initialPlans(a));
+        try std.testing.expectError(error.TopologyChanged, split_fixture.source().capture(a, definition, .{}));
+        var admission = try split_fixture.source().captureAdmission(a, definition, .{});
+        defer admission.deinit();
+        const split_plans = try admission.initialPlans(a);
+        defer a.free(split_plans);
+        const plan_mutation: control.Mutation = .{ .plan_roots = split_plans };
+        try std.testing.expectEqual(control.shared_namespace_plan_protocol_version, plan_mutation.requiredProtocol());
+        var plan_arena = std.heap.ArenaAllocator.init(a);
+        defer plan_arena.deinit();
+        const plan_allocator = plan_arena.allocator();
+        const stamp: control.Stamp = .{ .incarnation = @splat(9), .sequence = 1 };
+        const enrolling = try (control.Mutation{ .create = .{ .id = @splat(3), .definition = definition, .now = 1, .expires_at = 60 } }).apply(plan_allocator, .{}, stamp);
+        const planned = try plan_mutation.apply(plan_allocator, enrolling, .{ .incarnation = stamp.incarnation, .sequence = 2 });
+        try admission.validateInitialRoutes(planned.roots);
+        try physical.validateInstalledRoutes(planned);
+        const child_cursor = control.splitStreamNamespace(child.namespace, child.physicalIdentity().?);
+        const planned_child = planned.roots[try planned.rootIndex(child_cursor)];
+        try std.testing.expectEqual(child.namespace, planned_child.storageNamespace());
+        try std.testing.expectEqual(child_cursor, (try physical.findInstalled(planned_child)).namespace);
+        var merge: @import("../metadata/transition_state.zig").MergeTransitionRecord = .{
+            .transition_id = 21,
+            .donor_group_id = 72,
+            .receiver_group_id = 71,
+            .phase = .prepare,
+            .table_contract = .{ .table_id = 7, .table_name = "zeta", .source_identity = .{ .shard_id = 70, .range_id = 11 } },
+        };
+        // Even with a stale catalog phase, the drain must reach the cut port.
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, split_fixture.source().prepareMergeDrain(a, &physical, planned, planned_child, merge, .{}));
+        merge.phase = .rolled_back;
+        try std.testing.expect((try split_fixture.source().prepareMergeDrain(a, &physical, planned, planned_child, merge, .{})) == null);
+        const stored: control.Root = .{ .namespace = parent.namespace, .ownership_epoch = 1, .grant_sequence = 2, .physical = parent.physicalIdentity() };
+        var transition: SplitTransition = .{
+            .transition_id = 19,
+            .attempt_epoch = 1,
+            .source_group_id = 71,
+            .destination_group_id = 72,
+            .phase = .finalized,
+            .split_key = "wrong",
+            .table_contract = .{ .table_id = 7, .table_name = "zeta", .source_identity = .{ .shard_id = 70, .range_id = 11 } },
+        };
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, split_fixture.source().prepareSplitHandoff(a, &physical, stored, transition, .{}));
+        transition.split_key = "m";
+        try std.testing.expectError(error.ChangefeedCapabilityUnsupported, split_fixture.source().prepareSplitHandoff(a, &physical, stored, transition, .{}));
+        var installed = [_]control.Root{
+            stored,
+            .{ .namespace = captured.roots[2].namespace, .ownership_epoch = 1, .grant_sequence = 2 },
+        };
+        const installed_state: control.State = .{ .definition = definition, .roots = &installed };
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, physical.validateInstalledRoutes(installed_state));
+        installed[0].split_handoff = .{
+            .predecessor = parent.physicalIdentity().?,
+            .successor = child.physicalIdentity().?,
+            .cut = .{
+                .namespace = parent.namespace,
+                .transition = transition.transition_id,
+                .attempt = transition.attempt_epoch,
+                .successor_group = 72,
+                .term = 1,
+                .index = 2,
+                .latest = 1,
+                .reclaimed = 0,
+                .root_generation = 0,
+                .reserved_bytes = 0,
+                .boundary = @splat(1),
+            },
+        };
+        try physical.validateInstalledRoutes(installed_state);
+        try std.testing.expectEqual(@as(u64, 71), (try physical.findInstalled(installed[0])).fence.route.group_id);
+        installed[0].split_handoff.?.successor.range_id = 73;
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, physical.validateInstalledRoutes(installed_state));
+        var replaced = records;
+        replaced[0].table_id = 9;
+        var replacement_ranges = ranges;
+        for (&replacement_ranges) |*range| if (range.table_id == 7) {
+            range.table_id = 9;
+        };
+        fixture.generation = try catalog_api.RoutingGeneration.create(a, snapshot(&replaced, &replacement_ranges), .{});
+        defer fixture.generation.release();
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, fixture.source().capture(a, definition, .{}));
+        var gap = ranges;
+        gap[0].start_key = "n";
+        const gap_generation = try catalog_api.RoutingGeneration.create(a, snapshot(&records, &gap), .{});
+        defer gap_generation.release();
+        var gap_fixture: Fixture = .{ .generation = gap_generation };
+        try std.testing.expectError(error.TopologyChanged, gap_fixture.source().capture(a, definition, .{}));
+        const before = gap_fixture.captures;
+        try std.testing.expectError(error.DeadlineExceeded, gap_fixture.source().capture(a, definition, .{ .deadline_ns = 1 }));
+        try std.testing.expectEqual(before, gap_fixture.captures);
+        try std.testing.expectEqual(@as(usize, 0), gap_fixture.admin_calls);
+        var allocation_fixture: Fixture = .{ .generation = captured.session.generation.? };
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var state = try (control.Mutation{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } }).apply(arena.allocator(), .{}, .{ .incarnation = @splat(9), .sequence = 1 });
+        state = try (control.Mutation{ .plan_roots = plans }).apply(arena.allocator(), state, .{ .incarnation = @splat(9), .sequence = 2 });
+        const Routed = @import("../metadata/native_changefeed_root.zig").Routed;
+        var adapter = try Routed.initForRoot(allocation_fixture.source(), &captured, captured.roots[1].namespace);
+        try std.testing.expectEqual(selected[0].table_id, (try adapter.validateScope(state)).table_id);
+        var relational = try Routed.initForRoot(allocation_fixture.source(), &captured, captured.roots[2].namespace);
+        try std.testing.expectEqual(selected[1].table_id, (try relational.validateScope(state)).table_id);
+        const root = captured.roots[0];
+        try allocation_fixture.source().validate(a, state, root.namespace, root.fence, root.table_name, .{});
+        var wrong_fence = root.fence;
+        wrong_fence.metadata_incarnation = @splat(9);
+        try std.testing.expectError(error.ChangefeedResynchronizationRequired, allocation_fixture.source().validate(a, state, root.namespace, wrong_fence, root.table_name, .{}));
+        try enrollmentCut(a, arena.allocator(), state, &captured, allocation_fixture.source());
+        try std.testing.checkAllAllocationFailures(a, captureAllocations, .{ &allocation_fixture, definition });
+    }
+
+    fn enrollmentCut(a: A, scratch: A, planned: control.State, captured: *const Captured, source: Source) !void {
+        var state = planned;
+        for (planned.roots, 0..) |root, ordinal| {
+            state = try (control.Mutation{ .enroll = .{ .namespace = root.namespace, .ownership_epoch = 1, .grant_sequence = root.grant_sequence, .consumer_epoch = 1, .start = 5 } }).apply(scratch, state, .{ .incarnation = state.authority, .sequence = 3 + ordinal });
+        }
+        const grants = @import("history_grant_operations.zig");
+        const GrantFixture = struct {
+            calls: usize = 0,
+            fail_at: ?usize = null,
+            moved: bool = false,
+            fn read(raw: *anyopaque, _: A, _: metadata.CatalogRouteFence, _: []const u8, request: grants.Request, _: Context) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                try std.testing.expect(request.identity.include_cut);
+                return .{ .active = .{
+                    .grant = request.identity.sequence,
+                    .consumer = .{ .id = request.identity.consumer, .epoch = 1, .start = 5, .acknowledged = 5, .expires_at_seconds = 1000, .policy_revision = request.identity.policy_revision },
+                    .limit = 1024,
+                    .quiescent_latest = if (self.calls == self.fail_at) (if (self.moved) @as(?u64, 6) else null) else 5,
+                } };
+            }
+        };
+        const Policy = struct {
+            pub fn authorizeRoot(_: *@This(), _: control.State, _: control.Namespace, _: Context) !void {}
+            pub fn validateRoot(_: *@This(), _: control.State, _: control.Namespace, _: metadata.CatalogRouteFence, _: []const u8, _: Context) !void {}
+        };
+        var policy: Policy = .{};
+        var fixture: GrantFixture = .{};
+        var reader = source;
+        reader.grants = .{ .ptr = &fixture, .read_fn = GrantFixture.read };
+        const proof = try qualifyEnrollmentCut(a, reader, &policy, captured, state, .{});
+        try std.testing.expectEqual(captured.roots.len * 2, fixture.calls);
+        fixture = .{};
+        try std.testing.expectEqual(proof, try qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
+        fixture = .{ .fail_at = 1 };
+        try std.testing.expectError(error.ReadUnavailable, qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
+        fixture = .{ .fail_at = captured.roots.len + 1, .moved = true };
+        try std.testing.expectError(error.ChangefeedEnrollmentCutAdvanced, qualifyEnrollmentCut(a, reader, &policy, captured, state, .{}));
+    }
+    fn captureAllocations(a: A, fixture: *Fixture, definition: control.Definition) !void {
+        var owned = try fixture.source().capture(a, definition, .{});
+        defer owned.deinit();
+    }
+} else struct {};

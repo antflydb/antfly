@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.document_artifact_reprocess_job_phase import DocumentArtifactReprocessJobPhase
 from ..models.document_artifact_reprocess_job_reprocess_status import DocumentArtifactReprocessJobReprocessStatus
+from ..models.document_artifact_reprocess_job_selection import DocumentArtifactReprocessJobSelection
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -45,6 +46,11 @@ class DocumentArtifactReprocessJob:
         created_at_millis (int): Unix epoch milliseconds when the job was created.
         last_updated_at_millis (int): Unix epoch milliseconds when the job was last updated.
         expires_at_millis (int): Unix epoch milliseconds after which the retained job status may be removed.
+        selection (DocumentArtifactReprocessJobSelection | Unset): all explicitly regenerates selected source records,
+            including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts,
+            including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds
+            reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify
+            inference completion. Default: DocumentArtifactReprocessJobSelection.ALL.
         next_key (None | str | Unset): Single-shard continuation key when no shard cursors are present.
         last_error (None | str | Unset): Last terminal or transient job error, when available.
     """
@@ -69,6 +75,7 @@ class DocumentArtifactReprocessJob:
     created_at_millis: int
     last_updated_at_millis: int
     expires_at_millis: int
+    selection: DocumentArtifactReprocessJobSelection | Unset = DocumentArtifactReprocessJobSelection.ALL
     next_key: None | str | Unset = UNSET
     last_error: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -120,6 +127,10 @@ class DocumentArtifactReprocessJob:
 
         expires_at_millis = self.expires_at_millis
 
+        selection: str | Unset = UNSET
+        if not isinstance(self.selection, Unset):
+            selection = self.selection.value
+
         next_key: None | str | Unset
         if isinstance(self.next_key, Unset):
             next_key = UNSET
@@ -158,6 +169,8 @@ class DocumentArtifactReprocessJob:
                 "expires_at_millis": expires_at_millis,
             }
         )
+        if selection is not UNSET:
+            field_dict["selection"] = selection
         if next_key is not UNSET:
             field_dict["next_key"] = next_key
         if last_error is not UNSET:
@@ -221,6 +234,13 @@ class DocumentArtifactReprocessJob:
 
         expires_at_millis = d.pop("expires_at_millis")
 
+        _selection = d.pop("selection", UNSET)
+        selection: DocumentArtifactReprocessJobSelection | Unset
+        if isinstance(_selection, Unset):
+            selection = UNSET
+        else:
+            selection = DocumentArtifactReprocessJobSelection(_selection)
+
         def _parse_next_key(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -260,6 +280,7 @@ class DocumentArtifactReprocessJob:
             created_at_millis=created_at_millis,
             last_updated_at_millis=last_updated_at_millis,
             expires_at_millis=expires_at_millis,
+            selection=selection,
             next_key=next_key,
             last_error=last_error,
         )

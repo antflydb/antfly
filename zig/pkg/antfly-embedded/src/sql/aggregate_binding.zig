@@ -217,7 +217,9 @@ const Builder = struct {
             if ((call.star and (!std.mem.eql(u8, call.name, "count") or call.args.len != 0)) or (!call.star and call.args.len != 1)) return error.InvalidSqlParameters;
             for (call.args) |arg| if (contains(arg)) return error.SqlGroupingError;
             if (call.filter) |filter| if (contains(filter)) return error.SqlGroupingError;
+            if (aggregateKind(call.name).? == .array_agg and (call.distinct or call.filter != null)) return error.UnsupportedSqlShape;
             if (self.inference) return switch (aggregateKind(call.name).?) {
+                .array_agg => self.node(.{ .call = .{ .name = "$array", .args = call.args } }),
                 .count => self.node(.{ .literal = .{ .integer = 0 } }),
                 .avg => self.node(.{ .cast = .{ .operand = call.args[0], .type = .number } }),
                 .bool_and, .bool_or => self.node(.{ .cast = .{ .operand = call.args[0], .type = .boolean } }),
@@ -384,11 +386,13 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
             .avg => .number,
             .bool_and, .bool_or => .boolean,
             .pattern_set => .json,
+            .array_agg => .array,
             else => input_type orelse .string,
         };
         // Extrema retain the complete input domain, not just its coarse
         // number/array tag. Exact decimals must not become float results.
         if (column.type == .array or kind == .min or kind == .max) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
+        if (kind == .array_agg) column.element_type = try operators.Aggregate.arrayAggElement(input_type, input_element);
         if ((kind == .sum or kind == .avg) and input_element == .numeric) column.element_type = .numeric;
         if (kind == .sum and input_element == .float32) column.element_type = .float32;
         if (node.call.within_group != null) {

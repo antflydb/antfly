@@ -145,6 +145,15 @@ const OpaqueApiHttpServer = struct {
         callInfallible(?hot_standby_http_operation.Executor, void, self.functions.set_ha_executor, self.opaque_handle, &input, null);
     }
 
+    pub fn lakeStreamOwnerOptions(self: *OpaqueApiHttpServer, request: @import("lake_source_owner.zig").OptionsInput) !@import("lake_source_owner.zig").Options {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.lake_stream_owner)) return error.UnsupportedReplicationRoute;
+        const owner = @import("lake_source_owner.zig");
+        var input = request;
+        var result: owner.Options = undefined;
+        try callFallible(owner.OptionsInput, owner.Options, self.functions.lake_stream_owner_options, self.opaque_handle, &input, &result);
+        return result;
+    }
+
     pub fn attachRestoreJobRuntimeStore(self: *OpaqueApiHttpServer, store: *backend_erased.Store) !void {
         try callFallible(backend_erased.Store, void, self.functions.attach_runtime_restore_store, self.opaque_handle, store, null);
     }
