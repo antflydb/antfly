@@ -27,6 +27,39 @@ pub const protocol_version: u16 = 101;
 pub const closing_protocol_version: u16 = 115;
 pub const native_bootstrap_protocol_version: u16 = 130;
 pub const scoped_snapshot_protocol_version: u16 = 131;
+pub const legacy_handover_protocol_version: u16 = 137;
+pub const legacy_handover_phase = "native_legacy_handover";
+
+pub fn legacyHandoverCheckpoint(record: anytype) ?[]const u8 {
+    if ((!std.mem.eql(u8, record.phase, "streaming") and !std.mem.eql(u8, record.phase, legacy_handover_phase)) or
+        !std.mem.eql(u8, record.cutover_mode, "exported_snapshot") or
+        record.prepared_checkpoint.len == 0 or record.stream_checkpoint.len == 0 or
+        record.retired_cutover_authority_id != 0 or record.pending_snapshot_page != null or
+        record.snapshot_cleanup_job.len != 0) return null;
+    return record.stream_checkpoint;
+}
+
+pub fn supportsLegacyHandover(source: std.json.Value) bool {
+    if (source != .object) return false;
+    const kind = source.object.get("type") orelse return false;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "postgres")) return false;
+    for ([_][]const u8{ "routes", "on_update" }) |key| {
+        if (source.object.get(key)) |value| {
+            if (value != .null and !(value == .array and value.array.items.len == 0)) return false;
+        }
+    }
+    if (source.object.get("on_delete")) |value| {
+        if (value == .null) return true;
+        if (value != .array or value.array.items.len > 1) return false;
+        if (value.array.items.len == 1) {
+            const transform = value.array.items[0];
+            if (transform != .object or transform.object.count() != 1) return false;
+            const operation = transform.object.get("op") orelse return false;
+            return operation == .string and std.mem.eql(u8, operation.string, "$delete_document");
+        }
+    }
+    return true;
+}
 pub const native_bootstrap_preparing_phase = "native_bootstrap_preparing";
 pub const native_bootstrap_snapshot_phase = "native_bootstrap_snapshot";
 pub const native_bootstrap_retry_phase = "native_bootstrap_retry";
@@ -367,6 +400,11 @@ pub fn isNativeSnapshotScopedCheckpoint(checkpoint: []const u8) bool {
 }
 
 pub const Mutation = union(enum) {
+    begin_legacy_handover: struct {
+        scope: Scope,
+        authority: checkpoint_authority.Spec,
+        checkpoint: []const u8,
+    },
     /// Stop new grants while preserving original recovery and cleanup debt.
     close: void,
     enable_scope_fencing: void,
@@ -398,6 +436,13 @@ pub const Mutation = union(enum) {
 
     pub fn validate(self: Mutation) !void {
         switch (self) {
+            .begin_legacy_handover => |handover| {
+                try handover.scope.validate();
+                try handover.authority.validate();
+                if (handover.scope.destination != .native or handover.authority.retirement != null or
+                    !std.meta.eql(handover.authority.binding, handover.scope.identity()) or
+                    !text(handover.checkpoint, 1024, false)) return error.InvalidSourceControl;
+            },
             .close, .enable_scope_fencing => {},
             .certify_native_bootstrap => |checkpoint| if (!text(checkpoint, 1024, false)) return error.InvalidSourceControl,
             .certify_native_snapshot_pages => |cut| if (!text(cut.provider_checkpoint, 1024, false) or !nonzero(cut.first_page)) return error.InvalidSourceControl,
@@ -431,6 +476,14 @@ pub const Mutation = union(enum) {
         try state.validate();
         var next = try state.advance();
         switch (self) {
+            .begin_legacy_handover => |handover| {
+                if (state.scope != null) return error.SourceBindingConflict;
+                next.scope = handover.scope;
+                next.checkpoint_authority = handover.authority;
+                next.artifact_control = .{};
+                next.scope_fencing = true;
+                next.native_bootstrap_checkpoint = try a.dupe(u8, handover.checkpoint);
+            },
             .enable_scope_fencing => {
                 if (state.scope_fencing) return state;
                 const scope = state.scope orelse return error.SourceBindingConflict;
@@ -685,6 +738,9 @@ pub const Write = struct {
         if (self.table_id == 0 or !nonzero(self.source_id) or !nonzero(self.expected_catalog_digest) or !nonzero(self.expected_binding)) return error.InvalidSourceControl;
         try self.mutation.validate();
         switch (self.mutation) {
+            .begin_legacy_handover => |handover| if (handover.scope.table_id != self.table_id or
+                !std.meta.eql(handover.scope.source_id, self.source_id) or
+                !std.meta.eql(handover.scope.identity(), self.expected_binding)) return error.SourceBindingConflict,
             .configure, .reseed => |scope| if (scope.table_id != self.table_id or !std.mem.eql(u8, &scope.source_id, &self.source_id)) return error.SourceBindingConflict,
             else => {},
         }
@@ -1013,7 +1069,12 @@ pub fn mutateOnService(svc: anytype, a: A, write: Write, request: anytype) !void
     if (before.value.scope) |scope| {
         if (!std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return error.SourceBindingConflict;
     } else {
-        if (write.mutation != .configure or !std.mem.eql(u8, &write.mutation.configure.identity(), &write.expected_binding)) return error.SourceBindingConflict;
+        const scope = switch (write.mutation) {
+            .configure => |configured| configured,
+            .begin_legacy_handover => |handover| handover.scope,
+            else => return error.SourceBindingConflict,
+        };
+        if (!std.meta.eql(scope.identity(), write.expected_binding)) return error.SourceBindingConflict;
     }
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -1286,6 +1347,7 @@ fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!
 }
 pub fn requiredProtocol(mutation: Mutation) u16 {
     return switch (mutation) {
+        .begin_legacy_handover => legacy_handover_protocol_version,
         .close, .enable_scope_fencing => closing_protocol_version,
         .certify_native_bootstrap => native_bootstrap_protocol_version,
         .certify_native_snapshot_pages => scoped_snapshot_protocol_version,
@@ -1553,6 +1615,15 @@ test "source control scope fencing pins idle bindings until closing retirement a
     var state = try (Mutation{ .configure = scope }).apply(ca, .{});
     try std.testing.expectError(error.SourceBindingConflict, (Mutation{ .enable_scope_fencing = {} }).apply(ca, state));
     const authority: checkpoint_authority.Spec = .{ .binding = scope.identity(), .table_name = "checkpoint", .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
+    const handover: Mutation = .{ .begin_legacy_handover = .{ .scope = scope, .authority = authority, .checkpoint = "lsn:0/1235" } };
+    const handed_over = try handover.apply(ca, .{});
+    try std.testing.expectEqual(legacy_handover_protocol_version, requiredProtocol(handover));
+    try std.testing.expect(handed_over.scope_fencing and hasWork(handed_over));
+    try std.testing.expect(handed_over.checkpoint_authority.?.sameAuthority(authority));
+    try std.testing.expectEqual(@as(u64, 0), handed_over.accepted.sequence);
+    try std.testing.expectError(error.SourceCheckpointConflict, handed_over.requireInitialBootstrapCheckpoint("lsn:0/1234"));
+    try handed_over.requireInitialBootstrapCheckpoint("lsn:0/1235");
+    try std.testing.expectError(error.SourceBindingConflict, handover.apply(ca, handed_over));
     state = try (Mutation{ .bind_checkpoint = authority }).apply(ca, state);
     try std.testing.expect(!hasWork(state));
     const legacy = try encode(a, state);

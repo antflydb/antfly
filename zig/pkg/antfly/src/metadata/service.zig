@@ -11197,9 +11197,33 @@ pub const MetadataHttpService = struct {
     }
 
     fn advanceNativeReplicationSnapshotActor(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, context: api_operation.RequestContext) !void {
+        return self.advanceNativeReplicationActor(a, table, record, null, context);
+    }
+
+    pub fn beginLegacyReplicationHandover(self: *MetadataHttpService, a: std.mem.Allocator, tables: []const metadata_table_manager.TableRecord, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !bool {
+        if (!try metadata_replication_backfill.legacyHandoverEligible(a, table, record, self.destination_authorizer)) return false;
+        const control = @import("source_control.zig");
+        const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
+        try ensureCdcWorkPermit(self);
+        for (tables) |other| {
+            try context.ensureActive();
+            if (other.replication_sources_json.len == 0) continue;
+            var sources = try std.json.parseFromSlice(std.json.Value, a, other.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
+            defer sources.deinit();
+            if (sources.value != .array) return error.InvalidSourceControl;
+            for (sources.value.array.items, 0..) |source, ordinal| {
+                if (other.table_id == table.table_id and ordinal == record.source_ordinal) continue;
+                if (try control.sourceMayWriteNativeDestination(source, other.name, table.name)) return false;
+            }
+        }
+        try self.advanceNativeReplicationActor(a, table, record, control.legacyHandoverCheckpoint(record).?, context);
+        return true;
+    }
+
+    fn advanceNativeReplicationActor(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, handover_checkpoint: ?[]const u8, context: api_operation.RequestContext) !void {
         const control = @import("source_control.zig");
         var guard: NativeSnapshotPageGuard = .{ .service = self, .table = table, .record = record };
-        try NativeSnapshotPageGuard.check(&guard, context);
+        if (handover_checkpoint == null) try NativeSnapshotPageGuard.check(&guard, context);
         const definition = try control.definitionDigest(a, table.replication_sources_json, record.source_ordinal);
         const id = control.nativeBootstrapSourceId(table.table_id, record.source_ordinal, definition);
         const raw = try control.readOnService(self, a, table.table_id, id, context);
@@ -11246,7 +11270,9 @@ pub const MetadataHttpService = struct {
             .table_name = table.name,
             .owner = observed.owner,
         };
-        const mutation: control.Mutation = if (state.value.scope == null)
+        const mutation: control.Mutation = if (handover_checkpoint) |checkpoint|
+            .{ .begin_legacy_handover = .{ .scope = scope, .authority = authority, .checkpoint = checkpoint } }
+        else if (state.value.scope == null)
             .{ .configure = scope }
         else if (state.value.checkpoint_authority == null)
             .{ .bind_checkpoint = authority }
@@ -11254,7 +11280,12 @@ pub const MetadataHttpService = struct {
             if (!state.value.checkpoint_authority.?.sameAuthority(authority)) return error.SourceBindingConflict;
             break :blk .{ .enable_scope_fencing = {} };
         };
-        try NativeSnapshotPageGuard.check(&guard, context);
+        if (handover_checkpoint == null) {
+            try NativeSnapshotPageGuard.check(&guard, context);
+        } else {
+            try ensureCdcWorkPermit(self);
+            try self.replicationSourceAuthorityCurrent(table.replication_sources_json, record);
+        }
         try control.mutateOnService(self, a, .{
             .table_id = scope.table_id,
             .source_id = scope.source_id,
@@ -11291,8 +11322,9 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, table.table_id, ordinal)) orelse return;
         defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
-        if (!control.isNativeBootstrapPhase(source_status.phase)) return;
-        if (!std.mem.eql(u8, source_status.phase, control.native_bootstrap_prepared_phase) or
+        const handover = std.mem.eql(u8, source_status.phase, control.legacy_handover_phase);
+        if (!handover and !control.isNativeBootstrapPhase(source_status.phase)) return;
+        if ((!handover and !std.mem.eql(u8, source_status.phase, control.native_bootstrap_prepared_phase)) or
             !std.meta.eql(source_status.native_bootstrap_catalog_digest, control.nativeBootstrapCatalogDigest(table)))
             return error.TableTransitionActive;
 

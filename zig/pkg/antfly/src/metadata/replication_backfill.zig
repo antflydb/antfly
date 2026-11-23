@@ -2170,12 +2170,14 @@ pub const StreamingReplicationRunner = struct {
         const control = @import("source_control.zig");
         const scope = state.scope orelse return error.SourceBindingConflict;
         const bootstrap_phase = std.mem.eql(u8, status.phase, control.native_bootstrap_prepared_phase);
-        if (state.closing or state.retired or (!bootstrap_phase and !phaseAllowsStreaming(status.phase))) return;
+        const handover_phase = std.mem.eql(u8, status.phase, control.legacy_handover_phase);
+        if (state.closing or state.retired or (!bootstrap_phase and !handover_phase and !phaseAllowsStreaming(status.phase))) return;
         if (!std.meta.eql(scope.provider, try nativeSourceProviderBinding(status)))
             return error.ReplicationCutoverAuthorityLost;
         if (state.accepted.sequence == 0 or control.isNativeSnapshotScopedCheckpoint(state.accepted.checkpoint)) {
             const checkpoint = state.native_bootstrap_checkpoint orelse return error.ReplicationCutoverAuthorityLost;
-            if (!bootstrap_phase or !std.mem.eql(u8, checkpoint, status.prepared_checkpoint))
+            const baseline = if (handover_phase) control.legacyHandoverCheckpoint(status) orelse return error.ReplicationCutoverAuthorityLost else status.prepared_checkpoint;
+            if ((!bootstrap_phase and !handover_phase) or !std.mem.eql(u8, checkpoint, baseline))
                 return error.ReplicationCutoverAuthorityLost;
             try self.checkpointWork();
             try callCheckCutoverAuthority(service, table.replication_sources_json, status);
@@ -2650,6 +2652,20 @@ pub const StreamingReplicationCoordinator = struct {
                     );
                     summary.sources_skipped_pending_snapshot += 1;
                     continue;
+                }
+
+                if (comptime @hasDecl(Service, "beginLegacyReplicationHandover")) {
+                    const deadline = (try self.runner.workDeadlineNs()) orelse quantum_deadline_ns;
+                    if (service.beginLegacyReplicationHandover(self.alloc, tables, table, existing, @min(deadline, quantum_deadline_ns)) catch |err| switch (err) {
+                        error.TableTopologyProtocolUpgradeRequired => false,
+                        error.SourceControlConflict, error.MetadataMutationOutcomeUnknown => true,
+                        else => blk: {
+                            if (replicationErrorEndsRound(err)) return err;
+                            summary.sources_failed += 1;
+                            std.log.warn("metadata native source handover deferred table={s} source={d} err={s}", .{ table.name, ordinal, @errorName(err) });
+                            break :blk true;
+                        },
+                    }) continue;
                 }
 
                 const snapshot_offset = snapshotOffsetForStatus(existing);
@@ -4106,6 +4122,21 @@ fn hashCutoverConfigBytes(hasher: *std.crypto.hash.sha2.Sha256, value: []const u
 }
 
 pub const nativeSourceProviderBinding = @import("source_control.zig").nativeSourceProviderBinding;
+
+pub fn legacyHandoverEligible(a: Allocator, table: metadata_table_manager.TableRecord, status: metadata_table_manager.ReplicationSourceStatusRecord, authorizer: ?stored_destination_authorization.Authorizer) !bool {
+    const control = @import("source_control.zig");
+    if (table.storage.engine != .local or control.legacyHandoverCheckpoint(status) == null) return false;
+    var external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json);
+    defer if (external) |*value| value.deinit(a);
+    if (external != null) return false;
+    var sources = try std.json.parseFromSlice(std.json.Value, a, table.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
+    defer sources.deinit();
+    if (sources.value != .array or status.source_ordinal >= sources.value.array.items.len or
+        !control.supportsLegacyHandover(sources.value.array.items[status.source_ordinal])) return false;
+    var parsed = try parseReplicationSourceConfig(a, table.name, table.replication_sources_json, status.source_ordinal, authorizer);
+    defer parsed.deinit(a);
+    return exactCutoverIntentOwnsConfig(status, parsed, exactCutoverConfigFingerprint(table.table_id, status.source_ordinal, parsed));
+}
 
 fn exactCutoverIntentOwnsConfig(
     status: metadata_table_manager.ReplicationSourceStatusRecord,

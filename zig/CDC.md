@@ -451,11 +451,18 @@ For a native source with a fenced scope, the hosted metadata worker verifies
 the PostgreSQL provider identity and stages each complete source transaction as
 a durable reservation and immutable plan. The worker recovers the original
 plan after interruptions and acknowledges PostgreSQL through the committed
-frontier. Managed native streams use the compatibility writer until their
-source is handed over to scoped admission. An interruption between a
-compatibility write and its source checkpoint can replay that write.
-Use idempotent transforms on a compatibility stream. A non-idempotent transform
-requires the fenced native admission path before relying on crash recovery.
+frontier. The distributed metadata owner automatically hands an existing
+exact-cutover PostgreSQL stream over at its durable stream checkpoint when it
+is the sole CDC writer for its native destination and uses passthrough writes
+with optional document deletion. Handover preserves the snapshot checkpoint,
+slot and publication. Legacy intake closes before the destination establishes
+its fenced baseline. Roots with unresolved legacy transactions remain fenced
+until the original transactions resolve.
+
+An interruption between a compatibility write and its source checkpoint can
+replay that write. Use idempotent transforms on a compatibility stream.
+Non-idempotent transforms require the fenced native admission path before
+relying on crash recovery.
 Writable Iceberg reports its ingress and catalog commit capability. External
 read-only Iceberg attachments report committed snapshots as their change
 authority. Index publication is a separate milestone across these contracts.

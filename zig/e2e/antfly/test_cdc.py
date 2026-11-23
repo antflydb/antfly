@@ -1415,6 +1415,9 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
             if int(status.get("table_id", 0)) == table_id
             and int(status.get("source_ordinal", -1)) == 0
             and status.get("stream_checkpoint")
+            and (
+                _is_standalone(stateful_api) or status.get("accepted_stream_checkpoint")
+            )
         ],
         timeout_s=30.0,
         interval_s=0.25,
@@ -1422,13 +1425,10 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
     statuses_before_restart = _metadata_replication_status_records(stateful_api)
     assert matching_before_restart, (
         f"unexpected replication statuses before restart: {statuses_before_restart!r}"
+        f"\n{_server_logs(stateful_api)}"
     )
     assert any(
-        status.get("phase") == "cutover_prepared" and status.get("prepared_checkpoint")
-        for status in matching_before_restart
-    ) or any(
-        status.get("phase") == "streaming" and status.get("prepared_checkpoint")
-        for status in matching_before_restart
+        status.get("prepared_checkpoint") for status in matching_before_restart
     ), f"missing cutover-prepared status before restart: {statuses_before_restart!r}"
     prepared_checkpoint_before_restart = next(
         (
@@ -1493,6 +1493,25 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
     # especially under load. Poll here instead of reading the status once,
     # the same way the pre-restart checks above poll for status records to
     # appear.
+    def stream_checkpoint_caught_up(status: dict[str, Any]) -> bool:
+        checkpoint = status.get("stream_checkpoint") or ""
+        if checkpoint == stream_checkpoint_before_restart:
+            return True
+        identity, _, lsn = checkpoint.rpartition(":")
+        original_identity, _, original_lsn = (
+            stream_checkpoint_before_restart.rpartition(":")
+        )
+        if not identity.startswith("pg1:") or identity != original_identity:
+            return False
+        try:
+            high, low = (int(part, 16) for part in lsn.split("/"))
+            original_high, original_low = (
+                int(part, 16) for part in original_lsn.split("/")
+            )
+        except ValueError:
+            return False
+        return (high, low) >= (original_high, original_low)
+
     def matching_statuses_caught_up() -> list[dict[str, Any]] | None:
         statuses = _metadata_replication_status_records(stateful_api)
         matching = [
@@ -1505,7 +1524,7 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
             return None
         if not any(
             status.get("prepared_checkpoint") == prepared_checkpoint_before_restart
-            and status.get("stream_checkpoint") == stream_checkpoint_before_restart
+            and stream_checkpoint_caught_up(status)
             for status in matching
         ):
             return None
@@ -1541,10 +1560,9 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         for status in matching_after_restart
     ), "restart changed the exact-cutover PostgreSQL resource identity"
     assert any(
-        status.get("stream_checkpoint") == stream_checkpoint_before_restart
-        for status in matching_after_restart
+        stream_checkpoint_caught_up(status) for status in matching_after_restart
     ), (
-        "stream_checkpoint did not persist across restart\n"
+        "stream_checkpoint regressed across restart\n"
         f"before={stream_checkpoint_before_restart!r} after={matching_after_restart!r}"
     )
 

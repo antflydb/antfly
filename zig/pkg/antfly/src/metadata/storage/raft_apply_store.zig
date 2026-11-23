@@ -16095,13 +16095,14 @@ pub const RaftApplyStore = struct {
         if (state.revision != write.expected_revision) return;
         const scope = switch (write.mutation) {
             .configure, .reseed => |configured| configured,
+            .begin_legacy_handover => |handover| handover.scope,
             else => state.scope orelse return,
         };
         if (state.scope) |prior| {
             if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
-        } else if (write.mutation != .configure or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
+        } else if ((write.mutation != .configure and write.mutation != .begin_legacy_handover) or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
         switch (write.mutation) {
-            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages => {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover => {
                 const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return,
@@ -16112,12 +16113,39 @@ pub const RaftApplyStore = struct {
             // its current catalog CAS and original source binding still fence it.
             .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_checkpoint, .close => {},
         }
-        if (write.mutation == .bind_checkpoint) {
-            const authority = write.mutation.bind_checkpoint;
+        const new_authority = switch (write.mutation) {
+            .bind_checkpoint => |authority| authority,
+            .begin_legacy_handover => |handover| handover.authority,
+            else => null,
+        };
+        if (new_authority) |authority| {
             if (authority.owner.metadata_group_id != group_id) return;
             var incarnation_buffer: [160]u8 = undefined;
             const incarnation_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&incarnation_buffer, group_id))) orelse return;
             if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation, &authority.owner.metadata_incarnation)) return;
+        }
+        var handover_key_buffer: [224]u8 = undefined;
+        var handover_status: ?metadata.ReplicationSourceStatusRecord = null;
+        if (write.mutation == .begin_legacy_handover) {
+            const handover = write.mutation.begin_legacy_handover;
+            if (table.storage.engine != .local or scope.generation != 1 or
+                std.mem.readInt(u64, handover.authority.owner.namespace[0..8], .big) != table.table_id or
+                !std.meta.eql(scope.destination_binding, @import("../native_source_delivery.zig").binding(handover.authority.owner.namespace)) or
+                !std.mem.eql(u8, handover.authority.table_name, table.name) or
+                !std.meta.eql(handover.authority.owner.table_binding, changefeed_control.tableBinding(table)) or
+                !std.meta.eql(scope.source_id, source_control.nativeBootstrapSourceId(table.table_id, scope.source_ordinal, scope.definition))) return;
+            const sources = try std.json.parseFromSliceLeaky(std.json.Value, a, table.replication_sources_json, .{ .duplicate_field_behavior = .@"error" });
+            if (sources != .array or scope.source_ordinal >= sources.array.items.len or !source_control.supportsLegacyHandover(sources.array.items[scope.source_ordinal])) return;
+            const status_key = try replicationSourceStatusKeyForGroup(&handover_key_buffer, group_id, scope.table_id, scope.source_ordinal);
+            var status = try decodeReplicationSourceStatusRecord(a, (try stagingGet(txn, status_key)) orelse return);
+            if (!std.mem.eql(u8, status.phase, "streaming") or
+                !std.mem.eql(u8, source_control.legacyHandoverCheckpoint(status) orelse return, handover.checkpoint)) return;
+            const provider = source_control.nativeSourceProviderBinding(status) catch return;
+            if (!std.meta.eql(provider, scope.provider)) return;
+            if (!try nativeRootProducerCohortReadyFor(a, txn, group_id, table.name, scope)) return;
+            status.phase = source_control.legacy_handover_phase;
+            status.native_bootstrap_catalog_digest = source_control.nativeBootstrapCatalogDigest(table);
+            handover_status = status;
         }
         if (write.mutation == .certify_native_bootstrap or write.mutation == .certify_native_snapshot_pages) {
             var status_buffer: [224]u8 = undefined;
@@ -16188,6 +16216,15 @@ pub const RaftApplyStore = struct {
             try txn.put(work_key, &encoded_count);
         }
         try txn.put(key, output);
+        if (handover_status) |status| {
+            const status_key = try replicationSourceStatusKeyForGroup(&handover_key_buffer, group_id, status.table_id, status.source_ordinal);
+            try self.putReplicationSourceStatusTxn(txn, group_id, status_key, status);
+            // Freeze producer membership in the same cut as the checkpoint.
+            // The existing native root bind still proves physical closure.
+            var seal_buffer: [224]u8 = undefined;
+            const seal_key = try nativeRootCohortKey(&seal_buffer, group_id, table.name);
+            try txn.put(seal_key, &write.mutation.begin_legacy_handover.authority.owner.table_binding);
+        }
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         if (next.native_bootstrap_checkpoint != null and
             (next.accepted.sequence != state.accepted.sequence or next.committed.sequence != state.committed.sequence or
@@ -16651,7 +16688,8 @@ pub const RaftApplyStore = struct {
     fn readProjectedReplicationSourceStatus(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !metadata.ReplicationSourceStatusRecord {
         var status = try decodeReplicationSourceStatusRecord(alloc, bytes);
         errdefer metadata_table_manager.freeReplicationSourceStatus(alloc, status);
-        if (!std.mem.eql(u8, status.phase, source_control.native_bootstrap_prepared_phase)) return status;
+        const is_handover = std.mem.eql(u8, status.phase, source_control.legacy_handover_phase);
+        if (!is_handover and !std.mem.eql(u8, status.phase, source_control.native_bootstrap_prepared_phase)) return status;
 
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -16674,7 +16712,7 @@ pub const RaftApplyStore = struct {
         const provider = source_control.nativeSourceProviderBinding(status) catch return status;
         if (state.retired or state.closing or scope.destination != .native or scope.table_id != status.table_id or scope.source_ordinal != status.source_ordinal or
             !std.meta.eql(scope.source_id, id) or !std.meta.eql(scope.definition, definition) or !std.meta.eql(scope.provider, provider) or
-            !std.mem.eql(u8, checkpoint, status.prepared_checkpoint)) return status;
+            !std.mem.eql(u8, checkpoint, if (is_handover) status.stream_checkpoint else status.prepared_checkpoint)) return status;
 
         if (state.accepted.sequence != 0 and !source_control.isNativeSnapshotScopedCheckpoint(state.accepted.checkpoint)) {
             const accepted = try alloc.dupe(u8, state.accepted.checkpoint);
@@ -16739,6 +16777,10 @@ pub const RaftApplyStore = struct {
     }
 
     fn nativeRootProducerCohortReadyTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, destination: []const u8) !bool {
+        return nativeRootProducerCohortReadyFor(a, txn, group_id, destination, null);
+    }
+
+    fn nativeRootProducerCohortReadyFor(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, destination: []const u8, handover: ?source_control.Scope) !bool {
         var buffer: [224]u8 = undefined;
         const table_prefix = try tablePrefixForGroup(&buffer, group_id);
         var tables = try txn.openCursor();
@@ -16757,6 +16799,9 @@ pub const RaftApplyStore = struct {
             for (sources.value.array.items, 0..) |source, index| {
                 if (!try source_control.sourceMayWriteNativeDestination(source, table.name, destination)) continue;
                 const ordinal = std.math.cast(u32, index) orelse return error.InvalidSourceControl;
+                if (handover) |candidate| {
+                    if (candidate.table_id == table.table_id and candidate.source_ordinal == ordinal) continue;
+                }
                 var status_buffer: [224]u8 = undefined;
                 const status_key = try replicationSourceStatusKeyForGroup(&status_buffer, group_id, table.table_id, ordinal);
                 const bytes = (try stagingGet(txn, status_key)) orelse return false;
@@ -16766,6 +16811,10 @@ pub const RaftApplyStore = struct {
                     !std.meta.eql(status.native_bootstrap_catalog_digest, source_control.nativeBootstrapCatalogDigest(table)))
                     return false;
                 _ = source_control.nativeSourceProviderBinding(status) catch return false;
+                if (std.mem.eql(u8, status.phase, source_control.legacy_handover_phase)) {
+                    if (source_control.legacyHandoverCheckpoint(status) == null) return false;
+                    continue;
+                }
                 if (!std.mem.eql(u8, status.phase, source_control.native_bootstrap_prepared_phase)) {
                     const actor = (try readScopedSnapshotActorTxn(scratch, txn, group_id, table, status)) orelse return false;
                     const page = status.pending_snapshot_page orelse return false;
@@ -19819,7 +19868,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count),
             .advance_resolver_namespace, .apply_resolver_authority => metadataSnapshotProjectionBit(.resolver_namespaces) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
             .mutate_lake_index_lifecycle => metadataSnapshotProjectionBit(.lake_index_lifecycle),
-            .apply_source_control => metadataSnapshotProjectionBit(.source_control),
+            .apply_source_control => metadataSnapshotProjectionBit(.source_control) | metadataSnapshotProjectionBit(.replication_source_status) | metadataSnapshotProjectionBit(.native_root_cohort),
             .apply_changefeed_control, .apply_pg_publication => metadataSnapshotProjectionBit(.changefeeds),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
@@ -24818,7 +24867,7 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeReplicationSourceStatusRecord(self.alloc, encoded);
             defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing);
-            if (source_control.isNativeBootstrapPhase(existing.phase)) return;
+            if (source_control.isNativeBootstrapPhase(existing.phase) or std.mem.eql(u8, existing.phase, source_control.legacy_handover_phase)) return;
             if (existing.cutover_authority_id != 0) {
                 if (!replicationCutoverAuthorityIdentityEqual(existing, record))
                     return;
@@ -24877,7 +24926,7 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeReplicationSourceStatusRecord(self.alloc, encoded);
             defer metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing);
-            if (source_control.isNativeBootstrapPhase(existing.phase)) return;
+            if (source_control.isNativeBootstrapPhase(existing.phase) or std.mem.eql(u8, existing.phase, source_control.legacy_handover_phase)) return;
             if (replicationCutoverAuthorityIdentityEqual(existing, record)) {
                 if (!replicationCutoverRetirementEqual(existing, record)) return;
                 // Provider cleanup can legitimately fail after authority is
@@ -47762,6 +47811,96 @@ test "selected owner readiness durable transition index rebuilds and retires act
     defer a.free(retired);
     try std.testing.expectEqual(@as(usize, 0), retired.len);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadinessTransitions(a, 21, request, .{ .deadline_ns = 0 }));
+}
+
+test "metadata source control handover atomically fences the legacy checkpoint" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/legacy-handover", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const incarnation = "01010101010101010101010101010101".*;
+    const table: metadata.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]",
+    };
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const status: metadata.ReplicationSourceStatusRecord = .{
+        .table_id = table.table_id,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .cutover_mode = "exported_snapshot",
+        .slot_name = "slot",
+        .publication_name = "publication",
+        .phase = "streaming",
+        .prepared_checkpoint = "lsn:0/10",
+        .checkpoint = "lsn:0/20",
+        .stream_checkpoint = "lsn:0/20",
+        .cutover_intent_id = 1,
+        .cutover_authority_id = 2,
+        .cutover_config_fingerprint = @splat(1),
+        .cutover_provider_identity = @splat(2),
+    };
+    var buffer: [224]u8 = undefined;
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.putReplicationSourceStatusTxn(&txn, group, try replicationSourceStatusKeyForGroup(&buffer, group, table.table_id, 0), status);
+        try txn.commit();
+    }
+    const definition = try source_control.definitionDigest(scratch, table.replication_sources_json, 0);
+    var namespace: [24]u8 = @splat(1);
+    std.mem.writeInt(u64, namespace[0..8], table.table_id, .big);
+    const scope: source_control.Scope = .{
+        .table_id = table.table_id,
+        .source_id = source_control.nativeBootstrapSourceId(table.table_id, 0, definition),
+        .source_ordinal = 0,
+        .generation = 1,
+        .definition = definition,
+        .provider = try source_control.nativeSourceProviderBinding(status),
+        .destination = .native,
+        .destination_binding = @import("../native_source_delivery.zig").binding(namespace),
+    };
+    var write: source_control.Write = .{
+        .table_id = table.table_id,
+        .source_id = scope.source_id,
+        .expected_revision = 0,
+        .expected_binding = scope.identity(),
+        .expected_catalog_digest = source_control.digest(table.replication_sources_json),
+        .mutation = .{ .begin_legacy_handover = .{
+            .scope = scope,
+            .checkpoint = "lsn:0/10",
+            .authority = .{ .binding = scope.identity(), .table_name = table.name, .owner = .{
+                .metadata_group_id = group,
+                .metadata_incarnation = incarnation,
+                .namespace = namespace,
+                .table_binding = changefeed_control.tableBinding(table),
+                .group_id = 17,
+                .topology_epoch = 1,
+                .root_generation = 0,
+            } },
+        } },
+    };
+    try store.applyStandaloneCommand(group, .{ .apply_source_control = try source_control.encodeWrite(scratch, write) });
+    try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(scratch, group, table.table_id, 0, definition));
+    write.mutation.begin_legacy_handover.checkpoint = status.stream_checkpoint;
+    try store.applyStandaloneCommand(group, .{ .apply_source_control = try source_control.encodeWrite(scratch, write) });
+    try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(scratch, group, table.table_id, 0, definition));
+    try std.testing.expect(try store.nativeRootProducerCohortSealed(group, table.name, changefeed_control.tableBinding(table)));
+    var stale = status;
+    stale.stream_checkpoint = "lsn:0/30";
+    try store.applyStandaloneCommand(group, .{ .upsert_replication_source_status = stale });
+    const saved = (try store.getReplicationSourceStatus(scratch, group, table.table_id, 0)).?;
+    try std.testing.expectEqualStrings(source_control.legacy_handover_phase, saved.phase);
+    try std.testing.expectEqualStrings(status.stream_checkpoint, saved.stream_checkpoint);
+    try std.testing.expectEqualStrings(status.prepared_checkpoint, saved.prepared_checkpoint);
 }
 
 test "metadata source control survives reopen fences catalog and protects table retirement" {
