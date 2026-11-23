@@ -5259,9 +5259,9 @@ pub const HBCIndex = struct {
         if (backend.sink.resumeMaintenance) |f| f(backend.sink.ptr);
     }
 
+    idle_inline_writer: ?*HBCIndex = null,
     /// Borrowed only by private synchronous construction owners. close() joins
     /// any native work before the owner may release this callback.
-    idle_inline_writer: ?*HBCIndex = null,
     construction_cancellation: ?@import("antfly_cancellation").CancellationToken = null,
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -15435,6 +15435,8 @@ pub const HBCIndex = struct {
         {
             const submit_calls = test_sink.submit_calls;
             var writer = try idx.forkInlineWriter();
+            var parked = false;
+            defer if (!parked) writer.close();
             {
                 var first = try writer.insertWithMetadataStaged(11, &.{ 1.0, 0.0 }, "");
                 defer writer.abortStagedWrite(&first);
@@ -15446,7 +15448,8 @@ pub const HBCIndex = struct {
                 try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
                 try std.testing.expectEqual(submit_calls, test_sink.submit_calls);
             }
-            try std.testing.expect(idx.parkInlineWriter(&writer));
+            parked = idx.parkInlineWriter(&writer);
+            try std.testing.expect(parked);
             const reused_backend = idx.idle_inline_writer.?.env_owner.native_catalog;
             var reused = try idx.forkInlineWriter();
             defer reused.close();
