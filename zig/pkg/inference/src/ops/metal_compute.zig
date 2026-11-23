@@ -1220,7 +1220,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         held: ?operation_mod.Borrowed = null,
         standalone: operation_mod.Scope = .{},
 
-        pub fn beginInto(self: *DecoderMetadataScope, cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph) !void {
+        pub fn beginInto(self: *DecoderMetadataScope, cb: *const ops.ComputeBackend, graph: ?*const ml.graph.Graph) !void {
             if (!operationAccepts(cb.vtable)) return error.UnsupportedDenseSchedule;
             const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
             const parent = cb.operationToken() orelse {
@@ -40887,6 +40887,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .descriptor = desc, .role = .primary, .backing = .{ .kind = .host, .base = @intFromPtr(root.ptr) }, .byte_offset = 0, .base_alignment = @alignOf(f32), .logical_bytes = bytes, .readable_bytes = bytes };
     }
 
+    fn denseDecoderHasPackedQkv(ctx: *anyopaque, slots: [3]usize, width: usize) !bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const backend = self.computeBackend();
+        var metadata: DecoderMetadataScope = .{};
+        defer metadata.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        metadata.beginInto(&backend, null) catch |err| switch (err) {
+            error.QueueFull, error.UnsupportedDenseSchedule => return false,
+            else => return err,
+        };
+        const geometry = try ops.kernel_descriptor.Linear.init(1, width, width, false);
+        var operands: [3]ProjectionPackSlot = undefined;
+        for (slots, &operands) |slot, *operand| operand.* = .{ .slot = slot, .geometry = geometry };
+        const request = self.projectionPackRequest(&operands) orelse return false;
+        return self.hasInstalledProjectionPack(request);
+    }
+
     fn denseDecoderPrepareEmbeddingF32(ctx: *anyopaque, model: *const anyopaque, value: CT) !bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (self.ownsMetadataIndex() or !DenseProjectionProfile.noFrame(self)) return false;
@@ -41011,6 +41027,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         .available = denseDecoderAvailable,
         .heldWeightF32 = denseDecoderHeldWeight,
         .prepareEmbeddingF32 = denseDecoderPrepareEmbeddingF32,
+        .hasPackedQkv = denseDecoderHasPackedQkv,
         .projectionInto = denseDecoderProjectionInto,
         .projectionQkvCacheRow = denseDecoderProjectionQkvCacheRow,
     };

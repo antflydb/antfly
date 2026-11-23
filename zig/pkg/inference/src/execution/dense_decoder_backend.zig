@@ -51,6 +51,12 @@ pub fn heldShape(cb: *const ops.ComputeBackend, model: *const anyopaque, value: 
     return (try heldWeight(cb, model, value, name)).descriptor.shape;
 }
 
+pub fn hasPackedQkv(cb: *const ops.ComputeBackend, slots: [3]usize, width: usize) !bool {
+    const selected = services(cb) orelse return false;
+    const probe = selected.hasPackedQkv orelse return false;
+    return probe(cb.ptr, slots, width);
+}
+
 pub fn prepareEmbeddingF32(cb: *const ops.ComputeBackend, model: *const anyopaque, value: ops.CT) !bool {
     const selected = services(cb) orelse return false;
     const prepare = selected.prepareEmbeddingF32 orelse return false;

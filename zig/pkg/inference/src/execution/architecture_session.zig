@@ -5791,7 +5791,10 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     const shared_lookup = domain != null and schedule.sharedBackingSupported(arch.allocator);
     var preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_definitions else null, &header, &source, domain, current);
     defer preparation.deinit(current);
-    const scheduled_initial_rows = if (cb.kind() == .metal and initial_rows != null and initial_rows.? != 1) null else initial_rows;
+    const scheduled_initial_rows = if (initial_rows) |rows|
+        if (cb.kind() != .metal or rows == 1 or try self.weights.?.hasPackedInitialProjections(cb, config)) rows else null
+    else
+        null;
     var initial_preparation = schedule.Preparation{ .key = @splat(0) };
     defer initial_preparation.deinit(current);
     var initial_source: ?@TypeOf(source) = null;
@@ -11652,7 +11655,7 @@ test "native incremental actual Metal owned provider preserves source lease and 
     for (0..2) |_| {
         const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(source_cb);
         var observation = WhisperConstructionObservation{};
-        var decoder = try createResidentIncrementalDecoderObserved(host_session, a, control, try source.retained(), &observation, .{});
+        var decoder = try createResidentIncrementalDecoderObserved(host_session, a, control, try source.retained(), &observation, .{ .expected_initial_query_rows = 2 });
         var decoder_open = true;
         defer if (decoder_open) decoder.deinit();
         const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(decoder.cb.backend.ptr));
@@ -11666,6 +11669,7 @@ test "native incremental actual Metal owned provider preserves source lease and 
             return error.ExpectedPreparedResidentWhisper;
         }
         try std.testing.expectEqual(.prepared, observation.program.outcome);
+        try std.testing.expect(decoder.cache.native_program.?.initial == null);
         const templates = observation.templates orelse return error.MissingDefinitionLifetimeStatistics;
         try std.testing.expectEqual(.decode_prefix, templates.phase);
         try std.testing.expectEqual(.sampled, templates.availability);
