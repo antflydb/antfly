@@ -30,6 +30,7 @@ pub const scoped_snapshot_protocol_version: u16 = 131;
 pub const legacy_handover_protocol_version: u16 = 137;
 pub const scoped_stream_lifecycle_protocol_version: u16 = 138;
 pub const scoped_completion_health_protocol_version: u16 = 139;
+pub const independent_completion_stall_protocol_version: u16 = 140;
 pub const completion_wait_timeout_ms = 30 * std.time.ms_per_s;
 pub const completion_wait_error = "SourceOutcomeUnresolved";
 pub const legacy_handover_phase = "native_legacy_handover";
@@ -274,11 +275,20 @@ pub const State = struct {
     native_bootstrap_first_page: ?Digest = null,
     stream_failure: ?StreamFailure = null,
     completion_wait_since_ms: ?u64 = null,
+    completion_stalled_at_ms: ?u64 = null,
+
     manifest_retention: bool = false,
     retirement_receipt: []const u8 = "",
     retired_reservation_digest: Digest = @splat(0),
     artifact_control: ?@import("source_artifact_control.zig").State = null,
     checkpoint_authority: ?source_contract.checkpoint_authority.Spec = null,
+    pub fn reportedStreamFailure(self: State) ?StreamFailure {
+        if (self.stream_failure) |failure| return failure;
+        if (self.completion_stalled_at_ms) |observed|
+            return .{ .code = completion_wait_error, .terminal = false, .observed_at_ms = observed };
+        return null;
+    }
+
     pub fn jsonStringify(self: State, stream: anytype) @TypeOf(stream.*).Error!void {
         return writeArtifactFields(self, stream);
     }
@@ -422,6 +432,7 @@ pub fn isNativeSnapshotScopedCheckpoint(checkpoint: []const u8) bool {
 pub const Mutation = union(enum) {
     observe_stream_failure: ?StreamFailure,
     observe_completion_wait: u64,
+    observe_completion_stall: u64,
     begin_legacy_handover: struct {
         scope: Scope,
         authority: checkpoint_authority.Spec,
@@ -459,7 +470,7 @@ pub const Mutation = union(enum) {
     pub fn validate(self: Mutation) !void {
         switch (self) {
             .observe_stream_failure => |failure| if (failure) |value| try value.validate(),
-            .observe_completion_wait => |observed| if (observed == 0) return error.InvalidSourceControl,
+            .observe_completion_wait, .observe_completion_stall => |observed| if (observed == 0) return error.InvalidSourceControl,
             .begin_legacy_handover => |handover| {
                 try handover.scope.validate();
                 try handover.authority.validate();
@@ -500,16 +511,21 @@ pub const Mutation = union(enum) {
         try state.validate();
         var next = try state.advance();
         switch (self) {
-            .observe_completion_wait => |observed| {
+            .observe_completion_wait, .observe_completion_stall => |observed| {
                 if (!state.scope_fencing or state.closing or state.retired or
                     state.pending != null or state.accepted.sequence <= state.committed.sequence)
                     return error.SourceCheckpointConflict;
                 if (state.completion_wait_since_ms) |since| {
                     if (observed -| since < completion_wait_timeout_ms) return state;
-                    if (state.stream_failure) |failure| {
-                        if (failure.terminal or std.mem.eql(u8, failure.code, completion_wait_error)) return state;
+                    if (self == .observe_completion_stall) {
+                        if (state.completion_stalled_at_ms != null) return state;
+                        next.completion_stalled_at_ms = observed;
+                    } else {
+                        if (state.stream_failure) |failure| {
+                            if (failure.terminal or std.mem.eql(u8, failure.code, completion_wait_error)) return state;
+                        }
+                        next.stream_failure = .{ .code = completion_wait_error, .terminal = false, .observed_at_ms = observed };
                     }
-                    next.stream_failure = .{ .code = completion_wait_error, .terminal = false, .observed_at_ms = observed };
                 } else next.completion_wait_since_ms = observed;
             },
             .observe_stream_failure => |failure| {
@@ -734,6 +750,7 @@ pub const Mutation = union(enum) {
                 next.outstanding = state.outstanding[index + 1 ..];
                 if (committed.sequence == state.accepted.sequence and state.completion_wait_since_ms != null) {
                     next.completion_wait_since_ms = null;
+                    next.completion_stalled_at_ms = null;
                     if (state.stream_failure) |failure| {
                         if (!failure.terminal and std.mem.eql(u8, failure.code, completion_wait_error))
                             next.stream_failure = null;
@@ -1429,7 +1446,7 @@ test "source control replans only proven unadmitted delivery while retaining log
 fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page") or std.mem.eql(u8, name, "stream_failure") or std.mem.eql(u8, name, "completion_wait_since_ms")) @field(value, name) != null else true;
+        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page") or std.mem.eql(u8, name, "stream_failure") or std.mem.eql(u8, name, "completion_wait_since_ms") or std.mem.eql(u8, name, "completion_stalled_at_ms")) @field(value, name) != null else true;
         if (include) {
             try stream.objectField(name);
             try stream.write(@field(value, name));
@@ -1442,6 +1459,7 @@ pub fn requiredProtocol(mutation: Mutation) u16 {
         .begin_legacy_handover => legacy_handover_protocol_version,
         .observe_stream_failure => scoped_stream_lifecycle_protocol_version,
         .observe_completion_wait => scoped_completion_health_protocol_version,
+        .observe_completion_stall => independent_completion_stall_protocol_version,
         .close, .enable_scope_fencing => closing_protocol_version,
         .certify_native_bootstrap => native_bootstrap_protocol_version,
         .certify_native_snapshot_pages => scoped_snapshot_protocol_version,
@@ -1763,6 +1781,13 @@ test "source control scope fencing pins idle bindings until closing retirement a
     try std.testing.expect(waiting.completion_wait_since_ms == null);
     try std.testing.expect(waiting.stream_failure == null);
     try std.testing.expectEqual(@as(u64, 1), waiting.committed.sequence);
+    var independent = try (Mutation{ .observe_stream_failure = .{ .code = "TransportUnavailable", .terminal = false, .observed_at_ms = 100_000 } }).apply(ca, before_timeout);
+    independent = try (Mutation{ .observe_completion_stall = 130_000 }).apply(ca, independent);
+    try std.testing.expectEqual(@as(?u64, 130_000), independent.completion_stalled_at_ms);
+    try std.testing.expectEqualStrings("TransportUnavailable", independent.reportedStreamFailure().?.code);
+    independent = try (Mutation{ .commit = .{ .sequence = 1, .receipt_digest = digest("accepted"), .reference = "committed" } }).apply(ca, independent);
+    try std.testing.expect(independent.completion_stalled_at_ms == null);
+    try std.testing.expectEqualStrings("TransportUnavailable", independent.reportedStreamFailure().?.code);
     try std.testing.expectError(error.SourcePendingWork, (Mutation{ .retire = .{ .receipt = "too-early" } }).apply(ca, state));
     state = try (Mutation{ .close = {} }).apply(ca, state);
     state = try (Mutation{ .retire = .{ .receipt = "cohort-closed" } }).apply(ca, state);

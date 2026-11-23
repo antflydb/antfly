@@ -11498,7 +11498,7 @@ pub const MetadataHttpService = struct {
         const admission = hosted.sourceAdmission();
         if (state.value.artifact_control.?.current) |record| {
             try ensureCdcWorkPermit(self);
-            @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), context) catch |err| {
+            @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), try scopedWorkContext(context)) catch |err| {
                 self.recordScopedStreamError(a, table, state.value, err, context) catch |report_err|
                     std.log.debug("scoped CDC health update deferred table={s} err={s}", .{ table.name, @errorName(report_err) });
                 return err;
@@ -11548,7 +11548,7 @@ pub const MetadataHttpService = struct {
         } else null;
         defer if (snapshot) |*captured| captured.deinit(a);
         if (state.value.stream_failure) |failure| if (failure.terminal) return;
-        runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, context) catch |err| {
+        runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, try scopedWorkContext(context)) catch |err| {
             self.recordScopedStreamError(a, table, state.value, err, context) catch |report_err|
                 std.log.debug("scoped CDC health update deferred table={s} err={s}", .{ table.name, @errorName(report_err) });
             return err;
@@ -11560,6 +11560,16 @@ pub const MetadataHttpService = struct {
             defer latest.deinit();
             try self.observeScopedStreamFailure(a, table, latest.value, null, context);
         }
+    }
+
+    fn scopedWorkContext(context: api_operation.RequestContext) !api_operation.RequestContext {
+        var work = try context.platformDeadline();
+        if (work.deadline_ns) |deadline| {
+            const remaining = deadline -| platform_time.monotonicNs();
+            // Leave bounded time for a health observation in this round.
+            work.deadline_ns = deadline - @min(250 * std.time.ns_per_ms, remaining / 8);
+        }
+        return work;
     }
 
     fn recordScopedStreamError(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, err: anyerror, context: api_operation.RequestContext) !void {

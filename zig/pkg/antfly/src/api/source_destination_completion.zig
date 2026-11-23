@@ -110,11 +110,9 @@ pub fn recover(
             const now = @max(1, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             if (current.completion_wait_since_ms) |since| {
                 if (now -| since < source.completion_wait_timeout_ms) return;
-                if (current.stream_failure) |failure| {
-                    if (failure.terminal or std.mem.eql(u8, failure.code, source.completion_wait_error)) return;
-                }
+                if (current.completion_stalled_at_ms != null) return;
             }
-            mutate(svc, a, binding, catalog_digest, current, .{ .observe_completion_wait = now }, context) catch |err| switch (err) {
+            mutate(svc, a, binding, catalog_digest, current, .{ .observe_completion_stall = now }, context) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => {},
                 else => return err,
             };

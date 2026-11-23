@@ -110,6 +110,7 @@ pub const GroupCache = struct {
         refs: std.atomic.Value(usize) = .init(1),
         arena: std.heap.ArenaAllocator,
         group: IndexedGroup,
+        image_window_hint: std.atomic.Value(usize) = .init(64),
         used: u64 = 0,
 
         fn release(self: *Owner) void {
@@ -548,11 +549,17 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 @min(batch.changes.len, @as(usize, from) + @min(limits.events, 64));
             if (from > stop or stop > batch.changes.len or stop - from > 64)
                 return error.ChangefeedResynchronizationRequired;
+            if (bound == null) {
+                if (next.cached) |cached|
+                    stop = @min(stop, from + cached.image_window_hint.load(.monotonic));
+            }
             while (true) {
                 const rendered = self.boundedPageWindow(a, state, selector, next, start, from, stop, bound != null, limits, request) catch |err| switch (err) {
                     error.IcebergChangefeedImageBudgetExceeded => {
                         if (bound != null or stop - from <= 1) return error.ChangefeedBackpressure;
-                        stop = from + (stop - from) / 2;
+                        const smaller = (stop - from) / 2;
+                        if (next.cached) |cached| _ = cached.image_window_hint.fetchMin(smaller, .monotonic);
+                        stop = from + smaller;
                         continue;
                     },
                     else => return err,

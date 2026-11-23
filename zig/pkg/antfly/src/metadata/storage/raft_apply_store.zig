@@ -16135,7 +16135,7 @@ pub const RaftApplyStore = struct {
             if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
         } else if ((write.mutation != .configure and write.mutation != .begin_legacy_handover) or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
         switch (write.mutation) {
-            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover, .observe_stream_failure, .observe_completion_wait => {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover, .observe_stream_failure, .observe_completion_wait, .observe_completion_stall => {
                 const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return,
@@ -16268,7 +16268,7 @@ pub const RaftApplyStore = struct {
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         if (next.native_bootstrap_checkpoint != null and
             (next.accepted.sequence != state.accepted.sequence or next.committed.sequence != state.committed.sequence or
-                next.closing != state.closing or next.retired != state.retired or write.mutation == .observe_stream_failure or write.mutation == .observe_completion_wait))
+                next.closing != state.closing or next.retired != state.retired or write.mutation == .observe_stream_failure or write.mutation == .observe_completion_wait or write.mutation == .observe_completion_stall))
         {
             self.notifyProjectionListeners(.{
                 .kind = .replication_source_status,
@@ -16759,7 +16759,8 @@ pub const RaftApplyStore = struct {
             if (status.accepted_stream_checkpoint) |prior| alloc.free(prior);
             status.accepted_stream_checkpoint = accepted;
         }
-        if (state.stream_failure) |failure| {
+        const reported_failure = state.reportedStreamFailure();
+        if (reported_failure) |failure| {
             const code = try alloc.dupe(u8, failure.code);
             errdefer alloc.free(code);
             const class = try alloc.dupe(u8, if (failure.terminal) "terminal" else "retryable");
@@ -16771,8 +16772,8 @@ pub const RaftApplyStore = struct {
             status.updated_at_ms = @max(status.updated_at_ms, failure.observed_at_ms);
         }
         const has_commit = state.committed.sequence != 0 and !source_control.isNativeSnapshotScopedCheckpoint(state.committed.checkpoint);
-        if (!has_commit and state.stream_failure == null) return status;
-        const phase = try alloc.dupe(u8, if (state.stream_failure != null) "streaming_failed" else "streaming");
+        if (!has_commit and reported_failure == null) return status;
+        const phase = try alloc.dupe(u8, if (reported_failure != null) "streaming_failed" else "streaming");
         if (!has_commit) {
             alloc.free(status.phase);
             status.phase = phase;
