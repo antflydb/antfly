@@ -21,7 +21,6 @@ const local_transaction_contract = @import("antfly_local_sources").api_local_tra
 const local_write = @import("antfly_local_sources").storage_local_write;
 const validateTableBatchAgainstLocalSchema = local_write.validateTableBatchAgainstLocalSchema;
 const runTestBeforeBatchExecutionHook = @import("antfly_local_sources").api_local_write_test_hooks.runTestBeforeBatchExecutionHook;
-const batchWritesAsTransactionWrites = local_write.batchWritesAsTransactionWrites;
 
 pub fn applyStorageKernelReplicatedBatch(
     alloc: std.mem.Allocator,
@@ -69,7 +68,15 @@ pub fn applyReplicatedTransactionMutationInternal(
     visibility_cancellation: db_mod.types.CancellationToken,
     raft_entry: ?db_mod.OrderedApplyReceipt,
 ) !void {
+    try @import("antfly_local_sources").sql_catalog.trigger_native_admission.requireOwnerGroup(req, group_id);
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    // These new private controls belong to native-local owners. Never drop
+    // a real Raft receipt by routing them through a replica-local helper.
+    if (raft_entry != null) switch (mutation) {
+        .acknowledge => |ack| if (ack.external_decision_owner != null) return error.InvalidBatchRequest,
+        .acknowledge_many => |ack| if (ack.external_decision_owner != null and ack.replication_source_ack == null) return error.InvalidBatchRequest,
+        else => {},
+    };
     try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
@@ -120,7 +127,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
             if (begin.ordinary_producer or begin.legacy_producer) {
                 try @import("antfly_local_sources").api_internal_batch.validateProducerBeginControlRequest(req);
-                if (begin.ordinary_producer and begin.legacy_producer) return error.InvalidBatchRequest;
+                if (begin.external_decision_owner != null or (begin.ordinary_producer and begin.legacy_producer)) return error.InvalidBatchRequest;
                 const producer: @import("antfly_local_sources").storage_source_producer_policy.Producer = if (begin.ordinary_producer) .ordinary else .legacy_cdc;
                 if (raft_entry) |entry|
                     _ = try db.beginReplicatedProducerTransactionScoped(begin.txn_id, begin.begin_timestamp, begin.created_at_ns, durable_participants, coordinator, begin.retain_terminal, entry, req.restore_staging_scope, producer)
@@ -128,7 +135,22 @@ pub fn applyReplicatedTransactionMutationInternal(
                     _ = try db.beginProducerTransactionScoped(begin.txn_id, begin.begin_timestamp, begin.created_at_ns, durable_participants, coordinator, begin.retain_terminal, req.restore_staging_scope, producer);
                 return;
             }
-            if (raft_entry) |entry|
+            if (begin.external_decision_owner) |owner| {
+                if (!begin.retain_terminal) return error.InvalidBatchRequest;
+                _ = try db.beginExternalTransaction(.{
+                    .txn_id = begin.txn_id,
+                    .owner = owner,
+                    .sql_locks = begin.sql_locks,
+                    .document_revision_scope = begin.document_revision_scope,
+                    .begin_timestamp = begin.begin_timestamp,
+                    .created_at_ns = begin.created_at_ns,
+                    .participants = durable_participants,
+                    .coordinator = coordinator,
+                    .restore_staging_scope = req.restore_staging_scope,
+                    .ordered_receipt = raft_entry,
+                    .admission_timestamp_ns = req.timestamp_ns,
+                });
+            } else if (raft_entry) |entry|
                 _ = try db.beginReplicatedTransactionScoped(
                     begin.txn_id,
                     begin.begin_timestamp,
@@ -151,45 +173,17 @@ pub fn applyReplicatedTransactionMutationInternal(
                 );
         },
         .prepare => |prepare| {
-            const wire = @import("antfly_local_sources").api_internal_batch;
-            const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
-            const encoded_input = try wire.completionPrepareInput(alloc, req);
-            defer alloc.free(encoded_input);
-            const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
-            const intents: db_mod.types.TransactionIntentRequest = .{
-                .completion_ordinary_producer = prepare.ordinary_producer,
-                .completion_legacy_producer = prepare.legacy_producer,
-                .completion_owner = prepare.completion_owner,
-                .completion_source_purpose = prepare.source_purpose,
-                .completion_source_scope = prepare.source_scope,
-                .completion_source_checkpoint = prepare.source_checkpoint,
-                .completion_input_digest = completion.preparedInputDigest(namespace, encoded_input),
-                .commit_requires = req.commit_requires,
-                .prepared_enrichments_json = req.prepared_enrichments_json,
-                .document_version_scheme = req.document_version_scheme,
-                .row_policy_principal_proof = req.row_policy_principal_proof,
-                .row_policy_database = req.row_policy_database,
-                .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
-                .normalized_graph_rows = req.normalized_graph_rows,
-                .writes = batchWritesAsTransactionWrites(req.writes),
-                .deletes = req.deletes,
-                .transforms = req.transforms,
-                .graph_writes = req.graph_writes,
-                .graph_deletes = req.graph_deletes,
-                .predicates = req.predicates,
-                .integrity = req.integrity,
-                .integrity_commands = req.integrity_commands,
-                .range_guards = req.range_guards,
-                .relational_activation = req.relational_activation,
-                .relational_retirement = req.relational_retirement,
-                .relational_index_maintenance = req.relational_index_maintenance,
-                .schema_version = req.schema_version,
-                .relational_schema_version = req.relational_schema_version,
-                .relational_integrity_generation_set = req.relational_integrity_generation_set,
-                .restore_staging_scope = req.restore_staging_scope,
-                .restore_staging_plan_id = req.restore_staging_plan_id,
-                .relational_repair = req.relational_repair,
-            };
+            if (prepare.replication_source_permit != null and raft_entry == null) return error.UnsupportedReplicationParticipant;
+            var intents = try db_mod.types.TransactionIntentRequest.fromBatch(req);
+            if (prepare.completion_owner != null) {
+                if (prepare.external_decision_owner != null or prepare.replication_source_permit != null) return error.InvalidBatchRequest;
+                const wire = @import("antfly_local_sources").api_internal_batch;
+                const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
+                const encoded = try wire.completionPrepareInput(alloc, req);
+                defer alloc.free(encoded);
+                const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
+                intents.completion_input_digest = completion.preparedInputDigest(namespace, encoded);
+            }
             if (raft_entry) |entry|
                 try db.writeReplicatedTransactionAtOrderedReceipt(prepare.txn_id, intents, entry)
             else
@@ -208,6 +202,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                     else => return err,
                 };
                 if (resolve.completion_owner) |binding| {
+                    if (resolve.external_decision_owner != null) return error.InvalidBatchRequest;
                     try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
                     if (req.restore_staging_scope != null or binding.group_id != group_id) return error.TopologyChanged;
                     if (resolve.source_purpose) |purpose| {
@@ -218,7 +213,9 @@ pub fn applyReplicatedTransactionMutationInternal(
                     } else try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding);
                     return;
                 }
-                try db.resolveReplicatedTransactionAtOrderedReceipt(
+                if (resolve.external_decision_owner) |owner| {
+                    try db.resolveExternalTransaction(.{ .replication_source_permit = resolve.replication_source_permit, .txn_id = resolve.txn_id, .owner = owner, .status = resolve.status, .commit_version = resolve.commit_version, .sync_level = req.sync_level, .visibility_cancellation = visibility_cancellation, .ordered_receipt = entry, .resolved_participant = if (defer_coordinator_ack) null else local_participant });
+                } else try db.resolveReplicatedTransactionAtOrderedReceipt(
                     resolve.txn_id,
                     resolve.status,
                     resolve.commit_version,
@@ -232,6 +229,15 @@ pub fn applyReplicatedTransactionMutationInternal(
                 );
             } else {
                 if (resolve.completion_owner != null) return error.ChangefeedCapabilityUnsupported;
+                if (resolve.external_decision_owner) |owner| {
+                    // Publish the native participant ACK with its decision.
+                    // An abort before BEGIN has no roster yet: the existing
+                    // abort-fence writer creates its exact local membership.
+                    const defer_coordinator_ack = resolve.status == .committed and
+                        try db.transactionRetainsCoordinatorAcknowledgement(resolve.txn_id);
+                    try db.resolveExternalTransaction(.{ .replication_source_permit = resolve.replication_source_permit, .txn_id = resolve.txn_id, .owner = owner, .status = resolve.status, .commit_version = resolve.commit_version, .sync_level = req.sync_level, .visibility_cancellation = visibility_cancellation, .resolved_participant = if (defer_coordinator_ack) null else local_participant });
+                    return;
+                }
                 try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
                     resolve.txn_id,
                     resolve.status,
@@ -257,21 +263,31 @@ pub fn applyReplicatedTransactionMutationInternal(
             if (publication.completion_owner.group_id != group_id) return error.TopologyChanged;
             _ = try db.publishReplicatedCompletionCertificate(publication.certificate, publication.completion_owner, entry);
         },
-        .acknowledge => |ack| (if (raft_entry) |entry|
+        .acknowledge => |ack| (if (ack.external_decision_owner) |owner|
+            db.markExternalTransactionParticipantsResolved(ack.txn_id, &.{ack.participant}, owner)
+        else if (raft_entry) |entry|
             db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(ack.txn_id, ack.participant, entry)
         else
             db.markTransactionParticipantResolved(ack.txn_id, ack.participant)) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft
             // commands. Once cleanup wins, a late acknowledgement is a safe
             // no-op and must not recreate coordinator sidecar metadata.
-            transactions_mod.TxnError.TxnNotFound => {},
+            transactions_mod.TxnError.TxnNotFound => if (ack.external_decision_owner != null) return error.CommitDecisionUnknown,
             else => return err,
         },
-        .acknowledge_many => |ack| (if (raft_entry) |entry|
-            db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(ack.txn_id, ack.participants, entry)
+        .acknowledge_many => |ack| (if (ack.replication_source_ack) |completion| source: {
+            const entry = raft_entry orelse return error.OrderedApplyRequired;
+            const owner = ack.external_decision_owner orelse return error.InvalidBatchRequest;
+            if (!owner.eql(completion.permit.decision_owner) or group_id != completion.permit.owner_group_id)
+                return error.ReplicationCutoverAuthorityLost;
+            break :source db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(ack.txn_id, ack.participants, entry, completion);
+        } else if (ack.external_decision_owner) |owner|
+            db.markExternalTransactionParticipantsResolved(ack.txn_id, ack.participants, owner)
+        else if (raft_entry) |entry|
+            db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(ack.txn_id, ack.participants, entry, null)
         else
             db.markTransactionParticipantsResolved(ack.txn_id, ack.participants)) catch |err| switch (err) {
-            transactions_mod.TxnError.TxnNotFound => {},
+            transactions_mod.TxnError.TxnNotFound => if (ack.external_decision_owner != null) return error.CommitDecisionUnknown,
             else => return err,
         },
         .cleanup => |cleanup| {

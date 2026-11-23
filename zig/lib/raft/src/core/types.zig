@@ -302,13 +302,14 @@ pub const ConfState = struct {
     auto_leave: bool = false,
 
     pub fn clone(self: ConfState, alloc: Allocator) !ConfState {
-        return .{
-            .voters = try alloc.dupe(NodeId, self.voters),
-            .voters_outgoing = try alloc.dupe(NodeId, self.voters_outgoing),
-            .learners = try alloc.dupe(NodeId, self.learners),
-            .learners_next = try alloc.dupe(NodeId, self.learners_next),
-            .auto_leave = self.auto_leave,
-        };
+        const voters = try alloc.dupe(NodeId, self.voters);
+        errdefer alloc.free(voters);
+        const outgoing = try alloc.dupe(NodeId, self.voters_outgoing);
+        errdefer alloc.free(outgoing);
+        const learners = try alloc.dupe(NodeId, self.learners);
+        errdefer alloc.free(learners);
+        const next = try alloc.dupe(NodeId, self.learners_next);
+        return .{ .voters = voters, .voters_outgoing = outgoing, .learners = learners, .learners_next = next, .auto_leave = self.auto_leave };
     }
 
     pub fn deinit(self: *ConfState, alloc: Allocator) void {

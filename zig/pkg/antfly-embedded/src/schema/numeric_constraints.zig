@@ -16,8 +16,8 @@
 //! Immutable typed NUMERIC schema literals. Compilation owns coefficients;
 //! row checks borrow them and share the caller's sticky work/cancellation budget.
 const std = @import("std");
-const exact = @import("../sql/numeric_value.zig");
-const storage = @import("../sql/numeric_storage.zig");
+const exact = @import("../sql/numeric/value.zig");
+const storage = @import("../sql/numeric/storage.zig");
 const A = std.mem.Allocator;
 const Json = std.json.Value;
 pub const max_bytes = 4 * 1024 * 1024;

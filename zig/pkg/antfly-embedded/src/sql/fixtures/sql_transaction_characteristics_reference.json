@@ -1,0 +1,665 @@
+{
+  "format": 1,
+  "campaigns": [
+    {
+      "format": 1,
+      "reference": "PostgreSQL exact SQL",
+      "create_sql": "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT)",
+      "read_sql": "SELECT id::text AS id,status FROM usage_records ORDER BY id",
+      "cases": [
+        {
+          "id": "sql-0084",
+          "steps": [
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY",
+              "command_tag": "SET",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "SELECT id::text AS id,status FROM usage_records ORDER BY id",
+              "command_tag": "SELECT 0",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000001','outside')",
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SAVEPOINT guard",
+              "command_tag": "SAVEPOINT",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SET TRANSACTION READ WRITE",
+              "command_tag": "",
+              "sqlstate": "25001",
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK TO guard",
+              "command_tag": "ROLLBACK",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000002','forbidden')",
+              "command_tag": "",
+              "sqlstate": "25006",
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK",
+              "command_tag": "ROLLBACK",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SAVEPOINT mode_guard",
+              "command_tag": "SAVEPOINT",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SET TRANSACTION READ ONLY",
+              "command_tag": "SET",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SET TRANSACTION READ WRITE",
+              "command_tag": "",
+              "sqlstate": "25001",
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK TO mode_guard",
+              "command_tag": "ROLLBACK",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000002','restored')",
+              "command_tag": "INSERT 0 1",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "COMMIT",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            },
+            {
+              "statement": "SELECT id::text AS id,status FROM usage_records ORDER BY id",
+              "command_tag": "SELECT 2",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            },
+            {
+              "statement": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+              "command_tag": "",
+              "sqlstate": "25001",
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK",
+              "command_tag": "ROLLBACK",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "format": 1,
+      "reference": "PostgreSQL exact SQL",
+      "create_sql": "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT)",
+      "read_sql": "SELECT id::text AS id,status FROM usage_records ORDER BY id",
+      "cases": [
+        {
+          "id": "sql-0087",
+          "steps": [
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY, NOT DEFERRABLE",
+              "command_tag": "SET",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "SELECT id::text AS id,status FROM usage_records ORDER BY id",
+              "command_tag": "SELECT 0",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000001','outside')",
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SAVEPOINT guard",
+              "command_tag": "SAVEPOINT",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SET TRANSACTION READ WRITE",
+              "command_tag": "",
+              "sqlstate": "25001",
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK TO guard",
+              "command_tag": "ROLLBACK",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000002','forbidden')",
+              "command_tag": "",
+              "sqlstate": "25006",
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK",
+              "command_tag": "ROLLBACK",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SAVEPOINT mode_guard",
+              "command_tag": "SAVEPOINT",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SET TRANSACTION READ ONLY",
+              "command_tag": "SET",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "SET TRANSACTION READ WRITE",
+              "command_tag": "",
+              "sqlstate": "25001",
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK TO mode_guard",
+              "command_tag": "ROLLBACK",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000002','restored')",
+              "command_tag": "INSERT 0 1",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ]
+              ]
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "COMMIT",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "sqlstate": null,
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            },
+            {
+              "statement": "SELECT id::text AS id,status FROM usage_records ORDER BY id",
+              "command_tag": "SELECT 2",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            },
+            {
+              "statement": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+              "command_tag": "",
+              "sqlstate": "25001",
+              "observe_inside": false,
+              "observer_statement": null,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK",
+              "command_tag": "ROLLBACK",
+              "sqlstate": null,
+              "observe_inside": true,
+              "observer_statement": null,
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "outside"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "restored"
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

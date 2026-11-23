@@ -26,5 +26,5 @@ pub fn isRawMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
-        @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
+        @import("db/relational/indexes/maintenance_contract.zig").isControlKey(key);
 }

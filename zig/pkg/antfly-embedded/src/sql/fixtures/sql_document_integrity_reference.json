@@ -1,0 +1,236 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL with explicit Antfly patch and document-validation extensions",
+  "seed_version": 42,
+  "seeds": [
+    {
+      "key": "doc:a",
+      "value": {
+        "title": "Before",
+        "amount": 1,
+        "metadata": {
+          "profile": "pro"
+        }
+      }
+    },
+    {
+      "key": "doc:b",
+      "value": {
+        "title": "Other",
+        "amount": 2,
+        "metadata": {
+          "profile": "free"
+        }
+      }
+    },
+    {
+      "key": "doc:c",
+      "value": {
+        "title": "Untouched",
+        "amount": 3,
+        "cold": [
+          1,
+          2,
+          3
+        ]
+      }
+    }
+  ],
+  "entries": [
+    {
+      "id": "sql-0909",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "UPDATE",
+      "affected": 0,
+      "sqlstate": "22023",
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "amount": 1,
+            "metadata": {
+              "profile": "pro"
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "amount": 2,
+            "metadata": {
+              "profile": "free"
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "amount": 3,
+            "cold": [
+              1,
+              2,
+              3
+            ]
+          }
+        }
+      ],
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "amount": 1,
+            "metadata": {
+              "profile": "pro"
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "amount": 2,
+            "metadata": {
+              "profile": "free"
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Untouched",
+            "amount": 3
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0941",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "metadata": {}
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 0,
+      "sqlstate": "42804",
+      "seeds": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "amount": 1,
+            "metadata": {
+              "profile": "pro"
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "amount": 2,
+            "metadata": {
+              "profile": "free"
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "amount": 3,
+            "cold": [
+              1,
+              2,
+              3
+            ]
+          }
+        }
+      ],
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "amount": 1,
+            "metadata": {
+              "profile": "pro"
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "amount": 2,
+            "metadata": {
+              "profile": "free"
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Untouched",
+            "amount": 3
+          }
+        }
+      ]
+    }
+  ]
+}

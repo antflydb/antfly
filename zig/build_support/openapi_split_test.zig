@@ -32,3 +32,56 @@ test "server parsers use the same schema types as embedded code" {
     try std.testing.expect(@typeInfo(metadata_result).error_union.payload == std.json.Parsed(metadata.StatefulQueryRequest));
     try std.testing.expect(@typeInfo(usermgr_result).error_union.payload == std.json.Parsed(usermgr.CreateUserRequest));
 }
+
+const package_wire = @import("extension_client_types.zig");
+
+fn expectNativeSQLPackageEnum(comptime Generated: type, comptime declaration: []const u8) !void {
+    // Embed native bytes without importing the physical catalog graph.
+    const source = @embedFile("sql_routine_records_source.zig");
+    const start = (std.mem.indexOf(u8, source, declaration) orelse return error.TestNativeEnumMissing) + declaration.len;
+    const end = start + (std.mem.indexOf(u8, source[start..], "};") orelse return error.TestNativeEnumMissing);
+    var fields = std.mem.tokenizeAny(u8, source[start..end], ", \t\r\n");
+    var count: usize = 0;
+    while (fields.next()) |field| {
+        const name = if (std.mem.startsWith(u8, field, "@\"") and std.mem.endsWith(u8, field, "\"")) field[2 .. field.len - 1] else field;
+        try std.testing.expect(std.meta.stringToEnum(Generated, name) != null);
+        count += 1;
+    }
+    try std.testing.expectEqual(count, @typeInfo(Generated).@"enum".field_names.len);
+}
+
+test "generated SQL package enums preserve every native scalar and volatility domain" {
+    try expectNativeSQLPackageEnum(package_wire.SQLPackageScalarType, "pub const Scalar = enum {");
+    try expectNativeSQLPackageEnum(package_wire.SQLPackageVolatility, "pub const Volatility = enum {");
+}
+
+test "generated package models roundtrip native SQL controls and construct typed exports" {
+    const a = std.testing.allocator;
+    const native =
+        \\{"manifest_api_version":"extensions/v1","name":"configured_sql","version":"2","kind":"extension","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","install":{"scopes_supported":["embedded_db"],"runtimes":[{"name":"sql","mode":"wasm","artifact":"module.wasm"}]},"artifacts":[{"kind":"wasm","path":"module.wasm","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"}],"sql":{"default_version":"2","schema":null,"exports":[{"name":"marker","runtime":"sql","export_name":"marker","arguments":[{"name":null,"type":{"scalar":"int64","array":false}}],"result":{"scalar":"int64","array":false},"strict":true,"volatility":"immutable"}],"updates_from":["1"]}}
+    ;
+    var parsed = try std.json.parseFromSlice(package_wire.PackageManifest, a, native, .{});
+    defer parsed.deinit();
+    const control = parsed.value.sql orelse return error.TestExpectedSQLControl;
+    try std.testing.expectEqualStrings("2", control.default_version);
+    try std.testing.expectEqual(@as(usize, 1), control.exports.len);
+    try std.testing.expectEqual(package_wire.SQLPackageScalarType.int64, control.exports[0].result.scalar);
+    const encoded = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(encoded);
+    var decoded = try std.json.parseFromSlice(package_wire.PackageManifest, a, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(parsed.value, decoded.value);
+    var created = parsed.value;
+    created.version = "3";
+    created.sql = .{ .default_version = "3", .schema = .null_value, .exports = &.{.{ .name = "next_marker", .runtime = "sql", .export_name = "next_marker", .result = .{ .scalar = .numeric, .array = true }, .strict = true, .volatility = .stable }}, .updates_from = &.{"2"} };
+    const created_json = try std.json.Stringify.valueAlloc(a, created, .{});
+    defer a.free(created_json);
+    var roundtrip = try std.json.parseFromSlice(package_wire.PackageManifest, a, created_json, .{});
+    defer roundtrip.deinit();
+    try std.testing.expectEqualDeep(created, roundtrip.value);
+    if (std.json.parseFromSlice(package_wire.SQLPackageType, a, "{\"scalar\":\"invented_domain\",\"array\":false}", .{})) |invalid_| {
+        var invalid = invalid_;
+        defer invalid.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}

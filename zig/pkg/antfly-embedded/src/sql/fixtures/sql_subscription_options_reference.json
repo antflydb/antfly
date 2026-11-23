@@ -1,0 +1,21 @@
+{
+  "id": "sql-0120",
+  "sql": "CREATE SUBSCRIPTION usage_sub_options CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub WITH (copy_data = false, connect = false, binary = true, create_slot = false, enabled = false, two_phase = false, disable_on_error = false, synchronous_commit = 'remote_write', streaming = 'parallel', password_required = false, run_as_owner = true, failover = true, origin = 'none', slot_name = 'usage_slot')",
+  "command_tag": "CREATE SUBSCRIPTION",
+  "name": "usage_sub_options",
+  "connection": "host=localhost dbname=usage",
+  "enabled": false,
+  "binary": true,
+  "streaming": "parallel",
+  "two_phase": false,
+  "disable_on_error": false,
+  "password_required": false,
+  "run_as_owner": true,
+  "failover": true,
+  "origin": "none",
+  "slot_name": "usage_slot",
+  "synchronous_commit": "remote_write",
+  "publications": [
+    "usage_pub"
+  ]
+}

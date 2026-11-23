@@ -1,0 +1,804 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "description": "Explicit public typed SQL view over raw JSON document arrays; no implicit array coercion or index authority",
+    "schema": {
+      "version": 1,
+      "storage_mode": "document",
+      "default_type": "doc",
+      "document_schemas": {
+        "doc": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              },
+              "amount": {
+                "type": "integer",
+                "nullable": true
+              },
+              "tags": {
+                "type": "array",
+                "nullable": true
+              },
+              "labels": {
+                "type": "array",
+                "nullable": true
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "doc:a",
+        "value": {
+          "title": "a",
+          "status": "active",
+          "amount": 13,
+          "tags": [
+            "urgent",
+            "vip",
+            null
+          ],
+          "labels": [
+            "blue"
+          ]
+        }
+      },
+      {
+        "key": "doc:b",
+        "value": {
+          "title": "b",
+          "status": "active",
+          "amount": -2,
+          "tags": [
+            "stale",
+            "archived"
+          ],
+          "labels": [
+            "red",
+            "green"
+          ]
+        }
+      },
+      {
+        "key": "doc:c",
+        "value": {
+          "title": "c",
+          "status": "active",
+          "amount": null,
+          "tags": [],
+          "labels": [
+            "none"
+          ]
+        }
+      },
+      {
+        "key": "doc:d",
+        "value": {
+          "title": "d",
+          "status": "active",
+          "amount": 4,
+          "tags": null,
+          "labels": []
+        }
+      },
+      {
+        "key": "doc:e",
+        "value": {
+          "title": "e",
+          "status": "active",
+          "amount": 0,
+          "tags": [
+            "abcdefg-hit"
+          ],
+          "labels": [
+            "rare"
+          ]
+        }
+      },
+      {
+        "key": "doc:f",
+        "value": {
+          "title": "f",
+          "status": "active",
+          "amount": 7,
+          "tags": [
+            "zz"
+          ],
+          "labels": [
+            "tail"
+          ]
+        }
+      }
+    ],
+    "view_sql": "CREATE VIEW docs AS SELECT d._id,r.title,r.status,r.amount,r.tags,r.labels FROM document_source d CROSS JOIN LATERAL jsonb_to_record(d._doc) AS r(title TEXT,status TEXT,amount BIGINT,tags TEXT[],labels TEXT[])"
+  },
+  "entries": [
+    {
+      "id": "sql-0824",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10"
+    },
+    {
+      "id": "sql-0825",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "stale"
+        ],
+        [
+          "doc:b",
+          "archived"
+        ],
+        [
+          "doc:e",
+          "abcdefg-hit"
+        ],
+        [
+          "doc:f",
+          "zz"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag <> 'urgent' LIMIT 10"
+    },
+    {
+      "id": "sql-0826",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:e",
+          "abcdefg-hit"
+        ],
+        [
+          "doc:f",
+          "zz"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag NOT IN ('stale', 'archived') LIMIT 10"
+    },
+    {
+      "id": "sql-0827",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' AND tag <> 'stale' LIMIT 10"
+    },
+    {
+      "id": "sql-0828",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IN ('urgent', 'vip') AND tag NOT IN ('vip') LIMIT 10"
+    },
+    {
+      "id": "sql-0829",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "vip"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag LIKE 'v%' LIMIT 10"
+    },
+    {
+      "id": "sql-0830",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "vip"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag ILIKE 'V%' LIMIT 10"
+    },
+    {
+      "id": "sql-0831",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "stale"
+        ],
+        [
+          "doc:f",
+          "zz"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag > 'm' LIMIT 10"
+    },
+    {
+      "id": "sql-0832",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IS NULL LIMIT 10"
+    },
+    {
+      "id": "sql-0833",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent"
+        ],
+        [
+          "doc:a",
+          "vip"
+        ],
+        [
+          "doc:b",
+          "stale"
+        ],
+        [
+          "doc:b",
+          "archived"
+        ],
+        [
+          "doc:e",
+          "abcdefg-hit"
+        ],
+        [
+          "doc:f",
+          "zz"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IS NOT NULL LIMIT 10"
+    },
+    {
+      "id": "sql-0834",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "rows": [
+        [
+          "doc:e",
+          "abcdefg-hit"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag ILIKE 'abcdefg%' LIMIT 10"
+    },
+    {
+      "id": "sql-0835",
+      "columns": [
+        "_id",
+        "tag",
+        "label"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "urgent",
+          "blue"
+        ],
+        [
+          "doc:a",
+          "vip",
+          "blue"
+        ],
+        [
+          "doc:a",
+          null,
+          "blue"
+        ],
+        [
+          "doc:b",
+          "stale",
+          "red"
+        ],
+        [
+          "doc:b",
+          "stale",
+          "green"
+        ],
+        [
+          "doc:b",
+          "archived",
+          "red"
+        ],
+        [
+          "doc:b",
+          "archived",
+          "green"
+        ],
+        [
+          "doc:e",
+          "abcdefg-hit",
+          "rare"
+        ],
+        [
+          "doc:f",
+          "zz",
+          "tail"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          true,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        25
+      ],
+      "affected": 0,
+      "sql": "SELECT d._id, tag, label FROM docs AS d, UNNEST(d.tags) AS tag, UNNEST(d.labels) AS label LIMIT 10"
+    },
+    {
+      "id": "sql-1580",
+      "columns": [
+        "min_amount"
+      ],
+      "rows": [
+        [
+          -2
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        20
+      ],
+      "affected": 0,
+      "sql": "SELECT min(amount) AS min_amount FROM docs"
+    },
+    {
+      "id": "sql-1581",
+      "columns": [
+        "total_amount"
+      ],
+      "rows": [
+        [
+          22
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT sum(amount) AS total_amount FROM docs"
+    },
+    {
+      "id": "sql-1583",
+      "columns": [
+        "avg_amount"
+      ],
+      "rows": [
+        [
+          4.4
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        1700
+      ],
+      "affected": 0,
+      "sql": "SELECT avg(amount) AS avg_amount FROM docs LIMIT 10"
+    },
+    {
+      "id": "sql-1584",
+      "columns": [
+        "row_count"
+      ],
+      "rows": [
+        [
+          6
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        20
+      ],
+      "affected": 0,
+      "sql": "SELECT count(*) AS row_count FROM docs"
+    }
+  ],
+  "empty_reference": {
+    "reference": "PostgreSQL exact SQL",
+    "entries": [
+      {
+        "id": "sql-1580",
+        "columns": [
+          "min_amount"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            true
+          ]
+        ],
+        "column_oids": [
+          20
+        ],
+        "affected": 0,
+        "sql": "SELECT min(amount) AS min_amount FROM docs"
+      },
+      {
+        "id": "sql-1581",
+        "columns": [
+          "total_amount"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            true
+          ]
+        ],
+        "column_oids": [
+          1700
+        ],
+        "affected": 0,
+        "sql": "SELECT sum(amount) AS total_amount FROM docs"
+      },
+      {
+        "id": "sql-1583",
+        "columns": [
+          "avg_amount"
+        ],
+        "rows": [
+          [
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            true
+          ]
+        ],
+        "column_oids": [
+          1700
+        ],
+        "affected": 0,
+        "sql": "SELECT avg(amount) AS avg_amount FROM docs LIMIT 10"
+      },
+      {
+        "id": "sql-1584",
+        "columns": [
+          "row_count"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ],
+        "column_oids": [
+          20
+        ],
+        "affected": 0,
+        "sql": "SELECT count(*) AS row_count FROM docs"
+      }
+    ]
+  }
+}

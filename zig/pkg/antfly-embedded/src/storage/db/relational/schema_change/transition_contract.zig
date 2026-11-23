@@ -1,0 +1,98 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Bounded, data-only requests against an already leased physical owner.
+const topology = @import("../integrity/topology_contract.zig");
+const handoff = @import("../integrity/handoff_contract.zig");
+
+pub const max_native_retirement_status_bytes = 16 * 1024;
+/// Private metadata observation on the exact already-fenced native image.
+/// No user keys, lookup options or serialized process-local authority bit.
+pub const NativeRetirementStatusRequest = struct {
+    fence: topology.Fence,
+    descriptor: @import("../../../../common/relation_persistence.zig").Descriptor,
+    pin: @import("../../../../common/relation_persistence.zig").PhysicalPin,
+    native_instance: [16]u8,
+
+    pub fn validate(self: @This()) !void {
+        const std = @import("std");
+        try self.descriptor.validate();
+        try self.pin.validate();
+        _ = try self.fence.encode();
+        switch (self.fence.role) {
+            .child_generation_source, .child_generation_dual, .document_retirement_source => {},
+            else => return error.InvalidIntegrityTopologyFence,
+        }
+        if (std.mem.allEqual(u8, &self.native_instance, 0) or self.pin.table_id != self.fence.namespace.table_id or
+            self.pin.shard_id != self.fence.namespace.shard_id or self.pin.range_id != self.fence.namespace.range_id or
+            self.pin.data_generation != self.descriptor.data_generation) return error.IdentityNamespaceMismatch;
+    }
+};
+
+pub const Request = union(enum) {
+    sql_relation_binding: void,
+    native_retirement_status: NativeRetirementStatusRequest,
+    publication_capture_outbox: @import("../../../../system_catalog/logical_replication_capacity.zig").Observation,
+    replication_source_receipt: @import("../../replication_source_apply_store.zig").ObservationRequest,
+    publication_capture_terminal: @import("../../../../system_catalog/logical_replication_capacity.zig").Observation,
+    publication_outbox_page: @import("../../logical_replication_outbox_contract.zig").PageRequest,
+    publication_collection: @import("../../../../system_catalog/logical_replication_publisher.zig").GcPermission,
+    publication_capture_capacity: @import("../../../../system_catalog/logical_replication_capacity.zig").Request,
+    publication_capture_observe: @import("../../../../system_catalog/logical_replication_capture.zig").ObservationRequest,
+    publication_capture_native_observe: @import("../../../../system_catalog/logical_replication_capture.zig").ObservationRequest,
+    publication_capture_control: @import("../../../../system_catalog/logical_replication_capture.zig").Control,
+    identity: void,
+    status: void,
+    manifest: struct {
+        source: topology.Fence,
+        destination: topology.Fence,
+        lower: []const u8,
+        upper: []const u8,
+        primary_sequence: u64,
+    },
+    page: struct { manifest: handoff.Manifest, progress: handoff.Progress },
+};
+
+test "pure transition contract encodes binary owner and continuation proofs" {
+    const std = @import("std");
+    const alloc = std.testing.allocator;
+    const fence: topology.Fence = .{
+        .transition_id = 8,
+        .attempt = 9,
+        .peer_group_id = 2,
+        .owner_group_id = 1,
+        .role = .split_source,
+        .namespace = .{ .table_id = 5, .shard_id = 1, .range_id = 1 },
+        .catalog_digest = @splat(255),
+    };
+    const request: Request = .{ .page = .{ .manifest = .{
+        .source = fence,
+        .destination = fence,
+        .lower = "\x00\xff",
+        .upper = "\xff\xff",
+        .source_range_start = "",
+        .source_range_end = "",
+        .catalog_bytes = "\x00\xffcatalog",
+        .activation_bytes = "\xffproof",
+        .primary_sequence = 12,
+    }, .progress = .{ .manifest_digest = @splat(254), .cursor = "\xff\x00cursor" } } };
+    const encoded = try handoff.encode(alloc, request);
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(Request, alloc, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.page.manifest.source.eql(fence));
+    try std.testing.expectEqualStrings(request.page.manifest.catalog_bytes, parsed.value.page.manifest.catalog_bytes);
+    try std.testing.expectEqualStrings(request.page.progress.cursor, parsed.value.page.progress.cursor);
+}

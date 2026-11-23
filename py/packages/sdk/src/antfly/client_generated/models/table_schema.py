@@ -11,6 +11,7 @@ from ..models.table_storage_mode import TableStorageMode
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.document_sql_column import DocumentSQLColumn
     from ..models.dynamic_template import DynamicTemplate
     from ..models.external_lake_table_source import ExternalLakeTableSource
     from ..models.relational_check_constraint import RelationalCheckConstraint
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
     from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
     from ..models.relational_index_definition import RelationalIndexDefinition
     from ..models.relational_unique_constraint import RelationalUniqueConstraint
+    from ..models.sql_named_type_layout import SQLNamedTypeLayout
+    from ..models.sql_view_index_requirement import SQLViewIndexRequirement
     from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
     from ..models.table_schema_index_sort_item import TableSchemaIndexSortItem
     from ..models.ttl_config import TtlConfig
@@ -31,6 +34,19 @@ class TableSchema:
     """Schema definition for a table with multiple document types
 
     Attributes:
+        document_sql_columns (list[DocumentSQLColumn] | Unset): Read-only typed SQL aliases over literal document paths,
+            independent of JSON Schema write validation. SQL assignments reject these computed aliases; raw document ingress
+            remains unchanged. Missing paths produce SQL NULL; JSON null is retained for json columns and SQL NULL for
+            scalar columns. Scalar domain mismatches fail when the value is demanded instead of converting to text. Untaken
+            CASE and COALESCE branches do not evaluate a hidden typed failure. Alias names cannot shadow existing schema
+            columns or reserved document columns. Document storage only.
+        sql_view_requirements (list[SQLViewIndexRequirement] | Unset): Document-source dependency policies consumed by
+            ordinary CREATE VIEW in the same namespace. Typed paths use schema-owned document_sql_columns or existing
+            document property aliases; this field creates no second view catalog. Required index lifetimes and readiness are
+            checked once per retained physical read cut. Relational sources reject these policies.
+        named_types (list[SQLNamedTypeLayout] | Unset): Server-resolved immutable SQL type layouts, sorted by catalog
+            ID. Clients reference types through x-antfly-sql-type-id; catalog admission verifies every layout against its
+            active definition. Retained by backups and schema epochs for deterministic cold decoding.
         version (int | Unset): Backend-managed schema generation used for migrations. Omit it from create and update
             requests.
         index_sort (list[TableSchemaIndexSortItem] | Unset): Physical document index order. Fields must have sortable
@@ -61,14 +77,25 @@ class TableSchema:
             4096 expression nodes, and 4 MiB of literal data. Evaluation has
             a shared 4 MiB allocation budget across all column expressions.
             Restore verifies stored results instead of silently recomputing
-            them. Changing, adding, or removing generated semantics through
-            an existing table's schema update requires explicit rewrite=true
+            them. On relational tables, changing, adding, or removing generated
+            semantics through a schema update requires explicit rewrite=true
             on the PUT or PATCH schema route. This returns a durable restore
             job and replaces the complete authorized dependency cohort only
             after distributed transformation and validation. Ordinary schema
             updates reject these changes, even when a table appears empty.
             Declaration reordering and default-only changes remain allowed.
-            Relational tables only.
+            Supported by relational and document tables. Document declarations
+            require one enforced document type and target declared root fields.
+            Expressions may read persisted declared roots; SQL virtual fields
+            and transport directives cannot be expression sources.
+            SQL NULL removes the generated member; a JSON null datum remains
+            present. Unknown members are preserved. SQL column assignments to
+            generated roots or their aliases are rejected, while whole-document
+            writes replace submitted generated members with computed values.
+            Document producer definitions are immutable through schema-update
+            routes, including rewrite=true. Changing these definitions requires
+            a replacement table and explicit data migration; ordinary restore
+            preserves and verifies existing computed values.
         checks (list[RelationalCheckConstraint] | Unset): Named scalar CHECK constraints for a relational schema. This
             is
             part of the complete schema: omission or [] declares no checks.
@@ -98,6 +125,9 @@ class TableSchema:
             evaluated in order to determine how those fields should be indexed.
     """
 
+    document_sql_columns: list[DocumentSQLColumn] | Unset = UNSET
+    sql_view_requirements: list[SQLViewIndexRequirement] | Unset = UNSET
+    named_types: list[SQLNamedTypeLayout] | Unset = UNSET
     version: int | Unset = UNSET
     index_sort: list[TableSchemaIndexSortItem] | Unset = UNSET
     storage_mode: TableStorageMode | Unset = UNSET
@@ -120,6 +150,27 @@ class TableSchema:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.ttl_config import TtlConfig
+
+        document_sql_columns: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.document_sql_columns, Unset):
+            document_sql_columns = []
+            for document_sql_columns_item_data in self.document_sql_columns:
+                document_sql_columns_item = document_sql_columns_item_data.to_dict()
+                document_sql_columns.append(document_sql_columns_item)
+
+        sql_view_requirements: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sql_view_requirements, Unset):
+            sql_view_requirements = []
+            for sql_view_requirements_item_data in self.sql_view_requirements:
+                sql_view_requirements_item = sql_view_requirements_item_data.to_dict()
+                sql_view_requirements.append(sql_view_requirements_item)
+
+        named_types: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.named_types, Unset):
+            named_types = []
+            for named_types_item_data in self.named_types:
+                named_types_item = named_types_item_data.to_dict()
+                named_types.append(named_types_item)
 
         version = self.version
 
@@ -214,6 +265,12 @@ class TableSchema:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if document_sql_columns is not UNSET:
+            field_dict["document_sql_columns"] = document_sql_columns
+        if sql_view_requirements is not UNSET:
+            field_dict["sql_view_requirements"] = sql_view_requirements
+        if named_types is not UNSET:
+            field_dict["named_types"] = named_types
         if version is not UNSET:
             field_dict["version"] = version
         if index_sort is not UNSET:
@@ -255,6 +312,7 @@ class TableSchema:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.document_sql_column import DocumentSQLColumn
         from ..models.dynamic_template import DynamicTemplate
         from ..models.external_lake_table_source import ExternalLakeTableSource
         from ..models.relational_check_constraint import RelationalCheckConstraint
@@ -262,11 +320,40 @@ class TableSchema:
         from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
         from ..models.relational_index_definition import RelationalIndexDefinition
         from ..models.relational_unique_constraint import RelationalUniqueConstraint
+        from ..models.sql_named_type_layout import SQLNamedTypeLayout
+        from ..models.sql_view_index_requirement import SQLViewIndexRequirement
         from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
         from ..models.table_schema_index_sort_item import TableSchemaIndexSortItem
         from ..models.ttl_config import TtlConfig
 
         d = dict(src_dict)
+        _document_sql_columns = d.pop("document_sql_columns", UNSET)
+        document_sql_columns: list[DocumentSQLColumn] | Unset = UNSET
+        if _document_sql_columns is not UNSET:
+            document_sql_columns = []
+            for document_sql_columns_item_data in _document_sql_columns:
+                document_sql_columns_item = DocumentSQLColumn.from_dict(document_sql_columns_item_data)
+
+                document_sql_columns.append(document_sql_columns_item)
+
+        _sql_view_requirements = d.pop("sql_view_requirements", UNSET)
+        sql_view_requirements: list[SQLViewIndexRequirement] | Unset = UNSET
+        if _sql_view_requirements is not UNSET:
+            sql_view_requirements = []
+            for sql_view_requirements_item_data in _sql_view_requirements:
+                sql_view_requirements_item = SQLViewIndexRequirement.from_dict(sql_view_requirements_item_data)
+
+                sql_view_requirements.append(sql_view_requirements_item)
+
+        _named_types = d.pop("named_types", UNSET)
+        named_types: list[SQLNamedTypeLayout] | Unset = UNSET
+        if _named_types is not UNSET:
+            named_types = []
+            for named_types_item_data in _named_types:
+                named_types_item = SQLNamedTypeLayout.from_dict(named_types_item_data)
+
+                named_types.append(named_types_item)
+
         version = d.pop("version", UNSET)
 
         _index_sort = d.pop("index_sort", UNSET)
@@ -395,6 +482,9 @@ class TableSchema:
                 dynamic_templates.append(dynamic_templates_item)
 
         table_schema = cls(
+            document_sql_columns=document_sql_columns,
+            sql_view_requirements=sql_view_requirements,
+            named_types=named_types,
             version=version,
             index_sort=index_sort,
             storage_mode=storage_mode,

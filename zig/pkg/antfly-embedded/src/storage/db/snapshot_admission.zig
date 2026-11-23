@@ -43,6 +43,14 @@ pub const SnapshotAdmission = struct {
             return .{ .admission = self.admission, .capture = self.capture };
         }
 
+        // Move this owned admission without retaining another shared reader.
+        pub fn take(self: *@This()) @This() {
+            std.debug.assert(self.active);
+            const owned = self.*;
+            self.active = false;
+            return owned;
+        }
+
         pub fn release(self: *@This()) void {
             if (!self.active) return;
             if (self.capture) |capture| {
@@ -80,6 +88,13 @@ pub const SnapshotAdmission = struct {
 
     pub fn acquireMutation(self: *@This()) MutationLease {
         self.lock.lockShared();
+        return .{ .admission = self };
+    }
+
+    /// Committed apply must yield instead of retaining consensus ownership
+    /// while another operation owns or is waiting for a snapshot capture.
+    pub fn tryAcquireMutation(self: *@This()) ?MutationLease {
+        if (!self.lock.tryLockShared()) return null;
         return .{ .admission = self };
     }
 
@@ -281,4 +296,32 @@ test "storage.db snapshot admission lease can be released by another Io worker" 
     task.await(std.testing.io);
     try std.testing.expect(admission.lock.tryLockExclusive());
     admission.lock.unlockExclusive();
+}
+
+test "storage.db snapshot admission nonblocking mutation yields to capture" {
+    var admission: SnapshotAdmission = .{};
+    var first = admission.tryAcquireMutation().?;
+    var second = admission.tryAcquireMutation().?;
+    try std.testing.expect(admission.tryAcquireCapture() == null);
+    first.release();
+    second.release();
+    var capture = admission.tryAcquireCapture().?;
+    try std.testing.expect(admission.tryAcquireMutation() == null);
+    capture.release();
+    var resumed = admission.tryAcquireMutation().?;
+    resumed.release();
+    var complete = admission.tryAcquireCapture().?;
+    complete.release();
+}
+
+test "storage.db snapshot mutation move releases its sole reader before capture" {
+    var admission: SnapshotAdmission = .{};
+    var outer = admission.acquireMutation();
+    var inner = outer.take();
+    try std.testing.expect(!outer.active and inner.active);
+    outer.release();
+    try std.testing.expect(admission.tryAcquireCapture() == null);
+    inner.release();
+    var capture = admission.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    capture.release();
 }

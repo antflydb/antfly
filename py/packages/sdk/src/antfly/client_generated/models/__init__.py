@@ -423,6 +423,8 @@ from .document_schema import DocumentSchema
 from .document_schema_schema import DocumentSchemaSchema
 from .document_source import DocumentSource
 from .document_source_media_type import DocumentSourceMediaType
+from .document_sql_column import DocumentSQLColumn
+from .document_sql_column_type import DocumentSQLColumnType
 from .document_subfield_mapping import DocumentSubfieldMapping
 from .document_subfield_mapping_missing_null_policy import DocumentSubfieldMappingMissingNullPolicy
 from .drop_extension_request import DropExtensionRequest
@@ -1032,7 +1034,12 @@ from .index_mutation_conflict_error import IndexMutationConflictError
 from .index_mutation_conflict_error_error import IndexMutationConflictErrorError
 from .index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
 from .index_mutation_service_unavailable_error_error import IndexMutationServiceUnavailableErrorError
+from .index_publication_failure import IndexPublicationFailure
+from .index_publication_phase import IndexPublicationPhase
 from .index_publication_policy import IndexPublicationPolicy
+from .index_publication_state import IndexPublicationState
+from .index_publication_status import IndexPublicationStatus
+from .index_publication_status_index_type import IndexPublicationStatusIndexType
 from .index_readiness_reason import IndexReadinessReason
 from .index_readiness_state import IndexReadinessState
 from .index_readiness_status import IndexReadinessStatus
@@ -2297,6 +2304,8 @@ from .reauthorize_table_destinations_response_200_status import ReauthorizeTable
 from .regexp_query import RegexpQuery
 from .relational_check_constraint import RelationalCheckConstraint
 from .relational_column_expression import RelationalColumnExpression
+from .relational_column_sequence import RelationalColumnSequence
+from .relational_column_sequence_generation import RelationalColumnSequenceGeneration
 from .relational_comparison_op import RelationalComparisonOp
 from .relational_constraint_activation_phase import RelationalConstraintActivationPhase
 from .relational_constraint_conflict_reason import RelationalConstraintConflictReason
@@ -2445,6 +2454,7 @@ from .restore_job_result_restore import RestoreJobResultRestore
 from .restore_job_result_status import RestoreJobResultStatus
 from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
+from .restore_routine_mapping import RestoreRoutineMapping
 from .result_extract_document_job_response_200 import ResultExtractDocumentJobResponse200
 from .result_read_document_job_response_200 import ResultReadDocumentJobResponse200
 from .retrieval_agent_request import RetrievalAgentRequest
@@ -2474,6 +2484,10 @@ from .runtime_decl_mode import RuntimeDeclMode
 from .runtime_resolver_suppression import RuntimeResolverSuppression
 from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
+from .schema_validation_failure import SchemaValidationFailure
+from .schema_validation_phase import SchemaValidationPhase
+from .schema_validation_state import SchemaValidationState
+from .schema_validation_status import SchemaValidationStatus
 from .scoped_linear_merge_page import ScopedLinearMergePage
 from .scoped_linear_merge_page_key_range import ScopedLinearMergePageKeyRange
 from .scoped_linear_merge_page_records import ScopedLinearMergePageRecords
@@ -2513,17 +2527,46 @@ from .sql_array_dimension import SQLArrayDimension
 from .sql_array_element_type import SQLArrayElementType
 from .sql_array_value import SQLArrayValue
 from .sql_builtin_type import SQLBuiltinType
+from .sql_catalog_object_kind import SQLCatalogObjectKind
+from .sql_catalog_operation_kind import SQLCatalogOperationKind
+from .sql_catalog_operation_receipt import SQLCatalogOperationReceipt
+from .sql_catalog_operation_state import SQLCatalogOperationState
+from .sql_catalog_recovery_request import SQLCatalogRecoveryRequest
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
 from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_named_domain_base import SQLNamedDomainBase
+from .sql_named_domain_base_kind import SQLNamedDomainBaseKind
+from .sql_named_domain_check import SQLNamedDomainCheck
+from .sql_named_domain_definition import SQLNamedDomainDefinition
+from .sql_named_enum_column_schema import SQLNamedEnumColumnSchema
+from .sql_named_enum_column_schema_type import SQLNamedEnumColumnSchemaType
+from .sql_named_enum_label import SQLNamedEnumLabel
+from .sql_named_type_identity import SQLNamedTypeIdentity
+from .sql_named_type_layout import SQLNamedTypeLayout
+from .sql_named_type_layout_kind import SQLNamedTypeLayoutKind
+from .sql_named_type_reference import SQLNamedTypeReference
+from .sql_notice import SQLNotice
+from .sql_notification import SQLNotification
+from .sql_notification_page import SQLNotificationPage
+from .sql_notification_poll_request import SQLNotificationPollRequest
 from .sql_numeric_modifier import SQLNumericModifier
+from .sql_package_argument import SQLPackageArgument
+from .sql_package_control import SQLPackageControl
+from .sql_package_default_control import SQLPackageDefaultControl
+from .sql_package_export import SQLPackageExport
+from .sql_package_scalar_type import SQLPackageScalarType
+from .sql_package_type import SQLPackageType
+from .sql_package_volatility import SQLPackageVolatility
 from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
+from .sql_range_column_schema import SQLRangeColumnSchema
+from .sql_range_column_schema_type import SQLRangeColumnSchemaType
 from .sql_request import SQLRequest
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
@@ -2535,7 +2578,9 @@ from .sql_setting_role_default import SqlSettingRoleDefault
 from .sql_setting_value_type_0 import SqlSettingValueType0
 from .sql_setting_value_type_1 import SqlSettingValueType1
 from .sql_setting_value_type_2 import SqlSettingValueType2
+from .sql_temporal_kind import SQLTemporalKind
 from .sql_transaction_status import SQLTransactionStatus
+from .sql_view_index_requirement import SQLViewIndexRequirement
 from .sqlddl_receipt import SQLDDLReceipt
 from .sqlddl_receipt_state import SQLDDLReceiptState
 from .sse_error import SSEError
@@ -3171,6 +3216,8 @@ __all__ = (
     "DocumentSchemaSchema",
     "DocumentSource",
     "DocumentSourceMediaType",
+    "DocumentSQLColumn",
+    "DocumentSQLColumnType",
     "DocumentSubfieldMapping",
     "DocumentSubfieldMappingMissingNullPolicy",
     "DropExtensionRequest",
@@ -3774,7 +3821,12 @@ __all__ = (
     "IndexMutationConflictErrorError",
     "IndexMutationServiceUnavailableError",
     "IndexMutationServiceUnavailableErrorError",
+    "IndexPublicationFailure",
+    "IndexPublicationPhase",
     "IndexPublicationPolicy",
+    "IndexPublicationState",
+    "IndexPublicationStatus",
+    "IndexPublicationStatusIndexType",
     "IndexReadinessReason",
     "IndexReadinessState",
     "IndexReadinessStatus",
@@ -4823,6 +4875,8 @@ __all__ = (
     "RegexpQuery",
     "RelationalCheckConstraint",
     "RelationalColumnExpression",
+    "RelationalColumnSequence",
+    "RelationalColumnSequenceGeneration",
     "RelationalComparisonOp",
     "RelationalConstraintActivationPhase",
     "RelationalConstraintConflictReason",
@@ -4971,6 +5025,7 @@ __all__ = (
     "RestoreJobResultStatus",
     "RestoreJobScope",
     "RestoreRequest",
+    "RestoreRoutineMapping",
     "ResultExtractDocumentJobResponse200",
     "ResultReadDocumentJobResponse200",
     "RetrievalAgentRequest",
@@ -5000,6 +5055,10 @@ __all__ = (
     "RuntimeResolverSuppression",
     "SavedQuerySource",
     "ScanKeysRequest",
+    "SchemaValidationFailure",
+    "SchemaValidationPhase",
+    "SchemaValidationState",
+    "SchemaValidationStatus",
     "ScopedLinearMergePage",
     "ScopedLinearMergePageKeyRange",
     "ScopedLinearMergePageRecords",
@@ -5039,6 +5098,11 @@ __all__ = (
     "SQLArrayElementType",
     "SQLArrayValue",
     "SQLBuiltinType",
+    "SQLCatalogObjectKind",
+    "SQLCatalogOperationKind",
+    "SQLCatalogOperationReceipt",
+    "SQLCatalogOperationState",
+    "SQLCatalogRecoveryRequest",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
@@ -5047,11 +5111,35 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLNamedDomainBase",
+    "SQLNamedDomainBaseKind",
+    "SQLNamedDomainCheck",
+    "SQLNamedDomainDefinition",
+    "SQLNamedEnumColumnSchema",
+    "SQLNamedEnumColumnSchemaType",
+    "SQLNamedEnumLabel",
+    "SQLNamedTypeIdentity",
+    "SQLNamedTypeLayout",
+    "SQLNamedTypeLayoutKind",
+    "SQLNamedTypeReference",
+    "SQLNotice",
+    "SQLNotification",
+    "SQLNotificationPage",
+    "SQLNotificationPollRequest",
     "SQLNumericModifier",
+    "SQLPackageArgument",
+    "SQLPackageControl",
+    "SQLPackageDefaultControl",
+    "SQLPackageExport",
+    "SQLPackageScalarType",
+    "SQLPackageType",
+    "SQLPackageVolatility",
     "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",
+    "SQLRangeColumnSchema",
+    "SQLRangeColumnSchemaType",
     "SQLRequest",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
@@ -5063,7 +5151,9 @@ __all__ = (
     "SqlSettingValueType0",
     "SqlSettingValueType1",
     "SqlSettingValueType2",
+    "SQLTemporalKind",
     "SQLTransactionStatus",
+    "SQLViewIndexRequirement",
     "SSEError",
     "SSEErrorReason",
     "SSEEvent",

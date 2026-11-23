@@ -1,0 +1,529 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "cases": [
+    {
+      "id": "sql-1456",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT,status TEXT,name TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,status,name) VALUES ('u1','a@example.test','active','before'),('u9','z@example.test','inactive','untouched')"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records(email) WHERE status='active'"
+        }
+      ],
+      "read_sql": "SELECT id,email,status,name FROM usage_records ORDER BY id",
+      "ddl_sqlstate": "42704",
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,status,name) VALUES ('u3','a@example.test','active','collision')",
+          "sqlstate": "23505",
+          "repeat_on_reopen": true,
+          "after": {
+            "id": "sql-1456",
+            "columns": [
+              "id",
+              "email",
+              "status",
+              "name"
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "active",
+                "before"
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "inactive",
+                "untouched"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,status,name) VALUES ('u2','a@example.test','active','inferred') ON CONFLICT (email) WHERE status='active' DO UPDATE SET name=excluded.name",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1456",
+            "columns": [
+              "id",
+              "email",
+              "status",
+              "name"
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "active",
+                "inferred"
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "inactive",
+                "untouched"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "after_ddl": {
+        "id": "sql-1456",
+        "columns": [
+          "id",
+          "email",
+          "status",
+          "name"
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "active",
+            "before"
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "inactive",
+            "untouched"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1459",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,email TEXT,status TEXT,name TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,status,name) VALUES ('u1','a@example.test','active','before'),('u9','z@example.test','inactive','untouched')"
+        },
+        {
+          "statement": "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records(lower(email))"
+        }
+      ],
+      "read_sql": "SELECT id,email,status,name FROM usage_records ORDER BY id",
+      "ddl_sqlstate": "42704",
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,email,status,name) VALUES ('u3','a@example.test','active','collision')",
+          "sqlstate": "23505",
+          "repeat_on_reopen": true,
+          "after": {
+            "id": "sql-1459",
+            "columns": [
+              "id",
+              "email",
+              "status",
+              "name"
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "active",
+                "before"
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "inactive",
+                "untouched"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,email,status,name) VALUES ('u2','a@example.test','active','inferred') ON CONFLICT (lower(email)) DO UPDATE SET name=excluded.name",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1459",
+            "columns": [
+              "id",
+              "email",
+              "status",
+              "name"
+            ],
+            "rows": [
+              [
+                "u1",
+                "a@example.test",
+                "active",
+                "inferred"
+              ],
+              [
+                "u9",
+                "z@example.test",
+                "inactive",
+                "untouched"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false,
+                false,
+                false
+              ],
+              [
+                false,
+                false,
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25,
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "after_ddl": {
+        "id": "sql-1459",
+        "columns": [
+          "id",
+          "email",
+          "status",
+          "name"
+        ],
+        "rows": [
+          [
+            "u1",
+            "a@example.test",
+            "active",
+            "before"
+          ],
+          [
+            "u9",
+            "z@example.test",
+            "inactive",
+            "untouched"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25,
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    },
+    {
+      "id": "sql-1464",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE usage_records(id TEXT CONSTRAINT usage_records_id_pk PRIMARY KEY,status TEXT)",
+          "table": "usage_records"
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('u1','before'),('u9','untouched')"
+        }
+      ],
+      "read_sql": "SELECT id,status FROM usage_records ORDER BY id",
+      "ddl_sqlstate": null,
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('u1','collision')",
+          "sqlstate": "23505",
+          "repeat_on_reopen": true,
+          "after": {
+            "id": "sql-1464",
+            "columns": [
+              "id",
+              "status"
+            ],
+            "rows": [
+              [
+                "u1",
+                "custom_named"
+              ],
+              [
+                "u9",
+                "untouched"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('u2','future')",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1464",
+            "columns": [
+              "id",
+              "status"
+            ],
+            "rows": [
+              [
+                "u1",
+                "custom_named"
+              ],
+              [
+                "u2",
+                "future"
+              ],
+              [
+                "u9",
+                "untouched"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,status) VALUES ('u1','inferred') ON CONFLICT (id) DO UPDATE SET status=excluded.status",
+          "sqlstate": null,
+          "after": {
+            "id": "sql-1464",
+            "columns": [
+              "id",
+              "status"
+            ],
+            "rows": [
+              [
+                "u1",
+                "inferred"
+              ],
+              [
+                "u2",
+                "future"
+              ],
+              [
+                "u9",
+                "untouched"
+              ]
+            ],
+            "sql_nulls": [
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ],
+              [
+                false,
+                false
+              ]
+            ],
+            "column_oids": [
+              25,
+              25
+            ],
+            "affected": 0
+          }
+        }
+      ],
+      "outcome": {
+        "command_tag": "INSERT",
+        "result": {
+          "id": "sql-1464",
+          "columns": [
+            "id",
+            "status"
+          ],
+          "rows": [
+            [
+              "u1",
+              "custom_named"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ],
+          "column_oids": [
+            25,
+            25
+          ],
+          "affected": 1
+        }
+      },
+      "after_ddl": {
+        "id": "sql-1464",
+        "columns": [
+          "id",
+          "status"
+        ],
+        "rows": [
+          [
+            "u1",
+            "custom_named"
+          ],
+          [
+            "u9",
+            "untouched"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ],
+        "column_oids": [
+          25,
+          25
+        ],
+        "affected": 0
+      }
+    }
+  ]
+}

@@ -17,7 +17,7 @@
 //! streamed as base64 with fixed scratch space, never numeric JSON arrays.
 const std = @import("std");
 const pages = @import("merge_page_contract.zig");
-const binary = @import("relational_integrity_json.zig");
+const binary = @import("relational/integrity/json.zig");
 const Allocator = std.mem.Allocator;
 const WireVector = struct {
     key: []const u8,

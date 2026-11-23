@@ -18,6 +18,7 @@
 const callbacks = @import("../runtime_callback_abi.zig");
 const std = @import("std");
 const types = @import("db/types.zig");
+pub const RetainedGraphRead = @import("graph_read_snapshot.zig");
 const View = @import("relational_read_view.zig").View;
 pub const GraphInput = @import("cypher_read.zig").Input;
 pub const GraphRead = @import("cypher_read.zig").Read;
@@ -34,8 +35,10 @@ pub const Fence = struct {
 
     pub const VTable = struct {
         validate: *const fn (*anyopaque) anyerror!void,
+        native_sequence: ?*const fn (*anyopaque) anyerror!u64 = null,
         open: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, types.ScanOptions) anyerror!View,
         capture_snapshot: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Snapshot = null,
+        capture_snapshot_with_graphs: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8) anyerror!Snapshot = null,
         capture_graph: ?*const fn (*anyopaque, std.mem.Allocator, @import("cypher_read.zig").Input) anyerror!@import("cypher_read.zig").Read = null,
         release: *const fn (*anyopaque) void,
     };
@@ -43,6 +46,11 @@ pub const Fence = struct {
 
     pub fn validate(self: Fence) !void {
         return Abi.call("validate", self.boundary_dispatch, self.vtable.validate, .{self.ptr});
+    }
+
+    pub fn nativeSequence(self: Fence) !u64 {
+        const sequence = self.vtable.native_sequence orelse return error.SqlStatementSnapshotRequired;
+        return Abi.call("native_sequence", self.boundary_dispatch, sequence, .{self.ptr});
     }
 
     /// The fence itself is the admission proof. Re-running a Raft read-index
@@ -62,6 +70,12 @@ pub const Fence = struct {
         return Abi.call("capture_graph", self.boundary_dispatch, capture, .{ self.ptr, alloc, input });
     }
 
+    pub fn captureSnapshotWithGraphs(self: Fence, alloc: std.mem.Allocator, indexes: []const []const u8) !Snapshot {
+        if (indexes.len == 0) return self.captureSnapshot(alloc);
+        const capture = self.vtable.capture_snapshot_with_graphs orelse return error.SqlStatementSnapshotRequired;
+        return Abi.call("capture_snapshot_with_graphs", self.boundary_dispatch, capture, .{ self.ptr, alloc, indexes });
+    }
+
     pub fn deinit(self: Fence) void {
         Abi.call("release", self.boundary_dispatch, self.vtable.release, .{self.ptr}) catch unreachable;
     }
@@ -73,6 +87,8 @@ pub const Snapshot = struct {
     boundary_dispatch: SnapshotAbi.Dispatch = SnapshotAbi.local_dispatch,
 
     pub const VTable = struct {
+        renew: ?*const fn (*anyopaque, ?u64) anyerror!void = null,
+        graph_page: ?*const fn (*anyopaque, std.mem.Allocator, RetainedGraphRead.Request) anyerror!RetainedGraphRead.Page = null,
         open: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, types.ScanOptions) anyerror!View,
         release: *const fn (*anyopaque) void,
     };
@@ -80,6 +96,21 @@ pub const Snapshot = struct {
 
     pub fn open(self: Snapshot, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions) !View {
         return SnapshotAbi.call("open", self.boundary_dispatch, self.vtable.open, .{ self.ptr, alloc, from, to, opts });
+    }
+
+    pub fn graphPage(self: Snapshot, alloc: std.mem.Allocator, request: RetainedGraphRead.Request) !RetainedGraphRead.Page {
+        try request.check();
+        const callback = self.vtable.graph_page orelse return error.SqlStatementSnapshotRequired;
+        var page = try SnapshotAbi.call("graph_page", self.boundary_dispatch, callback, .{ self.ptr, alloc, request });
+        errdefer page.deinit(alloc);
+        try page.proof.validate();
+        try request.check();
+        return page;
+    }
+
+    pub fn renew(self: Snapshot, deadline_ns: ?u64) !void {
+        const callback = self.vtable.renew orelse return;
+        return SnapshotAbi.call("renew", self.boundary_dispatch, callback, .{ self.ptr, deadline_ns });
     }
 
     pub fn deinit(self: Snapshot) void {

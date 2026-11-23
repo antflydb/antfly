@@ -32,7 +32,13 @@ pub const max_privacy_findings_response_bytes: usize = max_privacy_cursor_encode
 /// Internal derived keys can include an escaped primary ID and namespace
 /// components. Keep that overhead distinct from the public document budget.
 pub const max_internal_document_key_bytes: usize = 2 * max_request_body_bytes + 8192;
-/// Base64 key bytes and bounded read controls travel outside the request line.
+/// Retain main's decoded query allowance. Existing integrity controls are
+/// bounded at 16 MiB, so their worst-case percent encoding plus selectors fits
+/// this 64 MiB allowance. JSON string escaping is bounded separately below.
+pub const max_document_read_query_bytes: usize = max_request_body_bytes;
+/// Preserve main's route ceiling. The actual serialized envelope is bounded,
+/// including JSON escaping, rather than independently summing impossible
+/// maximum-size components that the old transport never admitted together.
 pub const max_document_read_body_bytes: usize = std.base64.url_safe_no_pad.Encoder.calcSize(max_internal_document_key_bytes) + max_request_body_bytes + 8192;
 
 /// Carry a maximum-size identifier in the cursor and document/field filters
