@@ -13215,7 +13215,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     const FundedProjectionPack = struct {
-        compute: *MetalCompute,
+        data: *WeightStore,
+        provider: *MetalNativeProvider,
         layout: ProjectionPack.Layout,
         roots: [2]*anyopaque,
         owner: *ProjectionPack.Owner,
@@ -13226,12 +13227,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         fn deinitOutsideExecution(self: *FundedProjectionPack) void {
             for (self.roots) |root| metal_runtime.termite_metal_buffer_release(root);
             if (!self.published) {
-                const compute = self.compute;
-                compute.allocator.destroy(self.owner);
-                compute.allocator.destroy(self.node);
-                compute.data.prefetch.lock();
-                compute.data.tier_cache.?.noteLogicalPhysicalOwnerRemovalForTier(.backend, self.layout.weight_bytes + self.layout.bias_bytes);
-                compute.data.prefetch.unlock();
+                const data = self.data;
+                data.allocator.destroy(self.owner);
+                data.allocator.destroy(self.node);
+                data.prefetch.lock();
+                data.tier_cache.?.noteLogicalPhysicalOwnerRemovalForTier(.backend, self.layout.weight_bytes + self.layout.bias_bytes);
+                data.prefetch.unlock();
                 self.charge.release();
             }
             self.* = undefined;
@@ -13264,14 +13265,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const already_published = self.packedProjection(request) != null;
         self.packed_projection_mutex.unlock();
         if (already_published) return;
-        if (funded.published or funded.compute != self or !std.meta.eql(funded.layout, try request.layout())) return error.PreparedPackedProjectionChanged;
+        if (funded.published or funded.data != self.data or funded.provider != self.provider_impl or !std.meta.eql(funded.layout, try request.layout())) return error.PreparedPackedProjectionChanged;
         const entry = try metal_runtime.PackedProjectionEntry.create(self.provider_impl.raw_decode_runtime, request, funded.roots);
         const owner = funded.owner;
         const node = funded.node;
         // No fallible operation separates initialization and creator publication.
         // A later cache-publication/operation error leaves a valid cache creator,
         // never borrowed endpoints pointing at an error-unwound local Owner.
-        owner.init(self.allocator, entry.handle, funded.charge, antfly_metal_packed_projection_release_owner);
+        owner.init(funded.data.allocator, entry.handle, funded.charge, antfly_metal_packed_projection_release_owner);
         node.* = .{ .request = request, .owner = owner, .next = null };
         platform.sync.lockYielding(&self.packed_projection_mutex);
         node.next = self.packed_projection_entries;
@@ -13308,7 +13309,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn fundProjectionPackOutsideExecution(self: *MetalCompute, layout: ProjectionPack.Layout, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !FundedProjectionPack {
         const cache = if (self.data.tier_cache) |*cache| cache else return error.MissingCacheRetirementDomain;
-        const node = try self.allocator.create(PackedProjectionEntry);
+        const node = try self.data.allocator.create(PackedProjectionEntry);
         var pending_owner: ?*ProjectionPack.Owner = null;
         var pending_charge: ?*@import("../execution/resource_retirement.zig").Charge = null;
         var backings: ?[2]@import("../runtime/tier/cache.zig").PhysicalBacking = null;
@@ -13317,8 +13318,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var transferred = false;
         var pending_headers_live = true;
         defer if (!transferred) {
-            if (pending_owner) |owner| self.allocator.destroy(owner);
-            if (pending_headers_live) self.allocator.destroy(node);
+            if (pending_owner) |owner| self.data.allocator.destroy(owner);
+            if (pending_headers_live) self.data.allocator.destroy(node);
             // Entry and Owner requested metadata are dead before final SDK
             // witnesses can retire their independently charged components.
             if (pending_charge) |charge| charge.release();
@@ -13327,14 +13328,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         defer {
             if (!transferred and pending_headers_live) {
-                if (pending_owner) |header| self.allocator.destroy(header);
+                if (pending_owner) |header| self.data.allocator.destroy(header);
                 pending_owner = null;
-                self.allocator.destroy(node);
+                self.data.allocator.destroy(node);
                 pending_headers_live = false;
             }
             if (pending_growth) |growth| growth.finishOutsideExecution();
         }
-        const owner = try self.allocator.create(ProjectionPack.Owner);
+        const owner = try self.data.allocator.create(ProjectionPack.Owner);
         pending_owner = owner;
         var shell = try ProjectionPack.Owner.prepareCharge();
         defer shell.destroyUnused();
@@ -13391,7 +13392,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (metal_runtime.termite_metal_buffer_allocated_size(weight) != weight_physical or metal_runtime.termite_metal_buffer_allocated_size(bias) != bias_physical) return error.PhysicalAllocationSizeChanged;
         try ProjectionPack.Owner.attachSDKRoots(charge, .{ weight, bias });
         transferred = true;
-        return .{ .compute = self, .layout = layout, .roots = .{ weight, bias }, .owner = owner, .node = node, .charge = charge };
+        return .{ .data = self.data, .provider = self.provider_impl, .layout = layout, .roots = .{ weight, bias }, .owner = owner, .node = node, .charge = charge };
     }
 
     fn retireStaleProjectionPacksOutsideExecution(self: *MetalCompute, cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph) !void {
@@ -13411,7 +13412,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             while (retired) |entry| {
                 retired = entry.next;
                 const owner = entry.owner;
-                self.allocator.destroy(entry);
+                self.data.allocator.destroy(entry);
                 owner.releaseWithCleanup(.{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
             }
         }
@@ -13480,7 +13481,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, layout.weight_bytes + layout.bias_bytes);
             }
             const owner = entry.owner;
-            self.allocator.destroy(entry);
+            self.data.allocator.destroy(entry);
             owner.releaseWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         }
     }
