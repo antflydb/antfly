@@ -85,6 +85,9 @@ pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Sessio
             },
             .encoder_hidden_states => {
                 if (input.dtype != .f32 or input.shape.len != 3) return .unsupported_decoder_signature;
+                for (outputs[0].shape, input.shape) |produced, consumed| {
+                    if (produced > 0 and consumed > 0 and produced != consumed) return .unsupported_decoder_signature;
+                }
                 hidden = true;
             },
         }
@@ -433,6 +436,19 @@ test "encoder decoder resident stages retain hidden state and materialize only t
         encoder.run_admission = .{ .controller = &controller, .backend_class = if (kind == .native) .cpu else .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
         const control = Control{ .native_call_policy = .in_process };
         try std.testing.expect(supportsResidentPair(encoder, decoder, true));
+        const Mismatched = struct {
+            fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+                return &.{
+                    .{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, 2 } },
+                    .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 1, 2, 5 } },
+                };
+            }
+        };
+        var bad_decoder = decoder;
+        var bad_table = decoder.vtable.*;
+        bad_table.inputInfo = Mismatched.inputInfo;
+        bad_decoder.vtable = &bad_table;
+        try std.testing.expectEqual(PlacementReason.unsupported_decoder_signature, residentPairPlacement(encoder, bad_decoder, true));
         var encoded = blk: {
             var audit = audit_mod.Audit{ .forbid_activation_readbacks = true };
             try audit_mod.begin(&audit);
