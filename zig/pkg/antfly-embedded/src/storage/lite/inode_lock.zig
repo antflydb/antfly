@@ -211,9 +211,15 @@ pub const shared_fail_fast_retry_ns: i128 = 40 * std.time.ns_per_ms;
 const file_identity = @import("../lsm_backend/storage_io.zig");
 pub const FileIdentity = file_identity.NativeFileIdentity;
 
-const RegionBinding = struct {
+pub const RegionBinding = struct {
     region: shared_lock_region.Region,
-    next: ?*RegionBinding = null,
+    refs: std.atomic.Value(usize) = .init(1),
+
+    pub fn release(self: *RegionBinding) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.region.close();
+        std.heap.page_allocator.destroy(self);
+    }
 };
 
 pub const Entry = struct {
@@ -319,7 +325,6 @@ pub const Entry = struct {
     /// path, exactly like `ensureFd`'s existing lazy-reopen pattern after
     /// `entry.fd` goes back to `null`.
     region: ?*RegionBinding = null,
-    retired_regions: ?*RegionBinding = null,
     /// §9.6a: the redo-log's in-process versioned overlay, shared the
     /// same way `region` is -- one instance per inode, referenced by
     /// every `NativeFile` (writer or `ReadGeneration` reader) open on
@@ -665,9 +670,21 @@ pub fn withRedoOverlayLock(
 /// returns this inode's shared lock region. `entry.mutex` serializes
 /// concurrent first-use the same way it already serializes every other
 /// field above.
-pub fn ensureRegion(entry: *Entry, io: Io) !*shared_lock_region.Region {
+pub fn warmRegion(entry: *Entry, io: Io) !void {
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
+    _ = try ensureRegionLocked(entry, io);
+}
+
+pub fn borrowRegion(entry: *Entry, io: Io) !*RegionBinding {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    const binding = try ensureRegionLocked(entry, io);
+    _ = binding.refs.fetchAdd(1, .monotonic);
+    return binding;
+}
+
+fn ensureRegionLocked(entry: *Entry, io: Io) !*RegionBinding {
     if (entry.region == null) {
         const page = std.heap.page_allocator;
         const binding = try page.create(RegionBinding);
@@ -675,7 +692,7 @@ pub fn ensureRegion(entry: *Entry, io: Io) !*shared_lock_region.Region {
         binding.* = .{ .region = try shared_lock_region.Region.openForIdentity(page, io, entry.path, entry.identity) };
         entry.region = binding;
     }
-    return &entry.region.?.region;
+    return entry.region.?;
 }
 
 /// True when `err` (from `shared_lock_region.Region.open`/`openSized`)
@@ -1047,13 +1064,7 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
     if (debug_tracking and (entry.shared_count != 0 or entry.exclusive_count != 0)) debugDumpOutstanding(entry, "teardown with nonzero counts");
     std.debug.assert(entry.shared_count == 0 and entry.exclusive_count == 0);
     if (entry.fd) |held| held.close(io);
-    retireRegionLocked(entry);
-    var regions = entry.retired_regions;
-    while (regions) |binding| {
-        regions = binding.next;
-        binding.region.close();
-        page.destroy(binding);
-    }
+    if (entry.region) |binding| binding.release();
     if (entry.redo_overlay) |*overlay| overlay.deinit(page);
     page.free(entry.path);
     entry.reader_pins.deinit(page);
@@ -1079,16 +1090,9 @@ pub fn installRebind(entry: *Entry, io: Io, owned: []u8) void {
 pub fn installRebindLocked(entry: *Entry, owned: []u8) void {
     std.heap.page_allocator.free(entry.path);
     entry.path = owned;
-    retireRegionLocked(entry);
-}
-
-fn retireRegionLocked(entry: *Entry) void {
-    const binding = entry.region orelse return;
-    // Every borrower holds an Entry reference. Preserve the address and
-    // mapping until those references drain, including fences releasing slots.
-    binding.next = entry.retired_regions;
-    entry.retired_regions = binding;
+    const old = entry.region;
     entry.region = null;
+    if (old) |binding| binding.release();
 }
 
 /// Caller holds `entry.mutex`. Fully idle (no in-process holder remains):
@@ -1174,8 +1178,12 @@ test "ensureRegion opens the shared lock region once and shares it across refere
     defer unref(entry2, io);
     try std.testing.expectEqual(entry, entry2);
 
-    const region = try ensureRegion(entry, io);
-    const region_again = try ensureRegion(entry, io);
+    const region_binding = try borrowRegion(entry, io);
+    defer region_binding.release();
+    const region = &region_binding.region;
+    const region_again_binding = try borrowRegion(entry, io);
+    defer region_again_binding.release();
+    const region_again = &region_again_binding.region;
     try std.testing.expectEqual(region, region_again);
 
     const own_pid: u32 = @bitCast(std.c.getpid());
@@ -1199,7 +1207,7 @@ test "ensureRegion's region closes when the entry is torn down" {
 
     {
         const entry = try open(io, path);
-        _ = try ensureRegion(entry, io);
+        try warmRegion(entry, io);
         unref(entry, io); // last reference: tears the entry (and its region) down.
     }
 
@@ -1209,7 +1217,9 @@ test "ensureRegion's region closes when the entry is torn down" {
     // hang or fail instead.
     const entry = try open(io, path);
     defer unref(entry, io);
-    const region = try ensureRegion(entry, io);
+    const region_binding = try borrowRegion(entry, io);
+    defer region_binding.release();
+    const region = &region_binding.region;
     const own_pid: u32 = @bitCast(std.c.getpid());
     region.acquireWriter(own_pid);
     region.releaseWriter();
@@ -1242,10 +1252,17 @@ test "rebind preserves a borrowed region and opens a new region for the destinat
     const entry = try open(io, old_path);
     defer unref(entry, io);
 
-    const region_before_rebind = try ensureRegion(entry, io);
+    const region_before_rebind_binding = try borrowRegion(entry, io);
+    var borrower_live = true;
+    defer if (borrower_live) region_before_rebind_binding.release();
+    const region_before_rebind = &region_before_rebind_binding.region;
     const own_pid: u32 = @bitCast(std.c.getpid());
     region_before_rebind.acquireWriter(own_pid);
     region_before_rebind.releaseWriter();
+    var observer = try shared_lock_region.Region.open(a, io, old_path);
+    defer observer.close();
+    const staged_state: shared_lock_region.Region.LogState = .{ .checkpoint_sequence = 1, .durable_sequence = 1, .durable_offset = 0 };
+    region_before_rebind.publishReadyLogState(staged_state);
     // Only the old path's sidecar exists so far -- `ensureRegion` has
     // never been asked about `new_path`.
     try Io.Dir.cwd().access(io, old_region_sidecar, .{});
@@ -1265,14 +1282,21 @@ test "rebind preserves a borrowed region and opens a new region for the destinat
     // so the next `ensureRegion` reopens fresh against `new_path` rather
     // than going on serving the old sidecar's mapping.
     try std.testing.expect(entry.region == null);
+    try std.testing.expectEqual(@as(usize, 1), region_before_rebind_binding.refs.load(.acquire));
 
-    const region_after_rebind = try ensureRegion(entry, io);
+    const region_after_rebind_binding = try borrowRegion(entry, io);
+    defer region_after_rebind_binding.release();
+    const region_after_rebind = &region_after_rebind_binding.region;
     try std.testing.expect(region_before_rebind != region_after_rebind);
     try std.testing.expect(region_before_rebind.tryAcquireWriterFair(own_pid));
     region_before_rebind.releaseWriter();
     try Io.Dir.cwd().access(io, new_region_sidecar, .{});
     region_after_rebind.acquireWriter(own_pid);
     region_after_rebind.releaseWriter();
+    try std.testing.expect(observer.isLogStateLive(staged_state));
+    region_before_rebind_binding.release();
+    borrower_live = false;
+    try std.testing.expect(!observer.isLogStateLive(staged_state));
 }
 
 // The bug this guards against: `open`/`rebind` used to cache whatever
@@ -1325,7 +1349,9 @@ test "ensureRegion's lazy reopen after rebind uses the original directory, not a
     const entry = try open(io, "old.data");
     defer unref(entry, io);
     {
-        const region = try ensureRegion(entry, io);
+        const region_binding = try borrowRegion(entry, io);
+        defer region_binding.release();
+        const region = &region_binding.region;
         const own_pid: u32 = @bitCast(std.c.getpid());
         region.acquireWriter(own_pid);
         region.releaseWriter();
@@ -1345,7 +1371,9 @@ test "ensureRegion's lazy reopen after rebind uses the original directory, not a
     // Move cwd somewhere else entirely before the lazy reopen runs.
     try std.process.setCurrentPath(io, elsewhere_dir);
 
-    const region_after_cwd_change = try ensureRegion(entry, io);
+    const region_after_cwd_change_binding = try borrowRegion(entry, io);
+    defer region_after_cwd_change_binding.release();
+    const region_after_cwd_change = &region_after_cwd_change_binding.region;
     const own_pid: u32 = @bitCast(std.c.getpid());
     region_after_cwd_change.acquireWriter(own_pid);
     region_after_cwd_change.releaseWriter();

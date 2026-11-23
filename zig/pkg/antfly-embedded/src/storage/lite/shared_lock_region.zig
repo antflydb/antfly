@@ -650,6 +650,7 @@ var descriptor_waiters: std.AutoHashMapUnmanaged(u64, ?*AdmissionWaiter) = .empt
 var test_fail_process_fd_identity: std.atomic.Value(bool) = .init(false);
 var test_fail_specific_process_fd: std.atomic.Value(std.posix.fd_t) = .init(-1);
 var test_pause_recovery: std.atomic.Value(u32) = .init(0);
+var test_admissions_during_pause: std.atomic.Value(u32) = .init(0);
 
 /// Resolves `db_path` to an absolute, symlink-resolved path before
 /// `openSized` derives its own `<db_path>.aflite-lock` sidecar name from
@@ -722,6 +723,7 @@ fn acquireProcessFdUntil(io: Io, region_path: []const u8, deadline: ?Io.Timestam
                     defer unlinkAdmissionWaiter(io, &waiter);
                     if (now.compare(.gte, until.?)) return error.Timeout;
                     try antfly_platform.sync.futexWaitSharedBounded(io, &waiter.ready.raw, 0, until.?);
+                    if (Io.Clock.now(.awake, io).compare(.gte, until.?)) return error.Timeout;
                 } else if (now.compare(.gte, until.?)) return error.Timeout;
                 continue;
             },
@@ -731,6 +733,9 @@ fn acquireProcessFdUntil(io: Io, region_path: []const u8, deadline: ?Io.Timestam
 }
 
 fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *[max_unidentified_descriptors]bool, waiter: *AdmissionWaiter) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath })!*FdEntry {
+    if (builtin.is_test and test_pause_recovery.load(.acquire) != 0) {
+        _ = test_admissions_during_pause.fetchAdd(1, .monotonic);
+    }
     // A name past the filesystem limit cannot exist or be created. Refuse it
     // before `statFile`: Linux's statx wrapper treats ENAMETOOLONG as a
     // caller bug and panics in safe builds.
@@ -3887,6 +3892,7 @@ test "shared lock region: admission times out independently of a stalled quarant
         try linkAdmissionWaiter(&completion, device, path);
     }
     defer unlinkAdmissionWaiter(io, &completion);
+    test_admissions_during_pause.store(0, .monotonic);
     test_pause_recovery.store(1, .release);
     const deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(20));
     const result = acquireProcessFdUntil(io, path, deadline);
@@ -3896,6 +3902,7 @@ test "shared lock region: admission times out independently of a stalled quarant
     try antfly_platform.sync.futexWaitSharedBounded(io, &completion.ready.raw, 0, cleanup_deadline);
     try std.testing.expectEqual(@as(u32, 1), completion.ready.load(.acquire));
     try std.testing.expectError(error.Timeout, result);
+    try std.testing.expectEqual(@as(u32, 1), test_admissions_during_pause.load(.monotonic));
 }
 
 test "shared lock region: saturated reserve probes before waiting and stops at the first free slot" {

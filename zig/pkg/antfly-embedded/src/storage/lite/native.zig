@@ -6982,6 +6982,9 @@ pub const NativeFile = struct {
     /// `Handle` it gets back captures that exact entry, so a concurrent
     /// swap can only ever affect which entry a *future* acquire resolves
     /// to -- never which one an in-flight `Handle` releases against.
+    // Serializes a cached region miss with transfer of the inode at adoption.
+    region_binding_mutex: std.Io.Mutex = .init,
+    region_binding: std.atomic.Value(?*inode_lock.RegionBinding) = .init(null),
     inode_lock_ref: std.atomic.Value(?*inode_lock.Entry) = .init(null),
     /// The registry handle backing an outstanding `reader_fence`
     /// (`acquireReaderFence`/`captureFullReadSnapshot`), released in
@@ -7550,7 +7553,7 @@ pub const NativeFile = struct {
         // that can't be set up here just means every later caller's own
         // region-mode fallback engages instead, never a reason to fail
         // this open.
-        _ = inode_lock.ensureRegion(inode_entry, io) catch {};
+        inode_lock.warmRegion(inode_entry, io) catch {};
 
         var header_bytes: [header_size]u8 = undefined;
         try readHeaderExactAt(file, io, &header_bytes);
@@ -7586,6 +7589,7 @@ pub const NativeFile = struct {
             else
                 null,
         };
+        errdefer result.releaseRegionBinding();
         // §9.5: replay the redo log into a fresh in-memory overlay before
         // anything else touches `result.header`/`result.manifest_commits_enabled`
         // below. Every production opener of a redo-log file reaches this.
@@ -7647,10 +7651,7 @@ pub const NativeFile = struct {
             // the two, so there is no longer a reason to branch on it
             // here either.
             if (opts.reader_coordinator) |coordinator| {
-                const region = inode_lock.ensureRegion(inode_entry, io) catch |err| region_blk: {
-                    if (!inode_lock.isRegionUnusable(err)) return err;
-                    break :region_blk null;
-                };
+                const region = try result.regionForInode();
                 result.reader_fence = try coordinator.registerFull(file, region, result.dataIdentity() orelse return error.InvalidTransactionState, result.metadataReuseFrontier(), result.headerFingerprint());
             }
             errdefer if (result.reader_fence) |fence| opts.reader_coordinator.?.unregister(fence);
@@ -10527,7 +10528,7 @@ pub const NativeFile = struct {
         // See the matching comment in `openWithRuntime`: set the region up
         // eagerly here too, so a freshly created file never defers that
         // one-time cost into its first page-reusing commit either.
-        _ = inode_lock.ensureRegion(inode_entry, io) catch {};
+        inode_lock.warmRegion(inode_entry, io) catch {};
 
         var result = NativeFile{
             .allocator = allocator,
@@ -10681,6 +10682,7 @@ pub const NativeFile = struct {
             self.reader_pin_entry = null;
         }
         self.releaseCrossProcessRedoReaderSlot();
+        self.releaseRegionBinding();
         if (self.inode_lock_ref.load(.acquire)) |entry| {
             inode_lock.unref(entry, io);
             self.inode_lock_ref.store(null, .release);
@@ -11949,7 +11951,7 @@ pub const NativeFile = struct {
             // A full-graph snapshot reader always retains metadata, region
             // slot or not -- `registerFull` handles both uniformly now,
             // regardless of `indexed_reclamation`.
-            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, try self.regionForInode(), identity, reader.metadataReuseFrontier(), self.headerFingerprint());
+            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, try reader.regionForInode(), identity, reader.metadataReuseFrontier(), self.headerFingerprint());
         }
         return reader;
     }
@@ -12307,11 +12309,22 @@ pub const NativeFile = struct {
     /// fallback that would likely fail the same way.
     pub fn regionForInode(self: *NativeFile) !?*shared_lock_region.Region {
         if (builtin.is_test and self.test_region_unusable) return null;
+        if (self.region_binding.load(.acquire)) |binding| return &binding.region;
+        const io = self.runtime();
+        self.region_binding_mutex.lockUncancelable(io);
+        defer self.region_binding_mutex.unlock(io);
+        if (self.region_binding.load(.acquire)) |binding| return &binding.region;
         const entry = self.inode_lock_ref.load(.acquire) orelse return null;
-        return inode_lock.ensureRegion(entry, self.runtime()) catch |err| {
+        const binding = inode_lock.borrowRegion(entry, io) catch |err| {
             if (inode_lock.isRegionUnusable(err)) return null;
             return err;
         };
+        self.region_binding.store(binding, .release);
+        return &binding.region;
+    }
+
+    fn releaseRegionBinding(self: *NativeFile) void {
+        if (self.region_binding.swap(null, .acq_rel)) |binding| binding.release();
     }
 
     /// §9.3b: publishes `self.redo`'s current state (the checkpoint
@@ -23582,6 +23595,7 @@ pub const NativeFile = struct {
         prepared.releaseLifetimeWriterRegion();
         self.releaseCrossProcessRedoReaderSlot();
         prepared.releaseCrossProcessRedoReaderSlot();
+        prepared.releaseRegionBinding();
 
         std.mem.swap(std.Io.File, &self.file, &prepared.file);
         // `self.file` now holds the fd `prepared` had open on its own
@@ -23604,9 +23618,16 @@ pub const NativeFile = struct {
         // `inode_lock.zig`'s module doc comment), so this swap can only
         // ever change which entry a *future* acquire resolves to, never
         // which one an in-flight one releases against.
-        const self_entry = self.inode_lock_ref.load(.acquire);
-        self.inode_lock_ref.store(prepared_entry, .release);
-        prepared.inode_lock_ref.store(self_entry, .release);
+        {
+            self.region_binding_mutex.lockUncancelable(io);
+            defer self.region_binding_mutex.unlock(io);
+            // The prepared handle receives the old data generation and its
+            // cached region. The adopted handle resolves the destination anew.
+            prepared.region_binding.store(self.region_binding.swap(null, .acq_rel), .release);
+            const self_entry = self.inode_lock_ref.load(.acquire);
+            self.inode_lock_ref.store(prepared_entry, .release);
+            prepared.inode_lock_ref.store(self_entry, .release);
+        }
         const retired_header = self.header;
         self.header = prepared.header;
         prepared.header = retired_header;

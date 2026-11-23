@@ -5138,7 +5138,7 @@ pub const Store = struct {
     /// reopen on the next access still has to do the work later.
     fn reopenRegionAfterGenerationSwap(self: *Store) void {
         const io = self.file.runtime();
-        if (self.file.inode_lock_ref.load(.acquire)) |entry| _ = inode_lock.ensureRegion(entry, io) catch {};
+        if (self.file.inode_lock_ref.load(.acquire)) |entry| inode_lock.warmRegion(entry, io) catch {};
     }
 
     /// `from_background_worker`: see `maintainOnceWithCancel`'s own doc
