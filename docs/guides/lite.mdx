@@ -494,6 +494,10 @@ Lite builds embed the local inference runtime, and status advertises it by defau
 
 `zig build wasm` builds and installs the embedded database and inference WASM bundle, and `zig build wasm-test` runs its Node smoke test. `zig build lite-test` runs the Lite backend, CLI, C ABI, Go binding, embedded example, and packaging checks in one pass.
 
+## Upgrading Lite
+
+When upgrading to a build that uses lock-region format v6, stop every Lite process that has the database open before starting the upgraded processes. This includes read-only clients. A rolling restart can leave new readers waiting on an older writer's live lock region. The first upgraded opener rebuilds the coordination sidecar once the old processes have closed it. Keep the database and its sidecars in place during the restart.
+
 ## Maintenance
 
 ```bash

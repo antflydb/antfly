@@ -221,7 +221,7 @@ const Header = extern struct {
     /// rejecting its own freshly-written, uncorrupted bytes as corrupt on
     /// every reopen. `== header_bytes` below (not `<=`) keeps that
     /// invariant enforced at compile time for any future field addition.
-    _reserved: [4]u8 = @splat(0),
+    publication_release_epoch: std.atomic.Value(u32) = .init(0),
 
     // -- §9.3b: the cross-process WAL index. Also live/mutable, also
     // excluded from `header_checksum` for the same reason as the fields
@@ -645,8 +645,9 @@ const AdmissionWaiter = struct {
     ready: std.atomic.Value(u32) = .init(0),
 };
 var descriptor_waiters: std.AutoHashMapUnmanaged(u64, ?*AdmissionWaiter) = .empty;
-var test_fail_process_fd_identity = false;
-var test_fail_specific_process_fd: ?std.posix.fd_t = null;
+var test_fail_process_fd_identity: std.atomic.Value(bool) = .init(false);
+var test_fail_specific_process_fd: std.atomic.Value(std.posix.fd_t) = .init(-1);
+var test_pause_recovery: std.atomic.Value(u32) = .init(0);
 
 /// Resolves `db_path` to an absolute, symlink-resolved path before
 /// `openSized` derives its own `<db_path>.aflite-lock` sidecar name from
@@ -708,10 +709,10 @@ fn acquireProcessFd(io: Io, region_path: []const u8) !*FdEntry {
 
 fn acquireProcessFdUntil(io: Io, region_path: []const u8, deadline: ?Io.Timestamp) !*FdEntry {
     var until = deadline;
-    var attempted_repair = false;
+    var attempted_repair: [max_unidentified_descriptors]bool = @splat(false);
     while (true) {
         var waiter: AdmissionWaiter = .{};
-        return acquireProcessFdOnce(io, region_path, &attempted_repair, &waiter, until) catch |err| switch (err) {
+        return acquireProcessFdOnce(io, region_path, &attempted_repair, &waiter) catch |err| switch (err) {
             error.DescriptorOpening, error.ResampleDescriptorPath => {
                 const now = Io.Clock.now(.awake, io);
                 if (until == null) until = now.addDuration(.fromSeconds(30));
@@ -727,7 +728,7 @@ fn acquireProcessFdUntil(io: Io, region_path: []const u8, deadline: ?Io.Timestam
     }
 }
 
-fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool, waiter: *AdmissionWaiter, deadline: ?Io.Timestamp) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath, Timeout })!*FdEntry {
+fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *[max_unidentified_descriptors]bool, waiter: *AdmissionWaiter) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath })!*FdEntry {
     // A name past the filesystem limit cannot exist or be created. Refuse it
     // before `statFile`: Linux's statx wrapper treats ENAMETOOLONG as a
     // caller bug and panics in safe builds.
@@ -754,20 +755,7 @@ fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool
         }
     }
     fd_registry_mutex.unlock(io);
-    const pending = reserveDescriptor(io, device, region_path, path_identity, waiter, !attempted_repair.*) catch |err| retry: {
-        const quarantined_path = switch (err) {
-            error.DescriptorQuarantined => region_path,
-            error.DescriptorReserveFull => null,
-            else => |e| return e,
-        };
-        if (attempted_repair.*) return error.RegionUnavailable;
-        attempted_repair.* = true;
-        try resolveUnidentifiedDescriptors(io, device, quarantined_path, deadline);
-        break :retry reserveDescriptor(io, device, region_path, path_identity, waiter, false) catch |retry_err| switch (retry_err) {
-            error.DescriptorQuarantined, error.DescriptorReserveFull => return error.RegionUnavailable,
-            else => |e| return e,
-        };
-    };
+    const pending = try reserveDescriptor(io, device, region_path, path_identity, waiter, attempted_repair);
     // If another opener created the file after stat, sample the actual
     // inode again before we open a second fd that would have to be retained.
     const missing = path_identity == null;
@@ -800,7 +788,7 @@ fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool
     return RegionError.RegionUnavailable;
 }
 
-fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_identity.NativeFileIdentity, waiter: ?*AdmissionWaiter, try_quarantine: bool) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath, DescriptorQuarantined, DescriptorReserveFull })!*FdEntry {
+fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_identity.NativeFileIdentity, waiter: ?*AdmissionWaiter, attempted_repair: ?*[max_unidentified_descriptors]bool) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath })!*FdEntry {
     const page = std.heap.page_allocator;
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
@@ -812,21 +800,29 @@ fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_iden
 
     if (unidentified_by_device.getPtr(device)) |bucket| {
         var active_probe = false;
-        var recoverable = false;
+        var recoverable: ?usize = null;
         var occupied: usize = 0;
-        for (bucket) |slot| {
+        for (bucket, 0..) |slot, i| {
             const entry = slot orelse continue;
             if (std.mem.eql(u8, entry.unresolved_path.?, path)) {
-                if (!entry.probing_identity) return error.DescriptorQuarantined;
+                if (!entry.probing_identity) {
+                    const attempts = attempted_repair orelse return error.RegionUnavailable;
+                    if (attempts[i]) return error.RegionUnavailable;
+                    try startDescriptorRecovery(device, entry);
+                    attempts[i] = true;
+                }
                 try linkAdmissionWaiter(waiter, device, path);
                 return error.DescriptorOpening;
             }
             occupied += 1;
             active_probe = active_probe or entry.probing_identity;
-            recoverable = recoverable or (entry.fd != -1 and !entry.probing_identity);
+            if (!entry.probing_identity and attempted_repair != null and !attempted_repair.?[i] and recoverable == null) recoverable = i;
         }
         if (occupied == bucket.len) {
-            if (!active_probe or (try_quarantine and recoverable)) return error.DescriptorReserveFull;
+            if (recoverable) |i| {
+                try startDescriptorRecovery(device, bucket[i].?);
+                attempted_repair.?[i] = true;
+            } else if (!active_probe) return error.RegionUnavailable;
             try linkAdmissionWaiter(waiter, device, null);
             return error.DescriptorOpening;
         }
@@ -893,7 +889,7 @@ fn unreserveDescriptor(device: u64, pending: *FdEntry) void {
 }
 
 fn processFdIdentity(fd: std.posix.fd_t) !file_identity.NativeFileIdentity {
-    if (builtin.is_test and (test_fail_process_fd_identity or test_fail_specific_process_fd == fd)) return error.InputOutput;
+    if (builtin.is_test and (test_fail_process_fd_identity.load(.acquire) or test_fail_specific_process_fd.load(.acquire) == fd)) return error.InputOutput;
     return file_identity.nativeFileIdentity(fd);
 }
 
@@ -904,57 +900,42 @@ fn retainSpareDescriptor(entry: *FdEntry, spare: *FdEntry) void {
     entry.spare_descriptors = spare;
 }
 
-fn resolveUnidentifiedDescriptors(io: Io, device: u64, path: ?[]const u8, deadline: ?Io.Timestamp) error{Timeout}!void {
-    for (0..max_unidentified_descriptors) |i| {
-        fd_registry_mutex.lockUncancelable(io);
-        const bucket = unidentified_by_device.getPtr(device) orelse {
-            fd_registry_mutex.unlock(io);
-            return;
-        };
-        if (path == null and std.mem.indexOfScalar(?*FdEntry, bucket, null) != null) {
-            fd_registry_mutex.unlock(io);
-            return;
-        }
-        const pending = bucket[i];
-        if (pending == null or pending.?.probing_identity) {
-            fd_registry_mutex.unlock(io);
-            continue;
-        }
-        const entry = pending.?;
-        if (deadline) |until| {
-            if (Io.Clock.now(.awake, io).compare(.gte, until)) {
-                fd_registry_mutex.unlock(io);
-                return error.Timeout;
-            }
-        }
-        if (path) |name| {
-            if (!std.mem.eql(u8, name, entry.unresolved_path.?)) {
-                fd_registry_mutex.unlock(io);
-                continue;
-            }
-        }
-        entry.probing_identity = true;
-        fd_registry_mutex.unlock(io);
+// A recovery probe owns its reservation even if every original waiter
+// times out. It uses the process-lifetime runtime and never borrows one
+// from a caller that can return before the filesystem responds.
+fn startDescriptorRecovery(device: u64, entry: *FdEntry) RegionError!void {
+    if (builtin.single_threaded) return error.RegionUnavailable;
+    entry.probing_identity = true;
+    const worker = std.Thread.spawn(.{}, recoverDescriptor, .{ device, entry }) catch {
+        entry.probing_identity = false;
+        return error.RegionUnavailable;
+    };
+    worker.detach();
+}
 
-        const identity = processFdIdentity(entry.fd) catch null;
-
-        fd_registry_mutex.lockUncancelable(io);
-        defer fd_registry_mutex.unlock(io);
-        if (identity == null and fd_registry.count() != 0) {
-            entry.probing_identity = false;
-            wakeAdmissionWaiters(device, entry.unresolved_path.?);
-            continue;
+fn recoverDescriptor(device: u64, entry: *FdEntry) void {
+    if (builtin.is_test) {
+        while (test_pause_recovery.load(.acquire) != 0) {
+            antfly_platform.sync.rawFutexWaitShared(&test_pause_recovery.raw, 1, 10);
         }
-        unreserveDescriptor(device, entry);
-        if (identity) |known| {
-            if (fd_registry.get(known)) |registered| {
-                retainSpareDescriptor(registered, entry);
-                return;
-            }
-        }
-        closeSpareDescriptors(entry);
+    }
+    const io = Io.Threaded.global_single_threaded.io();
+    const identity = processFdIdentity(entry.fd) catch null;
+    fd_registry_mutex.lockUncancelable(io);
+    defer fd_registry_mutex.unlock(io);
+    if (identity == null and fd_registry.count() != 0) {
+        entry.probing_identity = false;
+        wakeAdmissionWaiters(device, entry.unresolved_path.?);
         return;
     }
+    unreserveDescriptor(device, entry);
+    if (identity) |known| {
+        if (fd_registry.get(known)) |registered| {
+            retainSpareDescriptor(registered, entry);
+            return;
+        }
+    }
+    closeSpareDescriptors(entry);
 }
 
 fn registerIdentifiedDescriptor(pending: *FdEntry, identity: file_identity.NativeFileIdentity) *FdEntry {
@@ -2885,10 +2866,13 @@ pub const Region = struct {
         self.publishLogStateWithPublisher(state, publisher);
     }
 
+    const publication_waiting: u128 = @as(u128, 1) << 127;
+
     fn publicationToken(self: *const Region) u128 {
         const slot = self.own_liveness_slot;
         const nonce = logNonces(self.mapping, self.header().max_readers)[slot].load(.acquire);
-        return (@as(u128, nonce) << 64) | (@as(u128, self.own_liveness_generation) << 32) | slot;
+        const tag = (nonce & std.math.maxInt(u62)) | (@as(u64, 1) << 62);
+        return (@as(u128, tag) << 64) | (@as(u128, self.own_liveness_generation) << 32) | slot;
     }
 
     fn tryOwnPublication(self: *const Region, token: u128) bool {
@@ -2897,9 +2881,17 @@ pub const Region = struct {
             const slot: u32 = @truncate(held);
             const generation: u32 = @truncate(held >> 32);
             if (slot < self.header().max_readers and !self.isReferenceDead(slot, generation)) return false;
-            return owner.cmpxchgStrong(held, token, .acq_rel, .acquire) == null;
+            return owner.cmpxchgStrong(held, token | (held & publication_waiting), .acq_rel, .acquire) == null;
         }
         return true;
+    }
+
+    fn releasePublication(self: *const Region) void {
+        if (self.publicationOwner().swap(0, .release) & publication_waiting != 0) {
+            const epoch = &self.header().publication_release_epoch;
+            _ = epoch.fetchAdd(1, .release);
+            futexWakeShared(&epoch.raw);
+        }
     }
 
     fn publishLogStateWithPublisher(self: *Region, state: LogState, publisher: u128) void {
@@ -2909,11 +2901,18 @@ pub const Region = struct {
         // refers to the publishing mapping, even when the visible publisher
         // is attributed to a separate fair writer lease.
         const owner = self.publicationOwner();
+        const epoch = &hdr.publication_release_epoch;
         while (!self.tryOwnPublication(token)) {
-            const generation = hdr.log_generation.load(.acquire);
-            antfly_platform.sync.rawFutexWaitShared(&hdr.log_generation.raw, generation, 1);
+            const before = epoch.load(.acquire);
+            const held = owner.load(.acquire);
+            if (held == 0) continue;
+            if (held & publication_waiting == 0 and
+                owner.cmpxchgStrong(held, held | publication_waiting, .acq_rel, .acquire) != null) continue;
+            // The timeout only serves as a liveness check if the publisher
+            // died without releasing the owner or sending a wake.
+            antfly_platform.sync.rawFutexWaitShared(&epoch.raw, before, 50);
         }
-        defer owner.store(0, .release);
+        defer self.releasePublication();
 
         // Sequential consistency still brackets the tuple and orders the
         // publisher's fold against readers publishing their pins.
@@ -3750,8 +3749,8 @@ test "shared lock region: identity failures are isolated to the unresolved path"
     defer releaseProcessFd(io, first);
 
     (try Io.Dir.cwd().createFile(io, retry_path, .{})).close(io);
-    test_fail_process_fd_identity = true;
-    defer test_fail_process_fd_identity = false;
+    test_fail_process_fd_identity.store(true, .release);
+    defer test_fail_process_fd_identity.store(false, .release);
     try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, retry_path));
     const device = (try file_identity.nativePathIdentity(retry_path)).device;
     const bucket = unidentified_by_device.get(device) orelse return error.MissingSpareDescriptor;
@@ -3767,13 +3766,13 @@ test "shared lock region: identity failures are isolated to the unresolved path"
 
     const cached = try acquireProcessFd(io, first_path);
     releaseProcessFd(io, cached);
-    test_fail_process_fd_identity = false;
-    test_fail_specific_process_fd = pending.fd;
-    defer test_fail_specific_process_fd = null;
+    test_fail_process_fd_identity.store(false, .release);
+    test_fail_specific_process_fd.store(pending.fd, .release);
+    defer test_fail_specific_process_fd.store(-1, .release);
     const unrelated = try acquireProcessFd(io, blocked_path);
     defer releaseProcessFd(io, unrelated);
     try std.testing.expect(unidentified_by_device.get(device).?[pending_slot] == pending);
-    test_fail_specific_process_fd = null;
+    test_fail_specific_process_fd.store(-1, .release);
     const recovered = try acquireProcessFd(io, retry_path);
     defer releaseProcessFd(io, recovered);
     try std.testing.expect(!unidentified_by_device.contains(device));
@@ -3827,7 +3826,7 @@ test "shared lock region: discarding quarantined descriptors wakes capacity wait
     const io = std.testing.io;
     var waiter: AdmissionWaiter = .{};
     const device = 1;
-    const pending = try reserveDescriptor(io, device, "discard", null, null, false);
+    const pending = try reserveDescriptor(io, device, "discard", null, null, null);
     {
         fd_registry_mutex.lockUncancelable(io);
         defer fd_registry_mutex.unlock(io);
@@ -3841,14 +3840,48 @@ test "shared lock region: discarding quarantined descriptors wakes capacity wait
     try std.testing.expect(!unidentified_by_device.contains(device));
 }
 
+test "shared lock region: admission times out independently of a stalled quarantine probe" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent = buf[0..try tmp.dir.realPath(io, &buf)];
+    const path = try std.fs.path.join(allocator, &.{ parent, "quarantined" });
+    defer allocator.free(path);
+    const device = (try file_identity.nativePathIdentity(parent)).device;
+    const entry = try reserveDescriptor(io, device, path, null, null, null);
+    var completion: AdmissionWaiter = .{};
+    {
+        fd_registry_mutex.lockUncancelable(io);
+        defer fd_registry_mutex.unlock(io);
+        pending_opens -= 1;
+        entry.fd = -2;
+        entry.probing_identity = false;
+        try linkAdmissionWaiter(&completion, device, path);
+    }
+    defer unlinkAdmissionWaiter(io, &completion);
+    test_pause_recovery.store(1, .release);
+    const deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(20));
+    const result = acquireProcessFdUntil(io, path, deadline);
+    test_pause_recovery.store(0, .release);
+    futexWakeShared(&test_pause_recovery.raw);
+    const cleanup_deadline = Io.Clock.now(.awake, io).addDuration(.fromSeconds(2));
+    try antfly_platform.sync.futexWaitSharedBounded(io, &completion.ready.raw, 0, cleanup_deadline);
+    try std.testing.expectEqual(@as(u32, 1), completion.ready.load(.acquire));
+    try std.testing.expectError(error.Timeout, result);
+}
+
 test "shared lock region: saturated reserve probes before waiting and stops at the first free slot" {
+    if (builtin.single_threaded) return error.SkipZigTest;
     const io = std.testing.io;
     const device = 1;
     var reservations: [max_unidentified_descriptors]*FdEntry = undefined;
     for (&reservations, 0..) |*reservation, i| {
         var buf: [32]u8 = undefined;
         const path = try std.fmt.bufPrint(&buf, "saturated-{d}", .{i});
-        reservation.* = try reserveDescriptor(io, device, path, null, null, false);
+        reservation.* = try reserveDescriptor(io, device, path, null, null, null);
     }
     defer {
         fd_registry_mutex.lockUncancelable(io);
@@ -3867,8 +3900,13 @@ test "shared lock region: saturated reserve probes before waiting and stops at t
         entry.probing_identity = false;
         pending_opens -= 1;
     }
-    try std.testing.expectError(error.DescriptorReserveFull, reserveDescriptor(io, device, "next", null, null, true));
-    try resolveUnidentifiedDescriptors(io, device, null, null);
+    var attempts: [max_unidentified_descriptors]bool = @splat(false);
+    var waiter: AdmissionWaiter = .{};
+    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, device, "next", null, &waiter, &attempts));
+    defer unlinkAdmissionWaiter(io, &waiter);
+    const deadline = Io.Clock.now(.awake, io).addDuration(.fromSeconds(1));
+    try antfly_platform.sync.futexWaitSharedBounded(io, &waiter.ready.raw, 0, deadline);
+    try std.testing.expectEqual(@as(u32, 1), waiter.ready.load(.acquire));
     var remaining: usize = 0;
     for (unidentified_by_device.get(device).?) |slot| {
         if (slot != null) remaining += 1;
@@ -3882,7 +3920,7 @@ test "shared lock region: descriptor reserves are independent per device" {
     for (&reservations, 0..) |*reservation, i| {
         var buf: [32]u8 = undefined;
         const path = try std.fmt.bufPrint(&buf, "device-one-{d}", .{i});
-        reservation.* = try reserveDescriptor(io, 1, path, null, null, false);
+        reservation.* = try reserveDescriptor(io, 1, path, null, null, null);
     }
     defer {
         fd_registry_mutex.lockUncancelable(io);
@@ -3893,9 +3931,9 @@ test "shared lock region: descriptor reserves are independent per device" {
             std.heap.page_allocator.destroy(reservation);
         }
     }
-    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-0", null, null, false));
-    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-extra", null, null, false));
-    const other = try reserveDescriptor(io, 2, "device-two", null, null, false);
+    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-0", null, null, null));
+    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-extra", null, null, null));
+    const other = try reserveDescriptor(io, 2, "device-two", null, null, null);
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
     pending_opens -= 1;
@@ -5838,6 +5876,8 @@ test "shared lock region: watermark takeover requires a dead publisher" {
     const token = observer.publicationToken();
     try std.testing.expect(publisher.tryOwnPublication(publisher.publicationToken()));
     publisher.tearLogStateForTest();
+    _ = publisher.publicationOwner().fetchOr(Region.publication_waiting, .acq_rel);
+    const release_epoch = observer.header().publication_release_epoch.load(.acquire);
     try std.testing.expect(!observer.tryOwnPublication(token));
     try std.testing.expect(observer.readLogStateChecked() == null);
 
@@ -5847,6 +5887,7 @@ test "shared lock region: watermark takeover requires a dead publisher" {
     const recovered: Region.LogState = .{ .checkpoint_sequence = 3, .durable_sequence = 5, .durable_offset = 512 };
     observer.publishLogState(recovered);
     try std.testing.expectEqual(recovered, observer.readLogState());
+    try std.testing.expectEqual(release_epoch +% 1, observer.header().publication_release_epoch.load(.acquire));
     try std.testing.expectEqual(@as(u128, 0), observer.publicationOwner().load(.acquire));
 }
 
