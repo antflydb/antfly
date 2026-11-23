@@ -652,8 +652,15 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                     try native.until(&durable, .idle, 2);
                     const ticket = try begin(&native, &durable, 60);
                     const fence = try execute(&durable, ticket);
-                    const session = try server.txn_sessions.beginForPrincipalWithSettings(a, .{ .sync_level = .propose, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, "alice", &.{}, connection);
-                    txn_id = session.txn_id;
+                    txn_id = transactions.newSessionTxnId(0);
+                    var live = try connections.load(&durable, a, connection, "alice", 0, 2);
+                    defer live.deinit();
+                    _ = try connections.mutateWithCommand(&durable, .{ .begin = .{ .id = connection, .expected_revision = live.value.revision, .txn_id = txn_id } }, "alice", 0, 2, &fence);
+                    _ = try server.txn_sessions.beginForPrincipalWithSettingsAndId(a, .{ .sync_level = .propose, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, "alice", &.{}, connection, txn_id);
+                    _ = try connections.mutateWithCommand(&durable, .{ .bind = .{ .id = connection, .txn_id = txn_id } }, "alice", 0, 2, &fence);
+                    var source_record = (try producer.load(&durable, a, connection)).?;
+                    defer source_record.deinit();
+                    try native.submit(source_record.value, .{ .bind = .{ .command = ticket.command, .transaction = txn_id } });
                     native.failure = fault;
                     native.fail_before = before;
                     var user: ?@import("../../http_server.zig").AuthenticatedIdentity = null;
