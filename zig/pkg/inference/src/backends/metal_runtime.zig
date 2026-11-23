@@ -28793,6 +28793,45 @@ pub fn tryApplyDenseRuntimeLinearInto(
 /// device tensors (rows of a resident cache slab), so the cache append needs
 /// no copy. Returns the freshly allocated Q, or null when the slots, shapes,
 /// or residency do not fit.
+inline fn denseLinearQkvSlotsReady(self: anytype, slots: [3]usize, in_dim: usize, q_dim: usize, kv_dim: usize) bool {
+    for (slots, 0..) |slot, index| {
+        if (slot >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, slot) or
+            self.raw_linear_slot_kinds[slot] != .dense or self.raw_linear_slot_in_dims[slot] != in_dim or
+            self.raw_linear_slot_out_dims[slot] != (if (index == 0) q_dim else kv_dim)) return false;
+    }
+    return true;
+}
+
+inline fn encodeDenseLinearQkvDevice(
+    runtime: *RawMetalDecodeRuntime,
+    slots: [3]usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    outputs: [3]MetalTensor,
+) c_int {
+    return termite_metal_decode_runtime_apply_linear_qkv_slots_device(
+        runtime,
+        slots[0],
+        slots[1],
+        slots[2],
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        rows,
+        in_dim,
+        q_dim,
+        kv_dim,
+        outputs[0].deviceHandle(),
+        outputs[0].deviceByteOffset(),
+        outputs[1].deviceHandle(),
+        outputs[1].deviceByteOffset(),
+        outputs[2].deviceHandle(),
+        outputs[2].deviceByteOffset(),
+    );
+}
+
 pub fn tryApplyDenseRuntimeLinearQkvInto(
     self: anytype,
     q_slot: usize,
@@ -28807,12 +28846,9 @@ pub fn tryApplyDenseRuntimeLinearQkvInto(
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return null;
     if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0 or in_dim > std.math.maxInt(i32) or q_out_dim > std.math.maxInt(i32) or kv_out_dim > std.math.maxInt(i32)) return null;
-    if (!rawLinearSlotPrepared(self, q_slot) or !rawLinearSlotPrepared(self, k_slot) or !rawLinearSlotPrepared(self, v_slot)) return null;
-    if (self.raw_linear_slot_kinds[q_slot] != .dense or self.raw_linear_slot_kinds[k_slot] != .dense or self.raw_linear_slot_kinds[v_slot] != .dense) return null;
-    if (self.raw_linear_slot_in_dims[q_slot] != in_dim or self.raw_linear_slot_in_dims[k_slot] != in_dim or self.raw_linear_slot_in_dims[v_slot] != in_dim or
-        self.raw_linear_slot_out_dims[q_slot] != q_out_dim or self.raw_linear_slot_out_dims[k_slot] != kv_out_dim or self.raw_linear_slot_out_dims[v_slot] != kv_out_dim) return null;
+    const slots = [3]usize{ q_slot, k_slot, v_slot };
+    if (!denseLinearQkvSlotsReady(self, slots, in_dim, q_out_dim, kv_out_dim)) return null;
     if (!input.isDevice() or !k_out.isDevice() or !v_out.isDevice()) return null;
     if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != 1 or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
     if (k_out.ndim() != 2 or @as(usize, @intCast(k_out.dim(0))) != 1 or @as(usize, @intCast(k_out.dim(1))) != kv_out_dim) return null;
@@ -28820,24 +28856,7 @@ pub fn tryApplyDenseRuntimeLinearQkvInto(
     const q_shape = [_]i32{ 1, @intCast(q_out_dim) };
     var q_device = try MetalTensor.deviceAllocate(runtime, q_out_dim * @sizeOf(f32), .private, &q_shape);
     errdefer q_device.deinit();
-    const device_rc = termite_metal_decode_runtime_apply_linear_qkv_slots_device(
-        runtime,
-        q_slot,
-        k_slot,
-        v_slot,
-        input.deviceHandle(),
-        input.deviceByteOffset(),
-        1,
-        in_dim,
-        q_out_dim,
-        kv_out_dim,
-        q_device.deviceHandle(),
-        q_device.deviceByteOffset(),
-        k_out.deviceHandle(),
-        k_out.deviceByteOffset(),
-        v_out.deviceHandle(),
-        v_out.deviceByteOffset(),
-    );
+    const device_rc = encodeDenseLinearQkvDevice(runtime, slots, input, 1, in_dim, q_out_dim, kv_out_dim, .{ q_device, k_out, v_out });
     if (device_rc == 0) return q_device;
     q_device.deinit();
     return null;
@@ -28880,24 +28899,7 @@ pub fn tryApplyDenseRuntimeLinearQkv(
         errdefer k_device.deinit();
         var v_device = try MetalTensor.deviceAllocate(runtime, kv_bytes, .private, &kv_shape);
         errdefer v_device.deinit();
-        const device_rc = termite_metal_decode_runtime_apply_linear_qkv_slots_device(
-            runtime,
-            q_slot,
-            k_slot,
-            v_slot,
-            input.deviceHandle(),
-            input.deviceByteOffset(),
-            rows,
-            in_dim,
-            q_out_dim,
-            kv_out_dim,
-            q_device.deviceHandle(),
-            q_device.deviceByteOffset(),
-            k_device.deviceHandle(),
-            k_device.deviceByteOffset(),
-            v_device.deviceHandle(),
-            v_device.deviceByteOffset(),
-        );
+        const device_rc = encodeDenseLinearQkvDevice(runtime, .{ q_slot, k_slot, v_slot }, input, rows, in_dim, q_out_dim, kv_out_dim, .{ q_device, k_device, v_device });
         if (device_rc == 0) {
             return .{
                 .first = q_device,
@@ -50978,12 +50980,11 @@ pub fn tryApplyDenseRuntimeLinearPairAssigned(self: anytype, slot_a: usize, slot
 
 pub fn tryApplyDenseRuntimeLinearQkvAssigned(self: anytype, q_slot: usize, k_slot: usize, v_slot: usize, input: MetalTensor, rows: usize, in_dim: usize, q_dim: usize, kv_dim: usize, q: MetalTensor, k: MetalTensor, v: MetalTensor, workspace: ?MetalTensor) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
-    if (!input.isDevice() or !q.isDevice() or !k.isDevice() or !v.isDevice() or rows == 0 or in_dim == 0 or q_dim == 0 or kv_dim == 0 or q_slot >= decoder_runtime_linear_slot_capacity or k_slot >= decoder_runtime_linear_slot_capacity or v_slot >= decoder_runtime_linear_slot_capacity) return false;
-    for ([_]usize{ q_slot, k_slot, v_slot }, 0..) |slot, index| {
-        if (!rawLinearSlotPrepared(self, slot) or self.raw_linear_slot_kinds[slot] != .dense or self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != (if (index == 0) q_dim else kv_dim)) return false;
-    }
+    if (!input.isDevice() or !q.isDevice() or !k.isDevice() or !v.isDevice() or rows == 0 or in_dim == 0 or q_dim == 0 or kv_dim == 0) return false;
+    const slots = [3]usize{ q_slot, k_slot, v_slot };
+    if (!denseLinearQkvSlotsReady(self, slots, in_dim, q_dim, kv_dim)) return false;
     if (!denseRegionShape(input, rows, in_dim) or !denseRegionShape(q, rows, q_dim) or !denseRegionShape(k, rows, kv_dim) or !denseRegionShape(v, rows, kv_dim)) return false;
-    if (rows == 1) return assignedDenseDispatch(termite_metal_decode_runtime_apply_linear_qkv_slots_device(runtime, q_slot, k_slot, v_slot, input.deviceHandle(), input.deviceByteOffset(), rows, in_dim, q_dim, kv_dim, q.deviceHandle(), q.deviceByteOffset(), k.deviceHandle(), k.deviceByteOffset(), v.deviceHandle(), v.deviceByteOffset()));
+    if (rows == 1) return assignedDenseDispatch(encodeDenseLinearQkvDevice(runtime, slots, input, rows, in_dim, q_dim, kv_dim, .{ q, k, v }));
     if (!hasActiveFrame(runtime) or getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return false;
     const packed_workspace = workspace orelse return false;
     const twice_kv = std.math.mul(usize, kv_dim, 2) catch return false;
