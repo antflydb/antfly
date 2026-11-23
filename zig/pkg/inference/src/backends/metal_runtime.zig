@@ -28998,15 +28998,24 @@ pub fn tryApplyQuantizedRuntimeLinearInto(
     if (out.ndim() != 2 or @as(usize, @intCast(out.dim(0))) != rows or @as(usize, @intCast(out.dim(1))) != out_dim) return false;
     const kind = ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
     if (kind == .none or referenceQuantizedRuntimeLinearDebug()) return false;
-    if (!quantizedRuntimeLinearKindHasSingleStageDeviceKernel(kind)) return false;
-    if (kind == .q4_0 and rows == 1 and !q4_0SingleRowDeviceLinearEnabled()) return false;
+    const format = quantizedLinearIntoFormat(self, slot, kind, rows, in_dim, out_dim) orelse return false;
+    return dispatchQuantizedLinearInto(self, runtime, format, slot, input, rows, in_dim, out_dim, out);
+}
+
+fn quantizedLinearIntoFormat(self: anytype, slot: usize, kind: RawQuantizedRuntimeLinearKind, rows: usize, in_dim: usize, out_dim: usize) ?MetalQuantFormat {
+    if (!quantizedRuntimeLinearKindHasSingleStageDeviceKernel(kind)) return null;
+    if (kind == .q4_0 and rows == 1 and !q4_0SingleRowDeviceLinearEnabled()) return null;
     const format = metalQuantFormatForKind(kind);
-    if (format == .unsupported) return false;
+    if (format == .unsupported) return null;
     if (kind != .tl1 and kind != .tl2) {
-        const storage = self.raw_linear_slot_quantized_storage[slot] orelse return false;
-        const descriptor = packedWeightDescriptorForMatrix(storage, in_dim, out_dim, format) orelse return false;
-        if (!descriptor.supported()) return false;
+        const storage = self.raw_linear_slot_quantized_storage[slot] orelse return null;
+        const descriptor = packedWeightDescriptorForMatrix(storage, in_dim, out_dim, format) orelse return null;
+        if (!descriptor.supported()) return null;
     }
+    return format;
+}
+
+fn dispatchQuantizedLinearInto(self: anytype, runtime: *RawMetalDecodeRuntime, format: MetalQuantFormat, slot: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, out: MetalTensor) !bool {
     const rc = termite_metal_decode_runtime_apply_quantized_linear_slot_device(
         runtime,
         @backingInt(format),
@@ -29021,7 +29030,8 @@ pub fn tryApplyQuantizedRuntimeLinearInto(
     );
     if (rc != 0) return false;
     var out_mut = out;
-    return applyRuntimeLinearBiasDevice(self, slot, &out_mut, rows, out_dim);
+    if (!applyRuntimeLinearBiasDevice(self, slot, &out_mut, rows, out_dim)) return error.MetalProjectionBiasDispatchFailed;
+    return true;
 }
 
 /// Quantized counterpart of `tryApplyDenseRuntimeLinearQkvInto`: the fused
@@ -29099,15 +29109,18 @@ pub fn tryApplyQuantizedRuntimeLinearQkvInto(
             {
                 return q_device;
             }
-            q_device.deinit();
-            return null;
+            return error.MetalProjectionBiasDispatchFailed;
         }
         q_device.deinit();
     }
     // Mixed or unfused formats: separate kernels, still into the slab rows.
-    if (!try tryApplyQuantizedRuntimeLinearInto(self, k_slot, input, 1, in_dim, kv_out_dim, k_out)) return null;
-    if (!try tryApplyQuantizedRuntimeLinearInto(self, v_slot, input, 1, in_dim, kv_out_dim, v_out)) return null;
-    return try tryApplyQuantizedRuntimeLinear(self, q_slot, input, 1, in_dim, q_out_dim);
+    const k_format = quantizedLinearIntoFormat(self, k_slot, k_kind, 1, in_dim, kv_out_dim) orelse return null;
+    const v_format = quantizedLinearIntoFormat(self, v_slot, v_kind, 1, in_dim, kv_out_dim) orelse return null;
+    if (!try dispatchQuantizedLinearInto(self, runtime, k_format, k_slot, input, 1, in_dim, kv_out_dim, k_out)) return null;
+    // K has already been encoded into a caller-owned row. A subsequent
+    // decline cannot reopen the compatibility path for this invocation.
+    if (!try dispatchQuantizedLinearInto(self, runtime, v_format, v_slot, input, 1, in_dim, kv_out_dim, v_out)) return error.MetalProjectionIncomplete;
+    return (try tryApplyQuantizedRuntimeLinear(self, q_slot, input, 1, in_dim, q_out_dim)) orelse error.MetalProjectionIncomplete;
 }
 
 pub fn tryApplyQuantizedRuntimeLinearQkv(
