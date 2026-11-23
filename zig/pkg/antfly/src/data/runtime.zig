@@ -51337,7 +51337,7 @@ fn consumerTests() type {
                 defer a.destroy(meta_store);
                 meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
                 defer meta_store.deinit();
-                var feed_svc: feed_fixture.Service = .{ .store = meta_store, .id = @splat(6), .authority = grant.authority, .max_topology_protocol = feed_control.physical_history_protocol_version };
+                var feed_svc: feed_fixture.Service = .{ .store = meta_store, .id = @splat(6), .authority = grant.authority, .max_topology_protocol = feed_control.native_collection_protocol_version };
                 const feed_table: antfly.metadata.table_manager.TableRecord = .{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" };
                 try meta_store.applyStandaloneCommand(feed_svc.metadata_group_id, .{ .upsert_table = feed_table });
                 try feed_svc.mutate(a, .{ .create = .{ .id = feed_svc.id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = feed_control.tableBinding(feed_table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
@@ -51431,10 +51431,16 @@ fn consumerTests() type {
                         var pulled = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
                         defer pulled.deinit();
                         try std.testing.expectEqualStrings("{\"version\":1,\"events\":[],\"transaction\":null}", pulled.body);
-                        var replayed = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
-                        defer replayed.deinit();
-                        try std.testing.expect(replayed.replayed);
-                        try std.testing.expectEqual(pulled.cursor, replayed.cursor);
+                        // An idle pull is a heartbeat and has no stored delivery
+                        // receipt. Repeating it leaves the cursor and sequence unchanged.
+                        var repeated = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
+                        defer repeated.deinit();
+                        try std.testing.expect(!pulled.replayed and !repeated.replayed);
+                        try std.testing.expectEqual(state.value.latest_cursor, pulled.cursor);
+                        try std.testing.expectEqual(state.value.latest_delivery, pulled.sequence);
+                        try std.testing.expectEqual(pulled.cursor, repeated.cursor);
+                        try std.testing.expectEqual(pulled.sequence, repeated.sequence);
+                        try std.testing.expectEqualStrings(pulled.body, repeated.body);
                     }
                 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
@@ -51646,12 +51652,15 @@ fn consumerTests() type {
                             {
                                 svc.lose_ack_at = svc.proposals + 1;
                                 defer svc.lose_ack_at = null;
-                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{}));
+                                // The durable metadata read confirms this ACK
+                                // even when its original apply reply was lost.
+                                var confirmed = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{});
+                                defer confirmed.deinit();
+                                try std.testing.expectEqual(snapshot.page.cursor, confirmed.acknowledged);
                             }
                             const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
                             const metadata_port = http_api.source.changefeeds.?;
                             try std.testing.expectError(error.Forbidden, api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, .{}));
-                            try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
                             const LostRelease = struct {
                                 fn reach(_: *anyopaque, event: DataRequestLifecycleEvent) !void {
                                     if (event.phase == .proposal_accepted) return error.InjectedSnapshotReleaseReplyLoss;
@@ -51660,8 +51669,9 @@ fn consumerTests() type {
                             {
                                 node.data_request_lifecycle_hook = .{ .ptr = node, .reach_fn = LostRelease.reach };
                                 defer node.data_request_lifecycle_hook = null;
-                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{}));
+                                try std.testing.expectError(error.MetadataMutationOutcomeUnknown, api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance));
                             }
+                            try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
                             var ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = snapshot.page.cursor }, null, .{});
                             defer ack.deinit();
                             const bytes = try svc.store.getChangefeedControl(allocator, svc.metadata_group_id, created.id);
@@ -51696,7 +51706,8 @@ fn consumerTests() type {
                         defer current.deinit();
                         const item = current.value.roots[0];
                         try std.testing.expectEqual(item.start + 1, item.acknowledged.sequence);
-                        try std.testing.expectEqual(item.acknowledged.sequence, item.reclaimed_through);
+                        try std.testing.expectEqual(item.start, item.reclaimed_through);
+                        try std.testing.expect(current.value.pendingNativeAcknowledgment() != null);
                         const before_collect = blk: {
                             lockAtomic(&node.data_raft_mutex);
                             defer node.data_raft_mutex.unlock();
@@ -51708,7 +51719,32 @@ fn consumerTests() type {
                         {
                             lockAtomic(&node.data_raft_mutex);
                             defer node.data_raft_mutex.unlock();
-                            try std.testing.expectEqual(before_collect + 1, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
+                            try std.testing.expectEqual(before_collect, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
+                        }
+                        const metadata_port = http_api.source.changefeeds.?;
+                        const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
+                        try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
+                        {
+                            const collected_bytes = try metadata_port.read(allocator, created.id, maintenance);
+                            defer allocator.free(collected_bytes);
+                            var collected = try feed_control.parse(allocator, collected_bytes);
+                            defer collected.deinit();
+                            const collected_root = collected.value.roots[0];
+                            try std.testing.expectEqual(item.acknowledged.sequence, collected_root.reclaimed_through);
+                            try std.testing.expectEqual(item.acknowledged.sequence, collected_root.native_collected_through.?);
+                            try std.testing.expect(collected.value.pendingNativeAcknowledgment() == null);
+                        }
+                        const after_collect = blk: {
+                            lockAtomic(&node.data_raft_mutex);
+                            defer node.data_raft_mutex.unlock();
+                            break :blk node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index;
+                        };
+                        try std.testing.expectEqual(before_collect + 2, after_collect);
+                        try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, created.id, maintenance);
+                        {
+                            lockAtomic(&node.data_raft_mutex);
+                            defer node.data_raft_mutex.unlock();
+                            try std.testing.expectEqual(after_collect, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
                         }
                         feed_catalog.logical_name = "renamed_docs";
                         try std.testing.expectError(error.Forbidden, api.execute(http_api, allocator, credential, .{ .id = created.id, .after = ack.acknowledged }, .{}, .{}));
@@ -51734,8 +51770,6 @@ fn consumerTests() type {
                         try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
 
                         const expiring = try api.create(http_api, allocator, credential, "expiring-feed", definition, .{});
-                        const metadata_port = http_api.source.changefeeds.?;
-                        const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
                         const active_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
                         defer allocator.free(active_bytes);
                         var active_feed = try feed_control.parse(allocator, active_bytes);
