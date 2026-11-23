@@ -10187,7 +10187,7 @@ pub fn applyAttentionWithCleanup(
     decode_context: ?*const DecodeContext,
     cleanup: ?*const @import("../execution/cleanup_context.zig").Context,
 ) !CT {
-    try validateForwardCleanup(cb, cleanup);
+    try validateDecoderForwardCleanup(cb, cleanup, decode_context);
     return applyAttentionWithSinkWithCleanup(cb, config, Q, K, V, null, batch, seq_len, num_heads, num_kv_heads, head_dim, layer, kv_layer_index, skip_kv_write, decode_context, cleanup);
 }
 
