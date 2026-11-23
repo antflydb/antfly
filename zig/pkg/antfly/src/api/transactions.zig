@@ -1996,10 +1996,18 @@ pub const DurableSessionStore = struct {
         return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, &std.fmt.bytesToHex(id, .lower) });
     }
 
-    fn readObservationReference(txn: anytype, key: []const u8) !?[16]u8 {
+    fn readObservationReference(self: *DurableSessionStore, txn: anytype, key: []const u8, id: [16]u8) !?[16]u8 {
         const value = txn.get(key) catch |err| if (err == error.NotFound) return null else return err;
         if (value.len != 16) return error.InvalidTransactionSessionRecord;
-        return value[0..16].*;
+        const reference = value[0..16].*;
+        var record = (try self.registrationOutboxFor(reference).load(txn, self.alloc, reference)) orelse return error.InvalidTransactionSessionRecord;
+        defer record.deinit();
+        if (record.value.observation != true or !record.value.prepared or !record.value.execution_admitted)
+            return error.InvalidTransactionSessionRecord;
+        const encoded = record.value.outcome.transaction_id orelse return error.InvalidTransactionSessionRecord;
+        const target = distributed_txn.parseTxnIdHex(encoded) catch return error.InvalidTransactionSessionRecord;
+        if (!std.mem.eql(u8, &target, &id)) return error.InvalidTransactionSessionRecord;
+        return reference;
     }
 
     pub fn existingObservationReference(self: *DurableSessionStore, id: [16]u8) !?[16]u8 {
@@ -2009,12 +2017,12 @@ pub const DurableSessionStore = struct {
             .docstore => |store| result: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :result try readObservationReference(&txn, key);
+                break :result try self.readObservationReference(&txn, key, id);
             },
             .runtime => |store| result: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :result try readObservationReference(&txn, key);
+                break :result try self.readObservationReference(&txn, key, id);
             },
         };
     }
@@ -2038,13 +2046,7 @@ pub const DurableSessionStore = struct {
                 var observation_buf: [128]u8 = undefined;
                 const observation_key = if (value.observe_only) try self.observationRegistrationKey(value.local_transaction_id.?, &observation_buf) else null;
                 if (observation_key) |key| {
-                    if (txn.get(key)) |previous| {
-                        if (previous.len != 16) return error.InvalidTransactionSessionRecord;
-                        const reference = previous[0..16].*;
-                        var current = (try self.registrationOutboxFor(reference).load(txn, self.alloc, reference)) orelse return error.InvalidTransactionSessionRecord;
-                        defer current.deinit();
-                        return reference;
-                    } else |err| if (err != error.NotFound) return err;
+                    if (try self.readObservationReference(txn, key, value.local_transaction_id.?)) |reference| return reference;
                 }
                 const floor: ?u64 = if (value.observe_only) null else (try outbox.producer(txn, self.alloc, value.seed)).retired_through;
                 const reference = try outbox.create(txn, self.alloc, value.seed, value.outcome, value.prepared);
@@ -12522,4 +12524,37 @@ test "distributed txn ordinary expiry retries an unprocessed page after a storag
     durable.fail_writes_for_test = false;
     try std.testing.expectEqual(@as(usize, 2), try registry.cleanupExpired(alloc, cutoff));
     try std.testing.expect(!registry.hasSessionCleanupBacklog(false));
+}
+
+test "distributed txn observation reuse rejects a different transaction on both lookup cuts" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/observation-identity" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(alloc);
+    const original = try registry.begin(alloc, .{}, 0);
+    const other = try registry.begin(alloc, .{}, 0);
+    const original_hex = std.fmt.bytesToHex(original.txn_id, .lower);
+    const other_hex = std.fmt.bytesToHex(other.txn_id, .lower);
+    const reference = try durable.createLocalObservedRegistration(@splat(1), .{ .transaction_id = &other_hex }, other.txn_id);
+    {
+        var key_buf: [128]u8 = undefined;
+        const key = try durable.observationRegistrationKey(original.txn_id, &key_buf);
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(key, &reference);
+        try write.commit();
+    }
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, durable.existingObservationReference(original.txn_id));
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, durable.registrationMutation(.{ .create = .{
+        .seed = @splat(2),
+        .outcome = .{ .transaction_id = &original_hex },
+        .prepared = true,
+        .local_transaction_id = original.txn_id,
+        .observe_only = true,
+    } }));
+    try std.testing.expectEqual(@as(?[16]u8, reference), try durable.existingObservationReference(other.txn_id));
 }

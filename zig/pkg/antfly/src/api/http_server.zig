@@ -14326,13 +14326,18 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub const SessionForwardOwner = union(enum) {
+        lookup,
+        resolved: ?u64,
+    };
+
     pub const SessionForwardRequest = struct {
         method: contextual_operations.Method,
         target: []const u8,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8 = null,
         sql_fence: ?[]const u8 = null,
-        bounded_owner_lookup: bool = false,
+        owner: SessionForwardOwner = .lookup,
         content_type: ?[]const u8,
         body: []const u8,
     };
@@ -14373,7 +14378,7 @@ pub const ApiHttpServer = struct {
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,
-        }, request.bounded_owner_lookup)) orelse return null;
+        }, request.owner)) orelse return null;
         defer response.deinit(self.alloc);
 
         return try self.cloneForwardedResponse(response);
@@ -14405,6 +14410,12 @@ pub const ApiHttpServer = struct {
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
         if (self.txn_sessions.durable) |store| if (try routing.ownsLocal(store, id, kind, router.localNodeId())) return null;
+        return self.forwardSQLResourceToOwner(owner, request, forwarded);
+    }
+
+    pub fn forwardSQLResourceToOwner(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest, forwarded: *bool) !?contextual_operations.OwnedResponse {
+        const router = self.cfg.session_router orelse return null;
+        if (owner == 0 or owner == router.localNodeId()) return null;
         const executor = self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
         const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return null;
         defer self.alloc.free(base);
@@ -14439,16 +14450,17 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest, bounded_owner_lookup: bool) !?http_common.HttpResponse {
+    fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest, route: SessionForwardOwner) !?http_common.HttpResponse {
         // A replicated receipt read has its own linearizable barrier. Its
         // availability must not depend on the original execution owner's life.
         if (req.method == .GET and self.txn_sessions.durableMissIsAuthoritative()) return null;
         const router = self.cfg.session_router orelse return null;
         const session_executor = self.cfg.session_executor orelse return null;
-        const owner = if (bounded_owner_lookup)
-            try self.sessionRoutingOwner(txn_id)
-        else
-            try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id);
+        const owner = switch (route) {
+            .lookup => try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id),
+            .resolved => |owner| owner,
+        };
+        const bounded_owner_lookup = route == .resolved;
         const owner_node_id = owner orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null
