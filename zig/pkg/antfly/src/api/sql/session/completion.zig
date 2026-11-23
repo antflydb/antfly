@@ -798,7 +798,7 @@ pub fn retireSettledObservations(server: *server_mod.ApiHttpServer, alloc: std.m
 pub fn recoverUnpublished(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize) !void {
     if (server.txn_sessions.durable == null) return;
     const recovering_legacy = !server.sql_completion_cold_scan_done;
-    const slice_ns = if (recovering_legacy) std.time.ns_per_s else 2 * std.time.ns_per_s;
+    const slice_ns: u64 = if (recovering_legacy) std.time.ns_per_s else 2 * std.time.ns_per_s;
     const live = recoverLivePublications(server, alloc, limit, recoveryContext(slice_ns));
     // A failing live owner or an exhausted slice must leave the cold pass a
     // chance to reclaim unrelated registrations written by older binaries.
