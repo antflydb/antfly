@@ -158,8 +158,35 @@ pub const Recovery = struct {
         // Validate and retain every original route before any recovery write.
         const fences = try a.alloc(metadata.CatalogRouteFence, admission.participants.len);
         defer a.free(fences);
+        var refreshed_lease = coordinator_fence.topology_epoch != coordinator.topology_epoch;
         for (admission.participants, fences) |member, *fence| {
-            fence.* = try routeRetainedOwner(&session, (member.routed_owner orelse return error.ChangefeedCapabilityUnsupported), member.locator, budget, context);
+            const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
+            fence.* = if (source_expected != null)
+                try routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context)
+            else
+                try routeRetainedOwner(&session, owner, member.locator, budget, context);
+            refreshed_lease = refreshed_lease or fence.topology_epoch != owner.topology_epoch;
+        }
+        // A changed lease can still prove work completed before the change.
+        // Leave unresolved actions pending until terminal replay is qualified.
+        if (refreshed_lease and !decision.record.acknowledgments_pending) {
+            if (source_expected == null) return .incomplete;
+            const manifest = try decision.committedManifest();
+            var certificate: ?completion.Digest = null;
+            for (admission.participants, fences) |member, fence| {
+                try self.checkpoint(context);
+                const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
+                const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+                const input: publication_ops.Request = .{ .version = 1, .owner = owner, .transaction_id = transaction_id, .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .minimum_applied_index = 1 };
+                const observed_publication = try self.publications.read(a, fence, locator.table_name, input, context);
+                try observed_publication.validate(input.binding());
+                const evidence = observed_publication.publication orelse return .incomplete;
+                if (certificate) |expected| {
+                    if (!std.meta.eql(expected, evidence.digest)) return error.DecisionConflict;
+                } else certificate = evidence.digest;
+            }
+            try self.checkpoint(context);
+            return .complete;
         }
         if (decision.record.status == .aborted) {
             for (fences, 0..) |fence, index| {
@@ -181,6 +208,7 @@ pub const Recovery = struct {
             var receipt = try self.resolutions.read(a, fence, locator.table_name, input, context);
             try receipt.validate(input.binding());
             if (receipt.resolution == null) {
+                if (fence.topology_epoch != owner.topology_epoch) return .incomplete;
                 // A positive durable coordinator COMMIT, not absence, authorizes
                 // idempotent terminal resolution. BEGIN/PREPARE are forbidden.
                 try self.checkpoint(context);
@@ -222,6 +250,14 @@ pub const Recovery = struct {
 };
 
 pub fn routeRetainedOwner(session: *catalog_api.RoutingSession, owner: completion.RoutedOwner, locator_bytes: []const u8, budget: catalog_api.RoutingBudget, context: Context) !metadata.CatalogRouteFence {
+    return routeRetainedOwnerAtEpoch(session, owner, locator_bytes, budget, context, false);
+}
+
+pub fn routeRetainedOwnerForCleanup(session: *catalog_api.RoutingSession, owner: completion.RoutedOwner, locator_bytes: []const u8, budget: catalog_api.RoutingBudget, context: Context) !metadata.CatalogRouteFence {
+    return routeRetainedOwnerAtEpoch(session, owner, locator_bytes, budget, context, true);
+}
+
+fn routeRetainedOwnerAtEpoch(session: *catalog_api.RoutingSession, owner: completion.RoutedOwner, locator_bytes: []const u8, budget: catalog_api.RoutingBudget, context: Context, cleanup: bool) !metadata.CatalogRouteFence {
     try context.ensureActive();
     try owner.validate();
     const locator = local.api_local_transaction_contract.parseParticipantRef(locator_bytes) orelse return error.InvalidParticipant;
@@ -229,7 +265,7 @@ pub fn routeRetainedOwner(session: *catalog_api.RoutingSession, owner: completio
     const snapshot = session.snapshot.value;
     if (snapshot.metadata_group_id != owner.metadata_group_id or snapshot.metadata_incarnation == null or !std.mem.eql(u8, &snapshot.metadata_incarnation.?, &owner.metadata_incarnation)) return error.TopologyChanged;
     const view = try session.tableRoutingView(locator.table_name, budget);
-    if (view.table_id != std.mem.readInt(u64, owner.namespace[0..8], .big) or view.topology_epoch != owner.topology_epoch) return error.TopologyChanged;
+    if (view.table_id != std.mem.readInt(u64, owner.namespace[0..8], .big) or (if (cleanup) view.topology_epoch < owner.topology_epoch else view.topology_epoch != owner.topology_epoch)) return error.TopologyChanged;
     const table = snapshot.tables[session.table_id_indexes.get(view.table_id) orelse return error.TopologyChanged];
     if (table.storage.engine != .local or table.routing_storage_binding == null) return error.ChangefeedCapabilityUnsupported;
     if (!std.mem.eql(u8, &@import("../metadata/changefeed_control.zig").tableBinding(table), &owner.table_binding)) return error.TopologyChanged;
@@ -237,7 +273,7 @@ pub fn routeRetainedOwner(session: *catalog_api.RoutingSession, owner: completio
     const shard = tables.rangeDocIdentityShardId(range.*);
     const range_id = tables.rangeDocIdentityRangeId(range.*);
     if (shard != std.mem.readInt(u64, owner.namespace[8..16], .big) or range_id != std.mem.readInt(u64, owner.namespace[16..24], .big)) return error.TopologyChanged;
-    const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = owner.metadata_group_id, .metadata_incarnation = owner.metadata_incarnation, .catalog_revision = snapshot.catalog_revision, .table_id = view.table_id, .topology_epoch = owner.topology_epoch, .route = .{ .group_id = owner.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = view.table_id, .shard_id = shard, .range_id = range_id } }, .admission_deadline_ns = context.deadline_ns, .admission_deadline_io = context.deadline_io, .admission_cancellation = context.cancellation };
+    const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = owner.metadata_group_id, .metadata_incarnation = owner.metadata_incarnation, .catalog_revision = snapshot.catalog_revision, .table_id = view.table_id, .topology_epoch = view.topology_epoch, .route = .{ .group_id = owner.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = view.table_id, .shard_id = shard, .range_id = range_id } }, .admission_deadline_ns = context.deadline_ns, .admission_deadline_io = context.deadline_io, .admission_cancellation = context.cancellation };
     try fence.validate();
     try budget.checkpoint();
     return fence;
@@ -804,6 +840,17 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     fake.absent = false;
     try std.testing.expectEqual(resolutions_before_bound, fake.resolves);
     try std.testing.expectEqual(publications_before_bound, fake.publishes);
+    var newer_source_fence = source_fence;
+    newer_source_fence.topology_epoch += 1;
+    fake.state.acknowledgments_pending = false;
+    fake.publication_digest = @splat(27);
+    fake.published = .{ true, false };
+    try std.testing.expectEqual(.incomplete, try recovery.runSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, expected, .{}));
+    fake.published[1] = true;
+    try std.testing.expectEqual(.complete, try recovery.runSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, expected, .{}));
+    try std.testing.expectEqual(resolutions_before_bound, fake.resolves);
+    try std.testing.expectEqual(publications_before_bound, fake.publishes);
+    fake.state = committed_record;
     fake.resolved = .{ true, false };
     fake.published = .{ false, false };
     const destination = @import("source_destination_plan.zig");
@@ -849,7 +896,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         lose_reply: bool = true,
 
         pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
-        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, _: u16) !void {}
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, _: u16) error{TableTopologyProtocolUpgradeRequired}!void {}
         pub fn projectedStore(self: *@This()) ?*@This() {
             return self;
         }
@@ -877,10 +924,10 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     var journal: ActorMetadata = .{ .alloc = actor_alloc, .state = actor_state };
     const source_completion = @import("source_destination_completion.zig");
     const actor_admission: @import("source_destination_admission.zig").Admission = .{ .coordinator = coordinator, .artifacts = undefined, .checkpoints = undefined };
-    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.recover(&journal, actor_admission, a, actor_scope, @splat(32), .{}));
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.recover(&journal, actor_admission, a, journal.state, @splat(32), .{}));
     try std.testing.expectEqual(@as(u64, 1), journal.state.committed.sequence);
     try std.testing.expectEqual(.accepted, journal.state.artifact_control.?.current.?.phase);
-    try source_completion.recover(&journal, actor_admission, a, actor_scope, @splat(32), .{});
+    try source_completion.recover(&journal, actor_admission, a, journal.state, @splat(32), .{});
     try std.testing.expectEqual(.garbage, journal.state.artifact_control.?.current.?.phase);
     try std.testing.expectEqual(publications_before_bound + 2, fake.publishes);
 
@@ -926,7 +973,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     reclaim_admission.artifacts.controls = .{ .ptr = &artifact_probe, .execute_fn = ArtifactProbe.execute };
     journal.state = try (source_control.Mutation{ .retire_artifact = .{ .reservation_digest = reservation_id, .proof = @splat(38), .reason = .not_admitted } }).apply(actor_alloc, sealed_actor);
     const retirement_revision = journal.state.revision;
-    try std.testing.expectError(error.SourceOutcomeUnresolved, source_completion.recover(&journal, reclaim_admission, a, actor_scope, @splat(32), .{}));
+    try std.testing.expectError(error.SourceOutcomeUnresolved, source_completion.recover(&journal, reclaim_admission, a, journal.state, @splat(32), .{}));
     try std.testing.expectEqual(retirement_revision, journal.state.revision);
     try std.testing.expectEqual(@as(usize, 1), artifact_probe.fences);
     try std.testing.expectEqual(.garbage, journal.state.artifact_control.?.current.?.phase);

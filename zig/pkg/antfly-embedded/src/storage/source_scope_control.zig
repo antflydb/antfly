@@ -21,7 +21,12 @@ pub const scope = @import("source_scope.zig");
 const completion = @import("transaction_completion.zig");
 const A = std.mem.Allocator;
 pub const max_bytes = 8192;
-pub const Action = union(enum) { bind: void, close: void, drop: scope.Cut };
+pub const FenceAttempt = struct {
+    reference: scope.Reference,
+    transaction_id: [16]u8,
+    reservation: scope.Digest,
+};
+pub const Action = union(enum) { bind: void, close: void, drop: scope.Cut, fence_attempt: FenceAttempt };
 pub const Intent = struct {
     version: u8,
     owner: completion.RoutedOwner,
@@ -33,6 +38,15 @@ pub const Intent = struct {
         try self.spec.validate();
         if (self.version != 1 or self.minimum_metadata_index == 0 or self.owner.metadata_group_id != self.spec.checkpoint_owner.metadata_group_id or !std.meta.eql(self.owner.metadata_incarnation, self.spec.checkpoint_owner.metadata_incarnation)) return error.InvalidSourceAdmission;
         if (self.action == .drop and (self.action.drop.term == 0 or self.action.drop.index == 0)) return error.InvalidSourceAdmission;
+        if (self.action == .fence_attempt) {
+            const attempt = self.action.fence_attempt;
+            try attempt.reference.validate();
+            if (!std.meta.eql(try scope.Basis.fromOwner(self.owner), self.spec.checkpoint_owner) or
+                !std.meta.eql(attempt.reference.domain, self.spec.domain()) or
+                !std.meta.eql(attempt.reference.binding, self.spec.binding) or attempt.reference.generation != self.spec.generation or
+                std.mem.allEqual(u8, &attempt.transaction_id, 0) or std.mem.allEqual(u8, &attempt.reservation, 0))
+                return error.InvalidSourceAdmission;
+        }
     }
 };
 pub const Command = struct {
@@ -41,7 +55,13 @@ pub const Command = struct {
     metadata_cut: scope.MetadataCut,
     pub fn validate(self: Command) !void {
         try self.intent.validate();
-        if ((self.version != 1 and (self.version != 2 or self.intent.action != .bind)) or self.metadata_cut.index < self.intent.minimum_metadata_index or self.metadata_cut.group_id != self.intent.owner.metadata_group_id or !std.meta.eql(self.metadata_cut.incarnation, self.intent.owner.metadata_incarnation)) return error.InvalidSourceAdmission;
+        const valid_version = switch (self.version) {
+            1 => self.intent.action != .fence_attempt,
+            2 => self.intent.action == .bind,
+            3 => self.intent.action == .fence_attempt,
+            else => false,
+        };
+        if (!valid_version or self.metadata_cut.index < self.intent.minimum_metadata_index or self.metadata_cut.group_id != self.intent.owner.metadata_group_id or !std.meta.eql(self.metadata_cut.incarnation, self.intent.owner.metadata_incarnation)) return error.InvalidSourceAdmission;
     }
 };
 pub const Query = struct {
@@ -100,6 +120,18 @@ pub fn apply(a: A, txn: anytype, gate: anytype, command: Command, applied: scope
             if (try scope.Store.readRecord(a, txn, intent.spec.domain()) != null) {
                 _ = try scope.Store.close(a, txn, root, intent.spec.domain(), intent.spec, command.metadata_cut, applied);
             } else _ = try scope.Store.closeAbsent(a, txn, root, intent.spec, command.metadata_cut);
+        },
+        .fence_attempt => |attempt| {
+            const GateType = switch (@typeInfo(@TypeOf(gate))) {
+                .pointer => |ptr| ptr.child,
+                else => @TypeOf(gate),
+            };
+            if (comptime @hasDecl(GateType, "fenceUnadmittedAttempt")) {
+                try gate.fenceUnadmittedAttempt(txn, root, attempt);
+            } else return error.SourcePendingWork;
+            var advanced = header;
+            advanced.metadata_floor = @max(advanced.metadata_floor, command.metadata_cut.index);
+            try scope.Store.writeHeader(a, txn, advanced);
         },
         .drop => |closed_at| {
             if (try scope.Store.readRecord(a, txn, intent.spec.domain())) |record| {

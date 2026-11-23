@@ -147,6 +147,15 @@ pub const Transfer = struct {
         try context.ensureActive();
         try self.authorize(record);
         if (record.phase != .garbage or record.retirement == null) return error.SourceControlConflict;
+        if (self.owner.topology_epoch != self.fence.topology_epoch) {
+            // An old-epoch observation is unavailable through this lease.
+            // Both cleanup commands address the original journal and are
+            // idempotent even when an earlier reply was lost.
+            const fenced = try self.apply(a, try self.command(.fence), context);
+            if (fenced.reclamation) |proof| return proof;
+            const reclaimed = try self.apply(a, try self.command(.reclaim), context);
+            return reclaimed.reclamation;
+        }
         const observation = try self.observe(a, context);
         var status = observation.status orelse return error.SourceOutcomeUnresolved;
         if (status.reclamation) |proof| return proof;

@@ -2717,6 +2717,7 @@ pub const MetadataServiceConfig = struct {
     internal_service_issuer: ?[]const u8 = null,
     setting_authority_secret: ?[]const u8 = null,
     setting_authority_issuer: ?[]const u8 = null,
+    cdc_payload_store: ?@import("../api/source_payload_retention.zig").Store = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
@@ -10316,6 +10317,7 @@ pub const MetadataHttpService = struct {
     internal_service_issuer: ?[]const u8 = null,
     setting_authority_secret: ?[]const u8 = null,
     setting_authority_issuer: ?[]const u8 = null,
+    cdc_payload_store: ?@import("../api/source_payload_retention.zig").Store = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -10332,6 +10334,10 @@ pub const MetadataHttpService = struct {
         deps: MetadataHttpServiceDeps,
         cfg: MetadataServiceConfig,
     ) !MetadataHttpService {
+        if (cfg.cdc_payload_store) |store| {
+            if (!@import("../api/source_payload_retention.zig").supportsRetention(store))
+                return error.SourcePayloadStorageUnavailable;
+        }
         const metadata_group_id = host_cfg.http.host.metadata_group_id orelse return error.MissingMetadataGroupId;
         var owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null;
         errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
@@ -10382,6 +10388,7 @@ pub const MetadataHttpService = struct {
             .setting_authority_secret = cfg.setting_authority_secret,
             .setting_authority_issuer = cfg.setting_authority_issuer,
             .destination_authorizer = cfg.destination_authorizer,
+            .cdc_payload_store = cfg.cdc_payload_store,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
@@ -12100,7 +12107,8 @@ pub const MetadataHttpService = struct {
             .issuer = self.internal_service_issuer,
             .provision_policy = true,
         };
-        const admission = hosted.sourceAdmission();
+        var admission = hosted.sourceAdmission();
+        admission.retained_payload_store = self.cdc_payload_store;
         const completion = @import("../api/source_destination_completion.zig");
         if (state.artifact_control.?.current) |artifact| {
             try completion.recover(self, admission, a, state, catalog_digest, context);
@@ -12663,7 +12671,8 @@ pub const MetadataHttpService = struct {
         const control = @import("source_control.zig");
         const scope = state.scope orelse return error.SourceBindingConflict;
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const admission = hosted.sourceAdmission();
+        var admission = hosted.sourceAdmission();
+        admission.retained_payload_store = self.cdc_payload_store;
         if (state.artifact_control.?.current) |record| {
             try ensureCdcWorkPermit(self);
             try @import("../api/source_destination_completion.zig").recover(self, admission, a, state, control.digest(table.replication_sources_json), context);
@@ -12673,7 +12682,8 @@ pub const MetadataHttpService = struct {
             var latest = try control.parse(a, after);
             defer latest.deinit();
             if (latest.value.revision != state.revision) return;
-        } else if (state.pending != null or state.outstanding.len != 0) return;
+        } else if ((state.pending != null and (state.pending_no_admission_receipt == null or state.closing)) or
+            state.outstanding.len != 0) return;
         if (state.closing) {
             try self.retireNativeReplicationSourceRoots(a, catalog, admission, table, state, context);
             return;

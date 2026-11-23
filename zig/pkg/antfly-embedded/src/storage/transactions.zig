@@ -5776,6 +5776,21 @@ pub fn requireCompletionResolvedRecord(raw: []const u8, commit_version: u64) !vo
 
 /// Decode the coordinator record with its canonical codec. Only retained,
 /// explicitly owned completion records qualify for restart decision recovery.
+/// Order an absent decision check against late BEGIN on the original
+/// checkpoint root. The caller must hold an authenticated source-attempt
+/// grant for this reference and apply this as a single native transaction.
+pub fn fenceUnadmittedSourceAttempt(a: Allocator, txn: anytype, root: source_scope.Basis, reference: source_scope.Reference, id: TxnId) !u64 {
+    if (std.mem.allEqual(u8, &id, 0)) return error.InvalidSourceAdmission;
+    const key = makeRecordKey(id);
+    if (txn.get(&key)) |_| {
+        return error.SourceOutcomeUnresolved;
+    } else |err| switch (@as(anyerror, err)) {
+        error.NotFound => {},
+        else => return err,
+    }
+    return source_scope.Store.fenceCoordinatorUnenlisted(a, txn, root, reference);
+}
+
 pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_wire.zig").Record {
     const record = try decodeRecord(raw);
     if (!record.coordinator_known or !record.coordinator or !record.retain_terminal_known or !record.prepared_known or (record.status != .pending and !record.intents_resolved_known)) return error.InvalidTxnRecord;
@@ -10468,6 +10483,19 @@ test "transaction source purpose scoped reference survives restart and fences st
             _ = try source_scope.Store.bind(arena.allocator(), &release, root, spec, .{ .group_id = 1, .incarnation = root.metadata_incarnation, .index = 10 });
             try release.commit();
         }
+        var expired = extra;
+        expired.source_scope.?.token = 1;
+        var expired_admission = admission;
+        expired_admission.transaction_id = @splat(43);
+        {
+            var fence = try store.beginWriteTxn();
+            errdefer fence.abort();
+            try std.testing.expectEqual(@as(u64, 1), try fenceUnadmittedSourceAttempt(a, &fence, root, expired.source_scope.?, expired_admission.transaction_id));
+            try std.testing.expectEqual(@as(u64, 1), try fenceUnadmittedSourceAttempt(a, &fence, root, expired.source_scope.?, expired_admission.transaction_id));
+            try fence.commit();
+        }
+        try std.testing.expectError(error.SourceCheckpointConflict, mgr.initTransactionWithCompletionAdmission(expired_admission, 10_000, 1_000, true, expired));
+        try std.testing.expectError(error.TxnNotFound, mgr.getTransactionStatus(expired_admission.transaction_id));
         var legacy_admission = admission;
         legacy_admission.transaction_id = @splat(40);
         try std.testing.expectError(error.SourceCheckpointConflict, mgr.initTransactionWithCompletionAdmission(legacy_admission, 10_000, 1_000, true, .{ .source_purpose = purpose }));
@@ -10480,6 +10508,11 @@ test "transaction source purpose scoped reference survives restart and fences st
         try std.testing.expectError(error.TxnNotFound, mgr.getTransactionStatus(unbound_admission.transaction_id));
         try std.testing.expectError(error.NotFound, store.get(a, &makeSidecarKey(completion_admission_prefix, unbound_admission.transaction_id)));
         try mgr.initTransactionWithCompletionAdmission(admission, 10_000, 1_000, true, extra);
+        {
+            var fence = try store.beginWriteTxn();
+            defer fence.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, fenceUnadmittedSourceAttempt(a, &fence, root, scope, id));
+        }
         try mgr.initTransactionWithCompletionAdmission(admission, 10_000, 2_000, true, extra);
         try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithCompletionAdmission(admission, 10_000, 1_000, true, .{ .source_purpose = purpose }));
         var changed = extra;

@@ -135,6 +135,20 @@ pub const Record = struct {
         if (same(local, coordinator) and (self.last_committed_sequence == std.math.maxInt(u64) or slot.reference.sequence != self.last_committed_sequence + 1)) return error.SourceCheckpointConflict;
         self.slot = slot;
     }
+    /// Used in the same ordered transaction that proves the original
+    /// coordinator has no transaction record. Never fence past an enlisted
+    /// attempt or past a committed source sequence.
+    fn fenceCoordinatorUnenlisted(self: *Record, ref: Reference, root: Basis) !bool {
+        try self.matches(ref);
+        if (!same(root, self.spec.checkpoint_owner)) return error.SourceCheckpointConflict;
+        if (ref.sequence <= self.last_committed_sequence) return error.SourceOutcomeUnresolved;
+        if (ref.token <= self.closed_through_token) return false;
+        if (self.phase != .active or self.slot != null or
+            ref.sequence - 1 != self.last_committed_sequence) return error.SourceOutcomeUnresolved;
+        self.closed_through_token = ref.token;
+        return true;
+    }
+
     /// Only an independently observed original coordinator ABORT may call this.
     /// No local BEGIN/outcome is fabricated. One cumulative floor bounds storage.
     pub fn retireUnenlisted(self: *Record, slot: Slot, coordinator: Basis, local: Basis, applied: Cut) !bool {
@@ -336,6 +350,13 @@ pub const Store = struct {
         var record = try requireRecord(a, txn, root, slot.reference.domain);
         try record.enter(slot, coordinator, root);
         try writeRecord(a, txn, record);
+    }
+    /// Persist a coordinator-side token floor inside the transaction that
+    /// checked native non-admission. The record owns the immutable scope.
+    pub fn fenceCoordinatorUnenlisted(a: std.mem.Allocator, txn: anytype, root: Basis, ref: Reference) !u64 {
+        var record = try requireRecord(a, txn, root, ref.domain);
+        if (try record.fenceCoordinatorUnenlisted(ref, root)) try writeRecord(a, txn, record);
+        return record.closed_through_token;
     }
     pub fn retireUnenlisted(a: std.mem.Allocator, txn: anytype, root: Basis, slot: Slot, coordinator: Basis, applied: Cut) !struct { changed: bool, floor: u64 } {
         var record = try requireRecord(a, txn, root, slot.reference.domain);

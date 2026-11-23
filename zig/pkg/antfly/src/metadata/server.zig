@@ -175,6 +175,17 @@ pub const MetadataServer = struct {
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
         var service_cfg = cfg.service;
+        if (service_cfg.cdc_payload_store == null) {
+            const retention = @import("../api/source_payload_retention.zig");
+            for ([_]?retention.Store{ cfg.api_server_cfg.pgwire_spool_store, cfg.api_server_cfg.document_artifact_store }) |candidate| {
+                if (candidate) |store| {
+                    if (retention.supportsRetention(store)) {
+                        service_cfg.cdc_payload_store = store;
+                        break;
+                    }
+                }
+            }
+        }
         service_cfg.internal_service_secret = cfg.api_server_cfg.internal_service_secret;
         service_cfg.internal_service_issuer = cfg.api_server_cfg.internal_service_issuer;
         const setting_authority = cfg.api_server_cfg.effectiveSettingAuthority();

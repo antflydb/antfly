@@ -2656,7 +2656,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             try request.validate(a);
             if (request.operation != .recover) return error.InvalidSourcePlanWire;
         } else try request.validate();
-        const expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal or kind == .legacy_inventory) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
+        var expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal or kind == .legacy_inventory) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
+        if (comptime kind == .checkpoint) {
+            if (fence.topology_epoch < expected.topology_epoch) return error.TopologyChanged;
+            expected.topology_epoch = fence.topology_epoch;
+        }
         const group = fence.route.group_id;
         if (expected.group_id != group) return error.TopologyChanged;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
@@ -2859,11 +2863,19 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!std.mem.eql(u8, &namespace, &requested_namespace)) return error.HistoryResynchronizationRequired;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
         const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
+        const requested_owner = if (comptime kind == .publication or kind == .admission or kind == .decision) routed: {
+            var current = request.owner;
+            if (comptime kind == .publication or kind == .decision) {
+                if (current.topology_epoch > fence.topology_epoch) return error.TopologyChanged;
+                current.topology_epoch = fence.topology_epoch;
+            }
+            break :routed current;
+        } else {};
         var publication_descriptor: ?LoadedDescriptor = if (comptime kind == .publication or kind == .admission or kind == .decision) try self.loadCompletionDescriptor(alloc, group, table_name, context) else null;
         defer if (publication_descriptor) |*owned| owned.deinit(alloc);
         if (comptime kind == .publication or kind == .admission or kind == .decision) {
             try request.validate();
-            try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
+            try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), requested_owner, context);
         }
         try self.prepareRetainedScanRead(group, "", "", opts, .read_index);
         const proof = try capture(barrier.ptr, group);
@@ -2919,7 +2931,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .decision => try lease.owner().historyDecision(alloc, table_name, request),
         };
         errdefer if (comptime kind == .page or kind == .bootstrap or kind == .decision) result.deinit();
-        if (comptime kind == .publication or kind == .admission or kind == .decision) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
+        if (comptime kind == .publication or kind == .admission or kind == .decision) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), requested_owner, context);
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(alloc, fence, group, table_name);
         // Preserve the actual persisted native cut. Quorum progress is a

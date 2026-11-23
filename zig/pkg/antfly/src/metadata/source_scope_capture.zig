@@ -50,10 +50,13 @@ pub const Snapshot = struct {
     checkpoint_table: []const u8,
     pending: ?Pending = null,
     native_bootstrap_certified: bool = false,
+    pending_fenceable: bool = false,
     pub fn jsonStringify(self: Snapshot, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Snapshot).@"struct".field_names) |name| {
-            if ((comptime !std.mem.eql(u8, name, "native_bootstrap_certified")) or self.native_bootstrap_certified) {
+            const boolean_flag = comptime std.mem.eql(u8, name, "native_bootstrap_certified") or std.mem.eql(u8, name, "pending_fenceable");
+            const include = if (comptime boolean_flag) @field(self, name) else true;
+            if (include) {
                 try stream.objectField(name);
                 try stream.write(@field(self, name));
             }
@@ -66,9 +69,15 @@ pub const Snapshot = struct {
             .bind => try self.requireBind(),
             .close => try self.requireClose(),
             .drop => try self.requireDrop(),
+            .fence_attempt => |attempt| {
+                const expected = self.pending orelse return error.SourcePendingWork;
+                if (!self.pending_fenceable or !std.meta.eql(attempt.reference, expected.reference) or
+                    !std.meta.eql(attempt.transaction_id, expected.transaction_id) or !std.meta.eql(attempt.reservation, expected.reservation))
+                    return error.SourceBindingConflict;
+            },
         }
         const result: native_control.Command = .{
-            .version = if (intent.action == .bind and self.native_bootstrap_certified) 2 else 1,
+            .version = if (intent.action == .fence_attempt) 3 else if (intent.action == .bind and self.native_bootstrap_certified) 2 else 1,
             .intent = intent,
             .metadata_cut = self.cut,
         };
@@ -116,7 +125,10 @@ pub fn capture(a: A, query: Query, applied_index: u64, incarnation: [32]u8, deco
         pending = .{ .reference = .{ .domain = spec.domain(), .binding = spec.binding, .generation = spec.generation, .token = artifact.token(), .sequence = reservation.sequence }, .transaction_id = reservation.transaction_id, .purpose = try reservation.inputFingerprint(source), .reservation = reservation.identity(source), .plan_digest = reservation.plan_digest, .artifact_plan_digest = artifact.plan_digest };
         try pending.?.reference.validate();
     }
-    return .{ .cut = .{ .group_id = query.metadata_group_id, .incarnation = incarnation, .index = applied_index }, .spec = spec, .phase = if (state.retired) .retired else if (state.closing) .closing else .active, .actor_revision = state.revision, .live_definition = if (definition) |value| std.meta.eql(value, source.definition) else false, .checkpoint_table = try a.dupe(u8, authority.table_name), .pending = pending, .native_bootstrap_certified = state.native_bootstrap_checkpoint != null };
+    const pending_fenceable = decoder_version >= control.retained_payload_protocol_version and
+        state.pending != null and state.pending.?.retain_payload and
+        state.artifact_control.?.current != null and state.artifact_control.?.current.?.phase == .sealed;
+    return .{ .cut = .{ .group_id = query.metadata_group_id, .incarnation = incarnation, .index = applied_index }, .spec = spec, .phase = if (state.retired) .retired else if (state.closing) .closing else .active, .actor_revision = state.revision, .live_definition = if (definition) |value| std.meta.eql(value, source.definition) else false, .checkpoint_table = try a.dupe(u8, authority.table_name), .pending = pending, .native_bootstrap_certified = state.native_bootstrap_checkpoint != null, .pending_fenceable = pending_fenceable };
 }
 
 pub fn readOnService(svc: anytype, a: A, query: Query, request: anytype) !Snapshot {

@@ -31,7 +31,7 @@ pub const Rejection = enum {
         return switch (err) {
             error.InvalidSourceAdmission => .invalid,
             error.HistoryResynchronizationRequired, error.IdentityNamespaceMismatch => .scope_changed,
-            error.SourcePendingWork, error.IntegrityTopologyBusy => .pending,
+            error.SourcePendingWork, error.SourceOutcomeUnresolved, error.IntegrityTopologyBusy => .pending,
             error.SourceCheckpointConflict, error.SourceTransactionIdentityConflict => .conflict,
             error.SourceAdmissionBackpressure => .backpressure,
             else => null,
@@ -108,6 +108,11 @@ fn validateApplied(command: control.Command, entry: scope.Cut, observed: control
         .bind => if (observed.record == null or observed.record.?.phase != .active) return error.SourceAdmissionCorrupt,
         .close => if (observed.record != null and observed.record.?.phase == .active) return error.SourceAdmissionCorrupt,
         .drop => if (observed.record != null) return error.SourceAdmissionCorrupt,
+        .fence_attempt => |attempt| {
+            const record = observed.record orelse return error.SourceAdmissionCorrupt;
+            if (record.closed_through_token < attempt.reference.token or record.last_committed_sequence >= attempt.reference.sequence)
+                return error.SourceAdmissionCorrupt;
+        },
     }
 }
 fn validateRecord(record: Record) !void {

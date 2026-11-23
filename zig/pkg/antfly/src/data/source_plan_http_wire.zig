@@ -32,6 +32,24 @@ pub const ControlRequest = struct {
     source_owner: Owner,
     command: native.Command,
     receipt: ?control.Entry = null,
+    /// Cleanup may follow a newer lease for the same physical root. The
+    /// command's original owner still names the journal and its fence digest.
+    pub fn cleanupOnly(self: ControlRequest) bool {
+        return self.command.action == .fence or self.command.action == .reclaim;
+    }
+
+    pub fn routedOwner(self: ControlRequest, epoch: u64) !Owner {
+        var routed = self.source_owner;
+        switch (self.command.action) {
+            .fence, .reclaim => {
+                if (epoch < routed.topology_epoch) return error.InvalidCatalogRouteFence;
+                routed.topology_epoch = epoch;
+            },
+            else => if (epoch != routed.topology_epoch) return error.InvalidCatalogRouteFence,
+        }
+        return routed;
+    }
+
     pub fn validate(self: ControlRequest, a: A) !void {
         if (self.version != 1) return error.InvalidSourcePlanWire;
         try requireRoot(self.source_owner, self.command.root);

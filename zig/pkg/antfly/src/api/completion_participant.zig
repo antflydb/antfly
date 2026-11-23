@@ -94,7 +94,10 @@ pub const Port = struct {
         const member = admission.participants[index];
         const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
-        try validateParticipantFence(owner, locator.group_id, fence);
+        var routed = owner;
+        if (phase == .publish and decision.record.source_scope != null and fence.topology_epoch > routed.topology_epoch)
+            routed.topology_epoch = fence.topology_epoch;
+        try validateParticipantFence(routed, locator.group_id, fence);
         var parsed: ?std.json.Parsed(completion.Envelope) = null;
         defer if (parsed) |*value| value.deinit();
         const request: types.BatchRequest = switch (phase) {
@@ -133,7 +136,10 @@ pub const Port = struct {
         const owner = try admission.coordinatorOwner();
         const coordinator = try admission.coordinatorMember();
         const locator = local.api_local_transaction_contract.parseParticipantRef(coordinator.locator) orelse return error.InvalidParticipant;
-        try validateParticipantFence(owner, locator.group_id, fence);
+        var routed = owner;
+        if (decision.record.status == .committed and decision.record.source_scope != null and fence.topology_epoch > routed.topology_epoch)
+            routed.topology_epoch = fence.topology_epoch;
+        try validateParticipantFence(routed, locator.group_id, fence);
         var pending: [64][]const u8 = undefined;
         var count: usize = 0;
         for (admission.participants) |member| {

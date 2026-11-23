@@ -45,6 +45,7 @@ pub const Grant = struct {
         const retained = record.recovery orelse return error.SourcePendingWork;
         if (!pending.retain_manifest or !std.mem.eql(u8, &retained.digest, &pending.plan_digest) or !std.mem.eql(u8, retained.bytes, pending.delivery_manifest)) return error.SourceTransactionIdentityConflict;
         const value = manifest.value;
+        if (pending.retain_payload != (value.retained_payload != null)) return error.SourceTransactionIdentityConflict;
         const plan = try value.deliveryPlan(a, pending.delivery_manifest);
         const purpose = try pending.inputFingerprint(scope);
         const checkpoint: local.storage_source_checkpoint.Command = .{ .binding = scope.identity(), .purpose = purpose, .sequence = pending.sequence, .checkpoint = pending.checkpoint, .expected_checkpoint = pending.expected_checkpoint, .accepted_at_ns = pending.accepted_at_ns, .receipt_window = value.checkpoint.receipt_window };
@@ -64,6 +65,7 @@ pub const Accepted = struct { reservation_digest: [32]u8, checkpoint: checkpoint
 pub const Admission = struct {
     coordinator: @import("completion_admission.zig").Coordinator,
     artifacts: destination.Ports,
+    retained_payload_store: ?destination.payload_retention.Store = null,
     checkpoints: checkpoints.Port,
     scope_reads: ?@import("source_scope_operations.zig").Port = null,
     scope_controls: ?@import("source_scope_control_operations.zig").Port = null,
@@ -160,6 +162,7 @@ pub const Admission = struct {
             if (!std.meta.eql(record.spec, intent.spec)) return error.SourceBindingConflict;
             return switch (intent.action) {
                 .bind => if (record.phase == .active) true else error.SourceBindingConflict,
+                .fence_attempt => return error.InvalidSourceAdmission,
                 .close => switch (record.phase) {
                     .active => false,
                     .closing => error.SourcePendingWork,
@@ -173,8 +176,48 @@ pub const Admission = struct {
                     false,
             };
         }
-        return intent.action != .bind and observed.header.strict and
+        return intent.action != .bind and intent.action != .fence_attempt and observed.header.strict and
             observed.header.metadata_floor >= intent.minimum_metadata_index;
+    }
+
+    /// A native ordered result is required. An absent checkpoint read alone
+    /// does not rule out an earlier or concurrently ordered BEGIN.
+    pub fn fenceUnadmittedAttempt(self: Admission, a: A, state: source.State, manifest: destination.Manifest, fence: metadata.CatalogRouteFence, context: Context) ![]u8 {
+        const controls = self.scope_controls orelse return error.ChangefeedCapabilityUnsupported;
+        const pending = state.pending orelse return error.SourcePendingWork;
+        const binding = state.scope orelse return error.SourceBindingConflict;
+        const spec = (try @import("../metadata/source_scope_binding.zig").spec(state)) orelse return error.SourceBindingConflict;
+        const id = pending.identity(binding);
+        var routed = manifest.owner;
+        if (fence.topology_epoch < routed.topology_epoch) return error.TopologyChanged;
+        routed.topology_epoch = fence.topology_epoch;
+        const wire = @import("source_scope_control_operations.zig").wire;
+        const request: wire.Request = .{
+            .version = 1,
+            .request_id = try requestNonce(a),
+            .operation = .submit,
+            .intent = .{
+                .version = 1,
+                .owner = routed,
+                .spec = spec,
+                .minimum_metadata_index = 1,
+                .action = .{ .fence_attempt = .{ .reference = manifest.source_scope, .transaction_id = manifest.transaction_id, .reservation = id } },
+            },
+        };
+        const reply = try controls.execute(a, fence, manifest.checkpoint_authority.table_name, request, context);
+        try reply.validate(request, try request.digest(a));
+        if (!reply.confirmed()) return error.SourceOutcomeUnresolved;
+        const observed = switch (reply.outcome.?) {
+            .applied => |observed| observed,
+            .rejected => |reason| return reason.asError(),
+            .superseded => return error.SourceOutcomeUnresolved,
+        };
+        try context.ensureActive();
+        return std.json.Stringify.valueAlloc(a, source.NativeNoAdmissionProof{
+            .command = reply.command.?,
+            .cut = reply.receipt.?,
+            .observation = observed,
+        }, .{});
     }
 
     fn grantFromState(a: A, state: source.State) !Grant {
@@ -216,7 +259,7 @@ pub const Admission = struct {
         const context = scope.context();
         try context.ensureActive();
         const manifest = grant.manifest.value;
-        _ = try manifest.transfer(fence, self.artifacts);
+        _ = try manifest.cleanupTransfer(fence, self.artifacts);
         const query: checkpoints.wire.Request = .{ .version = 1, .source_owner = manifest.owner, .transaction_id = manifest.transaction_id, .command = manifest.checkpoint, .minimum_applied_index = 1 };
         const observed = try self.checkpoints.read(a, fence, manifest.checkpoint_authority.table_name, query, context);
         try observed.validate(query);

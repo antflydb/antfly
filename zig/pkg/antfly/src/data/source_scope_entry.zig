@@ -22,6 +22,7 @@ pub const wire = local.storage_source_scope_ordered;
 const completion = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
 pub const required_protocol_version = @import("../common/data_raft_protocol.zig").batch_source_scope_control_protocol_version;
 pub fn requiredProtocol(command: wire.control.Command) u16 {
+    if (command.version == 3) return @import("../common/data_raft_protocol.zig").batch_source_attempt_fence_protocol_version;
     return if (command.version == 2)
         @import("../common/data_raft_protocol.zig").batch_source_drained_bind_protocol_version
     else

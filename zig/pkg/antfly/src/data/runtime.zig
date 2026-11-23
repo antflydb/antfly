@@ -17538,7 +17538,7 @@ pub const DataServer = struct {
         defer descriptor.deinit(alloc);
         const expected_identity = fence.route.identity_namespace;
         if (descriptor.identity.table_id != expected_identity.table_id or descriptor.identity.shard_id != expected_identity.shard_id or descriptor.identity.range_id != expected_identity.range_id) return error.HistoryResynchronizationRequired;
-        if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.source_owner, context);
+        if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), try command.routedOwner(fence.topology_epoch), context);
         if (comptime kind == .producer_closure) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command, context);
         if (comptime kind == .legacy_terminal) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.owner, context);
         if (comptime kind == .source_scope or kind == .source_retirement) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.intent.owner, context);
@@ -18062,13 +18062,18 @@ pub const DataServer = struct {
             }
 
             if (completion_command and preflighted_local_leader) {
-                const owner = switch (req.transaction.?) {
+                var owner = switch (req.transaction.?) {
                     .begin => |begin| begin.completion_owner orelse return error.InvalidHistoryAdmission,
                     .prepare => |prepare| prepare.completion_owner orelse return error.InvalidHistoryAdmission,
                     .resolve => |resolve| resolve.completion_owner orelse return error.InvalidHistoryAdmission,
                     .publish_completion => |publication| publication.completion_owner,
                     else => return error.InvalidBatchRequest,
                 };
+                // A certificate is independently validated at apply against
+                // original retained resolution evidence. Rebind only the
+                // live route check and keep its original owner in the command.
+                if (req.transaction.? == .publish_completion and route.write_route_fence.?.topology_epoch > owner.topology_epoch)
+                    owner.topology_epoch = route.write_route_fence.?.topology_epoch;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try @import("../api/completion_owner_admission.zig").require(alloc, admission_source.catalog, table_name, route.write_route_fence.?, storage_owner_descriptor.?.view(), owner, completion_context);
             }

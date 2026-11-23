@@ -3510,6 +3510,179 @@ def test_public_changefeed_projects_exact_before_and_after_predicates():
         server.stop()
 
 
+def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(tmp_path):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    try:
+        with requests.Session() as client:
+            client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+            base = server.api_url
+            table = f"{base}/tables/composite_feed"
+            feeds = f"{base}/changefeeds"
+            columns = ("tenant", "observed_at", "label")
+            keys = list(columns[:2])
+            _changefeed_call(
+                client,
+                "POST",
+                table,
+                json={
+                    "storage": {"engine": "object"},
+                    "schema": {
+                        "storage_mode": "relational",
+                        "default_type": "row",
+                        "enforce_types": True,
+                        "document_schemas": {
+                            "row": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        name: {"type": "string"} for name in columns
+                                    },
+                                    "required": list(columns),
+                                    "additionalProperties": False,
+                                }
+                            }
+                        },
+                        "base_source": {
+                            "kind": "external",
+                            "format": "iceberg",
+                            "table_id": "composite-feed",
+                            "uri": (tmp_path / "warehouse").as_uri(),
+                            "write_policy": "iceberg_writer",
+                            "catalog": {"type": "managed"},
+                            "row_identity": {"key_columns": keys},
+                        },
+                    },
+                },
+            )
+            _changefeed_call(
+                client,
+                "POST",
+                f"{table}/lake/catalog",
+                json={
+                    "commit_id": "initialize",
+                    "schema": {
+                        "type": "struct",
+                        "schema-id": 0,
+                        "identifier-field-ids": [1, 2],
+                        "fields": [
+                            {"id": index, "name": name, "required": True, "type": kind}
+                            for index, (name, kind) in enumerate(
+                                zip(columns, ("string", "timestamptz", "string")), 1
+                            )
+                        ],
+                    },
+                },
+            )
+            early = "2025-01-01T00:00:00Z"
+            late = "2025-01-02T00:00:00Z"
+
+            def write(checkpoint, changes, previous=None):
+                payload = {
+                    "batch_id": checkpoint,
+                    "source": "composite-test",
+                    "epoch": "1",
+                    "checkpoint": checkpoint,
+                    "key_fields": keys,
+                    "changes": changes,
+                }
+                if previous is not None:
+                    payload["expected_checkpoint"] = previous
+                _changefeed_call(client, "POST", f"{table}/lake/changes", json=payload)
+
+            def published():
+                catalog = _changefeed_call(
+                    client, "GET", f"{table}/lake/catalog"
+                ).json()
+                return int(
+                    catalog["metadata"]["properties"].get("antfly.wal.coverage", 0)
+                )
+
+            write(
+                "seed",
+                [
+                    {
+                        "op": "upsert",
+                        "row": {"tenant": tenant, "observed_at": ts, "label": "before"},
+                    }
+                    for tenant in ("east", "west")
+                    for ts in (early, late)
+                ],
+            )
+            assert wait_until(published, timeout_s=60, interval_s=0.25)
+            subscriptions = {}
+            for projection in ("rows", "keys_and_versions"):
+                feed = _changefeed_call(
+                    client,
+                    "POST",
+                    feeds,
+                    headers={"Idempotency-Key": f"composite-{projection}"},
+                    json={
+                        "tables": ["composite_feed"],
+                        "start": "now",
+                        "include": projection,
+                    },
+                ).json()
+                subscriptions[projection] = (f"{feeds}/{feed['id']}", feed["cursor"])
+            write(
+                "updated",
+                [
+                    {
+                        "op": "upsert",
+                        "row": {
+                            "tenant": "east",
+                            "observed_at": early,
+                            "label": "after",
+                        },
+                    },
+                    {"op": "delete", "row": {"tenant": "west", "observed_at": late}},
+                ],
+                previous="seed",
+            )
+            assert wait_until(lambda: published() >= 2, timeout_s=60, interval_s=0.25)
+
+            def collect(path, cursor):
+                events = {}
+                for _ in range(8):
+                    response = _changefeed_call(
+                        client, "GET", f"{path}/events", params={"after": cursor}
+                    )
+                    cursor = response.headers["Antfly-Changefeed-Cursor"]
+                    for event in response.json()["events"]:
+                        key = event["key"]["value"]
+                        assert key not in events
+                        events[key] = event
+                    _changefeed_call(
+                        client, "POST", f"{path}/ack", json={"cursor": cursor}
+                    )
+                    if len(events) >= 2:
+                        break
+                return events
+
+            rows = collect(*subscriptions["rows"])
+            projected = collect(*subscriptions["keys_and_versions"])
+            assert set(rows) == set(projected)
+            assert sorted(event["operation"] for event in rows.values()) == [
+                "delete",
+                "update",
+            ]
+            for key, event in rows.items():
+                assert event["before"]["label"] == "before"
+                if event["operation"] == "delete":
+                    assert event["before"]["tenant"] == "west"
+                    assert event["after"] is None
+                else:
+                    assert event["before"]["tenant"] == "east"
+                    assert event["after"]["label"] == "after"
+                assert projected[key]["operation"] == event["operation"]
+                assert projected[key].get("before") is None
+                assert projected[key].get("after") is None
+            for path, _ in subscriptions.values():
+                _changefeed_call(client, "DELETE", path)
+    finally:
+        server.stop()
+
+
 def test_public_changefeed_bootstraps_and_streams_native_sql_rows():
     from decimal import Decimal
 

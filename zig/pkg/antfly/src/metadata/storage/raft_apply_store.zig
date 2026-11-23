@@ -33295,7 +33295,7 @@ pub const RaftApplyStore = struct {
             },
             // Already accepted work can drain after configuration replacement;
             // its current catalog CAS and original source binding still fence it.
-            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_checkpoint, .close => {},
+            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_unsealed_delivery_attempt, .fence_delivery_attempt, .reclaim_superseded_payload, .checkpoint_payload_cleanup, .fence_checkpoint, .close => {},
         }
         const new_authority = switch (write.mutation) {
             .bind_checkpoint => |authority| authority,
