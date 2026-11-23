@@ -1632,7 +1632,9 @@ pub const MetalPartitionExecutor = struct {
             // the route separately verifies its exact specialized pipeline.
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
             if (descriptor) |value| switch (value.operation) {
-                .linear => return false,
+                // A single row is eligible only if cold selection later
+                // pins its concrete parameter slot and proves full storage.
+                .linear => |linear| if (linear.rows != 1) return false,
                 .gather => {
                     // The selected route requires checked host indices. Keep
                     // the tuned gather-after-bias owner for composite graphs.

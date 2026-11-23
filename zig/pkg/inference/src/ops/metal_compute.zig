@@ -12124,7 +12124,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 error.QueueFull, error.PreparedSlotUnavailable, error.ForeignPreparedSlotOwner => return null,
                 else => return err,
             };
-            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = request.output, .slot = slot, .key = key, .payload = payload, .declaration = declaration };
+            var output_slot = request.output;
+            output_slot.writable_bytes = direct.requirements.primary_bytes;
+            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = output_slot, .slot = slot, .key = key, .payload = payload, .declaration = declaration };
             committed = true;
             return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .vtable = &vtable };
         }
@@ -55692,7 +55694,7 @@ const PreparedDenseRegionFixture = struct {
         try std.testing.expectEqual(references, physical.device.?.ref.ref_count.load(.acquire));
         try std.testing.expectEqualDeep(identity, MetalCompute.parameterIdentity(MetalCompute.toBuf(source)));
     }
-    fn runInstalled(cb: ops.ComputeBackend, graph: *const ml.graph.Graph, nodes: []const ml.graph.NodeId, values: []const CT, expected: []const []f32) !void {
+    fn runInstalled(cb: ops.ComputeBackend, graph: *const ml.graph.Graph, nodes: []const ml.graph.NodeId, values: []const CT, expected: []const []f32, expect_region: bool) !void {
         const a = std.testing.allocator;
         const interpreter = @import("../graph/interpreter.zig");
         const route = @import("../execution/kernel_route.zig");
@@ -55707,8 +55709,6 @@ const PreparedDenseRegionFixture = struct {
         defer analysis.deinit(a);
         var executable = try @import("../execution/executable.zig").prepareAnalyzedGraph(a, graph, analysis, &cb, .partitioned, .{ .immutable_input_bindings = bindings[1..parameter_count], .input_bindings = inputs[0..parameter_count] });
         defer executable.deinit();
-        var profile = (try @import("../execution/region_execution_profile.zig").acquire(cb, graph)) orelse return error.MissingMetalRegionProfile;
-        defer profile.deinitChecked() catch unreachable;
         const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
         // Model weights are immutable bindings; the activation is an actual
         // resident runtime input. Runtime facts must never duplicate immutable
@@ -55734,6 +55734,29 @@ const PreparedDenseRegionFixture = struct {
         var resident = Resident{};
         try std.testing.expectEqual(ownership.Coverage.complete, try functions.storageOwnership.?(cb.ptr, values[0], .{ .context = &resident, .visit = Resident.emit }));
         const activation = route.InputBinding{ .node_id = nodes[0], .value = .{ .resident = .{ .logical = graph.node(nodes[0]).output_shape, .planes = resident.planes[0..resident.count], .implementation = .{ .context = cb.ptr, .table = cb.vtable } } } };
+        if (!expect_region) {
+            try std.testing.expect(pool.metal_frame_dispatch);
+            const selected = (try pool.prepareRoutes(&.{activation})) orelse return error.MissingPreparedRoutes;
+            defer selected.release();
+            if (selected.pool.completeOwnedPayload() == null) {
+                std.debug.print("Metal mixed primitive coverage: {any}\n", .{selected.pool.payload_coverage});
+                return error.MissingOwnedPayloadWitness;
+            }
+            const wrong = [_]interpreter.RuntimeInput{.{ .node_id = nodes[0], .value = values[1], .source_backend = &cb }};
+            try std.testing.expectError(error.PreparedRegionBindingChanged, selected.validateRuntimeInputs(&wrong, &cb));
+            var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
+            defer result.deinit(&executable.runtime);
+            try std.testing.expectEqual(@as(u64, 0), result.stats.graph_plan_slots_reserved);
+            try std.testing.expectEqual(expected.len, result.outputs.len);
+            for (result.outputs, expected) |output, wants| {
+                const actual = try cb.toFloat32(output, a);
+                defer a.free(actual);
+                for (actual, wants) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
+            }
+            return;
+        }
+        var profile = (try @import("../execution/region_execution_profile.zig").acquire(cb, graph)) orelse return error.MissingMetalRegionProfile;
+        defer profile.deinitChecked() catch unreachable;
         const selected = (try pool.prepareRoutesWithProfile(&.{activation}, .select_regions, profile.profile)) orelse return error.MissingPreparedRoutes;
         defer selected.release();
         try std.testing.expectEqual(@as(usize, 1), selected.pool.regions.len);
@@ -55909,7 +55932,13 @@ const PreparedDenseRegionFixture = struct {
                     for (actual, wanted) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
                 }
             }
-            try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..count]);
+            try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..count], true);
+            if (count == 2) {
+                graph.outputs.items.len = 1;
+                graph.outputs.items[0] = try builder.neg(graph.outputs.items[0]);
+                for (expected[0]) |*value| value.* = -value.*;
+                try runInstalled(cb, &graph, nodes[0..3], values[0..3], expected[0..1], false);
+            }
         }
     }
     fn check(cb: ops.ComputeBackend, reference: ops.ComputeBackend) !void {
@@ -56070,7 +56099,7 @@ const PreparedDenseRegionFixture = struct {
             selected.deinit();
             selected_live = false;
             try profile.finishSubmission();
-            try runInstalled(cb, &graph, nodes[0..count], values[0 .. projection_count + 1], expected[0..projection_count]);
+            try runInstalled(cb, &graph, nodes[0..count], values[0 .. projection_count + 1], expected[0..projection_count], true);
             // Actual assigned output ownership survives the selected slot pins,
             // and the following whole public execution of this same graph.
             for (0..projection_count) |index| {

@@ -248,7 +248,7 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
             .runtime_input => {
                 if (node.op != .parameter or slot.roles.graph_output) return inputDeclined(graph, @intCast(id), null);
                 if (selected.inputs.find(@intCast(id))) |binding| {
-                    if (binding == .resident and target.kind() == .metal and pool.metal_projection_region_candidate and pool.region_execution_profile == .synchronous) {
+                    if (binding == .resident and target.kind() == .metal) {
                         if (!(service.input(target.ptr, binding, slot.desc.shape) catch false)) return inputDeclined(graph, @intCast(id), binding);
                     } else if ((binding != .imported_host and binding != .imported_device) or !ingress(pool, @intCast(id), slot.desc.shape, target)) return inputDeclined(graph, @intCast(id), binding);
                 } else {
