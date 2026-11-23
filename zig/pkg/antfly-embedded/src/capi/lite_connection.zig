@@ -1573,18 +1573,21 @@ pub const WriterLane = struct {
     /// applies derived work, and that work can host a maintenance turn which
     /// borrows the lane again on the same thread. It runs under the outer
     /// checkout: waiting would wait on this thread's own return.
-    /// Also true on an assisted text merge's thread when the holder is the
-    /// producer it runs for (`text_merge_runtime.assisting_producer`): that
-    /// producer waits on the merge holding this lane, and a merge commit
-    /// waiting for the lane instead could only end by timing out.
+    /// Also true on a text merge's thread when the holder is a producer
+    /// blocked on that merge: its own assisted merge
+    /// (`text_merge_runtime.assisting_producer`), or any merge while it waits
+    /// on admission. The producer cannot release the lane mid-batch, so a
+    /// merge commit waiting for it could only end by timing out.
     fn heldByCurrentThread(self: *WriterLane) bool {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (!self.checked_out) return false;
         if (self.holder == std.Thread.getCurrentId()) return true;
-        const producer = text_merge_runtime.assisting_producer orelse return false;
-        return self.holder == producer;
+        if (text_merge_runtime.assisting_producer) |producer| if (self.holder == producer) return true;
+        // Any merge, while the holder waits on that merge runtime's
+        // admission (`text_merge_runtime.mergeMayUseLeaseOf`).
+        return text_merge_runtime.mergeMayUseLeaseOf(self.holder);
     }
 
     /// `PathWriterLock.ReturnTo.give_back` for the synthetic lease a nested
