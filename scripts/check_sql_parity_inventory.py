@@ -19,9 +19,12 @@
 import argparse
 import hashlib
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -319,14 +322,48 @@ def evidence_runs(gate_ids, gates):
     return runs
 
 
+def run_gate(command, *, cwd, timeout):
+    terminated = False
+
+    def terminate(_signum, _frame):
+        nonlocal terminated
+        terminated = True
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        with subprocess.Popen(command, cwd=cwd, start_new_session=True) as child:
+            deadline = time.monotonic() + timeout
+            try:
+                while not terminated:
+                    # Observe the leader without reaping it. Its PID pins the
+                    # group ID until cleanup, even if only descendants remain.
+                    if os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    time.sleep(min(remaining, 0.05))
+            finally:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                status = child.wait()
+        if terminated:
+            raise SystemExit(128 + signal.SIGTERM)
+        if status:
+            raise subprocess.CalledProcessError(status, command)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def run_evidence(gate_ids, gates, root=ROOT):
     for run in evidence_runs(gate_ids, gates):
         print(f"Running evidence gates: {', '.join(run['gate_ids'])}", flush=True)
-        subprocess.run(
+        run_gate(
             run["command"],
             cwd=repository_path(root, run["cwd"]),
             timeout=run["timeout_seconds"],
-            check=True,
         )
 
 

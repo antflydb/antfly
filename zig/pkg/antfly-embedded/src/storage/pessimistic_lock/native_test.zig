@@ -842,9 +842,12 @@ test "pessimistic locks native LSM data participants preserve admission atomicit
     defer cleanup(path);
     var store = try DocStore.open(a, path, .{});
     defer store.close();
-    const admitted = dataFixture();
+    var admitted = dataFixture();
+    admitted.source.replaces = admitted.source.lease.backend;
+    admitted.source.lease.backend.fence += 1;
     const receiving = admitted.binding.identity;
     const registration = try admitted.registration();
+    try std.testing.expect(registration.replaces == null);
     const authorized: DataAuthority = .{ .approved = admitted };
     const denied: DataAuthority = .{ .approved = admitted, .enabled = false };
     {

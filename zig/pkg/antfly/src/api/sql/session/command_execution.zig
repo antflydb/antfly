@@ -82,7 +82,24 @@ pub const Controller = struct {
         if (!self.store.supportsSharedMutations()) return error.SqlConnectionUnavailable;
         var existing = try source.load(self.store, a, self.connection);
         defer if (existing) |*owned| owned.deinit();
-        if (existing == null) {
+        const now_ms = self.now();
+        if (existing) |owned| {
+            const prior = owned.value;
+            if (prior.registration.lease.expires_at_ms <= now_ms and prior.phase != .retired) {
+                // Drive retirement only. No body from an expired execution is adopted.
+                for (0..16) |_| {
+                    var current = try self.load(a);
+                    defer current.deinit();
+                    if (current.value.phase == .retired or current.value.registration.lease.expires_at_ms > self.now()) break;
+                    try self.advance(a, current.value);
+                }
+                existing.?.deinit();
+                existing = null;
+                existing = try source.load(self.store, a, self.connection);
+            }
+        }
+        const predecessor = if (existing) |owned| if (owned.value.phase == .retired) owned.value else null else null;
+        if (existing == null or predecessor != null) {
             const bytes = try self.port.call(self.port.ptr, a, .{ .sql_lock_read = .{ .incarnation = @splat(0), .standalone = self.standalone, .actor = self.actor, .database = 0, .discovery = database } });
             defer a.free(bytes);
             if (bytes.len > 4096) return error.InvalidSqlBackendResponse;
@@ -91,15 +108,22 @@ pub const Controller = struct {
             const cut = observed.value;
             if (cut.group == 0 or cut.standalone != self.standalone or std.mem.allEqual(u8, &cut.incarnation, 0) or cut.database_id == null or cut.database_id.? == 0 or
                 cut.scope != null or cut.owner != null or cut.next_work != null or cut.receipt != null or cut.wait_resource != null) return error.InvalidSqlBackendResponse;
+            if (predecessor != null and cut.idle_session_reenrollment != true) return error.SqlConnectionUnavailable;
             try self.check();
-            const registration: authority.scopes.Registration = .{ .group = cut.group, .connection = self.connection, .nonce = try self.nonce(), .standalone = self.standalone, .lease = .{
-                .backend = .{ .incarnation = cut.incarnation, .id = try self.nonce(), .fence = 1 },
+            const replaces = if (predecessor) |prior| prior.retiredNativeBackend() else null;
+            const backend: @FieldType(authority.Request, "backend") = if (replaces) |prior| .{
+                .incarnation = cut.incarnation,
+                .id = prior.id,
+                .fence = std.math.add(u64, prior.fence, 1) catch return error.SqlProgramLimitExceeded,
+            } else .{ .incarnation = cut.incarnation, .id = try self.nonce(), .fence = 1 };
+            const registration: authority.scopes.Registration = .{ .group = cut.group, .connection = self.connection, .nonce = try self.nonce(), .standalone = self.standalone, .replaces = replaces, .lease = .{
+                .backend = backend,
                 .database = cut.database_id.?,
                 .node = self.node,
                 .principal = try authority.principalDigest(a, self.actor.session_user),
                 .expires_at_ms = self.now() +| source.execution_lease_ms,
             } };
-            source.create(self.store, self.principal, registration, self.actor, self.instance, cut.head, try self.nonce(), self.now()) catch |err| switch (err) {
+            source.create(self.store, self.principal, registration, self.actor, self.instance, cut.head, try self.nonce(), self.now(), if (predecessor) |prior| prior.revision else 0) catch |err| switch (err) {
                 error.SqlConnectionAlreadyExists => {},
                 else => return err,
             };
@@ -413,7 +437,7 @@ pub const Request = struct {
         if (enrolled == null and !server.source.vtable.supports_sql_command_ownership) return false;
         self.native = .{ .server = server, .context = context };
         const owner = try self.native.controller(lease.key.connection, identity);
-        if (enrolled == null) {
+        if (enrolled == null or enrolled.?.value.phase == .registering or enrolled.?.value.phase == .retired or enrolled.?.value.registration.lease.expires_at_ms <= owner.now()) {
             var connection = try @import("connections.zig").load(store, server.alloc, lease.key.connection, owner.principal, server.localSessionNodeId(), owner.now());
             defer connection.deinit();
             // Publish registration before taking a body. Lost registration
