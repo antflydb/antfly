@@ -235,6 +235,14 @@ pub const Plan = struct {
         self.storage.host_bytes = host_bytes;
     }
 
+    pub fn chargedBackendBytes(self: *const Plan) usize {
+        var bytes = self.storage.backend_bytes;
+        for ([_]?*@import("resource_retirement.zig").Charge{ self.arena_charge, self.input_workspace_charge }) |charge| {
+            if (charge) |owner| bytes +|= owner.cacheBackendBytes();
+        }
+        return bytes;
+    }
+
     /// Caller owns residency exclusion and has destroyed all published views.
     /// The logical cache slot can retire while the SDK retains the charge.
     pub fn retireFundedArenasLocked(self: *Plan, cache: *@import("../runtime/tier/cache.zig").SharedCache, arena_bytes: usize, scratch_bytes: usize) void {

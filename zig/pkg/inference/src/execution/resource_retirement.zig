@@ -531,6 +531,21 @@ pub const Charge = struct {
     }
     /// Validate both packed roots BEFORE the caller drops either SDK retain.
     /// This capability is no numerical permission and stores no creation B.
+    /// The cache charge owns this physical backing independently of its
+    /// logical slot. Read only while the caller still owns a charge reference.
+    pub fn cacheBackendBytes(self: *const Charge) usize {
+        var bytes: usize = 0;
+        switch (self.quota) {
+            .cache_component => |parts| for (parts) |part| {
+                if (part) |backing| {
+                    if (backing.tier == .backend) bytes +|= backing.bytes;
+                }
+            },
+            else => {},
+        }
+        return bytes;
+    }
+
     pub fn validateCacheCleanup(self: *const Charge, current: @import("cleanup_context.zig").Context) !void {
         switch (self.quota) {
             .cache_component => |backings| for (backings) |backing| {

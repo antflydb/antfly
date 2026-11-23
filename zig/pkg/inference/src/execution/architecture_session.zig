@@ -14756,6 +14756,73 @@ test "actual private Native stage quota callbacks can reenter the same model whi
     try std.testing.expect(scheduler.head == null);
 }
 
+test "actual Metal stage admits two learned audio arenas in one quiescent pause" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var session = try incrementalMetalFixtureSession(a);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    session.model_lifetime.?.admission_domain = pin.retain();
+    const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const data = gpuBackendData(arch);
+    if (data.tier_cache == null) data.tier_cache = runtime.tier.cache.SharedCache.init(.{});
+    const cache = &data.tier_cache.?;
+    const limits: runtime.tier.memory.Limits = .{ .host_limit_bytes = 4 << 20, .backend_limit_bytes = 4 << 20 };
+    try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, limits, .{});
+    try cache.installRetirementDomainOutsideExecution(&pin);
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false };
+    var permit = try session.admit(.{ .workspace_bytes = 8192, .workspace_planned = true, .backend_input_bytes = 0, .output_bytes = 0 });
+    defer permit.deinit();
+    var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+    var timings = StagedExecution.Counters{};
+    var stage = StagedExecution{ .session = session, .gate = session.execution_gate, .waiter = &waiter, .cb = undefined, .control = .{ .native_call_policy = .in_process }, .permit = &permit, .idle_backend = 8192, .timings = &timings };
+    defer stage.deinit();
+    try stage.prepareBeforeExecution();
+    try stage.enterInitial(a, stage.control);
+    const cb = stage.backend();
+    const hook = cb.embedding_stage orelse return error.MissingPreparedAudioCache;
+    const prepare = hook.audio_scratch_fn orelse return error.MissingPreparedAudioCache;
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    const compute: *Metal = @ptrCast(@alignCast(cb.ptr));
+    compute.require_f32_linears = true;
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 }));
+    defer cb.free(input);
+    const audio = @import("audio_schedule.zig");
+    const keys = [_]u64{ 41, 42 };
+    for (keys, 0..) |key, i| {
+        var schedule = audio.ScheduleKey.init(key, 0, 1);
+        schedule.addInput(&.{ 1, 4 }, input, &.{});
+        var nodes = [_]audio.Node{.{ .output = 1, .output_rows = 1, .output_dim = 4, .arena_offset = 0, .args = .{ .silu = .{ .input = 0 } } }};
+        const plan = try std.heap.c_allocator.create(audio.Plan);
+        errdefer std.heap.c_allocator.destroy(plan);
+        plan.* = .{ .key = schedule.finish(), .nodes = &nodes, .count = nodes.len, .ready = true, .bindings_ready = true, .arena_recipe = .{ .outputs_bytes = 4096, .total_bytes = 4096 } };
+        const learned = try plan.learnedMetadataBytes();
+        const charge = @sizeOf(audio.Plan) + learned;
+        try cache.reserve(.host, charge);
+        errdefer cache.noteRelease(.host, charge);
+        try plan.freezeLearnedMetadata(learned);
+        compute.provider_impl.embeddinggemma2_cache_admission = cache;
+        compute.provider_impl.audio_schedules[i] = plan;
+    }
+    const yields = timings.stage_yields;
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}));
+    try std.testing.expectEqual(yields + 1, timings.stage_yields);
+    try std.testing.expectEqual(@as(usize, 8192), cache.backend_bytes);
+    const before_warm = pin.controller().snapshot().backend_weight_bytes;
+    for (compute.provider_impl.audio_schedules[0..keys.len]) |entry| {
+        const plan = entry orelse return error.MissingPreparedAudioCache;
+        try std.testing.expect(plan.prepared and plan.arena_charge != null and plan.storage.outputs[0] != null);
+        try std.testing.expect(plan.chargedBackendBytes() >= 4096);
+    }
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}));
+    try std.testing.expectEqual(yields + 1, timings.stage_yields);
+    try std.testing.expectEqual(before_warm, pin.controller().snapshot().backend_weight_bytes);
+}
+
 test "actual Metal staged fresh output keeps physical identity and quota through provider handoff" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
