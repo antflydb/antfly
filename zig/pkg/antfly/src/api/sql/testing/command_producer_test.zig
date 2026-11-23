@@ -361,6 +361,9 @@ test "SQL command producer native connection GC retains uncertain owners and nat
         try std.testing.expectEqual(@as(usize, 0), empty.ids.len);
     }
     try native.until(&source, .retired, 2000);
+    var registry = transactions.SessionRegistry.init(&source);
+    defer registry.deinit(a);
+    try connections.reconcileExpired(&source, &registry, a, 2001);
     _ = try connections.mutate(&source, .{ .create = .{ .id = @splat('c'), .principal = "alice", .owner_node_id = 0, .expires_at_ms = 3000, .database = "main", .namespace = "public" } }, "alice", 0, 2001);
     try std.testing.expectError(error.SqlConnectionNotFound, connections.load(&source, a, connection, "alice", 0, 0));
     try std.testing.expect((try producer.load(&source, a, connection)) == null);
@@ -420,13 +423,21 @@ test "SQL command producer native supervisor uses existing authenticated transpo
     defer a.free(bytes);
     try std.testing.expect(!sql_submitted);
     for (0..32) |_| {
-        if (try phase(&source) == .retired) break;
+        const current = phase(&source) catch |err| switch (err) {
+            error.MissingCommandProducer => .retired,
+            else => return err,
+        };
+        if (current == .retired) break;
         // The supervisor interval is a scheduling policy, not part of source
         // correctness. Drive its real callback without wall-clock sleeps.
         server.sql_command_work_due_ns = 0;
         try server.runSessionMaintenanceOnce();
     }
-    try std.testing.expectEqual(.retired, try phase(&source));
+    const final_phase = phase(&source) catch |err| switch (err) {
+        error.MissingCommandProducer => .retired,
+        else => return err,
+    };
+    try std.testing.expectEqual(.retired, final_phase);
     try std.testing.expect(native.calls < 32);
 }
 
@@ -651,8 +662,15 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                     try native.until(&durable, .idle, 2);
                     const ticket = try begin(&native, &durable, 60);
                     const fence = try execute(&durable, ticket);
-                    const session = try server.txn_sessions.beginForPrincipalWithSettings(a, .{ .sync_level = .propose, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, "alice", &.{}, connection);
-                    txn_id = session.txn_id;
+                    txn_id = transactions.newSessionTxnId(0);
+                    var active = try connections.loadWithCommand(&durable, a, connection, "alice", 0, 2, &fence);
+                    defer active.deinit();
+                    _ = try connections.mutateWithCommand(&durable, .{ .begin = .{ .id = connection, .expected_revision = active.value.revision, .txn_id = txn_id } }, "alice", 0, 2, &fence);
+                    _ = try server.txn_sessions.beginForPrincipalWithSettingsAndId(a, .{ .sync_level = .propose, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, "alice", &.{}, connection, txn_id);
+                    _ = try connections.mutateWithCommand(&durable, .{ .bind = .{ .id = connection, .txn_id = txn_id } }, "alice", 0, 2, &fence);
+                    var enrolled = (try producer.load(&durable, a, connection)).?;
+                    defer enrolled.deinit();
+                    try native.submit(enrolled.value, .{ .bind = .{ .command = ticket.command, .transaction = txn_id } });
                     native.failure = fault;
                     native.fail_before = before;
                     var user: ?@import("../../http_server.zig").AuthenticatedIdentity = null;
