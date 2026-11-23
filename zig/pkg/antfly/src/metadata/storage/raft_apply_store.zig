@@ -49284,7 +49284,7 @@ pub const RaftApplyStore = struct {
             const database = (try view.lookup(.database, 0, name)) orelse return error.DatabaseNotFound;
             const journal: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
             try context.ensureActive();
-            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
+            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .idle_session_reenrollment = if (activation.version >= topology_protocol.sql_idle_session_reenrollment_version) true else null, .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
         }
         const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = incarnation };
         const item: ?SqlLocks.scopes.WorkItem = if (query.work) |work| blk: {
@@ -49331,7 +49331,13 @@ pub const RaftApplyStore = struct {
             break :page try @import("../../system_catalog/sql_notifications.zig").readPage(a, &txn, group, root.registration.connection, selection.generation, selection.maximum);
         } else null;
         const verified = if (query.failed_root) |request| try sqlFailedRootProof(a, &txn, group, scope, participant, request) else null;
-        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .failed_root_verified = verified, .database_after = if (database_source) |source| source.registration.lease.backend else null, .notification_binding = if (backend) |source_backend| try @import("../../system_catalog/sql_notifications.zig").readBinding(a, &txn, group, source_backend) else null, .notifications = notification_page, .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource, .participant = participant }, .{});
+        const superseded: ?bool = if (query.retired_connection) |session| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            if (activation.version < query.requiredDecoderVersion()) return error.TableTopologyProtocolUpgradeRequired;
+            const current = try SqlLocks.scopes.connection(a, &txn, ns, session.node, session.id) orelse break :blk false;
+            break :blk supersedesSqlReceipt(current, query.backend.?, query.database, standalone);
+        } else null;
+        return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .superseded = superseded, .failed_root_verified = verified, .database_after = if (database_source) |source| source.registration.lease.backend else null, .notification_binding = if (backend) |source_backend| try @import("../../system_catalog/sql_notifications.zig").readBinding(a, &txn, group, source_backend) else null, .notifications = notification_page, .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try outcomes.head(a), .scope = scope, .owner = owner, .next_work = work, .receipt = receipt, .wait_resource = wait_resource, .participant = participant }, .{});
     }
     // The data owner does not host metadata-owned SQL sessions. Join the
     // failed session and its exact control intent in this same authority cut.
@@ -49580,6 +49586,16 @@ pub const RaftApplyStore = struct {
         if (required > topology_protocol.sql_prepared_transactions_version) _ = try self.standbyRelationActivationTxn(txn, group, required);
     }
 
+    // Writer-side rollover only advances a fence after retiring its exact
+    // predecessor. The current connection binding is the durable high-water
+    // mark, including after the predecessor's scope and receipts are reclaimed.
+    fn supersedesSqlReceipt(scope: SqlLocks.scopes.Record, previous: SqlLocks.locks.Backend, database: u64, standalone: bool) bool {
+        const current = scope.registration.lease.backend;
+        return scope.registration.lease.database == database and scope.registration.standalone == standalone and
+            std.mem.eql(u8, &current.incarnation, &previous.incarnation) and
+            std.mem.eql(u8, &current.id, &previous.id) and current.fence > previous.fence;
+    }
+
     fn completeSqlLockReceiptTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, request: PreparedTransactions.Mutation, release: bool) !void {
         _ = self;
         if (request.operation != .acknowledge_receipt) return;
@@ -49590,7 +49606,10 @@ pub const RaftApplyStore = struct {
         const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
         const scope = try SqlLocks.scopes.connection(a, txn, ns, receipt.session.owner_node_id, connection_id) orelse return;
         if (receipt.lock_scope) |ref| {
-            if (!ref.backend.eql(scope.registration.lease.backend)) return error.InvalidCatalogRecord;
+            if (!ref.backend.eql(scope.registration.lease.backend)) {
+                if (supersedesSqlReceipt(scope, ref.backend, request.database_id, receipt.session.standalone)) return;
+                return error.InvalidCatalogRecord;
+            }
             if (scope.next_command > ref.command.sequence) return;
         }
         const transaction = scope.transaction orelse return;
@@ -49636,8 +49655,15 @@ pub const RaftApplyStore = struct {
         try requireSqlPreparedNativeRetirements(a, txn, group, record);
         if (record.hasPreparedLocks() and !record.locks_released) return error.CatalogPublicationProofPending;
         if (!(record.hasPreparedLocks() and record.locks_released)) if (record.identity.lock_scope) |ref| {
-            const scope = try SqlLocks.scopes.read(a, txn, .{ .home = .metadata, .group = group, .incarnation = request.incarnation }, ref.backend) orelse return error.InvalidCatalogRecord;
-            if (scope.transaction != null and scope.next_command <= ref.command.sequence) return error.CatalogPublicationProofPending;
+            const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = request.incarnation };
+            if (try SqlLocks.scopes.read(a, txn, ns, ref.backend)) |scope| {
+                if (scope.transaction != null and scope.next_command <= ref.command.sequence) return error.CatalogPublicationProofPending;
+            } else {
+                const session = record.identity.session orelse return error.InvalidCatalogRecord;
+                const connection_id = session.connection_id orelse return error.InvalidCatalogRecord;
+                const successor = try SqlLocks.scopes.connection(a, txn, ns, session.owner_node_id, connection_id) orelse return error.InvalidCatalogRecord;
+                if (!supersedesSqlReceipt(successor, ref.backend, record.identity.database_id, session.standalone)) return error.InvalidCatalogRecord;
+            }
         };
     }
 

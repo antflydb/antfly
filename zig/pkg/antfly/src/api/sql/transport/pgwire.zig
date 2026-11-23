@@ -1598,6 +1598,7 @@ pub const Adapter = struct {
         .import_snapshot = importSnapshot,
         .set_transaction_options = setTransactionOptions,
         .open_stream = openStream,
+        .guarded_select_stream = true,
         .disconnect = disconnect,
         .completion_safe = completionSafe,
         .pin_completion = pinCompletion,
@@ -2537,6 +2538,7 @@ const OwnedRead = struct {
         // Statement, parameter and binding-guard data are portal-owned. Keep a
         // private request capsule so I/O borrows point to a stable address.
         self.authority = .{ .server = server, .credential = credential, .identity = &self.identity, .request = request };
+        self.authority.request.expected_stream_columns = null;
         self.authority.request.statement = try arena.dupe(u8, request.statement);
         self.authority.request.database = try arena.dupe(u8, request.database orelse "default");
         self.authority.request.namespace = try arena.dupe(u8, request.namespace orelse "public");
@@ -2585,7 +2587,7 @@ const OwnedRead = struct {
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         errdefer if (self.decision_runtime) |*active| active.deinit();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
-        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
+        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .allow_revision_advance = request.expected_stream_columns != null and plainTableProjection(plan.compiled()) };
         try self.guarded.indexLargeGuard(arena);
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
         self.native_adapter.graph_parameters = parameters;
@@ -2597,7 +2599,7 @@ const OwnedRead = struct {
         stream_backend.setting_capture = try self.guarded.settingCapture(arena, &self.native_adapter, plan.compiled());
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision, .lease_epoch = tenure };
+        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision, .lease_epoch = tenure, .expected_columns = request.expected_stream_columns, .expected_tables = if (self.guarded.allow_revision_advance) self.guarded.expected_guard else null };
         if (plan.compiled().statement == .select) opening.install(&stream_backend);
         const opened = try Pull.Stream.openOwned(try @import("../execution/memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = if (plan.compiled().statement == .copy_to) std.math.maxInt(usize) else request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
@@ -2940,6 +2942,22 @@ const OwnedRead = struct {
 
 const ReadRevision = struct { grants: u64, token: u64 };
 
+// Direct projections have no independently rebound expressions.
+fn plainTableProjection(compiled: *const compiler.Compiled) bool {
+    if (compiled.statement != .select or compiled.parameter_count != 0 or compiled.uses_current_setting) return false;
+    const select = compiled.statement.select;
+    if (select.source) |source| {
+        if (source.* != .table or source.table.search != null or source.table.graph != null or source.table.graph_search != null) return false;
+    } else if (select.table == null) return false;
+    if (select.ctes.len != 0 or select.values_arms.len != 0 or select.set_operation != null or
+        select.predicate != null or select.having != null or select.count_all or select.distinct != null or
+        select.windows.len != 0 or select.group_by.len != 0 or select.order_by.len != 0 or select.locking != null) return false;
+    for (select.columns) |column| {
+        if (column.expression) |expression| if (expression.* != .column) return false;
+    }
+    return true;
+}
+
 // Capture the exact executable binding before either kind of reader can touch
 // rows. Preserve existing after-write receipt validation on the same binding.
 const CursorAdmission = struct {
@@ -2949,6 +2967,8 @@ const CursorAdmission = struct {
     credential: *Credential,
     admitted: ReadRevision,
     lease_epoch: ?u128,
+    expected_columns: ?[]const wire.Column = null,
+    expected_tables: ?[]const u8 = null,
     previous: @FieldType(catalog.Backend, "execution_binding_validator") = null,
     captured: ?RetainedRead = null,
 
@@ -2960,6 +2980,30 @@ const CursorAdmission = struct {
     fn capture(raw: *anyopaque, scratch: std.mem.Allocator, binding: describe_sql.BoundStatement) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.previous) |validator| try validator.validate(validator.ptr, scratch, binding);
+        if (self.expected_tables) |expected| {
+            const revision = self.native.revision orelse return error.CatalogGenerationChanged;
+            if (revision != std.mem.readInt(u64, expected[0..8], .little)) {
+                const current = (try statementBindingGuard(scratch, revision, binding)) orelse return error.CatalogGenerationChanged;
+                defer scratch.free(current);
+                if (!std.mem.eql(u8, expected[8..], current[8..])) return error.CatalogGenerationChanged;
+            }
+        }
+        if (self.expected_columns) |expected| {
+            if (expected.len != binding.columns.len) return error.CachedPlanResultTypeChanged;
+            for (expected, binding.columns) |column, current| {
+                const actual: wire.Column = .{
+                    .name = current.name,
+                    .type = try wireType(current.type),
+                    .element_type = current.element_type,
+                    .numeric_modifier = current.numeric_modifier,
+                    .enum_view = current.enum_view,
+                    .domain_view = current.domain_view,
+                    .temporal_kind = current.temporal_kind,
+                };
+                if (!wire.sameColumnType(column, actual) or !std.mem.eql(u8, column.name, actual.name))
+                    return error.CachedPlanResultTypeChanged;
+            }
+        }
         self.captured = try RetainedRead.capture(self.out, self.adapter, self.credential, self.native.identity.* orelse return error.Unauthorized, binding, self.native.context, self.native.revision, self.admitted);
         self.captured.?.lease_epoch = self.lease_epoch;
         // A later native operator may mint another owner proof. Bind its role
@@ -4264,14 +4308,20 @@ const GuardedCatalog = struct {
     authority: *Authority,
     revision: *const ?u64,
     expected_guard: ?[]const u8,
+    allow_revision_advance: bool = false,
     probe: ?*DescriptionProbe = null,
     indexed_entries: BindingEntries = .empty,
 
     fn indexLargeGuard(self: *GuardedCatalog, a: std.mem.Allocator) !void {
         const envelope = self.expected_guard orelse return;
-        const bytes = (try splitBinding(envelope)).targets;
+        const bound = try splitBinding(envelope);
+        const bytes = bound.targets;
         self.expected_guard = bytes;
-        if (@import("../catalog/ddl_binding.zig").Guard.isDdl(bytes) or std.mem.startsWith(u8, bytes, view_binding_magic)) return;
+        if (bound.incarnation == null) self.allow_revision_advance = false;
+        if (@import("../catalog/ddl_binding.zig").Guard.isDdl(bytes) or std.mem.startsWith(u8, bytes, view_binding_magic)) {
+            self.allow_revision_advance = false;
+            return;
+        }
         var targets = try GuardTargets.init(bytes);
         if (targets.count <= 8) return;
         errdefer self.indexed_entries.deinit(a);
@@ -4284,7 +4334,10 @@ const GuardedCatalog = struct {
     fn verify(self: *GuardedCatalog, table: catalog.Table) !void {
         const bytes = self.expected_guard orelse return;
         if (std.mem.startsWith(u8, bytes, view_binding_magic) or @import("../catalog/ddl_binding.zig").Guard.isDdl(bytes)) return;
-        const revision = self.revision.* orelse (table.scope orelse return error.InvalidSqlBackendResponse).revision;
+        const revision = if (self.allow_revision_advance)
+            std.mem.readInt(u64, bytes[0..8], .little)
+        else
+            self.revision.* orelse (table.scope orelse return error.InvalidSqlBackendResponse).revision;
         if (self.indexed_entries.count() == 0) return verifyBindingGuard(bytes, revision, table);
         if (std.mem.readInt(u64, bytes[0..8], .little) != revision or !self.indexed_entries.contains(BindingEntry.of(table))) return error.CatalogGenerationChanged;
     }
@@ -5459,7 +5512,7 @@ fn verifyBindingGuard(guard: []const u8, revision: u64, table: catalog.Table) !v
     var found = false;
     while (try targets.next()) |target| {
         if (target.id == table.id and (target.graph_revision != 0) == (table.graph != null) and std.mem.eql(u8, target.name, table.physical_name)) {
-            if (target.graph_revision != graphRevision(table) or target.version != table.schema_version) return error.CatalogGenerationChanged;
+            if (!BindingEntryContext.eql(.{}, BindingEntry.of(table), .{ .id = target.id, .name = target.name, .version = target.version, .column_lineage = target.column_lineage, .graph_revision = target.graph_revision }, 0)) return error.CatalogGenerationChanged;
             found = true;
         }
     }
@@ -5482,6 +5535,9 @@ test "SQL pgwire prepared identity rejects same shaped table replacement before 
     const other: catalog.Table = .{ .id = 55, .physical_name = "other_docs", .schema_version = 3, .columns = &.{} };
     const many = try encodeBindingGuard(std.testing.allocator, 7, &.{ BindingEntry.of(table), BindingEntry.of(other) });
     defer std.testing.allocator.free(many);
+    var same_version = table;
+    same_version.column_lineage = table.schema_version + 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, verifyBindingGuard(guard, 7, same_version));
     const recreated_column = try bindingGuard(std.testing.allocator, 8, replacement);
     defer std.testing.allocator.free(recreated_column);
     try std.testing.expect(!sameBindingTargets(guard, recreated_column));
@@ -5833,6 +5889,117 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     var replacement_identity = try replacement.identity(alloc);
     defer replacement_identity.deinit(alloc);
     try std.testing.expect(!(try http.tablePermissionCurrentlyAllowed(replacement_identity, "docs", .read)));
+}
+
+test "SQL pgwire native prepared streams validate catalog changes without a redundant warm probe" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const db_mod = local.storage_db_selected_root.db;
+    const raft = @import("../../../raft/mod.zig");
+    const reads = @import("antfly_source_root").antfly_sources.table_reads;
+    const Source = @import("../testing/parity_sources.zig").Tables(1);
+    var declaration = try compiler.compile(a, "CREATE TABLE usage_records(id TEXT,status TEXT)", .{});
+    defer declaration.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, declaration.statement.create_table);
+    defer a.free(schema);
+    var directory = try local.common_test_directory.TestDirectory.init("sql-prepared-admission-native");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
+    defer db.close();
+    try db.setSchemaJson(a, schema);
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"id\":\"row\",\"status\":\"open\"}" }} });
+    var ranges = [_]local.common_topology_records.RangeRecord{.{ .table_id = 7, .group_id = 7, .range_id = 1, .start_key = "", .doc_identity_shard_id = 1, .doc_identity_range_id = 1 }};
+    var source: Source = .{ .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }}, .reads = .{reads.BoundTableReadSource.init("usage_records", 7, &db, raft.read_gate.alreadyReadSafeBarrier())}, .ranges = &ranges };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var policies = @import("antfly_casbin").MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var permission = try usermgr.Permission.initOwned(a, .table, "usage_records", .read);
+    defer permission.deinit(a);
+    var user = try manager.createUser("copy-reader", "secret", &.{permission});
+    defer user.deinit(a);
+    var server = http.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .auth_enabled = true, .user_manager = &manager }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var adapter: Adapter = .{ .server = &server };
+    // Run extended protocol through the native adapter. Only Parse and Bind
+    // sample the catalog stamp on a warm execution. A new revision after
+    // Bind re-enters the compatibility path before delivering any rows.
+    source.catalog_epoch = .{ .incarnation = @splat(1), .revision = 1 };
+    const Frames = struct {
+        var admission_attempts: usize = 0;
+        fn observeAdmission(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
+            admission_attempts += 1;
+            return Adapter.openStream(raw, alloc, identity, request);
+        }
+
+        fn write(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
+            try out.writeByte(tag);
+            try out.writeInt(u32, @intCast(payload.len + 4), .big);
+            try out.writeAll(payload);
+        }
+        fn bindThenChange(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, description: wire.Description) !bool {
+            const valid = try Adapter.descriptionCurrent(raw, alloc, identity, request, description);
+            const owner: *Adapter = @ptrCast(@alignCast(raw));
+            const fixture: *Source = @ptrCast(@alignCast(owner.server.source.ptr));
+            if (valid) fixture.catalog_revision += 1;
+            return valid;
+        }
+    };
+    var baseline: [2]usize = undefined;
+    for ([_]bool{ false, true }) |guarded| for ([_]bool{ false, true }, 0..) |change, scenario| {
+        source.catalog_revision = 7;
+        source.catalog_stamp_reads.store(0, .monotonic);
+        source.catalog_reads.store(0, .monotonic);
+        Frames.admission_attempts = 0;
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        const startup = "user\x00copy-reader\x00database\x00default\x00\x00";
+        try input.writer.writeInt(u32, startup.len + 8, .big);
+        try input.writer.writeInt(u32, 196608, .big);
+        try input.writer.writeAll(startup);
+        try Frames.write(&input.writer, 'p', "secret\x00");
+        try Frames.write(&input.writer, 'P', "plan\x00SELECT id FROM usage_records\x00\x00\x00");
+        try Frames.write(&input.writer, 'B', "portal\x00plan\x00\x00\x00\x00\x00\x00\x00");
+        try Frames.write(&input.writer, 'E', "portal\x00\x00\x00\x00\x00");
+        try Frames.write(&input.writer, 'S', "");
+        try Frames.write(&input.writer, 'X', "");
+        var reader = std.Io.Reader.fixed(input.written());
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        const Protocol = @import("../../../pgwire/protocol.zig");
+        var backend = adapter.backend();
+        var vtable = backend.vtable.*;
+        vtable.open_stream = Frames.observeAdmission;
+        vtable.guarded_select_stream = guarded;
+        if (change) vtable.description_current = Frames.bindThenChange;
+        backend.vtable = &vtable;
+        var session: Protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = backend, .reader = &reader, .writer = &output.writer };
+        defer session.deinit();
+        try session.run();
+        var frames: Protocol.Cursor = .{ .bytes = output.written() };
+        var rows: usize = 0;
+        while (frames.offset < frames.bytes.len) {
+            const tag = try frames.int(u8);
+            const bytes = try frames.take((try frames.int(u32)) - 4);
+            if (tag == 'E') {
+                std.debug.print("prepared protocol error: {s}\n", .{bytes});
+                return error.UnexpectedPreparedQueryError;
+            }
+            if (tag == 'D') rows += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), rows);
+        try std.testing.expectEqual(@as(usize, if (guarded) 2 else if (change) 4 else 3), source.catalog_stamp_reads.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 1), Frames.admission_attempts);
+        const catalog_calls = source.catalog_reads.load(.monotonic);
+        if (!guarded) baseline[scenario] = catalog_calls else if (!change) {
+            try std.testing.expectEqual(baseline[scenario] - 1, catalog_calls);
+        }
+        std.debug.print("PGWIRE_PREPARED_ADMISSION guarded={} stale={} metadata_calls={d} admissions={d}\n", .{ guarded, change, catalog_calls, Frames.admission_attempts });
+    };
 }
 
 test "SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows" {
