@@ -22776,6 +22776,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn metalPersistentBuffer(self: *MetalCompute, storage_owner: *PreparedTensorStorage, bytes: usize, shared: bool) !?MetalTensor {
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (bytes % @sizeOf(f32) != 0) return null;
+        const elements = std.math.cast(i32, bytes / @sizeOf(f32)) orelse return null;
         const admitted = self.audioPlanAllocationBound(bytes, shared) orelse return null;
         const cache = if (self.data.tier_cache) |*v| v else return null;
         const ref_bytes = metal_tensor_mod.device_buffer_ref_bytes;
@@ -22797,7 +22799,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             cache.noteRelease(.host, ref_bytes);
             self.data.prefetch.unlock();
         };
-        var tensor = try MetalTensor.deviceAllocateUnpublishedBank(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{@intCast(bytes / 4)});
+        var tensor = try MetalTensor.deviceAllocateUnpublishedBank(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{elements});
         errdefer self.retireTemporaryWorkspaceValue(&tensor);
         const sdk_bytes = metal_runtime.termite_metal_buffer_allocated_size(tensor.deviceHandle());
         const actual = roundAudioBankCharge(@max(bytes, sdk_bytes)) orelse {
@@ -22990,19 +22992,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer if (storage) |*mt| mt.deinit();
         if (total > 0 and total <= 1024 * 1024) {
             storage = (try self.metalPersistentBuffer(&plan.storage, total * 4, true)) orelse return error.AudioScheduleAdmission;
-            if (storage != null) {
-                const host = try self.allocator.alloc(f32, total);
-                defer self.allocator.free(host);
-                @memset(host, 0);
-                for (plan.constants[0..plan.constant_count], 0..) |c, i| if (counts[i] > 0) {
-                    const weight = try getWeightOp(self, c.name[0..c.len]);
-                    defer freeOp(self, weight);
-                    const data = try toFloat32Op(self, weight, self.allocator);
-                    defer self.allocator.free(data);
-                    @memcpy(host[offsets[i]..][0..counts[i]], data);
-                };
-                try storage.?.uploadBytes(std.mem.sliceAsBytes(host));
-            }
+            const mapped = try storage.?.beginUnpublishedF32Initialization();
+            @memset(mapped, 0);
+            for (plan.constants[0..plan.constant_count], 0..) |c, i| if (counts[i] > 0) {
+                try cb.checkExecutionControl();
+                const weight = try getWeightOp(self, c.name[0..c.len]);
+                defer freeOp(self, weight);
+                const data = try toFloat32Op(self, weight, self.allocator);
+                defer self.allocator.free(data);
+                if (data.len != counts[i]) return error.AudioScheduleInvalid;
+                @memcpy(mapped[offsets[i]..][0..counts[i]], data);
+            };
         }
         for (plan.constants[0..plan.constant_count], 0..) |*c, i| {
             if (!c.required) continue;
@@ -53109,12 +53109,19 @@ test "embeddinggemma2 Metal audio prepared storage rolls back admission and rele
         plan.* = .{};
         try cache.reserve(.host, @sizeOf(audio_tape.Plan));
         var constants: [1]audio_tape.Constant = undefined;
-        var mt = (try compute.metalPersistentBuffer(&plan.storage, 4096, false)).?;
+        var mt = (try compute.metalPersistentBuffer(&plan.storage, 4096, !deny)).?;
         if (deny) {
             cache.budget.host_limit_bytes = cache.host_bytes;
             try std.testing.expectError(error.MemoryBudgetExceeded, compute.metalPersistentTensor(&plan.storage, mt));
             mt.deinit();
         } else {
+            const mapped = try mt.beginUnpublishedF32Initialization();
+            @memset(mapped, 0);
+            mapped[5] = 17;
+            try std.testing.expectError(error.InvalidPhysicalAllocation, mt.beginUnpublishedF32Initialization());
+            var readback: [1024]f32 = undefined;
+            try mt.downloadF32Into(&readback);
+            try std.testing.expectEqual(@as(f32, 17), readback[5]);
             plan.arena = try compute.metalPersistentTensor(&plan.storage, mt);
             plan.constant_count = 1;
             plan.constants = &constants;

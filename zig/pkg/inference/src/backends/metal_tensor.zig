@@ -71,6 +71,7 @@ const DeviceBufferRef = struct {
     /// An owned retain of external/runtime storage is not an allocation lease.
     /// Its final release must never make that storage available to the pool.
     recycle_on_drop: bool = true,
+    initialization_pending: bool = false,
     // Only exported legacy allocations with a successfully installed charge
     // witness bypass pooling. Ordinary kernel intermediate reuse is unchanged.
     retirement_witnessed: std.atomic.Value(bool) = .init(false),
@@ -907,7 +908,21 @@ pub const MetalTensor = struct {
     /// A cold bank is still owned by the caller while its views are prepared.
     /// Encoding, rather than allocation, retains it for the consuming frame.
     pub fn deviceAllocateUnpublishedBank(allocator: std.mem.Allocator, runtime: *anyopaque, byte_len: usize, mode: StorageMode, dims: []const i32) !MetalTensor {
-        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, true, .f32, false, false);
+        const result = try deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, true, .f32, false, false);
+        result.device.?.ref.initialization_pending = mode == .shared;
+        return result;
+    }
+
+    /// The unique, unsubmitted Shared root may be initialized directly.
+    /// Complete the write before retaining a view or encoding any consumer.
+    pub fn beginUnpublishedF32Initialization(self: *MetalTensor) ![]f32 {
+        const dev = self.device orelse return error.InvalidPhysicalAllocation;
+        if (self.dtype != .f32 or dev.byte_offset != 0 or dev.byte_len != dev.ref.byte_len or
+            !dev.ref.initialization_pending or dev.ref.released or dev.ref.ref_count.load(.acquire) != 1) return error.InvalidPhysicalAllocation;
+        const raw = termite_metal_buffer_contents(dev.ref.handle) orelse return error.InvalidPhysicalAllocation;
+        dev.ref.initialization_pending = false;
+        const base: [*]f32 = @ptrCast(@alignCast(raw));
+        return base[0 .. dev.byte_len / @sizeOf(f32)];
     }
 
     /// Allocate physical storage without converting or narrowing the dtype.
