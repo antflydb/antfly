@@ -215,8 +215,11 @@ pub const Source = struct {
         const size: usize = if (limits.max_reads <= 1) required else @intCast(@max(required, @min(preferred, self.length() - offset, limits.max_read_bytes, limits.max_retained_bytes, limits.max_total_bytes)));
         var started_io = false;
         return self.readSpanWithControl(offset, required, size, control, null, .sparse, &started_io) catch |err| {
-            if (started_io or size == required or (err != error.ResourceLimitExceeded and err != error.OutOfMemory)) return err;
-            return self.readSparseControlled(offset, required, control);
+            if (started_io or size == required) return err;
+            switch (err) {
+                error.ResourceLimitExceeded, error.OutOfMemory, error.SharedAdmissionExceeded, error.OptionalAudioBudgetExceeded => return self.readSparseControlled(offset, required, control),
+                else => return err,
+            }
         };
     }
 
@@ -271,6 +274,7 @@ pub const Source = struct {
             if (serial) try owner.provider_gate.lock(control);
             defer if (serial) owner.provider_gate.unlock();
             const result = borrow(range.context, offset, size, control) catch |err| {
+                if (started_io) |started| started.* = true;
                 first_call_used = true;
                 return err;
             };
@@ -771,6 +775,32 @@ test "preferred sparse reads keep a short reply and account for its owned alloca
         try std.testing.expectEqual(@as(usize, 8), source.retained_bytes);
     }
     try std.testing.expectEqual(@as(usize, 0), source.retained_bytes);
+}
+
+test "preferred sparse reads retry exact demand after preflight memory pressure" {
+    const Provider = struct {
+        calls: usize = 0,
+        fn read(raw: *anyopaque, _: u64, out: []u8, _: Control) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            @memset(out, 42);
+            return out.len;
+        }
+    };
+    var provider = Provider{};
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 2 } };
+    var source = Source{
+        .allocator = std.testing.allocator,
+        .identity = "preferred-preflight",
+        .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = 16, .accepts_full_read_size = true } },
+        .admission_pool = &pool,
+    };
+    var lease = try source.readSparsePreferring(0, 2, 8, .{});
+    defer lease.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 42, 42 }, lease.bytes);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
+    try std.testing.expectEqual(@as(usize, 2), source.retained_bytes);
 }
 
 test "preferred sparse reads send only demand to a legacy adapter with one attempt" {
