@@ -7731,7 +7731,7 @@ pub const DB = struct {
         const alloc = std.testing.allocator;
         var directory = try TestDirectory.init("idle-lsm-maintenance");
         defer directory.cleanup();
-        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .executor = .{ .backend = .manual } });
         defer db.close();
 
         // The fixture owns no source pins. Retire the initial cleanup probe
@@ -52832,15 +52832,15 @@ pub const DB = struct {
             return (entry orelse return null).persistent.writer.snapshotEpoch();
         }
 
-        fn unavailable(failure: ?*CutFailure, reason: CutFailure) @TypeOf(null) {
+        fn unavailable(comptime T: type, failure: ?*CutFailure, reason: CutFailure) ?T {
             if (failure) |out| out.* = reason;
             return null;
         }
 
         fn quietRevisions(db: *DB, failure: ?*CutFailure) ?Revisions {
             return .{
-                .primary = db.core.snapshot_admission.quietRevision() orelse return unavailable(failure, .primary_unquiet),
-                .replay = db.core.snapshot_replay_admission.quietRevision() orelse return unavailable(failure, .replay_unquiet),
+                .primary = db.core.snapshot_admission.quietRevision() orelse return unavailable(Revisions, failure, .primary_unquiet),
+                .replay = db.core.snapshot_replay_admission.quietRevision() orelse return unavailable(Revisions, failure, .replay_unquiet),
             };
         }
 
@@ -52849,7 +52849,7 @@ pub const DB = struct {
             const failure = if (self.profile) &reason else null;
             const current = if (quietRevisions(self.db, failure)) |revisions| self.readCutFrom(revisions, failure) else null;
             if (std.meta.eql(self.cut, current)) return true;
-            if (self.profile) std.log.info("antfly_bench_hybrid_cut phase={s} reason={s} old={any} new={any}", .{ phase, @tagName(reason), self.cut, current });
+            if (self.profile) std.log.info("antfly_bench_hybrid_cut phase={s} reason={s} old={any} new={any} db={s}", .{ phase, @tagName(reason), self.cut, current, self.db.core.path });
             return false;
         }
 
@@ -52860,7 +52860,7 @@ pub const DB = struct {
             const db = self.db;
             const generation = if (self.sources.dense) |entry| entry.index.publishedGeneration() else null;
             const mutation = if (self.sources.dense) |entry| entry.index.publishedMutationEpoch() else null;
-            if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return unavailable(failure, .dense_publishing);
+            if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return unavailable(Cut, failure, .dense_publishing);
             const cut: Cut = .{
                 .primary = revisions.primary,
                 .replay = revisions.replay,
@@ -52872,8 +52872,8 @@ pub const DB = struct {
             };
             // Bracket source sampling in reverse order so both mutation
             // domains were quiet over a common interval.
-            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, revisions.replay)) return unavailable(failure, .replay_bracket);
-            if (db.core.snapshot_admission.quietRevision() != @as(?u64, revisions.primary)) return unavailable(failure, .primary_bracket);
+            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, revisions.replay)) return unavailable(Cut, failure, .replay_bracket);
+            if (db.core.snapshot_admission.quietRevision() != @as(?u64, revisions.primary)) return unavailable(Cut, failure, .primary_bracket);
             return cut;
         }
 
