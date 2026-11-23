@@ -13100,6 +13100,46 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
         defer sink.release();
         var guard = try sink.enter();
         defer guard.finish();
+        {
+            const Region = @import("../execution/region_route.zig");
+            const route = @import("../execution/kernel_route.zig");
+            const compiled_graph = target.executable.graph;
+            const count_nodes = compiled_graph.nodeCount();
+            const facts = try a.alloc(route.Binding, count_nodes);
+            defer a.free(facts);
+            @memset(facts, .unknown);
+            facts[head.input] = .{ .imported_host = .{ .logical = compiled_graph.node(head.input).output_shape, .target = .metal } };
+            const immutable = target.executable.runtime.physical_pool.?.immutable_bindings.?;
+            for (head.weights[0..head.count], head.biases[0..head.count]) |weight, bias_node| {
+                const w = immutable.originalTensor(weight).?;
+                facts[weight] = .{ .tensor = .{ .value = w.value, .implementation = w.implementation } };
+                if (bias_node != ml.graph.null_node) {
+                    const b = immutable.originalTensor(bias_node).?;
+                    facts[bias_node] = .{ .tensor = .{ .value = b.value, .implementation = b.implementation } };
+                }
+            }
+            const reachable = try a.alloc(bool, count_nodes);
+            defer a.free(reachable);
+            @memset(reachable, false);
+            for (head.outputs[0..head.count]) |node| reachable[node] = true;
+            const order = try a.alloc(ml.graph.NodeId, count_nodes);
+            defer a.free(order);
+            for (order, 0..) |*node, index| node.* = @intCast(index);
+            const last_use = try a.alloc(u32, count_nodes);
+            defer a.free(last_use);
+            @memset(last_use, @intCast(count_nodes));
+            const compute_mod = @import("../ops/metal_compute.zig");
+            var metadata: compute_mod.MetalCompute.DecoderMetadataScope = .{};
+            try metadata.beginInto(&target.cb, compiled_graph);
+            defer metadata.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+            const query = Region.Prepare{ .allocator = a, .implementation = .{ .context = target.cb.ptr, .table = target.cb.vtable }, .policy_key = 1, .execution_profile = .unknown, .graph = compiled_graph, .reachable = reachable, .node_order = order, .last_use = last_use, .partition_index = 0, .partition_nodes = head.outputs[0..head.count], .node_facts = facts };
+            var regions = (try target.cb.vtable.kernels.?.prepareRegionRoutes.?(target.cb.ptr, query)) orelse return error.MissingPreparedProjectionRegion;
+            defer regions.deinit();
+            try std.testing.expectEqual(@as(usize, 1), regions.items.len);
+            try std.testing.expectEqual(rows * width * count * @sizeOf(f32), regions.items[0].requirements.dispatch_workspace.byte_size);
+            try std.testing.expect(!regions.items[0].requirements.requires_execution_profile);
+            try std.testing.expect(target.cb.vtable.kernels.?.ownedPayloadServices.?.region.?(target.cb.ptr, &regions.items[0]));
+        }
         var operation = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .managed);
         defer operation.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
         try std.testing.expect(try operation.bindCleanupEpoch(&guard.epoch));
