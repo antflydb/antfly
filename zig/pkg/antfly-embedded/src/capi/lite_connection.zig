@@ -9073,12 +9073,6 @@ test "capi native separate writer processes refresh full-text in place" {
 
 test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold reopen" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    var tmp = try api.TestDirectory.init("xproc-dense-v2");
-    defer tmp.cleanup();
-    try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
-    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
-    defer a.free(path);
     const options: api.LiteResolvedOpenOptions = .{ .profile = .native, .busy_timeout_ms = 10_000 };
     const Dense = struct {
         fn stopMaintenance(owner: *Owner) void {
@@ -9134,45 +9128,49 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
 
         const PeerMode = enum { append, replace_posting_checkpoint, fold_redo };
 
-        fn peerWrite(child_path: []const u8, opts: api.LiteResolvedOpenOptions, key: []const u8, vector: []const u8, mode: PeerMode) !void {
-            var fds: [2]std.c.fd_t = undefined;
-            try std.testing.expectEqual(0, std.c.pipe(&fds));
-            const pid = std.c.fork();
-            if (pid == 0) {
-                _ = std.posix.system.close(fds[0]);
-                var report: [1]u8 = .{1};
-                run_child: {
-                    const child = open(child_path, opts, false) catch break :run_child;
-                    const owner = child.lite_connection.?.owner;
-                    stopMaintenance(owner);
-                    const id = api.publishHandle(child) catch break :run_child;
-                    write(id, key, vector) catch break :run_child;
-                    const root = owner.current.?;
-                    const operation: anyerror!void = switch (mode) {
-                        .append => {},
-                        .replace_posting_checkpoint => replacePostingCheckpoint(root),
-                        .fold_redo => foldRedo(root),
-                    };
-                    operation catch |err| {
-                        std.debug.print("dense peer {s}: {s}\n", .{ @tagName(mode), @errorName(err) });
-                        break :run_child;
-                    };
-                    releaseWithoutFold(owner);
-                    report[0] = 0;
-                }
-                _ = std.c.write(fds[1], &report, report.len);
-                xprocParkForever();
+        const peer_path_env = "ANTFLY_TEST_DENSE_PEER_PATH";
+        const peer_key_env = "ANTFLY_TEST_DENSE_PEER_KEY";
+        const peer_vector_env = "ANTFLY_TEST_DENSE_PEER_VECTOR";
+        const peer_mode_env = "ANTFLY_TEST_DENSE_PEER_MODE";
+
+        fn runPeer(child_path: []const u8, opts: api.LiteResolvedOpenOptions) !void {
+            const key = std.mem.span(std.c.getenv(peer_key_env) orelse return error.MissingPeerKey);
+            const vector = std.mem.span(std.c.getenv(peer_vector_env) orelse return error.MissingPeerVector);
+            const mode_name = std.mem.span(std.c.getenv(peer_mode_env) orelse return error.MissingPeerMode);
+            const mode = std.meta.stringToEnum(PeerMode, mode_name) orelse return error.InvalidPeerMode;
+            const child = try open(child_path, opts, false);
+            const owner = child.lite_connection.?.owner;
+            stopMaintenance(owner);
+            const id = try api.publishHandle(child);
+            try write(id, key, vector);
+            const root = owner.current.?;
+            switch (mode) {
+                .append => {},
+                .replace_posting_checkpoint => try replacePostingCheckpoint(root),
+                .fold_redo => try foldRedo(root),
             }
-            _ = std.posix.system.close(fds[1]);
-            defer _ = std.posix.system.close(fds[0]);
-            try std.testing.expect(pid > 0);
-            defer {
-                _ = std.c.kill(pid, std.c.SIG.KILL);
-                _ = std.c.waitpid(pid, null, 0);
-            }
-            var report: [1]u8 = undefined;
-            try xprocReadBounded(fds[0], &report, 600_000);
-            try std.testing.expectEqual(@as(u8, 0), report[0]);
+            releaseWithoutFold(owner);
+            // A normal close can fold redo and change the boundary the parent tests.
+            std.c._exit(0);
+        }
+
+        fn peerWrite(child_path: []const u8, key: []const u8, vector: []const u8, mode: PeerMode) !void {
+            const allocator = std.testing.allocator;
+            const io = h.handleLockIo();
+            const executable = try std.process.executablePathAlloc(io, allocator);
+            defer allocator.free(executable);
+            var environment = std.process.Environ.Map.init(allocator);
+            defer environment.deinit();
+            try environment.put(peer_path_env, child_path);
+            try environment.put(peer_key_env, key);
+            try environment.put(peer_vector_env, vector);
+            try environment.put(peer_mode_env, @tagName(mode));
+            var child = try std.process.spawn(io, .{
+                .argv = &.{ executable, "capi Lite physical v2 peer ANN" },
+                .environ_map = &environment,
+            });
+            defer child.kill(io);
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try child.wait(io));
         }
 
         fn expectHit(handle: anytype, quoted_key: []const u8, vector: []const u8) !void {
@@ -9184,6 +9182,13 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
             try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], quoted_key) != null);
         }
     };
+    if (std.c.getenv(Dense.peer_path_env)) |child_path| return Dense.runPeer(std.mem.span(child_path), options);
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("xproc-dense-v2");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
     {
         const setup = try open(path, options, true);
         const setup_connection = setup.lite_connection.?;
@@ -9212,7 +9217,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
     const count_before = owner.test_in_place_refresh_count.load(.acquire);
     Dense.releaseWithoutFold(owner);
 
-    try Dense.peerWrite(path, options, "peer", "[0,8,0,0,0,0,0,0]", .append);
+    try Dense.peerWrite(path, "peer", "[0,8,0,0,0,0,0,0]", .append);
     try Dense.expectHit(id, "\"peer\"", "[0,8,0,0,0,0,0,0]");
     try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > count_before);
     try std.testing.expect(owner.current.? == runtime_before);
@@ -9220,14 +9225,14 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
     try std.testing.expect(owner.current.? == runtime_before);
     Dense.releaseWithoutFold(owner);
     const before_replacement = owner.test_in_place_refresh_count.load(.acquire);
-    try Dense.peerWrite(path, options, "replacement", "[0,0,0,8,0,0,0,0]", .replace_posting_checkpoint);
+    try Dense.peerWrite(path, "replacement", "[0,0,0,8,0,0,0,0]", .replace_posting_checkpoint);
     try Dense.expectHit(id, "\"replacement\"", "[0,0,0,8,0,0,0,0]");
     try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > before_replacement);
     try std.testing.expect(owner.current.? == runtime_before);
 
     // The previous search installed a read cut. Folding after that cut
     // requires writer admission to validate a new cut before appending.
-    try Dense.peerWrite(path, options, "folded", "[0,0,0,0,8,0,0,0]", .fold_redo);
+    try Dense.peerWrite(path, "folded", "[0,0,0,0,8,0,0,0]", .fold_redo);
     try Dense.write(id, "after-fold", "[0,0,0,0,0,8,0,0]");
     api.antfly_db_close(id);
     parent_open = false;
