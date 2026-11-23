@@ -829,8 +829,9 @@ pub const Pool = struct {
         if (!@import("dense_decoder_backend.zig").available(&backend)) return null;
         const native = backend.kind() == .native;
         const cuda = backend.kind() == .cuda;
-        if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch or self.metal_projection_region_candidate or
-            (!native and !cuda) or self.backends.len != 1 or self.backends[0].vtable != backend.vtable or self.backends[0].ptr != backend.ptr or
+        const metal = backend.kind() == .metal;
+        if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch != metal or self.metal_projection_region_candidate or
+            (!native and !cuda and !metal) or self.backends.len != 1 or self.backends[0].vtable != backend.vtable or self.backends[0].ptr != backend.ptr or
             reachable.len != graph.nodeCount() or self.kernels.len != graph.nodeCount() or
             self.frames.items.len != 0 or self.pending_frames != 0 or self.prepared_backings.load(.acquire) or
             self.immutable_bindings != null or self.variant_cache != null or self.selection != null or self.route_owner != null or self.root_pool != null or
@@ -841,7 +842,14 @@ pub const Pool = struct {
         for (self.transfers) |transfer| if (transfer != null) return null;
         for (self.plan.allocations) |allocation| if (allocation.backend != backend.kind()) return null;
         self.immutable_bindings = try prepared_routes.ImmutableBindings.createSource(self.allocator, immutable_inputs);
-        const selected = (try finishPreparedVariant(self, inputs, .compatibility_regions, .unknown, null)) orelse return null;
+        const operation = @import("backend_operation.zig");
+        var metadata: operation.Scope = .{};
+        defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (metal) {
+            try operation.enterInto(&backend, graph, null, .metadata, &metadata);
+            if (metadata.token() == null) return null;
+        }
+        const selected = (try finishPreparedVariant(self, inputs, .compatibility_regions, .unknown, metadata.token())) orelse return null;
         owner.* = null;
         return selected;
     }
@@ -909,13 +917,17 @@ pub const Pool = struct {
     /// would charge the same payload twice. The caller keeps this allocator
     /// alive through every Frame; all physical reservation/ledger rules remain.
     pub fn setDeclaredHostWorkspaceAllocator(self: *Pool, backing: std.mem.Allocator) !void {
-        if (self.frames.items.len != 0 or self.pending_frames != 0 or self.backends.len != 1 or self.metal_frame_dispatch) return error.InvalidHostWorkspaceAllocator;
+        if (self.frames.items.len != 0 or self.pending_frames != 0 or self.backends.len != 1) return error.InvalidHostWorkspaceAllocator;
         const functions = self.backends[0].vtable.kernels orelse return error.InvalidHostWorkspaceAllocator;
         if (!functions.accepts(self.backends[0].vtable)) return error.InvalidHostWorkspaceAllocator;
         const kind = self.backends[0].kind();
         // Match the accepted target before opaque decoder-policy access.
-        if ((kind != .native and kind != .cuda) or self.native_frame_dispatch != (kind == .native) or self.cuda_frame_dispatch != (kind == .cuda)) return error.InvalidHostWorkspaceAllocator;
+        if ((kind != .native and kind != .cuda and kind != .metal) or self.native_frame_dispatch != (kind == .native) or self.cuda_frame_dispatch != (kind == .cuda) or self.metal_frame_dispatch != (kind == .metal)) return error.InvalidHostWorkspaceAllocator;
         if (!@import("dense_decoder_backend.zig").available(&self.backends[0])) return error.InvalidHostWorkspaceAllocator;
+        if (kind == .metal) {
+            if (self.host_workspace_allocation != buffers.invalid_allocation) return error.InvalidHostWorkspaceAllocator;
+            return;
+        }
         self.host_workspace_allocator = backing;
     }
     pub fn preparedKernelRoute(self: *const Pool, node: NodeId) ?*const route.Owned {
@@ -3211,7 +3223,7 @@ pub const Frame = struct {
         errdefer self.clearNativeProgramViews(cleanup);
         self.native_program_view_pins = try self.pool.allocator.alloc(usize, self.storages.len);
         @memset(self.native_program_view_pins, 0);
-        if (cb.kind() == .cuda) {
+        if (cb.kind() == .cuda or cb.kind() == .metal) {
             self.program_resources = try self.pool.allocator.alloc(ProgramResources, graph.nodeCount());
             for (self.program_resources) |*resource| resource.* = .{};
         }

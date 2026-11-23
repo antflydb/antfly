@@ -821,6 +821,7 @@ pub const Schedule = struct {
         private_pool.?.coverage_backend = self.backend;
         private_pool.?.native_frame_dispatch = self.backend.kind() == .native;
         private_pool.?.cuda_frame_dispatch = self.backend.kind() == .cuda;
+        private_pool.?.metal_frame_dispatch = self.backend.kind() == .metal;
         self.selected = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private_pool, immutable, bindings)) orelse return error.UnsupportedDenseSchedule;
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.UnsupportedDenseSchedule;
