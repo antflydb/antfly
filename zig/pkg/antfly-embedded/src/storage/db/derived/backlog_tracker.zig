@@ -53,6 +53,7 @@ pub const Tracker = struct {
 
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    first_live_entry: usize = 0,
     pending_admissions: std.atomic.Value(usize) = .init(0),
     released_through: u64 = 0,
     retained_bytes: u64 = 0,
@@ -70,7 +71,7 @@ pub const Tracker = struct {
     }
 
     pub fn deinit(self: *Tracker, alloc: Allocator) void {
-        for (self.entries.items) |*entry| {
+        for (self.entries.items[self.first_live_entry..]) |*entry| {
             if (entry.reservation) |*reservation| reservation.release();
         }
         self.observe(0);
@@ -81,7 +82,7 @@ pub const Tracker = struct {
     pub fn track(self: *Tracker, alloc: Allocator, sequence: u64, bytes: u64) !void {
         if (self.resource_manager == null) return;
         if (sequence <= self.released_through) return;
-        var start: usize = 0;
+        var start = self.first_live_entry;
         var end = self.entries.items.len;
         while (start < end) {
             const mid = start + (end - start) / 2;
@@ -147,7 +148,7 @@ pub const Tracker = struct {
     fn insertOrdered(self: *Tracker, entry: Entry) void {
         var position = self.entries.items.len;
         if (position != 0 and self.entries.items[position - 1].sequence > entry.sequence) {
-            var first: usize = 0;
+            var first = self.first_live_entry;
             while (first < position) {
                 const mid = first + (position - first) / 2;
                 if (self.entries.items[mid].sequence <= entry.sequence) first = mid + 1 else position = mid;
@@ -159,22 +160,25 @@ pub const Tracker = struct {
     pub fn releaseThrough(self: *Tracker, sequence: u64) void {
         if (self.resource_manager == null) return;
         self.released_through = @max(self.released_through, sequence);
-        var write_index: usize = 0;
         var released_observed: u64 = 0;
         var released_total: u64 = 0;
-        for (self.entries.items) |*entry| {
-            if (entry.sequence <= sequence) {
-                released_total +|= entry.retained_bytes;
-                if (entry.reservation) |*reservation|
-                    reservation.release()
-                else
-                    released_observed +|= entry.retained_bytes;
-                continue;
-            }
-            self.entries.items[write_index] = entry.*;
-            write_index += 1;
+        while (self.first_live_entry < self.entries.items.len) {
+            const entry = &self.entries.items[self.first_live_entry];
+            if (entry.sequence > sequence) break;
+            released_total +|= entry.retained_bytes;
+            if (entry.reservation) |*reservation|
+                reservation.release()
+            else
+                released_observed +|= entry.retained_bytes;
+            self.first_live_entry += 1;
         }
-        self.entries.items.len = write_index;
+        const live = self.entries.items[self.first_live_entry..];
+        if (self.first_live_entry >= live.len) {
+            // Pay for moving live entries only after retiring at least as many.
+            std.mem.copyForwards(Entry, self.entries.items[0..live.len], live);
+            self.entries.items.len = live.len;
+            self.first_live_entry = 0;
+        }
         if (self.overflow_first_sequence != null and sequence >= self.overflow_last_sequence) {
             released_total +|= self.overflow_bytes;
             released_observed +|= self.overflow_bytes;
@@ -197,12 +201,13 @@ pub const Tracker = struct {
         // low-water target. Draining the aggregate range is bounded by the
         // committed replay head and restores precise accounting.
         if (self.overflow_first_sequence != null) return self.overflow_last_sequence;
-        if (self.entries.items.len == 0) return null;
+        const live = self.entries.items[self.first_live_entry..];
+        if (live.len == 0) return null;
 
         var release_count: usize = 0;
         const limits = manager.derivedBacklogLimits();
-        if (limits.high_sequences > 0 and self.entries.items.len > limits.high_sequences) {
-            const to_resume = self.entries.items.len - @min(limits.resume_sequences, self.entries.items.len);
+        if (limits.high_sequences > 0 and live.len > limits.high_sequences) {
+            const to_resume = live.len - @min(limits.resume_sequences, live.len);
             release_count = if (limits.throttle_window_sequences == 0)
                 to_resume
             else
@@ -218,8 +223,8 @@ pub const Tracker = struct {
                 stats.hard_limit_bytes * 3 / 4;
             var remaining_bytes = self.retained_bytes;
             var byte_release_count: usize = 0;
-            while (byte_release_count < self.entries.items.len and remaining_bytes > low_water_bytes) : (byte_release_count += 1) {
-                remaining_bytes -|= self.entries.items[byte_release_count].retained_bytes;
+            while (byte_release_count < live.len and remaining_bytes > low_water_bytes) : (byte_release_count += 1) {
+                remaining_bytes -|= live[byte_release_count].retained_bytes;
             }
             release_count = @max(release_count, byte_release_count);
         }
@@ -234,7 +239,7 @@ pub const Tracker = struct {
         }
 
         if (release_count == 0) return null;
-        return self.entries.items[release_count - 1].sequence;
+        return live[release_count - 1].sequence;
     }
 
     fn pressureRequestsProducerThrottle(stats: resource_manager_mod.SliceStats) bool {
@@ -341,6 +346,27 @@ test "derived backlog admission reserves slots for queued writers and ignores re
         try std.testing.expectEqual(sequence, entry.sequence);
     }
     tracker.releaseThrough(pending.len);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
+}
+
+test "derived backlog retires the ordered prefix and compacts after half is retired" {
+    const allocator = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var tracker = Tracker.init(&manager);
+    defer tracker.deinit(allocator);
+    for (1..9) |sequence| try tracker.track(allocator, sequence, 1);
+
+    tracker.releaseThrough(1);
+    try std.testing.expectEqual(@as(usize, 1), tracker.first_live_entry);
+    try std.testing.expectEqual(@as(usize, 8), tracker.entries.items.len);
+    try tracker.track(allocator, 2, 1);
+    tracker.releaseThrough(4);
+    try std.testing.expectEqual(@as(usize, 0), tracker.first_live_entry);
+    try std.testing.expectEqual(@as(usize, 4), tracker.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 5), tracker.entries.items[0].sequence);
+    try std.testing.expectEqual(Tracker.retainedCharge(1) * 4, tracker.retained_bytes);
+    tracker.releaseThrough(8);
+    try std.testing.expectEqual(@as(u64, 0), tracker.retained_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_backlog).used_bytes);
 }
 
