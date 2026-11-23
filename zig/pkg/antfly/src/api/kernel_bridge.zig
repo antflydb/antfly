@@ -236,6 +236,16 @@ const OpaqueApiHttpServer = struct {
     }
 };
 
+fn withRequestForwardLane(raw: *anyopaque, context: *anyopaque, callback: abi.RequestForwardLaneSource.Callback) callconv(.c) bool {
+    const runtime: *@import("antfly_local_sources").storage_background_runtime.BackendRuntime = @ptrCast(@alignCast(raw));
+    var lane = runtime.acquireDedicatedRequestForwardLane() catch return false;
+    defer lane.release();
+    const io = lane.io();
+    const borrow: abi.native_abi.IoBorrow = .init(&io);
+    callback(context, &borrow);
+    return true;
+}
+
 fn createOpaqueServer(
     owner_alloc: std.mem.Allocator,
     cfg: server_mod.ApiHttpServerConfig,
@@ -254,7 +264,12 @@ fn createOpaqueServer(
     const api_network_borrow: ?abi.native_abi.IoBorrow = if (api_network_io) |io| .init(&io) else null;
     const api_filesystem_borrow: ?abi.native_abi.IoBorrow = if (api_filesystem_io) |io| .init(&io) else null;
     const durable_borrow: ?abi.native_abi.IoBorrow = if (durable_io) |io| .init(&io) else null;
+    const request_forward: ?abi.RequestForwardLaneSource = if (cfg.backend_runtime) |runtime|
+        .{ .context = runtime, .with_lane = withRequestForwardLane }
+    else
+        null;
     const runtime_io: abi.RuntimeIoBorrows = .{
+        .request_forward = if (request_forward) |*lane_source| lane_source else null,
         .api = if (api_borrow) |*borrow| borrow else null,
         .api_network = if (api_network_borrow) |*borrow| borrow else null,
         .api_filesystem = if (api_filesystem_borrow) |*borrow| borrow else null,
@@ -652,6 +667,45 @@ pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.Ant
         server.antfly_provider = provider
     else
         server.setAntflyProvider(provider);
+}
+
+test "API kernel forward lane reserves owning runtime capacity" {
+    const runtime_mod = @import("antfly_local_sources").storage_background_runtime;
+    var runtime = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.sql_request_forward_workers_per_request },
+    });
+    defer runtime.deinit();
+
+    const Probe = struct {
+        owner: *runtime_mod.BackendRuntime,
+        called: bool = false,
+        busy: bool = false,
+
+        fn invoke(raw: *anyopaque, borrow: *const abi.native_abi.IoBorrow) callconv(.c) void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            _ = borrow.receive() catch return;
+            probe.called = true;
+            var additional = probe.owner.acquireDedicatedRequestForwardLane() catch |err| {
+                probe.busy = err == error.RequestForwardCapacityUnavailable;
+                return;
+            };
+            additional.release();
+        }
+    };
+
+    var probe: Probe = .{ .owner = runtime.ptr() };
+    try std.testing.expect(withRequestForwardLane(probe.owner, &probe, Probe.invoke));
+    try std.testing.expect(probe.called and probe.busy);
+    var acquired = try probe.owner.acquireDedicatedRequestForwardLane();
+    defer acquired.release();
+
+    var borrowed = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = std.testing.io },
+    });
+    defer borrowed.deinit();
+    try std.testing.expect(!withRequestForwardLane(borrowed.ptr(), &probe, Probe.invoke));
 }
 
 test "opaque host middleware protects direct internal routes across the kernel ABI" {
