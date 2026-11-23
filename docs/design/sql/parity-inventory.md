@@ -1,6 +1,6 @@
 # Original SQL extraction parity inventory
 
-Status: release gate blocking. Run
+For the current ledger status, run
 `python3 scripts/check_sql_parity_inventory.py --report` for current
 dispositions and per-family blocking counts; this document does not restate
 them. The checker reads only the JSON fixtures below, never this page.
@@ -319,42 +319,29 @@ from current SQL extraction is not repaired by naming this inventory check a ful
 | window | 22 |
 
 
-## Remaining activation caveats
+## Evidence scope
 
-- `sql-1412` declares a NOT VALID CHECK in its original setup; PostgreSQL still
-  enforces that CHECK on new writes. Success against a baseline without the
-  CHECK does not establish parity.
-- The unique-selector cases `sql-1509`, `sql-1510`, `sql-1512`, `sql-1514`,
-  `sql-1515` and `sql-1517` need their ordinary/partial/expression-predicate
-  index owners and bounded native access evidence. Their original setup uses
-  VALIDATE CONSTRAINT on index names, which is not a PostgreSQL constraint
-  operation. `sql-1509`, `sql-1510`, `sql-1514` and `sql-1515` have PostgreSQL
-  DML results and mounted native execution against ready unique-index owners
-  (exact equality index spans, primary content digests, no full-table capture),
-  but remain unresolved until that setup and public catalog activation are
-  adjudicated. `sql-1512` and `sql-1517` still need their own owner profiles.
-  A table scan against the baseline is not a substitute for unique-owner
-  activation.
-- Unique-owner provenance is an OpenAPI-generated `constraint`/`index` identity.
-  Table-bound DROP/VALIDATE CONSTRAINT reject index owners; index retirement
-  removes its paired uniqueness rule. Unqualified PostgreSQL DROP INDEX still
-  needs catalog owner resolution (see
-  [namespace relation ownership](../../../zig/SYSTEM_CATALOG.md#namespace-relation-ownership)).
-- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`, `sql-1103`) uses the durable
-  empty-generation barrier. The document RESTART IDENTITY original has public
-  admission, completed publication, future-write and cold-owner evidence.
-  Owned sequence counters now exist; their transactional generation/reset
-  handoff remains unfinished, as do the promoted-standby and asynchronous-artifact
-  online-transfer fault matrices.
-- Prepared CTE/recursive/MERGE cases (`sql-0005`, `sql-0008`–`sql-0010`) have
-  hosted single-owner evidence but stay unresolved pending multi-owner and
-  distributed fault evidence.
-- Joined/source UPDATE and DELETE, MERGE, lateral and recursive source cases
-  require explicit current-engine mapping beyond ordinary DML component tests.
-- DDL's 384 entries include session commands, prepared statements, cursors,
-  maintenance, locks, and constraints. Review actual original admission/runtime
-  behavior before treating all of these as implemented or all as future scope.
-- Existing scalar/aggregate/join/window, document DML, DDL, session and protocol
-  tests should be mapped to exact IDs. Current passing component suites do not
-  automatically resolve source corpus entries. No cases are automatically
-  waived by family or by keyword.
+- `sql-1412` verifies that PostgreSQL and Antfly enforce a NOT VALID CHECK on
+  new writes. The mounted gate checks SQLSTATE 23514, unchanged postimages,
+  historical-invalid-row readability, and enforcement after cold owner restart.
+- The six unique-selector cases (`sql-1509`, `sql-1510`, `sql-1512`,
+  `sql-1514`, `sql-1515`, and `sql-1517`) use public CREATE UNIQUE INDEX
+  activation, full and partial index witnesses, and a PostgreSQL DML reference.
+  The native gate verifies RETURNING, postimages, uniqueness on future writes,
+  and cold owner recovery. The original setups treated index names as
+  constraints, so the gate uses the corresponding public index operation.
+- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`, `sql-1103`) uses durable
+  empty-generation publication. The document RESTART IDENTITY gate checks
+  authenticated admission, completion, future writes, cold recovery, and
+  preservation of unrelated counters. Owned sequence reset and the
+  promoted-standby and asynchronous-artifact fault matrices require their own
+  qualification.
+- The prepared CTE, recursive, and MERGE cases (`sql-0005`,
+  `sql-0008`–`sql-0010`) have authenticated native pgwire and PostgreSQL
+  evidence for their recorded owner profiles. Consult each ledger entry for
+  its topology and restart coverage. Multi-node failover, distributed
+  cancellation, and transaction-spanning snapshot behavior have separate
+  evidence requirements.
+- Pure compiler and storage gates qualify the contracts they exercise.
+  The ledger records which mounted, provider, or distributed checks qualify
+  each case. Release readiness requires executing the referenced gates.
