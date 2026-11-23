@@ -7604,8 +7604,7 @@ pub const DB = struct {
         // polls must not advance the replay revision seen by hybrid readers.
         const primary = &self.core.primary_store_owner;
         if (!self.source_pin_cleanup.due(monotonicTimeNs()) and
-            primary.lsmMaintenanceDebtHint() == 0 and
-            primary.nextLsmMaintenanceWakeDelayNsBestEffort() != @as(?u64, 0) and
+            !primary.mayHaveLsmMaintenanceWork() and
             !self.core.index_manager.mayHaveLsmMaintenanceWork()) return false;
 
         var replication_mutation = self.acquireReplicationMutationShared();
@@ -7676,20 +7675,15 @@ pub const DB = struct {
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runPrimaryLsmMaintenanceStepBestEffort", .{self});
         const primary = &self.core.primary_store_owner;
-        if (primary.lsmMaintenanceDebtHint() == 0 and
-            primary.nextLsmMaintenanceWakeDelayNsBestEffort() != @as(?u64, 0) and
-            primary.lsmMaintenanceScoreBestEffort() == @as(?u64, 0)) return false;
+        if (!primary.mayHaveLsmMaintenanceWork()) return false;
 
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
-        if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
-        const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
-        const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
-        if (primary_score == 0 and !primary_reclaim_due) return false;
-        if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
-        self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+        if (!primary.mayHaveLsmMaintenanceWork()) return false;
+        if (try primary.runLsmMaintenanceStepBestEffort()) return true;
+        primary.refreshLsmMaintenanceDebtHint();
         return false;
     }
 
@@ -7731,23 +7725,46 @@ pub const DB = struct {
         const alloc = std.testing.allocator;
         var directory = try TestDirectory.init("idle-lsm-maintenance");
         defer directory.cleanup();
-        // With no LSM backend or pending source pins, neither poll has work
-        // to admit. This isolates admission from startup reclamation debt.
+        var options = db_config.primary_lsm_options_default;
+        options.obsolete_retention_ns = 0;
         var db = try DB.open(alloc, directory.path(), .{
-            .primary_backend = .{ .mem = .{} },
+            .primary_backend = .{ .lsm = options },
+            .start_optional_runtimes = false,
             .start_index_workers = false,
             .executor = .{ .backend = .manual },
         });
         defer db.close();
+        const backend = db.core.primary_store_owner.lsmBackend() orelse return error.TestUnexpectedResult;
+        const root = backend.root_dir orelse return error.TestUnexpectedResult;
+        const storage = backend.storage orelse return error.TestUnexpectedResult;
 
-        // The fixture owns no source pins. Retire the initial cleanup probe
-        // before sampling the revision that hybrid search would observe.
-        _ = try db.runSourcePinCleanupStep();
+        _ = try db.runLsmMaintenanceUntilIdle();
+        db.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         try std.testing.expect(!db.source_pin_cleanup.due(monotonicTimeNs()));
+        try std.testing.expect(!backend.mayHaveMaintenanceWork());
+
         const revision = db.core.snapshot_replay_admission.quietRevision().?;
         try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
         try std.testing.expect(!try db.runPrimaryLsmMaintenanceStepBestEffort());
         try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+
+        for ([_]bool{ true, false }, 0..) |primary_only, i| {
+            const obsolete = try lsm_backend_mod.repository.runPath(alloc, root, 999_999 + i);
+            defer alloc.free(obsolete);
+            try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(storage, obsolete, "obsolete");
+            {
+                const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, backend);
+                defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+                try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete));
+            }
+            const progressed = if (primary_only)
+                try db.runPrimaryLsmMaintenanceStepBestEffort()
+            else
+                try db.runLsmMaintenanceStepBestEffort();
+            try std.testing.expect(progressed);
+            try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(alloc, obsolete, 1024));
+            try std.testing.expectEqual(@as(?u64, revision + i + 1), db.core.snapshot_replay_admission.quietRevision());
+        }
     }
 
     test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {

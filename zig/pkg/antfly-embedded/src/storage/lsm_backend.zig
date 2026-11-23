@@ -8923,6 +8923,19 @@ pub const Backend = struct {
     pub fn nextMaintenanceWakeDelayNsBestEffort(self: *Backend) ?u64 {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
+        return self.nextMaintenanceWakeDelayNsLocked();
+    }
+
+    /// Cached debt and scheduled work are the admission signals used by the
+    /// maintenance runner. A busy backend cannot prove it is idle.
+    pub fn mayHaveMaintenanceWork(self: *Backend) bool {
+        if (self.maintenanceDebtHint() != 0) return true;
+        if (!self.mu.tryLock()) return true;
+        defer self.mu.unlock();
+        return self.maintenanceDebtHint() != 0 or self.nextMaintenanceWakeDelayNsLocked() == @as(?u64, 0);
+    }
+
+    fn nextMaintenanceWakeDelayNsLocked(self: *Backend) ?u64 {
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return 0;
         if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return 0;
         if (self.manifest_recovery_required) return null;

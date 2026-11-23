@@ -303,10 +303,10 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
-    pub fn lsmMaintenanceScoreBestEffort(self: *const PrimaryStoreOwner) ?u64 {
+    pub fn mayHaveLsmMaintenanceWork(self: *const PrimaryStoreOwner) bool {
         return switch (self.*) {
-            .none, .mem => 0,
-            .lsm => |owner| owner.handle.backend.maintenanceScoreBestEffort(),
+            .none, .mem => false,
+            .lsm => |owner| owner.handle.backend.mayHaveMaintenanceWork(),
         };
     }
 
