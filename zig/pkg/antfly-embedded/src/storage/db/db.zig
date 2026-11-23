@@ -52844,8 +52844,9 @@ pub const DB = struct {
             // outside the stoppable ranker. Resolve the same default index as
             // the ranker, including when multiple text indexes exist.
             if (text.request.include_stored or text.request.aggregations_json.len != 0) return null;
-            const text_entry = self.db.core.textIndexEntry(text.request.index_name) orelse return null;
-            if (self.db.core.textIndexIsChunkBacked(a, text_entry.config.name) catch return null) return null;
+            if (self.db.core.textIndexEntry(text.request.index_name)) |entry| {
+                if (self.db.core.textIndexIsChunkBacked(a, entry.config.name) catch return null) return null;
+            }
 
             const dense = components[1];
             const entry = self.db.core.denseIndex(dense.request.index_name) orelse return null;
