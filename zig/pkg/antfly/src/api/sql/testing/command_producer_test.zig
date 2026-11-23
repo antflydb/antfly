@@ -51,6 +51,7 @@ const Native = struct {
     outcome_reads: usize = 0,
     scope_reads: usize = 0,
     reject_retired_connection: bool = false,
+    topology_version: u16 = protocol.current_version,
     failure: ?enum { admit, prepare, commit, handoff, ack, cancel } = null,
     fail_before: bool = false,
     block_ack: bool = false,
@@ -113,7 +114,7 @@ const Native = struct {
             },
             .sql_lock_read => |query| blk: {
                 self.scope_reads += 1;
-                if (self.reject_retired_connection and query.retired_connection != null) return error.UnknownField;
+                if (self.reject_retired_connection and query.retired_connection != null) return error.UnsupportedOperation;
                 break :blk self.metadata.sqlLockRead(alloc, group, query, .{ .setting_admin = true });
             },
             .sql_lock_outcome => |request| blk: {
@@ -184,7 +185,7 @@ fn setup(metadata: *storage.RaftApplyStore, source: *transactions.DurableSession
     native.standalone = standalone;
     try metadata.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
     if (standalone) try metadata.replaceStandaloneCatalog(group, try metadata.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
-    const activation = try std.json.Stringify.valueAlloc(a, protocol.Activation{ .version = protocol.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    const activation = try std.json.Stringify.valueAlloc(a, protocol.Activation{ .version = native.topology_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
     defer a.free(activation);
     try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
     const node: u64 = if (standalone) 0 else 9;
@@ -674,6 +675,9 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                         native.connection_expiry_ms = 3600001;
                         native.database = "default";
                     }
+                    // Ordinary scoped commits also complete while the newer
+                    // supersession decoder is available but inactive.
+                    if (fault == null) native.topology_version = protocol.sql_idle_session_reenrollment_version - 1;
                     try setup(&metadata, &durable, true, &native);
                     try native.until(&durable, .idle, 2);
                     const ticket = try begin(&native, &durable, 60);

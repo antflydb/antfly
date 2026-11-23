@@ -759,10 +759,9 @@ pub const Registry = struct {
     fn observeRecoveryScope(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
         const types = @import("../../../system_catalog/lock_authority.zig");
         const bytes = self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }) catch |err| switch (err) {
-            // Pre-reenrollment metadata may reject the selector at decode or
-            // activation. The plain read can still prove that the scope exists.
-            // A failed proof followed by a missing scope never permits cleanup.
-            error.UnknownField, error.TableTopologyProtocolUpgradeRequired, error.MetadataMutationOutcomeUnknown => fallback: {
+            // Older receivers can reject the selector at decode or require
+            // activation before reading it. A plain read proves presence only.
+            error.UnknownField, error.UnsupportedOperation, error.TableTopologyProtocolUpgradeRequired => fallback: {
                 if (query.retired_connection == null) return err;
                 try context.ensureActive();
                 var plain = query;
