@@ -610,8 +610,7 @@ pub const DirectoryBuilder = struct {
         prefix_len: u8,
         packet_index: usize,
         padding_index: usize,
-        resolved_packets: usize = 0,
-        resolved_padding: usize = 0,
+        packet_count: u16,
         ticks: u64,
         scale: u64,
     };
@@ -622,9 +621,9 @@ pub const DirectoryBuilder = struct {
 
     fn tracks(context: *anyopaque, bytes: []const u8) void {
         const self: *DirectoryBuilder = @ptrCast(@alignCast(context));
-        if (self.failure != null) return;
         const suspended = if (self.pool) |pool| pool.swapReclaimer(null) else null;
         defer if (self.pool) |pool| pool.setReclaimer(suspended);
+        if (self.failure != null) return;
         self.collectTracks(bytes) catch |err| self.fail(err);
     }
 
@@ -640,9 +639,9 @@ pub const DirectoryBuilder = struct {
 
     fn block(context: *anyopaque, input: *Source, elem: Webm.Element, discard: ?Webm.ObservedDiscard, prefix: []const u8, ticks: u64, scale: u64) void {
         const self: *DirectoryBuilder = @ptrCast(@alignCast(context));
-        if (self.failure != null) return;
         const suspended = if (self.pool) |pool| pool.swapReclaimer(null) else null;
         defer if (self.pool) |pool| pool.setReclaimer(suspended);
+        if (self.failure != null) return;
         self.observeBlock(input, elem, discard, prefix, ticks, scale) catch |err| self.fail(err);
     }
 
@@ -654,87 +653,62 @@ pub const DirectoryBuilder = struct {
         self.collectBlock(input, elem, discard, prefix, ticks, scale, true) catch |err| {
             if (err != error.AudioDirectoryNeedsRead) return err;
             self.packets.shrinkRetainingCapacity(before);
-            if (self.deferred.items.len >= self.limits.max_packets -| before) return error.AudioTooLarge;
+            // The fixed block header includes the lace count. Reserve the
+            // final positions now and fill them after video preparation.
+            if (prefix.len < number.len + 3) return error.UnsupportedAudioFormat;
+            const flags = prefix[number.len + 2];
+            const count = if (flags & 6 == 0) 1 else count: {
+                if (prefix.len < number.len + 4) return error.UnsupportedAudioFormat;
+                break :count @as(usize, prefix[number.len + 3]) + 1;
+            };
+            const limit = @min(self.limits.max_packets, self.limits.max_index_bytes / @sizeOf(Packet));
+            if (count > limit -| before) return error.AudioTooLarge;
             var entry = DeferredBlock{
                 .element = elem,
                 .discard = discard,
                 .prefix = undefined,
                 .prefix_len = @intCast(prefix.len),
                 .packet_index = before,
+                .packet_count = @intCast(count),
                 .padding_index = self.padding.items.len,
                 .ticks = ticks,
                 .scale = scale,
             };
             @memcpy(entry.prefix[0..prefix.len], prefix);
+            if (discard != null) try self.padding.append(self.allocator, .{ .first = before, .end = before + count, .ns = 0 });
+            if (before + count > self.packets.capacity)
+                try self.packets.ensureTotalCapacityPrecise(self.allocator, @min(limit, @max(before + count, self.packets.capacity *| 2)));
+            self.packets.items.len = before + count;
             try self.deferred.append(self.allocator, entry);
         };
-        if (self.packets.items.len > self.limits.max_packets -| self.deferred.items.len) return error.AudioTooLarge;
     }
 
-    /// Merge the missing blocks into the resident packet order.
     pub fn resolve(self: *DirectoryBuilder, input: *Source) !void {
         if (self.failure) |err| return err;
         if (self.deferred.items.len == 0) return;
-        const limit = @min(self.limits.max_packets, self.limits.max_index_bytes / @sizeOf(Packet));
-        const trailing = self.deferred.items[0].packet_index == self.packets.items.len;
-        if (trailing) {
-            const packets = self.packets.items.len;
-            const padding = self.padding.items.len;
-            errdefer {
-                self.packets.shrinkRetainingCapacity(packets);
-                self.padding.shrinkRetainingCapacity(padding);
-            }
-            for (self.deferred.items) |entry| {
-                try input.checkControl();
-                try self.collectBlock(input, entry.element, entry.discard, entry.prefix[0..entry.prefix_len], entry.ticks, entry.scale, false);
-            }
-            self.deferred.clearAndFree(self.allocator);
-            return;
-        }
-
-        // Resolve only missing packets into scratch, then merge backward so
-        // every resident run moves at most once.
-        var missing = DirectoryBuilder{ .allocator = self.allocator, .limits = self.limits, .track = self.track };
-        defer {
-            missing.track = null;
-            missing.deinit();
-        }
-        for (self.deferred.items) |*entry| {
+        var padding: [1]BlockPadding = undefined;
+        for (self.deferred.items) |entry| {
             try input.checkControl();
-            try missing.collectBlock(input, entry.element, entry.discard, entry.prefix[0..entry.prefix_len], entry.ticks, entry.scale, false);
-            if (missing.packets.items.len > limit -| self.packets.items.len) return error.AudioTooLarge;
-            entry.resolved_packets = missing.packets.items.len;
-            entry.resolved_padding = missing.padding.items.len;
+            const slots = self.packets.items[entry.packet_index..][0..entry.packet_count];
+            var fill = DirectoryBuilder{
+                .allocator = self.allocator,
+                .limits = self.limits,
+                .track = self.track,
+                .packets = .initBuffer(slots),
+                .padding = .initBuffer(&padding),
+            };
+            fill.limits.max_packets = slots.len;
+            try fill.collectBlock(input, entry.element, entry.discard, entry.prefix[0..entry.prefix_len], entry.ticks, entry.scale, false);
+            if (fill.packets.items.len != slots.len) return error.UnsupportedAudioFormat;
+            if (fill.padding.items.len != 0) self.padding.items[entry.padding_index].ns = padding[0].ns;
         }
-
-        var packet_cursor = self.packets.items.len;
-        var padding_cursor = self.padding.items.len;
-        try self.packets.ensureTotalCapacityPrecise(self.allocator, packet_cursor + missing.packets.items.len);
-        try self.padding.ensureTotalCapacityPrecise(self.allocator, padding_cursor + missing.padding.items.len);
-        self.packets.items.len = packet_cursor + missing.packets.items.len;
-        self.padding.items.len = padding_cursor + missing.padding.items.len;
-        var index = self.deferred.items.len;
-        while (index != 0) {
-            index -= 1;
-            const entry = self.deferred.items[index];
-            const count = entry.resolved_packets;
-            const pads = entry.resolved_padding;
-            const previous_count = if (index == 0) 0 else self.deferred.items[index - 1].resolved_packets;
-            const previous_pads = if (index == 0) 0 else self.deferred.items[index - 1].resolved_padding;
-            std.mem.copyBackwards(Packet, self.packets.items[entry.packet_index + count .. packet_cursor + count], self.packets.items[entry.packet_index..packet_cursor]);
-            @memcpy(self.packets.items[entry.packet_index + previous_count .. entry.packet_index + count], missing.packets.items[previous_count..count]);
-            var pad = padding_cursor;
-            while (pad > entry.padding_index) {
-                pad -= 1;
-                const resident = self.padding.items[pad];
-                self.padding.items[pad + pads] = .{ .first = resident.first + count, .end = resident.end + count, .ns = resident.ns };
-            }
-            for (missing.padding.items[previous_pads..pads], self.padding.items[entry.padding_index + previous_pads .. entry.padding_index + pads]) |resolved, *out| {
-                out.* = .{ .first = resolved.first + entry.packet_index, .end = resolved.end + entry.packet_index, .ns = resolved.ns };
-            }
-            packet_cursor = entry.packet_index;
-            padding_cursor = entry.padding_index;
+        var count: usize = 0;
+        for (self.padding.items) |entry| {
+            if (entry.ns == 0) continue;
+            self.padding.items[count] = entry;
+            count += 1;
         }
+        self.padding.shrinkRetainingCapacity(count);
         self.deferred.clearAndFree(self.allocator);
     }
 
@@ -757,7 +731,10 @@ pub const DirectoryBuilder = struct {
                 defer lease.deinit();
                 break :count try readSignedInt(lease.bytes);
             };
-            if (ns != 0) try self.padding.append(self.allocator, .{ .first = before, .end = self.packets.items.len, .ns = ns });
+            if (ns != 0) {
+                if (self.padding.items.len == self.padding.capacity) try self.padding.ensureUnusedCapacity(self.allocator, 1);
+                self.padding.appendAssumeCapacity(.{ .first = before, .end = self.packets.items.len, .ns = ns });
+            }
         };
     }
 
@@ -1021,7 +998,8 @@ test "WebM joint video and audio index reuses the block prefix" {
     try std.testing.expectError(error.AudioTooLarge, denied.borrowDirectory());
 
     var uncached = Source{ .allocator = a, .identity = plain.identity, .storage = .{ .range = range }, .limits = joint.limits };
-    var deferred = DirectoryBuilder{ .allocator = a, .limits = .{} };
+    var directory_memory = std.testing.FailingAllocator.init(a, .{});
+    var deferred = DirectoryBuilder{ .allocator = directory_memory.allocator(), .limits = .{} };
     defer deferred.deinit();
     var uncached_video = try Webm.Reader.initObserved(a, &uncached, .{}, deferred.observer());
     defer uncached_video.deinit();
@@ -1029,8 +1007,9 @@ test "WebM joint video and audio index reuses the block prefix" {
     try std.testing.expectEqual(plain.reads, uncached.reads);
     try std.testing.expectError(error.AudioDirectoryNeedsRead, deferred.borrowDirectory());
     try std.testing.expectEqual(@as(usize, 1), deferred.deferred.items.len);
-    try std.testing.expectEqual(@as(usize, 1), deferred.packets.items.len);
+    try std.testing.expectEqual(baseline.packets.len, deferred.packets.items.len);
     uncached.limits = .{};
+    directory_memory.fail_index = directory_memory.alloc_index;
     try deferred.resolve(&uncached);
     const resolved = try deferred.borrowDirectory();
     try std.testing.expectEqualSlices(Packet, baseline.packets, resolved.packets);

@@ -1062,7 +1062,7 @@ pub const Runner = struct {
     fn reclaimVideoAudio(raw: *anyopaque) bool {
         const builder: *media.webm_audio.DirectoryBuilder = @ptrCast(@alignCast(raw));
         if (builder.failure != null) return false;
-        builder.fail(error.AudioTooLarge);
+        builder.fail(error.SharedAudioDirectoryReclaimed);
         return true;
     }
 
@@ -1115,6 +1115,12 @@ pub const Runner = struct {
             break :warm Track.fromCachedAudio(self.allocator, input, self.control, self.request.index_cache.?, entry);
         } else if (owner.observed) |observed| observed_track: {
             observed.builder.resolve(input) catch |err| {
+                if (err == error.SharedAudioDirectoryReclaimed) {
+                    if (optional) break :observed_track error.AudioTooLarge;
+                    if (owner.flight) |lease| lease.deinit();
+                    owner.flight = null;
+                    break :observed_track Track.initCached(self.allocator, input, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission);
+                }
                 break :observed_track if (err == error.OutOfMemory and observed.memory.denied != null) error.AudioTooLarge else err;
             };
             break :observed_track Track.initObservedWebm(self.allocator, input, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission, observed.builder, observed.memory.live, owner.flight != null);
@@ -1285,7 +1291,11 @@ pub const Runner = struct {
                 var reader = try media.webm.Reader.initObserved(self.allocator, source, .{ .max_packets = count, .max_index_bytes = self.request.max_working_bytes }, builder.observer());
                 defer reader.deinit();
                 if (builder.failure) |err| {
-                    if (err == error.OutOfMemory and memory.denied != null) builder.failure = error.AudioTooLarge;
+                    if (err == error.OutOfMemory) {
+                        if (memory.denied) |denied| {
+                            builder.failure = if (denied == error.SharedAdmissionExceeded) error.SharedAudioDirectoryReclaimed else error.AudioTooLarge;
+                        }
+                    }
                 }
                 return self.webmWindowsCached(&reader, identity, &build);
             }
@@ -4087,7 +4097,7 @@ test "model aware media video admission can reclaim optional audio geometry" {
     defer video_window.deinit();
     try video_window.resize(.{ .host_bytes = 128 });
     try std.testing.expectEqual(@as(usize, 0), memory.live);
-    try std.testing.expectError(error.AudioTooLarge, builder.borrowDirectory());
+    try std.testing.expectError(error.SharedAudioDirectoryReclaimed, builder.borrowDirectory());
 }
 
 test "model aware media fails a partial video request on an audio source version mismatch" {
@@ -4170,7 +4180,15 @@ test "model aware media builds WebM audio independently and budgets optional spe
             .output_executor = .{ .context = &provider, .execute = Speaker.unexpectedOutput },
             .speaker_analysis = .{ .context = &provider, .prepare = Speaker.prepare },
         }, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+        var memory = media.admission.TrackedAllocator{ .backing = a, .reservation = try runner.pool.acquire(.{}), .limit = runner.request.max_working_bytes };
+        defer memory.reservation.deinit();
+        var builder = media.webm_audio.DirectoryBuilder{ .allocator = memory.allocator(), .limits = .{} };
+        defer builder.deinit();
         var owner = Runner.VideoAudio{ .source = &source, .range_webm = true };
+        if (!partial) {
+            try std.testing.expect(Runner.reclaimVideoAudio(&builder));
+            owner.observed = .{ .builder = &builder, .memory = &memory };
+        }
         runner.video_audio = &owner;
         defer runner.finishVideoAudio(&owner);
         try runner.prepareVideoAudio();
