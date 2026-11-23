@@ -21,7 +21,7 @@ const build_options = @import("build_options");
 
 /// Actual successful/declined/failed backend callback returns. These entry
 /// families do not claim vendor-internal kernel algorithms or completion.
-pub const Entry = enum { linear, linear_no_bias, layer_norm, gelu, add, encoder_attention, causal_attention, cross_attention, convolution_1d, convolution_2d, prepared_linear, prepared_linear_pair, prepared_qkv, prepared_linear_into, prepared_qkv_into };
+pub const Entry = enum { linear, linear_no_bias, layer_norm, gelu, add, encoder_attention, causal_attention, cross_attention, convolution_1d, convolution_2d, prepared_linear, prepared_linear_pair, prepared_qkv, prepared_linear_into, prepared_qkv_into, audio_execution };
 pub const EntryBackend = enum { native, metal, cuda };
 pub const EntryOutcome = enum { selected, declined, failed };
 pub const FailureText = struct {

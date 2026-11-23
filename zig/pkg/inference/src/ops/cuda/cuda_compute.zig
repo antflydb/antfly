@@ -60211,9 +60211,18 @@ test "public source audio linear recreates input bank through actual learning ca
         if (iteration == 2) {
             // Learning is complete. A cancelled recording must leave no
             // input staging copies, and the next recording can still succeed.
+            var observation = @import("../../execution/runtime_observation.zig").Scope.init();
+            defer observation.deinit();
             const copies_before = compute.stats.d2d_bytes;
             try std.testing.expectError(error.Cancelled, cb.audioExecution(0x303, &.{ projected, identity }, &run, Run.cancel));
             try std.testing.expectEqual(copies_before, compute.stats.d2d_bytes);
+            const entries = observation.snapshot().backend_entries;
+            for (entries.records[0..entries.count]) |entry| {
+                if (entry.family == .audio_execution and entry.backend == .cuda) {
+                    try std.testing.expectEqual(@as(u64, 1), entry.failed_returns);
+                    break;
+                }
+            } else return error.TestUnexpectedResult;
         }
         const before_calls = run.calls;
         var transfers = transfer_audit.Audit{};

@@ -5753,7 +5753,7 @@ pub const ComputeBackend = struct {
             _ = set(self.ptr, previous);
         };
         try self.checkExecutionControl();
-        const result = try op(self.ptr, key, inputs, context, run);
+        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run });
         errdefer if (result) |ct| self.free(ct);
         try self.checkExecutionControl();
         return result;
