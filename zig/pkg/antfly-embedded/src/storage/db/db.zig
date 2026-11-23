@@ -7607,9 +7607,12 @@ pub const DB = struct {
             !primary.hasReadyLsmMaintenanceWorkBestEffort() and
             !self.core.index_manager.hasReadyLsmMaintenanceWorkBestEffort()) return false;
 
-        var replication_mutation = self.acquireReplicationMutationShared();
+        var replication_mutation = if (self.replicationMutationBarrier()) |barrier|
+            barrier.tryAcquireShared() orelse return false
+        else
+            null;
         defer if (replication_mutation) |*lease| lease.release();
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        var snapshot_replay = self.core.snapshot_replay_admission.tryAcquireMutation() orelse return false;
         defer snapshot_replay.release();
         if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
@@ -7666,9 +7669,12 @@ pub const DB = struct {
         const primary = &self.core.primary_store_owner;
         if (!primary.hasReadyLsmMaintenanceWorkBestEffort()) return false;
 
-        var replication_mutation = self.acquireReplicationMutationShared();
+        var replication_mutation = if (self.replicationMutationBarrier()) |barrier|
+            barrier.tryAcquireShared() orelse return false
+        else
+            null;
         defer if (replication_mutation) |*lease| lease.release();
-        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        var snapshot_replay = self.core.snapshot_replay_admission.tryAcquireMutation() orelse return false;
         defer snapshot_replay.release();
         return try primary.runReadyLsmMaintenanceStepBestEffort();
     }
@@ -7736,23 +7742,30 @@ pub const DB = struct {
 
         // Keep the backend mutex held until both best-effort polls return.
         // The timeout releases the mutex before joining if either poll blocks.
+        const Poll = struct {
+            db: *DB,
+            primary_only: ?bool = null,
+            done: Io.Event = .unset,
+            result: anyerror!bool = false,
+
+            fn run(self: *@This()) void {
+                self.result = self.poll();
+                self.done.set(std.testing.io);
+            }
+
+            fn poll(self: *@This()) !bool {
+                if (self.primary_only) |only| {
+                    return if (only)
+                        self.db.runPrimaryLsmMaintenanceStepBestEffort()
+                    else
+                        self.db.runLsmMaintenanceStepBestEffort();
+                }
+                const primary = try self.db.runPrimaryLsmMaintenanceStepBestEffort();
+                const combined = try self.db.runLsmMaintenanceStepBestEffort();
+                return primary or combined;
+            }
+        };
         {
-            const Poll = struct {
-                db: *DB,
-                done: Io.Event = .unset,
-                result: anyerror!bool = false,
-
-                fn run(self: *@This()) void {
-                    self.result = self.poll();
-                    self.done.set(std.testing.io);
-                }
-
-                fn poll(self: *@This()) !bool {
-                    const primary = try self.db.runPrimaryLsmMaintenanceStepBestEffort();
-                    const combined = try self.db.runLsmMaintenanceStepBestEffort();
-                    return primary or combined;
-                }
-            };
             var poll: Poll = .{ .db = &db };
             var worker: ?std.Thread = null;
             defer if (worker) |thread| thread.join();
@@ -7772,6 +7785,17 @@ pub const DB = struct {
                 const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, backend);
                 defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
                 try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete));
+            }
+            {
+                var poll: Poll = .{ .db = &db, .primary_only = primary_only };
+                var worker: ?std.Thread = null;
+                defer if (worker) |thread| thread.join();
+                var capture = db.core.snapshot_replay_admission.tryAcquireCapture().?;
+                defer capture.release();
+                worker = try std.Thread.spawn(.{}, Poll.run, .{&poll});
+                try poll.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+                try std.testing.expect(!try poll.result);
+                try std.testing.expectEqual(revision + i, db.core.snapshot_replay_admission.mutationRevision());
             }
             const progressed = if (primary_only)
                 try db.runPrimaryLsmMaintenanceStepBestEffort()
