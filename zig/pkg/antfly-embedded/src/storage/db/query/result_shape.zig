@@ -27,6 +27,12 @@ pub const VisibleHitEvaluator = struct {
     worker_stop: ?*const std.atomic.Value(bool) = null,
     ctx: ?*anyopaque,
     filter_many_ctx: ?*anyopaque = null,
+    filter_many_controlled: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        hits: []const types.SearchHit,
+        stop: *const std.atomic.Value(bool),
+    ) anyerror![]bool = null,
     func: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -159,6 +165,12 @@ pub const SearchResultPostprocessor = struct {
     worker_stop: ?*const std.atomic.Value(bool) = null,
     ctx: ?*anyopaque,
     filter_visible_many_ctx: ?*anyopaque = null,
+    filter_visible_many_controlled: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        hits: []const types.SearchHit,
+        stop: *const std.atomic.Value(bool),
+    ) anyerror![]bool = null,
     is_visible: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -401,22 +413,12 @@ pub fn filterVisibleSearchResult(
     const control: @import("../../../search/query.zig").ExecutionControl = .{ .worker_stop = evaluator.worker_stop };
     try control.check();
 
-    const keep_mask = if (evaluator.filter_many) |filter_many| mask: {
+    const keep_mask = mask: {
         const ctx = evaluator.filter_many_ctx orelse evaluator.ctx;
-        if (evaluator.worker_stop == null) break :mask try filter_many(ctx, alloc, owned.hits);
-        const mask = try alloc.alloc(bool, owned.hits.len);
-        errdefer alloc.free(mask);
-        var start: usize = 0;
-        while (start < owned.hits.len) {
-            try control.check();
-            const end = @min(start + 256, owned.hits.len);
-            const partial = try filter_many(ctx, alloc, owned.hits[start..end]);
-            defer alloc.free(partial);
-            @memcpy(mask[start..end], partial);
-            start = end;
+        if (evaluator.worker_stop) |stop| {
+            if (evaluator.filter_many_controlled) |filter| break :mask try filter(ctx, alloc, owned.hits, stop);
         }
-        break :mask mask;
-    } else mask: {
+        if (evaluator.filter_many) |filter| break :mask try filter(ctx, alloc, owned.hits);
         const mask = try alloc.alloc(bool, owned.hits.len);
         errdefer alloc.free(mask);
         for (owned.hits, mask, 0..) |hit, *keep, i| {
@@ -2062,6 +2064,7 @@ pub fn postprocessTextSearchResult(
         .ctx = processor.ctx,
         .worker_stop = processor.worker_stop,
         .func = processor.is_visible,
+        .filter_many_controlled = processor.filter_visible_many_controlled,
         .filter_many = processor.filter_visible_many,
         .filter_many_ctx = processor.filter_visible_many_ctx,
     });
