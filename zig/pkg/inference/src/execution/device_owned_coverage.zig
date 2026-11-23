@@ -185,24 +185,24 @@ fn completeRegion(pool: *const physical.Pool, installed: *const @import("region_
         pool.host_alignment.toByteUnits() >= @max(need.host_alignment, need.preparation_host_alignment));
 }
 
-fn inputDeclined(graph: *const ml.graph.Graph, node: ml.graph.NodeId, binding: ?route.Binding) coverage.Coverage {
+fn inputDeclined(graph: *const ml.graph.Graph, node: ml.graph.NodeId, binding: ?route.Binding) coverage.Reason {
     if (@import("antfly_platform").env.getenvBool("TERMITE_GRAPH_PARTITION_REPORT")) {
         const parameter = graph.node(node);
         const name = if (parameter.op == .parameter) graph.parameterName(parameter) else @tagName(parameter.op);
         const representation = if (binding) |fact| @tagName(fact) else "missing";
         std.debug.print("graph-partition-report prepared input rejected node={d} name={s} dtype={s} binding={s}\n", .{ node, name, @tagName(parameter.output_shape.dtype), representation });
     }
-    return .{ .compatibility = .input_representation };
+    return .input_representation;
 }
 
-fn operationDeclined(graph: *const ml.graph.Graph, id: usize, reason: []const u8) coverage.Coverage {
+fn operationDeclined(graph: *const ml.graph.Graph, id: usize, reason: []const u8) coverage.Reason {
     if (@import("antfly_platform").env.getenvBool("TERMITE_GRAPH_PARTITION_REPORT")) {
         const node = graph.nodes.items[id];
         std.debug.print("graph-partition-report prepared operation rejected node={d} op={s} reason={s} shape={any}\n", .{
             id, @tagName(node.op), reason, node.output_shape,
         });
     }
-    return .{ .compatibility = .operation };
+    return .operation;
 }
 
 // Inspect every reachable use of an immutable input with no device plane.
@@ -249,34 +249,74 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
         .metal => pool.metal_frame_dispatch,
         else => false,
     }) or reachable.len != graph.nodeCount() or pool.plan.node_slots.len != graph.nodeCount() or graph.outputs.items.len == 0) return .{ .compatibility = .execution_path };
+    const mixed = pool.mixed_frame_dispatch;
+    if (mixed) {
+        if (!pool.attestsOwnedTransfers(reachable)) return .{ .compatibility = .transfer };
+        // Default publication must never introduce an unplanned device copy.
+        for (graph.outputs.items) |id| {
+            const slot = pool.plan.slotForNode(id) orelse return .{ .compatibility = .output_publication };
+            if (slot.backend != target.kind()) return .{ .compatibility = .output_publication };
+        }
+    } else if (pool.plan.transfers.len != 0) return .{ .compatibility = .transfer };
+    var result = coverage.Complete{ .epoch = selected.epoch, .accounting_class = .device };
+    if (mixed) {
+        const native = for (pool.backends) |backend| {
+            if (backend.kind() == .native) break backend;
+        } else return .{ .compatibility = .backend_region };
+        if (coverage.assessNativeNodes(pool, graph, reachable, native, .provider, &result)) |reason| return .{ .compatibility = reason };
+    }
+    const scope: coverage.NodeScope = if (mixed) .provider else .whole;
+    if (assessDeviceNodes(pool, target, service, graph, reachable, scope, &result)) |reason| return .{ .compatibility = reason };
+    if (!coverage.outputsArePublished(pool, graph, reachable)) return .{ .compatibility = .output_publication };
+    return .{ .complete = result };
+}
+
+/// Device-specific node and region ownership. The caller attests the
+/// operation authority and the whole schedule before composing this proof.
+fn assessDeviceNodes(
+    pool: *const physical.Pool,
+    target: ops.ComputeBackend,
+    service: *const services_type,
+    graph: *const ml.graph.Graph,
+    reachable: []const bool,
+    scope: coverage.NodeScope,
+    result: *coverage.Complete,
+) ?coverage.Reason {
+    const selected = if (pool.selection) |*value| value else return .no_selected_routes;
     if (pool.regions.len != 0) {
-        const attestsRegion = service.region orelse return .{ .compatibility = .backend_region };
+        const attestsRegion = service.region orelse return .backend_region;
         for (pool.regions) |*installed| {
-            if (!attestsRegion(target.ptr, installed.owner) or !completeRegion(pool, installed, target, selected.epoch, graph, reachable)) return .{ .compatibility = .backend_region };
+            if (installed.backend_index >= pool.backends.len) return .backend_region;
+            if (scope == .provider and pool.backends[installed.backend_index].kind() != target.kind()) continue;
+            if (!attestsRegion(target.ptr, installed.owner) or !completeRegion(pool, installed, target, selected.epoch, graph, reachable)) return .backend_region;
         }
     }
-    if (pool.plan.transfers.len != 0) return .{ .compatibility = .transfer };
-    for (pool.host_input_plans) |plan| if (plan.node >= reachable.len or !reachable[plan.node] or !ingress(pool, plan.node, plan.shape, target)) return .{ .compatibility = .input_representation };
+    for (pool.host_input_plans) |plan| {
+        if (plan.node >= reachable.len or !reachable[plan.node]) return .input_representation;
+        const slot = pool.plan.slotForNode(plan.node) orelse return .input_representation;
+        if (scope == .provider and slot.backend != target.kind()) continue;
+        if (!ingress(pool, plan.node, plan.shape, target)) return .input_representation;
+    }
     var pinned_inputs: ?std.DynamicBitSetUnmanaged = null;
     defer if (pinned_inputs) |*pending| pending.deinit(pool.allocator);
-    var result = coverage.Complete{ .epoch = selected.epoch, .accounting_class = .device };
     for (reachable, 0..) |active, id| {
         if (!active) continue;
+        const slot = (pool.plan.slotForNode(@intCast(id)) orelse return operationDeclined(graph, id, "missing slot")).*;
+        if (scope == .provider and slot.backend != target.kind()) continue;
         if (pool.regionForNode(@intCast(id))) |installed| {
-            if (std.mem.indexOfScalar(ml.graph.NodeId, installed.owner.covered_nodes, @intCast(id)) == null) return .{ .compatibility = .backend_region };
+            if (std.mem.indexOfScalar(ml.graph.NodeId, installed.owner.covered_nodes, @intCast(id)) == null) return .backend_region;
             if (installed.owner.entry_node == id) result.operations += installed.owner.covered_nodes.len;
             continue;
         }
-        const slot = (pool.plan.slotForNode(@intCast(id)) orelse return operationDeclined(graph, id, "missing slot")).*;
         const node = graph.node(@intCast(id));
-        if (slot.node_id != id or slot.id >= pool.plan.slots.len or pool.plan.node_slots[id] != slot.id or slot.backend != target.kind() or !slot.desc.shape.eq(node.output_shape)) return .{ .compatibility = .backend_region };
+        if (slot.node_id != id or slot.id >= pool.plan.slots.len or pool.plan.node_slots[id] != slot.id or slot.backend != target.kind() or !slot.desc.shape.eq(node.output_shape)) return .backend_region;
         if (target.kind() == .cuda and slot.kind == .constant and node.op == .constant and
             slot.desc.shape.dtype == .f32 and slot.desc.shape.numElements() == 0 and node.op.constant.data_len == 0)
         {
             result.literals += 1;
             continue;
         }
-        const size = bytes(slot.desc.shape) orelse return .{ .compatibility = .input_representation };
+        const size = bytes(slot.desc.shape) orelse return .input_representation;
         switch (slot.kind) {
             .runtime_input => {
                 if (node.op != .parameter or slot.roles.graph_output) return inputDeclined(graph, @intCast(id), null);
@@ -295,10 +335,10 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
                 }
             },
             .constant => {
-                const index = literal(pool, slot, target) orelse return .{ .compatibility = .literal };
+                const index = literal(pool, slot, target) orelse return .literal;
                 if (target.kind() == .metal and pool.literal_store.?.literals[index].staging_bound == 0)
-                    return .{ .compatibility = .literal };
-                if (node.op != .constant or (slot.roles.graph_output and !publication(pool, slot, index))) return .{ .compatibility = .output_publication };
+                    return .literal;
+                if (node.op != .constant or (slot.roles.graph_output and !publication(pool, slot, index))) return .output_publication;
                 result.literals += 1;
             },
             .view => {
@@ -309,7 +349,7 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
                             slot.node_id, @tagName(node.op), slot.desc.shape, if (root) |value| @tagName(value.kind) else "unknown",
                         });
                     }
-                    return .{ .compatibility = .alias };
+                    return .alias;
                 }
                 result.aliases += 1;
             },
@@ -317,19 +357,18 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
                 if (id >= selected.routes.len or id >= pool.kernels.len) return operationDeclined(graph, id, "slot outside route table");
                 const owned = selected.routes[id] orelse return operationDeclined(graph, id, "missing route");
                 const kernel = pool.kernels[id] orelse return operationDeclined(graph, id, "missing descriptor");
-                if (kernel.backend_index >= pool.backends.len) return .{ .compatibility = .backend_region };
+                if (kernel.backend_index >= pool.backends.len) return .backend_region;
                 const backend = pool.backends[kernel.backend_index];
                 if (backend.ptr != target.ptr or backend.vtable != target.vtable or !service.route(target.ptr, &owned) or
                     !coverage.kernelOutputMatches(kernel, owned, backend, slot, size)) return operationDeclined(graph, id, "route attestation or output geometry");
                 if (!coverage.kernelInputsMatch(graph, reachable, @intCast(id), kernel)) return operationDeclined(graph, id, "input binding or shape");
-                if (!resources(pool, kernel, owned)) return .{ .compatibility = .workspace };
+                if (!resources(pool, kernel, owned)) return .workspace;
                 result.operations += 1;
             },
         }
     }
-    if (!coverage.outputsArePublished(pool, graph, reachable)) return .{ .compatibility = .output_publication };
     if (pinned_inputs) |*pending| {
         if (pinnedInputsCovered(pool, graph, reachable, pending)) |node| return inputDeclined(graph, node, pool.immutable_bindings.?.find(node));
     }
-    return .{ .complete = result };
+    return null;
 }

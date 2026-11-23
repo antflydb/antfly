@@ -192,6 +192,7 @@ pub const Pool = struct {
     coverage_graph: ?*const Graph = null,
     coverage_reachable: ?[]const bool = null,
     native_frame_dispatch: bool = false,
+    mixed_frame_dispatch: bool = false,
     cuda_frame_dispatch: bool = false,
     metal_frame_dispatch: bool = false,
     private_decoder_program: bool = false,
@@ -904,7 +905,7 @@ pub const Pool = struct {
         const native = backend.kind() == .native;
         const cuda = backend.kind() == .cuda;
         const metal = backend.kind() == .metal;
-        if (!self.owns_plan or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch != metal or self.metal_projection_region_candidate or
+        if (!self.owns_plan or self.mixed_frame_dispatch or self.accounting == null or self.payload_coverage == .complete or self.native_frame_dispatch != native or self.cuda_frame_dispatch != cuda or self.metal_frame_dispatch != metal or self.metal_projection_region_candidate or
             (!native and !cuda and !metal) or self.backends.len != 1 or self.backends[0].vtable != backend.vtable or self.backends[0].ptr != backend.ptr or
             reachable.len != graph.nodeCount() or self.kernels.len != graph.nodeCount() or
             self.private_decoder_program or self.frames.items.len != 0 or self.pending_frames != 0 or self.prepared_backings.load(.acquire) or
@@ -1027,6 +1028,59 @@ pub const Pool = struct {
         const slot = self.plan.slotForNode(node) orelse return null;
         return if (self.plan.allocationForSlot(slot.id)) |allocation| allocation.id else null;
     }
+    /// Check that every cross-provider edge binds a dedicated destination
+    /// bank and can read the selected producer without materializing storage
+    /// outside the physical plan. Executing an admitted schedule also requires
+    /// the runtime to reject any refused copy.
+    pub fn attestsOwnedTransfers(self: *const Pool, reachable: []const bool) bool {
+        const selected = if (self.selection) |*value| value else return false;
+        if (self.transfers.len == 0 or self.transfers.len != self.plan.transfers.len or self.transfers.len != selected.transfer_planes.len) return false;
+        for (self.plan.transfers, self.transfers, selected.transfer_planes, 0..) |edge, recipe, plane, index| {
+            const transfer_plan = recipe orelse return false;
+            const destination = plane orelse return false;
+            if (edge.source_node >= reachable.len or !reachable[edge.source_node] or
+                edge.source_partition >= edge.target_partition or
+                self.plan.transfer_index.get(buffers.transferKey(edge.source_node, edge.target_partition)) != index) return false;
+            if (transfer_plan.source_backend_index >= self.backends.len or transfer_plan.backend_index >= self.backends.len) return false;
+            const source = self.backends[transfer_plan.source_backend_index];
+            const target = self.backends[transfer_plan.backend_index];
+            if (source.kind() != edge.source_backend or target.kind() != edge.target_backend or source.kind() == target.kind()) return false;
+            const slot = self.plan.slotForNode(edge.source_node) orelse return false;
+            const shape = slot.desc.shape;
+            if (slot.id != edge.source_slot or slot.partition_index != edge.source_partition or slot.backend != source.kind() or
+                shape.dtype != .f32 or !shape.eq(transfer_plan.shape) or
+                transfer_plan.allocation != edge.allocation) return false;
+            const allocation = self.plan.allocationById(edge.allocation) orelse return false;
+            if (allocation.kind != .transfer or allocation.reusable or allocation.backend != target.kind() or
+                allocation.byte_size < edge.byte_size or
+                destination.descriptor.current_backend != target.kind() or destination.descriptor.resident_backend != target.kind() or
+                !destination.descriptor.shape.eq(shape) or destination.logical_bytes != edge.byte_size or
+                destination.readable_bytes != edge.byte_size or destination.storage_epoch != selected.epoch) return false;
+            switch (slot.kind) {
+                .allocation, .constant => {
+                    if (edge.source_node >= selected.plane_counts.len or selected.plane_counts[edge.source_node] == 0) return false;
+                    const primary = selected.planes[edge.source_node][0];
+                    if (primary.role != .primary or primary.descriptor.current_backend != source.kind() or
+                        primary.descriptor.resident_backend != source.kind() or !primary.descriptor.shape.eq(shape) or
+                        primary.descriptor.quant_format != null or primary.descriptor.view_source != null or
+                        primary.logical_bytes != edge.byte_size or primary.readable_bytes != edge.byte_size or primary.byte_offset != 0) return false;
+                    const expected_storage: @FieldType(@TypeOf(primary.descriptor), "storage") = switch (source.kind()) {
+                        .native => .host_f32,
+                        .cuda => .cuda_buffer,
+                        .metal => .metal_buffer,
+                        else => return false,
+                    };
+                    if (primary.descriptor.storage != expected_storage) return false;
+                },
+                // These sources have separate dynamic ownership contracts.
+                // Their proof must describe the exact view or ingress backing
+                // that the transfer callback will observe.
+                .runtime_input, .view => return false,
+            }
+        }
+        return true;
+    }
+
     pub fn completeOwnedPayload(self: *const Pool) ?@import("owned_coverage.zig").Complete {
         const selected = if (self.selection) |*value| value else return null;
         const coverage = switch (self.payload_coverage) {
@@ -1267,7 +1321,7 @@ pub const Pool = struct {
         const ledger = try accounting.Ledger.create(self.allocator);
         errdefer ledger.release();
         const child = try self.allocator.create(Pool);
-        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .metal_projection_region_candidate = self.metal_projection_region_candidate, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
+        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .mixed_frame_dispatch = self.mixed_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .metal_projection_region_candidate = self.metal_projection_region_candidate, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
         if (self.literal_store) |store| {
             store.retain();
             child.literal_store = store;
@@ -5410,6 +5464,107 @@ test "Native to Metal partition transfer uses its assigned Shared destination" {
     const actual = try metal.toFloat32(executed.outputs[0], allocator);
     defer allocator.free(actual);
     for (expected, actual) |want, found| try std.testing.expectApproxEqAbs(want, found, 0.0001);
+}
+
+test "mixed Native Metal owned admission executes the declared transfer without fallback" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    try mixedOwnedTransferCase(.metal);
+}
+
+test "mixed Native CUDA owned admission executes the declared transfer without fallback" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    try mixedOwnedTransferCase(.cuda);
+}
+
+fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
+    const a = std.testing.allocator;
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    var host_context = try Context.init(a, .native, std.testing.io);
+    defer host_context.deinit(a);
+    const SharedContext = @import("../backends/compute_context.zig").SharedBackendContext;
+    const device_context = try SharedContext.init(a, if (target_kind == .metal) .metal else .cuda, std.testing.io);
+    defer device_context.release();
+    const host = host_context.computeBackend();
+    const target = device_context.computeBackend();
+
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const literal = try builder.tensorConst(&.{ 1, -2, 3, -4 }, shape);
+    const producer = try builder.neg(literal);
+    const on_device = try builder.absOp(producer);
+    const on_host = try builder.neg(on_device);
+    const output = try builder.absOp(on_host);
+    try graph.markOutput(output);
+    const reached = try @import("../graph/interpreter.zig").computeReachable(a, &graph);
+    defer a.free(reached);
+
+    const partition = @import("../graph/partition.zig");
+    const Native = @import("../graph/native_partition_executor.zig").NativePartitionExecutor;
+    var native = Native.initBorrowed(a, &graph, &host);
+    const native_executor = native.partitionExecutor();
+    var parts = [_]partition.Partition{
+        .{ .backend = .native, .node_ids = &.{ literal, producer }, .external_inputs = &.{}, .executor = native_executor },
+        .{ .backend = target_kind, .node_ids = &.{on_device}, .external_inputs = &.{.{ .node_id = producer, .source_partition = 0 }} },
+        .{ .backend = .native, .node_ids = &.{on_host}, .external_inputs = &.{.{ .node_id = on_device, .source_partition = 1 }}, .executor = native_executor },
+        .{ .backend = target_kind, .node_ids = &.{output}, .external_inputs = &.{.{ .node_id = on_host, .source_partition = 2 }} },
+    };
+    const placement: partition.PartitionPlan = .{
+        .allocator = a,
+        .partitions = &parts,
+        .node_assignment = &.{ 0, 0, 1, 2, 3 },
+        .node_operator_plans = &.{ null, null, null, null, null },
+        .owns_executors = false,
+    };
+    var layout = try buffers.build(a, &graph, &placement, .{});
+    defer layout.deinit();
+    const root = (try Pool.create(a, &graph, &layout, &.{ &host, &target }, placement.node_operator_plans)) orelse return error.MissingPhysicalPool;
+    defer root.deinit();
+    root.coverage_graph = &graph;
+    root.coverage_reachable = reached;
+    root.coverage_backend = target;
+    // Use the real provider callbacks with a fixed placement so this test
+    // isolates admission from independent placement cost heuristics.
+    root.metal_frame_dispatch = target_kind == .metal;
+    root.cuda_frame_dispatch = target_kind == .cuda;
+    root.mixed_frame_dispatch = true;
+    try root.configureRoutes(&.{});
+    const routes = (try root.prepareRoutes(&.{})) orelse return error.MissingPreparedKernelRoute;
+    defer routes.release();
+    try std.testing.expect(routes.pool.attestsOwnedTransfers(reached));
+    try std.testing.expectEqual(.complete, std.meta.activeTag(routes.pool.payload_coverage));
+    const proof = routes.pool.completeOwnedPayload() orelse return error.MissingOwnedPayloadWitness;
+    try std.testing.expectEqual(@as(usize, 4), proof.operations);
+    try std.testing.expectEqual(@as(usize, 1), proof.literals);
+
+    const multi = @import("../graph/multi_executor.zig");
+    const device = @import("../graph/device_mesh.zig");
+    const plan: multi.DevicePartitionPlan = .{ .allocator = a, .base = placement, .device_assignment = &.{ 1, 0, 1, 0 } };
+    var mesh = try device.DeviceMesh.init(a, &.{
+        .{ .id = 0, .backend = &target, .kind = target_kind },
+        .{ .id = 1, .backend = &host, .kind = .native },
+    });
+    defer mesh.deinit();
+    const frame = try Frame.create(routes.pool);
+    defer frame.deinit();
+    try frame.begin();
+    var actual = try multi.executeMultiDevice(a, &graph, &plan, &mesh, .{
+        .physical_frame = frame,
+        .require_assigned_kernels = true,
+        .planned_device_execution = target_kind == .metal,
+        .collect_partition_stats = true,
+    });
+    defer actual.deinit(&mesh);
+    const receipt = try frame.finish();
+    try std.testing.expectEqual(@as(u64, 3), receipt.transfers);
+    try std.testing.expectEqual(@as(u64, 48), receipt.transfer_bytes);
+    try std.testing.expectEqual(@as(u64, 4), receipt.dispatches);
+    try std.testing.expectEqualSlices(device.DeviceId, &.{0}, actual.output_devices);
+    const values = try target.toFloat32(actual.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
 }
 
 test "Metal to Native partition transfer preserves a held download" {

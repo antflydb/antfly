@@ -2852,12 +2852,26 @@ fn attestOwnedDeviceSchedule(
     return ordinal == count;
 }
 
+fn attestNativePartition(executable: *const Executable, graph: *const @import("ml").graph.Graph, executor: *const @import("../graph/partition.zig").PartitionExecutor, backend: *const ops.ComputeBackend) bool {
+    if (backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return false;
+    const pool = executable.runtime.physical_pool orelse return false;
+    for (pool.backends) |known| {
+        if (known.ptr == backend.ptr and known.vtable == backend.vtable) break;
+    } else return false;
+    for (executable.runtime.native_partition_executors.items) |owner| {
+        if (executor.ptr == @as(*anyopaque, @ptrCast(owner)) and executor.vtable == owner.pe.vtable and
+            owner.graph == graph and owner.backend.ptr == backend.ptr and owner.backend.vtable == backend.vtable) return true;
+    }
+    return false;
+}
+
 fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").graph.Graph, analysis: interpreter.CachedAnalysis) !void {
     if (comptime @import("build_options").enable_wasm) return;
     const pool = executable.runtime.physical_pool orelse return;
     pool.coverage_graph = graph;
     pool.coverage_reachable = analysis.reachable;
     pool.native_frame_dispatch = false;
+    pool.mixed_frame_dispatch = false;
     pool.cuda_frame_dispatch = false;
     pool.metal_frame_dispatch = false;
     pool.metal_projection_region_candidate = false;
@@ -2868,7 +2882,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
             const mesh = executable.runtime.mesh orelse return;
             const entry = executable.runtime.runtime_cache_entry orelse return;
             const compiled = entry.compiled_partitions orelse return;
-            if (pool.plan.transfers.len != 0 or !attestOwnedDeviceSchedule(pool, &plan, &mesh, executable.runtime.default_backend, analysis.reachable)) return;
+            if (!attestOwnedDeviceSchedule(pool, &plan, &mesh, executable.runtime.default_backend, analysis.reachable)) return;
             const Executor = @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor;
             const projection_head = ops.kernel_descriptor.metalRowProjectionHead(graph) or
                 if (ops.kernel_descriptor.metalProjectionHead(graph)) |head| head.linears[0].operation.linear.rows > 1 else false;
@@ -2887,6 +2901,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 if (metadata.token() == null) return;
             }
             var active_partitions: usize = 0;
+            var native_partitions: usize = 0;
             for (plan.base.partitions, 0..) |part, index| {
                 var active = false;
                 var active_compute = false;
@@ -2898,6 +2913,13 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                     active_compute = active_compute or graph.node(id).op != .parameter;
                 }
                 if (!active) continue;
+                if (part.backend == .native) {
+                    if (projection_head or pool.plan.transfers.len == 0 or pool.backends.len != 2) return;
+                    const device = mesh.device(plan.device_assignment[index]) orelse return;
+                    if (!attestNativePartition(executable, graph, part.executor orelse return, device.backend)) return;
+                    native_partitions += 1;
+                    continue;
+                }
                 if (part.backend != .metal or plan.device_assignment[index] != 0) return;
                 if (projection_head and !active_compute) continue;
                 active_partitions += 1;
@@ -2911,6 +2933,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                     if (active_partitions != 1 or !Executor.ownsPartition(actual, graph, executable.runtime.default_backend)) return;
                 } else if (!try Executor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
             }
+            if (active_partitions == 0 or (pool.plan.transfers.len != 0 and native_partitions == 0)) return;
+            pool.mixed_frame_dispatch = native_partitions != 0;
             pool.metal_projection_region_candidate = projection_head and active_partitions == 1;
             pool.metal_frame_dispatch = !projection_head;
             return;
@@ -2922,6 +2946,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
         const plan = executable.runtime.plan orelse return;
         const mesh = executable.runtime.mesh orelse return;
         if (!attestOwnedDeviceSchedule(pool, &plan, &mesh, executable.runtime.default_backend, analysis.reachable)) return;
+        var native_partitions: usize = 0;
+        var cuda_partitions: usize = 0;
         for (plan.base.partitions, 0..) |part, index| {
             var active = false;
             for (part.node_ids) |id| {
@@ -2931,17 +2957,28 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                 active = true;
             }
             if (!active) continue;
+            if (part.backend == .native) {
+                if (pool.plan.transfers.len == 0 or pool.backends.len != 2) return;
+                const device = mesh.device(plan.device_assignment[index]) orelse return;
+                if (!attestNativePartition(executable, graph, part.executor orelse return, device.backend)) return;
+                native_partitions += 1;
+                continue;
+            }
             if (part.backend != .cuda or part.executor != null or plan.device_assignment[index] != 0) return;
+            cuda_partitions += 1;
             const device = mesh.device(plan.device_assignment[index]) orelse return;
             if (device.kind != .cuda or device.backend.ptr != executable.runtime.default_backend.ptr or device.backend.vtable != executable.runtime.default_backend.vtable) return;
         }
+        if (cuda_partitions == 0) return;
+        pool.mixed_frame_dispatch = native_partitions != 0;
         pool.cuda_frame_dispatch = true;
         return;
     }
     if (executable.runtime.default_backend.vtable != &@import("../ops/native_compute.zig").vtable_impl) return;
     const plan = executable.runtime.plan orelse return;
     if (analysis.reachable.len != graph.nodeCount()) return;
-    for (plan.base.partitions) |part| {
+    const mesh = executable.runtime.mesh orelse return;
+    for (plan.base.partitions, plan.device_assignment) |part, device_id| {
         var executed = false;
         for (part.node_ids) |id| {
             if (id >= analysis.reachable.len) return;
@@ -2950,15 +2987,8 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
         if (!executed) continue;
         if (part.backend != .native) return;
         const actual = part.executor orelse return;
-        var found = false;
-        for (executable.runtime.native_partition_executors.items) |owner| {
-            if (actual.ptr == @as(*anyopaque, @ptrCast(owner)) and actual.vtable == owner.pe.vtable and owner.graph == graph and owner.backend.ptr == executable.runtime.default_backend.ptr and owner.backend.vtable == &@import("../ops/native_compute.zig").vtable_impl) {
-                for (pool.backends) |backend| if (backend.ptr == owner.backend.ptr and backend.vtable == owner.backend.vtable) {
-                    found = true;
-                };
-            }
-        }
-        if (!found) return;
+        const device = mesh.device(device_id) orelse return;
+        if (device.backend.ptr != executable.runtime.default_backend.ptr or !attestNativePartition(executable, graph, actual, device.backend)) return;
     }
     pool.native_frame_dispatch = true;
 }

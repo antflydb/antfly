@@ -584,7 +584,8 @@ pub const Runtime = struct {
                 var planned_options = options.*;
                 planned_options.backend_operation = backend_operation;
                 planned_options.physical_frame = frame;
-                planned_options.require_assigned_kernels = strict_cuda;
+                const strict_mixed = if (selected_pool) |pool| pool.mixed_frame_dispatch and pool.completeOwnedPayload() != null else false;
+                planned_options.require_assigned_kernels = strict_cuda or strict_mixed;
                 var input_storage: [16]interpreter.RuntimeInput = undefined;
                 var allocated_inputs: ?[]interpreter.RuntimeInput = null;
                 defer if (allocated_inputs) |inputs| allocator.free(inputs);

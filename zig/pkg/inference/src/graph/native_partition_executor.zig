@@ -145,6 +145,7 @@ pub const NativePartitionExecutor = struct {
             if (rt_map.get(node_id)) |rt_val| {
                 const current_dev = value_device[i];
                 if (current_dev != device_id) {
+                    if (options.require_assigned_kernels) return error.UnsupportedCompiledGraphRuntime;
                     const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
                     const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
                     if (exec_ctx.owned_runtime_transfers) |owned| try owned.ensureUnusedCapacity(allocator, 1);
@@ -247,6 +248,7 @@ fn executeNativePlannedNode(
         if (try frame.execute(cb, values, node_id, if (graph.node(node_id).op == .fused_rope) (try interpreter.ropePositionOverride(exec_state.options.attention)) else null)) |output| return output;
     }
     const n = graph.node(node_id);
+    if (exec_state.options.require_assigned_kernels) return error.UnsupportedCompiledGraphRuntime;
     const inputs = n.getInputs();
     // Planned native kernels currently derive several operand layouts from
     // graph declarations. When any participating shape is symbolic, route the

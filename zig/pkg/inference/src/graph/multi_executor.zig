@@ -464,6 +464,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                 if (rt_map.get(node_id)) |rt_val| {
                     const current_dev = value_device[i];
                     if (current_dev != dev_id) {
+                        if (options.require_assigned_kernels) return error.UnsupportedCompiledGraphRuntime;
                         const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
                         try owned_runtime_transfers.ensureUnusedCapacity(allocator, 1);
                         const transferred = try transferTensor(allocator, rt_val, src_entry.backend, cb);
