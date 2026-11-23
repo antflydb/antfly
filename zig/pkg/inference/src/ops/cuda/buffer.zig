@@ -289,6 +289,18 @@ pub const DeviceBuffer = struct {
         if (len > self.len or len > src.len) return error.InvalidCudaState;
         if (len == 0) return;
         try ctx.makeCurrent();
+        try self.submitDeviceCopy(ctx, src, len);
+    }
+
+    /// For a series of copies on the same thread after makeCurrent. The
+    /// caller keeps the context current for the full submission sequence.
+    pub fn copyFromCurrentDevice(self: DeviceBuffer, ctx: *context_mod.CudaContext, src: DeviceBuffer, len: usize) driver_mod.Error!void {
+        if (len > self.len or len > src.len) return error.InvalidCudaState;
+        if (len == 0) return;
+        try self.submitDeviceCopy(ctx, src, len);
+    }
+
+    fn submitDeviceCopy(self: DeviceBuffer, ctx: *context_mod.CudaContext, src: DeviceBuffer, len: usize) driver_mod.Error!void {
         const result = ctx.driver.fns.cuMemcpyDtoDAsync(self.ptr, src.ptr, len, ctx.stream);
         if (result != driver_mod.CUDA_SUCCESS) {
             std.log.err("CUDA cuMemcpyDtoDAsync failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });

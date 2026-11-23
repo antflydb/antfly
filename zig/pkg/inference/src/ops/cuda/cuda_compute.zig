@@ -20741,9 +20741,18 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     if (replay or capture) {
         // Capture only records the stable addresses. Stage bytes after a
         // successful recording and immediately before the common launch.
+        const use_copy_kernel = self.debug_cuda_graph_capture_active;
+        if (!use_copy_kernel) try self.ctx.makeCurrent();
         for (inputs, spans) |ct, span| {
+            if (span.bytes == 0) continue;
             const destination = try audioBufferView(input_bank, span.offset, span.bytes);
-            try copyFromDeviceTracked(self, destination, tensorFromCt(ct).buffer, span.bytes);
+            const source = tensorFromCt(ct).buffer;
+            if (use_copy_kernel) {
+                try copyFromDeviceTracked(self, destination, source, span.bytes);
+            } else {
+                try destination.copyFromCurrentDevice(&self.ctx, source, span.bytes);
+                self.stats.d2d_bytes += span.bytes;
+            }
         }
         try arena.launch(&self.ctx);
         if (replay) self.audio_graph_replays += 1;
