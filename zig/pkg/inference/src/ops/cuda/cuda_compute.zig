@@ -40333,7 +40333,7 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
             },
             .dense_attention_rows => |geometry| {
                 const provided = if (request.attention) |attention| attention.dense_attention_rows else null;
-                const binding = provided orelse if (geometry.all_keys_visible) .{} else return false;
+                const binding = provided orelse if (geometry.all_keys_visible) backend_contracts.DenseAttentionRowsBinding{} else return false;
                 if (plan.mask_bytes == 0 and binding.mask != null) return error.InvalidAttentionShape;
                 if (binding.mask) |values| if (values.len != keys) return error.InvalidAttentionShape;
                 mask = binding.mask;
