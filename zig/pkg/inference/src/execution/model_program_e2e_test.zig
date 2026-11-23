@@ -1154,8 +1154,8 @@ test "model program real Whisper resident full-window banks and first decode mat
         }
         const tokens = [_]i64{ cfg.decoder_start_token_id, cfg.bos_token_id, cfg.eos_token_id, cfg.decoder_start_token_id };
         for ([_]usize{ 3, 4 }) |length| {
-            const actual = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = tokens[decoder.position..length] }, hidden, mask, a, DecoderQualification.control);
-            defer a.free(actual);
+            var actual = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = tokens[decoder.position..length] }, hidden, mask, a, DecoderQualification.control);
+            defer actual.deinit();
             {
                 const state = decoder.resident.?;
                 for (state.buffers, 0..) |*buffer, index| {
@@ -1182,15 +1182,15 @@ test "model program real Whisper resident full-window banks and first decode mat
             if (length == 4) {
                 var fresh = (try DecoderQualification.Decoder.initEncoderDecoder(a, session, rows, true, DecoderQualification.control)).?;
                 defer fresh.deinit();
-                const fresh_logits = try fresh.encoderDecoderSuffix(.{ .position = 0, .tokens = tokens[0..length] }, hidden, mask, a, DecoderQualification.control);
-                defer a.free(fresh_logits);
+                var fresh_logits = try fresh.encoderDecoderSuffix(.{ .position = 0, .tokens = tokens[0..length] }, hidden, mask, a, DecoderQualification.control);
+                defer fresh_logits.deinit();
                 var native_backend = try factory.getComputeBackend(session, a);
                 defer native_backend.deinit();
                 const native_encoder = try native_backend.fromFloat32Shape(values, &.{ 1, @intCast(rows), @intCast(cfg.d_model) });
                 defer native_backend.free(native_encoder);
                 const native_logits = try @import("../architectures/whisper.zig").decoderForward(&native_backend, a, cfg.*, tokens[0..length], native_encoder, mask, 1, length, rows);
                 defer a.free(native_logits);
-                for (native_logits[native_logits.len - cfg.vocab_size ..], actual, fresh_logits) |reference, cached, initial| {
+                for (native_logits[native_logits.len - cfg.vocab_size ..], actual.asFloat32(), fresh_logits.asFloat32()) |reference, cached, initial| {
                     try std.testing.expectApproxEqAbs(reference, cached, 1e-4);
                     try std.testing.expectApproxEqAbs(reference, initial, 1e-4);
                 }
@@ -1216,7 +1216,7 @@ test "model program real Whisper resident full-window banks and first decode mat
             defer a.free(expected);
             defer for (expected) |*output| output.deinit();
             const logits = expected[0].asFloat32();
-            for (logits[logits.len - cfg.vocab_size ..], actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
+            for (logits[logits.len - cfg.vocab_size ..], actual.asFloat32()) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-4);
         }
     }
 }

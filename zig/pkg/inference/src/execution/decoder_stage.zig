@@ -213,8 +213,8 @@ pub const Decoder = struct {
         }
         if (self.compiled) |*decoder| {
             const outputs = self.encoder.host;
-            row.owned_logits = try decoder.encoderDecoderSuffix(suffix, outputs[0], self.encoder_mask, self.allocator, self.control);
-            row.logits = row.owned_logits.?;
+            row.host_logits = try decoder.encoderDecoderSuffix(suffix, outputs[0], self.encoder_mask, self.allocator, self.control);
+            row.logits = row.host_logits.?.asFloat32();
             return row;
         }
         if (self.incremental) |*state| {

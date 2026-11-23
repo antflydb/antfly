@@ -251,7 +251,7 @@ pub const Decoder = struct {
         return .{ .allocator = a, .source = source, .config = .{}, .encoder_decoder_config = cfg, .encoder_rows = encoder_rows, .capacity = cfg.max_target_positions, .limit = cfg.max_target_positions, .bank_bytes = bytes, .reservation = reservation, .control = control };
     }
 
-    pub fn encoderDecoderSuffix(self: *Decoder, suffix: @import("decoder_position.zig").Suffix, encoder: Tensor, mask: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+    pub fn encoderDecoderSuffix(self: *Decoder, suffix: @import("decoder_position.zig").Suffix, encoder: Tensor, mask: []const i64, a: std.mem.Allocator, control: ?Control) !Tensor {
         if (self.failed) return error.DecoderRequestFailed;
         const cfg = self.encoder_decoder_config orelse return error.UnsupportedResidentDecode;
         const end = suffix.endAt(self.position) catch return error.InvalidResidentDecodePosition;
@@ -282,9 +282,11 @@ pub const Decoder = struct {
         if (hidden.dtype != .f32 or hidden.shape.len != 3 or hidden.shape[0] != 1 or hidden.shape[1] != self.encoder_rows or hidden.shape[2] != cfg.d_model) return error.InvalidInputShape;
         const outputs = try self.run(&.{ input, pos, hidden, attention }, a, control);
         defer a.free(outputs);
-        defer for (outputs) |*output| output.deinit();
-        if (outputs.len != 1 or outputs[0].asFloat32().len != cfg.vocab_size) return error.InvalidResidentDecoderOutput;
-        return a.dupe(f32, outputs[0].asFloat32());
+        errdefer for (outputs) |*output| output.deinit();
+        const logits_bytes = try std.math.mul(usize, cfg.vocab_size, @sizeOf(f32));
+        if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].data.len != logits_bytes or
+            !outputs[0].isAlignedFor(f32)) return error.InvalidResidentDecoderOutput;
+        return outputs[0];
     }
 
     pub fn deinit(self: *Decoder) void {
@@ -708,6 +710,7 @@ test "resident encoder decoder accepts forced prompt suffixes and rejects immuta
     const fixture = @import("testing/incremental_encoder_decoder.zig");
     const Probe = struct {
         calls: usize = 0,
+        last_logits: ?[*]const u8 = null,
         fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
             return .pjrt;
         }
@@ -734,6 +737,7 @@ test "resident encoder decoder accepts forced prompt suffixes and rejects immuta
             const outputs = try a.alloc(Tensor, 1);
             errdefer a.free(outputs);
             outputs[0] = try Tensor.initFloat32(a, "logits", &.{ 1, fixture.config.vocab_size }, &(@as([fixture.config.vocab_size]f32, @splat(0))));
+            self.last_logits = outputs[0].data.ptr;
             state.position += lengths[self.calls];
             self.calls += 1;
             return outputs;
@@ -748,8 +752,9 @@ test "resident encoder decoder accepts forced prompt suffixes and rejects immuta
     defer hidden.deinit();
     const history = [_]i64{ 0, 1, 2, 3, 4 };
     for ([_]usize{ 1, 3, 4 }) |length| {
-        const logits = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = history[decoder.position..length] }, hidden, &.{ 1, 1 }, a, null);
-        a.free(logits);
+        var logits = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = history[decoder.position..length] }, hidden, &.{ 1, 1 }, a, null);
+        defer logits.deinit();
+        try std.testing.expect(logits.data.ptr == probe.last_logits.?);
     }
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expectError(error.InvalidResidentDecodePosition, decoder.encoderDecoderSuffix(.{ .position = 0, .tokens = history[0..4] }, hidden, &.{ 1, 1 }, a, null));
