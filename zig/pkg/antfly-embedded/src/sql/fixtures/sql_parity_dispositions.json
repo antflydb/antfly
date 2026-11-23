@@ -458,8 +458,19 @@
       "command": [
         "zig",
         "build",
-        "sql-test",
         "antfly-api-sql-source-mutation-lifecycle-test",
+        "-Dtest-filter=mounted SQL original source mutations preserve constrained postimages errors defaults and cold identities",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-source-mutation-compiler-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
         "-Dtest-filter=SQL MERGE follows PostgreSQL CTE",
         "-Doptimize=Debug",
         "-j1"
@@ -5847,6 +5858,11 @@
       "status": "superseded",
       "reason": "Superseded by PostgreSQL grammar: outer WITH RECURSIVE is not supported on MERGE. The unchanged original reproduces 42601 in PostgreSQL 18 and authenticated native SQL against root-only and nontrivial recursive source profiles, with complete unchanged table postimages and primary digests/versions through cold restart. The compiler still accepts ordinary CTE MERGE and recursive queries inside a derived source; this does not claim execution support for PostgreSQL-invalid outer recursive MERGE.",
       "evidence": [
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "SQL MERGE follows PostgreSQL CTE recursion grammar and preserves derived sources",
+          "gate": "sql-qualified-source-mutation-compiler-debug"
+        },
         {
           "path": "zig/pkg/antfly/src/api/sql/testing/lifecycle/sql_document_mutation_lifecycle_integration_test.zig",
           "test": "mounted SQL original source mutations preserve constrained postimages errors defaults and cold identities",
