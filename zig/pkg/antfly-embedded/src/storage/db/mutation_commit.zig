@@ -4415,6 +4415,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Same reasoning as `primary_ticket`'s errdefer immediately
             // above, for the transaction-resolution commit's own ticket.
             errdefer if (txn_ticket) |*ticket| ticket.wait() catch {};
+            if (inline_sparse_publication) |prepared| prepared.markEnqueued();
             local_coverage_guard.release();
             if (opts.primary_committed) |committed| committed.* = true;
             if (opts.prepared_commit_disposition) |disposition| disposition.markPrimaryCommitted();
@@ -4615,8 +4616,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
             }
             if (inline_sparse_publication) |prepared| {
-                prepared.install();
                 inline_sparse_publication = null;
+                try prepared.install();
                 if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
             }
             if (inline_dense_publication) |prepared| {

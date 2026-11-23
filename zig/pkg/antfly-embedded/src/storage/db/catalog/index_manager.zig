@@ -1616,7 +1616,7 @@ pub const IndexManager = struct {
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
-    text_publication_reopen_required: std.atomic.Value(bool) = .init(false),
+    index_publication_reopen_required: std.atomic.Value(bool) = .init(false),
     text_merge_scheduler: TextMergeScheduler,
     dense_indexes: std.ArrayListUnmanaged(DenseIndex),
     retired_lsm_owner_stats: std.ArrayListUnmanaged(LsmOwnerStats) = .empty,
@@ -3254,6 +3254,7 @@ pub const IndexManager = struct {
         embedding_names: [][]u8 = &.{},
         supports_unit_grouping: bool = false,
         rebuild_root_path: []u8,
+        inline_writer: @import("../../commit_participant.zig").WriterViewQueue(sparse_mod.SparseIndex) = .{},
         index: sparse_mod.SparseIndex,
     };
 

@@ -3439,7 +3439,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// for just this, not across the commit.
             pub fn install(self: *InlineTextPublication) !void {
                 defer self.finish();
-                errdefer self.index_manager.text_publication_reopen_required.store(true, .release);
+                errdefer self.index_manager.index_publication_reopen_required.store(true, .release);
                 if (!self.index_locked) {
                     self.apply_guard.relockIndex();
                     self.index_locked = true;
@@ -3983,6 +3983,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             scope: []const u8,
             progress: apply_state.Progress,
             coverage_plan: ?InlineCoveragePlan = null,
+            enqueued: bool = false,
+            install_error: ?anyerror = null,
 
             fn reset(_: *anyopaque) void {}
             fn observe(_: *anyopaque, _: []const u8, _: ?[]const u8) void {}
@@ -3994,28 +3996,67 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
-            /// Call only once the host transaction's commit has actually
-            /// returned successfully (see `InlineTextPublication.install`'s
-            /// identical warning).
-            pub fn participant(self: *InlineSparsePublication) commit_participant.Participant {
-                return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+            fn validate(ptr: *anyopaque) anyerror!void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                try self.entry.inline_writer.validate();
             }
 
-            pub fn install(self: *InlineSparsePublication) void {
-                std.debug.assert(self.apply_guard.locked());
-                self.entry.index.installInlineSparsePublication(&self.publication) catch |err| {
-                    std.log.err("inline sparse publication install: mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+            fn reject(ptr: *anyopaque) void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                self.entry.inline_writer.reject();
+            }
+
+            fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
+                self.apply_guard.relockIndex();
+                defer self.apply_guard.unlockIndex();
+                if (outcome) |_| {
+                    self.entry.index.applyInlinePublicationToView(&self.publication) catch |err| {
+                        self.install_error = err;
+                        self.apply_guard.manager.index_publication_reopen_required.store(true, .release);
+                        self.entry.inline_writer.reject();
+                    };
+                } else |_| {}
+                self.entry.inline_writer.completed(outcome);
+            }
+
+            pub fn participant(self: *InlineSparsePublication) commit_participant.Participant {
+                return .{
+                    .ptr = self,
+                    .reset = reset,
+                    .observe = observe,
+                    .stage = stage,
+                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
                 };
-                if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
-                self.apply_guard.unlock();
-                self.alloc.destroy(self);
+            }
+
+            /// Called immediately after the primary ticket is returned. The
+            /// completion callback can only advance the serving state after
+            /// acquiring the index guard that is released here.
+            pub fn markEnqueued(self: *InlineSparsePublication) void {
+                const queue = &self.entry.inline_writer;
+                queue.enqueued();
+                self.enqueued = true;
+                queue.view.?.applyInlinePublicationToView(&self.publication) catch queue.reject();
+                self.apply_guard.unlockIndex();
+            }
+
+            pub fn install(self: *InlineSparsePublication) !void {
+                std.debug.assert(self.enqueued);
+                const install_error = self.install_error;
+                self.abort();
+                if (install_error) |err| return err;
             }
 
             pub fn abort(self: *InlineSparsePublication) void {
-                std.debug.assert(self.apply_guard.locked());
                 self.publication.abort();
                 if (self.coverage_plan) |*plan| plan.deinit(self.alloc);
-                self.apply_guard.unlock();
+                if (self.enqueued) {
+                    self.apply_guard.unlockCatalog();
+                } else {
+                    self.entry.inline_writer.discardIdle();
+                    self.apply_guard.unlock();
+                }
                 self.alloc.destroy(self);
             }
         };
@@ -4078,11 +4119,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .doc_num = doc_num,
             };
 
-            const publication = entry.index.prepareInlineSparsePublication(&.{sparse_write}, &.{}) catch |err| switch (err) {
+            const queue = &entry.inline_writer;
+            try queue.validate();
+            if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
+            errdefer queue.discardIdle();
+            var publication = queue.view.?.prepareInlineSparsePublication(&.{sparse_write}, &.{}) catch |err| switch (err) {
                 error.InlineSparsePublicationUnsupported => return error.InlineSparsePublicationUnsupported,
                 else => return err,
             };
 
+            errdefer publication.abort();
             const result = try alloc.create(InlineSparsePublication);
             result.* = .{
                 .alloc = alloc,

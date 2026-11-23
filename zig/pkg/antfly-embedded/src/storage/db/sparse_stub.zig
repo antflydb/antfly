@@ -142,6 +142,10 @@ pub const SparseIndex = struct {
         pub fn abort(_: *InlineSparsePublication) void {}
     };
 
+    pub fn applyInlinePublicationToView(_: *SparseIndex, _: *const InlineSparsePublication) !void {
+        return error.InlineSparsePublicationUnsupported;
+    }
+
     pub fn installInlineSparsePublication(_: *SparseIndex, _: *InlineSparsePublication) !void {}
 
     /// Stub builds have no native-catalog sparse index.
