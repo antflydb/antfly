@@ -471,6 +471,28 @@ fn appendConjunctJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), c: Con
     try out.append(alloc, '}');
 }
 
+/// `"filter_query":...` (plus the lowered tree in stored form) of a query
+/// or a filtered traversal.
+fn appendFilterJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), source: Source, with_identity: bool) !void {
+    if (!with_identity and source.public_filter.len != 0) {
+        try out.appendSlice(alloc, "\"filter_query\":");
+        try out.appendSlice(alloc, source.public_filter);
+    } else {
+        try out.appendSlice(alloc, "\"filter_query\":{\"conjuncts\":[");
+        for (source.conjuncts, 0..) |c, i| {
+            if (i != 0) try out.append(alloc, ',');
+            try appendConjunctJson(alloc, out, c);
+        }
+        try out.appendSlice(alloc, "]}");
+    }
+    if (with_identity and source.tree.len != 0) {
+        try out.appendSlice(alloc, ",\"filter_tree\":");
+        try out.appendSlice(alloc, source.tree);
+        try out.appendSlice(alloc, ",\"public_filter\":");
+        try out.appendSlice(alloc, source.public_filter);
+    }
+}
+
 fn appendSourceJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), source: Source, with_identity: bool) !void {
     try out.append(alloc, '{');
     switch (source.kind) {
@@ -525,6 +547,10 @@ fn appendSourceJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), source: 
             }
             try out.print(alloc, "],\"direction\":\"{s}\",\"depth\":{d},\"max_fanout\":{d}", .{ @tagName(g.direction), g.depth, g.max_fanout });
             if (g.include_generated) try out.appendSlice(alloc, ",\"include_generated\":true");
+            if (source.conjuncts.len != 0 or source.tree.len != 0) {
+                try out.append(alloc, ',');
+                try appendFilterJson(alloc, out, source, with_identity);
+            }
             try out.append(alloc, '}');
         },
         .search => {
@@ -709,10 +735,83 @@ pub const ranking_clauses = [_][]const u8{
 };
 const search_shorthands = [_][]const u8{ "text", "text_field", "vector", "vector_index", "k" };
 
-/// The first ranking clause of a public `query` object, if any.
+/// The first ranking clause of a public `query` object, if any. A
+/// `graph_queries` holding one plain bounded traversal is not ranking: it is
+/// tracked live like a filter.
 pub fn rankingClause(query: std.json.ObjectMap) ?[]const u8 {
-    inline for (ranking_clauses) |clause| if (query.get(clause) != null) return clause;
+    inline for (ranking_clauses) |clause| if (query.get(clause) != null) {
+        if (comptime std.mem.eql(u8, clause, "graph_queries")) {
+            if (!isLiveTraversal(query)) return clause;
+        } else return clause;
+    };
     return null;
+}
+
+/// Traversal options context tracking follows exactly. Anything else
+/// (`edge_filter`, `edge_weight`, `limit`, metric order/filters, paths) is
+/// executed by the query engine as a snapshot.
+const live_traverse_keys = [_][]const u8{ "start", "direction", "edge_types", "max_depth", "max_fanout", "include_generated" };
+
+/// One `graph_queries` entry that is a plain `traverse` within the live
+/// depth bound, from the dependent row or a single `$source`-bound key,
+/// with nothing beside it but `table` and `filter_query`.
+pub fn isLiveTraversal(query: std.json.ObjectMap) bool {
+    return liveTraversalOp(query) != null;
+}
+
+fn liveTraversalOp(query: std.json.ObjectMap) ?struct { index: []const u8, traverse: std.json.ObjectMap } {
+    var it = query.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "table") and !std.mem.eql(u8, key, "graph_queries") and !std.mem.eql(u8, key, "filter_query")) return null;
+    }
+    const queries = query.get("graph_queries") orelse return null;
+    if (queries != .object or queries.object.count() != 1) return null;
+    const op = queries.object.values()[0];
+    if (op != .object or op.object.count() != 2) return null;
+    const index = op.object.get("index") orelse return null;
+    const traverse = op.object.get("traverse") orelse return null;
+    if (index != .string or traverse != .object) return null;
+    var tit = traverse.object.iterator();
+    while (tit.next()) |entry| {
+        const known = for (live_traverse_keys) |k| {
+            if (std.mem.eql(u8, k, entry.key_ptr.*)) break true;
+        } else false;
+        if (!known) return null;
+    }
+    if (traverse.object.get("max_depth")) |d| {
+        if (d != .integer or d.integer < 1 or d.integer > max_graph_depth) return null;
+    }
+    if (traverse.object.get("start")) |start| {
+        if (start != .object or start.object.count() != 1) return null;
+        const keys = start.object.get("keys") orelse return null;
+        if (keys != .array or keys.array.items.len != 1) return null;
+        const only = keys.array.items[0];
+        if (only != .object or only.object.count() != 1 or only.object.get("$source") == null) return null;
+    }
+    return .{ .index = index.string, .traverse = traverse.object };
+}
+
+/// A live traversal `query`, as the internal graph target: the graph index,
+/// start pointer (empty: the dependent row), shape, and its filter.
+fn traversalTargetAlloc(a: Allocator, query: std.json.ObjectMap) Error!std.json.ObjectMap {
+    const op = liveTraversalOp(query) orelse return error.UnsupportedContextPredicate;
+    var target: std.json.ObjectMap = .empty;
+    if (query.get("table")) |t| try target.put(a, "table", t);
+    if (query.get("filter_query")) |f| try target.put(a, "filter_query", f);
+    try target.put(a, "graph_index", .{ .string = op.index });
+    var it = op.traverse.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "start")) {
+            const pointer = entry.value_ptr.object.get("keys").?.array.items[0].object.get("$source").?;
+            if (pointer != .string) return error.InvalidContextSourcesConfig;
+            try target.put(a, "start_from", pointer);
+        } else if (std.mem.eql(u8, key, "max_depth")) {
+            try target.put(a, "depth", entry.value_ptr.*);
+        } else try target.put(a, key, entry.value_ptr.*);
+    }
+    return target;
 }
 
 /// Public `query` with ranking clauses, as the internal ranked-retrieval
@@ -800,12 +899,17 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, opts: Pars
             if (field != .object) return error.InvalidContextSourcesConfig;
             source.kind = k;
             if (!opts.allow_identity) switch (k) {
-                // Ranked retrieval is declared as a `query` with ranking
-                // clauses; the internal kind is not public grammar.
-                .search => return error.InvalidContextSourcesConfig,
+                // Ranked retrieval and traversal are declared as a `query`
+                // (ranking clauses, or one plain `graph_queries` traverse);
+                // the internal kinds are not public grammar.
+                .search, .graph => return error.InvalidContextSourcesConfig,
                 .query => if (rankingClause(field.object) != null) {
                     source.kind = .search;
                     try parseTarget(a, &source, try rankedTargetAlloc(a, field.object), opts);
+                    continue;
+                } else if (isLiveTraversal(field.object)) {
+                    source.kind = .graph;
+                    try parseTarget(a, &source, try traversalTargetAlloc(a, field.object), opts);
                     continue;
                 },
                 else => {},
@@ -885,6 +989,9 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, opts: Pars
     try trimmed.appendSlice(a, fields.items);
     try trimmed.appendSlice(a, tree_fields);
     for (source.conjuncts) |c| if (!c.isEquality()) try trimmed.append(a, c.field);
+    // A filtered traversal re-checks each reached row on change: equality
+    // fields decide membership there too (no indexed subscription covers them).
+    if (source.kind == .graph) for (source.conjuncts) |c| if (c.isEquality()) try trimmed.append(a, c.field);
     if (source.order_by) |o| try trimmed.append(a, o.field);
     sortUniqueStrings(&trimmed);
     source.relevant_fields = trimmed.items;
@@ -925,7 +1032,20 @@ fn parseTarget(a: Allocator, source: *Source, object: std.json.ObjectMap, opts: 
             } else if (std.mem.eql(u8, key, "order_by")) {
                 source.order_by = try parseOrderBy(a, field);
             } else return error.InvalidContextSourcesConfig,
-            .graph => try parseGraphField(a, &source.graph, key, field),
+            .graph => if (std.mem.eql(u8, key, "filter_query")) {
+                // Narrows the reached rows; evaluated per reached row.
+                const parsed = try parseFilter(a, field, opts);
+                source.conjuncts = parsed.conjuncts;
+                if (parsed.tree.len != 0) {
+                    source.tree = parsed.tree;
+                    source.public_filter = try stringifyAlloc(a, field);
+                }
+            } else if (allow_identity and std.mem.eql(u8, key, "filter_tree")) {
+                if (field != .array) return error.InvalidContextSourcesConfig;
+                source.tree = if (field.array.items.len == 0) "" else try stringifyAlloc(a, field);
+            } else if (allow_identity and std.mem.eql(u8, key, "public_filter")) {
+                source.public_filter = try stringifyAlloc(a, field);
+            } else try parseGraphField(a, &source.graph, key, field),
             .search => try parseSearchField(a, &source.search, key, field),
         }
     }
@@ -941,7 +1061,15 @@ fn parseTarget(a: Allocator, source: *Source, object: std.json.ObjectMap, opts: 
             };
             if (similar > 1) return error.UnsupportedContextPredicate;
         },
-        .graph => if (source.graph.graph_index.len == 0) return error.InvalidContextSourcesConfig,
+        .graph => {
+            if (source.graph.graph_index.len == 0) return error.InvalidContextSourcesConfig;
+            if (source.tree.len == 0) source.public_filter = "";
+            var similar: usize = 0;
+            for (source.conjuncts) |c| if (c.op == .similar) {
+                similar += 1;
+            };
+            if (similar > 1) return error.UnsupportedContextPredicate;
+        },
         .search => {
             const s = source.search;
             const has_text = s.text.present();
@@ -2431,11 +2559,23 @@ pub fn bindForKeyAlloc(alloc: Allocator, config: *const Config, doc_key: []const
                 if (bound.key) |key| bound.tuples = try oneTuple(a, documentTuple(bound.spec, key));
             },
             .graph => {
+                // A filter binds like a query (values and residual), but the
+                // traversal owns the subscriptions: its start, then every
+                // node it visits and every row it reaches.
+                if (source.conjuncts.len != 0 or source.tree.len != 0) try bindQuery(a, &bound, source_doc);
                 bound.start = if (source.graph.start_from.len == 0)
                     (if (doc_key.len == 0) null else try a.dupe(u8, doc_key))
                 else
                     try bindKey(a, source_doc, source.graph.start_from);
-                if (bound.start) |start| bound.tuples = try oneTuple(a, graphTuple(bound.spec, start));
+                bound.tuples = &.{};
+                bound.pivot = null;
+                if (bound.start) |start| {
+                    bound.tuples = try oneTuple(a, graphTuple(bound.spec, start));
+                    var h = Sha256.init(.{});
+                    hashField(&h, &bound.query_identity);
+                    hashField(&h, start);
+                    h.final(&bound.query_identity);
+                }
             },
             .query => try bindQuery(a, &bound, source_doc),
             .search => {
@@ -2971,6 +3111,30 @@ pub fn similarityScore(alloc: Allocator, conjunct: Conjunct, query: []const f32,
 /// Evaluate a dependent's residual parameters (its subscription value) on
 /// one row. With `check_boundary`, a full top-N result additionally requires
 /// the row to rank at or above the recorded boundary (ties by key).
+/// Whether `row` satisfies a bound filter in full: equality conjuncts
+/// against their resolved values, then the residual (other conjuncts and the
+/// predicate tree). Used where no indexed subscription prefiltered the row
+/// (a traversal's reached rows).
+pub fn filterMatches(alloc: Allocator, bound: *const Bound, key: []const u8, row: std.json.Value, row_filter: ?RowFilter) !bool {
+    const source = bound.source;
+    if (bound.unsatisfiable) return false;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (source.conjuncts, 0..) |c, j| {
+        if (!c.isEquality()) continue;
+        const allowed = if (j < bound.values.len) bound.values[j] else return false;
+        const value = resolveFieldPath(row, c.field) orelse return false;
+        const candidates: []const std.json.Value = if (value == .array) value.array.items else &.{value};
+        const hit = outer: for (candidates) |candidate| {
+            const canonical = (try canonicalScalarAlloc(a, candidate)) orelse continue;
+            for (allowed) |v| if (std.mem.eql(u8, v, canonical)) break :outer true;
+        } else false;
+        if (!hit) return false;
+    }
+    return residualMatches(alloc, source, bound.residual, key, row, false, row_filter);
+}
+
 pub fn residualMatches(alloc: Allocator, source: *const Source, residual_json: []const u8, key: []const u8, row: std.json.Value, check_boundary: bool, row_filter: ?RowFilter) !bool {
     if (residual_json.len == 0) return true;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -3913,7 +4077,7 @@ test "ordered top-N relevance follows the recorded boundary" {
 test "graph and ranked query sources bind and validate" {
     const alloc = testing.allocator;
     var config = try parsePublicJson(alloc,
-        \\{"cites":{"graph":{"graph_index":"refs","edge_types":["cites"],"depth":2,"max_fanout":5},"fields":["title"],"max_documents":20},
+        \\{"cites":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{"edge_types":["cites"],"max_depth":2,"max_fanout":5}}}},"fields":["title"],"max_documents":20},
         \\ "similar_docs":{"query":{"vector":{"$source":"/embedding"},"vector_index":"dense","k":5},"fields":["title"],"refresh_interval":"1h"}}
     , "");
     defer config.deinit();
@@ -3970,8 +4134,35 @@ test "graph and ranked query sources bind and validate" {
     try testing.expectEqualStrings(
         \\{"live":{"kind":"query","tracking":"live"},"ranked":{"kind":"query","tracking":"snapshot","reason":"semantic_search"},"pinned":{"kind":"query","tracking":"snapshot","reason":"declared"},"org":{"kind":"document","tracking":"live"}}
     , summary);
+    // A plain bounded traversal is tracked live; anything the walk cannot
+    // follow exactly (depth past the live bound, edge filters or weights,
+    // result limits, other graph operations) runs in the query engine as a
+    // snapshot, and asserting live on it is refused.
+    var walk = try parsePublicJson(alloc,
+        \\{"g":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{"start":{"keys":[{"$source":"/owner"}]},"edge_types":["cites"],"max_depth":2}}},"filter_query":{"field":"status","term":"published"}},"fields":["t"],"tracking":"live"}}
+    , "");
+    defer walk.deinit();
+    try testing.expectEqual(SourceKind.graph, walk.sources[0].kind);
+    try testing.expectEqualStrings("/owner", walk.sources[0].graph.start_from);
+    try testing.expectEqual(@as(u8, 2), walk.sources[0].graph.depth);
+    try testing.expectEqual(@as(usize, 1), walk.sources[0].conjuncts.len);
+    // The filter survives the stored round trip.
+    const walk_stored = try walk.canonicalJsonAlloc(alloc);
+    defer alloc.free(walk_stored);
+    var walk_again = try parseStoredJson(alloc, walk_stored);
+    defer walk_again.deinit();
+    try testing.expectEqualSlices(u8, &walk.digest(), &walk_again.digest());
+    try testing.expectEqual(@as(usize, 1), walk_again.sources[0].conjuncts.len);
+    var deep = try parsePublicJson(alloc,
+        \\{"g":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{"max_depth":4}}}},"fields":["t"]}}
+    , "");
+    defer deep.deinit();
+    try testing.expectEqual(SourceKind.search, deep.sources[0].kind);
+    try testing.expectError(error.ContextSourceRequiresSnapshot, parsePublicJson(alloc,
+        \\{"g":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{"edge_filter":{"types":["x"]}}}}},"fields":["t"],"tracking":"live"}}
+    , ""));
     try testing.expectError(error.InvalidContextSourcesConfig, parsePublicJson(alloc,
-        \\{"g":{"graph":{"graph_index":"refs","depth":4},"fields":["t"]}}
+        \\{"g":{"graph":{"graph_index":"refs"},"fields":["t"]}}
     , ""));
     try testing.expectError(error.UnsupportedContextPredicate, parsePublicJson(alloc,
         \\{"q":{"query":{"filter_query":{"disjuncts":[]}},"fields":["t"]}}
@@ -3993,7 +4184,7 @@ test "artifact virtual fields are admitted and recorded per source" {
     var config = try parsePublicJson(alloc,
         \\{"labels":{"query":{"filter_query":{"conjuncts":[{"field":"org","term":{"$source":"/org"}},{"field":"_artifacts.classify.label","term":"policy"},
         \\  {"field":"_artifacts.emb","similar":{"vector":{"$source":"/v"},"threshold":0.8,"dims":2,"model":"m"}}]}},"fields":["title","_artifacts.summary"]},
-        \\ "g":{"graph":{"graph_index":"kg","include_generated":true},"fields":["title"]}}
+        \\ "g":{"query":{"graph_queries":{"g":{"index":"kg","traverse":{"include_generated":true}}}},"fields":["title"]}}
     , "");
     defer config.deinit();
     const labels = config.find("labels").?;

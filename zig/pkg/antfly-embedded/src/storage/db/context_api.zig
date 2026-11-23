@@ -66,12 +66,12 @@ fn appendSourcesTracking(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
         if (i != 0) try out.append(alloc, ',');
         try out.appendSlice(alloc, "{\"name\":");
         try ctx.appendJsonString(alloc, out, source.name);
-        // Ranked retrieval is declared as a `query` with ranking clauses.
+        // Ranked retrieval and traversals are declared as a `query`.
         const kind: []const u8 = switch (source.kind) {
-            .search => "query",
+            .search, .graph => "query",
             else => @tagName(source.kind),
         };
-        try out.print(alloc, ",\"kind\":\"{s}\",\"tracking\":\"{s}\",\"ranked\":{}}}", .{ kind, @tagName(source.tracking), source.kind == .search });
+        try out.print(alloc, ",\"kind\":\"{s}\",\"tracking\":\"{s}\",\"ranked\":{},\"traversal\":{}}}", .{ kind, @tagName(source.tracking), source.kind == .search, source.kind == .graph });
     }
 }
 

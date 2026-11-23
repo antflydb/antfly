@@ -892,12 +892,26 @@ public form of the declaration is kept verbatim for reads.
 
 A `query` with any ranking clause (`full_text_search`, `semantic_search`,
 `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`,
-`graph_queries`, `limit`, or the `text`/`vector` shorthands) is a ranked
+`limit`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain
+bounded traverse) is a ranked
 retrieval: the whole query is a public `QueryRequest` with `$source` bindings
 anywhere, run by the host's query engine; members render in rank order. Its
 membership depends on the whole corpus, so it is a snapshot and publishes
 `unverified`. Internally it is stored as the `search` source kind, which is not
 public grammar.
+
+Graph traversal is a `query` too. One `graph_queries` entry holding a plain
+`traverse` (from the dependent row or a `$source`-bound start key, with only
+`edge_types`, `direction`, `max_depth` up to 3, and the context options
+`max_fanout` and `include_generated`) is tracked live: the dependent watches
+every visited node's adjacency and every reached row, and members render with
+depth, edge type, and direction. A `filter_query` beside it narrows the reached
+rows (equality conjuncts against bound values, then the residual, per row) and
+stays live, because every reached row is watched whether it matched or not.
+Anything the walk cannot follow exactly (edge filters or weights, result
+limits, metric ordering, `match`, shortest paths, deeper traversals) runs in
+the query engine as a snapshot. Internally a live traversal is stored as the
+`graph` source kind, which is not public grammar.
 
 `tracking` is the second knob. Left out, each source gets the strongest
 guarantee it supports (`live` for filters, `snapshot` for ranked queries) and
@@ -920,7 +934,7 @@ and next values determine exactly which dependents change:
 | `match` (filter mode) | yes | token-indexed subscriptions, exact residual test with the pinned `antfly.context.simple.v1` analyzer (part of the source identity) |
 | `similar` (threshold) | yes | cosine: pivot-distance blocks, exact residual test; dot: spec-wide tuple filtered per subscriber. The vector is read from a document field; `model` names the embedding space and is part of the source identity |
 | `order_by` top-N | yes | interval blocks from the recorded boundary; relevant only if the row ranks at or above it (ties by key) |
-| `graph`, depth 1-3 | yes | adjacency tuple per visited node plus document tuple per member; generated and field-derived edges with `include_generated` |
+| `graph_queries` traverse, depth 1-3 (optionally with a `filter_query` on reached rows) | yes | adjacency tuple per visited node plus document tuple per member; generated and field-derived edges with `include_generated` |
 | `_artifacts.<name>` fields and predicates | yes | logical rows include generated artifacts; generated records stage notices |
 | `bool`/`should`/`must_not`/`disjuncts` | yes | residual tree evaluated per subscriber on the previous and next row |
 | wildcard, regexp, fuzzy, date/IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches` | yes | lowered at admission to the storage per-row filter; evaluated per subscriber and pushed into resolution scans |
@@ -1108,10 +1122,10 @@ not a decision explanation.
 
 | Runtime | Context sources |
 | --- | --- |
-| Embedded single DB | own-table document, query (all live predicates, top-N), graph, and snapshot sources |
+| Embedded single DB | own-table document and query sources: live filters (all live predicates, top-N), live traversals with filters, and ranked snapshots |
 | Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
 | Ordered (Raft) publication | dependency state commits with the artifact through replicated publish intents |
-| Distributed server tables | every source kind (document, query with all live predicates and top-N, graph, `_artifacts` fields, ranked queries without `semantic_search`), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
+| Distributed server tables | document and query sources (live filters with all predicates and top-N, live traversals with filters, `_artifacts` fields, ranked queries without `semantic_search`), own table and across tables; declared through the enrichment endpoint; HTTP dependency state, `require_current` barrier, and impact |
 
 ### Distributed tables
 
@@ -1202,11 +1216,12 @@ Distributed tables expose the dependency state over HTTP:
 Context reads run in the background with no caller, so they execute as the
 principal that declared the enrichment. At admission the declarer must be
 able to read every source table, and its effective row filter on each
-source table is conjoined into query sources (filters and ranked) in the stored
-declaration (so it is part of the subscription identity, is evaluated by
-storage on every resolution, and drives invalidation). Document and graph
-sources read rows by key or edge and cannot carry a filter: they are
-refused on tables where the declarer has one. The filter is captured at
+source table is conjoined into query sources (filters, traversals, and ranked
+queries) in the stored declaration (so it is part of the subscription
+identity, is evaluated on every resolution, and drives invalidation). Document
+sources read one row by key, ranked graph operations return graph results the
+filter does not narrow, and the `text`/`vector` shorthands carry no filter:
+they are refused on tables where the declarer has one. The filter is captured at
 declaration: after the principal's policies change, re-declare the
 enrichment (`PUT .../enrichment`) to re-capture it; retained artifacts keep
 the content they were built from until rebuilt. Anyone who can read the

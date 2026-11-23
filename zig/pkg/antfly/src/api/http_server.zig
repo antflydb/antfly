@@ -19006,7 +19006,7 @@ pub const ApiHttpServer = struct {
         while (it.next()) |entry| {
             if (entry.value_ptr.* != .object) continue;
             const spec = &entry.value_ptr.object;
-            inline for (.{ "query", "document", "graph" }) |kind| if (spec.getPtr(kind)) |target| {
+            inline for (.{ "query", "document" }) |kind| if (spec.getPtr(kind)) |target| {
                 if (target.* != .object) return error.InvalidContextSourcesConfig;
                 const public_name: []const u8 = if (target.object.get("table")) |t| (if (t == .string) t.string else return error.InvalidContextSourcesConfig) else owner_table;
                 var identity: ?AuthenticatedIdentity = null;
@@ -19023,10 +19023,15 @@ pub const ApiHttpServer = struct {
                         inline for (.{ "text", "text_field", "vector", "vector_index", "k" }) |shorthand| {
                             if (target.object.get(shorthand) != null) return error.Forbidden;
                         }
+                        // A live traversal filters the rows it reaches; graph
+                        // operations run by the query engine return graph
+                        // results the filter does not narrow.
+                        if (target.object.get("graph_queries") != null and
+                            !@import("antfly_local_sources").storage_db_enrichment_context_sources.isLiveTraversal(target.object)) return error.Forbidden;
                         const next = if (target.object.get("filter_query")) |existing| try conjoinJson(a, existing, row_filter) else row_filter;
                         try target.object.put(a, "filter_query", next);
                     } else {
-                        // Key lookups and edge traversals cannot be narrowed.
+                        // Key lookups cannot be narrowed.
                         return error.Forbidden;
                     }
                 }

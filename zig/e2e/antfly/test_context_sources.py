@@ -405,3 +405,36 @@ def test_distributed_context_source_admission(stateful_api, echo_generator):
         "tracking": "snapshot",
         "reason": "full_text_search",
     }, registered
+
+    # Graph traversal is a query: one plain bounded traverse (here with a
+    # filter on the reached rows) is live; an edge filter makes it a snapshot.
+    def traversal(extra: dict) -> dict:
+        return {
+            "cited": {
+                "query": {
+                    "table": right,
+                    "graph_queries": {
+                        "refs": {
+                            "index": "refs",
+                            "traverse": {"edge_types": ["cites"], "max_depth": 2, **extra},
+                        }
+                    },
+                    "filter_query": {"field": "status", "term": "published"},
+                },
+                "fields": ["title"],
+            }
+        }
+
+    registered = stateful_api.put(
+        f"/tables/{left}/artifacts/cited/enrichment", _enrichment(echo_generator, traversal({}))
+    )
+    assert registered["context_sources"]["cited"] == {"kind": "query", "tracking": "live"}, registered
+    registered = stateful_api.put(
+        f"/tables/{left}/artifacts/cited/enrichment",
+        _enrichment(echo_generator, traversal({"edge_filter": {"types": ["cites"]}})),
+    )
+    assert registered["context_sources"]["cited"] == {
+        "kind": "query",
+        "tracking": "snapshot",
+        "reason": "graph_queries",
+    }, registered

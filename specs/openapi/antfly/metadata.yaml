@@ -3373,12 +3373,15 @@ components:
                 type: string
               kind:
                 type: string
-                enum: [document, query, graph]
+                enum: [document, query]
               tracking:
                 type: string
                 enum: [live, snapshot]
               ranked:
                 type: boolean
+              traversal:
+                type: boolean
+                description: A live graph traversal (`graph_queries` traverse).
         current:
           type: boolean
           description: |
@@ -17630,7 +17633,7 @@ paths:
                       properties:
                         kind:
                           type: string
-                          enum: [document, query, graph]
+                          enum: [document, query]
                         tracking:
                           type: string
                           enum: [live, snapshot]

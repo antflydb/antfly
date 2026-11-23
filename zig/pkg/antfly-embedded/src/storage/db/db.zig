@@ -159695,7 +159695,7 @@ test "db context sources track residual ranges per subscriber and direct graph a
     try db.addIndex(.{ .name = "refs", .kind = .graph, .config_json = "{}" });
     const declaration = try contextSourcesTestDeclarationAlloc(alloc,
         \\{"recent":{"query":{"filter_query":{"conjuncts":[{"field":"org","term":{"$source":"/org"}},{"field":"at","range":{"gte":{"$source":"/since"}}}]}},"fields":["title"],"max_documents":10},
-        \\ "cites":{"graph":{"graph_index":"refs","edge_types":["cites"],"depth":1},"fields":["title"],"max_documents":10}}
+        \\ "cites":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{"edge_types":["cites"],"max_depth":1}}}},"fields":["title"],"max_documents":10}}
     );
     defer alloc.free(declaration);
     try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });

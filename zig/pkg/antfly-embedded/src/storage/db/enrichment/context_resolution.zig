@@ -552,10 +552,18 @@ fn resolveGraph(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
             return std.mem.lessThan(u8, l.key, r.key);
         }
     }.lt);
+    const filtered = source.conjuncts.len != 0 or source.tree.len != 0;
     for (order.items) |v| {
+        // Every reached row is watched, members or not: a filtered-out row
+        // that starts matching (or a member that stops) invalidates too.
         if (source.isLive()) try tuples.append(a, .{ .spec = bound.spec, .tuple = ctx.documentTuple(bound.spec, v.key) });
         const raw = try reader.lookup_fn(reader.ptr, a, source.table_id, v.key);
-        const projection = if (raw) |doc| try ctx.projectAlloc(a, try logicalRow(a, reader, source, v.key, doc), source.fields) else "null";
+        const row: ?std.json.Value = if (raw) |doc| try logicalRow(a, reader, source, v.key, doc) else null;
+        if (filtered) {
+            const candidate = row orelse continue;
+            if (!try ctx.filterMatches(a, bound, v.key, candidate, reader.row_filter)) continue;
+        }
+        const projection = if (row) |value| try ctx.projectAlloc(a, value, source.fields) else "null";
         var extra = std.ArrayListUnmanaged(u8).empty;
         try extra.print(a, "\"depth\":{d},\"edge_type\":", .{v.depth});
         try ctx.appendJsonString(a, &extra, v.edge_type);
@@ -876,7 +884,7 @@ test "ordered top-N, graph traversal, and snapshot search resolve with exact sub
     try tables.put("edges:refs", "n1|mentions|n3", "{}");
     var config = try ctx.parsePublicJson(alloc,
         \\{"latest":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}},"order_by":{"field":"at","order":"desc"}},"fields":["title"],"max_documents":2},
-        \\ "cites":{"graph":{"graph_index":"refs","edge_types":["cites"],"depth":2},"fields":["title"],"max_documents":10},
+        \\ "cites":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{"edge_types":["cites"],"max_depth":2}}}},"fields":["title"],"max_documents":10},
         \\ "solar":{"query":{"text":"solar","text_field":"title","k":5},"fields":["title"]}}
     , "");
     defer config.deinit();
@@ -906,12 +914,48 @@ test "ordered top-N, graph traversal, and snapshot search resolve with exact sub
     try testing.expect(boundary_recorded);
     // Fan-out beyond the declared bound fails explicitly.
     var tight = try ctx.parsePublicJson(alloc,
-        \\{"g":{"graph":{"graph_index":"refs","depth":2,"max_fanout":1},"fields":["title"]}}
+        \\{"g":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{"max_depth":2,"max_fanout":1}}}},"fields":["title"]}}
     , "");
     defer tight.deinit();
     var tight_bindings = try ctx.bindForKeyAlloc(alloc, &tight, "dep", try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{}", .{}));
     defer tight_bindings.deinit();
     try testing.expectError(error.ContextBudgetExceeded, resolveAlloc(alloc, tables.reader(""), &tight_bindings, .{}));
+}
+
+test "a traversal with a filter keeps matching reached rows and watches all of them" {
+    const alloc = testing.allocator;
+    var tables = MemoryTables{ .alloc = alloc };
+    defer tables.deinit();
+    for ([_][2][]const u8{ .{ "n1", "{\"status\":\"published\",\"region\":\"eu\",\"title\":\"a\"}" }, .{ "n2", "{\"status\":\"draft\",\"region\":\"eu\",\"title\":\"b\"}" }, .{ "n3", "{\"status\":\"published\",\"region\":\"us\",\"title\":\"c\"}" } }) |r| try tables.put("own", r[0], r[1]);
+    try tables.put("edges:refs", "dep|cites|n1", "{}");
+    try tables.put("edges:refs", "dep|cites|n2", "{}");
+    try tables.put("edges:refs", "dep|cites|n3", "{}");
+    var config = try ctx.parsePublicJson(alloc,
+        \\{"cited":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{"edge_types":["cites"]}}},
+        \\  "filter_query":{"conjuncts":[{"field":"status","term":"published"},{"field":"region","term":{"$source":"/region"}}]}},"fields":["title"]}}
+    , "");
+    defer config.deinit();
+    // Equality fields decide membership of reached rows, so they are relevant.
+    var relevant_status = false;
+    for (config.sources[0].relevant_fields) |f| if (std.mem.eql(u8, f, "status")) {
+        relevant_status = true;
+    };
+    try testing.expect(relevant_status);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var bindings = try ctx.bindForKeyAlloc(alloc, &config, "dep", try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"region\":\"eu\"}", .{}));
+    defer bindings.deinit();
+    var r = try resolveAlloc(alloc, tables.reader(""), &bindings, .{});
+    defer r.deinit(alloc);
+    // n2 is a draft and n3 is in another region: only n1 is a member.
+    try testing.expectEqualStrings(
+        "{\"cited\":{\"count\":1,\"members\":[{\"key\":\"n1\",\"depth\":1,\"edge_type\":\"cites\",\"direction\":\"out\",\"value\":{\"title\":\"a\"}}]}}",
+        r.rendered.json,
+    );
+    try testing.expect(!r.snapshot);
+    // Adjacency of dep plus a document tuple for every reached row (n1-n3),
+    // so a filtered-out row that starts matching invalidates the dependent.
+    try testing.expectEqual(@as(usize, 4), r.tuples.len);
 }
 
 test "context reads generated artifacts as fields and predicates" {

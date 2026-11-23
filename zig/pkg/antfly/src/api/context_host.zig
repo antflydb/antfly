@@ -666,7 +666,7 @@ test "context host admission resolves names, rejects cycles, and computes inboun
     // Graph sources and generated-artifact fields are admitted (read from the
     // owning group); a cross-table artifact cycle is not.
     const graph = try admitAlloc(alloc, &tables, collect, "docs", "s", try parse.of(a,
-        \\{"g":{"graph":{"graph_index":"refs"},"fields":["a"]}}
+        \\{"g":{"query":{"graph_queries":{"g":{"index":"refs","traverse":{}}}},"fields":["a"]}}
     ), null, null);
     alloc.free(graph);
     const artifacts = try admitAlloc(alloc, &tables, collect, "docs", "s", try parse.of(a,
