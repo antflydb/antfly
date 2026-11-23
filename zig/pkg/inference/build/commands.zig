@@ -122,5 +122,19 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const http_server_step = ctx.step("http-server", "Build the constrained production HTTP-only server");
     http_server_step.dependOn(&install_http_server.step);
 
+    if (ctx.backend.enable_cuda) {
+        const inkling_root = b.createModule(.{
+            .root_source_file = ctx.path("src/inkling2_generate.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .link_libc = ctx.backend.link_libc,
+        });
+        var imports = ctx.graph.inference_mod.import_table.iterator();
+        while (imports.next()) |entry| inkling_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        const inkling = b.addExecutable(.{ .name = "antfly-inference-inkling2-cuda", .root_module = inkling_root });
+        const install_inkling = b.addInstallArtifact(inkling, .{});
+        ctx.step("inkling2-cuda", "Build the native CUDA Inkling 2 generator").dependOn(&install_inkling.step);
+    }
+
     return exe;
 }

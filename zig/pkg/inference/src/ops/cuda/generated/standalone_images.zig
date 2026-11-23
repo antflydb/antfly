@@ -33,4 +33,12 @@ pub const images = struct {
     pub const @"lighton_vision.ptx" = @embedFile("../lighton_vision.ptx") ++ "\x00";
     pub const @"florence_fused.ptx" = @embedFile("../florence_fused.ptx") ++ "\x00";
     pub const @"row_selection_stats_f32.ptx" = @embedFile("../row_selection_stats_f32.ptx") ++ "\x00";
+    pub const @"routed_block_scaled_projection.ptx" = @embedFile("../routed_block_scaled_projection.ptx") ++ "\x00";
+    pub const @"paged_relative_attention_bf16.ptx" = @embedFile("../paged_relative_attention_bf16.ptx") ++ "\x00";
+    pub const @"causal_depthwise4_bf16.ptx" = @embedFile("../causal_depthwise4_bf16.ptx") ++ "\x00";
+    pub const @"head_norm_bf16.ptx" = @embedFile("../head_norm_bf16.ptx") ++ "\x00";
+    pub const @"residual_block_mix_bf16.ptx" = @embedFile("../residual_block_mix_bf16.ptx") ++ "\x00";
+    pub const @"patch_transformer_bf16.ptx" = @embedFile("../patch_transformer_bf16.ptx") ++ "\x00";
+    pub const @"routed_block_scaled_matvec_sm120.ptx" = @embedFile("../routed_block_scaled_matvec_sm120.ptx") ++ "\x00";
+    pub const @"dense_bf16_matvec.ptx" = @embedFile("../dense_bf16_matvec.ptx") ++ "\x00";
 };

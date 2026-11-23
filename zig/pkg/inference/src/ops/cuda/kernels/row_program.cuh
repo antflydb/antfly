@@ -10,6 +10,12 @@ __device__ __forceinline__ float antfly_row_warp_sum(float x) {
     return x;
 }
 
+__device__ __forceinline__ float antfly_head_norm_factor(float square, unsigned dim, float clip, float eps) {
+    square = __shfl_sync(0xffffffffu, antfly_row_warp_sum(square), 0);
+    return clip > 0 ? fminf(1.0f, clip / (sqrtf(square) + eps))
+                    : rsqrtf(square / (float)dim + eps);
+}
+
 __device__ __forceinline__ float antfly_row_warp_max(float x) {
     for (int d = 16; d; d >>= 1) x = fmaxf(x, __shfl_down_sync(0xffffffffu, x, d));
     return x;

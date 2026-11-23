@@ -368,6 +368,92 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
     test_step.dependOn(&run_lifecycle_tests.step);
     ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);
+    const hybrid_kv_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_hybrid_kv.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var hybrid_kv_imports = suite.tests.root_module.import_table.iterator();
+    while (hybrid_kv_imports.next()) |entry| hybrid_kv_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    hybrid_kv_root.link_libc = true;
+    const hybrid_kv_host_tests = b.addTest(.{
+        .root_module = hybrid_kv_root,
+        .filters = &.{ "test_0", "runtime.kv.hybrid_paged.test.hybrid paged KV", "runtime.kv.writable_blocks.test.prepared KV" },
+    });
+    ctx.step("test-hybrid-kv", "Verify bounded hybrid page tables and prepared KV transactions").dependOn(&ctx.addRunArtifact(hybrid_kv_host_tests).step);
+    const inkling2_root = b.createModule(.{ .root_source_file = ctx.path("src/test_inkling2_checkpoint.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    inkling2_root.addImport("antfly_platform", ctx.graph.platform_mod);
+    inkling2_root.link_libc = true;
+    const inkling2_tests = b.addTest(.{ .root_module = inkling2_root, .filters = &.{"Inkling 2 Mini validates"} });
+    const run_inkling2 = ctx.addRunArtifact(inkling2_tests);
+    run_inkling2.has_side_effects = true;
+    ctx.step("test-inkling2-checkpoint", "Validate the Inkling 2 Mini decoder geometry against the released header").dependOn(&run_inkling2.step);
+    if (ctx.backend.enable_cuda) {
+        const inkling_attention_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_inkling2_attention.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var inkling_attention_imports = suite.tests.root_module.import_table.iterator();
+        while (inkling_attention_imports.next()) |entry| inkling_attention_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        inkling_attention_root.link_libc = true;
+        const inkling_attention_test = b.addTest(.{
+            .root_module = inkling_attention_root,
+            .filters = &.{"CUDA Inkling 2 runs resident"},
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_inkling_attention = ctx.addRunArtifact(inkling_attention_test);
+        run_inkling_attention.has_side_effects = true;
+        ctx.step("test-cuda-inkling2-attention", "Run Inkling local and global checkpoint attention with staged CUDA KV").dependOn(&run_inkling_attention.step);
+        const inkling_decoder_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_inkling2_decoder.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var inkling_decoder_imports = suite.tests.root_module.import_table.iterator();
+        while (inkling_decoder_imports.next()) |entry| inkling_decoder_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        inkling_decoder_root.link_libc = true;
+        const inkling_decoder_test = b.addTest(.{
+            .root_module = inkling_decoder_root,
+            .filters = &.{ "CUDA Inkling 2 runs the fixed loop", "CUDA BF16 patch norm reads" },
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_inkling_decoder = ctx.addRunArtifact(inkling_decoder_test);
+        run_inkling_decoder.has_side_effects = true;
+        ctx.step("test-cuda-inkling2-decoder", "Run Inkling 2 text and vision with the released CUDA weights").dependOn(&run_inkling_decoder.step);
+        const paged_relative_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_paged_relative_attention.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var paged_relative_imports = suite.tests.root_module.import_table.iterator();
+        while (paged_relative_imports.next()) |entry| paged_relative_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        paged_relative_root.link_libc = true;
+        const paged_relative_test = b.addTest(.{
+            .root_module = paged_relative_root,
+            .filters = &.{ "CUDA paged relative attention", "CUDA four-tap convolution" },
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_paged_relative = ctx.addRunArtifact(paged_relative_test);
+        run_paged_relative.has_side_effects = true;
+        ctx.step("test-cuda-paged-relative-attention", "Verify BF16 paged relative GQA and its staged short convolution").dependOn(&run_paged_relative.step);
+        const inkling_moe_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_inkling2_moe.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var inkling_moe_imports = suite.tests.root_module.import_table.iterator();
+        while (inkling_moe_imports.next()) |entry| inkling_moe_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        inkling_moe_root.link_libc = true;
+        const inkling_moe_test = b.addTest(.{
+            .root_module = inkling_moe_root,
+            .filters = &.{"CUDA Inkling 2 loads and executes"},
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_inkling_moe = ctx.addRunArtifact(inkling_moe_test);
+        run_inkling_moe.has_side_effects = true;
+        ctx.step("test-cuda-inkling2-moe", "Load and execute both Inkling 2 expert formats from the full checkpoint").dependOn(&run_inkling_moe.step);
+        const routed_projection_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_routed_projection.zig"), .target = ctx.target, .optimize = ctx.optimize });
+        var projection_imports = suite.tests.root_module.import_table.iterator();
+        while (projection_imports.next()) |entry| routed_projection_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        routed_projection_root.link_libc = true;
+        const routed_projection_test = b.addTest(.{
+            .root_module = routed_projection_root,
+            .filters = &.{"CUDA routed block scaled projection"},
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_routed_projection = ctx.addRunArtifact(routed_projection_test);
+        run_routed_projection.has_side_effects = true;
+        ctx.step("test-cuda-routed-projection", "Verify CUDA expert projection against released packed checkpoint rows").dependOn(&run_routed_projection.step);
+        const hybrid_kv_cuda_tests = b.addTest(.{
+            .root_module = hybrid_kv_root,
+            .filters = &.{"CUDA hybrid paged KV"},
+            .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+        });
+        const run_hybrid_kv_cuda = ctx.addRunArtifact(hybrid_kv_cuda_tests);
+        run_hybrid_kv_cuda.has_side_effects = true;
+        ctx.step("test-cuda-hybrid-kv", "Require CUDA and verify BF16 hybrid KV payloads at 32K").dependOn(&run_hybrid_kv_cuda.step);
+    }
     const microbatch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_executor_microbatch.zig"), .target = ctx.target, .optimize = ctx.optimize });
     var microbatch_imports = suite.tests.root_module.import_table.iterator();
     while (microbatch_imports.next()) |entry| microbatch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);

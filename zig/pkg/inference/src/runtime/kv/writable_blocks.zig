@@ -221,6 +221,13 @@ pub const PreparedAppend = struct {
     pub fn futureTokenCount(self: *const @This()) usize {
         return self.future_tokens;
     }
+
+    /// Staged table before front retirement. Attention can still read old
+    /// pages during the append, including pages that commit will retire.
+    pub fn stagedPageId(self: *@This(), index: usize) ?block.KvBlockId {
+        if (!self.active or index >= self.old_blocks + self.append_pages) return null;
+        return self.logicalAt(index);
+    }
 };
 
 pub fn canPrepareTruncate(storage: *const storage_mod.KvStorage) bool {

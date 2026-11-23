@@ -87,8 +87,10 @@ def main():
             source = cuda / "prototypes" / producer
             if source.suffix == ".cu":
                 spec = profiles[0]
-                subprocess.run([args.nvcc, "--ptx", "-arch=compute_" + str(spec["target"]), "-O3",
-                                *spec["nvcc_flags"], str(source), "-o", str(output / spec["file"])],
+                flags = spec["nvcc_flags"]
+                arch = [] if any(flag.startswith("-arch=") for flag in flags) else ["-arch=compute_" + str(spec["target"])]
+                subprocess.run([args.nvcc, "--ptx", *arch, "-O3",
+                                *flags, str(source), "-o", str(output / spec["file"])],
                                env=env, check=True)
                 p = output / spec["file"]
                 p.write_bytes(p.read_bytes().rstrip() + b"\n")
