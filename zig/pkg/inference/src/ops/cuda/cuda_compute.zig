@@ -8372,7 +8372,7 @@ pub const CudaCompute = struct {
                 try entry.invalidateGraph(&self.ctx);
             }
             try @import("../../backends/embedding_gemma2_cuda.zig").prepareAttentionSource(entry, &self.ctx, attention_source, config, policy, self.encoderGraphRouteState());
-            const graph_action = entry.graphAction();
+            const graph_action = entry.graphAction(entry.warm);
             if (entry.graph != null) {
                 const replay = graph_action == .replay;
                 if (replay) {
@@ -20667,7 +20667,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
     const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
-    const capture = arena.graph == null and !arena.disabled;
     // Collect only completed events, with no new stream/device wait.
     if (arena.timing_replay) |replay| if (arena.timing) |pair| {
         var ms: f32 = 0;
@@ -20677,7 +20676,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         }
     };
     const capture_sample = arena.graph == null;
-    const replay = arena.graph != null and arena.preferReplay();
+    // The sealed allocation plan above is the audio route's capture proof.
+    const action = arena.graphAction(true);
+    const capture = action == .capture;
+    const replay = action == .replay;
     // Establish scratch and input custody before allocating the result or
     // submitting profiling events and copies.
     for (inputs, spans) |ct, span| {

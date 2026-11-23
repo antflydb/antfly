@@ -190,9 +190,9 @@ pub fn Program(comptime Recipe: type) type {
                 return total;
             }
             pub const GraphAction = enum { eager, capture, replay };
-            pub fn graphAction(self: *const Arena) GraphAction {
+            pub fn graphAction(self: *const Arena, capture_ready: bool) GraphAction {
                 if (self.graph != null) return if (self.preferReplay()) .replay else .eager;
-                return if (self.warm and !self.disabled) .capture else .eager;
+                return if (capture_ready and !self.disabled) .capture else .eager;
             }
             pub fn preferReplay(self: *const Arena) bool {
                 if (self.replay_samples < 2) return true;
@@ -607,4 +607,15 @@ test "retained CUDA execution accepts an independent typed recipe without model 
     try std.testing.expect(arena.warm);
     try arena.prepareAttentionSource(&context, .{ .sequence = 5, .all_valid = true }, .{ .generation = 2 });
     try std.testing.expect(!arena.warm and arena.attention_source == null);
+
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(false));
+    try std.testing.expectEqual(P.Arena.GraphAction.capture, arena.graphAction(true));
+    arena.disabled = true;
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(true));
+    arena.disabled = false;
+    var graph_marker: u8 = 0;
+    arena.graph = &graph_marker;
+    try std.testing.expectEqual(P.Arena.GraphAction.replay, arena.graphAction(false));
+    arena.replay_samples = 2;
+    try std.testing.expectEqual(P.Arena.GraphAction.eager, arena.graphAction(true));
 }

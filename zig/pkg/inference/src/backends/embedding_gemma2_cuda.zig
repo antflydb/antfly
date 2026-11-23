@@ -609,7 +609,7 @@ test "CUDA encoder graph refresh preserves physical banks across logical source 
             const source: AttentionSource = .{ .sequence = program.source_sequence, .all_valid = true };
             try prepareAttentionSource(arena, context, source, config, .{}, .{});
             try arena.uploadLogical(context, program.logical_metadata, source);
-            const action = arena.graphAction();
+            const action = arena.graphAction(arena.warm);
             switch (action) {
                 .eager => {
                     try m.launchLocalFlashAttention(context, arena.buffers[3], arena.buffers[0], arena.buffers[1], arena.buffers[2], arena.buffers[4], program, arena.buffers[5]);
@@ -742,7 +742,7 @@ test "encoder retained logical metadata rejects topology changes without borrowi
     entry.eager_samples = 1;
     try prepareAttentionSource(&entry, &ctx, next, config, .{ .graph_replay = true }, .{});
     try std.testing.expect(entry.warm); // next logical request can capture
-    try std.testing.expectEqual(Arena.GraphAction.capture, entry.graphAction());
+    try std.testing.expectEqual(Arena.GraphAction.capture, entry.graphAction(entry.warm));
     try std.testing.expectEqual(@as(u8, 0), entry.eager_samples);
     try std.testing.expectEqual(@as(usize, 177), entry.attention_source.?.sequence); // not published before execution
     var changed = config;
