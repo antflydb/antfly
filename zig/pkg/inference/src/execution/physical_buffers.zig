@@ -5579,6 +5579,27 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     };
     var layout = try buffers.build(a, &graph, &placement, .{});
     defer layout.deinit();
+    const memory = @import("../runtime/tier/memory.zig");
+    const Ledger = struct {
+        controller: memory.AdmissionController = .{},
+        permit: ?memory.AdmissionLease = null,
+        remaining: memory.AdmissionAmounts = .{},
+        limits: memory.Limits = .{},
+
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: ops.BackendKind, class: @import("storage_accounting.zig").Class, byte_size: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.permit.?, .{
+                .controller = &self.controller,
+                .backend_class = .gpu,
+                .limits = self.limits,
+                .credit = &self.remaining,
+                .check_live_memory = false,
+            }, kind, class, byte_size);
+        }
+    };
+    var ledger = Ledger{};
+    defer ledger.controller.deinit();
+    defer if (ledger.permit) |*permit| permit.release();
     const root = (try Pool.create(a, &graph, &layout, &.{ &host, &target }, placement.node_operator_plans)) orelse return error.MissingPhysicalPool;
     defer root.deinit();
     root.coverage_graph = &graph;
@@ -5617,8 +5638,27 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
         .{ .id = 1, .backend = &host, .kind = .native },
     });
     defer mesh.deinit();
-    const frame = try Frame.create(routes.pool);
-    defer frame.deinit();
+    const required = try routes.pool.storageRequirement();
+    try std.testing.expect(required.host_scratch_bytes != 0 and required.backend_scratch_bytes != 0);
+    const total = try std.math.add(usize, required.host_scratch_bytes, required.backend_scratch_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, ledger.controller.tryAcquire(.gpu, .{ .combined_limit_bytes = total - 1 }, required, false));
+    ledger.limits = .{
+        .host_limit_bytes = required.host_scratch_bytes,
+        .backend_limit_bytes = required.backend_scratch_bytes,
+        .combined_limit_bytes = total,
+    };
+    ledger.permit = try ledger.controller.tryAcquire(.gpu, ledger.limits, required, false);
+    ledger.remaining = required;
+    const cap = admission.Capability{
+        .context = &ledger,
+        .identity = .{ .controller = &ledger.controller, .backend_class = .gpu },
+        .services = &.{ .reserve = Ledger.reserve },
+    };
+    const frame = (try routes.pool.acquireWithAdmission(cap)) orelse return error.MissingPhysicalFrame;
+    var active = true;
+    defer if (active) {
+        _ = frame.finish() catch unreachable;
+    };
     try frame.begin();
     var values_in = [_]f32{ 8, 8, 8, 8 };
     const packet_input = @import("../backends/tensor.zig").Tensor{
@@ -5631,7 +5671,6 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
         .owns_shape = false,
     };
     const bound = try frame.bindHostInputs(&.{.{ .node_id = packet, .value = &packet_input }});
-    defer frame.releaseHostInputs();
     var actual = try multi.executeMultiDevice(a, &graph, &plan, &mesh, .{
         .physical_frame = frame,
         .runtime_inputs = bound,
@@ -5641,6 +5680,9 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     });
     defer actual.deinit(&mesh);
     const receipt = try frame.finish();
+    active = false;
+    try std.testing.expectEqualDeep(required, ledger.controller.snapshot());
+    try std.testing.expect((try frame.reusableCredit(cap.identity, null)) == null);
     try std.testing.expectEqual(@as(u64, 4), receipt.transfers);
     try std.testing.expectEqual(@as(u64, 64), receipt.transfer_bytes);
     try std.testing.expectEqual(@as(u64, 4), receipt.dispatches);
