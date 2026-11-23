@@ -744,11 +744,50 @@ pub const Session = struct {
         return current;
     }
 
-    fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal, describe_only: bool) !backend.Description {
+    fn openPortalStream(self: *Session, portal: *Portal, expected_columns: ?[]const backend.Column) !void {
+        const open = self.source.vtable.open_stream orelse return;
+        var req = self.request(portal.statement, portal.parameters, portal.types);
+        req.parameter_cells = portal.parameter_cells;
+        req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
+        req.parameter_descriptors = portal.description.parameter_descriptors;
+        req.binding_guard = portal.description.binding_guard;
+        req.setting_epoch = portal.description.setting_epoch;
+        req.expected_stream_columns = expected_columns;
+        portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
+        if (portal.stream) |stream| {
+            if (stream.validate == null or stream.detach == null) return error.UnsupportedSqlExecution;
+            self.snapshot_import_allowed = false;
+        }
+        try req.check();
+    }
+
+    const GuardedSelect = enum { opened, declined, recheck, stale };
+
+    fn tryOpenGuardedSelect(self: *Session, portal: *Portal) !GuardedSelect {
+        const description = portal.description;
+        const stamp = description.stamp orelse return .recheck;
+        if (!self.source.vtable.guarded_select_stream or self.status != .idle or
+            !description.is_select or description.copy_out != null or description.copy_in != null or
+            !stamp.reusable or stamp.catalog == null or description.binding_guard == null) return .recheck;
+        self.openPortalStream(portal, description.columns) catch |err| switch (err) {
+            error.CachedPlanResultTypeChanged => return self.cachedPlanChanged(),
+            error.CatalogGenerationChanged, error.SettingCatalogChanged => {
+                self.diagnostic.clearNotices();
+                self.diagnostic = .{ .notice_allocator = self.alloc };
+                return .stale;
+            },
+            else => return err,
+        };
+        const stream = portal.stream orelse return .declined;
+        if (stream.copy_out != null or !columnsEqual(description.columns, stream.columns)) return self.cachedPlanChanged();
+        return .opened;
+    }
+
+    fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal, describe_only: bool, known_stale: bool) !backend.Description {
         const bound = portal.description;
         var probe = bound;
         if (describe_only) probe.stamp = portal.describe_stamp orelse bound.stamp;
-        if (try self.descriptionCurrent(alloc, portal.statement, probe)) return probe;
+        if (!known_stale and try self.descriptionCurrent(alloc, portal.statement, probe)) return probe;
         const current = try self.rebindCached(alloc, portal.statement, bound);
         if (bound.binding_guard) |before| {
             if (if (bound.stamp) |s| s.catalog else null) |previous| {
@@ -1682,7 +1721,11 @@ pub const Session = struct {
                 portal.* = .{ .arena = .init(self.alloc), .statement = "", .parameters = &.{}, .types = &.{}, .formats = &.{}, .description = .{ .columns = &.{} } };
                 errdefer if (!transferred) portal.arena.deinit();
                 const a = portal.arena.allocator();
-                const current = try self.preparedDescription(statement, a);
+                const current = description: {
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    break :description try self.preparedDescription(statement, scratch.allocator());
+                };
                 self.executing.store(true, .release);
                 defer self.executing.store(false, .release);
                 var admission_request = self.request(statement.statement, &.{}, &.{});
@@ -1756,13 +1799,13 @@ pub const Session = struct {
                 const text = try a.dupe(u8, statement.statement);
                 const description = backend.Description{
                     .cursor_readable = current.cursor_readable,
-                    .copy_out = current.copy_out,
-                    .copy_in = current.copy_in,
+                    .copy_out = if (current.copy_out) |options| try options.clone(a) else null,
+                    .copy_in = if (current.copy_in) |input| try input.cloneLeaky(a) else null,
                     .stamp = current.stamp,
                     .is_select = current.is_select,
                     .columns = try cloneColumns(a, current.columns),
                     .parameter_types = types,
-                    .parameter_descriptors = try a.dupe(backend.Parameter, current.parameter_descriptors),
+                    .parameter_descriptors = try backend.cloneParametersLeaky(a, current.parameter_descriptors),
                     .binding_guard = if (current.binding_guard) |guard| try a.dupe(u8, guard) else null,
                     .setting_epoch = current.setting_epoch,
                 };
@@ -1820,7 +1863,7 @@ pub const Session = struct {
                         defer self.request_search_path = previous_path;
                         var scratch = std.heap.ArenaAllocator.init(self.alloc);
                         defer scratch.deinit();
-                        const current = try self.checkedPortalDescription(scratch.allocator(), portal, true);
+                        const current = try self.checkedPortalDescription(scratch.allocator(), portal, true, false);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
@@ -1867,7 +1910,9 @@ pub const Session = struct {
                 }
                 if (!portal.stream_opened) {
                     self.read_receipt_budget = .{};
-                    portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal, false);
+                    const guarded = try self.tryOpenGuardedSelect(portal);
+                    if (guarded != .opened)
+                        portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal, false, guarded == .stale);
                     portal.describe_stamp = portal.description.stamp;
                     portal.stream_opened = true;
                     if (portal.description.copy_in != null) {
@@ -1882,20 +1927,9 @@ pub const Session = struct {
                         return;
                     }
                     if (self.session_id) |id| portal.session_id = try portal.arena.allocator().dupe(u8, id);
-                    if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
-                        var req = self.request(portal.statement, portal.parameters, portal.types);
-                        req.parameter_cells = portal.parameter_cells;
-                        req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
-                        req.parameter_descriptors = portal.description.parameter_descriptors;
-                        req.binding_guard = portal.description.binding_guard;
-                        req.setting_epoch = portal.description.setting_epoch;
-                        portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
-                        if (portal.stream != null) self.snapshot_import_allowed = false;
-                        if (portal.stream) |stream| {
-                            if (stream.validate == null or stream.detach == null) return error.UnsupportedSqlExecution;
-                        }
-                        try req.check();
-                    };
+                    if ((guarded == .recheck or guarded == .stale) and self.source.vtable.open_stream != null and
+                        try commands.settingCommand(portal.arena.allocator(), portal.statement) == null)
+                        try self.openPortalStream(portal, null);
                 }
                 if (portal.description.copy_in != null and portal.stream_complete) return error.PortalExecutionFailed;
                 if (portal.stream != null or portal.stream_complete) {

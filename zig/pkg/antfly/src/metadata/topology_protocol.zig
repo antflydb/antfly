@@ -197,6 +197,7 @@ pub const sql_catalog_reservation_version: u16 = 247;
 pub const sql_catalog_progress_version: u16 = 248;
 pub const sql_catalog_atomic_admission_version: u16 = 249;
 pub const sql_selinux_approval_version: u16 = 250;
+pub const sql_idle_session_reenrollment_version: u16 = 251;
 
 /// Immutable, pre-executed statement trigger receipts/results on SQL TRUNCATE.
 pub const sql_truncate_preparation_version: u16 = 215;
@@ -389,10 +390,12 @@ pub const iceberg_acceptance_status_version: u16 = 132;
 /// Version 136 retires absent public feed roots with catalog authority.
 /// Version 137 transfers a qualified legacy checkpoint into fenced source control.
 /// Version 138 persists scoped PostgreSQL stream health within the actor revision.
-/// Versions 251–253 track scoped completion wait, stall, and failure provenance.
-/// Version 254 binds route-independent payload retention to a source reservation.
-/// Version 255 adopts an installed checkpoint on a topology successor.
-pub const source_successor_retirement_guard_version: u16 = 256;
+/// Versions 252–254 track scoped completion wait, stall, and failure provenance.
+/// Version 255 binds route-independent payload retention to a source reservation.
+/// Version 256 adopts an installed checkpoint on a topology successor.
+/// Version 257 pins successor ranges against retirement until adoption.
+/// Version 258 tracks shared spool prewrites through recovery.
+pub const source_successor_retirement_guard_version: u16 = 257;
 pub const current_version: u16 = @import("source_control.zig").payload_prewrite_protocol_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;

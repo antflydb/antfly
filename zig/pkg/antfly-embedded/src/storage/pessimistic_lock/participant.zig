@@ -71,6 +71,8 @@ pub const Admission = struct {
         hash.final(&digest);
         var result = self.source;
         result.group = self.binding.namespace.group;
+        // The predecessor names a metadata scope, never a data participant.
+        result.replaces = null;
         result.lease.backend.id = digest[0..16].*;
         // Data connection bindings live for one participant transaction. The
         // original logical connection remains metadata-owned and may visit

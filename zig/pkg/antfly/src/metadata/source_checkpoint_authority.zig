@@ -76,7 +76,7 @@ pub const Spec = struct {
 const local = @import("antfly_local_sources");
 const native = local.storage_source_scope;
 const ordered = local.storage_source_scope_ordered;
-pub const successor_protocol_version: u16 = 255;
+pub const successor_protocol_version: u16 = 256;
 
 pub const TransferIntent = struct {
     target: Spec,

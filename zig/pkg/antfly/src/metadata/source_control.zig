@@ -29,11 +29,11 @@ pub const native_bootstrap_protocol_version: u16 = 130;
 pub const scoped_snapshot_protocol_version: u16 = 131;
 pub const legacy_handover_protocol_version: u16 = 137;
 pub const scoped_stream_lifecycle_protocol_version: u16 = 138;
-pub const scoped_completion_health_protocol_version: u16 = 251;
-pub const independent_completion_stall_protocol_version: u16 = 252;
-pub const qualified_completion_stall_protocol_version: u16 = 253;
-pub const retained_payload_protocol_version: u16 = 254;
-pub const payload_prewrite_protocol_version: u16 = 257;
+pub const scoped_completion_health_protocol_version: u16 = 252;
+pub const independent_completion_stall_protocol_version: u16 = 253;
+pub const qualified_completion_stall_protocol_version: u16 = 254;
+pub const retained_payload_protocol_version: u16 = 255;
+pub const payload_prewrite_protocol_version: u16 = 258;
 pub const max_payload_cleanup_cursor_bytes = 2048;
 pub const completion_wait_timeout_ms = 30 * std.time.ms_per_s;
 pub const completion_wait_error = "SourceOutcomeUnresolved";
@@ -2416,4 +2416,21 @@ test "source control checkpoint successor preparation survives reload and fences
     try std.testing.expect(state.checkpoint_preparation == null);
     try std.testing.expectEqual(adoption.adopt_checkpoint_successor.installed, state.checkpoint_install_receipt.?);
     try std.testing.expectEqual(state.revision, (try adoption.apply(ca, state)).revision);
+}
+
+test "source control assigns CDC decoder floors after SQL session reenrollment" {
+    const topology = @import("topology_protocol.zig");
+    const ordered = [_]u16{
+        topology.sql_idle_session_reenrollment_version,
+        scoped_completion_health_protocol_version,
+        independent_completion_stall_protocol_version,
+        qualified_completion_stall_protocol_version,
+        retained_payload_protocol_version,
+        checkpoint_authority.successor_protocol_version,
+        topology.source_successor_retirement_guard_version,
+        payload_prewrite_protocol_version,
+    };
+    for (ordered[0 .. ordered.len - 1], ordered[1..]) |previous, next|
+        try std.testing.expect(previous < next);
+    try std.testing.expect(topology.current_version >= ordered[ordered.len - 1]);
 }

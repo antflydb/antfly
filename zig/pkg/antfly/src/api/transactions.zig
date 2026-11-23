@@ -1821,6 +1821,7 @@ pub const DurableSessionStore = struct {
         creating: bool = false,
         capacity: ?usize = null,
         external_progress: bool = false,
+        unscoped_savepoint: bool = false,
         guard: ?Mutation = null,
     };
 
@@ -3186,6 +3187,12 @@ pub const DurableSessionStore = struct {
 
     fn putSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, value: []const u8, session: Session, options: SaveOptions) !void {
         if (options.creating) try self.requireBeginningConnection(txn, session);
+        if (options.unscoped_savepoint) if (session.connection_id) |connection| {
+            // Only the SQL owner's scoped path can publish a savepoint for
+            // a connection with a native command record. Check in the same
+            // writer transaction as the session CAS and lease renewal.
+            try @import("sql/session/command_producer.zig").requireCommandTxn(self.alloc, txn, connection, null, 0);
+        };
         var previous_needs_recovery = false;
         if (txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
@@ -6476,7 +6483,7 @@ pub const SessionRegistry = struct {
         savepoint_inserted = true;
         touchSession(&candidate);
 
-        if (plan != null) try self.persistSavepoint(candidate, digest, plan, null, guard) else try self.persistMutation(candidate, expected, guard);
+        if (plan != null) try self.persistSavepoint(candidate, digest, plan, null, guard) else try self.persistUnscopedSavepoint(candidate, expected, guard);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(guard.id) orelse return error.SessionRemovedDuringMutation;
@@ -6580,7 +6587,7 @@ pub const SessionRegistry = struct {
         if (plan != null) try self.persistSavepoint(candidate, digest, plan, if (release)
             .{ .release_savepoint = .{ .transaction = guard.id, .first_child = savepoint_id, .parent = candidate.current_subtransaction } }
         else
-            .{ .rollback = .{ .transaction = guard.id, .first_aborted = savepoint_id } }, guard) else try self.persistMutation(candidate, expected, guard);
+            .{ .rollback = .{ .transaction = guard.id, .first_aborted = savepoint_id } }, guard) else try self.persistUnscopedSavepoint(candidate, expected, guard);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(guard.id) orelse return error.SessionRemovedDuringMutation;
@@ -7373,6 +7380,17 @@ pub const SessionRegistry = struct {
         } else try self.renewLeaseLocked(session.txn_id, session.owner_node_id);
     }
 
+    fn persistUnscopedSavepoint(self: *SessionRegistry, session: Session, expected: DurableSessionStore.Version, guard: Mutation) !void {
+        if (self.durable) |durable| {
+            try durable.saveRecord(session, self.max_record_bytes, .{
+                .expected = expected,
+                .ttl_ns = if (self.lease_store != null) self.owner_lease_ttl_ns else null,
+                .guard = guard,
+                .unscoped_savepoint = true,
+            });
+        } else try self.renewLeaseLocked(session.txn_id, session.owner_node_id);
+    }
+
     fn persistOwnedVersion(self: *SessionRegistry, session: Session, expected: DurableSessionStore.Version) !void {
         return self.persistMutation(session, expected, null);
     }
@@ -7494,6 +7512,7 @@ pub const SessionRegistry = struct {
         for (ids.items) |txn_id| {
             const session_lock = self.sessionLock(txn_id);
             session_lock.lock();
+            defer session_lock.unlock();
             self.mutex.lock();
             const still_owned = if (self.sessions.getPtr(txn_id)) |session| shouldRenewLease(session.*, owner_node_id) else false;
             self.mutex.unlock();

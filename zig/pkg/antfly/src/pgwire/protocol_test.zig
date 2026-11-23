@@ -143,6 +143,7 @@ const Mock = struct {
     setting_snapshots: usize = 0,
     observed_setting: ?i64 = null,
     describe_setting_epoch: ?u64 = null,
+    guarded_select_stream: bool = false,
     observed_setting_epoch: ?u64 = null,
     setting_epoch_changes_on_describe: bool = false,
     setting_changes_before_admission: bool = false,
@@ -184,7 +185,13 @@ const Mock = struct {
         };
         break :blk tables;
     };
+    const guarded_source = blk: {
+        var table = source_tables[0][0];
+        table.guarded_select_stream = true;
+        break :blk table;
+    };
     fn source(self: *Mock) backend.Backend {
+        if (self.guarded_select_stream) return .{ .context = self, .vtable = &guarded_source };
         return .{ .context = self, .vtable = &source_tables[@intFromBool(self.native_parameters)][@intFromBool(self.replication_enabled)] };
     }
     fn openReplication(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.ReplicationSession {
@@ -447,6 +454,13 @@ const Mock = struct {
             return .{ .columns = columns, .parameter_types = &.{.enumeration}, .parameter_descriptors = descriptors };
         }
         if (self.replace_before_setting_execute and self.describes == 3) self.catalog_revision += 1;
+        if (self.guarded_select_stream) return .{
+            .stamp = .{ .catalog = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(1), .revision = self.catalog_revision } }, .authority = 1, .reusable = true },
+            .binding_guard = "immutable-catalog-binding",
+            .columns = &.{.{ .name = "n", .type = .integer }},
+            .setting_epoch = self.settingEpoch(),
+            .is_select = true,
+        };
         if (self.probe_change_at != null or self.replace_before_setting_execute) return .{
             .stamp = .{ .catalog = .{ .catalog_revision = self.catalog_revision, .relation_epoch = .{ .incarnation = @splat(if (self.replace_incarnation) @intCast(self.catalog_revision) else 1), .revision = self.catalog_revision } }, .authority = 1, .reusable = !self.replace_before_setting_execute },
             .binding_guard = if (self.compatible_revision or self.replace_incarnation or self.catalog_revision == 1) "original table" else "replacement table",
@@ -2079,6 +2093,30 @@ test "pgwire prepared statement carries setting catalog epoch to execution" {
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
     try std.testing.expectEqual(@as(?u64, 17), mock.observed_setting_epoch);
+}
+
+test "pgwire guarded select validates its opened shape without a second catalog probe" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "plan", "SELECT 1", false);
+    try bind(&input.writer, "portal", "plan", null);
+    try execute(&input.writer, "portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    for ([_]bool{ true, false }) |compatible| {
+        var mock: Mock = .{
+            .guarded_select_stream = true,
+            .stream_rows = 2,
+            .stream_definitions = if (compatible) null else &.{.{ .name = "renamed", .type = .integer }},
+        };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.probes);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, if (compatible) 1 else 0), mock.stream_pulls);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    }
 }
 
 test "pgwire cached statements refresh settings guards and fence changes after rebind" {
