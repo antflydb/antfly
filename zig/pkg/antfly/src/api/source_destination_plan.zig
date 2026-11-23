@@ -77,7 +77,7 @@ pub const Manifest = struct {
         if (self.retained_payload) |reference| {
             try reference.validate();
             if (reference.bytes != self.artifact.bytes or !std.meta.eql(reference.checksum, self.artifact.checksum) or
-                !std.meta.eql(reference.upload.domain, self.artifact.domain) or !std.meta.eql(reference.upload.attempt, self.artifact.attempt))
+                !std.meta.eql(reference.upload.domain, self.artifact.domain) or !std.mem.eql(u8, reference.upload.attempt[8..], self.artifact.attempt[8..]))
                 return error.SourceTransactionIdentityConflict;
         }
         if (self.checkpoint_authority.retirement != null or self.checkpoint.receipt_window == 0 or
@@ -160,12 +160,16 @@ pub const Frozen = struct {
         self.arena.deinit();
         self.* = undefined;
     }
-    /// Publish before advertising the reference in a source reservation.
-    pub fn retain(self: *Frozen, store: *payload_retention.Store, context: local.api_operation.RequestContext) !void {
+    /// The actor revision supplies a spool token independently of the
+    /// destination upload. An abandoned spool write never consumes a native
+    /// admission token or reuses a previously retired spool token.
+    pub fn bindRetention(self: *Frozen, store: *const payload_retention.Store, spool_token: u64) !void {
         const spec = self.manifest.artifact;
+        var attempt = spec.attempt;
+        std.mem.writeInt(u64, attempt[0..8], spool_token, .big);
         const reference: payload_retention.Reference = .{
             .namespace = store.namespace_identity orelse return error.SourcePayloadStorageUnavailable,
-            .upload = .{ .domain = spec.domain, .attempt = spec.attempt },
+            .upload = .{ .domain = spec.domain, .attempt = attempt },
             .checksum = spec.checksum,
             .bytes = spec.bytes,
         };
@@ -174,8 +178,6 @@ pub const Frozen = struct {
         try manifest.validate();
         const encoded = try std.json.Stringify.valueAlloc(self.arena.allocator(), manifest, .{});
         if (encoded.len > max_manifest_bytes) return error.HistoryTooLarge;
-        const cancellation: payload_retention.Cancellation = .{ .context = context };
-        try reference.put(store, self.bytes, cancellation.token());
         self.manifest = manifest;
         self.encoded_manifest = encoded;
     }

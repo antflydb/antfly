@@ -2956,6 +2956,11 @@ pub fn compareAndSetOnlineMerge(service: anytype, previous: @import("online_merg
     if (comptime @TypeOf(service) == *MetadataHttpService) {
         if (previous.phase == .tail and next.phase == .freeze and
             !try service.prepareOnlineMergeSourceCheckpoints(arena.allocator(), context.record, request)) return false;
+        if (previous.phase == .cutover and next.phase == .release) {
+            const store = service.projectedStore() orelse return error.MissingMetadataStore;
+            if ((try store.sourceCheckpointActors(service.metadata_group_id, context.record.donor_group_id, null)).len != 0)
+                _ = try service.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.source_successor_retirement_guard_version);
+        }
     }
     const proposal = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_set_online_merge = .{
         .expected = previous,
@@ -12205,7 +12210,7 @@ pub const MetadataHttpService = struct {
     pub fn admitFreshNativeReplicationBootstrap(self: *MetadataHttpService, deadline_ns: ?u64) !void {
         try ensureCdcWorkPermit(self);
         if (self.cdc_payload_store == null) return error.SourcePayloadStorageUnavailable;
-        _ = try self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = deadline_ns }, @import("source_control.zig").retained_payload_protocol_version);
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = deadline_ns }, @import("source_control.zig").payload_prewrite_protocol_version);
     }
 
     pub fn commitNativeReplicationSnapshotPage(
@@ -12376,7 +12381,7 @@ pub const MetadataHttpService = struct {
         if (producer_counts.* == null)
             producer_counts.* = try control.nativeProducerCounts(index_allocator, a, tables, context);
         if (producer_counts.*.?.get(table.name) != 1) return false;
-        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.retained_payload_protocol_version);
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.payload_prewrite_protocol_version);
         try self.advanceNativeReplicationActor(a, table, record, control.legacyHandoverCheckpoint(record).?, context);
         return true;
     }
@@ -12687,7 +12692,7 @@ pub const MetadataHttpService = struct {
         var after: ?metadata_storage.raft_apply_store.RaftApplyStore.SourceCheckpointActor = null;
         while (true) {
             try context.ensureActive();
-            const page = try store.sourceCheckpointActors(self.metadata_group_id, merge.donor_group_id, after);
+            const page = try store.sourceCheckpointActorsFiltered(self.metadata_group_id, merge.donor_group_id, after, true);
             for (page.items()) |actor| {
                 var scratch = std.heap.ArenaAllocator.init(a);
                 defer scratch.deinit();
@@ -12701,6 +12706,7 @@ pub const MetadataHttpService = struct {
                     if (state.checkpoint_preparation == null) return false;
                     continue;
                 }
+                _ = try self.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.source_successor_retirement_guard_version);
                 const binding = state.scope orelse return error.SourceBindingConflict;
                 const table = (try store.getTable(temporary, self.metadata_group_id, actor.table_id)) orelse return error.SourceBindingConflict;
                 const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
@@ -12750,6 +12756,7 @@ pub const MetadataHttpService = struct {
         const donor = state.checkpoint_authority orelse return error.SourceBindingConflict;
         const target = state.checkpoint_transfer_target orelse return error.SourceBindingConflict;
         if (!state.checkpointTransferDrained()) return error.SourcePendingWork;
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.source_successor_retirement_guard_version);
         var snapshot = try @import("source_scope_capture.zig").readOnService(self, a, .{
             .metadata_group_id = donor.owner.metadata_group_id,
             .metadata_incarnation = donor.owner.metadata_incarnation,
@@ -12838,6 +12845,17 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var admission = hosted.sourceAdmission();
         admission.retained_payload_store = self.cdc_payload_store;
+        if (state.payload_prewrite != null) {
+            try ensureCdcWorkPermit(self);
+            return @import("../api/source_destination_completion.zig").recoverPayloadPrewrite(
+                self,
+                self.cdc_payload_store,
+                a,
+                state,
+                control.digest(table.replication_sources_json),
+                context,
+            );
+        }
         if (state.artifact_control.?.current) |record| {
             try ensureCdcWorkPermit(self);
             try @import("../api/source_destination_completion.zig").recover(self, admission, a, state, control.digest(table.replication_sources_json), context);

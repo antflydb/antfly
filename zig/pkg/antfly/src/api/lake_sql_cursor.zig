@@ -216,7 +216,7 @@ fn lookupTypedRows(
     keys_only: bool,
     context: operation.RequestContext,
     options: configured.BindingObjectStoreOpenOptions,
-) ![]?std.json.Value {
+) !?[]?std.json.Value {
     const sources = @import("antfly_local_sources");
     const scalar = sources.sql_scalar;
     const values = sources.sql_lake_values;
@@ -252,25 +252,47 @@ fn lookupTypedRows(
     }
     const result = try a.alloc(?std.json.Value, requested.len);
     @memset(result, null);
-    errdefer freeLookupRows(a, result);
-    if (requested.len == 0) return result;
+    var complete = false;
+    defer if (!complete) freeLookupRows(a, result);
+    if (requested.len == 0) {
+        complete = true;
+        return result;
+    }
     const fields = if (keys_only) keys else all: {
         const names = try scratch.alloc([]const u8, table.columns.len);
         for (table.columns, names) |column, *name| name.* = column.name;
         break :all names;
     };
-    const cursor = try openSnapshot(scratch, table, snapshot_id, metadata, .{ .fields = fields, .conditions = ranges, .limit = 4 }, context, options);
+    const cursor = try openSnapshot(scratch, table, snapshot_id, metadata, .{
+        .fields = fields,
+        .conditions = ranges,
+        .limit = 4,
+        .lake_speculation = .{
+            .max_rows_after_first_group = @max(1024, requested.len *| 64),
+            .max_files = @max(2, requested.len),
+            .max_group_probes = @max(8, requested.len *| 4),
+        },
+    }, context, options);
     defer cursor.close(cursor.ptr);
     var row_arena = std.heap.ArenaAllocator.init(a);
     defer row_arena.deinit();
     const tuple = try scratch.alloc(scalar.Datum, keys.len);
     const json = @import("../metadata/changefeed_json.zig");
     var retained_bytes: u64 = 0;
+    // The range box is only a pruning hint. Abandon it when it yields
+    // substantially more candidate rows than exact point probes would.
+    const candidate_budget = @max(32, requested.len *| 8);
+    var candidates: usize = 0;
     while (true) {
         try context.ensureActive();
-        const page = try cursor.next(cursor.ptr, a, 4);
+        const page = cursor.next(cursor.ptr, a, 4) catch |err| switch (err) {
+            error.LakeRowsScanBudgetExceeded => return null,
+            else => return err,
+        };
         defer page.deinit();
         for (page.rows) |row| {
+            candidates += 1;
+            if (candidates > candidate_budget) return null;
             _ = row_arena.reset(.retain_capacity);
             const row_alloc = row_arena.allocator();
             for (columns, tuple) |column, *datum| {
@@ -291,6 +313,9 @@ fn lookupTypedRows(
                 }
             }
         }
-        if (page.after == null) return result;
+        if (page.after == null) {
+            complete = true;
+            return result;
+        }
     }
 }

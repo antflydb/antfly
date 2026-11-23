@@ -103,21 +103,21 @@ pub const CheckpointPage = struct {
     }
 };
 
-fn checkpointPrefix(buffer: []u8, group: u64, owner_group: u64) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "\x00\x00__metadata_derived__:source_scope:{d}:checkpoint:{d}:", .{ group, owner_group });
+fn checkpointPrefix(buffer: []u8, group: u64, owner_group: u64, unprepared: bool) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata_derived__:source_scope:{d}:{s}:{d}:", .{ group, if (unprepared) "unprepared" else "checkpoint", owner_group });
 }
 
-fn checkpointKey(buffer: []u8, group: u64, owner_group: u64, actor: CheckpointActor) ![]const u8 {
-    const prefix = try checkpointPrefix(buffer, group, owner_group);
+fn checkpointKey(buffer: []u8, group: u64, owner_group: u64, actor: CheckpointActor, unprepared: bool) ![]const u8 {
+    const prefix = try checkpointPrefix(buffer, group, owner_group, unprepared);
     if (buffer.len - prefix.len < 40) return error.NoSpaceLeft;
     std.mem.writeInt(u64, buffer[prefix.len..][0..8], actor.table_id, .big);
     @memcpy(buffer[prefix.len..][8..40], &actor.source_id);
     return buffer[0 .. prefix.len + 40];
 }
 
-fn writeCheckpointIndex(txn: anytype, group: u64, owner_group: u64, scope: control.Scope, add: bool) !void {
+fn writeCheckpointIndex(txn: anytype, group: u64, owner_group: u64, scope: control.Scope, add: bool, unprepared: bool) !void {
     var buffer: [160]u8 = undefined;
-    const key = try checkpointKey(&buffer, group, owner_group, .{ .table_id = scope.table_id, .source_id = scope.source_id });
+    const key = try checkpointKey(&buffer, group, owner_group, .{ .table_id = scope.table_id, .source_id = scope.source_id }, unprepared);
     if (add) return txn.put(key, "");
     txn.delete(key) catch |err| switch (err) {
         error.NotFound => {},
@@ -126,12 +126,16 @@ fn writeCheckpointIndex(txn: anytype, group: u64, owner_group: u64, scope: contr
 }
 
 pub fn checkpointActors(txn: anytype, group: u64, owner_group: u64, after: ?CheckpointActor) !CheckpointPage {
+    return checkpointActorsFiltered(txn, group, owner_group, after, false);
+}
+
+pub fn checkpointActorsFiltered(txn: anytype, group: u64, owner_group: u64, after: ?CheckpointActor, unprepared: bool) !CheckpointPage {
     if (group == 0 or owner_group == 0) return error.InvalidSourceControl;
     var prefix_buffer: [160]u8 = undefined;
-    const prefix = try checkpointPrefix(&prefix_buffer, group, owner_group);
+    const prefix = try checkpointPrefix(&prefix_buffer, group, owner_group, unprepared);
     var after_buffer: [161]u8 = undefined;
     const seek = if (after) |actor| next: {
-        const key = try checkpointKey(&after_buffer, group, owner_group, actor);
+        const key = try checkpointKey(&after_buffer, group, owner_group, actor, unprepared);
         after_buffer[key.len] = 0;
         break :next after_buffer[0 .. key.len + 1];
     } else prefix;
@@ -152,8 +156,107 @@ pub fn checkpointActors(txn: anytype, group: u64, owner_group: u64, after: ?Chec
     return page;
 }
 
+fn successorPrefix(buffer: []u8, group: u64, owner: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata_derived__:source_scope:{d}:successor:{d}:", .{ group, owner });
+}
+
+pub fn hasPendingSuccessors(txn: anytype, group: u64, owner: u64) !bool {
+    var buffer: [192]u8 = undefined;
+    return txn.hasPrefix(try successorPrefix(&buffer, group, owner));
+}
+
+fn writeSuccessorIndex(txn: anytype, group: u64, owner: u64, scope: control.Scope, add: bool) !void {
+    var buffer: [192]u8 = undefined;
+    const prefix = try successorPrefix(&buffer, group, owner);
+    const suffix = try std.fmt.bufPrint(buffer[prefix.len..], "{d}:{x}", .{ scope.table_id, &scope.source_id });
+    const key = buffer[0 .. prefix.len + suffix.len];
+    if (add) return txn.put(key, "");
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+
+fn successorGroup(state: control.State) ?u64 {
+    const target = state.checkpoint_transfer_target orelse return null;
+    return if (live(state)) target.owner.group_id else null;
+}
+
 fn checkpointGroup(state: control.State) ?u64 {
     return if (live(state)) state.checkpoint_authority.?.owner.group_id else null;
+}
+
+const Prepared = struct { merge: u64, receiver: u64 };
+
+fn preparedFor(state: control.State) ?Prepared {
+    const preparation = state.checkpoint_preparation orelse return null;
+    return .{
+        .merge = state.checkpoint_transfer_merge_id orelse 0,
+        .receiver = preparation.successor.owner.group_id,
+    };
+}
+
+fn preparedOwnerPrefix(buffer: []u8, group: u64, donor: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata_derived__:source_scope:{d}:prepared:{d}:", .{ group, donor });
+}
+
+fn preparedMergePrefix(buffer: []u8, group: u64, donor: u64, prepared: Prepared) ![]const u8 {
+    const owner = try preparedOwnerPrefix(buffer, group, donor);
+    const suffix = try std.fmt.bufPrint(buffer[owner.len..], "{d}:{d}:", .{ prepared.merge, prepared.receiver });
+    return buffer[0 .. owner.len + suffix.len];
+}
+
+fn writePreparedIndex(txn: anytype, group: u64, donor: u64, prepared: Prepared, scope: control.Scope, add: bool) !void {
+    var buffer: [224]u8 = undefined;
+    const prefix = try preparedMergePrefix(&buffer, group, donor, prepared);
+    const suffix = try std.fmt.bufPrint(buffer[prefix.len..], "{d}:{x}", .{ scope.table_id, &scope.source_id });
+    const key = buffer[0 .. prefix.len + suffix.len];
+    if (add) return txn.put(key, "");
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+
+pub fn checkpointsReadyForMerge(txn: anytype, group: u64, donor: u64, receiver: u64, merge: u64) !bool {
+    var pending_buffer: [160]u8 = undefined;
+    if (try txn.hasPrefix(try checkpointPrefix(&pending_buffer, group, donor, true))) return false;
+    var owner_buffer: [160]u8 = undefined;
+    const owner = try preparedOwnerPrefix(&owner_buffer, group, donor);
+    var merge_buffer: [224]u8 = undefined;
+    const expected = try preparedMergePrefix(&merge_buffer, group, donor, .{ .merge = merge, .receiver = receiver });
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    if (try cursor.seekAtOrAfter(owner)) |row| {
+        if (!std.mem.startsWith(u8, row.key, owner)) return true;
+        if (!std.mem.startsWith(u8, row.key, expected)) return false;
+        // An ASCII actor suffix always sorts before this exclusive seek.
+        merge_buffer[expected.len] = 0xff;
+        if (try cursor.seekAtOrAfter(merge_buffer[0 .. expected.len + 1])) |next|
+            return !std.mem.startsWith(u8, next.key, owner);
+    }
+    return true;
+}
+
+fn prewritePrefix(buffer: []u8, group: u64, table: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata_derived__:source_scope:{d}:prewrite:{d}:", .{ group, table });
+}
+
+pub fn hasPayloadPrewrites(txn: anytype, group: u64, table: u64) !bool {
+    var buffer: [192]u8 = undefined;
+    return txn.hasPrefix(try prewritePrefix(&buffer, group, table));
+}
+
+fn writePrewriteIndex(txn: anytype, group: u64, scope: control.Scope, add: bool) !void {
+    var buffer: [192]u8 = undefined;
+    const prefix = try prewritePrefix(&buffer, group, scope.table_id);
+    const suffix = try std.fmt.bufPrint(buffer[prefix.len..], "{x}", .{&scope.source_id});
+    const key = buffer[0 .. prefix.len + suffix.len];
+    if (add) return txn.put(key, "");
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
 }
 
 pub fn indexTransition(txn: anytype, group: u64, before: control.State, after: control.State) !void {
@@ -168,11 +271,33 @@ pub fn indexTransition(txn: anytype, group: u64, before: control.State, after: c
             try writeIndex(txn, group, scope, .legacy_gate, true, true);
         }
     }
+    if (!same_scope or (before.payload_prewrite == null) != (after.payload_prewrite == null)) {
+        if (before.payload_prewrite != null) try writePrewriteIndex(txn, group, before.scope.?, false);
+        if (after.payload_prewrite != null) try writePrewriteIndex(txn, group, after.scope.?, true);
+    }
     const before_owner = checkpointGroup(before);
     const after_owner = checkpointGroup(after);
     if (!same_scope or before_owner != after_owner) {
-        if (before_owner) |owner| try writeCheckpointIndex(txn, group, owner, before.scope.?, false);
-        if (after_owner) |owner| try writeCheckpointIndex(txn, group, owner, after.scope.?, true);
+        if (before_owner) |owner| try writeCheckpointIndex(txn, group, owner, before.scope.?, false, false);
+        if (after_owner) |owner| try writeCheckpointIndex(txn, group, owner, after.scope.?, true, false);
+    }
+    const before_work = if (before.checkpoint_preparation == null) before_owner else null;
+    const after_work = if (after.checkpoint_preparation == null) after_owner else null;
+    if (!same_scope or before_work != after_work) {
+        if (before_work) |owner| try writeCheckpointIndex(txn, group, owner, before.scope.?, false, true);
+        if (after_work) |owner| try writeCheckpointIndex(txn, group, owner, after.scope.?, true, true);
+    }
+    const before_prepared = preparedFor(before);
+    const after_prepared = preparedFor(after);
+    if (!same_scope or before_owner != after_owner or !std.meta.eql(before_prepared, after_prepared)) {
+        if (before_owner) |owner| if (before_prepared) |prepared| try writePreparedIndex(txn, group, owner, prepared, before.scope.?, false);
+        if (after_owner) |owner| if (after_prepared) |prepared| try writePreparedIndex(txn, group, owner, prepared, after.scope.?, true);
+    }
+    const before_successor = successorGroup(before);
+    const after_successor = successorGroup(after);
+    if (!same_scope or before_successor != after_successor) {
+        if (before_successor) |owner| try writeSuccessorIndex(txn, group, owner, before.scope.?, false);
+        if (after_successor) |owner| try writeSuccessorIndex(txn, group, owner, after.scope.?, true);
     }
     if (!same_scope or live(before) != live(after)) {
         if (live(before)) try writeIndex(txn, group, before.scope.?, .recovery, false, false);
@@ -185,7 +310,7 @@ pub fn rebuild(a: std.mem.Allocator, txn: anytype, group: u64) !void {
     const prefix = try std.fmt.bufPrint(&prefix_buffer, "\x00\x00__metadata__:source_control:{d}:state:", .{group});
     var resume_buffer: [257]u8 = undefined;
     var seek_key: []const u8 = prefix;
-    const Candidate = struct { scope: control.Scope, owner_group: ?u64 };
+    const Candidate = struct { scope: control.Scope, owner_group: ?u64, successor_group: ?u64, prepared: ?Prepared, has_prewrite: bool };
     var page: [128]Candidate = undefined;
     while (true) {
         var count: usize = 0;
@@ -203,7 +328,7 @@ pub fn rebuild(a: std.mem.Allocator, txn: anytype, group: u64) !void {
                     var expected: [256]u8 = undefined;
                     if (!std.mem.eql(u8, entry.key, try control.keyForGroup(&expected, group, scope.table_id, scope.source_id)))
                         return error.InvalidSourceControl;
-                    page[count] = .{ .scope = scope, .owner_group = checkpointGroup(parsed.value) };
+                    page[count] = .{ .scope = scope, .owner_group = checkpointGroup(parsed.value), .successor_group = successorGroup(parsed.value), .prepared = preparedFor(parsed.value), .has_prewrite = parsed.value.payload_prewrite != null };
                     count += 1;
                 }
                 scanned += 1;
@@ -223,8 +348,13 @@ pub fn rebuild(a: std.mem.Allocator, txn: anytype, group: u64) !void {
             try writeIndex(txn, group, entry.scope, .legacy_gate, true, true);
             if (entry.owner_group) |owner| {
                 try writeIndex(txn, group, entry.scope, .recovery, false, true);
-                try writeCheckpointIndex(txn, group, owner, entry.scope, true);
+                try writeCheckpointIndex(txn, group, owner, entry.scope, true, false);
+                if (entry.prepared) |prepared| {
+                    try writePreparedIndex(txn, group, owner, prepared, entry.scope, true);
+                } else try writeCheckpointIndex(txn, group, owner, entry.scope, true, true);
             }
+            if (entry.successor_group) |owner| try writeSuccessorIndex(txn, group, owner, entry.scope, true);
+            if (entry.has_prewrite) try writePrewriteIndex(txn, group, entry.scope, true);
         }
         if (exhausted) return;
     }

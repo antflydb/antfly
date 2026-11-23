@@ -2760,7 +2760,7 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .source_checkpoint_actors => |input| {
-                    const page = handle.store.sourceCheckpointActors(group_id, input.owner_group, input.after) catch |err| break :blk storageOwnerStatusFromError(err);
+                    const page = handle.store.sourceCheckpointActorsFiltered(group_id, input.owner_group, input.after, input.unprepared) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, page.items());
                 },
                 .legacy_source_intake => |input| {

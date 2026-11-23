@@ -77,9 +77,19 @@ pub const Reference = struct {
     /// Collect the fenced prefix, including uploads that failed before their
     /// reservation CAS. A newer token is outside this collector's authority.
     pub fn sweep(self: Reference, store: *Store, previous: []const u8, token: CancellationToken) !Sweep {
+        return self.sweepRange(store, previous, false, token);
+    }
+
+    /// Clean a discarded prewrite while a previous reservation may still need its payload.
+    pub fn sweepPrewrite(self: Reference, store: *Store, previous: []const u8, token: CancellationToken) !Sweep {
+        return self.sweepRange(store, previous, true, token);
+    }
+
+    fn sweepRange(self: Reference, store: *Store, previous: []const u8, exact: bool, token: CancellationToken) !Sweep {
         try self.reclaim(store, token);
         const through = self.upload.fencingToken();
-        var ctx: SweepContext = .{ .store = store, .token = token, .domain = self.upload.domain, .through = through };
+        const floor = if (exact) through else 0;
+        var ctx: SweepContext = .{ .store = store, .token = token, .domain = self.upload.domain, .through = through, .floor = floor };
         var decoded: [max_cursor_bytes]u8 = undefined;
         const decoder = std.base64.url_safe_no_pad.Decoder;
         const length = try decoder.calcSizeForSlice(previous);
@@ -91,6 +101,8 @@ pub const Reference = struct {
             .checkpoint = SweepContext.checkpoint,
             .retain_scope = SweepContext.retain,
             .continuation = if (length == 0) null else decoded[0..length],
+            .only_attempt = if (exact) self.upload.attempt else null,
+            .fencing_floor = floor,
             .fencing_cutoff = std.math.add(u64, through, 1) catch return error.SourceReceiptExpired,
             .max_entries = 32,
             .cleanup_staging = true,
@@ -122,11 +134,12 @@ const SweepContext = struct {
     token: CancellationToken,
     domain: [32]u8,
     through: u64,
+    floor: u64,
     progress: Sweep = .{},
     retained: bool = false,
 
     fn checkScope(self: *SweepContext, scope: artifacts.UploadScope) !void {
-        if (!std.meta.eql(scope.domain, self.domain) or scope.fencingToken() > self.through)
+        if (!std.meta.eql(scope.domain, self.domain) or scope.fencingToken() > self.through or scope.fencingToken() < self.floor)
             return error.InvalidArtifactUploadScope;
     }
     fn visit(raw: *anyopaque, scope: artifacts.UploadScope, id: []const u8) !void {
@@ -210,6 +223,23 @@ test "completion frozen plan shared payload survives owner reopen and fences lat
         abandoned.upload = try artifacts.UploadScope.forPublication(domain, 1, std.testing.io);
         try abandoned.put(&reopened, &bytes, .none);
     }
+    // A replacement writer can crash after uploading but before reserving.
+    // Recover that prewrite without removing the previous reservation.
+    var prewrite = reference;
+    prewrite.upload = try artifacts.UploadScope.forPublication(domain, 3, std.testing.io);
+    try prewrite.put(&store, &bytes, .none);
+    var recovery = try prewrite.sweepPrewrite(&reopened, "", .none);
+    for (0..8) |_| {
+        if (recovery.done) break;
+        recovery = try prewrite.sweepPrewrite(&reopened, recovery.cursor[0..recovery.cursor_len], .none);
+    }
+    try std.testing.expect(recovery.done);
+    try std.testing.expect(try reopened.scopedUploadsReclaimed(prewrite.upload, .none));
+    try std.testing.expectError(error.ArtifactUploadAttemptRetired, prewrite.put(&store, &bytes, .none));
+    const prior = try reference.load(&reopened, a, .none);
+    defer a.free(prior);
+    try std.testing.expectEqualSlices(u8, &bytes, prior);
+
     var progress = try reference.sweep(&reopened, "", .none);
     try std.testing.expect(!progress.done);
     try std.testing.expect(progress.cursor_len > 0);

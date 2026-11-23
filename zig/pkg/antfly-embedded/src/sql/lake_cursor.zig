@@ -217,6 +217,7 @@ fn openPinnedMaterializedMode(alloc: Allocator, table: catalog.Table, request: c
     const Stream = @import("../serverless/query/lake_stream.zig").Stream;
     var stream = if (partition != null) try Stream.initMaterialized(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{}) else try Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
+    stream.speculation = request.lake_speculation;
     if (partition) |part| try stream.partitionRows(part.index, part.count);
     stream.identity_only = identity_only;
     if (request.physical_selection) |selection| {

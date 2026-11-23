@@ -51,6 +51,26 @@ pub const Completion = struct {
 
 /// Advance at most one durable recovery phase before returning to the CDC
 /// scheduler. This pass only uses a manifest reserved by the source actor.
+pub fn recoverPayloadPrewrite(svc: anytype, store: ?@import("source_payload_retention.zig").Store, a: std.mem.Allocator, current: source.State, catalog_digest: source.Digest, context: Context) !void {
+    const prewrite = current.payload_prewrite orelse return;
+    const binding = current.scope orelse return error.SourceBindingConflict;
+    if (!prewrite.discarding) {
+        // Win the actor CAS against reservation before fencing the spool.
+        return mutate(svc, a, binding, catalog_digest, current, .{ .discard_payload_prewrite = prewrite.manifest.digest }, context);
+    }
+    var parsed = try @import("source_destination_plan.zig").parse(a, prewrite.manifest.bytes, prewrite.manifest.digest);
+    defer parsed.deinit();
+    const reference = parsed.value.retained_payload orelse return error.InvalidSourceControl;
+    var retained = store orelse return error.SourcePayloadStorageUnavailable;
+    const cancellation: @import("source_payload_retention.zig").Cancellation = .{ .context = context };
+    const sweep = try reference.sweepPrewrite(&retained, prewrite.cleanup_cursor orelse "", cancellation.token());
+    if (!sweep.done) return mutate(svc, a, binding, catalog_digest, current, .{ .checkpoint_payload_prewrite = .{
+        .manifest_digest = prewrite.manifest.digest,
+        .cursor = sweep.cursor[0..sweep.cursor_len],
+    } }, context);
+    return mutate(svc, a, binding, catalog_digest, current, .{ .clear_payload_prewrite = prewrite.manifest.digest }, context);
+}
+
 pub fn recover(
     svc: anytype,
     admission: @import("source_destination_admission.zig").Admission,
@@ -408,7 +428,7 @@ fn stageBound(
     const current = state.value;
     if (!current.scope_fencing or current.closing or current.retired or
         !std.meta.eql(current.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;
-    if (current.checkpoint_transfer_target != null) return error.SourcePendingWork;
+    if (current.checkpoint_transfer_target != null or current.payload_prewrite != null) return error.SourcePendingWork;
     const authority = current.checkpoint_authority orelse return error.SourceBindingConflict;
     const ledger = current.artifact_control orelse return error.SourceBindingConflict;
     const previous: ?[]const u8 = if (current.accepted.sequence == 0) null else current.accepted.checkpoint;
@@ -518,9 +538,21 @@ fn stageBound(
     var frozen = try @import("source_destination_plan.zig").Frozen.init(a, &prepared.plan, authority, quota, commit_version);
     defer frozen.deinit();
     var retained = admission.retained_payload_store orelse return error.SourcePayloadStorageUnavailable;
-    _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, source.retained_payload_protocol_version);
-    try frozen.retain(&retained, context);
+    const spool_token = std.math.add(u64, current.revision, 1) catch return error.SourceReceiptExpired;
+    try frozen.bindRetention(&retained, spool_token);
     const plan = try frozen.manifest.deliveryPlan(a, frozen.encoded_manifest);
+    try mutate(svc, a, binding, catalog_digest, current, .{
+        .pin_payload_prewrite = .{ .digest = plan.digest, .bytes = plan.manifest },
+    }, context);
+    const pinned_raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
+    defer a.free(pinned_raw);
+    var pinned = try source.parse(a, pinned_raw);
+    defer pinned.deinit();
+    const prewrite = pinned.value.payload_prewrite orelse return error.SourceOutcomeUnresolved;
+    if (pinned.value.revision != spool_token or prewrite.discarding or
+        !std.meta.eql(prewrite.manifest.digest, plan.digest)) return error.SourceOutcomeUnresolved;
+    const cancellation: @import("source_payload_retention.zig").Cancellation = .{ .context = context };
+    try frozen.manifest.retained_payload.?.put(&retained, frozen.bytes, cancellation.token());
     const mutation: source.Mutation = if (replanning) .{ .replan = .{
         .reservation_digest = original_id.?,
         .plan_digest = plan.digest,
@@ -545,7 +577,7 @@ fn stageBound(
         .retain_manifest = true,
         .retain_payload = true,
     } };
-    try mutate(svc, a, binding, catalog_digest, current, mutation, context);
+    try mutate(svc, a, binding, catalog_digest, pinned.value, mutation, context);
 
     const reserved_raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
     defer a.free(reserved_raw);

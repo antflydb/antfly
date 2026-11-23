@@ -1408,8 +1408,12 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn sourceCheckpointActors(self: *RaftApplyStore, group_id: u64, owner_group: u64, after: ?@import("../metadata/source_legacy_intake.zig").CheckpointActor) !@import("../metadata/source_legacy_intake.zig").CheckpointPage {
+        return self.sourceCheckpointActorsFiltered(group_id, owner_group, after, false);
+    }
+
+    pub fn sourceCheckpointActorsFiltered(self: *RaftApplyStore, group_id: u64, owner_group: u64, after: ?@import("../metadata/source_legacy_intake.zig").CheckpointActor, unprepared: bool) !@import("../metadata/source_legacy_intake.zig").CheckpointPage {
         const index = @import("../metadata/source_legacy_intake.zig");
-        const actors = try self.catalogProjection([]index.CheckpointActor, self.alloc, group_id, .{ .source_checkpoint_actors = .{ .owner_group = owner_group, .after = after } });
+        const actors = try self.catalogProjection([]index.CheckpointActor, self.alloc, group_id, .{ .source_checkpoint_actors = .{ .owner_group = owner_group, .after = after, .unprepared = unprepared } });
         defer self.alloc.free(actors);
         var page: index.CheckpointPage = .{};
         if (actors.len > page.actors.len) return error.InvalidSourceControl;
