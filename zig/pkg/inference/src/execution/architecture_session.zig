@@ -21385,6 +21385,28 @@ fn nativeWhisperDeclaredInitialCase(a: std.mem.Allocator) !void {
         try std.testing.expectEqual(initial.schedule.steps.len, initial.schedule.cursor);
         try std.testing.expectEqual(@as(usize, 0), program.schedule.cursor);
         const first_dispatches = initial.schedule.frame.?.stats.dispatches;
+        {
+            // Every original parameter remains bound even when the caller
+            // substitutes a same-shaped tensor in the last group member.
+            const schedule = initial.schedule;
+            const completed_cursor = schedule.cursor;
+            defer schedule.cursor = completed_cursor;
+            schedule.cursor = 0;
+            while ((try schedule.nextDescriptor()).operation != .linear) schedule.cursor += 1;
+            var operands: [3][3]ops.CT = undefined;
+            var inputs: [3][]const ops.CT = undefined;
+            for (&operands, &inputs, schedule.steps[schedule.cursor..][0..3]) |*values, *input, id| {
+                const node = schedule.graph.node(id);
+                values[0] = schedule.values[node.inputs[0]].?;
+                for (node.getInputs()[1..], values[1..node.num_inputs]) |parameter, *value| value.* = schedule.values[parameter].?;
+                input.* = values[0..node.num_inputs];
+            }
+            operands[2][1] = operands[1][1];
+            const cursor_before = schedule.cursor;
+            try std.testing.expectError(error.PreparedKernelBindingChanged, schedule.executeQkv(inputs));
+            try std.testing.expectEqual(cursor_before, schedule.cursor);
+            try std.testing.expectEqual(first_dispatches, schedule.frame.?.stats.dispatches);
+        }
         const later = try decoder.step(&.{3});
         defer a.free(later);
         const later_expected = try whisper_arch.decoderStepCachedLogits(&decoder.cb.backend, a, cfg, &.{3}, &original);

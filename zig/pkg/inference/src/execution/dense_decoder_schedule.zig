@@ -909,6 +909,9 @@ pub const Schedule = struct {
             if (descriptor.operation != .linear or operands.len < 2 or operands.len != descriptor.input_count or
                 node.num_inputs != operands.len or node.inputs[0] != activation or operands[0] != inputs[0][0])
                 return error.DenseScheduleOrderChanged;
+            for (node.getInputs()[1..], operands[1..]) |source, value| {
+                if (self.graph.node(source).op != .parameter or self.values[source] != value) return error.PreparedKernelBindingChanged;
+            }
         }
         return .{
             .first = try self.executeStep(self.graph.node(members[0]), inputs[0], null),
