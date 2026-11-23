@@ -5861,17 +5861,26 @@ pub const SessionRegistry = struct {
             };
         }
         const body_digest = try commitBodyDigest(alloc, extra_req);
+        if (terminal) |result| if (candidate.terminal_commit) |commit| {
+            if (candidate.commit_body_digest) |sealed_digest| {
+                if (!std.mem.eql(u8, &sealed_digest, &body_digest)) return error.TransactionCommitRequestMismatch;
+            } else if (extra_req != null) return error.TransactionCommitRequestMismatch;
+            var out: OwnedTransactionCommitRequest = if (candidate.staged) |*sealed|
+                try sealed.clone(alloc)
+            else
+                .{ .sync_level = candidate.sync_level };
+            errdefer out.deinit(alloc);
+            if (pending) |generations| try out.discardPrivateGenerations(alloc, generations);
+            result.* = try commit.clone(alloc);
+            candidate.deinit(alloc);
+            return out;
+        };
         if (candidate.commit_body_digest) |sealed_digest| {
             if (!std.mem.eql(u8, &sealed_digest, &body_digest)) return error.TransactionCommitRequestMismatch;
             const sealed = candidate.staged orelse return error.InvalidTransactionSessionRecord;
             var out = try sealed.clone(alloc);
             errdefer out.deinit(alloc);
             if (pending) |generations| try out.discardPrivateGenerations(alloc, generations);
-            if (terminal) |result| if (candidate.terminal_commit) |commit| {
-                result.* = try commit.clone(alloc);
-                candidate.deinit(alloc);
-                return out;
-            };
             touchSession(&candidate);
             out.session_version = DurableSessionStore.Version.of(candidate);
             try self.persistMutation(candidate, expected, guard);
