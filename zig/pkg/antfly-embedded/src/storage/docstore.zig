@@ -752,6 +752,13 @@ pub const DocStore = struct {
             };
         }
 
+        /// Release borrowed physical probe results once the caller has
+        /// consumed them. Unsupported backends keep them until abort.
+        pub fn releasePhysicalProbeResults(self: *Txn) !bool {
+            if (self.probe) |*probe| return probe.releaseResults();
+            return false;
+        }
+
         pub fn getManySortedPhysical(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);

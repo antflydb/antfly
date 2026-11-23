@@ -3976,19 +3976,33 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
+            self.releaseResults();
             self.batch_scratch.deinit(self.metadata_allocator);
-            for (self.held_layouts.items) |*layout| layout.deinitAfterUnlockedRead();
             self.held_layouts.deinit(self.metadata_allocator);
-            releaseHeldValues(&self.leased_values, backend.allocator);
-            for (self.leased_entries.items) |*entry| entry.deinit(self.allocator);
+            self.leased_values.deinit(backend.allocator);
             self.leased_entries.deinit(self.metadata_allocator);
-            releaseHeldBlocks(&self.held_blocks, backend.allocator);
-            releaseHeldValues(&self.held_values, self.allocator);
+            self.held_blocks.deinit(backend.allocator);
+            self.held_values.deinit(self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             if (self.read_view) |view| view.release(backend);
             releaseReadReader(BackendType, backend, .probe_txn);
             self.* = undefined;
+        }
+
+        pub fn releaseResults(self: *@This()) void {
+            self.read_hint = null;
+            self.last_l0_group_index = null;
+            for (self.held_layouts.items) |*layout| layout.deinitAfterUnlockedRead();
+            self.held_layouts.clearRetainingCapacity();
+            for (self.leased_values.items) |value| self.backend.allocator.free(value);
+            self.leased_values.clearRetainingCapacity();
+            for (self.leased_entries.items) |*entry| entry.deinit(self.allocator);
+            self.leased_entries.clearRetainingCapacity();
+            for (self.held_blocks.items) |*block| block.release();
+            self.held_blocks.clearRetainingCapacity();
+            for (self.held_values.items) |value| self.allocator.free(value);
+            self.held_values.clearRetainingCapacity();
         }
 
         fn ownValue(self: *@This(), value: []const u8) ![]const u8 {
@@ -10658,6 +10672,15 @@ test "lsm cold optimization mixed batch owns immutable values before releasing i
     try probe.getManySorted(&.{ "a", "missing" }, &values);
     try std.testing.expectEqualStrings("new", values[0].?);
     try std.testing.expectEqualStrings(&original, saved);
+
+    // Retire both batches while leaving the probe usable for the next batch.
+    try std.testing.expect(probe.held_values.items.len > 1);
+    probe.releaseResults();
+    try std.testing.expectEqual(@as(usize, 0), probe.held_values.items.len);
+    try std.testing.expectEqual(@as(usize, 0), probe.held_blocks.items.len);
+    try probe.getManySorted(&.{ "a", "missing" }, &values);
+    try std.testing.expectEqualStrings("new", values[0].?);
+    try std.testing.expect(values[1] == null);
 }
 
 test "lsm remaining wins writer cursors pin base and promoted overlay roots" {

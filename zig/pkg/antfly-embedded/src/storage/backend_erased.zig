@@ -658,12 +658,22 @@ pub const ProbeTxn = struct {
         get_leased: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
+        release_results: ?*const fn (*anyopaque) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn abort(self: *ProbeTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
+    }
+
+    /// Invalidate prior read results and release their resources, while
+    /// retaining the probe's view and reusable scratch. Returns false when
+    /// the backend requires closing the probe to release its results.
+    pub fn releaseResults(self: *ProbeTxn) !bool {
+        const release = self.vtable.release_results orelse return false;
+        try BoundaryAbi.call("release_results", self.boundary_dispatch, release, .{self.ptr});
+        return true;
     }
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
@@ -1731,6 +1741,10 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             box_allocator.destroy(state);
         }
 
+        fn releaseResults(ptr: *anyopaque) void {
+            unbox(ptr).handle.releaseResults();
+        }
+
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             return try unbox(ptr).handle.get(key);
         }
@@ -1776,6 +1790,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
         .vtable = &.{
             .get_many_sorted_is_atomic = @hasDecl(Handle, "get_many_sorted_is_atomic") and Handle.get_many_sorted_is_atomic,
             .abort = vt.abort,
+            .release_results = if (@hasDecl(Handle, "releaseResults")) vt.releaseResults else null,
             .get = vt.get,
             .contains = if (@hasDecl(Handle, "contains")) vt.contains else null,
             .get_leased = vt.getLeased,
