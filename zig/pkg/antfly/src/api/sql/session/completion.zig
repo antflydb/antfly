@@ -22,6 +22,9 @@ const operation = @import("antfly_local_sources").api_operation;
 const refs = @import("../../../metadata/sql/completion_references.zig");
 const catalog = @import("antfly_local_sources").sql_catalog;
 fn registrationStore(server: *server_mod.ApiHttpServer) !*@import("../../transactions.zig").DurableSessionStore {
+    return registrationStoreControlled(server, .{});
+}
+fn registrationStoreControlled(server: *server_mod.ApiHttpServer, context: operation.RequestContext) !*@import("../../transactions.zig").DurableSessionStore {
     const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
     const issuer = if (server.txn_sessions.durable_scope == .cluster_shared) blk: {
         const router = server.cfg.session_router orelse return error.CompletionOwnerUnavailable;
@@ -29,7 +32,7 @@ fn registrationStore(server: *server_mod.ApiHttpServer) !*@import("../../transac
         if (node == 0) return error.CompletionOwnerUnavailable;
         break :blk node;
     } else 0;
-    try store.bindRegistrationIssuer(issuer);
+    try store.bindRegistrationIssuerControlled(issuer, context);
     return store;
 }
 fn parseId(encoded: []const u8) ![16]u8 {
@@ -58,11 +61,12 @@ fn change(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, reference
 }
 // Keep permits until diagnostics and disconnect have joined. Taking capacity
 // never allocates an outbox ID; successful reads incur no durable writes.
-pub fn reserveOnOwner(server: *server_mod.ApiHttpServer, completion: *wire.Completion) !void {
+pub fn reserveOnOwnerControlled(server: *server_mod.ApiHttpServer, completion: *wire.Completion, context: operation.RequestContext) !void {
+    try context.ensureActive();
     if (completion.capacity.remaining != 0) return;
-    const store = try registrationStore(server);
+    const store = try registrationStoreControlled(server, context);
     const desired = 3;
-    store.reserveRegistrations(desired) catch |err| switch (err) {
+    store.reserveRegistrationsControlled(desired, context) catch |err| switch (err) {
         error.SessionLimitExceeded => return error.SqlWriteCapacityUnavailable,
         else => return err,
     };
@@ -101,16 +105,22 @@ pub fn reserveJoined(server: *server_mod.ApiHttpServer, completion: *wire.Comple
 // Persist the issuer intent and the target proof before the coordinator may
 // seal its plan. A failed/ambiguous preparation never admits the mutation.
 pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
-    try registerTransaction(server, alloc, completion, id, false);
+    try registerTransaction(server, alloc, completion, id, false, null);
 }
 
 pub fn observeTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
-    try registerTransaction(server, alloc, completion, id, true);
+    try registerTransaction(server, alloc, completion, id, true, null);
 }
 
-fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8, observe_only: bool) !void {
+pub fn observeTransactionControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8, context: operation.RequestContext) !void {
+    try registerTransaction(server, alloc, completion, id, true, context);
+}
+
+fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8, observe_only: bool, control: ?operation.RequestContext) !void {
+    const context = control orelse operation.RequestContext{};
+    try context.ensureActive();
     const encoded_id = std.fmt.bytesToHex(id, .lower);
-    const store = try registrationStore(server);
+    const store = try registrationStoreControlled(server, context);
     for (completion.outcomes.items) |outcome| if (outcome.transaction_id) |old| {
         if (!std.mem.eql(u8, old, &encoded_id) or outcome.registration_node_id == null) continue;
         var record = (try store.loadRegistration(alloc, try parseId(outcome.reference_id.?))) orelse continue;
@@ -134,12 +144,12 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
     const encoded = try alloc.alloc(u8, 32);
     errdefer if (outcome.reference_id == null) alloc.free(encoded);
     const local_node = if (server.cfg.session_router) |router| router.localNodeId() else 0;
-    const existing = if (observe_only) try store.existingObservationReference(id) else null;
+    const existing = if (observe_only) try store.existingObservationReferenceControlled(id, context, control != null) else null;
     var local = true;
     const reference = existing orelse fresh: {
         var read = if (observe_only)
             server.acquireSqlExecution(false) catch |err| {
-                if (try store.existingObservationReference(id)) |current| break :fresh current;
+                if (try store.existingObservationReferenceControlled(id, context, control != null)) |current| break :fresh current;
                 return err;
             }
         else
@@ -151,7 +161,10 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
         var seed: [8]u8 = undefined;
         try server.inferenceIo().randomSecure(&seed);
         if (!local) break :fresh try store.createPreparedRegistration(seed, outcome.*);
-        if (observe_only) break :fresh try store.createLocalObservedRegistration(seed, outcome.*, id);
+        if (observe_only) {
+            if (control != null) break :fresh try store.publishObservedRegistration(seed, outcome.*, id, context);
+            break :fresh try store.createLocalObservedRegistration(seed, outcome.*, id);
+        }
         break :fresh try store.createLocalPreparedRegistration(seed, outcome.*, id);
     };
     if (!observe_only) completion.capacity.remaining -= 1;
@@ -159,7 +172,7 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
     @memcpy(encoded, &std.fmt.bytesToHex(reference, .lower));
     outcome.reference_id = encoded;
     outcome.registration_node_id = if (server.cfg.session_router) |router| router.localNodeId() else 0;
-    if (completion.join_begin == null) completion.join_begin = completion.outcomes.items.len - 1;
+    if (control == null and completion.join_begin == null) completion.join_begin = completion.outcomes.items.len - 1;
     if (local) return;
     const floor = try store.registrationFloor();
     if (!try ownerAction(server, alloc, .{ .transaction_id = id, .reference_id = reference, .action = .prepare, .managed = true, .retired_through = floor }, true)) return error.CompletionUnavailable;

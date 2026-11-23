@@ -26,7 +26,7 @@ pub const Host = struct {
     ptr: *anyopaque,
     read: *const fn (*anyopaque, A) anyerror!erased.ReadTxn,
     controlled_read: ?*const fn (*anyopaque, A, RoutingContext) anyerror!erased.ReadTxn = null,
-    term: *const fn (*anyopaque) ?u64,
+    term: *const fn (*anyopaque, RoutingContext) anyerror!?u64,
     propose: *const fn (*anyopaque, []const u8, u64, *bool, RoutingContext) anyerror!bool,
 };
 pub const Store = struct {
@@ -73,12 +73,12 @@ pub const Store = struct {
 
     fn beginWriteControlled(a: A, self: *Store, context: RoutingContext) !erased.WriteTxn {
         try context.ensureActive();
-        const term = self.host.term(self.host.ptr) orelse return error.NotLeader;
+        const term = (try self.host.term(self.host.ptr, context)) orelse return error.NotLeader;
         const write = try a.create(Write);
         errdefer a.destroy(write);
         const read = try Read.createControlled(a, self, context);
         errdefer read.destroy(a);
-        if (self.host.term(self.host.ptr) != term) return error.NotLeader;
+        if ((try self.host.term(self.host.ptr, context)) != term) return error.NotLeader;
         const raw = read.physical.get(try record.keyAlloc(read.arena.allocator(), self.group, record.epoch_key)) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -350,7 +350,7 @@ const Write = struct {
         const self = cast(ptr);
         if (self.refs.load(.acquire) != 1) return error.TransactionCursorActive;
         const store = self.read.store;
-        if (store.host.term(store.host.ptr) != self.term) return error.SessionWriteNotLeaderBeforeProposal;
+        if ((try store.host.term(store.host.ptr, self.context)) != self.term) return error.SessionWriteNotLeaderBeforeProposal;
         if (self.changes.items.len != 0) {
             const bytes = self.encodeChanges() catch |err| return switch (err) {
                 error.OutOfMemory => error.SessionWriteOutOfMemoryBeforeProposal,
@@ -497,7 +497,7 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         fn read(ptr: *anyopaque, _: A) !erased.ReadTxn {
             return cast(ptr).physical.beginRead();
         }
-        fn term(ptr: *anyopaque) ?u64 {
+        fn term(ptr: *anyopaque, _: RoutingContext) !?u64 {
             return cast(ptr).current_term;
         }
         fn propose(ptr: *anyopaque, bytes: []const u8, expected: u64, submitted: *bool, _: RoutingContext) !bool {

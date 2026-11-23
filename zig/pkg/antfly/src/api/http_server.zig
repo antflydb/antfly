@@ -1893,6 +1893,9 @@ pub const ApiHttpServerConfig = struct {
     prepared_transaction_leadership: ?@import("group_work_ownership.zig").Source = null,
     prepared_transaction_group_id: u64 = @import("antfly_local_sources").common_group_ids.main_metadata_group_id,
     session_executor: ?http_common.RequestExecutor = null,
+    /// Optional externally admitted SQL transport. Its owner is responsible
+    /// for bounding the full network task graph independently of the request.
+    admitted_sql_peer_executor: ?http_common.RequestExecutor = null,
     sql_peer_transport_config: ?@import("../common/http/io_http_executor.zig").IoHttpExecutorConfig = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
@@ -15436,7 +15439,7 @@ pub const ApiHttpServer = struct {
     };
 
     pub fn sqlPeerExecutor(self: *ApiHttpServer, borrow: @import("antfly_runtime_abi").io_abi.Borrow) !http_common.RequestExecutor {
-        const config = self.cfg.sql_peer_transport_config orelse return self.cfg.session_executor orelse error.HttpExecutorUnavailable;
+        const config = self.cfg.sql_peer_transport_config orelse return self.cfg.admitted_sql_peer_executor orelse error.SqlPeerUnavailable;
         platform_sync.lockYielding(&self.sql_peer_transport_mutex);
         defer self.sql_peer_transport_mutex.unlock();
         if (self.sql_peer_transport == null) {

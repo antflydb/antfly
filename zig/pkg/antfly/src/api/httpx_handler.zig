@@ -1309,11 +1309,12 @@ pub const AntflyApiHandler = struct {
         value: @import("../pgwire/completion.zig").Completion = .{},
         reports_existing_commit: bool = false,
         reserve_on_prepare: bool = false,
+        control: operation_contract.RequestContext = .{},
         fn prepareTransaction(raw: *anyopaque, id: [16]u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const server = self.server orelse return error.DurabilityUnavailable;
             const protocol = @import("sql/session/completion.zig");
-            if (self.reserve_on_prepare) try protocol.reserveOnOwner(server, &self.value);
+            if (self.reserve_on_prepare) try protocol.reserveOnOwnerControlled(server, &self.value, self.control);
             try protocol.prepareTransaction(server, self.alloc, &self.value, id);
         }
         fn prepareMetadata(raw: *anyopaque, owner: operation_contract.SQLCompletionOwner) !void {
@@ -1349,6 +1350,7 @@ pub const AntflyApiHandler = struct {
         owned.server = self.api_server;
         if (routes.matchTransactionSessionCommit(path) != null) {
             owned.reserve_on_prepare = true;
+            owned.control = operationContext(ctx, null);
             return null;
         }
         @import("sql/session/completion.zig").reserveJoined(self.api_server, completion, 3, ctx.io) catch {
@@ -7683,8 +7685,7 @@ pub const AntflyApiHandler = struct {
 
     fn reserveFencedTransaction(context: operation_contract.RequestContext, server: *ApiHttpServer, completion: *@import("../pgwire/completion.zig").Completion) !void {
         try context.ensureActive();
-        try @import("sql/session/completion.zig").reserveOnOwner(server, completion);
-        try context.ensureActive();
+        try @import("sql/session/completion.zig").reserveOnOwnerControlled(server, completion, context);
     }
 
     fn prepareFencedTransaction(context: operation_contract.RequestContext, txn_id: db_mod.types.TxnId) !void {
@@ -7766,7 +7767,9 @@ pub const AntflyApiHandler = struct {
                 else => return err,
             };
         }
-        var commit_req = (self.api_server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+        var terminal_on_cut: ?transactions_api.TerminalCommit = null;
+        defer if (terminal_on_cut) |*terminal| terminal.deinit(alloc);
+        var commit_req = (self.api_server.txn_sessions.inspectOrSealHttpCommit(alloc, guard, if (parsed_req) |*value| value else null, &terminal_on_cut) catch |err| switch (err) {
             error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
@@ -7786,9 +7789,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
 
-        if (self.api_server.txn_sessions.getTerminalCommitForMutation(alloc, guard) catch |err| return sessionInspectionFailure(ctx, err)) |terminal_value| {
-            var terminal = terminal_value;
-            defer terminal.deinit(alloc);
+        if (terminal_on_cut) |terminal| {
             var status = terminal.status;
             // A complete terminal response is durable before the coordinator
             // self-participant is released. Retrying that final ACK is safe;
@@ -7823,7 +7824,7 @@ pub const AntflyApiHandler = struct {
                 const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
                 owned.reports_existing_commit = true;
                 if (status != .committed or terminal.repair_required)
-                    self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransaction, .{ self.api_server, ctx.allocator, completion, txn_id }) catch {
+                    self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransactionControlled, .{ self.api_server, ctx.allocator, completion, txn_id, commit_request }) catch {
                         completion.unknown = true;
                     };
             }
@@ -8466,7 +8467,7 @@ pub const AntflyApiHandler = struct {
                 self.observation_unavailable = true;
                 return;
             };
-            @import("sql/session/completion.zig").observeTransaction(self.adapter.server, self.completion_alloc, self.completion, id) catch {
+            @import("sql/session/completion.zig").observeTransactionControlled(self.adapter.server, self.completion_alloc, self.completion, id, self.adapter.context) catch {
                 self.observation_unavailable = true;
             };
         }
@@ -8917,7 +8918,7 @@ pub const AntflyApiHandler = struct {
             .active, .prepared, .outcome_unknown => unreachable,
         };
         if ((outcome == .committed_pending or outcome == .committed_repair_required) and ctx.header("X-Antfly-SQL-Fence") != null)
-            self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransaction, .{ self.api_server, ctx.allocator, completion, id }) catch {
+            self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransactionControlled, .{ self.api_server, ctx.allocator, completion, id, operationContext(ctx, null) }) catch {
                 completion.unknown = true;
             };
         return try ctx.status(200).json(sql_wire.SQLResponse{
@@ -9434,6 +9435,7 @@ pub const AntflyApiHandler = struct {
                 const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
                 owned.server = self.api_server;
                 owned.reserve_on_prepare = true;
+                owned.control = operationContext(ctx, null);
             } else if (try self.admitCompletion(ctx)) |response| return response;
         }
 
@@ -18173,6 +18175,20 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         defer persisted.deinit(alloc);
         try std.testing.expect(persisted.commit_body_digest == null);
         _ = (try server.txn_sessions.stage(alloc, generic_guard, &staged)).?;
+        var sealed = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, generic_guard, null)).?;
+        defer sealed.deinit(alloc);
+        const participants = try sealed.distributedTables(alloc);
+        defer participants.deinit();
+        var execution = (try server.txn_sessions.sealExecutionPlan(alloc, generic_guard, participants.tables)).?;
+        defer execution.deinit();
+        _ = (try server.txn_sessions.recordTerminalCommitForMutation(alloc, generic_guard, .committed, false, null, null)).?;
+        durable.fail_writes_for_test = true;
+        defer durable.fail_writes_for_test = false;
+        var replay_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer replay_ctx.deinit();
+        var replayed = try handler.commitTransactionSession(&replay_ctx, &generic_hex);
+        defer replayed.deinit();
+        try std.testing.expectEqual(@as(u16, 200), replayed.status.code);
     }
     var sealed_request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, null)).?;
     defer sealed_request.deinit(alloc);
@@ -26952,6 +26968,7 @@ test "SQL pgwire native HTTP connection capacity proves no execution and failed 
     };
     api.cfg.session_router = .{ .ptr = undefined, .vtable = &.{ .local_node_id = Remote.node, .local_status = undefined, .node_base_uri = Remote.uri } };
     api.cfg.session_executor = .{ .ptr = undefined, .vtable = &.{ .execute = Remote.execute } };
+    api.cfg.admitted_sql_peer_executor = api.cfg.session_executor;
     const remote = @import("sql/execution/resource_routing.zig").encode(1, @splat(1));
     const uri = try std.fmt.allocPrint(a, "http://localhost/db/v1/sql/connections/{s}", .{remote});
     defer a.free(uri);
@@ -27228,6 +27245,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         .imported_runtime_io = .{ .durable = std.testing.io, .request_forward = testRequestForwardSource(&transport_io) },
         .session_router = .{ .ptr = &peer, .vtable = &.{ .local_node_id = Peer.local, .local_status = undefined, .node_base_uri = Peer.uri } },
         .session_executor = .{ .ptr = &peer, .vtable = &.{ .execute = Peer.execute } },
+        .admitted_sql_peer_executor = .{ .ptr = &peer, .vtable = &.{ .execute = Peer.execute } },
     }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
     defer server.deinit();
     const session = try server.txn_sessions.begin(a, .{}, 7);
@@ -27404,6 +27422,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         .imported_runtime_io = .{ .durable = durable_pool.io(), .request_forward = testRequestForwardSource(&transport_io) },
         .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.nodeUri } },
         .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+        .admitted_sql_peer_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
     }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
     defer api.deinit();
     fixture.api = &api;
@@ -27630,6 +27649,7 @@ test "subscription receipt RPC binds internal service, group and deadline before
             .node_base_uri = Fixture.uri,
         } },
         .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+        .admitted_sql_peer_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
         .replication_receipt_driver = .{ .ptr = &fixture, .observe = Fixture.observe },
     }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
     defer api.deinit();

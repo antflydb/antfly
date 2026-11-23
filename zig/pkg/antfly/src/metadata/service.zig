@@ -5040,6 +5040,10 @@ fn topologyActivationAdmission(service: anytype, bytes: []const u8, readiness: T
     return .{ .readiness = readiness, .source_mutation = false };
 }
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !CoordinatedDecoderAdmission {
+    return prepareCoordinatedDecoderAdmissionWithContext(service, commands, .{});
+}
+
+fn prepareCoordinatedDecoderAdmissionWithContext(service: anytype, commands: []const metadata_storage.TransitionCommand, request: api_operation.RequestContext) !CoordinatedDecoderAdmission {
     // Reject malformed requirement facts before acquiring the runtime/apply
     // lock. Keep payload scanning out of final append's cheap group-ID checks.
     for (commands) |command| try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
@@ -5058,7 +5062,10 @@ fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metada
     if (required_version == 0) return .{ .source_mutation = has_source };
     if (comptime !@hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness"))
         return error.TableTopologyProtocolUpgradeRequired;
-    const readiness = try service.cachedCoordinatedDecoderReadiness(required_version);
+    const readiness = if (comptime @TypeOf(service.*) == MetadataHttpService)
+        try service.ensureTableTopologyProtocolReadyMode(request, required_version, true, true)
+    else
+        try service.cachedCoordinatedDecoderReadiness(required_version);
     for (commands) |command| if (command == .apply_relation_reconciliation) {
         const intent = try @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation);
         try validateRelationCapabilityProof(intent, readiness);
@@ -10883,11 +10890,11 @@ pub const MetadataHttpService = struct {
         request: api_operation.RequestContext,
     ) !MetadataProposalReceipt {
         try request.ensureActive();
-        const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
+        const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmissionWithContext(self, &.{command}, request);
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
         const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
-        self.lockRuntime();
+        try self.lockRuntimeForRequest(request);
         defer self.unlockRuntime();
         try validateCoordinatedDecoderAdmissionLocked(self, decoder);
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
@@ -11046,12 +11053,35 @@ pub const MetadataHttpService = struct {
         return receipt;
     }
 
-    pub fn proposeSessionCommandObserved(self: *MetadataHttpService, bytes: []const u8, term: u64, submitted: *bool, context: api_operation.RequestContext) !MetadataProposalReceipt {
+    pub fn proposeSessionCommandObserved(self: *MetadataHttpService, bytes: []const u8, term: u64, submitted: *bool, context: api_operation.RequestContext) !bool {
         if (term == 0) return error.NotLeader;
-        const request = try context.platformDeadline();
+        var request = try context.platformDeadline();
+        const controlled = hasRequestControl(context);
+        const local_deadline = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        if (controlled) request.deadline_ns = @min(request.deadline_ns orelse local_deadline, local_deadline);
         const receipt = try self.proposeTransitionCommandWithReceiptInContext(.{ .apply_transaction_sessions = bytes }, term, null, submitted, request);
-        try self.waitForTransitionAppliedWithContext(receipt, request);
-        return receipt;
+        if (!controlled) try self.waitForTransitionApplied(receipt);
+        const projected = self.projectedStore() orelse return error.MissingMetadataStore;
+        while (true) {
+            try request.ensureActive();
+            const observed = self.lifecycle_signal.snapshot(null);
+            const result = result: {
+                var txn = try projected.openSessionRead(self.alloc, self.metadata_group_id);
+                defer txn.abort();
+                break :result @import("transaction_session_record.zig").readApplyResult(&txn, self.alloc, self.metadata_group_id, receipt.term, receipt.index);
+            };
+            return result catch |err| switch (err) {
+                error.SessionApplyResultUnavailable => if (controlled) {
+                    // The managed owner keeps the accepted proposal alive.
+                    // Return unknown if its exact projection cannot be observed.
+                    _ = self.proposal_progress_driver.notifyManagedOwner();
+                    const remaining = request.deadline_ns.? -| platform_time.monotonicNs();
+                    if (remaining > 0) self.lifecycle_signal.wait(observed, @min(remaining, metadata_proposal_passive_wait_ns));
+                    continue;
+                } else err,
+                else => err,
+            };
+        }
     }
 
     pub fn upsertNode(self: *MetadataHttpService, record: metadata_table_manager.NodeRecord) !void {
@@ -12993,7 +13023,7 @@ pub const MetadataHttpService = struct {
         // release it before any network I/O.
         diagnostic_stage = .membership;
         const observation = locked: {
-            self.lockRuntime();
+            try self.lockRuntimeForRequest(request);
             defer self.unlockRuntime();
             const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
                 return zig017_failure: {
@@ -14145,6 +14175,18 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
     ) !void {
+        return self.ensureLinearizableReadMode(request, false);
+    }
+
+    pub fn ensureSessionLinearizableRead(self: *MetadataHttpService, request: api_operation.RequestContext) !void {
+        return self.ensureLinearizableReadMode(request, hasRequestControl(request));
+    }
+
+    fn ensureLinearizableReadMode(
+        self: *MetadataHttpService,
+        request: api_operation.RequestContext,
+        passive: bool,
+    ) !void {
         try request.ensureActive();
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
@@ -14171,7 +14213,7 @@ pub const MetadataHttpService = struct {
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             const now_ns = platform_time.monotonicNs();
             if (now_ns >= next_request_ns) {
-                self.lockRuntime();
+                try self.lockRuntimeForRequest(request);
                 {
                     defer self.unlockRuntime();
                     request_attempts += 1;
@@ -14190,8 +14232,10 @@ pub const MetadataHttpService = struct {
             }
             var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
             var drove_progress = false;
-            self.lockRuntime();
-            {
+            if (passive) {
+                _ = self.proposal_progress_driver.notifyManagedOwner();
+            } else {
+                self.lockRuntime();
                 defer self.unlockRuntime();
                 // Registered runtimes coalesce a wake instead of persisting
                 // on the request thread. Standalone callers retain their
@@ -14939,6 +14983,16 @@ pub const MetadataHttpService = struct {
     pub fn localMetadataLeadershipTerm(self: *MetadataHttpService) ?u64 {
         self.lockRuntime();
         defer self.unlockRuntime();
+        return self.localMetadataLeadershipTermLocked();
+    }
+
+    pub fn localSessionLeadershipTerm(self: *MetadataHttpService, context: api_operation.RequestContext) !?u64 {
+        try self.lockRuntimeForRequest(context);
+        defer self.unlockRuntime();
+        return self.localMetadataLeadershipTermLocked();
+    }
+
+    fn localMetadataLeadershipTermLocked(self: *MetadataHttpService) ?u64 {
         const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return null;
         if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or raft_status.soft.leader_id.? != raft_status.id) return null;
         return raft_status.hard.current_term;
@@ -15392,6 +15446,24 @@ pub const MetadataHttpService = struct {
 
     fn unlockProjection(self: *MetadataHttpService) void {
         self.projection_mutex.unlock(std.Options.debug_io);
+    }
+
+    fn hasRequestControl(request: api_operation.RequestContext) bool {
+        return request.deadline_ns != null or request.cancellation.ptr != null;
+    }
+
+    fn lockRuntimeForRequest(self: *MetadataHttpService, request: api_operation.RequestContext) !void {
+        if (!hasRequestControl(request)) {
+            self.lockRuntime();
+            return;
+        }
+        try request.ensureActive();
+        while (!self.runtime_mutex.tryLock()) {
+            try request.ensureActive();
+            platform_time.yieldBriefly();
+        }
+        errdefer self.unlockRuntime();
+        try request.ensureActive();
     }
 
     fn lockRuntime(self: *MetadataHttpService) void {

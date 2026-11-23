@@ -50,7 +50,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 45 adds the artifact history read provider to API configuration.
 // Version 46 combines CDC capabilities with SQL native relation and shutdown contracts.
 // Version 47 adds request-forward lane reservations, peer configuration and controlled session-store routing access.
-pub const abi_version: u32 = 47;
+// Version 48 adds an explicitly admitted custom SQL peer executor.
+pub const abi_version: u32 = 48;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

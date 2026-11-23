@@ -122,22 +122,18 @@ const MetadataSessions = struct {
     fn readControlled(ptr: *anyopaque, alloc: std.mem.Allocator, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         const request = try context.platformDeadline();
-        try svc.ensureLinearizableReadWithContext(request);
+        try svc.ensureSessionLinearizableRead(request);
         try request.ensureActive();
         const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
         return projected.openSessionRead(alloc, svc.metadata_group_id);
     }
-    fn term(ptr: *anyopaque) ?u64 {
+    fn term(ptr: *anyopaque, context: @import("antfly_local_sources").api_operation.RequestContext) !?u64 {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        return svc.localMetadataLeadershipTerm();
+        return svc.localSessionLeadershipTerm(context);
     }
     fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64, submitted: *bool, context: @import("antfly_local_sources").api_operation.RequestContext) !bool {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        const receipt = try svc.proposeSessionCommandObserved(bytes, expected_term, submitted, context);
-        const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
-        var txn = try projected.openSessionRead(svc.alloc, svc.metadata_group_id);
-        defer txn.abort();
-        return @import("transaction_session_record.zig").readApplyResult(&txn, svc.alloc, svc.metadata_group_id, receipt.term, receipt.index);
+        return svc.proposeSessionCommandObserved(bytes, expected_term, submitted, context);
     }
 };
 
