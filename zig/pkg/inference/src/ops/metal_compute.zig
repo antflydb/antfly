@@ -11939,10 +11939,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .linear, .gather => false,
             .dot => |dot| (dot.m < 8 or dot.n < 128 or dot.k < 128) and
                 metal_runtime.termite_metal_decode_runtime_dot_general_2d_f32_ready(self.provider_impl.raw_decode_runtime) != 0,
-            .norm => |norm| norm.kind == .rms and !disableRuntimeElementwise() and
-                descriptor.input_shapes[0].eq(descriptor.output_shape) and
-                (!(self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) or
-                    metal_runtime.antfly_metal_norm_clamp_ready(self.provider_impl.raw_decode_runtime) != 0),
+            .norm => |norm| !disableRuntimeElementwise() and
+                descriptor.input_shapes[0].eq(descriptor.output_shape) and switch (norm.kind) {
+                .layer => metal_runtime.antfly_metal_layer_norm_buffers_ready(self.provider_impl.raw_decode_runtime) != 0,
+                .rms => !(self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) or
+                    metal_runtime.antfly_metal_norm_clamp_ready(self.provider_impl.raw_decode_runtime) != 0,
+            },
             .add_mul_scalar => metal_runtime.assignedAddMulScalarAvailable(self.provider_impl),
             .rope => |r| metal_runtime.regularRopeAvailable(self.provider_impl, r),
             else => true,
@@ -12942,21 +12944,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const tensor = buf.metal_tensor orelse return false;
             if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
         }
-        var layer_norm_slot: ?usize = null;
+        var mutable_layer_norm = false;
         var rms_clamped = false;
         if (descriptor.operation == .norm) {
             if (request.auxiliaries.len != 0 or disableRuntimeElementwise()) return false;
             const norm = descriptor.operation.norm;
             if (norm.kind == .layer) {
-                if (toBuf(request.inputs[1]).mutable_state or toBuf(request.inputs[2]).mutable_state) {
+                mutable_layer_norm = toBuf(request.inputs[1]).mutable_state or toBuf(request.inputs[2]).mutable_state;
+                if (mutable_layer_norm) {
                     _ = layerNormDeviceRequest(norm, descriptor.elements()) orelse return false;
                     metal_runtime.requireGlinerBoundaryReady(self.provider_impl.raw_decode_runtime) catch return false;
-                } else {
-                    const entry = self.livePreparedSlot("dynamic_layer_norm_slots", .layer_norm, dynamicLayerNormSlotKey(request.inputs[1], request.inputs[2], norm.dim)) orelse return false;
-                    const slot = entry.slot;
-                    if (!metal_runtime.decoderRuntimeLayerNormSlotPrepared(self.provider_impl, slot, norm.dim)) return false;
-                    layer_norm_slot = slot;
-                }
+                } else if (metal_runtime.antfly_metal_layer_norm_buffers_ready(self.provider_impl.raw_decode_runtime) == 0) return false;
             } else if (self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) {
                 if (metal_runtime.antfly_metal_norm_clamp_ready(self.provider_impl.raw_decode_runtime) == 0) return false;
                 rms_clamped = true;
@@ -13053,11 +13051,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (rms_clamped) break :blk try metal_runtime.decoderRuntimeNormClampedInto(self.provider_impl, input, weight, .{ .rows = @intCast(descriptor.elements() / norm.dim), .dim = norm.dim, .eps = norm.eps, .flags = 0, .lo = 0, .hi = 0 }, out_tensor);
                     break :blk try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceInto(self.provider_impl, input, weight, norm.dim, norm.eps, out_tensor);
                 }
-                if (layer_norm_slot) |slot| {
+                if (!mutable_layer_norm) {
                     const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
                     defer self.endActivePlannedComputeScope(scope);
-                    self.timing_stats.decoder_runtime_apply_layer_norm_calls += 1;
-                    break :blk try metal_runtime.decoderRuntimeApplyLayerNormDeviceInto(self.provider_impl, slot, input, norm.dim, norm.eps, out_tensor);
+                    break :blk metal_runtime.decoderRuntimeLayerNormBuffersInto(self.provider_impl, input, weight, toBuf(request.inputs[2]).metal_tensor.?, norm.dim, norm.eps, out_tensor);
                 }
                 const kernel = layerNormDeviceRequest(norm, descriptor.elements()) orelse return error.InvalidTensorShape;
                 var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
@@ -54091,13 +54088,12 @@ test "Metal norm descriptors preserve prepared and F32 SIMD schedules and mutabl
     const inputs = [_]CT{ input, weight, beta };
     var request = K.Invocation{ .descriptor = &descriptor, .inputs = &inputs };
     const dispatch = cb.vtable.kernels.?.runAssignedKernel.?;
-    try std.testing.expect(!try dispatch(cb.ptr, request));
-    try std.testing.expectEqual(@as(usize, 0), compute.dynamic_layer_norm_slots.count());
-    const ordinary = try cb.layerNorm(input, weight, beta, 4, 1e-5);
-    defer cb.free(ordinary);
     try std.testing.expect(try dispatch(cb.ptr, request));
     request.output = output;
     try std.testing.expect(try dispatch(cb.ptr, request));
+    try std.testing.expectEqual(@as(usize, 0), compute.dynamic_layer_norm_slots.count());
+    const ordinary = try cb.layerNorm(input, weight, beta, 4, 1e-5);
+    defer cb.free(ordinary);
     const expected_prepared = try cb.toFloat32(ordinary, a);
     defer a.free(expected_prepared);
     const actual_prepared = try cb.toFloat32(output, a);

@@ -7533,7 +7533,11 @@ test "complete Imported Metal fused scalar publishes assigned output" {
     try qualifyCompleteMetalPrimitive(.fused_scalar, false);
 }
 
-fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar }, comptime consumed: bool) !void {
+test "complete Imported Metal LayerNorm binds affine operands without prepared slots" {
+    try qualifyCompleteMetalPrimitive(.layer_norm, false);
+}
+
+fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, layer_norm, dot, fused_scalar }, comptime consumed: bool) !void {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const runtime = @import("../backends/metal_runtime.zig");
     if (!runtime.metalDeviceAvailable()) return error.SkipZigTest;
@@ -7545,7 +7549,7 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar },
     const input_node = try builder.parameter("x", shape);
     const rhs_shape: []const i64 = switch (kind) {
         .dot => &.{ 64, 4 },
-        .rms => &.{64},
+        .rms, .layer_norm => &.{64},
         .fused_scalar => &.{ 8, 64 },
     };
     const rhs_node = try builder.parameter("gamma", Shape.init(.f32, rhs_shape));
@@ -7558,7 +7562,10 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar },
         const scalar = try builder.parameter("scale", Shape.init(.f32, &.{1}));
         try graph.markOutput(try builder.mul(sum, scalar));
     } else {
-        const normalized = try builder.rmsNorm(input_node, rhs_node, 64, 1e-5);
+        const normalized = if (kind == .layer_norm)
+            try builder.layerNorm(input_node, rhs_node, try builder.parameter("beta", Shape.init(.f32, &.{64})), 64, 1e-5)
+        else
+            try builder.rmsNorm(input_node, rhs_node, 64, 1e-5);
         const activated = try builder.neg(normalized);
         try graph.markOutput(try builder.reshape(activated, Shape.init(.f32, &.{512})));
     }
@@ -7578,7 +7585,7 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar },
     const gains: [
         switch (kind) {
             .dot => 64 * 4,
-            .rms => 64,
+            .rms, .layer_norm => 64,
             .fused_scalar => 512,
         }
     ]f32 = @splat(3);
@@ -7586,9 +7593,14 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar },
     defer input.deinit();
     var gamma = try Tensor.initFloat32(a, "gamma", rhs_shape, &gains);
     defer gamma.deinit();
-    var scale: ?Tensor = if (kind == .fused_scalar) try Tensor.initFloat32(a, "scale", &.{1}, &.{2}) else null;
-    defer if (scale) |*value| value.deinit();
-    const inputs: []const Tensor = if (scale) |value| &.{ input, gamma, value } else &.{ input, gamma };
+    const biases: [64]f32 = @splat(0.25);
+    var extra: ?Tensor = switch (kind) {
+        .fused_scalar => try Tensor.initFloat32(a, "scale", &.{1}, &.{2}),
+        .layer_norm => try Tensor.initFloat32(a, "beta", &.{64}, &biases),
+        else => null,
+    };
+    defer if (extra) |*value| value.deinit();
+    const inputs: []const Tensor = if (extra) |value| &.{ input, gamma, value } else &.{ input, gamma };
     var proof = (try prepared_mod.prepare(session, .{ .tensors = inputs }, a, null)) orelse return error.MissingPreparedMetalFrame;
     defer proof.deinit();
     if (kind == .fused_scalar and !proof.hasCompleteOwnedPayload()) {
@@ -7608,7 +7620,7 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar },
         } else return error.MissingFusedScalar;
     }
     const stats = session.executionDiagnostics().?.execution.?;
-    try std.testing.expect(stats.assigned_kernel_dispatches >= (if (kind == .rms) @as(u64, 2) else 1));
+    try std.testing.expect(stats.assigned_kernel_dispatches >= (if (kind == .rms or kind == .layer_norm) @as(u64, 2) else 1));
     try std.testing.expectEqual(@as(u64, 0), stats.graph_plan_slots_reserved);
     try std.testing.expectEqual(@as(u64, 0), stats.actual_download_bytes);
     const actual = try result.backend.toFloat32(result.outputs[0], a);
@@ -7617,6 +7629,7 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar },
         .dot => 384,
         .rms => -6.0 / @sqrt(@as(f32, 4.0 + 1e-5)),
         .fused_scalar => 10,
+        .layer_norm => -0.25,
     };
     for (actual) |item| try std.testing.expectApproxEqAbs(expected, item, 2e-5);
 }

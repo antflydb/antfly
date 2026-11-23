@@ -39534,6 +39534,69 @@ static int termite_metal_encode_head_rms_rope_on_encoder(
     return 0;
 }
 
+int antfly_metal_layer_norm_buffers_ready(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && runtime->layer_norm_pipeline != nil;
+}
+
+int antfly_metal_layer_norm_buffers(
+    termite_metal_decode_runtime *runtime,
+    void *input_handle, size_t input_offset,
+    void *weight_handle, size_t weight_offset,
+    void *bias_handle, size_t bias_offset,
+    size_t rows, size_t hidden_size, float eps,
+    void *output_handle, size_t output_offset
+) {
+    if (!antfly_metal_layer_norm_buffers_ready(runtime) || input_handle == NULL ||
+        weight_handle == NULL || bias_handle == NULL || output_handle == NULL) return -1;
+    if (rows == 0 || hidden_size == 0 || rows > UINT32_MAX || hidden_size > UINT32_MAX ||
+        hidden_size > SIZE_MAX / sizeof(float) || rows > SIZE_MAX / (hidden_size * sizeof(float))) return -6;
+    @autoreleasepool {
+        id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        id<MTLBuffer> weight_buffer = (__bridge id<MTLBuffer>)weight_handle;
+        id<MTLBuffer> bias_buffer = (__bridge id<MTLBuffer>)bias_handle;
+        const size_t vector_bytes = hidden_size * sizeof(float);
+        const size_t bytes = rows * vector_bytes;
+        termite_metal_planned_encoder_range accesses[4];
+        if (termite_metal_planned_range_make(input_buffer, input_offset, bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -7) != 0 ||
+            termite_metal_planned_range_make(weight_buffer, weight_offset, vector_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -7) != 0 ||
+            termite_metal_planned_range_make(bias_buffer, bias_offset, vector_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -7) != 0 ||
+            termite_metal_planned_range_make(output_buffer, output_offset, bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -8) != 0) return -8;
+        termite_metal_apply_layer_norm_params params = {
+            .hidden_size = (uint32_t)hidden_size,
+            .eps = eps,
+        };
+        const bool frame_owned = (runtime->active_frame_cb == nil);
+        id<MTLCommandBuffer> command_buffer = frame_owned
+            ? termite_metal_new_command_buffer(runtime->queue, __func__)
+            : runtime->active_frame_cb;
+        if (command_buffer == nil) return -10;
+        if (!frame_owned &&
+            (termite_metal_decode_runtime_retain_frame_resource(runtime, input_buffer) != 0 ||
+             termite_metal_decode_runtime_retain_frame_resource(runtime, weight_buffer) != 0 ||
+             termite_metal_decode_runtime_retain_frame_resource(runtime, bias_buffer) != 0 ||
+             termite_metal_decode_runtime_retain_frame_resource(runtime, output_buffer) != 0 ||
+             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 4, -11) != 0)) return -11;
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM, &encoder_owned);
+        if (encoder == nil) return -11;
+        const BOOL use_rows_pipeline = rows > 1 && hidden_size >= 128 && runtime->layer_norm_rows_pipeline != nil;
+        antfly_metal_set_compute_pipeline(encoder, (use_rows_pipeline ? runtime->layer_norm_rows_pipeline : runtime->layer_norm_pipeline));
+        termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, weight_buffer, weight_offset, bias_buffer, bias_offset, output_buffer, output_offset, &params, sizeof(params));
+        if (use_rows_pipeline) {
+            [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
+            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
+        } else {
+            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
+        }
+        if (encoder_owned) [encoder endEncoding];
+        if (!frame_owned) return 0;
+        antfly_metal_commit(command_buffer);
+        antfly_metal_wait(command_buffer);
+        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
+    }
+}
+
 int termite_metal_decode_runtime_apply_layer_norm_device(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -39545,46 +39608,13 @@ int termite_metal_decode_runtime_apply_layer_norm_device(
     void *output_handle,
     size_t output_offset
 ) {
-    if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
-    if (runtime->layer_norm_pipeline == nil) return -2;
-    if (slot >= TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY || rows == 0 || hidden_size == 0) return -3;
+    if (runtime == NULL || slot >= TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY) return -3;
     if (antfly_metal_layer_norm_slot_prepared(runtime, slot) == 0) return -4;
     if (runtime->layer_norm_hidden_sizes[slot] != hidden_size) return -5;
-    if (rows > UINT32_MAX || hidden_size > UINT32_MAX) return -6;
-    @autoreleasepool {
-        id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
-        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        const size_t bytes = rows * hidden_size * sizeof(float);
-        if (input_offset + bytes > input_buffer.length) return -7;
-        if (output_offset + bytes > output_buffer.length) return -8;
-        termite_metal_apply_layer_norm_params params = {
-            .hidden_size = (uint32_t)hidden_size,
-            .eps = eps,
-        };
-        const bool frame_owned = (runtime->active_frame_cb == nil);
-        id<MTLCommandBuffer> command_buffer = frame_owned
-            ? termite_metal_new_command_buffer(runtime->queue, __func__)
-            : runtime->active_frame_cb;
-        if (command_buffer == nil) return -10;
-        id<MTLComputeCommandEncoder> encoder = frame_owned ? nil : runtime->active_planned_compute_encoder;
-        const BOOL planned_encoder = (encoder != nil);
-        if (!planned_encoder) encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_RMS_NORM);
-        if (encoder == nil) return -11;
-        const BOOL use_rows_pipeline = rows > 1 && hidden_size >= 128 && runtime->layer_norm_rows_pipeline != nil;
-        antfly_metal_set_compute_pipeline(encoder, (use_rows_pipeline ? runtime->layer_norm_rows_pipeline : runtime->layer_norm_pipeline));
-        termite_metal_bind_four_buffers(encoder, input_buffer, input_offset, runtime->layer_norm_weight_buffers[slot], 0, runtime->layer_norm_bias_buffers[slot], 0, output_buffer, output_offset, &params, sizeof(params));
-        if (use_rows_pipeline) {
-            [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-            antfly_metal_dispatch_threadgroups(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
-        } else {
-            antfly_metal_dispatch_threads(encoder, MTLSizeMake(rows, 1, 1), MTLSizeMake(1, 1, 1));
-        }
-        if (!planned_encoder) [encoder endEncoding];
-        if (!frame_owned) return 0;
-        antfly_metal_commit(command_buffer);
-        antfly_metal_wait(command_buffer);
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
-    }
+    return antfly_metal_layer_norm_buffers(runtime, input_handle, input_offset,
+        (__bridge void *)runtime->layer_norm_weight_buffers[slot], 0,
+        (__bridge void *)runtime->layer_norm_bias_buffers[slot], 0,
+        rows, hidden_size, eps, output_handle, output_offset);
 }
 
 int termite_metal_decode_runtime_apply_add_layer_norm_sum_device(

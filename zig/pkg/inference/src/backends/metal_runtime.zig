@@ -4624,6 +4624,12 @@ pub fn decoderRuntimePrepareRmsNorm(self: anytype, request: anytype) !bool {
     return true;
 }
 
+pub fn decoderRuntimeLayerNormBuffersInto(self: anytype, input: MetalTensor, weight: MetalTensor, bias: MetalTensor, dim: usize, eps: f32, output: MetalTensor) bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (dim == 0 or input.elemCount() % dim != 0) return false;
+    return antfly_metal_layer_norm_buffers(runtime, input.deviceHandle(), input.deviceByteOffset(), weight.deviceHandle(), weight.deviceByteOffset(), bias.deviceHandle(), bias.deviceByteOffset(), input.elemCount() / dim, dim, eps, output.deviceHandle(), output.deviceByteOffset()) == 0;
+}
+
 pub fn decoderRuntimeApplyLayerNormDeviceInto(self: anytype, slot: usize, input: MetalTensor, dim: usize, eps: f32, output: MetalTensor) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0 or !decoderRuntimeLayerNormSlotPrepared(self, slot, dim)) return false;
@@ -21412,6 +21418,21 @@ pub extern fn termite_metal_decode_runtime_apply_layer_norm(
     hidden_size: usize,
     eps: f32,
     output: [*c]f32,
+) c_int;
+pub extern fn antfly_metal_layer_norm_buffers_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn antfly_metal_layer_norm_buffers(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    weight_handle: ?*anyopaque,
+    weight_offset: usize,
+    bias_handle: ?*anyopaque,
+    bias_offset: usize,
+    rows: usize,
+    dim: usize,
+    eps: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_apply_layer_norm_device(
     runtime: ?*RawMetalDecodeRuntime,

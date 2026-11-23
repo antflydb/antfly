@@ -1623,9 +1623,8 @@ pub const MetalPartitionExecutor = struct {
                 if (initializer.staging.byte_size != bytes or initializer.staging.usage != .host_input or initializer.staging.admitted) return false;
                 continue;
             }
-            // Keep projection and layer-norm families on their tuned owner.
-            // RMS-only scopes can bind their existing destination kernel; the
-            // region and elision checks below still guard composite schedules.
+            // The region and elision checks below guard composite schedules
+            // that use a different owner than a standalone destination kernel.
             // Regular RoPE descriptors derive positions in the shared kernel;
             // the route separately verifies its exact specialized pipeline.
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
@@ -1640,7 +1639,6 @@ pub const MetalPartitionExecutor = struct {
                     }
                     saw_dot = true;
                 },
-                .norm => |norm| if (norm.kind != .rms) return false,
                 else => {},
             } else if (@import("../execution/metadata_alias.zig").Plan.lower(graph, id, .metal) == null) return false;
             // These exact heuristics run ahead of the physical branch. Even
