@@ -7870,6 +7870,7 @@ pub const SessionRegistry = struct {
         for (ids.items) |txn_id| {
             const session_lock = self.sessionLock(txn_id);
             session_lock.lock();
+            defer session_lock.unlock();
             self.mutex.lock();
             const still_owned = if (self.sessions.getPtr(txn_id)) |session| shouldRenewLease(session.*, owner_node_id) else false;
             self.mutex.unlock();
