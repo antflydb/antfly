@@ -1921,7 +1921,7 @@ pub const EmbeddingStageControl = struct {
     video_consumer_fn: ?*const fn (*anyopaque, *const ComputeBackend) anyerror!EmbeddingCacheScope = null,
     image_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingImageCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
     vision_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingVisionCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
-    audio_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, @import("cuda/prepared_cache.zig").AudioRecipe, []const *CT) anyerror!EmbeddingCacheScope = null,
+    audio_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, @import("../execution/audio_schedule.zig").AudioRecipe, []const *CT) anyerror!EmbeddingCacheScope = null,
     /// A fenced ready-work boundary may keep its provider when uncontended.
     yield_ready_fn: ?*const fn (*anyopaque) anyerror!void = null,
     /// Marks the actual synchronous cuvid consumer boundary. Only a scope
@@ -1947,7 +1947,7 @@ pub const EmbeddingStageControl = struct {
         const run = self.image_cache_fn orelse return .{};
         return run(self.ptr, cb, request, live_inputs);
     }
-    pub fn audioCache(self: *const @This(), cb: *const ComputeBackend, recipe: @import("cuda/prepared_cache.zig").AudioRecipe, live_inputs: []const *CT) !EmbeddingCacheScope {
+    pub fn audioCache(self: *const @This(), cb: *const ComputeBackend, recipe: @import("../execution/audio_schedule.zig").AudioRecipe, live_inputs: []const *CT) !EmbeddingCacheScope {
         const run = self.audio_cache_fn orelse return .{};
         return run(self.ptr, cb, recipe, live_inputs);
     }

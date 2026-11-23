@@ -1362,7 +1362,7 @@ fn embeddingGemma2ImageConfig() Config {
     };
 }
 
-const AudioCacheRecipe = @import("../ops/cuda/prepared_cache.zig").AudioRecipe;
+const AudioCacheRecipe = @import("../execution/audio_schedule.zig").AudioRecipe;
 fn audioCacheConfig(cfg: AudioConfig) AudioCacheRecipe {
     return .{
         .count = 0,

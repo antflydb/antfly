@@ -13037,7 +13037,7 @@ pub const StagedExecution = struct {
     pub const CachePhase = if (build_options.enable_cuda) struct {
         stage: *StagedExecution,
         work: PreparedCache.Workload,
-        recipe: union(enum) { copied, image: ops.EmbeddingImageCacheRequest, vision: ops.EmbeddingVisionCacheRequest, audio: PreparedCache.AudioRecipe, video: PreparedCache.VideoRecipe } = .copied,
+        recipe: union(enum) { copied, image: ops.EmbeddingImageCacheRequest, vision: ops.EmbeddingVisionCacheRequest, audio: @import("audio_schedule.zig").AudioRecipe, video: PreparedCache.VideoRecipe } = .copied,
         // Official supported topology uses49 encoder requests; vision uses33.
         // Inline values keep warm phases allocator-free and names owned.
         request_storage: [128]PreparedCache.Request = undefined,
@@ -13745,7 +13745,7 @@ pub const StagedExecution = struct {
         return .{ .ptr = self, .close_fn = closeFrontendCache };
     }
 
-    fn audioCache(raw: *anyopaque, cb: *const ops.ComputeBackend, request: PreparedCache.AudioRecipe, live_inputs: []const *ops.CT) anyerror!ops.EmbeddingCacheScope {
+    fn audioCache(raw: *anyopaque, cb: *const ops.ComputeBackend, request: @import("audio_schedule.zig").AudioRecipe, live_inputs: []const *ops.CT) anyerror!ops.EmbeddingCacheScope {
         if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
         const compute = try self.cacheReceiver(cb);
