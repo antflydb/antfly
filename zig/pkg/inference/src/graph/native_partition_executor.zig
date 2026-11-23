@@ -147,10 +147,11 @@ pub const NativePartitionExecutor = struct {
                 if (current_dev != device_id) {
                     const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
                     const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
+                    if (exec_ctx.owned_runtime_transfers) |owned| try owned.ensureUnusedCapacity(allocator, 1);
                     const transferred = try tensor_transfer.copyRuntimeInput(allocator, rt_val, src_entry.backend, cb);
                     values[i] = transferred;
                     if (exec_ctx.owned_runtime_transfers) |owned| {
-                        try owned.put(allocator, node_id, {});
+                        owned.putAssumeCapacity(node_id, {});
                     }
                     if (exec_ctx.stats) |stats| stats.runtime_input_transfers += 1;
                 } else {
@@ -204,7 +205,7 @@ pub const NativePartitionExecutor = struct {
                 if (last_use[input_index] != i) continue;
                 if (rt_map.contains(input_id) and
                     !donated.contains(input_id) and
-                    !ownedRuntimeTransferContains(exec_ctx, input_id)) continue;
+                    !exec_ctx.ownsRuntimeTransfer(input_id)) continue;
                 if (values[input_index]) |ct| {
                     if (values[i]) |out_ct| {
                         if (ct == out_ct and interpreter.canKeepAliasedOutput(n.op)) {
@@ -863,14 +864,6 @@ fn nativeGraphNodeRequiresPlannedExecution(graph: *const Graph, values: []?CT, n
                 native_compute.nativeTensorHasQuantizedStorage(valueAt(values, inputs[2]))),
         else => false,
     };
-}
-
-fn ownedRuntimeTransferContains(
-    exec_ctx: PartitionExecutor.ExecutionContext,
-    node_id: NodeId,
-) bool {
-    const owned = exec_ctx.owned_runtime_transfers orelse return false;
-    return owned.contains(node_id);
 }
 
 test "native partition executor evaluates a partition through backend ops" {

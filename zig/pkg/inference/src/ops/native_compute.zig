@@ -40703,6 +40703,19 @@ fn exportDenseTensorDType(tensor: *const tensor_mod.Tensor) tensor_mod.DType {
     return tensor.dtype;
 }
 
+/// Borrow exact, contiguous integer bytes only for the synchronous transfer.
+pub fn borrowDenseIntegerTransferBytes(backend: *const ComputeBackend, tensor: CT, dtype: tensor_mod.DType, shape: []const i64) ?[]const u8 {
+    if (!isCanonicalVTable(backend.vtable) or (dtype != .i32 and dtype != .i64)) return null;
+    const buf = toBuf(tensor);
+    if (buf.whole_named_weight and weightOrigin(buf) != null) return null;
+    if (buf.view_strides != null or buf.view_base_offset != 0 or buf.quantized_storage != null) return null;
+    const source = buf.source_tensor orelse return null;
+    if (source.dtype != dtype or !std.mem.eql(i64, source.shape, shape)) return null;
+    if (buf.logical_shape) |logical| if (!std.mem.eql(i64, logical, shape)) return null;
+    if (source.data.len != (tensorExpectedDenseByteLen(source) orelse return null)) return null;
+    return source.data;
+}
+
 fn exportTensorDataOp(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror!?ops.ExportTensorData {
     if (@intFromPtr(tensor) == 0) return error.InvalidTensorHandle;
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));

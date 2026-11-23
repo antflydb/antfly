@@ -322,6 +322,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
             const src_val = values[nid] orelse continue;
             const src_dev = value_device[nid];
             if (src_dev != dev_id) {
+                if (options.execution_control) |control| try control.check();
                 const src_entry = mesh.device(src_dev) orelse continue;
                 if (trace_partitions) {
                     std.debug.print(
@@ -338,6 +339,8 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                         },
                     );
                 }
+                const runtime_input = rt_map.contains(ext_in.node_id);
+                if (runtime_input) try owned_runtime_transfers.ensureUnusedCapacity(allocator, 1);
                 var static_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
                 const static_shape = try graphShapeDims(graph.node(ext_in.node_id).output_shape, &static_shape_buf);
                 const planned_transfer = if (options.physical_frame) |frame|
@@ -363,9 +366,7 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                 if (!source_is_borrowed_runtime_input) {
                     src_entry.backend.free(src_val);
                 }
-                if (rt_map.contains(ext_in.node_id)) {
-                    try owned_runtime_transfers.put(allocator, ext_in.node_id, {});
-                }
+                if (runtime_input) owned_runtime_transfers.putAssumeCapacity(ext_in.node_id, {});
             }
         }
 
@@ -427,9 +428,10 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                     const current_dev = value_device[i];
                     if (current_dev != dev_id) {
                         const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
+                        try owned_runtime_transfers.ensureUnusedCapacity(allocator, 1);
                         const transferred = try transferTensor(allocator, rt_val, src_entry.backend, cb);
                         values[i] = transferred;
-                        try owned_runtime_transfers.put(allocator, node_id, {});
+                        owned_runtime_transfers.putAssumeCapacity(node_id, {});
                         if (collect_stats) exec_stats.runtime_input_transfers += 1;
                     } else {
                         values[i] = rt_val;
@@ -869,7 +871,7 @@ test "graph backend partition executes through native partition executor path" {
     try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, raw);
 }
 
-test "native partition executor transfers borrowed runtime input across devices" {
+test "native partition executor transfers borrowed runtime input across devices with partition transfer ownership" {
     const allocator = std.testing.allocator;
 
     var g = Graph.init(allocator);
@@ -931,6 +933,17 @@ test "native partition executor transfers borrowed runtime input across devices"
     const original = try cb_a.toFloat32(input, allocator);
     defer allocator.free(original);
     try std.testing.expectEqualSlices(f32, &input_data, original);
+
+    const AllocationProbe = struct {
+        fn run(scratch: std.mem.Allocator, graph: *const Graph, placement: *const DevicePartitionPlan, devices: *const DeviceMesh, node: NodeId, borrowed: CT) !void {
+            var executed = try executeMultiDevice(scratch, graph, placement, devices, .{
+                .runtime_inputs = &.{.{ .node_id = node, .value = borrowed }},
+            });
+            defer executed.deinit(devices);
+            try std.testing.expectEqual(@as(DeviceId, 1), executed.output_devices[0]);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, AllocationProbe.run, .{ &g, &dpp, &mesh, x, input });
 
     // A resident input on a non-default device needs no upload to that same
     // device. Its owner is independent of the parameter's proposed placement.

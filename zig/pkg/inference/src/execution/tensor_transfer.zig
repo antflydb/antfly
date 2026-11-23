@@ -61,7 +61,7 @@ fn copyImpl(
     if (try to.copyTensorFromBackend(from, value)) |copied| return copied;
     const runtime_shape_needed = if (known_shape) |shape| blk: {
         for (shape) |dim| if (dim < 0) break :blk true;
-        break :blk false;
+        break :blk !(try from.tensorShapeMatches(value, shape) orelse true);
     } else true;
     const owned_shape_i64 = if (runtime_shape_needed) try from.tensorShape(value, allocator) else null;
     defer if (owned_shape_i64) |shape| allocator.free(shape);
@@ -74,17 +74,26 @@ fn copyImpl(
     const dtype = if (allow_untyped_float32 and from.vtable.tensorDType == null) .f32 else try from.tensorDType(value);
     switch (dtype) {
         inline .i8, .i16, .i32, .i64, .u8, .bool_, .f16, .bf16, .f64 => |tag| {
-            const exported = (try from.exportTensorData(value, allocator)) orelse return error.UnsupportedTensorType;
-            const bytes = switch (exported.payload) {
-                .bytes => |bytes| bytes,
-                .quantized_f32 => |quant| {
-                    allocator.free(quant.raw_bytes);
-                    allocator.free(quant.shape);
-                    return error.UnsupportedTensorType;
-                },
+            const borrowed: ?[]const u8 = if (comptime build_options.enable_native)
+                @import("../ops/native_compute.zig").borrowDenseIntegerTransferBytes(from, value, dtype, shape_i64)
+            else
+                null;
+            var owned: ?[]u8 = null;
+            defer if (owned) |data| allocator.free(data);
+            const bytes = borrowed orelse exact: {
+                const exported = (try from.exportTensorData(value, allocator)) orelse return error.UnsupportedTensorType;
+                const data = switch (exported.payload) {
+                    .bytes => |bytes| bytes,
+                    .quantized_f32 => |quant| {
+                        allocator.free(quant.raw_bytes);
+                        allocator.free(quant.shape);
+                        return error.UnsupportedTensorType;
+                    },
+                };
+                owned = data;
+                if (exported.dtype != dtype) return error.UnsupportedTensorType;
+                break :exact data;
             };
-            defer allocator.free(bytes);
-            if (exported.dtype != dtype) return error.UnsupportedTensorType;
             if (try to.fromConstantBytes(bytes, @field(ml.graph.DType, @tagName(tag)), shape_i64)) |exact| return exact;
             if (dtype != .i32 or bytes.len % 4 != 0) return error.UnsupportedTensorType;
             const integers = try allocator.alloc(i32, bytes.len / 4);
@@ -119,6 +128,7 @@ pub fn copyHostFloat32(allocator: std.mem.Allocator, value: CT, from: *const Com
 }
 
 fn copyFloat32(allocator: std.mem.Allocator, value: CT, from: *const ComputeBackend, to: *const ComputeBackend, shape_i32: []const i32) !CT {
+    if (try from.hostFloat32Read(value)) |data| return to.fromFloat32Shape(data, shape_i32);
     const data = try from.toFloat32(value, allocator);
     defer allocator.free(data);
     return to.fromFloat32Shape(data, shape_i32);
@@ -145,4 +155,50 @@ test "transfer dimensions borrow inline storage and retain checked overflow fall
     defer std.testing.allocator.free(owned);
     try std.testing.expectEqualSlices(i32, &.{ 3, 5, 7 }, owned);
     try std.testing.expectError(error.UnsupportedShape, tensorShapeI32(std.testing.allocator, &.{ 3, 5, std.math.maxInt(i64) }, &inline_dimensions));
+}
+
+test "exact Native integer transfer borrows bytes without allocating temporary storage" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    var source_context = try Context.init(allocator, .native, std.testing.io);
+    defer source_context.deinit(allocator);
+    var target_context = try Context.init(allocator, .native, std.testing.io);
+    defer target_context.deinit(allocator);
+    const source = source_context.computeBackend();
+    const target = target_context.computeBackend();
+    const shape = &[_]i64{2};
+    var input: [16]u8 = undefined;
+    std.mem.writeInt(i64, input[0..8], (1 << 56) + 17, .little);
+    std.mem.writeInt(i64, input[8..16], -(1 << 58) + 5, .little);
+    const original = (try source.fromConstantBytes(&input, .i64, shape)) orelse return error.UnsupportedTensorType;
+    var original_owned = true;
+    defer if (original_owned) source.free(original);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const copied = try copyWithKnownShape(failing.allocator(), original, &source, &target, shape);
+    defer target.free(copied);
+    try std.testing.expect(!failing.has_induced_failure);
+    source.free(original);
+    original_owned = false;
+    const exported = (try target.exportTensorData(copied, allocator)) orelse return error.UnsupportedTensorType;
+    const bytes = exported.payload.bytes;
+    defer allocator.free(bytes);
+    try std.testing.expectEqual(.i64, exported.dtype);
+    try std.testing.expectEqualSlices(u8, &input, bytes);
+
+    const copied_with_stale_shape = try copyWithKnownShape(allocator, copied, &target, &source, &.{ 1, 2 });
+    defer source.free(copied_with_stale_shape);
+    try std.testing.expect((try source.tensorShapeMatches(copied_with_stale_shape, shape)).?);
+
+    const floats = [_]f32{ -2, 3 };
+    const float_copy = imported: {
+        const float_input = try source.fromFloat32Shape(&floats, &.{2});
+        defer source.free(float_input);
+        break :imported try copyWithKnownShape(failing.allocator(), float_input, &source, &target, shape);
+    };
+    defer target.free(float_copy);
+    try std.testing.expect(!failing.has_induced_failure);
+    const float_output = try target.toFloat32(float_copy, allocator);
+    defer allocator.free(float_output);
+    try std.testing.expectEqualSlices(f32, &floats, float_output);
 }

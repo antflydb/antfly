@@ -11701,14 +11701,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // terminal status before returning, including a GPU-error return.
         try source.copyInto(target);
     }
-    fn writePhysicalFloat32Op(_: *anyopaque, output: CT, input: []const f32) anyerror!void {
-        const target = toBuf(output).metal_tensor orelse return error.InvalidPhysicalTransferSize;
+    fn writePhysicalFloat32Op(ctx: *anyopaque, output: CT, input: []const f32) anyerror!void {
+        const target = if (toBuf(output).metal_tensor) |*tensor| tensor else return error.InvalidPhysicalTransferSize;
         const lease = target.physicalLease() orelse return error.InvalidPhysicalTransferSize;
-        if (target.dtype != .f32 or target.elemCount() != input.len) return error.InvalidPhysicalTransferSize;
-        // Initialization uses the allocation's private base owner. Published
-        // literal views reject writes through copy/upload/assigned interfaces.
+        if (lease.backend.ptr != ctx or !acceptsPhysicalImplementation(lease.backend.vtable) or target.dtype != .f32 or target.elemCount() != input.len)
+            return error.InvalidPhysicalTransferSize;
+        const bytes = std.mem.sliceAsBytes(input);
+        if (!target.isReadOnlyPhysical()) {
+            lease.invalidateHostIndices();
+            return target.uploadBytes(bytes);
+        }
+        // Immutable literals can be initialized only through their full base
+        // allocation. Writable regions use their exact leased byte range.
         const original = &toBuf(lease.tensor).metal_tensor.?;
-        try original.uploadBytes(std.mem.sliceAsBytes(input));
+        if (target.deviceByteOffset() != original.deviceByteOffset() or target.deviceByteLen() != original.deviceByteLen())
+            return error.InvalidPhysicalTransferSize;
+        try original.uploadBytes(bytes);
     }
     fn gatherDeviceRowsOp(ctx: *anyopaque, output: CT, sources: []const CT) !void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -59461,6 +59469,30 @@ test "Metal authored layer norm backward scratch intervals include stats and par
     const actual = try output.toHostSlice();
     try std.testing.expectEqual(expected.len, actual.len);
     try std.testing.expect(auditMaxAbsDelta(expected, actual) <= 2e-4);
+}
+
+test "Metal physical F32 writes respect the bounded destination view" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(allocator, .metal, std.testing.io);
+    defer context.deinit(allocator);
+    const cb = context.computeBackend();
+    const functions = cb.vtable.kernels.?;
+    const bank = (try ops.physical_storage.Lease.createAdmittedWithUsage(allocator, cb, 32, null, .activation, null, .host_input)) orelse return error.MissingHostBank;
+    defer bank.release();
+    const full = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = bank, .shape = &.{8} })) orelse return error.MissingPhysicalView;
+    defer cb.free(full);
+    try functions.writePhysicalFloat32.?(cb.ptr, full, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const before = try cb.toFloat32(full, allocator);
+    defer allocator.free(before);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, before);
+    const prefix = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = bank, .shape = &.{4} })) orelse return error.MissingPhysicalView;
+    defer cb.free(prefix);
+    try functions.writePhysicalFloat32.?(cb.ptr, prefix, &.{ 11, 12, 13, 14 });
+    const observed = try cb.toFloat32(full, allocator);
+    defer allocator.free(observed);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 12, 13, 14, 5, 6, 7, 8 }, observed);
 }
 
 test "Metal owned shared ingress requires actual managed authority and refuses private or shifted bank views" {

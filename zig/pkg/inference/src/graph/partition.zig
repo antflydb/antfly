@@ -132,6 +132,11 @@ pub const PartitionExecutor = struct {
             return RuntimeInputIndex.init(allocator, options);
         }
 
+        pub fn ownsRuntimeTransfer(self: @This(), node: NodeId) bool {
+            const transfers = self.owned_runtime_transfers orelse return false;
+            return transfers.contains(node);
+        }
+
         /// Every partition backend shares this checkpoint contract. Compiled
         /// executors additionally wire the control into their native runtime
         /// when that runtime exposes an interrupt mechanism.

@@ -175,5 +175,6 @@ test {
     _ = @import("resident_decoder.zig");
     _ = @import("media_prefix.zig");
     _ = @import("physical_buffers.zig");
+    _ = @import("tensor_transfer.zig");
     _ = @import("decoder_checkpoint.zig");
 }

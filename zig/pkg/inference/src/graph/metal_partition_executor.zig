@@ -2260,7 +2260,7 @@ pub const MetalPartitionExecutor = struct {
                         }
                         for (installed.owner.input_nodes) |input| {
                             if (last_use[input] != node_id) continue;
-                            if (rt_map.contains(input) and !donated.contains(input) and !ownedRuntimeTransferContains(effective_exec_ctx, input)) continue;
+                            if (rt_map.contains(input) and !donated.contains(input) and !effective_exec_ctx.ownsRuntimeTransfer(input)) continue;
                             if (values[input]) |value| {
                                 cb.free(value);
                                 values[input] = null;
@@ -3986,7 +3986,7 @@ fn arenaAliasStillLive(
     }
     if (rt_map.contains(alias_node) and
         !donated.contains(alias_node) and
-        !ownedRuntimeTransferContains(exec_ctx, alias_node))
+        !exec_ctx.ownsRuntimeTransfer(alias_node))
     {
         return true;
     }
@@ -16676,6 +16676,7 @@ fn materializePartitionRuntimeInputs(
     const trace_nodes = traceMetalGraphNodesEnabled();
     for (node_ids) |node_id| {
         const rt_val = rt_map.get(node_id) orelse continue;
+        try exec_ctx.check();
         const i: usize = @intCast(node_id);
         const current_dev = value_device[i];
         if (trace_nodes) std.debug.print(
@@ -16683,30 +16684,24 @@ fn materializePartitionRuntimeInputs(
             .{ node_id, current_dev, device_id, isMetalDeviceResident(cb, rt_val) },
         );
         const stay_host_backed = runtimeInputShouldStayHostBackedForDynamicMetalSlot(graph, node_id);
-        if (current_dev != device_id and stay_host_backed) {
+        if (current_dev != device_id) {
             const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
             const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
             if (trace_nodes) std.debug.print(
-                "graph_executor_node_trace: materialize_runtime_input_transfer_host node={d} from_backend={s} to_backend={s}\n",
-                .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()) },
+                "graph_executor_node_trace: materialize_runtime_input_transfer node={d} from_backend={s} to_backend={s} host={}\n",
+                .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()), stay_host_backed },
             );
-            const transferred = try tensor_transfer.copyHostFloat32(allocator, rt_val, src_entry.backend, cb);
+            if (exec_ctx.owned_runtime_transfers) |owned| try owned.ensureUnusedCapacity(allocator, 1);
+            const transferred = if (stay_host_backed)
+                try tensor_transfer.copyHostFloat32(allocator, rt_val, src_entry.backend, cb)
+            else
+                try tensor_transfer.copyRuntimeInput(allocator, rt_val, src_entry.backend, cb);
             values[i] = transferred;
-            if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
-            if (exec_ctx.stats) |stats| stats.runtime_input_transfers += 1;
-        } else if (current_dev != device_id) {
-            const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
-            const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
-            if (trace_nodes) std.debug.print(
-                "graph_executor_node_trace: materialize_runtime_input_transfer node={d} from_backend={s} to_backend={s}\n",
-                .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()) },
-            );
-            const transferred = try tensor_transfer.copyRuntimeInput(allocator, rt_val, src_entry.backend, cb);
-            values[i] = transferred;
-            if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
+            value_device[i] = device_id;
+            if (exec_ctx.owned_runtime_transfers) |owned| owned.putAssumeCapacity(node_id, {});
             if (exec_ctx.stats) |stats| {
                 stats.runtime_input_transfers += 1;
-                if (isMetalDeviceResident(cb, transferred)) stats.device_resident_transfers += 1;
+                if (!stay_host_backed and isMetalDeviceResident(cb, transferred)) stats.device_resident_transfers += 1;
             }
         } else {
             values[i] = rt_val;
@@ -16715,6 +16710,7 @@ fn materializePartitionRuntimeInputs(
         if (!preserve_runtime_input_residency and values[i] != null) {
             const current = values[i].?;
             if (!stay_host_backed and !isMetalDeviceResident(cb, current)) {
+                if (exec_ctx.owned_runtime_transfers) |owned| try owned.ensureUnusedCapacity(allocator, 1);
                 if (trace_nodes) std.debug.print(
                     "graph_executor_node_trace: materialize_runtime_input_make_resident node={d}\n",
                     .{node_id},
@@ -16722,7 +16718,8 @@ fn materializePartitionRuntimeInputs(
                 if (try makeMetalDeviceResident(cb, current)) |device_value| {
                     if (device_value != current) {
                         values[i] = device_value;
-                        if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
+                        if (exec_ctx.owned_runtime_transfers) |owned| owned.putAssumeCapacity(node_id, {});
+                        if (current_dev != device_id) cb.free(current);
                     }
                     if (exec_ctx.stats) |stats| stats.device_resident_transfers += 1;
                 }
@@ -16955,7 +16952,7 @@ fn freeExpiredInputs(
         }
         if (rt_map.contains(input_id) and
             !donated.contains(input_id) and
-            !ownedRuntimeTransferContains(exec_ctx, input_id)) continue;
+            !exec_ctx.ownsRuntimeTransfer(input_id)) continue;
         const ct = values[input_index] orelse continue;
         const input_bytes = outputByteLen(graph.node(input_id).output_shape) orelse 0;
         if (values[node_index]) |out_ct| {
@@ -17025,7 +17022,7 @@ fn sweepExpiredValuesThroughNode(
         }
         if (rt_map.contains(node_id) and
             !donated.contains(node_id) and
-            !ownedRuntimeTransferContains(exec_ctx, node_id)) continue;
+            !exec_ctx.ownsRuntimeTransfer(node_id)) continue;
 
         var has_live_alias = false;
         for (values, 0..) |other_maybe, other_raw_id| {
@@ -17044,7 +17041,7 @@ fn sweepExpiredValuesThroughNode(
             }
             if (rt_map.contains(other_id) and
                 !donated.contains(other_id) and
-                !ownedRuntimeTransferContains(exec_ctx, other_id))
+                !exec_ctx.ownsRuntimeTransfer(other_id))
             {
                 has_live_alias = true;
                 break;
@@ -17097,7 +17094,7 @@ fn promoteLiveValuesAcrossFrameBoundary(
         if (!valueReferencedAfterBoundary(graph, node_ids, boundary_pos, node_id)) continue;
         if (rt_map.contains(node_id) and
             !donated.contains(node_id) and
-            !ownedRuntimeTransferContains(exec_ctx, node_id)) continue;
+            !exec_ctx.ownsRuntimeTransfer(node_id)) continue;
 
         const owned = (try metal_compute_mod.MetalCompute.cloneOutputTensorOwned(cb, ct)) orelse continue;
         errdefer cb.free(owned);
@@ -17317,14 +17314,6 @@ fn countPartitionBoundaryOutputs(view: buffer_plan_mod.PartitionBufferView) u64 
         if (slot_view.roles.output or slot_view.roles.graph_output) count += 1;
     }
     return count;
-}
-
-fn ownedRuntimeTransferContains(
-    exec_ctx: PartitionExecutor.ExecutionContext,
-    node_id: NodeId,
-) bool {
-    const owned = exec_ctx.owned_runtime_transfers orelse return false;
-    return owned.contains(node_id);
 }
 
 const native_compute = @import("../ops/native_compute.zig");

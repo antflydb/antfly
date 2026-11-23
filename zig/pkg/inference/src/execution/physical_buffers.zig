@@ -3296,12 +3296,14 @@ pub const Frame = struct {
     pub fn transfer(self: *Frame, source: *const ops.ComputeBackend, target: *const ops.ComputeBackend, value: CT, node: NodeId, partition: u32) !?CT {
         const index = self.pool.plan.transfer_index.get(buffers.transferKey(node, partition)) orelse return null;
         const binding = self.pool.transfers[index] orelse return null;
-        if (try source.tensorDType(value) != .f32) return null;
         const selected = self.pool.backends[binding.backend_index];
         if (selected.ptr != target.ptr or selected.vtable != target.vtable) return null;
+        if (source.kind() != self.pool.plan.transfers[index].source_backend) return null;
+        if (source.vtable.tensorDType == null or try source.tensorDType(value) != .f32) return null;
+        const dimensions = binding.shape.dims[0..binding.shape.rank()];
+        if (!(try source.tensorShapeMatches(value, dimensions) orelse false)) return null;
         const count: usize = @intCast(binding.shape.numElements().?);
         const result = if (target.kind() == .cuda or target.kind() == .metal) upload: {
-            if (source.kind() != .native) return null;
             const host = (try source.hostFloat32Read(value)) orelse return null;
             if (host.len != count) return error.InvalidPhysicalTransferSize;
             const allocation = (try self.storageForUsage(target, binding.backend_index, binding.allocation, binding.usage)) orelse return null;
@@ -5312,6 +5314,10 @@ test "Native to Metal partition transfer uses its assigned Shared destination" {
     const values = [_]f32{ -2, 3, -5, 7 };
     const source = try host.fromFloat32Shape(&values, &.{4});
     defer host.free(source);
+    const reshaped_source = try host.fromFloat32Shape(&values, &.{ 2, 2 });
+    defer host.free(reshaped_source);
+    try std.testing.expect((try frame.transfer(&host, &metal, reshaped_source, boundary, target_partition)) == null);
+    try std.testing.expect(frame.storages[binding.allocation] == null);
     var observed = @import("runtime_observation.zig").Scope.init();
     defer observed.deinit();
     const result = (try frame.transfer(&host, &metal, source, boundary, target_partition)) orelse return error.MissingPhysicalTransfer;
@@ -5447,6 +5453,10 @@ fn checkHeldPartitionTransfer(from: *const ops.ComputeBackend, to: *const ops.Co
     defer from.free(second);
 
     const partition = partitions.node_assignment[output];
+    const unplanned_source = try physicalTransferTestSource(to, &original);
+    defer to.free(unplanned_source);
+    try std.testing.expect((try frame.transfer(to, to, unplanned_source, boundary, partition)) == null);
+    try std.testing.expectEqual(@as(u64, 0), frame.stats.transfers);
     {
         const held = (try frame.transfer(from, to, first, boundary, partition)) orelse return error.MissingPhysicalTransfer;
         defer to.free(held);
