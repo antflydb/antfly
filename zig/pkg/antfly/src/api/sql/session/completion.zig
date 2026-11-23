@@ -554,10 +554,14 @@ pub fn remaining(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, re
             continue;
         }
         const named: wire.Receipt = .{ .outcomes = &.{outcome} };
-        const complete = settled(server, alloc, named, context) catch false;
-        // A mixed receipt stays unknown. Its independently named, settled
-        // references have no later whole-receipt acknowledgement to await.
-        const retired = complete and (!receipt.unknown or (acknowledge(server, alloc, named, context) catch false));
+        // The issuer checks settlement before acknowledging. Acknowledge
+        // directly for mixed receipts so a retry can finish even after the
+        // issuer deleted the registration and lost the acknowledgement.
+        // The unnamed part of the receipt stays unknown.
+        const retired = if (receipt.unknown)
+            acknowledge(server, alloc, named, context) catch false
+        else
+            settled(server, alloc, named, context) catch false;
         if (!retired) try pending.append(alloc, outcome);
     }
     return .{ .unknown = receipt.unknown, .outcomes = try pending.toOwnedSlice(alloc) };
