@@ -1520,6 +1520,40 @@ test "WAND matching prefixes preserve score order across uneven postings" {
         defer a.free(actual.hits);
         try std.testing.expectEqualDeep(expected.hits, actual.hits);
     };
+
+    const Stoppable = struct {
+        checks: usize = 0,
+        scored: usize = 0,
+        stop: std.atomic.Value(bool) = .init(false),
+
+        pub fn checkActive(self: *@This()) !void {
+            self.checks += 1;
+            const control: @import("execution_control.zig").ExecutionControl = .{ .worker_stop = &self.stop };
+            try control.check();
+        }
+        pub fn minCompetitiveScore(_: *@This()) f32 {
+            return 0;
+        }
+        pub fn worstCompetitiveDocId(_: *@This()) ?u32 {
+            return null;
+        }
+        pub fn markLowerBound(_: *@This()) void {}
+        pub fn collect(self: *@This(), _: ScoredHit) !void {
+            self.scored += 1;
+            self.stop.store(true, .release);
+        }
+    };
+    var scorer = WANDScorer.init(a, doc_count, doc_count, reader.avgDocLen(), .{});
+    defer scorer.deinit();
+    for (names[0..2]) |name| {
+        const lookup = reader.lookup(&name).?;
+        const postings = lookup.postings;
+        try scorer.addTerm(try lookup.iterator(a), lookup.docFreq(), postings.block_max, postings.scoringChunkSize(), 0);
+    }
+    var stopped: Stoppable = .{};
+    try std.testing.expectError(error.Cancelled, scorer.executeInto(&stopped));
+    try std.testing.expect(stopped.scored > 0 and stopped.scored <= 256);
+    try std.testing.expectEqual(@as(usize, 2), stopped.checks);
 }
 
 test "WAND failed term admission releases owned metadata" {

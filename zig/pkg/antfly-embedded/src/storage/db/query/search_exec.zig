@@ -215,6 +215,7 @@ pub const NativeTieOrder = struct {
 pub const LogicalSourceOpener = *const fn (?*anyopaque, Allocator) anyerror!?LogicalSourceReader;
 
 pub const SearchTextQueryExecutor = struct {
+    worker_stop: ?*const std.atomic.Value(bool) = null,
     open_logical_sources: ?LogicalSourceOpener = null,
     load_many_stored_values: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
 
@@ -16833,7 +16834,7 @@ pub fn searchTextQuery(
                     .ctx = executor.ctx,
                     .live_filter = executor.live_filter_doc_set.?,
                     .generation = effective_req.identity_read_generation,
-                    .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                    .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
                     .materialize_after = @max(1024, snapshot.liveDocCount() / 128),
                     .controlled_filter = executor.live_filter_doc_set_controlled,
                 };
@@ -16856,7 +16857,7 @@ pub fn searchTextQuery(
                         .ctx = executor.ctx,
                         .live_filter = TextLiveVisibilityProducer.identityFilter,
                         .generation = effective_req.identity_read_generation,
-                        .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                        .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
                         .materialize_after = @max(1024, snapshot.liveDocCount() / 128),
                         .skip_live_filter = true,
                     };
@@ -16944,7 +16945,7 @@ pub fn searchTextQuery(
             (chunk_backed or try snapshot.hasDocOrdinalCoverage()),
         .text_snapshot_for_doc_num_projection = snapshot,
         .text_project_parent_keys = chunk_backed and executor.native_key == null,
-        .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+        .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
         .apply_live_all_docs = apply_broad_live_all_docs,
     });
     defer native_constraints.deinit(alloc);
@@ -16974,7 +16975,7 @@ pub fn searchTextQuery(
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = effective_req.identity_read_generation,
             .text_project_parent_keys = chunk_backed and executor.native_key == null,
-            .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+            .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
         });
     }
     const resolved_filter_ns = if (bench_query_profile) platform_time.monotonicNs() - resolved_filter_start_ns else 0;
@@ -17055,7 +17056,7 @@ pub fn searchTextQuery(
         effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
     {
         try checkSearchRequestDeadline(effective_req);
-        const total = try search_mod.countMatchesPreparedWithControl(alloc, snapshot, search_query, effective_req.text_navigation_plan, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs });
+        const total = try search_mod.countMatchesPreparedWithControl(alloc, snapshot, search_query, effective_req.text_navigation_plan, .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs });
         try checkSearchRequestDeadline(effective_req);
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
     }
@@ -17089,7 +17090,7 @@ pub fn searchTextQuery(
             else => return err,
         };
         if (membership_filter) |filter| {
-            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }), .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns });
+            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter.withControl(.{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }), .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns });
             defer membership.deinit(alloc);
 
             const cost_decision = sortedSegmentSelectiveCandidateDocValuesDecision(effective_req, membership.candidate_count, snapshot);
@@ -17179,7 +17180,7 @@ pub fn searchTextQuery(
                 alloc,
                 effective_req,
                 snapshot,
-                filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }),
+                filter.withControl(.{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }),
                 executor,
                 field_sort_plan,
             );
@@ -17267,12 +17268,12 @@ pub fn searchTextQuery(
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
-            try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
+            try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
         else
             try search_mod.execute(alloc, snapshot, .{
                 .doc_num_predicate = doc_predicate,
                 .query = search_query,
-                .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership },
+                .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
                 .offset = if (collect_window_candidates) 0 else paging.offset,
                 .include_stored = load_stored_in_search_engine,

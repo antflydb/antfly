@@ -34,6 +34,15 @@ pub const SnapshotAdmission = struct {
         return self.mutation_revision.load(.monotonic);
     }
 
+    /// Observe a quiet admission without competing with other observers.
+    /// The lock covers the gap before a mutator increments its revision.
+    pub fn quietRevision(self: *const @This()) ?u64 {
+        const before = self.mutation_revision.load(.acquire);
+        if (self.lock.state.load(.acquire) != 0) return null;
+        const after = self.mutation_revision.load(.acquire);
+        return if (before == after) after else null;
+    }
+
     pub const MutationLease = struct {
         admission: *SnapshotAdmission,
         // Capture-owned helpers are scoped borrows: they must finish before
@@ -80,7 +89,7 @@ pub const SnapshotAdmission = struct {
 
         pub fn borrowMutation(self: *const @This()) MutationLease {
             std.debug.assert(self.active);
-            _ = self.admission.mutation_revision.fetchAdd(1, .monotonic);
+            _ = self.admission.mutation_revision.fetchAdd(1, .release);
             return .{ .admission = self.admission, .capture = self };
         }
 
@@ -97,7 +106,7 @@ pub const SnapshotAdmission = struct {
 
     pub fn acquireMutation(self: *@This()) MutationLease {
         self.lock.lockShared();
-        _ = self.mutation_revision.fetchAdd(1, .monotonic);
+        _ = self.mutation_revision.fetchAdd(1, .release);
         return .{ .admission = self };
     }
 
@@ -105,13 +114,13 @@ pub const SnapshotAdmission = struct {
     /// while another operation owns or is waiting for a snapshot capture.
     pub fn tryAcquireMutation(self: *@This()) ?MutationLease {
         if (!self.lock.tryLockShared()) return null;
-        _ = self.mutation_revision.fetchAdd(1, .monotonic);
+        _ = self.mutation_revision.fetchAdd(1, .release);
         return .{ .admission = self };
     }
 
     pub fn acquireMutationIo(self: *@This(), io: std.Io, cancellation: anytype) !MutationLease {
         try self.lock.lockSharedIo(io, cancellation);
-        _ = self.mutation_revision.fetchAdd(1, .monotonic);
+        _ = self.mutation_revision.fetchAdd(1, .release);
         return .{ .admission = self };
     }
 
@@ -138,15 +147,20 @@ test "storage.db snapshot admission capture revisions include nonblocking mutati
     var admission: SnapshotAdmission = .{};
     var before = admission.tryAcquireCapture().?;
     const revision = admission.mutationRevision();
+    try std.testing.expect(admission.quietRevision() == null);
     try std.testing.expect(admission.tryAcquireMutation() == null);
     try std.testing.expectEqual(revision, admission.mutationRevision());
     before.release();
+    try std.testing.expectEqual(@as(?u64, revision), admission.quietRevision());
+    try std.testing.expectEqual(@as(?u64, revision), admission.quietRevision());
 
     var mutation = admission.tryAcquireMutation().?;
+    try std.testing.expect(admission.quietRevision() == null);
     var retained = mutation.retain();
     mutation.release();
     try std.testing.expect(admission.tryAcquireCapture() == null);
     retained.release();
+    try std.testing.expectEqual(@as(?u64, revision + 1), admission.quietRevision());
 
     var after = admission.tryAcquireCapture().?;
     defer after.release();

@@ -52616,8 +52616,9 @@ pub const DB = struct {
             (if (req.cancellation) |token| token.check_fn == null else true) and
             (exec_ctx.max_parallelism orelse 2) >= 2 and ttlDurationNs(self) == 0;
         const scratch = if (can_overlap) HybridComponents.Budget.reclaimingAllocator(alloc) else alloc;
-        // Known quotas must be able to refund discarded speculation.
-        const reusable = !can_overlap or HybridComponents.Budget.headroom(scratch) == null or
+        // Only recognized allocator chains can cross threads and refund
+        // discarded speculation. Unknown caller allocators stay on the caller.
+        const reusable = can_overlap and
             (HybridComponents.Budget.reusableHeadroom(scratch) orelse 0) >= HybridComponents.workspace_bytes;
         const io = if (can_overlap and reusable) exec_ctx.io orelse self.backend_runtime.io() else null;
         const probe = if (builtin.is_test) test_hybrid_probe else null;
@@ -52626,7 +52627,10 @@ pub const DB = struct {
             .io = io,
             .sources = if (io != null) .{
                 .text = self.core.textIndexEntry(if (req.full_text_queries.len == 1) req.full_text_queries[0].index_name else req.index_name),
-                .filter_text = self.core.textIndexEntry(req.primary_text_index_name orelse req.index_name),
+                .filter_text = if (req.primary_text_index_name) |name|
+                    self.core.textIndexEntry(name) orelse self.core.textIndexEntry(req.index_name) orelse self.core.textIndexEntry(null)
+                else
+                    self.core.textIndexEntry(req.index_name) orelse self.core.textIndexEntry(null),
                 .dense = self.core.denseIndex(if (req.dense_queries.len == 1) req.dense_queries[0].index_name else req.index_name),
             } else .{},
             .probe = probe,
@@ -52684,7 +52688,7 @@ pub const DB = struct {
         started: Io.Event = .unset,
         release: Io.Event = .unset,
         workspace_bytes: usize = HybridComponents.workspace_bytes,
-        publish: bool = false,
+        replacement: ?struct { id: u64, bytes: []const u8 } = null,
         cancellation: ?*std.atomic.Value(bool) = null,
         overlapped: bool = false,
         retry: ?anyerror = null,
@@ -52720,35 +52724,30 @@ pub const DB = struct {
         lexical_budget: Budget = undefined,
 
         fn textEpoch(entry: ?*index_manager_mod.IndexManager.TextIndex) ?u64 {
-            const persistent = &(entry orelse return null).persistent;
-            const pinned = persistent.acquireSnapshot();
-            defer pinned.release();
-            return pinned.epoch;
+            return (entry orelse return null).persistent.writer.snapshotEpoch();
         }
 
         fn readCut(self: *HybridComponents) ?Cut {
             const db = self.db;
-            // Briefly sample both fences in canonical order. Between the two
-            // samples writers can proceed. Accept the batch only if neither
-            // mutation domain changed from filter planning through retrieval.
-            var primary = db.core.snapshot_admission.tryAcquireCapture() orelse return null;
-            defer primary.release();
-            var replay = db.core.snapshot_replay_admission.tryAcquireCapture() orelse return null;
-            defer replay.release();
+            const primary = db.core.snapshot_admission.quietRevision() orelse return null;
+            const replay = db.core.snapshot_replay_admission.quietRevision() orelse return null;
             const generation = if (self.sources.dense) |entry| entry.index.publishedGeneration() else null;
             const mutation = if (self.sources.dense) |entry| entry.index.publishedMutationEpoch() else null;
-            // An odd epoch denotes an in-flight HBC update, including
-            // updates that have yet to mark their durable generation.
             if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return null;
-            return .{
-                .primary = db.core.snapshot_admission.mutationRevision(),
-                .replay = db.core.snapshot_replay_admission.mutationRevision(),
+            const cut: Cut = .{
+                .primary = primary,
+                .replay = replay,
                 .revision = db.core.store.query_generation_revision.load(.acquire),
                 .text_epoch = textEpoch(self.sources.text),
                 .filter_text_epoch = if (self.sources.text == self.sources.filter_text) null else textEpoch(self.sources.filter_text),
                 .dense_generation = generation,
                 .dense_mutation = mutation,
             };
+            // Bracket source sampling in reverse order so both mutation
+            // domains were quiet over a common interval.
+            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, replay) or
+                db.core.snapshot_admission.quietRevision() != @as(?u64, primary)) return null;
+            return cut;
         }
 
         const Lexical = struct {
@@ -52760,10 +52759,9 @@ pub const DB = struct {
             diagnostic: ?db_query_search.SortRejectionDiagnostic = null,
             diagnostic_field: [256]u8 = undefined,
 
-            fn isCancelled(raw: *const anyopaque) bool {
-                const worker: *const Lexical = @ptrCast(@alignCast(raw));
-                return worker.cancelled.load(.acquire) or
-                    if (worker.component.request.cancellation) |parent| parent.isCancelled() else false;
+            fn searchDefault(raw: ?*anyopaque, a: Allocator, req: types.SearchRequest, query: types.TextQuery) anyerror!types.SearchResult {
+                const worker: *Lexical = @ptrCast(@alignCast(raw.?));
+                return worker.owner.db.searchTextQueryControlled(a, req, query, &worker.cancelled);
             }
 
             fn run(worker: *@This()) anyerror!types.SearchResult {
@@ -52783,15 +52781,13 @@ pub const DB = struct {
                     probe.started.set(io);
                     try probe.release.wait(io);
                 }
-                var req = worker.component.request;
-                const cancellation: types.CancellationToken = .{ .ptr = worker, .is_cancelled_fn = isCancelled };
-                req.cancellation = cancellation;
+                const req = worker.component.request;
                 const db = worker.owner.db;
                 const a = worker.owner.lexical_budget.allocator();
                 try db_query_search.checkSearchRequestDeadline(req);
                 return switch (worker.component.query) {
-                    .text => |query| db.searchTextQuery(a, req, query),
-                    .default_text => db.searchText(a, req),
+                    .text => |query| db.searchTextQueryControlled(a, req, query, &worker.cancelled),
+                    .default_text => db_query_search.searchText(a, req, .{ .ctx = worker, .func = searchDefault }),
                     else => unreachable,
                 };
             }
@@ -52841,13 +52837,14 @@ pub const DB = struct {
 
             if (self.probe) |probe| {
                 probe.overlapped = true;
-                if (probe.publish) {
-                    // Use the same admission as asynchronous text publication.
+                defer probe.release.set(io);
+                if (probe.replacement) |segment| {
                     var mutation = self.db.core.snapshot_replay_admission.acquireMutation();
-                    mutation.release();
+                    defer mutation.release();
+                    const replaced = try self.sources.text.?.persistent.replaceSegmentsIfActive(&.{segment.id}, segment.bytes);
+                    if (!replaced) return error.TestUnexpectedResult;
                 }
                 if (probe.cancellation) |signal| signal.store(true, .release);
-                probe.release.set(io);
             }
 
             try lexical.done.wait(io);
@@ -53299,6 +53296,10 @@ pub const DB = struct {
     }
 
     fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
+        return self.searchTextQueryControlled(alloc, req, text_query, null);
+    }
+
+    fn searchTextQueryControlled(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery, worker_stop: ?*const std.atomic.Value(bool)) !types.SearchResult {
         if (self.core.textIndexEntry(req.index_name) == null and (textQueryHasLogicalValues(text_query) or (if (req.filter_text) |filter| textQueryHasLogicalValues(filter) else false) or (if (req.exclusion_text) |filter| textQueryHasLogicalValues(filter) else false))) {
             return self.searchLogicalValuesWithoutTextIndex(alloc, req, text_query);
         }
@@ -53421,6 +53422,7 @@ pub const DB = struct {
         const start_ns = platform_time.monotonicNs();
         errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
         const result = try db_query_search.searchTextQuery(alloc, execution_req, text_query, .{
+            .worker_stop = worker_stop,
             // Native artifact IDs are binary storage keys. Public sort/cursor
             // identity must be projected before comparing and selecting a page.
             .project_key = if (chunk_backed_for_filter and member_mode_for_filter) publicArtifactSearchKeyCallback else null,
@@ -132822,19 +132824,34 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     try std.testing.expect(!probe.overlapped);
     try std.testing.expectEqualDeep(serial.hits, saturated.hits);
 
-    probe = .{ .publish = true };
+    const published_index = db.core.textIndexEntry("ft_v1").?;
+    const text_view = published_index.persistent.acquireSnapshot();
+    defer text_view.release();
+    const segment = text_view.segments[0];
+    const before_epoch = text_view.epoch;
+    probe = .{ .replacement = .{ .id = segment.id, .bytes = segment.data.bytes() } };
     var revised = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
     defer revised.deinit();
     try std.testing.expect(probe.overlapped);
     try std.testing.expectEqual(@as(?anyerror, error.HybridReadCutChanged), probe.retry);
-    try std.testing.expectEqualDeep(serial.hits, revised.hits);
+    try std.testing.expect(published_index.persistent.writer.snapshotEpoch() != before_epoch);
+    var after_publication = try db.searchWithExecutionContext(alloc, filtered, .{ .max_parallelism = 1 });
+    defer after_publication.deinit();
+    try std.testing.expectEqualDeep(after_publication.hits, revised.hits);
+
+    var opaque_allocator = std.testing.FailingAllocator.init(alloc, .{});
+    probe = .{};
+    var opaque_result = try db.searchWithExecutionContext(opaque_allocator.allocator(), filtered, parallel_context);
+    defer opaque_result.deinit();
+    try std.testing.expect(!probe.overlapped);
+    try std.testing.expectEqualDeep(after_publication.hits, opaque_result.hits);
 
     probe = .{ .workspace_bytes = 1 };
     var memory_fallback = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
     defer memory_fallback.deinit();
     try std.testing.expect(probe.overlapped);
     try std.testing.expectEqual(@as(?anyerror, error.HybridSerialRetry), probe.retry);
-    try std.testing.expectEqualDeep(serial.hits, memory_fallback.hits);
+    try std.testing.expectEqualDeep(after_publication.hits, memory_fallback.hits);
 
     var signal = std.atomic.Value(bool).init(false);
     probe = .{ .cancellation = &signal };
@@ -132863,7 +132880,7 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     defer guarded_result.deinit();
     try std.testing.expect(!probe.overlapped);
     try std.testing.expect(predicate.calls != 0);
-    try std.testing.expectEqualDeep(serial.hits, guarded_result.hits);
+    try std.testing.expectEqualDeep(after_publication.hits, guarded_result.hits);
 
     probe = .{};
     var invalid = req;
