@@ -372,7 +372,7 @@ pub const Sink = struct {
 
     fn loadTipAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
         const self: *Sink = @ptrCast(@alignCast(ptr));
-        return try self.loadScopeAlloc(allocator, scope, .tip, false);
+        return try self.loadScopeAlloc(allocator, scope, .tip, true);
     }
 
     fn loadScopeAlloc(self: *Sink, allocator: Allocator, scope: []const u8, which: enum { mirrored, tip }, comptime keys_only: bool) ![]native_catalog_backend.Entry {
@@ -380,7 +380,10 @@ pub const Sink = struct {
         defer txn.abort();
         const file = try txn.readFile();
 
-        const prefix = try scopePrefixAlloc(allocator, scope);
+        const prefix = switch (which) {
+            .mirrored => try scopePrefixAlloc(allocator, scope),
+            .tip => try durableKeyAlloc(allocator, scope, native_catalog_backend.tip_namespace, ""),
+        };
         defer allocator.free(prefix);
 
         var cursor = try file.indexCatalogCursor(txn.checkpoint, prefix);
@@ -584,6 +587,15 @@ test "native catalog sink: a mid-stream index admission is visible to loadAllAll
     try std.testing.expectEqualStrings("seg-two", findEntry(reloaded, "segments", "range:0002").?);
     try std.testing.expectEqualStrings("seg-three", findEntry(reloaded, "segments", "range:0003").?);
     try std.testing.expectEqualStrings("768", findEntry(reloaded, "meta", "dims").?);
+
+    try iface.submit(iface.ptr, scope, &.{
+        .{ .namespace = native_catalog_backend.tip_namespace, .key = "doc", .value = "version" },
+    }, true);
+    const tip = try iface.loadTipAlloc.?(iface.ptr, a, scope);
+    defer freeEntries(a, tip);
+    try std.testing.expectEqual(@as(usize, 1), tip.len);
+    try std.testing.expectEqualStrings("doc", tip[0].key);
+    try std.testing.expectEqualStrings("", tip[0].value);
 
     const keys = try iface.loadKeysAlloc.?(iface.ptr, a, scope);
     defer freeEntries(a, keys);

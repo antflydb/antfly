@@ -113,8 +113,9 @@ pub const Sink = struct {
     loadOneAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
     /// Reads all keys at one durable checkpoint. Results use the supplied arena.
     loadMany: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, keys: []const Mutation, values: []?[]const u8) anyerror!void = null,
-    /// With `loadOneAlloc`: every committed `tip_namespace` entry of `scope`
-    /// (which `loadAllAlloc` leaves out), for removing them all.
+    /// With `loadOneAlloc`: every committed `tip_namespace` key of `scope`
+    /// (which `loadAllAlloc` leaves out), for removing them all. Values may
+    /// be empty because deletion only consumes the keys.
     loadTipAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
     /// Whether `submit` runs a commit's `Resolver`s itself, while applying
     /// the commit at the file's tip. When false, the backend resolves them
@@ -778,7 +779,7 @@ pub const Backend = struct {
         return self.sink.loadOneAlloc != null;
     }
 
-    /// Every committed `tip_namespace` entry (empty without tip reads).
+    /// Keys of committed `tip_namespace` entries (empty without tip reads).
     /// Free with `freeEntries`.
     pub fn loadTipEntriesAlloc(self: *const Backend, allocator: Allocator) ![]Entry {
         const load_tip = self.sink.loadTipAlloc orelse return try allocator.alloc(Entry, 0);

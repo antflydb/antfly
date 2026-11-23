@@ -15513,6 +15513,30 @@ pub const HBCIndex = struct {
             try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
         }
 
+        // A reader that has warmed its caches adopts an externally
+        // committed overwrite through the key delta alone.
+        {
+            var peer = try idx.forkInlineWriter();
+            defer peer.close();
+            var update = try peer.insertWithMetadataStaged(1, &.{ 0.0, 1.0 }, "peer");
+            defer peer.abortStagedWrite(&update);
+            try commitStaged(a, test_sink.sink(), scope, update.mutations);
+            const delta = try a.alloc(native_catalog_backend.Mutation, update.mutations.len);
+            defer a.free(delta);
+            for (update.mutations, delta) |m, *out| {
+                out.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+            }
+            try idx.refreshCatalogDelta(delta);
+            try std.testing.expectEqual(@as(u64, 1), idx.publishedActiveCount());
+            const doc = (try idx.getMetadata(1)).?;
+            defer a.free(doc);
+            try std.testing.expectEqualStrings("peer", doc);
+            var results = try idx.searchWithRequest(.{ .query = &.{ 0.0, 1.0 }, .k = 1, .search_effort = 1.0 });
+            defer results.deinit();
+            try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
+            try std.testing.expectApproxEqAbs(@as(f32, 0), results.getHits()[0].distance, 0.001);
+        }
+
         // --- Delete, staged ---
         const submits_before_delete = test_sink.submit_calls;
         var del_staged = try idx.deleteStaged(1);
