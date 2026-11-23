@@ -731,17 +731,29 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                             .runtime = ingress.runtime(),
                         };
                         try controller.enroll(a, "default");
+                        var command = try controller.take(a, @splat(42));
+
                         var successor = (try producer.load(&durable, a, connection)).?;
                         defer successor.deinit();
+                        try native.submit(successor.value, .{ .effect = .{ .command = command.ticket.command, .effect = .{
+                            .backend = command.fence.backend,
+                            .sequence = 1,
+                            .nonce = native.nonce(),
+                            .action = .{ .try_acquire = .{ .resource = @splat(7), .mode = .{ .advisory = .exclusive }, .scope = .session } },
+                        } } });
                         var before_ack = try native.port().snapshot(a, successor.value);
                         defer before_ack.deinit();
+                        try std.testing.expectEqual(@as(u32, 1), before_ack.value.owner.?.resources);
                         var seal = try std.json.parseFromSlice(transactions.ExternalPreparationSeal, a, bytes.external_preparation.?, .{});
                         defer seal.deinit();
+                        const reads_before = native.scope_reads;
                         try owner.acknowledgeReceipt(region.allocator(), seal.value.identity);
+                        try std.testing.expectEqual(reads_before + 1, native.scope_reads);
                         var after_ack = try native.port().snapshot(a, successor.value);
                         defer after_ack.deinit();
                         try std.testing.expectEqualDeep(before_ack.value.scope, after_ack.value.scope);
                         try std.testing.expectEqualDeep(before_ack.value.owner, after_ack.value.owner);
+                        try command.finish(a);
                         cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
                         try std.testing.expectEqual(@as(usize, 0), cut.receipts.len);
                     }
@@ -3385,6 +3397,16 @@ test "SQL command producer native population read cancellation retains the paren
                 var pending = (try durable.load(transaction_id)).?;
                 defer pending.deinit(a);
                 try std.testing.expect(pending.external_preparation != null and !pending.terminal_abort and !pending.external_receipt_acknowledged);
+                var previous = (try producer.load(&durable, a, connection)).?;
+                defer previous.deinit();
+                var replacement = previous.value.registration;
+                replacement.replaces = replacement.lease.backend;
+                replacement.lease.backend.fence += 1;
+                replacement.nonce = native.nonce();
+                try std.testing.expectError(error.SqlConnectionAlreadyExists, producer.create(&durable, "alice", replacement, actor, id(992), try native.head(), native.nonce(), 2, previous.value.revision));
+                var original = try native.port().snapshot(a, previous.value);
+                defer original.deinit();
+                try std.testing.expectEqual(transaction_id, original.value.scope.?.transaction.?.id);
                 canceled.store(false, .release);
                 native.block_cancel = false;
                 native.cancel_on_block = null;

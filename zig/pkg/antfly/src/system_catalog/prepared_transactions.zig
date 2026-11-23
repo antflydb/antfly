@@ -1685,6 +1685,7 @@ pub const Read = union(enum) {
 pub const Snapshot = struct {
     standalone: bool = false,
     publication_capture_ready: bool = false,
+    scope_supersession_ready: bool = false,
     catalog_revision: u64 = 0,
     incarnation: [16]u8,
     head: u64,
@@ -1697,7 +1698,9 @@ pub const Snapshot = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            if (!(comptime std.mem.eql(u8, field, "publication_capture_ready")) or self.publication_capture_ready) {
+            const omitted = ((comptime std.mem.eql(u8, field, "publication_capture_ready")) and !self.publication_capture_ready) or
+                ((comptime std.mem.eql(u8, field, "scope_supersession_ready")) and !self.scope_supersession_ready);
+            if (!omitted) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
             }

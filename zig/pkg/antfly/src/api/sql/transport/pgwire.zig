@@ -2587,7 +2587,7 @@ const OwnedRead = struct {
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         errdefer if (self.decision_runtime) |*active| active.deinit();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
-        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .allow_revision_advance = request.expected_stream_columns != null and plainTableProjection(plan.compiled()) };
+        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .allow_revision_advance = request.expected_stream_columns != null and tableOnlyPreparedRead(plan.compiled()) };
         try self.guarded.indexLargeGuard(arena);
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
         self.native_adapter.graph_parameters = parameters;
@@ -2942,16 +2942,26 @@ const OwnedRead = struct {
 
 const ReadRevision = struct { grants: u64, token: u64 };
 
-// Direct projections have no independently rebound expressions.
-fn plainTableProjection(compiled: *const compiler.Compiled) bool {
+// These scan clauses bind only to the table layout captured by the guard.
+fn tableOnlyPreparedRead(compiled: *const compiler.Compiled) bool {
     if (compiled.statement != .select or compiled.parameter_count != 0 or compiled.uses_current_setting) return false;
     const select = compiled.statement.select;
     if (select.source) |source| {
         if (source.* != .table or source.table.search != null or source.table.graph != null or source.table.graph_search != null) return false;
     } else if (select.table == null) return false;
     if (select.ctes.len != 0 or select.values_arms.len != 0 or select.set_operation != null or
-        select.predicate != null or select.having != null or select.count_all or select.distinct != null or
-        select.windows.len != 0 or select.group_by.len != 0 or select.order_by.len != 0 or select.locking != null) return false;
+        select.having != null or select.count_all or select.distinct != null or
+        select.windows.len != 0 or select.group_by.len != 0 or select.locking != null) return false;
+    if (select.predicate) |predicate| switch (predicate.*) {
+        .is_null => {},
+        .scalar => |expr| {
+            if (expr.* != .unary or (expr.unary.op != .is_null and expr.unary.op != .is_not_null) or expr.unary.operand.* != .column) return false;
+        },
+        else => return false,
+    };
+    for (select.order_by) |order| {
+        if (order.expression) |expression| if (expression.* != .column) return false;
+    }
     for (select.columns) |column| {
         if (column.expression) |expression| if (expression.* != .column) return false;
     }
@@ -5950,7 +5960,10 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
         }
     };
     var baseline: [2]usize = undefined;
-    for ([_]bool{ false, true }) |guarded| for ([_]bool{ false, true }, 0..) |change, scenario| {
+    for ([_][]const u8{
+        "SELECT id FROM usage_records",
+        "SELECT id FROM usage_records WHERE id IS NOT NULL ORDER BY id",
+    }) |statement| for ([_]bool{ false, true }) |guarded| for ([_]bool{ false, true }, 0..) |change, scenario| {
         source.catalog_revision = 7;
         source.catalog_stamp_reads.store(0, .monotonic);
         source.catalog_reads.store(0, .monotonic);
@@ -5962,7 +5975,9 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
         try input.writer.writeInt(u32, 196608, .big);
         try input.writer.writeAll(startup);
         try Frames.write(&input.writer, 'p', "secret\x00");
-        try Frames.write(&input.writer, 'P', "plan\x00SELECT id FROM usage_records\x00\x00\x00");
+        const parse = try std.fmt.allocPrint(a, "plan\x00{s}\x00\x00\x00", .{statement});
+        defer a.free(parse);
+        try Frames.write(&input.writer, 'P', parse);
         try Frames.write(&input.writer, 'B', "portal\x00plan\x00\x00\x00\x00\x00\x00\x00");
         try Frames.write(&input.writer, 'E', "portal\x00\x00\x00\x00\x00");
         try Frames.write(&input.writer, 'S', "");

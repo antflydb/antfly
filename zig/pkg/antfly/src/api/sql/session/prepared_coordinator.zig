@@ -742,6 +742,32 @@ pub const Registry = struct {
         return (fenced or head_fence) and cut.records.len == 0 and cut.receipts.len == 0;
     }
 
+    fn scopeRecoveryQuery(anchor: registry.Snapshot, identity: registry.Identity, ref: @import("../../../system_catalog/lock_authority.zig").Ref) @import("../../../system_catalog/lock_authority.zig").Query {
+        var query: @import("../../../system_catalog/lock_authority.zig").Query = .{
+            .incarnation = anchor.incarnation,
+            .standalone = anchor.standalone,
+            .actor = .{ .session_user = .bootstrap, .credential = "" },
+            .database = identity.database_id,
+            .backend = ref.backend,
+        };
+        if (anchor.scope_supersession_ready) if (identity.session) |session| {
+            if (session.connection_id) |id| query.retired_connection = .{ .id = id, .node = session.owner_node_id };
+        };
+        return query;
+    }
+
+    fn observeRecoveryScope(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query, session: ?registry.SessionRef) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
+        const types = @import("../../../system_catalog/lock_authority.zig");
+        const result = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
+        if (result.scope != null or query.retired_connection != null) return result;
+        // During mixed-version rollout the previous decoder supports proof
+        // on demand. Gate the combined request on the advertised capability.
+        const bound = session orelse return result;
+        var proof = query;
+        proof.retired_connection = .{ .id = bound.connection_id orelse return result, .node = bound.owner_node_id };
+        return std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = proof }), .{});
+    }
+
     /// Unadmitted SQL may already hold transaction locks. Native cleanup must
     /// prove the original purpose was rejected or permanently fenced, in the
     /// same writer transaction that releases a quantum of those locks.
@@ -754,9 +780,9 @@ pub const Registry = struct {
         context.sql_command_fence = null;
         context.sql_completion = null;
         context.sql_completion_submission = null;
-        const query: types.Query = .{ .incarnation = anchor.incarnation, .standalone = anchor.standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = seal.identity.database_id, .backend = ref.backend };
-        const before = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
-        const scope = before.scope orelse return error.InvalidSqlBackendResponse;
+        const query = scopeRecoveryQuery(anchor, seal.identity, ref);
+        const before = try self.observeRecoveryScope(a, context, query, seal.identity.session);
+        const scope = before.scope orelse return if (before.superseded == true) true else error.InvalidSqlBackendResponse;
         if (scope.next_command > ref.command.sequence or scope.transaction == null) return true;
         if (!std.meta.eql(scope.transaction, @as(?types.scopes.Transaction, .{ .id = seal.identity.txn_id }))) return error.ExternalTransactionDecisionChanged;
         var nonce: [16]u8 = undefined;
@@ -768,8 +794,8 @@ pub const Registry = struct {
         _ = try result.result();
         self.anchor = null;
         // One bounded cleanup quantum, then yield to the existing supervisor.
-        const after = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
-        return after.scope != null and after.scope.?.transaction == null;
+        const after = try self.observeRecoveryScope(a, context, query, seal.identity.session);
+        return after.superseded == true or after.scope != null and after.scope.?.transaction == null;
     }
 
     /// One journal quantum per recovery pass. Scope cleanup shares the same
@@ -783,19 +809,9 @@ pub const Registry = struct {
         };
         var context = self.context;
         context.setting_admin = true;
-        const query: types.Query = .{ .incarnation = anchor.incarnation, .standalone = anchor.standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = identity.database_id, .backend = ref.backend };
-        const before = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
-        const scope = before.scope orelse {
-            const session = identity.session orelse return error.InvalidSqlBackendResponse;
-            var proof_query = query;
-            proof_query.retired_connection = .{
-                .id = session.connection_id orelse return error.InvalidSqlBackendResponse,
-                .node = session.owner_node_id,
-            };
-            const proof = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = proof_query }), .{});
-            if (proof.superseded != true) return error.InvalidSqlBackendResponse;
-            return true;
-        };
+        const query = scopeRecoveryQuery(anchor, identity, ref);
+        const before = try self.observeRecoveryScope(a, context, query, identity.session);
+        const scope = before.scope orelse return if (before.superseded == true) true else error.InvalidSqlBackendResponse;
         // A completed sealed command is a permanent cleanup witness, even if
         // later transactions have replaced the single recent release marker.
         if (scope.next_command > ref.command.sequence) return true;
@@ -813,8 +829,8 @@ pub const Registry = struct {
         _ = try result.result();
         self.server.sql_lock_work_pending.store(true, .release);
         self.anchor = null; // Scope progress advances the shared admission head.
-        const after = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
-        return after.scope != null and after.scope.?.transaction == null and std.meta.eql(after.scope.?.released_transaction, @as(?types.scopes.Transaction, expected));
+        const after = try self.observeRecoveryScope(a, context, query, identity.session);
+        return after.superseded == true or after.scope != null and after.scope.?.transaction == null and std.meta.eql(after.scope.?.released_transaction, @as(?types.scopes.Transaction, expected));
     }
     pub fn acknowledgeReceipt(self: *@This(), a: A, identity: registry.Identity) !void {
         const scope_released = self.releaseScopeQuantum(a, identity) catch |err| {
