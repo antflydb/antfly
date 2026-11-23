@@ -1376,15 +1376,15 @@ pub const PreparedSingleToken = struct {
             slab.* = .{ .k = k, .v = v, .cross_k = cross_k, .cross_v = cross_v };
             built += 1;
         }
-        const authored = try authorPhase(cb, source_data, a, config, encoder, rows, weights, slabs, preparation, spec, storage);
+        try validateCrossDestinations(cb, source_data, config, encoder, rows, weights, slabs);
+        const authored = try authorPhase(cb, source_data, a, config, rows, weights, slabs, preparation, spec, storage);
         errdefer authored.schedule.deinit(.{ .outside_execution = true });
         const cache_layers = try a.alloc(DecodeCache.LayerCache, config.decoder_layers);
         errdefer a.free(cache_layers);
         return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = authored.schedule, .source_data = source_data, .self_slabs = slabs, .token_node = authored.token_node, .position_node = authored.position_node, .cache_layers = cache_layers, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
     }
-    fn authorPhase(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, slabs: []const Slab, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !Authored {
+    fn authorPhase(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, rows: usize, weights: *const PreparedDecoderWeights, slabs: []const Slab, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !Authored {
         const source = (try specSource(cb, source_data, config, rows, weights, spec.geometry.query_rows, spec.phase == .initial)) orelse return error.UnsupportedDenseSchedule;
-        try validateCrossDestinations(cb, source_data, config, encoder, rows, weights, slabs);
         const bound = try source.bind(a, spec, slabs);
         defer a.free(bound);
         if (preparation) |prepared| if (prepared.cached) |definition| {
@@ -1415,7 +1415,7 @@ pub const PreparedSingleToken = struct {
         const nodes = try schedule_mod.authorSemanticGraph(&b);
         return .{ .schedule = try schedule_mod.Schedule.create(&b), .token_node = nodes.token_node, .position_node = nodes.position_node };
     }
-    pub fn initInitial(self: *PreparedSingleToken, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !void {
+    pub fn initInitial(self: *PreparedSingleToken, config: Config, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, query_rows: usize, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !void {
         if (self.initial != null or query_rows == 0 or query_rows > config.max_target_positions or query_rows > 2048) return error.UnsupportedDenseSchedule;
         if (spec.phase != .initial or spec.geometry.query_rows != query_rows) return error.DenseDefinitionChanged;
         const tokens = try self.allocator.alloc(i64, query_rows);
@@ -1424,7 +1424,7 @@ pub const PreparedSingleToken = struct {
         errdefer self.allocator.free(positions);
         @memset(tokens, 0);
         for (positions, 0..) |*position, i| position.* = @intCast(i);
-        const phase = try authorPhase(&self.backend, self.source_data, self.allocator, config, encoder, rows, weights, self.self_slabs, preparation, spec, storage);
+        const phase = try authorPhase(&self.backend, self.source_data, self.allocator, config, rows, weights, self.self_slabs, preparation, spec, storage);
         self.initial = .{ .schedule = phase.schedule, .token_node = phase.token_node, .position_node = phase.position_node, .tokens = tokens, .positions = positions };
     }
     fn bindInitial(self: *PreparedSingleToken, capability: ?@import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context, enter: bool) !void {

@@ -5842,7 +5842,7 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
             owned_initial_spec = try createDenseProgramSpecStorage(&initial_preparation, metadata.allocator(), &initial_header.?, &initial_source.?);
             break :create &owned_initial_spec.?.value;
         };
-        self.program.?.initInitial(config, self.encoder.?, geometry.encoder_rows, &self.weights.?, &initial_preparation, query_rows, initial_spec, if (owned_initial_spec) |*storage| storage else null) catch |err| {
+        self.program.?.initInitial(config, geometry.encoder_rows, &self.weights.?, &initial_preparation, query_rows, initial_spec, if (owned_initial_spec) |*storage| storage else null) catch |err| {
             if (cb.kind() == .metal and err == error.UnsupportedDenseSchedule) break :initial_phase;
             if (err == error.OutOfMemory) if (initial_preparation.shared) |shared| return shared.admissionError() orelse err;
             return err;
