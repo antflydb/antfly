@@ -681,6 +681,23 @@ fn convertGemm(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
     const alpha = getFloat(node.attributes, "alpha", 1.0);
     const beta = getFloat(node.attributes, "beta", 1.0);
 
+    // Preserve the exact affine projection signature for the shared
+    // projection planner. General C broadcasts and scaled Gemm retain the
+    // original primitive lowering below.
+    if (!trans_a and trans_b and alpha == 1.0 and beta == 1.0 and inputs.len >= 3 and inputs[2] != null_node) linear: {
+        const activation = builder.graph.node(inputs[0]).output_shape;
+        const weight = builder.graph.node(inputs[1]).output_shape;
+        const bias = builder.graph.node(inputs[2]).output_shape;
+        if (activation.rank() != 2 or weight.rank() != 2 or bias.rank() != 1 or
+            activation.dtype != .f32 or weight.dtype != .f32 or bias.dtype != .f32 or
+            activation.dim(1) != weight.dim(1) or bias.dim(0) != weight.dim(0)) break :linear;
+        const rows = std.math.cast(u32, activation.dim(0)) orelse break :linear;
+        const width = std.math.cast(u32, activation.dim(1)) orelse break :linear;
+        const columns = std.math.cast(u32, weight.dim(0)) orelse break :linear;
+        if (rows == 0 or width == 0 or columns == 0) break :linear;
+        return try builder.linear(inputs[0], inputs[1], inputs[2], rows, width, columns);
+    }
+
     var a = inputs[0];
     var b = inputs[1];
 

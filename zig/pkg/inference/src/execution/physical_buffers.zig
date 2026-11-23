@@ -327,7 +327,7 @@ pub const Pool = struct {
         // no individually assigned primitive. Keep its physical output plan
         // available to the real region provider; this grants no kernel or
         // complete-payload coverage before exact runtime region selection.
-        const region_only = count == 0 and literal_store == null and (kernels.projectionHead(graph) != null or kernels.metalRowProjectionHead(graph)) and blk: {
+        const region_only = count == 0 and literal_store == null and (kernels.metalProjectionHead(graph) != null or kernels.metalRowProjectionHead(graph)) and blk: {
             for (owned_backends) |backend| if (backend.vtable.kernels) |functions| {
                 if (functions.accepts(backend.vtable) and functions.prepareRegionRoutes != null) break :blk true;
             };

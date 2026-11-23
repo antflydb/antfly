@@ -12812,7 +12812,7 @@ test "Native active cache refund and reentrant final Model release occur outside
 
 // The entire loader, admission Domain and cold service are production owners.
 // Only analytical model data and metadata-allocation failures are test inputs.
-fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize) !void {
+fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize, comptime with_bias: bool) !void {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const metal = @import("../backends/metal_runtime.zig");
     if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
@@ -12828,11 +12828,19 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     const x = try builder.parameter("x", Shape.init(.f32, &.{ rows, width }));
     var matrices: [count][width * width]f32 = @splat(@splat(0));
     const names = [_][]const u8{ "w0", "w1", "w2" };
-    var initializers: [count]onnx_graph.ParameterInitializer = undefined;
+    const bias_value: f32 = if (with_bias) 0.125 else 0;
+    var bias_values: [width]f32 = @splat(bias_value);
+    var initializers: [count + @intFromBool(with_bias)]onnx_graph.ParameterInitializer = undefined;
+    const bias = if (with_bias) try builder.parameter("bias", Shape.init(.f32, &.{width})) else ml.graph.null_node;
+    if (with_bias) initializers[count] = .{ .name = "bias", .shape = Shape.init(.f32, &.{width}), .data = .{ .f32 = &bias_values } };
     for (0..count) |index| {
         for (0..width) |column| matrices[index][column * width + column] = @floatFromInt(index + 1);
         const weight = try builder.parameter(names[index], Shape.init(.f32, &.{ width, width }));
-        try graph.markOutput(try builder.linearNoBias(x, weight, rows, width, width));
+        const output = if (with_bias and index == 0)
+            try builder.linear(x, weight, bias, rows, width, width)
+        else
+            try builder.linearNoBias(x, weight, rows, width, width);
+        try graph.markOutput(output);
         initializers[index] = .{ .name = names[index], .shape = Shape.init(.f32, &.{ width, width }), .data = .{ .f32 = &matrices[index] } };
     }
     const bytes = try onnx_graph.exportGraph(a, &graph, .{ .parameter_initializers = &initializers });
@@ -12864,7 +12872,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     const controller = pin.controller();
     const cache = (try impl.shared_backend_ctx.managedMetalCache()) orelse return error.MissingImportedManagedCache;
     try std.testing.expect(cache.admission != null and cache.admission.?.controller == controller);
-    const head = @import("../ops/kernel_descriptor.zig").projectionHead(impl.executable.graph) orelse return error.MissingSemanticProjectionHead;
+    const head = @import("../ops/kernel_descriptor.zig").metalProjectionHead(impl.executable.graph) orelse return error.MissingSemanticProjectionHead;
     try std.testing.expectEqual(@as(u8, count), head.count);
     try std.testing.expect(try @import("../execution/prepared_invocation.zig").needsBeforeExecution(session));
     var values: [rows * width]f32 = undefined;
@@ -12911,7 +12919,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         for (original.outputs, 0..) |output, index| {
             const actual = try original.backend.toFloat32(output, a);
             defer a.free(actual);
-            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
         }
     }
     // This fixture exports fixed shapes. The optimized fused semantic head
@@ -12953,7 +12961,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     for (held.outputs, 0..) |output, index| {
         const actual = try held.backend.toFloat32(output, a);
         defer a.free(actual);
-        for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+        for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
     }
     // Independent CPU evaluation uses the original same serialized artifact.
     var native_session = try imported.createSessionWithOptions(a, path, .native, .{ .graph_runtime_strategy = .partitioned });
@@ -12994,7 +13002,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         try std.testing.expectEqual(@as(u64, 1), session.executionDiagnostics().?.execution.?.runtime_region_plan_dispatches);
         try std.testing.expectEqual(@as(u64, head.covered_count), session.executionDiagnostics().?.execution.?.runtime_region_plan_covered_nodes);
         for (outputs, 0..) |output, index| for (output.asFloat32(), &values) |got, value| {
-            try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+            try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
         };
     }
     {
@@ -13007,14 +13015,14 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         for (outputs.outputs, 0..) |output, index| {
             const actual = try outputs.backend.toFloat32(output, a);
             defer a.free(actual);
-            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
         }
     }
     try std.testing.expectEqual(warm_cache.backend_weight_bytes, cache.admissionAmounts().backend_weight_bytes);
     try std.testing.expectEqual(warm_cache.host_weight_bytes, cache.admissionAmounts().host_weight_bytes);
     // Compatibility and assigned calls consume exactly the same physical
     // packed payload. The ordinary callback retains its original selector.
-    {
+    if (comptime !with_bias) {
         const cached = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
         const current_runtime = compute.provider_impl.raw_decode_runtime;
         try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, cached.owner.entry));
@@ -13076,12 +13084,12 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         if (generic_qkv) |triple| for ([_]@import("../ops/ops.zig").CT{ triple.first, triple.second, triple.third }, 0..) |output, index| {
             const actual = try target.cb.toFloat32(output, a);
             defer a.free(actual);
-            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
         };
         for (outputs[0..count], 0..) |output, index| {
             const actual = try target.cb.toFloat32(output, a);
             defer a.free(actual);
-            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
         }
     }
     // An unused pre-entry Claim owns only exact metadata/pins. Wrong graphs
@@ -13144,7 +13152,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     for (held.outputs, 0..) |output, index| {
         const actual = try held.backend.toFloat32(output, a);
         defer a.free(actual);
-        for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+        for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
     }
     held.deinit();
     held_open = false;
@@ -13161,7 +13169,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         for (next.outputs, 0..) |output, index| {
             const actual = try next.backend.toFloat32(output, a);
             defer a.free(actual);
-            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 2)), got, 0.0001);
+            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 2)) + (if (index == 0) bias_value else 0), got, 0.0001);
         }
     }
     const surviving_snapshot = @import("../execution/architecture_session.zig").sharedCacheAdmissionSnapshot(second.session) orelse return error.MissingImportedManagedCache;
@@ -13177,10 +13185,14 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
 }
 
 test "managed Imported Metal packed pair cold service owns direct reduce roots outputs and Model close" {
-    try checkManagedPackedProjectionHead(2, 3);
+    try checkManagedPackedProjectionHead(2, 3, false);
 }
 test "managed Imported Metal packed QKV cold service owns direct tiled roots outputs and Model close" {
-    try checkManagedPackedProjectionHead(3, 128);
+    try checkManagedPackedProjectionHead(3, 128, false);
+}
+
+test "managed Imported Metal packed mixed bias pair retains the original affine outputs" {
+    try checkManagedPackedProjectionHead(2, 3, true);
 }
 
 test "direct Imported component floors use file classification and preserve explicit hard caps" {

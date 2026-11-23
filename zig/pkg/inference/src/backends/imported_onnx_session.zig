@@ -844,7 +844,7 @@ fn needsBeforeExecution(session: Session) !bool {
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
     // This is a call-order hint for complete fixed heads only. Dynamic roots
     // keep their existing explicit Source/specialization preparation path.
-    const head = @import("../ops/kernel_descriptor.zig").projectionHead(self.executable.graph) orelse return false;
+    const head = @import("../ops/kernel_descriptor.zig").metalProjectionHead(self.executable.graph) orelse return false;
     if (head.linears[0].operation.linear.rows <= 1) return false;
     return managedProjectionPackReceiver(session, &self.cb);
 }

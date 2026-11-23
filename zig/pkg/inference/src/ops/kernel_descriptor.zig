@@ -365,6 +365,7 @@ pub const ProjectionHead = struct {
     count: u8,
     input: ml.graph.NodeId,
     weights: [3]ml.graph.NodeId = @splat(ml.graph.null_node),
+    biases: [3]ml.graph.NodeId = @splat(ml.graph.null_node),
     outputs: [3]ml.graph.NodeId = @splat(ml.graph.null_node),
     covered: [6]ml.graph.NodeId = @splat(ml.graph.null_node),
     covered_count: u8 = 0,
@@ -594,6 +595,7 @@ pub fn independentProjectionHead(graph: *const ml.graph.Graph, outputs: []const 
             const bias = graph.node(node.inputs[2]);
             if (bias.op != .parameter or bias.output_shape.dtype != .f32 or bias.output_shape.rank() != 1 or
                 bias.output_shape.dim(0) != descriptor.operation.linear.out_dim) return null;
+            head.biases[index] = node.inputs[2];
         } else if (node.getInputs().len != 2) return null;
         if (index == 0) head.input = node.inputs[0] else if (node.inputs[0] != head.input) return null;
         const dims = descriptor.operation.linear;
@@ -622,6 +624,14 @@ pub fn metalRowProjectionHead(graph: *const ml.graph.Graph) bool {
 /// Complete parameter-fed projection head only. Mixed graphs keep their
 /// original executor and schedule; no reachability/placement is guessed here.
 pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
+    return projectionHeadWithBias(graph, false);
+}
+
+pub fn metalProjectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
+    return projectionHeadWithBias(graph, true);
+}
+
+fn projectionHeadWithBias(graph: *const ml.graph.Graph, allow_bias: bool) ?ProjectionHead {
     const outputs = graph.outputs.items;
     if (outputs.len != 2 and outputs.len != 3) return null;
     var result: ?ProjectionHead = null;
@@ -635,7 +645,7 @@ pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
             result = head;
         }
     }
-    if (result == null) result = independentProjections(graph, outputs) orelse return null;
+    if (result == null) result = independentProjectionHead(graph, outputs, allow_bias) orelse return null;
     const head = result.?;
     if (graph.node(head.input).op != .parameter) return null;
     for (head.linears[0..head.count], 0..) |linear, index| {
@@ -1298,6 +1308,7 @@ test "Metal row projection head preserves optional bias operands" {
     try std.testing.expect(projectionHead(&graph) == null);
     const head = independentProjectionHead(&graph, graph.outputs.items, true) orelse return error.MissingIndependentProjection;
     try std.testing.expect(head.linears[0].operation.linear.bias);
+    try std.testing.expectEqualSlices(ml.graph.NodeId, &.{ bias, ml.graph.null_node }, metalProjectionHead(&graph).?.biases[0..2]);
     try std.testing.expect(!head.linears[1].operation.linear.bias);
     graph.nodeMut(bias).output_shape.dtype = .bf16;
     try std.testing.expect(!metalRowProjectionHead(&graph));

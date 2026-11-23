@@ -12560,7 +12560,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.ForeignPreparedProjectionBackend;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         if (!DenseProjectionProfile.noFrame(self) or !DenseProjectionRegion.hasProjectionHead(graph, false) or currentEngineOperation(self) != null) return null;
-        const semantic = ops.kernel_descriptor.projectionHead(graph) orelse return error.PreparedProjectionSourceChanged;
+        const semantic = ops.kernel_descriptor.metalProjectionHead(graph) orelse return error.PreparedProjectionSourceChanged;
         if (semantic.count != request.count) return error.PreparedProjectionSourceChanged;
         for (semantic.linears[0..semantic.count], 0..) |descriptor, index| {
             if (descriptor.operation.linear.in_dim != request.width or descriptor.operation.linear.out_dim != request.widths[index]) return error.PreparedProjectionSourceChanged;
@@ -12661,7 +12661,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return ops.kernel_descriptor.metalRowProjectionHead(graph);
         }
         fn hasProjectionHead(graph: *const ml.graph.Graph, row_one: bool) bool {
-            const head = ops.kernel_descriptor.projectionHead(graph) orelse return false;
+            const head = ops.kernel_descriptor.metalProjectionHead(graph) orelse return false;
             return if (row_one) head.form == .independent and head.linears[0].operation.linear.rows == 1 else head.linears[0].operation.linear.rows > 1;
         }
         fn slotsSupported(self: *@This()) bool {
@@ -12868,7 +12868,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn prepareSemanticProjectionRegions(self: *MetalCompute, request: @import("../execution/region_route.zig").Prepare) !?@import("../execution/region_route.zig").OwnedList {
         const region = @import("../execution/region_route.zig");
         const route = @import("../execution/kernel_route.zig");
-        const semantic = ops.kernel_descriptor.projectionHead(request.graph) orelse return null;
+        const semantic = ops.kernel_descriptor.metalProjectionHead(request.graph) orelse return null;
         if (semantic.linears[0].operation.linear.rows <= 1) return null;
         const profile = self.packed_projection_profile orelse return null;
         if (profile.program != request.graph or profile.packed_owner == null) return null;
@@ -12913,14 +12913,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         for (semantic.linears[0..semantic.count], 0..) |descriptor, index| {
             const weight = semantic.weights[index];
             if (request.node_facts[weight] != .tensor) return null;
-            const facts = [_]route.Binding{ request.node_facts[semantic.input], request.node_facts[weight] };
+            var facts: [3]route.Binding = .{ request.node_facts[semantic.input], request.node_facts[weight], .unknown };
+            const bias = semantic.biases[index];
+            if (bias != ml.graph.null_node) {
+                if (request.node_facts[bias] != .tensor) return null;
+                facts[2] = request.node_facts[bias];
+            }
             const bytes = try std.math.mul(usize, descriptor.elements(), @sizeOf(f32));
             const output_node = semantic.outputs[index];
             const output = route.OutputSlot{ .allocation = 0, .node = output_node, .epoch = 0, .logical = descriptor.output_shape, .writable_bytes = bytes };
-            owner.linears[index] = (try PreparedDenseLinear.prepareRegion(self, .{ .allocator = request.allocator, .implementation = request.implementation, .descriptor = &descriptor, .inputs = &facts, .output = output }, table)) orelse return null;
+            owner.linears[index] = (try PreparedDenseLinear.prepareRegion(self, .{ .allocator = request.allocator, .implementation = request.implementation, .descriptor = &descriptor, .inputs = facts[0..descriptor.input_count], .output = output }, table)) orelse return null;
             owner.count += 1;
             owner.inputs[owner.input_count] = weight;
             owner.input_count += 1;
+            if (bias != ml.graph.null_node) {
+                owner.inputs[owner.input_count] = bias;
+                owner.input_count += 1;
+            }
             owner.outputs[index] = .{ .node = output_node, .logical = descriptor.output_shape, .bytes = bytes };
             const prepared: *PreparedDenseLinear = @ptrCast(@alignCast(owner.linears[index].context));
             actual.widths[index] = descriptor.operation.linear.out_dim;
@@ -13113,7 +13122,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (node >= pool.plan.node_positions.len or pool.plan.node_positions[node] == std.math.maxInt(u32)) return null;
             if (index != 0 and pool.plan.node_positions[graph.outputs.items[index - 1]] >= pool.plan.node_positions[node]) return null;
         }
-        const semantic = ops.kernel_descriptor.projectionHead(graph) orelse return null;
+        const semantic = ops.kernel_descriptor.metalProjectionHead(graph) orelse return null;
         const count = semantic.count;
         if (count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return null;
         var request = ProjectionPack.Request{ .count = @intCast(count), .slots = @splat(0), .generations = @splat(0), .declarations = @splat(0), .width = 0, .widths = @splat(0) };
@@ -13122,7 +13131,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (linear.rows <= 1) return null;
             const source = immutable.originalTensor(semantic.weights[index]) orelse return null;
             if (source.implementation.context != cb.ptr or !acceptsPhysicalImplementation(source.implementation.table)) return null;
-            const key = self.assignedDenseLinearKey(linear, source.value, null) orelse return null;
+            const bias: ?CT = if (linear.bias) bias: {
+                const operand = immutable.originalTensor(semantic.biases[index]) orelse return null;
+                if (operand.implementation.context != cb.ptr or !acceptsPhysicalImplementation(operand.implementation.table)) return null;
+                break :bias operand.value;
+            } else null;
+            const key = self.assignedDenseLinearKey(linear, source.value, bias) orelse return null;
             const slot = self.assignedDenseLinearSlot(key) orelse return null;
             if (metal_runtime.termite_metal_decode_runtime_linear_slot_dtype(self.provider_impl.raw_decode_runtime, slot) != @backingInt(metal_runtime.DenseLinearSlotDtype.f32)) return null;
             request.width = linear.in_dim;
