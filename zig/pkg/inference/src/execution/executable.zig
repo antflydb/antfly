@@ -673,6 +673,12 @@ test "prepared physical transfer protocol binds download and upload storage with
         const actual = try result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], a);
         defer a.free(actual);
         try std.testing.expectEqualSlices(f32, &.{ 2, 0, 0, 4 }, actual);
+        var diagnostics = @import("diagnostics.zig").Diagnostics{};
+        diagnostics.configure(true);
+        diagnostics.publish(.{ .execution = result.stats });
+        const transfers = diagnostics.snapshot().?.report.?.assigned_frame_copies.?;
+        try std.testing.expectEqual(result.stats.physical_transfer_dispatches, transfers.partition_transfers);
+        try std.testing.expectEqual(result.stats.physical_transfer_bytes, transfers.partition_transfer_bytes);
         try std.testing.expectEqual(@as(u64, 2), result.stats.physical_transfer_dispatches);
         try std.testing.expectEqual(@as(u64, 40), result.stats.physical_transfer_bytes);
         if (iteration != 0) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);

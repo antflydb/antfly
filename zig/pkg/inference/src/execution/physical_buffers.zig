@@ -3305,9 +3305,9 @@ pub const Frame = struct {
             const host = (try source.hostFloat32Read(value)) orelse return null;
             if (host.len != count) return error.InvalidPhysicalTransferSize;
             const allocation = (try self.storageForUsage(target, binding.backend_index, binding.allocation, binding.usage)) orelse return null;
-            // Shared storage is CPU-writable, so a retained view must keep the
-            // old payload intact. The ordinary copy path can fund a new value.
-            if (binding.usage == .host_input and !allocation.unique()) return null;
+            // A retained view owns the previous payload in this allocation.
+            // The ordinary transfer can allocate a separate destination.
+            if (!allocation.unique()) return null;
             self.invalidateManagedTerminalEvidence();
             const output = try self.viewForShape(target, allocation, binding.shape);
             errdefer target.free(output);
@@ -3316,10 +3316,11 @@ pub const Frame = struct {
         } else download: {
             const functions = source.vtable.kernels orelse return null;
             if (functions.readFloat32Into == null) return null;
-            self.invalidateManagedTerminalEvidence();
             const allocation = (try self.storageFor(target, binding.backend_index, binding.allocation)) orelse return null;
+            if (!allocation.unique()) return null;
             const host = (try target.hostFloat32Write(allocation.tensor)) orelse return null;
             if (host.len < count) return error.InvalidPhysicalTransferSize;
+            self.invalidateManagedTerminalEvidence();
             if (!try source.readFloat32Into(value, host[0..count])) return null;
             break :download try self.viewForShape(target, allocation, binding.shape);
         };
@@ -5364,4 +5365,68 @@ test "Native to Metal partition transfer uses its assigned Shared destination" {
     const actual = try metal.toFloat32(executed.outputs[0], allocator);
     defer allocator.free(actual);
     for (expected, actual) |want, found| try std.testing.expectApproxEqAbs(want, found, 0.0001);
+}
+
+test "Metal to Native partition transfer preserves a held download" {
+    const build_options = @import("build_options");
+    const metal_runtime = @import("../backends/metal_runtime.zig");
+    if (!build_options.enable_metal or !metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const contexts = @import("../backends/compute_context.zig");
+    var host_context = try contexts.BackendContext.init(allocator, .native, std.testing.io);
+    defer host_context.deinit(allocator);
+    var metal_context = try contexts.BackendContext.init(allocator, .metal, std.testing.io);
+    defer metal_context.deinit(allocator);
+    const host = host_context.computeBackend();
+    const metal = metal_context.computeBackend();
+
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const boundary = try builder.neg(input);
+    const output = try builder.gelu(boundary);
+    try graph.markOutput(output);
+    const partitioning = @import("../graph/partition.zig");
+    const onlyGelu = struct {
+        fn supports(op: ml.graph.OpCode) bool {
+            return op == .fused_gelu;
+        }
+    }.supports;
+    var partitions = try partitioning.partition(allocator, &graph, &.{
+        .{ .backend = .native, .priority = 10, .supports = &onlyGelu },
+        .{ .backend = .metal, .priority = 0, .supports = &partitioning.supportsAll },
+    });
+    defer partitions.deinit();
+    var plan = try buffers.build(allocator, &graph, &partitions, .{});
+    defer plan.deinit();
+    const pool = (try Pool.create(allocator, &graph, &plan, &.{ &host, &metal }, &.{ null, null, null })) orelse return error.MissingPhysicalTransfer;
+    defer pool.deinit();
+    const frame = try Frame.create(pool);
+    defer frame.deinit();
+
+    const original = [_]f32{ -2, 3, -5, 7 };
+    const replacement = [_]f32{ 1, 2, 3, 4 };
+    const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
+    const first_host = try metal.fromFloat32Shape(&original, &.{4});
+    defer metal.free(first_host);
+    const first = (try MetalCompute.makeDeviceResident(&metal, first_host)) orelse return error.MissingPhysicalTransfer;
+    defer if (first != first_host) metal.free(first);
+    const second_host = try metal.fromFloat32Shape(&replacement, &.{4});
+    defer metal.free(second_host);
+    const second = (try MetalCompute.makeDeviceResident(&metal, second_host)) orelse return error.MissingPhysicalTransfer;
+    defer if (second != second_host) metal.free(second);
+
+    const partition = partitions.node_assignment[output];
+    {
+        const held = (try frame.transfer(&metal, &host, first, boundary, partition)) orelse return error.MissingPhysicalTransfer;
+        defer host.free(held);
+        try std.testing.expect((try frame.transfer(&metal, &host, second, boundary, partition)) == null);
+        try std.testing.expectEqualSlices(f32, &original, (try host.hostFloat32Read(held)).?);
+        try std.testing.expectEqual(@as(u64, 1), frame.stats.transfers);
+    }
+    const reused = (try frame.transfer(&metal, &host, second, boundary, partition)) orelse return error.MissingPhysicalTransfer;
+    defer host.free(reused);
+    try std.testing.expectEqualSlices(f32, &replacement, (try host.hostFloat32Read(reused)).?);
+    try std.testing.expectEqual(@as(u64, 2), frame.stats.transfers);
 }

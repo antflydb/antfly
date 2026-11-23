@@ -40,6 +40,9 @@ pub const Report = struct {
     program_failure: ?@import("runtime_observation.zig").FailureText = null,
     transfers: ?@import("transfer_audit.zig").Measurements = null,
     transfers_scope: enum { unavailable, invocation_submitting_thread, last_program_only } = .unavailable,
+    /// Physical Frame route counters overlap submitting-thread I/O. The
+    /// two observations carry independent scopes and must not be summed.
+    assigned_frame_copies: ?AssignedFrameCopies = null,
     implementation_entries: ?@import("runtime_observation.zig").Entries = null,
     native_assigned_dispatches: ?u64 = null,
     metal_encoded_dispatches: ?u64 = null,
@@ -174,6 +177,12 @@ pub const Report = struct {
         }
         if (value.runtime.device_owners) |owners| report.retained_device_owner_count = owners.owners;
         if (value.execution) |program| {
+            if (program.physical_frame_observed) report.assigned_frame_copies = .{
+                .partition_transfers = program.physical_transfer_dispatches,
+                .partition_transfer_bytes = program.physical_transfer_bytes,
+                .bound_input_copies = program.physical_input_copies,
+                .bound_input_copy_bytes = program.physical_input_copy_bytes,
+            };
             if (program.prepared_payload_coverage) |coverage| report.payload_admission_coverage = .{ .scope = .corresponding_program_last_finished_frame_prepared_metadata, .value = coverage };
             if (program.metal_region_policy_observed) report.metal_region_policy = MetalRegionPolicy.init(program);
             report.assigned_regions = program.assigned_regions;
@@ -219,6 +228,14 @@ pub const Report = struct {
         }
         return report;
     }
+};
+
+pub const AssignedFrameCopies = struct {
+    scope: enum { corresponding_program_physical_frame_publication } = .corresponding_program_physical_frame_publication,
+    partition_transfers: u64,
+    partition_transfer_bytes: u64,
+    bound_input_copies: u64,
+    bound_input_copy_bytes: u64,
 };
 
 /// Counts from the corresponding published program's two known output-copy
@@ -423,6 +440,10 @@ test "program transfers retain audited device copy counts and distinguish unavai
     var program: @import("stats.zig").ExecutionStats = .{};
     diagnostics.publish(.{ .execution = program });
     try std.testing.expect(diagnostics.snapshot().?.report.?.transfers == null);
+    try std.testing.expect(diagnostics.snapshot().?.report.?.assigned_frame_copies == null);
+    program.physical_frame_observed = true;
+    diagnostics.publish(.{ .execution = program });
+    try std.testing.expectEqual(@as(u64, 0), diagnostics.snapshot().?.report.?.assigned_frame_copies.?.partition_transfers);
     var audit = @import("transfer_audit.zig").Audit{};
     audit.recordStats(&program);
     diagnostics.publish(.{ .execution = program });
@@ -437,4 +458,15 @@ test "program transfers retain audited device copy counts and distinguish unavai
     try std.testing.expectEqual(.last_program_only, report.transfers_scope);
     try std.testing.expectEqual(@as(?u64, 2), report.transfers.?.device_copy_calls);
     try std.testing.expectEqual(@as(?u64, 80), report.transfers.?.device_copy_bytes);
+
+    program.physical_transfer_dispatches = 2;
+    program.physical_transfer_bytes = 40;
+    program.physical_input_copies = 1;
+    program.physical_input_copy_bytes = 16;
+    diagnostics.publish(.{ .execution = program });
+    const counts = diagnostics.snapshot().?.report.?.assigned_frame_copies.?;
+    try std.testing.expectEqual(@as(u64, 2), counts.partition_transfers);
+    try std.testing.expectEqual(@as(u64, 40), counts.partition_transfer_bytes);
+    try std.testing.expectEqual(@as(u64, 1), counts.bound_input_copies);
+    try std.testing.expectEqual(@as(u64, 16), counts.bound_input_copy_bytes);
 }

@@ -56,6 +56,8 @@ pub const ExecutionStats = struct {
     physical_capture_failures: u64 = 0,
     physical_replay_error: ?[]const u8 = null,
     physical_graph_replays: u64 = 0,
+    /// True only after the runtime receives a completed Frame receipt.
+    physical_frame_observed: bool = false,
     physical_input_copies: u64 = 0,
     physical_input_copy_bytes: u64 = 0,
     physical_transfer_dispatches: u64 = 0,
