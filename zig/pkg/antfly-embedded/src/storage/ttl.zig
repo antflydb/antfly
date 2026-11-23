@@ -92,14 +92,27 @@ pub fn nextDocumentVersionTxn(txn: anytype, a: Allocator, wall: u64, writes: any
             return std.mem.order(u8, left, right) == .lt;
         }
     }.less);
-    var unique = std.ArrayList([]const u8).empty;
-    defer unique.deinit(a);
-    for (keys.items) |key| if (unique.items.len == 0 or !std.mem.eql(u8, unique.items[unique.items.len - 1], key)) try unique.append(a, key);
-    const values = try a.alloc(?[]const u8, unique.items.len);
+    var unique_count: usize = 0;
+    for (keys.items) |key| {
+        if (unique_count != 0 and std.mem.eql(u8, keys.items[unique_count - 1], key)) {
+            a.free(key);
+        } else {
+            keys.items[unique_count] = key;
+            unique_count += 1;
+        }
+    }
+    keys.items.len = unique_count;
+    const values = try a.alloc(?[]const u8, keys.items.len);
     defer a.free(values);
-    try txn.getManySorted(unique.items, values);
+    try txn.getManySorted(keys.items, values);
+    return try nextDocumentVersionFromMetadata(wall, keys.items, values);
+}
+
+/// Reuse an already pinned writer cut instead of opening a nested probe.
+pub fn nextDocumentVersionFromMetadata(wall: u64, keys: []const []const u8, values: []const ?[]const u8) !u64 {
+    if (keys.len != values.len) return error.InvalidTimestamp;
     var previous: u64 = 0;
-    for (unique.items, values) |key, value| if (value) |bytes| {
+    for (keys, values) |key, value| if (value) |bytes| {
         const version = if (std.mem.eql(u8, key, document_version_watermark_key)) blk: {
             if (bytes.len != 8) return error.InvalidTimestamp;
             break :blk std.mem.readInt(u64, bytes[0..8], .little);

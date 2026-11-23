@@ -192,7 +192,7 @@ test "SQL external set partial ownership unwinds every allocation failure" {
 }
 
 test "SQL external set leases retain complete array identities across disk blocks" {
-    const arrays = @import("array_value.zig");
+    const arrays = @import("array/value.zig");
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };

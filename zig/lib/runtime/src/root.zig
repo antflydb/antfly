@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const callback_abi = @import("runtime_callback_abi.zig");
+pub const collation_abi = @import("runtime_collation_abi.zig");
 pub const error_abi = @import("runtime_error_abi.zig");
 pub const document_abi = @import("runtime_document_abi.zig");
 pub const http_abi = @import("runtime_http_abi.zig");

@@ -1065,6 +1065,13 @@ fn hasVersionedFullTextIndex(alloc: std.mem.Allocator, indexes_json: []const u8,
 /// Only an active migration without the usual versioned full-text target
 /// needs the V18 owner-epoch proof. Ordinary store heartbeats stay on their
 /// negotiated predecessor profile during rolling upgrades.
+pub fn runtimeSchemaEpochRequired(alloc: std.mem.Allocator, table: table_manager.TableRecord) !bool {
+    if (table.schema_reader_requirements) |requirement| {
+        if (requirement.semantic_version >= @import("antfly_local_sources").common_schema_readers.sql_view_index_semantic_version) return true;
+    }
+    return indexlessSchemaEpochRequired(alloc, table);
+}
+
 pub fn indexlessSchemaEpochRequired(alloc: std.mem.Allocator, table: table_manager.TableRecord) !bool {
     if (table.read_schema_json.len == 0) return false;
     return !try hasVersionedFullTextIndex(alloc, table.indexes_json, try schemaVersion(alloc, table.schema_json));

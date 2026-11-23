@@ -543,6 +543,11 @@ pub fn minAppliedSequenceAcrossAllConsumers(alloc: Allocator, store: anytype) !u
     return min_applied + 1;
 }
 
+pub fn loadProjectionCheckpointTxn(txn: anytype, index_name: []const u8) !ProjectionCheckpoint {
+    const record = try loadProgressTxn(txn, index_name);
+    return if (record) |value| value.checkpoint() else .{};
+}
+
 pub fn loadProjectionCheckpoint(alloc: Allocator, store: anytype, index_name: []const u8) !ProjectionCheckpoint {
     const record = try loadProgress(alloc, store, index_name);
     return if (record) |value| value.checkpoint() else .{};

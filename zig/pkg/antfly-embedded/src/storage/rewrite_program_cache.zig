@@ -18,8 +18,8 @@
 //! A lease pins the program through page preparation. Replicated staging state,
 //! not this disposable cache, remains the publication/progress authority.
 const std = @import("std");
-const programs = @import("db/relational_rewrite_program.zig");
-const contract = @import("db/relational_rewrite_contract.zig");
+const programs = @import("db/relational/schema_change/rewrite_program.zig");
+const contract = @import("db/relational/schema_change/rewrite_contract.zig");
 const staging = @import("db/restore_staging_contract.zig");
 const resources = @import("resource_manager.zig");
 const RequestContext = @import("../api/operation.zig").RequestContext;
@@ -368,7 +368,11 @@ test "relational index system rewrite program cache owns validates and budgets i
             lease.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Failure.attempt, .{ scope, intent });
+    // Backing-allocator in-place growth depends on prior heap addresses.
+    // Force the allocation path so the exhaustive fault indices are stable;
+    // retain the full sweep and every cache/lifetime assertion.
+    var deterministic = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(deterministic.allocator(), Failure.attempt, .{ scope, intent });
     // Contending RPCs share one compile; no std.Thread lifecycle or spin waits.
     var runtime = std.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();

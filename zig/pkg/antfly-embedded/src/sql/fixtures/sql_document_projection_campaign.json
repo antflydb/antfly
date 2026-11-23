@@ -1,0 +1,554 @@
+{
+  "format": 1,
+  "source_commit": "79644dfa1605e8da0f486d021d1c1393577d6265",
+  "description": "Exact source-owned document schemas for formerly rejected PostgreSQL JSON path operators; augments the fixed document campaign without changing it.",
+  "entries": [
+    {
+      "id": "sql-1034",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1035",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "payload": {
+                  "type": "json"
+                },
+                "metadata_billing_plan": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "billing.plan",
+                      "args": [
+                        {
+                          "field": "payload"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1036",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_billing_plan": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "billing.plan",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1037",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_billing_plan": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "billing.plan",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "metadata_billing_plan",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1038",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_billing_plan": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "billing.plan",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "metadata_billing_plan_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:metadata_billing_plan_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "metadata_billing_plan",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1039",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1040",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "payload": {
+                  "type": "json"
+                },
+                "metadata_flags": {
+                  "type": "json",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "path": "flags",
+                      "args": [
+                        {
+                          "field": "payload"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1041",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flags": {
+                  "type": "json",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "path": "flags",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1042",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flags": {
+                  "type": "json",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "path": "flags",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "metadata_flags",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1043",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flags": {
+                  "type": "json",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "path": "flags",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "metadata_flags_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:metadata_flags_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "metadata_flags",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1045",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_billing_plan": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "billing.plan",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1046",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flags": {
+                  "type": "json",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "path": "flags",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    }
+  ]
+}

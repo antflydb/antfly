@@ -45,21 +45,29 @@ def _response(source: httpx.Response, body: bytearray) -> httpx.Response:
     return httpx.Response(source.status_code, headers=headers, content=bytes(body), request=source.request)
 
 
-def sql_request(client: httpx.Client, **kwargs: Any) -> httpx.Response:
+def sql_request(
+    client: httpx.Client, *, max_response_bytes: int = MAX_SQL_RESPONSE_BYTES, **kwargs: Any
+) -> httpx.Response:
+    if type(max_response_bytes) is not int or not 0 < max_response_bytes <= MAX_SQL_RESPONSE_BYTES:
+        raise ValueError("invalid SQL response limit")
     with client.stream(**_kwargs(kwargs)) as response:
         body = bytearray()
         for chunk in response.iter_bytes(chunk_size=64 << 10):
-            if len(body) + len(chunk) > MAX_SQL_RESPONSE_BYTES:
-                raise ValueError("SQL response exceeds 16 MiB")
+            if len(body) + len(chunk) > max_response_bytes:
+                raise ValueError(f"SQL response exceeds {max_response_bytes >> 20} MiB")
             body.extend(chunk)
         return _response(response, body)
 
 
-async def sql_request_async(client: httpx.AsyncClient, **kwargs: Any) -> httpx.Response:
+async def sql_request_async(
+    client: httpx.AsyncClient, *, max_response_bytes: int = MAX_SQL_RESPONSE_BYTES, **kwargs: Any
+) -> httpx.Response:
+    if type(max_response_bytes) is not int or not 0 < max_response_bytes <= MAX_SQL_RESPONSE_BYTES:
+        raise ValueError("invalid SQL response limit")
     async with client.stream(**_kwargs(kwargs)) as response:
         body = bytearray()
         async for chunk in response.aiter_bytes(chunk_size=64 << 10):
-            if len(body) + len(chunk) > MAX_SQL_RESPONSE_BYTES:
-                raise ValueError("SQL response exceeds 16 MiB")
+            if len(body) + len(chunk) > max_response_bytes:
+                raise ValueError(f"SQL response exceeds {max_response_bytes >> 20} MiB")
             body.extend(chunk)
         return _response(response, body)

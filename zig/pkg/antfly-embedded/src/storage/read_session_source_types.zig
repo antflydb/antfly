@@ -29,19 +29,19 @@ pub const scalar = @import("../sql/scalar.zig");
 pub const typed_json = @import("typed_json.zig");
 pub const platform = @import("antfly_platform");
 pub const schema = @import("schema.zig");
-pub const index_catalog = @import("db/relational_index_catalog.zig");
-pub const index_plan = @import("db/relational_index_plan.zig");
-pub const index_records = @import("db/relational_index_records.zig");
-pub const index_jobs = @import("db/relational_index_jobs.zig");
-pub const index_keys = @import("db/relational_index_keys.zig");
+pub const index_catalog = @import("db/relational/indexes/catalog.zig");
+pub const index_plan = @import("db/relational/indexes/plan.zig");
+pub const index_records = @import("db/relational/indexes/records.zig");
+pub const index_jobs = @import("db/relational/indexes/jobs.zig");
+pub const index_keys = @import("db/relational/indexes/keys.zig");
 pub const row_codec = @import("db/algebraic/relational_row_codec.zig");
 pub const range_state = @import("db/range_state.zig");
-pub const predicates = @import("db/relational_predicate.zig");
-pub const row_cursor = @import("db/relational_row_cursor.zig");
+pub const predicates = @import("db/relational/indexes/predicate.zig");
+pub const row_cursor = @import("db/relational/rows/row_cursor.zig");
 pub const sql_builtin_type = @import("../common/sql_builtin_type.zig");
 pub const sql_memory_budget = @import("../sql/memory_budget.zig");
 pub const sql_operators = @import("../sql/operators.zig");
-pub const index_cover = @import("db/relational_index_cover.zig");
+pub const index_cover = @import("db/relational/indexes/cover.zig");
 
 pub const document_revision = @import("document_mutation_revision.zig");
 pub const backend_erased = @import("backend_erased.zig");
@@ -57,3 +57,14 @@ pub const streamed_projection = @import("db/query/streamed_projection.zig");
 pub const relational_checks = @import("../schema/relational_checks.zig");
 
 pub const cypher = @import("cypher");
+
+pub const foreign_validation = @import("read_session_types").types.reader_values.foreign_validation;
+pub const nullability = @import("read_session_types").types.reader_values.nullability;
+pub const relational_expression = @import("../schema/relational_expression.zig");
+pub const domain_row = @import("read_session_types").types.reader_values.domain_row;
+pub const domain_handoff = @import("read_session_types").types.reader_values.domain_handoff;
+pub const transactions = @import("transactions.zig");
+pub const required_sql_indexes = @import("db/required_sql_indexes.zig");
+pub const text_rows = @import("db/text_rows.zig");
+
+pub const graph_types = @import("../graph/graph.zig");

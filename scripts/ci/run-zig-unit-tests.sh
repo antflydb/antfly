@@ -118,6 +118,13 @@ if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
   echo "::endgroup::"
 fi
 
+# The SQL extension owners execute real Wasmtime modules, including the
+# 1000-call resource contract. Missing native dependencies must fail explicitly.
+if [ -z "${ANTFLY_WASMTIME_LIB:-}" ] || [ ! -r "$ANTFLY_WASMTIME_LIB" ]; then
+  echo "::error::mandatory SQL extension tests require the pinned Wasmtime C API; run scripts/ci/install-wasmtime-c-api.sh in CI setup" >&2
+  exit 1
+fi
+
 unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
 : > "$unit_log"
 export ANTFLY_TEST_LOG_DIR="${RUNNER_TEMP:-/tmp}/antfly-zig-test-logs"

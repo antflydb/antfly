@@ -40,7 +40,8 @@ pub fn aggregationModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     const regex = module(b, "lib/regex/src/mod.zig", target, optimize);
     regex.addImport("antfly_fst", module(b, "lib/fst/src/mod.zig", target, optimize));
     regex.addImport("antfly_grapheme", module(b, "lib/tokenizer/src/grapheme.zig", target, optimize));
-    const captures = module(b, "lib/regex/src/captures.zig", target, optimize);
+    const sql_regex = @import("../lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex"));
+    const captures = sql_regex.import_table.get("antfly_capture_regex").?;
     regex.addImport("antfly_capture_regex", captures);
     regex.addImport("antfly_platform", platform);
     root.addImport("antfly_platform", platform);
@@ -48,6 +49,7 @@ pub fn aggregationModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     root.addImport("antfly_cancellation", cancellation);
     root.addImport("antfly_reranking", reranking);
     root.addImport("antfly_regex", regex);
+    root.addImport("antfly_sql_regex", sql_regex);
     const cypher = @import("../lib/cypher/build_support.zig").createModule(b, b.path("lib/cypher"), target, optimize);
     cypher.addImport("cypher_regex_capture", captures);
     root.addImport("cypher", cypher);

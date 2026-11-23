@@ -196,7 +196,7 @@ fn decimalComparison(a: std.mem.Allocator, program: *const scalar.Program, page:
     var literal_program = program.*;
     literal_program.root = constant;
     const literal = try literal_program.evaluate(sa, &.{}, parameters, .{});
-    const numeric = @import("numeric_value.zig");
+    const numeric = @import("numeric/value.zig");
     var integer: numeric.ScaledInteger = undefined;
     const number: ?numeric.Value = if (literal.sql_null) null else if (literal.numeric) |value| value.* else if (literal.value == .integer) number: {
         integer = try numeric.ScaledInteger.init(literal.value.integer, 0);
@@ -377,7 +377,7 @@ const DecimalArithmetic = struct {
         if (depth == 32 or self.remaining == 0) return null;
         self.remaining -= 1;
         const instruction = self.program.instructions[index];
-        const number = @import("numeric_value.zig");
+        const number = @import("numeric/value.zig");
         if (constantOperand(self.program, index, 0)) {
             var constant = self.program.*;
             constant.root = index;
@@ -584,7 +584,7 @@ const FusedDecimal = struct {
             if (datum.sql_null) break :blk .{ .constant = .{ .null = true } };
             const scale: u16 = if (datum.numeric) |value| value.scale else 0;
             if (scale > 38) return null;
-            const coefficient = if (datum.numeric) |value| @import("numeric_value.zig").coefficientAtScale(value.*, scale) orelse return null else if (datum.value == .integer) @as(i128, datum.value.integer) else return null;
+            const coefficient = if (datum.numeric) |value| @import("numeric/value.zig").coefficientAtScale(value.*, scale) orelse return null else if (datum.value == .integer) @as(i128, datum.value.integer) else return null;
             @import("../common/decimal128.zig").validateCoefficient(coefficient, 38, scale) catch return null;
             break :blk .{ .constant = .{ .coefficient = coefficient, .scale = scale } };
         } else switch (instruction.operation) {
@@ -654,7 +654,7 @@ const FusedDecimal = struct {
         var scale = if (op == .multiply) left.scale + right.scale else @max(left.scale, right.scale);
         if (op == .divide) {
             if (right.coefficient == 0) return error.SqlDivisionByZero;
-            const numeric = @import("numeric_value.zig");
+            const numeric = @import("numeric/value.zig");
             const l = try numeric.ScaledInteger.init(left.coefficient, left.scale);
             const r = try numeric.ScaledInteger.init(right.coefficient, right.scale);
             scale = numeric.divisionScale(l.view(), r.view());
@@ -1190,8 +1190,9 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
     return vectors[0];
 }
 pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
+    try value.validateTemporal();
     if (op == .is_null or op == .is_not_null or op == .is_unknown or op == .is_not_unknown) return Datum.json(.{ .bool = value.sql_null == (op == .is_null or op == .is_unknown) });
-    if (value.array != null or value.numeric != null) return error.SqlTypeMismatch;
+    if (value.isVoid() or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null or value.enumeration() != null or value.bytes() != null) return error.SqlTypeMismatch;
     if (op == .is_true or op == .is_not_true or op == .is_false or op == .is_not_false) {
         const target = op == .is_true or op == .is_not_true;
         const matches = value.value == .bool and value.value.bool == target;
@@ -1216,13 +1217,15 @@ fn comparison(op: Binary) bool {
     };
 }
 pub fn binary(op: Binary, left: Datum, right: Datum) !Datum {
+    try left.validateTemporal();
+    try right.validateTemporal();
     if (op == .is_distinct or op == .is_not_distinct) {
         const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try scalar.compareDatums(left, right)) == .eq;
         return Datum.json(.{ .bool = equal == (op == .is_not_distinct) });
     }
     if (left.sql_null or right.sql_null) return .{};
     if (comparison(op)) return Datum.json(scalar.comparison(op, try scalar.compareDatums(left, right)));
-    if (left.array != null or right.array != null or left.numeric != null or right.numeric != null) return error.SqlTypeMismatch;
+    if (left.array != null or right.array != null or left.numeric != null or right.numeric != null or left.temporal() != null or right.temporal() != null or left.range() != null or right.range() != null or left.enumeration() != null or right.enumeration() != null or left.bytes() != null or right.bytes() != null) return error.SqlTypeMismatch;
     // Arithmetic shares the scalar overflow/division/finite-number contract.
     // JSON null is a value for comparison, but remains null in arithmetic.
     if (left.value == .null or right.value == .null) return .{};
@@ -1370,15 +1373,15 @@ test "SQL NUMERIC integer decimal expressions retain exact scalar fallback inste
     defer compiled.deinit();
     var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer }}, &.{}, .{});
     defer program.deinit();
-    try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, program.output_type.element_type.?);
+    try std.testing.expectEqual(@import("array/value.zig").ElementType.numeric, program.output_type.element_type.?);
     const input: Datum = Datum.json(.{ .integer = 9007199254740993 });
     const cells = [_][]const Datum{ &.{input}, &.{input}, &.{input}, &.{input} };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     try std.testing.expect((try evaluate(arena.allocator(), &program, &cells, &.{})) == null);
     const result = try program.evaluate(arena.allocator(), &.{input}, &.{}, .{});
-    var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
-    try std.testing.expectEqualStrings("9007199254740993.5", try @import("numeric_value.zig").format(&context, result.numeric.?.*));
+    var context: @import("numeric/value.zig").Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectEqualStrings("9007199254740993.5", try @import("numeric/value.zig").format(&context, result.numeric.?.*));
 }
 
 test "SQL shared scheduled column kernels match scalar values over permuted nullable pages" {
@@ -1730,7 +1733,7 @@ test "external lake NUMERIC column evaluation preserves physical and native exac
         }
         try std.testing.expectEqual(std.math.Order.lt, try scalar.compareDatums(values[0], values[1]));
     }
-    var work: @import("array_value.zig").Budget = .{};
+    var work: @import("array/value.zig").Budget = .{};
     const number = try scalar.numericTextLeaky(ca, "9007199254740993.125", &work);
     const batch: @import("execution_batch.zig").Batch = .{ .rows = &.{&.{number}} };
     const native: ColumnInput = .{ .page = .{ .native = .{ .values = &batch, .names = &.{"n"} }, .selection = &.{0} }, .columns = &columns, .count = 1 };
@@ -1974,8 +1977,8 @@ fn decimalArithmeticScenario(a: std.mem.Allocator) !void {
             const actual = try output.cell(sa, row, 0);
             try std.testing.expectEqual(expected.sql_null, actual.sql_null);
             if (expected.sql_null) continue;
-            var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
-            try std.testing.expectEqualStrings(try @import("numeric_value.zig").format(&context, expected.numeric.?.*), try @import("numeric_value.zig").format(&context, actual.numeric.?.*));
+            var context: @import("numeric/value.zig").Context = .{ .alloc = sa };
+            try std.testing.expectEqualStrings(try @import("numeric/value.zig").format(&context, expected.numeric.?.*), try @import("numeric/value.zig").format(&context, actual.numeric.?.*));
         }
     }
     for ([_][]const u8{ "n*99999999999999999999999999999999999999", "n+CAST('NaN' AS NUMERIC)", "n/0.00000000000000000000000000000000000001" }) |text| {
@@ -2010,8 +2013,8 @@ fn mixedDecimalScenario(a: std.mem.Allocator) !void {
             const actual = try output.cell(sa, row, 0);
             try std.testing.expectEqual(expected.sql_null, actual.sql_null);
             if (expected.sql_null) continue;
-            var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
-            try std.testing.expectEqualStrings(try @import("numeric_value.zig").format(&context, expected.numeric.?.*), try @import("numeric_value.zig").format(&context, actual.numeric.?.*));
+            var context: @import("numeric/value.zig").Context = .{ .alloc = sa };
+            try std.testing.expectEqualStrings(try @import("numeric/value.zig").format(&context, expected.numeric.?.*), try @import("numeric/value.zig").format(&context, actual.numeric.?.*));
         }
     }
     var c1 = try @import("compiler.zig").compileScalar(a, "n+m", .{});
@@ -2078,8 +2081,8 @@ fn fusedDecimalScenario(a: std.mem.Allocator) !void {
         const sa = scratch.allocator();
         const expected = try program.evaluate(sa, &.{ try page.typedCell(sa, row, "n", true), try page.typedCell(sa, row, "m", true) }, &.{}, .{});
         const actual = try outputs[0].?.cell(sa, row, 0);
-        var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
-        try std.testing.expectEqualStrings(try @import("numeric_value.zig").format(&context, expected.numeric.?.*), try @import("numeric_value.zig").format(&context, actual.numeric.?.*));
+        var context: @import("numeric/value.zig").Context = .{ .alloc = sa };
+        try std.testing.expectEqualStrings(try @import("numeric/value.zig").format(&context, expected.numeric.?.*), try @import("numeric/value.zig").format(&context, actual.numeric.?.*));
     }
 }
 
