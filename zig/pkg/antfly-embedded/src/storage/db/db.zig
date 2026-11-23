@@ -45670,8 +45670,9 @@ pub const DB = struct {
             HybridComponents.ownerAllocatorCanOverlap(self.alloc) and
             (HybridComponents.Budget.reusableHeadroom(alloc) orelse 0) >= HybridComponents.workspace_bytes;
         const io = if (can_overlap and reusable) exec_ctx.io orelse self.backend_runtime.io() else null;
-        const sources = if (io != null) HybridComponents.resolveSources(self, alloc, req) else null;
+        const revisions = if (io != null) HybridComponents.quietRevisions(self) else null;
         const probe = if (builtin.is_test) test_hybrid_probe else null;
+        const sources = if (revisions != null) HybridComponents.resolveSources(self, alloc, req, probe) else null;
         var hybrid: HybridComponents = .{
             .db = self,
             .io = if (sources != null) io else null,
@@ -45679,7 +45680,7 @@ pub const DB = struct {
             .probe = probe,
             .component_alloc = .{ .backing = alloc },
         };
-        if (sources != null) hybrid.cut = hybrid.readCut();
+        if (sources != null) hybrid.cut = hybrid.readCutFrom(revisions.?);
         hybrid.lexical_budget = .{ .backing = hybrid.component_alloc.allocator(), .limit = if (probe) |test_probe| test_probe.workspace_bytes else HybridComponents.workspace_bytes };
         defer if (has_text and has_dense and benchQueryProfileEnabled()) {
             std.log.info("antfly_bench_hybrid launched={} accepted={} replay={s}", .{
@@ -45742,6 +45743,7 @@ pub const DB = struct {
         cancellation: ?*std.atomic.Value(bool) = null,
         overlapped: bool = false,
         read_cut_samples: usize = 0,
+        source_resolutions: usize = 0,
         retry: ?anyerror = null,
         meet_in_retrieval: bool = false,
         dense_retrieved: Io.Event = .unset,
@@ -45771,6 +45773,7 @@ pub const DB = struct {
         const scheduler = @import("../../sql/parallel_scheduler.zig");
         const Budget = @import("../../sql/memory_budget.zig");
         const workspace_bytes = 16 * 1024 * 1024;
+        const Revisions = struct { primary: u64, replay: u64 };
         const Cut = struct {
             primary: u64,
             replay: u64,
@@ -45797,7 +45800,10 @@ pub const DB = struct {
         retry_reason: ?anyerror = null,
         lexical_budget: Budget = undefined,
 
-        fn resolveSources(db: *DB, alloc: Allocator, req: types.SearchRequest) ?Sources {
+        fn resolveSources(db: *DB, alloc: Allocator, req: types.SearchRequest, probe: ?*HybridTestProbe) ?Sources {
+            if (builtin.is_test) {
+                if (probe) |active| active.source_resolutions += 1;
+            }
             const named_text = if (req.full_text_queries.len == 1) req.full_text_queries[0] else null;
             const query = if (named_text) |named| named.query else req.full_text;
             if (query) |text_query| if (text_query == .match_all) return null;
@@ -45832,19 +45838,28 @@ pub const DB = struct {
             return (entry orelse return null).persistent.writer.snapshotEpoch();
         }
 
+        fn quietRevisions(db: *DB) ?Revisions {
+            return .{
+                .primary = db.core.snapshot_admission.quietRevision() orelse return null,
+                .replay = db.core.snapshot_replay_admission.quietRevision() orelse return null,
+            };
+        }
+
         fn readCut(self: *HybridComponents) ?Cut {
+            return self.readCutFrom(quietRevisions(self.db) orelse return null);
+        }
+
+        fn readCutFrom(self: *HybridComponents, revisions: Revisions) ?Cut {
             if (builtin.is_test) {
                 if (self.probe) |probe| probe.read_cut_samples += 1;
             }
             const db = self.db;
-            const primary = db.core.snapshot_admission.quietRevision() orelse return null;
-            const replay = db.core.snapshot_replay_admission.quietRevision() orelse return null;
             const generation = if (self.sources.dense) |entry| entry.index.publishedGeneration() else null;
             const mutation = if (self.sources.dense) |entry| entry.index.publishedMutationEpoch() else null;
             if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return null;
             const cut: Cut = .{
-                .primary = primary,
-                .replay = replay,
+                .primary = revisions.primary,
+                .replay = revisions.replay,
                 .revision = db.core.store.query_generation_revision.load(.acquire),
                 .text_epoch = textEpoch(self.sources.text),
                 .filter_text_epoch = if (self.sources.text == self.sources.filter_text) null else textEpoch(self.sources.filter_text),
@@ -45853,8 +45868,8 @@ pub const DB = struct {
             };
             // Bracket source sampling in reverse order so both mutation
             // domains were quiet over a common interval.
-            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, replay) or
-                db.core.snapshot_admission.quietRevision() != @as(?u64, primary)) return null;
+            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, revisions.replay) or
+                db.core.snapshot_admission.quietRevision() != @as(?u64, revisions.primary)) return null;
             return cut;
         }
 
@@ -125065,6 +125080,17 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     try std.testing.expect(probe.read_cut_samples != 0);
     try std.testing.expect(hydrated_result.hits[0].stored_data != null);
 
+    {
+        var mutation = db.core.snapshot_replay_admission.acquireMutation();
+        defer mutation.release();
+        probe = .{};
+        var busy = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
+        defer busy.deinit();
+        try std.testing.expectEqual(@as(usize, 0), probe.source_resolutions);
+        try std.testing.expectEqual(@as(usize, 0), probe.read_cut_samples);
+        try std.testing.expectEqualDeep(serial.hits, busy.hits);
+    }
+
     probe = .{};
     probe.scheduler.max_workers = 0;
     var saturated = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
@@ -125190,6 +125216,46 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     try std.testing.expectError(error.IndexNotFound, db.searchWithExecutionContext(alloc, invalid, .{ .max_parallelism = 1 }));
     try std.testing.expectError(error.IndexNotFound, db.searchWithExecutionContext(alloc, invalid, parallel_context));
     try std.testing.expect(probe.overlapped);
+
+    try db.addIndex(.{
+        .name = "leann_admission",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"leann_admission\",\"algorithm\":\"leann\"}",
+    });
+    try std.testing.expect(db.core.denseIndex("leann_admission").?.index.leann != null);
+    var leann = req;
+    var leann_dense = req.dense_queries[0];
+    leann_dense.index_name = "leann_admission";
+    leann.dense_queries = &.{leann_dense};
+    probe = .{};
+    var leann_result = try db.searchWithExecutionContext(alloc, leann, parallel_context);
+    defer leann_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.source_resolutions);
+    try std.testing.expectEqual(@as(usize, 0), probe.read_cut_samples);
+    try std.testing.expect(!probe.overlapped);
+
+    try db.addEnrichment(.{
+        .name = "hybrid_admission_chunks",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}",
+    });
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"hybrid_admission_chunks\"}]}",
+    });
+    const default_text = db.core.textIndexEntry(null).?;
+    try std.testing.expectEqualStrings("full_text_index_v0", default_text.config.name);
+    try std.testing.expect(try db.core.textIndexIsChunkBacked(alloc, default_text.config.name));
+    var chunks = req;
+    chunks.index_name = null;
+    probe = .{};
+    var chunk_result = try db.searchWithExecutionContext(alloc, chunks, parallel_context);
+    defer chunk_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.source_resolutions);
+    try std.testing.expectEqual(@as(usize, 0), probe.read_cut_samples);
+    try std.testing.expect(!probe.overlapped);
 }
 
 test "db search fuses full_text and dense named searches before graph expansion with durable lsm primary backend" {
