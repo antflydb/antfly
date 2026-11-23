@@ -1529,9 +1529,9 @@ test "SQL command producer native begin observation cannot erase TEMP namespace 
     next.ticket = .{ .instance = baseline.instance, .command = .{ .sequence = 1, .nonce = @splat(5), .executor = @splat(6) }, .body = @splat(7) };
     next.pending = next.controlRequest(0, @splat(8), .{ .begin = next.ticket.?.command });
     next.temporary_owner = null;
-    try std.testing.expectError(error.InvalidSqlConnection, changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next } }));
+    try std.testing.expectError(error.InvalidSqlConnection, changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next, .now_ms = 2, .native_transaction = false } }));
     next.temporary_owner = owner;
-    try changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next } });
+    try changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next, .now_ms = 2, .native_transaction = false } });
     var retained = (try readTxn(a, &write, connection.id)).?;
     defer retained.deinit();
     try std.testing.expect(retained.value.temporary_owner.?.eql(owner));
