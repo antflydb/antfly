@@ -1408,8 +1408,12 @@ pub const ExternalPreparation = struct {
     publication_bindings: ?[]const ?publication_installation.DemandBinding = null,
 
     pub fn init(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest) !ExternalPreparation {
-        if (try contract.transactionProducer(tables) != .unlabelled) return error.ChangefeedCapabilityUnsupported;
-        return fromParticipants(a, try buildParticipantTxns(a, catalog, tables, true));
+        if (try contract.transactionProducer(tables) == .legacy_cdc) return error.ChangefeedCapabilityUnsupported;
+        const participants = try buildParticipantTxns(a, catalog, tables, true);
+        // The metadata decision owner supplies provenance for this lane.
+        // Ordered-history producer flags belong to data-owned completion.
+        for (participants.items) |*participant| participant.source_producer = .unlabelled;
+        return fromParticipants(a, participants);
     }
 
     pub fn intentAt(self: *const ExternalPreparation, index: usize) db_mod.types.TransactionIntentRequest {
@@ -10101,10 +10105,11 @@ fn qualifyNativeParticipantCapture(atomic: bool) !void {
     var catalog: Catalog = .{ .tables = .{.{ .table_id = 17, .name = "scratch", .sql_persistence = persistence }}, .ranges = .{.{ .group_id = 19, .table_id = 17, .start_key = "", .end_key = null }} };
     const a = std.testing.allocator;
     const writes = [_]db_mod.types.TransactionWrite{.{ .key = "key", .value = "{}" }};
-    var tables = [_]TableCommitRequest{.{ .table_name = "scratch", .sql_persistence = persistence, .writes = &writes }};
+    var tables = [_]TableCommitRequest{.{ .table_name = "scratch", .sql_persistence = persistence, .writes = &writes, .source_producer = .ordinary }};
     var captured = try ExternalPreparation.init(a, catalog.source(), &tables);
     defer captured.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), captured.manifest.len);
+    try std.testing.expect(!captured.intentAt(0).completion_ordinary_producer);
     try std.testing.expect(captured.manifest[0].route.route.execution == .native_local);
     try std.testing.expect(captured.manifest[0].route.route.execution.native_local.eql(persistence));
     const pin = captured.manifest[0].route.native_participant orelse return error.TestUnexpectedResult;

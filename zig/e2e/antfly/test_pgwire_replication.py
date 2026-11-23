@@ -121,7 +121,12 @@ def test_pg_recvlogical_resume_after_restart(
     def writer_env():
         return {**env, "PGPASSWORD": harness.AUTH_BOOTSTRAP_PASSWORD}
 
-    def sql(*statements, retry_uncommitted=False, publication_owner=False):
+    def sql(
+        *statements,
+        retry_uncommitted=False,
+        publication_owner=False,
+        wait_for_catalog=False,
+    ):
         args = [
             psql,
             *(connection if publication_owner else writer_connection()),
@@ -143,6 +148,15 @@ def test_pg_recvlogical_resume_after_restart(
             )
             if result.returncode == 0:
                 return
+            if (
+                wait_for_catalog
+                and len(statements) == 1
+                and "ERROR:  53300: The relation catalog publication is not ready to authorize this DDL. No schema change was admitted."
+                in result.stderr
+                and time.monotonic() < expires
+            ):
+                time.sleep(0.2)
+                continue
             if (
                 retry_uncommitted
                 and (
@@ -406,7 +420,8 @@ def test_pg_recvlogical_resume_after_restart(
             check_catalog_discovery()
         sql(
             "CREATE TABLE smoke (id BIGINT PRIMARY KEY, content TEXT, "
-            "computed BIGINT GENERATED ALWAYS AS (id + 314159265) STORED)"
+            "computed BIGINT GENERATED ALWAYS AS (id + 314159265) STORED)",
+            wait_for_catalog=True,
         )
         if multi_table:
             sql("CREATE TABLE smoke_other (id BIGINT PRIMARY KEY, content TEXT)")
