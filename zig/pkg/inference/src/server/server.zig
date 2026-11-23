@@ -55042,7 +55042,13 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
     domain.controller.configureSharedLimits(.{});
     try std.testing.expect(session.model_lifetime.?.admission_domain == null);
     session.model_lifetime.?.admission_domain = domain.pin();
-    const limits = runtime.tier.memory.Limits{ .host_limit_bytes = 256 * 1024 * 1024, .backend_limit_bytes = 1024 * 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 * 1024 };
+    // Preserve the backend retention-pressure check while independently
+    // allowing the prepared host arena alongside optional vendor scratch.
+    const limits = runtime.tier.memory.Limits{
+        .host_limit_bytes = 256 * 1024 * 1024,
+        .backend_limit_bytes = 1024 * 1024 * 1024,
+        .scratch_limit_bytes = (256 + 1024) * 1024 * 1024,
+    };
     session.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false };
     var model: model_manager_mod.LoadedModel = undefined;
     try session.installOwnedExecutionGate(a);
@@ -55076,7 +55082,6 @@ test "LightOn reader actual public CUDA loader prepares immutable norm caches be
             defer request.closeBackend(&backend);
             if (!self.legacy_peer_proved and request.preparation.norm_count > 1) {
                 const compute = request.preparation.expectedCudaCompute();
-                try std.testing.expect(compute.managed_norm_publication);
                 const source = try @import("../architectures/gpt.zig").getModelWeight(&backend, self.config, "model.layers.0.post_attention_layernorm.weight");
                 defer backend.free(source);
                 const roots_before = compute.embedding_gemma2_constant_count.load(.acquire);

@@ -322,7 +322,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             ctx.coordinator.max_decode_streak_before_prefill = factory.features.prefill_decode_streak;
             if (comptime build_options.enable_cuda) if (factory.model.session.backend() == .cuda) {
                 ctx.captured_root_slots = try a.alloc(@import("../ops/cuda/cuda_compute.zig").CudaCompute.CapturedCacheRoots.Slot, try std.math.add(usize, 2, try std.math.mul(usize, factory.cfg.num_hidden_layers, 4)));
-                @memset(ctx.captured_root_slots, .{});
+                @memset(ctx.captured_root_slots, null);
             };
             if (comptime build_options.enable_metal) if (factory.model.session.backend() == .metal) {
                 ctx.metal_park = try @import("../ops/metal_compute.zig").MetalCompute.ReaderEpochPark.prepare();
@@ -372,7 +372,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     norms = try factory.prepareNorm();
                     if (norms) |value| {
                         ctx.captured_roots = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.CapturedCacheRoots.init(ctx.captured_root_slots, value.normRequests());
-                        try ctx.prepareLegacyQuotasOutside(value);
                     }
                 };
                 lane = try factory.model.native_reader_execution_lane.acquire(factory.control);
@@ -381,7 +380,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                 model_owned = true;
                 try ctx.enterSessionCohort(factory.control);
                 if (comptime build_options.enable_cuda) if (norms) |value| {
-                    ctx.validateNormsAndLegacyQuotas(value) catch |err| {
+                    value.validateForCohort(ctx.model.session, &ctx.cohort_waiter) catch |err| {
                         if (err != error.PreparedCachePlanChanged) return err;
                         // No ctx/consumer/bank adoption or numerical SDK work
                         // exists yet. Retry only after BOTH real lanes leave.
@@ -390,10 +389,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                         model_owned = false;
                         lane.release();
                         lane_owned = false;
-                        if (comptime build_options.enable_cuda) if (ctx.captured_roots) |*roots| {
-                            roots.finishLegacyPreparationOutside();
-                            ctx.captured_roots = null;
-                        };
+                        ctx.captured_roots = null;
                         value.finishAfterUnlock(cleanup.epoch());
                         norms = null;
                         continue;
@@ -416,7 +412,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         }
         fn destroyUnpublished(ctx: *LightOnStreamContext) void {
             if (comptime build_options.enable_cuda) {
-                if (ctx.captured_roots) |*roots| roots.finishLegacyPreparationOutside();
                 ctx.allocator.free(ctx.captured_root_slots);
             }
             if (comptime build_options.enable_metal) if (ctx.metal_park) |*park| park.deinit();
@@ -627,7 +622,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             if (comptime build_options.enable_cuda) {
                 // Roots died under current B above. Only inert unused cold
                 // metadata remains; release it after every actual gate left.
-                for (ctx.captured_root_slots) |*slot| if (slot.upgrade) |*upgrade| upgrade.deinitOutsideExecution();
                 ctx.allocator.free(ctx.captured_root_slots);
             }
             ctx.allocator.destroy(ctx);
@@ -795,7 +789,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                         if (ctx.cb) |*cb| try self.cuda.prepareRestore(cb, norms.expectedCudaCompute());
                         const Resume = struct {
                             fn run(owner: *LightOnStreamContext, preparation: *NormPreparation) !void {
-                                try owner.validateNormsAndLegacyQuotas(preparation);
+                                try preparation.validateForCohort(owner.model.session, &owner.cohort_waiter);
                                 try preparation.resumeRequestForCohort(owner.model.session, &owner.cohort_waiter, if (owner.cb) |*cb| cb else null, owner.cleanup_owner.epoch() orelse return error.MissingCurrentCleanupEpoch);
                             }
                         };
@@ -829,18 +823,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             }
         };
 
-        fn prepareLegacyQuotasOutside(ctx: *LightOnStreamContext, norms: *NormPreparation) !void {
-            if (comptime build_options.enable_cuda) if (ctx.captured_roots) |*roots| {
-                const model = ctx.model.session.model_lifetime orelse return error.MissingCacheRetirementModel;
-                try roots.prepareLegacyQuotasOutside(norms.expectedCudaCompute(), model);
-            };
-        }
-        fn validateNormsAndLegacyQuotas(ctx: *LightOnStreamContext, norms: *NormPreparation) !void {
-            if (comptime build_options.enable_cuda) {
-                try norms.validateForCohort(ctx.model.session, &ctx.cohort_waiter);
-                if (ctx.captured_roots) |*roots| try roots.commitLegacyQuotas(norms.expectedCudaCompute());
-            }
-        }
         fn refreshNormFundingOutside(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
             if (comptime build_options.enable_cuda) if (ctx.norm_preparation) |norms| {
                 norms.finishFundingOutsideExecution();
@@ -851,7 +833,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
                     error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => try norms.recoverOptionalFundingOutsideExecution(),
                     else => return err,
                 };
-                try ctx.prepareLegacyQuotasOutside(norms);
             };
         }
 
@@ -922,12 +903,6 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             // normal cache preparation instead of preserving a disabled policy.
             if (comptime build_options.enable_cuda) if (ctx.norm_preparation) |norms| if (norms.optionalRecoveryActive()) {
                 ctx.refreshNormFundingOutside(control) catch |err| {
-                    parked.restore() catch platform.inference_process_supervisor.restartWorker();
-                    return err;
-                };
-            };
-            if (comptime build_options.enable_cuda) if (ctx.norm_preparation) |norms| {
-                ctx.prepareLegacyQuotasOutside(norms) catch |err| {
                     parked.restore() catch platform.inference_process_supervisor.restartWorker();
                     return err;
                 };

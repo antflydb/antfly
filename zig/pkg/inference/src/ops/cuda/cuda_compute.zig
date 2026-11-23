@@ -2357,13 +2357,7 @@ pub const CudaCompute = struct {
     /// value borrows them and the actual model keeps compute alive. No cleanup
     /// boundary, operation token, request allocator or supplier is stored.
     pub const CapturedCacheRoots = struct {
-        pub const Slot = struct {
-            tensor: ?*CudaTensor = null,
-            // Discovery identities never own/dereference a parent outside exclusion.
-            discovered_parent: ?*CudaTensor = null,
-            discovered_buffer: driver_mod.CUdeviceptr = 0,
-            upgrade: ?@import("cache_quota.zig").RawUpgrade = null,
-        };
+        pub const Slot = ?*CudaTensor;
         slots: []Slot,
         requests: []const @import("prepared_cache.zig").Request,
         epoch: u64 = 0,
@@ -2375,71 +2369,15 @@ pub const CudaCompute = struct {
                 .constant => |named| if (!std.mem.startsWith(u8, named.name.slice(), "lighton.norm_weight.")) return error.InvalidCapturedCacheRequest,
                 else => return error.InvalidCapturedCacheRequest,
             };
-            @memset(slots, .{});
+            @memset(slots, null);
             return .{ .slots = slots, .requests = requests };
-        }
-        /// Cold weak discovery copies exact values under the cache metadata
-        /// mutex. Allocate shells before taking any strong legacy raw parent:
-        /// OOM therefore cannot strand a final raw owner outside its cohort.
-        pub fn prepareLegacyQuotasOutside(self: *CapturedCacheRoots, compute: *CudaCompute, model: *const @import("../../backends/session.zig").Session.ModelLifetime) !void {
-            self.finishLegacyPreparationOutside();
-            errdefer self.finishLegacyPreparationOutside();
-            for (self.requests, 0..) |request, index| {
-                const slot = &self.slots[index];
-                compute.lockConstantMetadata();
-                const found = compute.embedding_gemma2_constants.get(request.constant.name.slice());
-                var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
-                if (found) |parent| if (parent.model_constant_quota == .raw) {
-                    slot.discovered_parent = parent;
-                    slot.discovered_buffer = parent.buffer.ptr;
-                    lease = parent.model_constant_quota.raw;
-                };
-                compute.unlockConstantMetadata();
-                if (lease) |actual| {
-                    const controller = actual.controller orelse return error.MissingResourceRetirementLease;
-                    const pin = model.retainAdmissionDomain(controller) orelse return error.MissingCacheRetirementDomain;
-                    defer pin.release();
-                    slot.upgrade = try @import("cache_quota.zig").RawUpgrade.prepare(actual, &pin);
-                }
-            }
-        }
-        pub fn finishLegacyPreparationOutside(self: *CapturedCacheRoots) void {
-            for (self.slots) |*slot| {
-                if (slot.upgrade) |*upgrade| upgrade.deinitOutsideExecution();
-                slot.upgrade = null;
-                slot.discovered_parent = null;
-                slot.discovered_buffer = 0;
-            }
-        }
-        /// Caller owns the actual Session cohort, before selecting/capturing any
-        /// graph. No allocation, supplier, SDK work, or source pointer borrow.
-        pub fn commitLegacyQuotas(self: *CapturedCacheRoots, compute: *CudaCompute) !void {
-            for (self.requests, 0..) |request, index| {
-                const slot = &self.slots[index];
-                const parent = compute.embedding_gemma2_constants.get(request.constant.name.slice()) orelse {
-                    if (slot.upgrade != null) return error.PreparedCachePlanChanged;
-                    continue;
-                };
-                if (parent.model_constant_quota != .raw) continue;
-                const upgrade = if (slot.upgrade) |*value| value else return error.PreparedCachePlanChanged;
-                if (slot.discovered_parent != parent or slot.discovered_buffer != parent.buffer.ptr) return error.PreparedCachePlanChanged;
-                retainResidentTensor(parent); // actual revalidated parent, not discovery
-                defer {
-                    const previous = parent.resident_references.fetchSub(1, .acq_rel);
-                    std.debug.assert(previous > 1); // map still owns the same parent
-                }
-                _ = try upgrade.install(&parent.model_constant_quota);
-            }
-            // All current raw norm parents are now exact prepared owners.
-            // Later peers cannot create an unprepared replacement for them.
-            compute.managed_norm_publication = true;
         }
         fn identity(self: *const CapturedCacheRoots) usize {
             return @intFromPtr(self);
         }
         fn releaseRoots(self: *CapturedCacheRoots, compute: *CudaCompute, current: @import("../../execution/cleanup_context.zig").Context) void {
-            for (self.slots) |*slot| if (slot.tensor) |tensor| {
-                slot.tensor = null;
+            for (self.slots) |*slot| if (slot.*) |tensor| {
+                slot.* = null;
                 freeTensorWithCleanup(compute, @ptrCast(tensor), current);
             };
             self.epoch = 0;
@@ -2468,12 +2406,12 @@ pub const CudaCompute = struct {
             if (!tensor.model_constant or tensor.resident_parent != null or !tensor.owned_by_tensor or !tensor.owns_buffer or tensor.dtype != .f32 or tensor.buffer.len < bytes or try checkedMul(tensor.elem_count, 4) != bytes) return error.CapturedCacheRootChanged;
             var empty: ?*Slot = null;
             for (self.slots) |*slot| {
-                if (slot.tensor == tensor) return;
-                if (slot.tensor == null and empty == null) empty = slot;
+                if (slot.* == tensor) return;
+                if (slot.* == null and empty == null) empty = slot;
             }
             const target = empty orelse return error.CapturedCacheRootCapacity;
             retainResidentTensor(tensor);
-            target.tensor = tensor;
+            target.* = tensor;
         }
         pub fn bind(self: *CapturedCacheRoots, cb: *const ops.ComputeBackend, expected: *CudaCompute) !void {
             if (!acceptsPhysicalImplementation(cb.vtable) or cb.ptr != @as(*anyopaque, @ptrCast(expected))) return error.UnsupportedReaderEpochBackend;
@@ -3333,8 +3271,7 @@ pub const CudaCompute = struct {
     /// copy/admission/publication. An unfunded legacy miss keeps the ordinary
     /// result path once; no global cache flag or valid existing root changes.
     fn managedNormMissFunded(self: *const CudaCompute, key: []const u8, bytes: usize) bool {
-        if (!self.managed_norm_publication) return true; // historical raw compatibility before ownership
-        const funding = self.ctx.prepared_cache_funding orelse return false;
+        const funding = self.ctx.prepared_cache_funding orelse return self.ctx.video_cache_budget.admission == null;
         if (funding.state != .bound or funding.boundary == null or funding.deny_cold_misses or funding.deny_constants) return false;
         for (funding.entries) |entry| {
             if (entry.request != .constant or !std.mem.eql(u8, entry.request.constant.name.slice(), key)) continue;
@@ -6226,7 +6163,6 @@ pub const CudaCompute = struct {
     captured_cache_roots: ?*CapturedCacheRoots = null,
     // Armed only by real managed cold publication after legacy roots upgraded.
     // Existing hits stay usable; new norm roots require actual cold Funding.
-    managed_norm_publication: bool = false,
     lighton_decode_graph_enabled: bool = false,
 
     audio_arena_executes: u64 = 0,
@@ -43635,23 +43571,59 @@ test "LightOnOCR3 CUDA Florence fused KV append preserves exact bits active pref
 test "LightOnOCR3 CUDA norm weight cache preserves bits readonly sources detached borrowers and admission fallback" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    const domain = try @import("../../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const controller = pin.controller();
     var compute = try CudaCompute.testing.init(a);
     defer compute.deinit();
     compute.capability_profile = .lightonocr3;
     compute.lighton_norm_weight_cache_enabled = true;
-    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 65536, .scratch_limit_bytes = 65536 }, .check_live_memory = false };
+    compute.ctx.video_cache_budget.admission = .{ .controller = controller, .limits = .{ .backend_limit_bytes = 65536, .scratch_limit_bytes = 65536 }, .check_live_memory = false };
     const cb = compute.computeBackend();
-    // This direct component fixture owns no model/provider execution lane.
-    // Detached raw cache borrowers need this explicit final cleanup authority.
+    const Funding = @import("prepared_cache.zig");
+    const dimensions = [_]usize{ 128, 256, 1024, 2560 };
+    var requests: [dimensions.len]Funding.Request = undefined;
     var values: [2560]f32 = undefined;
     for (&values, 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 32;
-    for ([_]usize{ 128, 256, 1024, 2560 }) |dim| {
+    for (dimensions, 0..) |dim, i| {
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "norm-cache.{d}", .{dim});
         const shape = [_]i64{@intCast(dim)};
         const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values[0..dim]), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
         try compute.insertWeightFromTensor(try a.dupe(u8, name), &tensor);
+        const source = try cb.getWeight(name);
+        defer cb.freeWithCleanup(source, .{ .outside_execution = true });
+        const before = compute.stats.add_scalar_calls;
+        try std.testing.expect(try CudaCompute.lightOnAdjustedNormWeight(&cb, source, dim, 1) == null);
+        try std.testing.expectEqual(before, compute.stats.add_scalar_calls);
+        const resident = tensorFromCt(source);
+        var key_buf: [128]u8 = undefined;
+        const key = try CudaCompute.lightOnNormCacheKey(&key_buf, @intFromPtr(resident), resident.buffer.ptr, dim, 1);
+        requests[i] = try Funding.Request.constantSpan(key, dim * @sizeOf(f32));
+    }
+    const funding = try Funding.Funding.create(.{ .requests = &requests });
+    defer funding.finishOutsideExecution();
+    for (dimensions, 0..) |dim, i| try funding.noteMiss(i, .{ .backend_scratch_bytes = dim * @sizeOf(f32) }, 0);
+    funding.admission = compute.ctx.video_cache_budget.admission;
+    funding.state = .snapped;
+    try funding.fundOutsideExecution(&pin);
+    var sink = try @import("../../execution/retirement_sink.zig").Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try funding.bind(&epoch);
+    compute.ctx.prepared_cache_funding = funding;
+    defer {
+        compute.ctx.prepared_cache_funding = null;
+        funding.unbind();
+    }
+    for (dimensions) |dim| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "norm-cache.{d}", .{dim});
         const source = try cb.getWeight(name);
         defer cb.freeWithCleanup(source, .{ .outside_execution = true });
         const before = compute.stats.add_scalar_calls;
@@ -43695,11 +43667,12 @@ test "LightOnOCR3 CUDA norm weight cache preserves bits readonly sources detache
     cb.freeWithCleanup(detached, .{ .outside_execution = true });
     detached_owned = false;
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    // A denied snapshot still returns the ordinary owned adjusted tensor.
-    compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 1;
-    const denied = (try CudaCompute.lightOnAdjustedNormWeight(&cb, last, 2560, 1)).?;
-    defer cb.freeWithCleanup(denied, .{ .outside_execution = true });
-    try std.testing.expect(tensorFromCt(denied).resident_parent == null);
+    // The consumed funding cannot cover an additional miss. The caller's
+    // ordinary add remains available without creating a late cache owner.
+    try std.testing.expect(try CudaCompute.lightOnAdjustedNormWeight(&cb, last, 2560, 1) == null);
+    const ordinary = (try cb.addScalar(last, 1)).?;
+    defer cb.freeWithCleanup(ordinary, .{ .outside_execution = true });
+    try std.testing.expect(tensorFromCt(ordinary).resident_parent == null);
     try std.testing.expectEqual(@as(usize, 0), compute.embedding_gemma2_constant_count.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
 }
