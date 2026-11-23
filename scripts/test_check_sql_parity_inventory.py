@@ -336,6 +336,7 @@ class ParityInventoryTest(unittest.TestCase):
                 "timeout_seconds": 13,
             },
         }
+        gates["f"] = {**gates["e"], "timeout_seconds": 15}
         runs = evidence_runs(list(gates), gates)
         self.assertEqual(4, len(runs))
         self.assertEqual(["a", "b"], runs[0]["gate_ids"])
@@ -355,7 +356,8 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertEqual(12, runs[0]["timeout_seconds"])
         self.assertEqual(["c"], runs[1]["gate_ids"])
         self.assertEqual(["d"], runs[2]["gate_ids"])
-        self.assertEqual(["e"], runs[3]["gate_ids"])
+        self.assertEqual(["e", "f"], runs[3]["gate_ids"])
+        self.assertEqual(15, runs[3]["timeout_seconds"])
 
     def test_compile_filter_grouping_keeps_owner_and_build_options_isolated(self):
         def gate(filters, target="sql-test", options=()):

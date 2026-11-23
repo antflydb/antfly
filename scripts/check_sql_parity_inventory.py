@@ -246,7 +246,7 @@ def select_evidence_gates(inventory, entries, used_gates, family=None, requested
 
 
 def evidence_runs(gate_ids, gates):
-    """Share one Zig test binary across gates that differ only by test filters."""
+    """Share compatible Zig runs across evidence references."""
     runs = []
     grouped = {}
     for gate_id in gate_ids:
@@ -285,12 +285,19 @@ def evidence_runs(gate_ids, gates):
             and len(filters) % 2 == 0
             and all(flag == "--test-filter" for flag in filters[::2])
         )
-        key = (
-            ("runtime", gate["cwd"], tuple(command[:separator])) if mergeable else None
-        )
+        key = None
+        if mergeable:
+            key = ("runtime", gate["cwd"], tuple(command[:separator]))
+        elif command[:2] == ["zig", "build"]:
+            key = ("exact", gate["cwd"], tuple(command))
         if key is not None and key in grouped:
             run = grouped[key]
             run["gate_ids"].append(gate_id)
+            if not mergeable:
+                run["timeout_seconds"] = max(
+                    run["timeout_seconds"], gate["timeout_seconds"]
+                )
+                continue
             existing = set(run["command"][run["command"].index("--") + 2 :: 2])
             for value in filters[1::2]:
                 if value not in existing:
