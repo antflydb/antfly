@@ -40,6 +40,8 @@ pub const MapperDoc = struct {
     /// serializing the logical tree back to JSON.
     source_bytes: usize = 0,
     doc_ordinal: ?u32 = null,
+    /// This copy's version (lite-full-text-storage.md), when indexed under one.
+    doc_version: ?u64 = null,
     /// Relational scans can supply the already-decoded logical tree alongside
     /// the materialized source bytes, avoiding a whole-document JSON reparse.
     root: ?std.json.Value = null,
@@ -1142,6 +1144,7 @@ pub const TextProjectionBatchBuilder = struct {
             .stored_source = doc.typed_source,
             .stored_source_bytes = if (self.store_source_columns and doc.typed_source != null) try @import("../typed_json.zig").encodedSize(doc.typed_source.?) else 0,
             .doc_ordinal = doc.doc_ordinal,
+            .doc_version = doc.doc_version,
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
@@ -1288,6 +1291,7 @@ pub const TextProjectionSourceDoc = struct {
     stored_data: []const u8,
     typed_source: ?std.json.Value,
     doc_ordinal: ?u32 = null,
+    doc_version: ?u64 = null,
     schema_less_text_fields: []const introducer_mod.TextField = &.{},
     schema_less_fast_projection: bool = false,
 };
@@ -1467,7 +1471,7 @@ pub fn buildTextProjectionSourceBatchWithOptions(
     defer source_docs.deinit(arena);
 
     for (docs) |doc| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, doc.root, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, doc.key, doc.value, doc.doc_ordinal, doc.doc_version, doc.root, opts);
     }
 
     return .{
@@ -1491,7 +1495,7 @@ pub fn buildTextProjectionSourceBatchFromWritesWithOptions(
     defer source_docs.deinit(arena);
 
     for (writes) |write| {
-        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, null, opts);
+        try appendTextProjectionSourceDoc(arena, &source_docs, write.key, write.value, null, null, null, opts);
     }
 
     return .{
@@ -1505,6 +1509,7 @@ fn appendTextProjectionSourceDoc(
     key: []const u8,
     value: []const u8,
     doc_ordinal: ?u32,
+    doc_version: ?u64,
     prepared_root: ?std.json.Value,
     opts: TextProjectionOptions,
 ) !void {
@@ -1516,6 +1521,7 @@ fn appendTextProjectionSourceDoc(
             .stored_data = stored_projection.stored_data,
             .typed_source = stored_projection.typed_source,
             .doc_ordinal = doc_ordinal,
+            .doc_version = doc_version,
         });
         return;
     }
@@ -1526,6 +1532,7 @@ fn appendTextProjectionSourceDoc(
             .stored_data = if (opts.retain_stored_data) value else "",
             .typed_source = null,
             .doc_ordinal = doc_ordinal,
+            .doc_version = doc_version,
             .schema_less_text_fields = try extractStringFieldsNoSchemaRaw(arena, value, opts),
             .schema_less_fast_projection = true,
         });
@@ -1543,6 +1550,7 @@ fn appendTextProjectionSourceDoc(
         .stored_data = stored_projection.stored_data,
         .typed_source = stored_projection.typed_source,
         .doc_ordinal = doc_ordinal,
+        .doc_version = doc_version,
     });
 }
 

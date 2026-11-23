@@ -542,6 +542,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.InvalidRowPolicyBundle,
         => .busy,
         error.FileLocksUnsupported,
+        error.HardLinkedDatabase,
         error.GenerationFileLocksUnsupported,
         error.RowPolicyAuthenticationRequired,
         error.RowPolicyAuthorityUnavailable,
