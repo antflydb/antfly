@@ -114,22 +114,28 @@ pub const EncoderIntent = enum { resident, incremental, vocabulary_row };
 
 const EncoderRoute = struct {
     dispatched: bool,
-    resident: bool,
-    incremental: ?Incremental.Receiver,
+    incremental: ?Incremental.Receiver = null,
     placement: PlacementReason,
+
+    fn isResident(self: EncoderRoute) bool {
+        return self.placement == .resident_pair or self.placement == .resident_incremental;
+    }
 };
 fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, intent: EncoderIntent) EncoderRoute {
     const dispatched = if (comptime @TypeOf(dispatch) == @TypeOf(null)) false else if (comptime @typeInfo(@TypeOf(dispatch)) == .optional) dispatch != null else true;
-    const incremental = if (intent == .incremental) Incremental.qualify(encoder, decoder) else null;
-    const placement: PlacementReason = if (intent == .vocabulary_row and outputVocabulary(decoder) == null)
-        .unknown_decoder_vocabulary
-    else if (!supportsResidentDispatch(dispatch) or (dispatched and @import("tensor_dispatch.zig").stageDispatcher(dispatch) == null))
-        .dispatcher_host_only
-    else if (incremental != null)
-        .resident_incremental
-    else
-        residentPairPlacement(encoder, decoder, control != null);
-    return .{ .dispatched = dispatched, .incremental = incremental, .placement = placement, .resident = placement == .resident_pair or placement == .resident_incremental };
+    if (intent == .vocabulary_row and outputVocabulary(decoder) == null) {
+        return .{ .dispatched = dispatched, .placement = .unknown_decoder_vocabulary };
+    }
+    if (!supportsResidentDispatch(dispatch) or (dispatched and @import("tensor_dispatch.zig").stageDispatcher(dispatch) == null)) {
+        return .{ .dispatched = dispatched, .placement = .dispatcher_host_only };
+    }
+    if (intent == .incremental) {
+        if (Incremental.qualify(encoder, decoder)) |receiver| {
+            return .{ .dispatched = dispatched, .incremental = receiver, .placement = .resident_incremental };
+        }
+    }
+    const placement = residentPairPlacement(encoder, decoder, control != null);
+    return .{ .dispatched = dispatched, .placement = placement };
 }
 
 /// The owning task calls this before its model/provider lane. Qualification is
@@ -139,7 +145,7 @@ fn encoderRoute(encoder: backends.Session, decoder: backends.Session, dispatch: 
 pub fn prepareEncoderPermit(encoder: backends.Session, decoder: backends.Session, dispatch: anytype, control: ?Control, intent: EncoderIntent, permit: *session_mod.RunPermit) !void {
     if (permit.session.ptr != encoder.ptr or permit.session.vtable != encoder.vtable) return error.InvalidStagePermit;
     const selected = encoderRoute(encoder, decoder, dispatch, control, intent);
-    if (selected.resident and !selected.dispatched) try permit.prepareResidentOutputRetirement();
+    if (selected.isResident() and !selected.dispatched) try permit.prepareResidentOutputRetirement();
 }
 
 fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decoder: backends.Session, inputs: []const backends.Tensor, dispatch: anytype, control: ?Control, supplied: ?*session_mod.RunPermit, intent: EncoderIntent) !EncoderOutputs {
@@ -148,7 +154,7 @@ fn encodeOptions(allocator: std.mem.Allocator, encoder: backends.Session, decode
     observePlacement(encoder, decoder, selected.placement);
     const dispatched = selected.dispatched;
     const incremental = selected.incremental;
-    if (selected.resident) {
+    if (selected.isResident()) {
         var own_permit: ?session_mod.RunPermit = null;
         defer if (own_permit) |*owned| owned.deinit();
         const permit: ?*session_mod.RunPermit = if (dispatched) supplied else supplied orelse blk: {
@@ -565,7 +571,7 @@ test "encoder cold preparation shares host fallback and typed dispatcher qualifi
     var dispatcher = Dispatch{};
     try prepareEncoderPermit(session, session, &dispatcher, null, .incremental, &permit);
     try std.testing.expect(permit.output_retirement_shell == null);
-    try std.testing.expect(!encoderRoute(session, session, &dispatcher, null, .incremental).resident);
+    try std.testing.expect(!encoderRoute(session, session, &dispatcher, null, .incremental).isResident());
     try std.testing.expectEqual(PlacementReason.dispatcher_host_only, encoderRoute(session, session, &dispatcher, null, .incremental).placement);
     try std.testing.expectEqual(PlacementReason.no_source_context, residentPairPlacement(session, session, false));
     try prepareEncoderPermit(session, session, null, null, .vocabulary_row, &permit);
