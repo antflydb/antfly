@@ -691,9 +691,38 @@ pub const Executor = struct {
         const scope = self.claimed_execution_scope orelse return error.InvalidBatchDecodeState;
         scope.deinit();
         const waited = pending.wait();
+        self.reacquireClaimedExecution(scope);
+        try waited;
+    }
+
+    fn reacquireClaimedExecution(self: *Executor, scope: *@import("../ops/execution_scope.zig").Scope) void {
         scope.* = self.access.acquireCleanupScope().?;
         if (self.claimed_batch_budget) |budget| scope.bindDecodeBatch(budget, self.claimed_batch_rows);
-        try waited;
+    }
+
+    fn preparePackedHostLoan(self: *Executor, bytes: usize) !@import("../execution/packed_host_loan.zig").Loan {
+        const before = self.context.before_owned_forward orelse return error.MissingPackedHostPreparation;
+        const control: execution_control.InferenceExecutionControl = self.context.execution_control orelse .{};
+        var wait: ?@import("../execution/reader_pool.zig").AdmissionWait = null;
+        while (true) {
+            try control.check();
+            return before.prepare_fn(before.ptr, self.context.cb, bytes, control) catch |err| switch (err) {
+                error.ReaderAdmissionWindowBusy => {
+                    const now = platform.time.monotonicNs();
+                    if (wait == null) wait = .{ .last_progress_ns = now };
+                    if (wait.?.expired(now, null)) return error.ResourceTemporarilyUnavailable;
+                    const scope = self.claimed_execution_scope orelse return error.ResourceTemporarilyUnavailable;
+                    // Another page may already own the outside turn and be
+                    // waiting for our step. Keep the packet claimed and give
+                    // that page room to finish before retrying preparation.
+                    scope.deinit();
+                    platform.time.sleepNs(wait.?.nextRetryDelayNs());
+                    self.reacquireClaimedExecution(scope);
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
 
     /// Mixed prefix/decode choices use the same independently owned token
@@ -1196,8 +1225,7 @@ pub const Executor = struct {
             host_lease.deinit();
         }
         if (cuda_packed and session.run_admission != null) {
-            const before = self.context.before_owned_forward orelse return error.MissingPackedHostPreparation;
-            host_loan = try before.prepare_fn(before.ptr, cb, host_bytes, self.context.execution_control orelse .{});
+            host_loan = try self.preparePackedHostLoan(host_bytes);
             try host_loan.?.validateBound(session, .{ .context = cb.ptr, .table = cb.vtable }, host_bytes, .{ .boundary = self.context.cleanupEpoch(), .operation = cb.operationToken() });
             self.packed_host_preparations +|= 1;
         } else {
@@ -1758,6 +1786,52 @@ pub const Executor = struct {
         }
     }
 };
+
+test "packed host preparation retries only reader contention under the claimed step" {
+    const Loan = @import("../execution/packed_host_loan.zig").Loan;
+    const Probe = struct {
+        gate: *const execution_control.ExecutionLane,
+        calls: usize = 0,
+        cancel_after_busy: bool = false,
+
+        fn prepare(raw: *anyopaque, _: *const ComputeBackend, bytes: usize, _: execution_control.InferenceExecutionControl) !Loan {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(probe.gate.owned);
+            try std.testing.expectEqual(@as(usize, 35028), bytes);
+            probe.calls += 1;
+            if (probe.calls == 1) return error.ReaderAdmissionWindowBusy;
+            return error.ResourceTemporarilyUnavailable;
+        }
+
+        fn check(raw: ?*anyopaque) !void {
+            const probe: *@This() = @ptrCast(@alignCast(raw.?));
+            if (probe.cancel_after_busy and probe.calls != 0) return error.Cancelled;
+        }
+    };
+    for ([_]bool{ false, true }) |cancel| {
+        var mutex: std.atomic.Mutex = .unlocked;
+        var gate = execution_control.ExecutionLane{};
+        var probe = Probe{ .gate = &gate, .cancel_after_busy = cancel };
+        const backend: ComputeBackend = undefined;
+        var executor = Executor{
+            .context = .{
+                .allocator = std.testing.allocator,
+                .cb = &backend,
+                .gpt_config = undefined,
+                .execution_control = .{ .ptr = &probe, .check_fn = Probe.check },
+                .before_owned_forward = .{ .ptr = &probe, .prepare_fn = Probe.prepare },
+            },
+            .access = .{ .mutex = &mutex, .gate = &gate },
+        };
+        var scope = (try executor.access.acquireScope()).?;
+        defer scope.deinit();
+        executor.claimed_execution_scope = &scope;
+        const expected: anyerror = if (cancel) error.Cancelled else error.ResourceTemporarilyUnavailable;
+        try std.testing.expectError(expected, executor.preparePackedHostLoan(35028));
+        try std.testing.expectEqual(@as(usize, if (cancel) 1 else 2), probe.calls);
+        try std.testing.expect(scope.active and gate.owned);
+    }
+}
 
 test "physical decoder step cancellation publishes once before borrowing backend or work" {
     const Probe = struct {

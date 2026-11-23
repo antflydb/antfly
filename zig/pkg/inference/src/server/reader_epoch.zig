@@ -1435,7 +1435,7 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
         /// Mandatory packed CPU arrays precede ALL packet KV mutation/math,
         /// regardless of whether an optional external DSO exists or declines.
         /// This is the SAME actual owned-step outside window as graph/DSO
-        /// preparation. Busy/cancel/admission errors restore and propagate.
+        /// preparation. Window contention is retryable before dispatch.
         fn preparePackedHost(raw: *anyopaque, cb: *const ops.ComputeBackend, bytes: usize, control: InferenceExecutionControl) !@import("../execution/packed_host_loan.zig").Loan {
             if (comptime !build_options.enable_cuda) return error.UnsupportedReaderEpochBackend;
             const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
@@ -1445,7 +1445,10 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             try preparation.validateForCohort(ctx.model.session, &ctx.cohort_waiter);
             if (@as(*anyopaque, @ptrCast(preparation.expectedCudaCompute())) != cb.ptr) return error.ForeignReaderEpochBackend;
             const identity = @import("../execution/kernel_route.zig").Implementation{ .context = cb.ptr, .table = cb.vtable };
-            var parked = try ctx.parkWithOwnedStep(control);
+            var parked = ctx.parkWithOwnedStep(control) catch |err| switch (err) {
+                error.ResourceTemporarilyUnavailable => return error.ReaderAdmissionWindowBusy,
+                else => return err,
+            };
             var loan = @import("../execution/packed_host_loan.zig").Loan.prepareOutsideExecution(ctx.model.session, identity, bytes) catch |err| {
                 parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
                 return err;
