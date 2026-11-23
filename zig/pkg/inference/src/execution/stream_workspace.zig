@@ -77,6 +77,7 @@ pub const Plan = struct {
         if (!self.valid or self.sealed) return;
         for (self.allocations[0..self.count], 0..) |*a, i| if (a.live and a.pointer == pointer) {
             a.live = false;
+            a.pointer = 0;
             self.event(i, false);
             return;
         };
@@ -91,9 +92,11 @@ pub const Plan = struct {
 
     fn seal(self: *Plan, expected: ?DevicePointer) bool {
         if (self.sealed) return false;
-        for (self.allocations[0..self.count], 0..) |allocation, index| {
+        for (self.allocations[0..self.count], 0..) |*allocation, index| {
             if (!allocation.live) continue;
             if (expected != allocation.pointer or self.output != null) self.valid = false;
+            // The published layout keeps slot geometry, never a learning-run address.
+            allocation.pointer = 0;
             self.output = index;
         }
         self.valid = self.valid and (expected == null) == (self.output == null);
@@ -234,6 +237,7 @@ test "stream workspace redirects only the sealed publication slot" {
     plan.release(0x1000);
     plan.allocate(64, 0x2000);
     try std.testing.expect(plan.finish(0x2000));
+    for (plan.allocations[0..plan.count]) |allocation| try std.testing.expectEqual(@as(DevicePointer, 0), allocation.pointer);
     const layout = try plan.layout(alignment);
     var scope = try Scope.bind(&plan, layout, 0x1000, layout.bytes + alignment);
     try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x1000, 64));
