@@ -3539,8 +3539,12 @@ pub const DurableSessionStore = struct {
 
     fn putSessionAndExpiryTxn(self: *DurableSessionStore, txn: anytype, key: []const u8, value: []const u8, session: Session, options: SaveOptions) !void {
         if (options.creating) try self.requireBeginningConnection(txn, session);
-        if (options.unscoped_savepoint) if (session.connection_id) |id|
-            try @import("sql/session/command_producer.zig").requireCommandTxn(self.alloc, txn, id, null, 0);
+        if (options.unscoped_savepoint) if (session.connection_id) |connection| {
+            // Only the SQL owner's scoped path can publish a savepoint for
+            // a connection with a native command record. Check in the same
+            // writer transaction as the session CAS and lease renewal.
+            try @import("sql/session/command_producer.zig").requireCommandTxn(self.alloc, txn, connection, null, 0);
+        };
         var previous_needs_recovery = false;
         if (txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
@@ -4801,10 +4805,14 @@ pub const SessionRegistry = struct {
     }
 
     pub fn readMutationInfo(self: *SessionRegistry, guard: Mutation) !?SessionInfo {
+        return self.readMutationInfoControlled(guard, .{});
+    }
+
+    pub fn readMutationInfoControlled(self: *SessionRegistry, guard: Mutation, context: RoutingContext) !?SessionInfo {
         const lock = self.sessionLock(guard.id);
-        lock.lock();
+        try lock.lockControlled(context);
         defer lock.unlock();
-        var view = (try self.readSessionAssumeStripe(guard.id)) orelse return null;
+        var view = (try self.readSessionControlled(guard.id, context)) orelse return null;
         defer view.deinit();
         _ = try guard.version(view.session);
         return view.session.info();
@@ -4942,6 +4950,10 @@ pub const SessionRegistry = struct {
     };
 
     fn readSessionAssumeStripe(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?SessionView {
+        return self.readSessionControlled(txn_id, .{});
+    }
+
+    fn readSessionControlled(self: *SessionRegistry, txn_id: db_mod.types.TxnId, context: RoutingContext) !?SessionView {
         if (!self.durableMissIsAuthoritative()) {
             self.mutex.lock();
             const cached = self.sessions.get(txn_id);
@@ -4949,7 +4961,7 @@ pub const SessionRegistry = struct {
             if (cached) |session| return .{ .session = session };
         }
         const durable = self.durable orelse return null;
-        return .{ .session = (try durable.load(txn_id)) orelse return null, .owned_by = durable.alloc };
+        return .{ .session = (try durable.loadForRouting(txn_id, context)) orelse return null, .owned_by = durable.alloc };
     }
 
     pub const SqlAdmission = struct {
@@ -5896,7 +5908,7 @@ pub const SessionRegistry = struct {
         const stripe = self.sessionLock(guard.id);
         try stripe.lockControlled(context);
         defer stripe.unlock();
-        var view = (try self.readSessionAssumeStripe(guard.id)) orelse return null;
+        var view = (try self.readSessionControlled(guard.id, context)) orelse return null;
         defer view.deinit();
         return terminalHttpCommitFromSession(alloc, guard, view.session, extra_req, terminal, context, null);
     }
@@ -6912,7 +6924,7 @@ pub const SessionRegistry = struct {
         savepoint_inserted = true;
         touchSession(&candidate);
 
-        if (plan != null) try self.persistSavepoint(candidate, digest, plan, null, guard) else try self.persistVersionedSession(candidate, expected, guard, true);
+        if (plan != null) try self.persistSavepoint(candidate, digest, plan, null, guard) else try self.persistUnscopedSavepoint(candidate, expected, guard);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(guard.id) orelse return error.SessionRemovedDuringMutation;
@@ -7016,7 +7028,7 @@ pub const SessionRegistry = struct {
         if (plan != null) try self.persistSavepoint(candidate, digest, plan, if (release)
             .{ .release_savepoint = .{ .transaction = guard.id, .first_child = savepoint_id, .parent = candidate.current_subtransaction } }
         else
-            .{ .rollback = .{ .transaction = guard.id, .first_aborted = savepoint_id } }, guard) else try self.persistVersionedSession(candidate, expected, guard, true);
+            .{ .rollback = .{ .transaction = guard.id, .first_aborted = savepoint_id } }, guard) else try self.persistUnscopedSavepoint(candidate, expected, guard);
         self.mutex.lock();
         defer self.mutex.unlock();
         const publish_target = self.sessions.getPtr(guard.id) orelse return error.SessionRemovedDuringMutation;
@@ -7921,11 +7933,7 @@ pub const SessionRegistry = struct {
     }
 
     fn persistMutation(self: *SessionRegistry, session: Session, expected: DurableSessionStore.Version, guard: ?Mutation) !void {
-        try self.persistVersionedSession(session, expected, guard, false);
-    }
-
-    fn persistVersionedSession(self: *SessionRegistry, session: Session, expected: DurableSessionStore.Version, guard: ?Mutation, unscoped_savepoint: bool) !void {
-        try self.persistVersionedSessionControlled(session, expected, guard, unscoped_savepoint, .{});
+        try self.persistVersionedSessionControlled(session, expected, guard, false, .{});
     }
 
     fn persistVersionedSessionControlled(self: *SessionRegistry, session: Session, expected: DurableSessionStore.Version, guard: ?Mutation, unscoped_savepoint: bool, context: RoutingContext) !void {
@@ -7939,6 +7947,10 @@ pub const SessionRegistry = struct {
                 .unscoped_savepoint = unscoped_savepoint,
             });
         } else try self.renewLeaseLocked(session.txn_id, session.owner_node_id);
+    }
+
+    fn persistUnscopedSavepoint(self: *SessionRegistry, session: Session, expected: DurableSessionStore.Version, guard: Mutation) !void {
+        try self.persistVersionedSessionControlled(session, expected, guard, true, .{});
     }
 
     fn persistOwnedVersion(self: *SessionRegistry, session: Session, expected: DurableSessionStore.Version) !void {

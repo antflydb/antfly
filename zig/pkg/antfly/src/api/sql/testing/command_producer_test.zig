@@ -40,6 +40,7 @@ const Native = struct {
     index: u64 = 100,
     serial: u64 = 1000,
     expiry_ms: u64 = 1000,
+    connection_expiry_ms: ?u64 = null,
     database: []const u8 = "main",
     principal: []const u8 = "alice",
     wire_epoch: ?[16]u8 = null,
@@ -51,6 +52,7 @@ const Native = struct {
     scope_reads: usize = 0,
     failure: ?enum { admit, prepare, commit, handoff, ack, cancel } = null,
     fail_before: bool = false,
+    block_ack: bool = false,
     block_cancel: bool = false,
     cancel_on_block: ?*std.atomic.Value(bool) = null,
     original_admissions: usize = 0,
@@ -87,6 +89,10 @@ const Native = struct {
                         else => null,
                     },
                 };
+                if (point == .ack and self.block_ack) {
+                    if (self.cancel_on_block) |signal| signal.store(true, .release);
+                    return error.MetadataMutationOutcomeUnknown;
+                }
                 const lose = point != null and point == self.failure;
                 if (lose) self.failure = null;
                 if (lose and self.fail_before) return error.MetadataMutationOutcomeUnknown;
@@ -181,9 +187,9 @@ fn setup(metadata: *storage.RaftApplyStore, source: *transactions.DurableSession
     try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
     const node: u64 = if (standalone) 0 else 9;
     const created_at_ms = if (native.expiry_ms == 1000) 1 else native.expiry_ms - 60000;
-    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .wire_epoch = native.wire_epoch, .durable_http = native.durable_http, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
+    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .wire_epoch = native.wire_epoch, .durable_http = native.durable_http, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.connection_expiry_ms orelse native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
     const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = node, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = native.expiry_ms }, .connection = connection, .nonce = id(3), .standalone = standalone };
-    try producer.create(source, native.principal, registration, actor, instance, try native.head(), native.nonce(), created_at_ms);
+    try producer.create(source, native.principal, registration, actor, instance, try native.head(), native.nonce(), created_at_ms, 0);
 }
 fn begin(native: *Native, source: *transactions.DurableSessionStore, serial: u64) !producer.Ticket {
     var owned = (try producer.load(source, a, connection)).?;
@@ -360,6 +366,7 @@ test "SQL command producer native connection GC retains uncertain owners and nat
         defer a.free(empty.ids);
         try std.testing.expectEqual(@as(usize, 0), empty.ids.len);
     }
+    try native.until(&source, .idle, 2);
     try native.until(&source, .retired, 2000);
     var registry = transactions.SessionRegistry.init(&source);
     defer registry.deinit(a);
@@ -371,7 +378,7 @@ test "SQL command producer native connection GC retains uncertain owners and nat
     // rather than another growing local tombstone family, rejects resurrection.
     _ = try connections.mutate(&source, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = 0, .expires_at_ms = 3000, .database = "main", .namespace = "public" } }, "alice", 0, 2001);
     const replacement: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(500), .fence = 1 }, .database = 1, .node = 0, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = 3000 }, .connection = connection, .nonce = id(501), .standalone = true };
-    try producer.create(&source, "alice", replacement, actor, instance, try native.head(), native.nonce(), 2001);
+    try producer.create(&source, "alice", replacement, actor, instance, try native.head(), native.nonce(), 2001, 0);
     for (0..8) |_| {
         var current = (try producer.load(&source, a, connection)).?;
         defer current.deinit();
@@ -423,21 +430,19 @@ test "SQL command producer native supervisor uses existing authenticated transpo
     defer a.free(bytes);
     try std.testing.expect(!sql_submitted);
     for (0..32) |_| {
-        const current = phase(&source) catch |err| switch (err) {
-            error.MissingCommandProducer => .retired,
-            else => return err,
-        };
-        if (current == .retired) break;
+        if (try producer.load(&source, a, connection)) |value| {
+            var owned = value;
+            defer owned.deinit();
+            if (owned.value.phase == .retired) break;
+        } else break;
         // The supervisor interval is a scheduling policy, not part of source
         // correctness. Drive its real callback without wall-clock sleeps.
         server.sql_command_work_due_ns = 0;
         try server.runSessionMaintenanceOnce();
     }
-    const final_phase = phase(&source) catch |err| switch (err) {
-        error.MissingCommandProducer => .retired,
-        else => return err,
-    };
-    try std.testing.expectEqual(.retired, final_phase);
+    var retired = try nativeCut(&native, .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, null);
+    defer retired.deinit();
+    try std.testing.expectEqual(.retired, retired.value.scope.?.state);
     try std.testing.expect(native.calls < 32);
 }
 
@@ -451,7 +456,7 @@ test "SQL command producer native providers must prove transaction-wide shared w
     unsupported.write_serialization = .unsupported;
     var store = transactions.DurableSessionStore.initRuntime(a, &unsupported);
     const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = 0, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = connection, .nonce = id(3), .standalone = true };
-    try std.testing.expectError(error.SqlConnectionUnavailable, producer.create(&store, "alice", registration, actor, instance, 0, id(4), 1));
+    try std.testing.expectError(error.SqlConnectionUnavailable, producer.create(&store, "alice", registration, actor, instance, 0, id(4), 1, 0));
     try std.testing.expect((try producer.load(&store, a, connection)) == null);
     const work = try producer.scanWork(&store, a, null, 1);
     defer a.free(work.ids);
@@ -462,7 +467,7 @@ test "SQL command producer native providers must prove transaction-wide shared w
     var supported = transactions.DurableSessionStore.initRuntime(a, &runtime);
     try std.testing.expect(supported.supportsSharedMutations());
     _ = try connections.mutate(&supported, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = 0, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 0, 1);
-    try producer.create(&supported, "alice", registration, actor, instance, 0, id(4), 1);
+    try producer.create(&supported, "alice", registration, actor, instance, 0, id(4), 1, 0);
     try std.testing.expectEqual(.registering, try phase(&supported));
 }
 
@@ -657,27 +662,36 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                 defer runtime.deinit();
                 var server = @import("../../http_server.zig").ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .session_store = &durable, .session_maintenance_local_only = true, .deployment_mode = .standalone }, .{ .ptr = &native, .vtable = &.{ .status = Forward.status, .system_catalog = Forward.catalog } }, null, null);
                 defer server.deinit();
+                var canceled: std.atomic.Value(bool) = .init(false);
                 if (phase_index == 0) {
+                    if (fault == .ack and before) {
+                        native.block_ack = true;
+                        native.cancel_on_block = &canceled;
+                        native.wire_epoch = instance;
+                        native.durable_http = true;
+                        native.connection_expiry_ms = 3600001;
+                        native.database = "default";
+                    }
                     try setup(&metadata, &durable, true, &native);
                     try native.until(&durable, .idle, 2);
                     const ticket = try begin(&native, &durable, 60);
                     const fence = try execute(&durable, ticket);
                     txn_id = transactions.newSessionTxnId(0);
-                    var active = try connections.loadWithCommand(&durable, a, connection, "alice", 0, 2, &fence);
-                    defer active.deinit();
-                    _ = try connections.mutateWithCommand(&durable, .{ .begin = .{ .id = connection, .expected_revision = active.value.revision, .txn_id = txn_id } }, "alice", 0, 2, &fence);
+                    var live = try connections.load(&durable, a, connection, "alice", 0, 2);
+                    defer live.deinit();
+                    _ = try connections.mutateWithCommand(&durable, .{ .begin = .{ .id = connection, .expected_revision = live.value.revision, .txn_id = txn_id } }, "alice", 0, 2, &fence);
                     _ = try server.txn_sessions.beginForPrincipalWithSettingsAndId(a, .{ .sync_level = .propose, .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 0, "alice", &.{}, connection, txn_id);
                     _ = try connections.mutateWithCommand(&durable, .{ .bind = .{ .id = connection, .txn_id = txn_id } }, "alice", 0, 2, &fence);
-                    var enrolled = (try producer.load(&durable, a, connection)).?;
-                    defer enrolled.deinit();
-                    try native.submit(enrolled.value, .{ .bind = .{ .command = ticket.command, .transaction = txn_id } });
+                    var source_record = (try producer.load(&durable, a, connection)).?;
+                    defer source_record.deinit();
+                    try native.submit(source_record.value, .{ .bind = .{ .command = ticket.command, .transaction = txn_id } });
                     native.failure = fault;
                     native.fail_before = before;
                     var user: ?@import("../../http_server.zig").AuthenticatedIdentity = null;
-                    var owner: @import("../session/session.zig").Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence } };
-                    const result = try @import("../session/session.zig").Coordinator.commit(&owner, .{ .principal = "alice", .database = "default", .namespace = "public" }, try server.txn_sessions.mutation(a, txn_id, 0));
+                    var owner: @import("../session/session.zig").Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence, .cancellation = .fromAtomic(&canceled) } };
+                    const result = try @import("../session/session.zig").Coordinator.commit(&owner, .{ .principal = "alice", .database = "default", .namespace = "public" }, try fixtureMutation(&server.txn_sessions, txn_id));
                     try std.testing.expectEqualDeep(txn_id, result.reconciliation_id);
-                    try std.testing.expect(result.outcome == .committed or result.outcome == .aborted or result.outcome == .unknown);
+                    try std.testing.expect(result.outcome == .committed or result.outcome == .aborted or result.outcome == .unknown or (native.block_ack and result.outcome == .committed_pending));
                     if (fault == null) try std.testing.expectEqual(.committed, result.outcome);
                     var durable_result = (try durable.load(txn_id)).?;
                     defer durable_result.deinit(a);
@@ -696,6 +710,41 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                     defer region.deinit();
                     var owner: coordinator.Registry = .{ .server = &server, .context = .{}, .database_id = 1 };
                     var cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
+                    if (phase_index == 1 and fault == .ack and before) {
+                        native.serial = 50000;
+                        try std.testing.expectEqual(@as(usize, 1), cut.receipts.len);
+                        try std.testing.expectEqual(.committed, cut.receipts[0].status);
+                        try native.until(&durable, .retired, 1001);
+                        var logical = try connections.loadReconciled(&durable, &server.txn_sessions, a, connection, "alice", 0, 1001);
+                        defer logical.deinit();
+                        try std.testing.expectEqual(.idle, logical.value.state);
+                        var ingress: IngressRuntime = .{ .native = &native, .now_ms = 1001 };
+                        const controller: @import("../session/command_execution.zig").Controller = .{
+                            .store = &durable,
+                            .connection = connection,
+                            .principal = "alice",
+                            .actor = actor,
+                            .instance = id(991),
+                            .node = 0,
+                            .standalone = true,
+                            .port = .{ .ptr = &ingress, .call = IngressRuntime.call },
+                            .runtime = ingress.runtime(),
+                        };
+                        try controller.enroll(a, "default");
+                        var successor = (try producer.load(&durable, a, connection)).?;
+                        defer successor.deinit();
+                        var before_ack = try native.port().snapshot(a, successor.value);
+                        defer before_ack.deinit();
+                        var seal = try std.json.parseFromSlice(transactions.ExternalPreparationSeal, a, bytes.external_preparation.?, .{});
+                        defer seal.deinit();
+                        try owner.acknowledgeReceipt(region.allocator(), seal.value.identity);
+                        var after_ack = try native.port().snapshot(a, successor.value);
+                        defer after_ack.deinit();
+                        try std.testing.expectEqualDeep(before_ack.value.scope, after_ack.value.scope);
+                        try std.testing.expectEqualDeep(before_ack.value.owner, after_ack.value.owner);
+                        cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
+                        try std.testing.expectEqual(@as(usize, 0), cut.receipts.len);
+                    }
                     if (cut.records.len == 1 and cut.records[0].phase == .preparing) {
                         // Interrupted preparation may abort, but can never be
                         // promoted to a commit without its durable prepare cut.
@@ -1167,7 +1216,7 @@ test "SQL command producer native advisory contention avoids journal churn and h
             registration.lease.backend.id = id(50);
             registration.nonce = native.nonce();
             _ = try connections.mutate(&source, .{ .create = .{ .id = key_b, .principal = "alice", .owner_node_id = registration.lease.node, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", registration.lease.node, 1);
-            try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), 1);
+            try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), 1, 0);
         }
         try driveConnection(&native, &source, key_b, .idle);
         const frame_a = try beginConnection(&native, &source, connection);
@@ -1351,14 +1400,17 @@ fn attachedTransaction(native: *Native, source: *transactions.DurableSessionStor
     _ = try connections.mutateWithCommand(source, .{ .bind = .{ .id = connection, .txn_id = txn } }, "alice", node, 2, &fence);
     return txn;
 }
+fn fixtureMutation(registry: *transactions.SessionRegistry, txn: [16]u8) !transactions.Mutation {
+    const info = (try registry.readInfo(txn)) orelse return error.SqlTransactionNotActive;
+    const owner = info.version.owner;
+    return registry.mutation(a, txn, owner);
+}
 fn stageSavepointRow(registry: *transactions.SessionRegistry, txn: [16]u8, key: []const u8) !void {
     const body = try std.fmt.allocPrint(a, "{{\"table\":\"items\",\"key\":\"{s}\",\"document\":{{\"v\":1}}}}", .{key});
     defer a.free(body);
     var parsed = try transactions.parseStageWriteRequest(a, body);
     defer parsed.deinit(a);
-    const owner = (try registry.getOwnerNodeId(a, txn)) orelse return error.TestUnexpectedResult;
-    const guard = try registry.mutation(a, txn, owner);
-    _ = (try registry.stage(a, guard, &parsed)).?;
+    _ = (try registry.stage(a, try fixtureMutation(registry, txn), &parsed)).?;
 }
 fn savepointRows(registry: *transactions.SessionRegistry, txn: [16]u8) !usize {
     const durable = registry.durable orelse return error.MissingDurableSessionStore;
@@ -1468,10 +1520,9 @@ test "SQL command producer native savepoint publication atomically rewinds SQL a
         }
         // SQL release is durable before native reparenting begins. No public
         // legacy path may mutate savepoints through this in-flight owner.
-        const guard = try registry.mutation(a, txn, if (native.standalone) 0 else 9);
-        try std.testing.expectError(error.SqlConnectionBusy, registry.createNamedSavepoint(a, guard, "bypass"));
-        try std.testing.expectError(error.SqlConnectionBusy, registry.rollbackToNamedSavepoint(a, guard, "outer"));
-        try std.testing.expectError(error.SqlConnectionBusy, registry.releaseNamedSavepoint(a, guard, "outer"));
+        try std.testing.expectError(error.SqlConnectionBusy, registry.createNamedSavepoint(a, try fixtureMutation(&registry, txn), "bypass"));
+        try std.testing.expectError(error.SqlConnectionBusy, registry.rollbackToNamedSavepoint(a, try fixtureMutation(&registry, txn), "outer"));
+        try std.testing.expectError(error.SqlConnectionBusy, registry.releaseNamedSavepoint(a, try fixtureMutation(&registry, txn), "outer"));
         {
             const pinned = try registry.nativeSqlCut(a, txn);
             defer if (pinned.cut) |cut| cut.release();
@@ -1668,6 +1719,105 @@ const IngressRuntime = struct {
         return .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause };
     }
 };
+
+test "SQL command producer native cold restart reenrolls an idle durable HTTP connection" {
+    const execution = @import("../session/command_execution.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/idle-http-restart", .{tmp.sub_path});
+    defer a.free(path);
+    var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer metadata.deinit();
+    var source = transactions.DurableSessionStore.init(a, &metadata.store);
+    var native: Native = .{ .metadata = &metadata, .wire_epoch = instance, .durable_http = true, .connection_expiry_ms = 3600001, .database = "default" };
+    try setup(&metadata, &source, true, &native);
+    try native.until(&source, .idle, 2);
+    var original = (try producer.load(&source, a, connection)).?;
+    defer original.deinit();
+
+    metadata.deinit();
+    metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    source = transactions.DurableSessionStore.init(a, &metadata.store);
+    var hooks: IngressRuntime = .{ .native = &native, .now_ms = native.expiry_ms + 1 };
+    const owner: execution.Controller = .{
+        .store = &source,
+        .connection = connection,
+        .principal = "alice",
+        .actor = actor,
+        .instance = id(999),
+        .node = 0,
+        .standalone = true,
+        .port = .{ .ptr = &hooks, .call = IngressRuntime.call },
+        .runtime = hooks.runtime(),
+    };
+    try native.until(&source, .retired, hooks.now_ms);
+    const FaultPort = struct {
+        native: *Native,
+        backend: @FieldType(authority.scopes.Registration, "replaces"),
+        mode: enum { expired, rejected },
+        fn call(raw: *anyopaque, alloc: A, input: Call) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode == .rejected and input == .sql_lock_outcome)
+                return std.json.Stringify.valueAlloc(alloc, authority.outcomes.Outcome{ .rejected = .CatalogGenerationChanged }, .{});
+            const bytes = try Native.call(self.native, alloc, input);
+            if (self.mode != .expired or input != .sql_lock_read or !std.meta.eql(input.sql_lock_read.backend, self.backend)) return bytes;
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(authority.Snapshot, alloc, bytes, .{});
+            defer parsed.deinit();
+            parsed.value.head += authority.outcomes.retained;
+            return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        }
+    };
+    for ([_]@FieldType(FaultPort, "mode"){ .expired, .rejected }) |mode| {
+        var retired = (try producer.load(&source, a, connection)).?;
+        defer retired.deinit();
+        var registration = original.value.registration;
+        registration.replaces = retired.value.retiredNativeBackend();
+        registration.lease.backend.fence += 1;
+        registration.lease.expires_at_ms = hooks.now_ms + producer.execution_lease_ms;
+        registration.nonce = native.nonce();
+        try producer.create(&source, "alice", registration, actor, owner.instance, try native.head(), native.nonce(), hooks.now_ms, retired.value.revision);
+        var pending = (try producer.load(&source, a, connection)).?;
+        defer pending.deinit();
+        var fault: FaultPort = .{ .native = &native, .backend = registration.lease.backend, .mode = mode };
+        try producer.advance(&source, a, "alice", pending.value, owner.instance, hooks.now_ms, native.nonce(), .{ .ptr = &fault, .call = FaultPort.call });
+        var failed = (try producer.load(&source, a, connection)).?;
+        defer failed.deinit();
+        try std.testing.expectEqual(.retired, failed.value.phase);
+        try std.testing.expect(failed.value.registration_absent);
+        try std.testing.expect(failed.value.retiredNativeBackend().?.eql(original.value.registration.lease.backend));
+    }
+    for (0..4) |ordinal| {
+        var preceding = (try producer.load(&source, a, connection)).?;
+        defer preceding.deinit();
+        const old_backend = preceding.value.retiredNativeBackend();
+        try owner.enroll(a, native.database);
+        var successor = (try producer.load(&source, a, connection)).?;
+        defer successor.deinit();
+        const backend = successor.value.registration.lease.backend;
+        try std.testing.expectEqual(.idle, successor.value.phase);
+        try std.testing.expectEqual(original.value.registration.lease.backend.id, backend.id);
+        try std.testing.expectEqual(@as(u64, ordinal) + 2, backend.fence);
+        try std.testing.expect(successor.value.registration.replaces.?.eql(old_backend.?));
+        const bytes = try Native.call(&native, a, .{ .sql_lock_read = .{
+            .incarnation = backend.incarnation,
+            .standalone = true,
+            .actor = actor,
+            .database = 1,
+            .backend = old_backend,
+        } });
+        defer a.free(bytes);
+        var old_cut = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{});
+        defer old_cut.deinit();
+        try std.testing.expect(old_cut.value.scope == null and old_cut.value.owner == null);
+        try std.testing.expectError(error.CatalogGenerationChanged, native.submit(original.value, .{ .register = original.value.registration }));
+        var command = try owner.take(a, @splat(42));
+        try std.testing.expect(command.fence.backend.eql(backend));
+        try command.finish(a);
+        hooks.now_ms = successor.value.registration.lease.expires_at_ms + 1;
+        try native.until(&source, .retired, hooks.now_ms);
+    }
+}
 
 test "SQL command producer native ingress discovers one database enrolls exact owners and never reissues a body" {
     const execution = @import("../session/command_execution.zig");
@@ -2320,7 +2470,7 @@ test "SQL command producer native upkeep progresses with exhausted request concu
         last = key;
         _ = try connections.mutate(&source, .{ .create = .{ .id = key, .principal = "alice", .owner_node_id = 0, .expires_at_ms = initial_expiry, .database = "default", .namespace = "public" } }, "alice", 0, initial_expiry - 30000);
         const registration: authority.scopes.Registration = .{ .connection = key, .nonce = native.nonce(), .standalone = true, .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(ordinal + 500), .fence = 1 }, .database = 1, .node = 0, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = initial_expiry } };
-        try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), initial_expiry - 30000);
+        try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), initial_expiry - 30000, 0);
     }
     var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
     defer runtime.deinit();
@@ -2776,7 +2926,7 @@ test "SQL command producer native sealed execution fences completion before the 
                 native.fail_before = true;
                 // Stop after the durable seal and unknown native admission,
                 // before Adapter.commit can write the logical uncertain marker.
-                const outcome = try session_api.Coordinator.commit(&coordinator, scope, try server.txn_sessions.mutation(a, txn_id, 0));
+                const outcome = try session_api.Coordinator.commit(&coordinator, scope, try fixtureMutation(&server.txn_sessions, txn_id));
                 try std.testing.expectEqual(local.sql_session.CommitOutcome.unknown, outcome.outcome);
                 try producer.finish(&durable, "alice", source.value, instance, ticket, try native.head(), native.nonce());
             }

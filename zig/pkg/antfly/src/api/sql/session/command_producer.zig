@@ -73,7 +73,15 @@ pub const Record = struct {
     /// No execution permit was taken. Recovery may finish begin/finish only.
     body_skipped: bool = false,
     recovery: bool = false,
+    /// A rollover attempt ended without creating its native scope.
+    registration_absent: bool = false,
     failure: ?authority.outcomes.Rejection = null,
+
+    pub fn retiredNativeBackend(self: Record) @FieldType(authority.scopes.Registration, "replaces") {
+        std.debug.assert(self.phase == .retired);
+        if (self.registration_absent) return self.registration.replaces;
+        return self.registration.lease.backend;
+    }
 
     pub fn requiresWork(self: Record) bool {
         return self.phase != .retired or self.temporary_owner != null or self.temporary_retirement != null;
@@ -134,6 +142,7 @@ pub const Record = struct {
         }
         if (self.body_skipped and (self.ticket == null or (self.phase != .beginning and self.phase != .finishing and self.phase != .fencing and self.phase != .closing))) return error.InvalidSqlConnection;
         if (self.failure != null and !self.recovery) return error.InvalidSqlConnection;
+        if (self.registration_absent and (self.phase != .retired or self.registration.replaces == null)) return error.InvalidSqlConnection;
         if (self.phase == .retired and (!self.recovery or self.pending != null)) return error.InvalidSqlConnection;
         if ((self.phase == .fencing or self.phase == .closing) and !self.recovery) return error.InvalidSqlConnection;
         if (self.pending) |request| {
@@ -171,7 +180,12 @@ pub const Record = struct {
     pub fn jsonStringify(self: Record, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Record).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "notification_generation") or std.mem.eql(u8, field, "temporary_owner") or std.mem.eql(u8, field, "temporary_retirement")) {
+            if (comptime std.mem.eql(u8, field, "registration_absent")) {
+                if (self.registration_absent) {
+                    try writer.objectField(field);
+                    try writer.write(self.registration_absent);
+                }
+            } else if (comptime std.mem.eql(u8, field, "notification_generation") or std.mem.eql(u8, field, "temporary_owner") or std.mem.eql(u8, field, "temporary_retirement")) {
                 if (@field(self, field) != null) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -474,9 +488,17 @@ fn changeTxn(a: A, txn: anytype, id: [32]u8, principal: []const u8, node: u64, a
             const live = (connection orelse return error.SqlConnectionNotFound).value;
             try live.requireOwner(&id, principal, node, input.now_ms);
             if (value.registration.lease.expires_at_ms <= input.now_ms) return error.SqlConnectionNotFound;
-            if (previous != null) return error.SqlConnectionAlreadyExists;
+            if (previous) |owned| {
+                const old = owned.value;
+                if (old.phase != .retired) return error.SqlConnectionAlreadyExists;
+                if (!isDurableIdleHttp(live, input.now_ms) or live.active_txn != null or
+                    !old.temporaryRetirementComplete() or (!old.registration_absent and old.registration.lease.expires_at_ms > input.now_ms) or
+                    !std.meta.eql(old.retiredNativeBackend(), value.registration.replaces) or
+                    old.registration.lease.database != value.registration.lease.database or
+                    value.revision != old.revision + 1) return error.SqlConnectionChanged;
+            } else if (value.registration.replaces != null or value.revision != 1) return error.SqlConnectionChanged;
             if (live.state != .idle or value.registration.lease.node != node or
-                !std.mem.eql(u8, &value.registration.connection, &id) or value.phase != .registering or value.revision != 1) return error.InvalidSqlConnection;
+                !std.mem.eql(u8, &value.registration.connection, &id) or value.phase != .registering) return error.InvalidSqlConnection;
             break :blk value;
         },
         .replace => |update| blk: {
@@ -588,8 +610,8 @@ pub fn markTemporaryOwner(store: *transactions.DurableSessionStore, owner: Tempo
     try change(store, owner.connection_id, prior.value.principal, owner.issuer_node_id, .{ .temporary_owner = .{ .owner = owner, .fence = fence, .database = database, .now_ms = now_ms } });
 }
 
-pub fn create(store: *transactions.DurableSessionStore, principal: []const u8, registration: authority.scopes.Registration, actor: authority.prepared.Actor, instance: Id, head: u64, nonce: Id, now_ms: u64) !void {
-    var value: Record = .{ .registration = registration, .actor = actor, .principal = principal, .instance = instance };
+pub fn create(store: *transactions.DurableSessionStore, principal: []const u8, registration: authority.scopes.Registration, actor: authority.prepared.Actor, instance: Id, head: u64, nonce: Id, now_ms: u64, previous_revision: u64) !void {
+    var value: Record = .{ .revision = std.math.add(u64, previous_revision, 1) catch return error.SqlProgramLimitExceeded, .registration = registration, .actor = actor, .principal = principal, .instance = instance };
     value.pending = value.controlRequest(head, nonce, .{ .register = registration });
     try change(store, registration.connection, principal, registration.lease.node, .{ .create = .{ .value = value, .now_ms = now_ms } });
 }
@@ -1058,11 +1080,13 @@ pub fn advance(store: *transactions.DurableSessionStore, a: A, principal: []cons
         // Scope records are retained. Absence beyond the admission window
         // proves an old registration can no longer arrive and create one.
         if (expired(prior.pending.?, cut.head)) {
+            next.registration_absent = prior.registration.replaces != null;
             next.phase = .retired;
             next.recovery = true;
             next.pending = null;
         } else {
             if (try port.deliver(a, prior.pending.?)) |failure| {
+                next.registration_absent = prior.registration.replaces != null;
                 next.phase = .retired;
                 next.recovery = true;
                 next.failure = failure;
@@ -1521,9 +1545,9 @@ test "SQL command producer native begin observation cannot erase TEMP namespace 
     next.ticket = .{ .instance = baseline.instance, .command = .{ .sequence = 1, .nonce = @splat(5), .executor = @splat(6) }, .body = @splat(7) };
     next.pending = next.controlRequest(0, @splat(8), .{ .begin = next.ticket.?.command });
     next.temporary_owner = null;
-    try std.testing.expectError(error.InvalidSqlConnection, changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next, .now_ms = 1, .native_transaction = false } }));
+    try std.testing.expectError(error.InvalidSqlConnection, changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next, .now_ms = 2, .native_transaction = false } }));
     next.temporary_owner = owner;
-    try changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next, .now_ms = 1, .native_transaction = false } });
+    try changeTxn(a, &write, connection.id, "alice", 0, .{ .begin_observed = .{ .revision = baseline.revision, .prior_digest = try digest(a, baseline), .next = next, .now_ms = 2, .native_transaction = false } });
     var retained = (try readTxn(a, &write, connection.id)).?;
     defer retained.deinit();
     try std.testing.expect(retained.value.temporary_owner.?.eql(owner));

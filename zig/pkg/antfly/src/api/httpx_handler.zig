@@ -7828,7 +7828,7 @@ pub const AntflyApiHandler = struct {
         const execution = self.api_server.txn_sessions.acquireCommitExecutionControlled(txn_id, ctx.io, commit_request) catch |err| return sessionInspectionFailure(ctx, err);
         defer execution.release();
         const owner = self.api_server.localSessionNodeId();
-        const session = (self.api_server.txn_sessions.readMutationInfo(guard) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
+        const session = (self.api_server.txn_sessions.readMutationInfoControlled(guard, commit_request) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
