@@ -101,6 +101,7 @@ const TensorPlan = struct {
     quantization: QuantizationMode = .none,
     transform: TensorTransform = .none,
     source_byte_range: ?SourceByteRange = null,
+    source_tensor_index: ?usize = null,
 
     pub fn deinit(self: *TensorPlan, allocator: std.mem.Allocator) void {
         allocator.free(self.source_name);
@@ -179,12 +180,18 @@ const PlannedExport = struct {
     source_kind: ExportSourceKind,
     plan: ExportPlan,
     projector_source_path: ?[]const u8 = null,
+    pinned_decoder_path: ?[]const u8 = null,
+    pinned_decoder: ?SourceGguf = null,
+    pinned_projector: ?SourceGguf = null,
     projector_plan: ?ExportPlan = null,
     projector_format: ?ResolvedProjectorFormat = null,
 
     pub fn deinit(self: *PlannedExport, allocator: std.mem.Allocator) void {
         self.plan.deinit(allocator);
         if (self.projector_source_path) |path| allocator.free(path);
+        if (self.pinned_decoder_path) |path| allocator.free(path);
+        if (self.pinned_decoder) |*source| source.deinit();
+        if (self.pinned_projector) |*source| source.deinit();
         if (self.projector_plan) |*plan| plan.deinit(allocator);
     }
 };
@@ -277,8 +284,11 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         else
             try defaultProjectorOutputPath(allocator, output_path)
     else
-        null;
+        opts.projector_output_path;
     defer if ((planned.projector_source_path != null or planned.projector_plan != null) and opts.projector_output_path == null) allocator.free(projector_output_path.?);
+
+    if (opts.projector_output_path != null and planned.projector_source_path == null and planned.projector_plan == null)
+        return error.UnexpectedProjectorOutputPath;
 
     if (opts.dry_run) {
         const report = try formatDryRunReport(allocator, opts.model_dir, output_path, projector_output_path, opts.quantization, filter, planned.source_kind, &planned);
@@ -353,9 +363,24 @@ fn writePlannedExport(
     projector_output_path: ?[]const u8,
     planned: *const PlannedExport,
 ) !void {
+    const needs_projector = planned.projector_source_path != null or planned.projector_plan != null;
+    const default_projector_path = if (needs_projector and projector_output_path == null)
+        try defaultProjectorOutputPath(allocator, output_path)
+    else
+        null;
+    defer if (default_projector_path) |path| allocator.free(path);
+    const target_projector_path = projector_output_path orelse default_projector_path;
+    if (target_projector_path != null and !needs_projector) return error.UnexpectedProjectorOutputPath;
+
+    if (planned.pinned_decoder) |*source| {
+        try validateExportPaths(allocator, output_path, target_projector_path, planned.pinned_decoder_path, planned.projector_source_path);
+        return writePinnedGgufExport(allocator, output_path, target_projector_path, source, planned);
+    }
+
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
     try preferClipclapDefaultOnnxInputs(allocator, model_dir, &manifest);
+    try validateExportPaths(allocator, output_path, target_projector_path, manifest.gguf_path, planned.projector_source_path);
 
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
@@ -363,10 +388,10 @@ fn writePlannedExport(
     try writeSinglePlanExport(allocator, output_path, access, &planned.plan);
 
     if (planned.projector_source_path) |source_path| {
-        const target_path = projector_output_path orelse return error.MissingProjectorOutputPath;
+        const target_path = target_projector_path.?;
         try copyProjectorGguf(source_path, target_path);
     } else if (planned.projector_plan) |projector_plan| {
-        const target_path = projector_output_path orelse return error.MissingProjectorOutputPath;
+        const target_path = target_projector_path.?;
         const projector_specs = try allocator.alloc(gguf_mod.writer.TensorSpec, projector_plan.tensors.len);
         defer allocator.free(projector_specs);
         for (projector_plan.tensors, 0..) |tensor, i| {
@@ -389,26 +414,207 @@ fn writePlannedExport(
     }
 }
 
+// Resolve an existing destination or its nearest existing ancestor, including
+// directory aliases when the final destination has yet to be created.
+fn resolveExportPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const io = io_compat();
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.realPathFileAlloc(io, path, allocator)) |resolved| {
+        defer allocator.free(resolved);
+        return allocator.dupe(u8, resolved);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    if (base.len == 0 or std.mem.eql(u8, parent, path)) return error.InvalidExportPath;
+    const resolved_parent = try resolveExportPath(allocator, parent);
+    defer allocator.free(resolved_parent);
+    return std.fs.path.resolve(allocator, &.{ resolved_parent, base });
+}
+
+fn validateExportPaths(
+    allocator: std.mem.Allocator,
+    decoder: []const u8,
+    projector: ?[]const u8,
+    input_decoder: ?[]const u8,
+    input_projector: ?[]const u8,
+) !void {
+    const resolved_decoder = try resolveExportPath(allocator, decoder);
+    defer allocator.free(resolved_decoder);
+    const resolved_projector = if (projector) |path| try resolveExportPath(allocator, path) else null;
+    defer if (resolved_projector) |path| allocator.free(path);
+    if (resolved_projector) |path| {
+        if (std.mem.eql(u8, resolved_decoder, path) or
+            isExportPathAncestor(resolved_decoder, path) or
+            isExportPathAncestor(path, resolved_decoder)) return error.ConflictingExportPaths;
+    }
+    try validateExportOutputFile(resolved_decoder);
+    if (resolved_projector) |path| try validateExportOutputFile(path);
+    if (input_decoder) |input| {
+        const resolved_input = try resolveExportPath(allocator, input);
+        defer allocator.free(resolved_input);
+        if (std.mem.eql(u8, resolved_decoder, resolved_input)) return error.ConflictingExportPaths;
+        if (resolved_projector) |path| {
+            if (std.mem.eql(u8, path, resolved_input)) return error.ConflictingExportPaths;
+        }
+    }
+    if (input_projector) |input| {
+        const resolved_input = try resolveExportPath(allocator, input);
+        defer allocator.free(resolved_input);
+        if (std.mem.eql(u8, resolved_decoder, resolved_input)) return error.ConflictingExportPaths;
+    }
+}
+
+fn isExportPathAncestor(parent: []const u8, child: []const u8) bool {
+    return child.len > parent.len and std.mem.startsWith(u8, child, parent) and
+        std.fs.path.isSep(child[parent.len]);
+}
+
+fn validateExportOutputFile(path: []const u8) !void {
+    const stat = std.Io.Dir.cwd().statFile(io_compat(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind != .file) return error.InvalidExportPath;
+}
+
 fn writeSinglePlanExport(
     allocator: std.mem.Allocator,
     output_path: []const u8,
     access: tensor_access_mod.TensorAccess,
     plan: *const ExportPlan,
 ) !void {
+    var layout = try buildPlanLayout(allocator, plan);
+    defer layout.deinit(allocator);
+    try writeExportFile(allocator, output_path, layout, access, plan.tensors);
+}
+
+fn buildPlanLayout(allocator: std.mem.Allocator, plan: *const ExportPlan) !gguf_mod.writer.Layout {
     const tensor_specs = try allocator.alloc(gguf_mod.writer.TensorSpec, plan.tensors.len);
     defer allocator.free(tensor_specs);
-    for (plan.tensors, 0..) |tensor, i| {
-        tensor_specs[i] = .{
+    for (plan.tensors, tensor_specs) |tensor, *spec| {
+        spec.* = .{
             .name = tensor.output_name,
             .dimensions = tensor.dimensions,
             .tensor_type = tensor.tensor_type,
         };
     }
+    return gguf_mod.writer.buildLayout(allocator, plan.metadata(), tensor_specs);
+}
 
-    var layout = try gguf_mod.writer.buildLayout(allocator, plan.metadata(), tensor_specs);
+fn writePinnedGgufExport(
+    allocator: std.mem.Allocator,
+    output_path: []const u8,
+    projector_output_path: ?[]const u8,
+    source: *const SourceGguf,
+    planned: *const PlannedExport,
+) !void {
+    const io = io_compat();
+    const cwd = std.Io.Dir.cwd();
+    var layout = try buildPlanLayout(allocator, &planned.plan);
     defer layout.deinit(allocator);
+    const scratch = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(scratch);
 
-    try writeExportFile(allocator, output_path, layout, access, plan.tensors);
+    var decoder = try cwd.createFileAtomic(io, output_path, .{ .replace = true, .make_path = true });
+    defer decoder.deinit(io);
+    try writePinnedGgufDecoder(io, decoder.file, source, layout, planned.plan.tensors, scratch);
+
+    // Stage both payloads before replacing either destination. Publish the
+    // decoder last so a stalled projector copy cannot expose a new decoder.
+    if (planned.pinned_projector) |*projector| {
+        var projector_file = try cwd.createFileAtomic(io, projector_output_path.?, .{ .replace = true, .make_path = true });
+        defer projector_file.deinit(io);
+        try copyPinnedRange(io, projector_file.file, projector, 0, projector.region.data.len, scratch);
+        try projector_file.replace(io);
+    }
+    try decoder.replace(io);
+}
+
+fn writePinnedGgufDecoder(
+    io: std.Io,
+    file: std.Io.File,
+    source: *const SourceGguf,
+    layout: gguf_mod.writer.Layout,
+    tensors: []const TensorPlan,
+    scratch: []u8,
+) !void {
+    try file.writeStreamingAll(io, layout.header_bytes);
+    const data_offset = std.mem.alignForward(usize, layout.header_bytes.len, @intCast(layout.alignment));
+    try writeZeroPadding(io, &file, data_offset - layout.header_bytes.len);
+
+    var current_offset: u64 = 0;
+    for (tensors, layout.offsets) |tensor, target_offset| {
+        if (target_offset < current_offset) return error.InvalidTensorOffset;
+        try writeZeroPadding(io, &file, @intCast(target_offset - current_offset));
+        const original = source.parsed.tensors[tensor.source_tensor_index.?];
+        const bytes = gguf_mod.tensor_types.byteLen(original.tensor_type, original.dimensions) orelse return error.UnsupportedTensorType;
+        const end = try std.math.add(u64, original.data_offset, bytes);
+        if (end > source.region.data.len) return error.RegionOutOfBounds;
+        if (tensor.quantization == .none) {
+            try copyPinnedRange(io, file, source, original.data_offset, bytes, scratch);
+        } else {
+            try writePinnedQuantized(io, file, source, original, bytes, tensor, scratch);
+        }
+        current_offset = target_offset + (gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType);
+    }
+}
+
+fn copyPinnedRange(io: std.Io, file: std.Io.File, source: *const SourceGguf, offset: u64, len: u64, scratch: []u8) !void {
+    var written: u64 = 0;
+    while (written < len) {
+        const chunk = scratch[0..@intCast(@min(scratch.len, len - written))];
+        try c_file.readRegionFromFd(source.region.fd, chunk, offset + written);
+        try file.writeStreamingAll(io, chunk);
+        written += chunk.len;
+    }
+}
+
+fn writePinnedQuantized(
+    io: std.Io,
+    file: std.Io.File,
+    source: *const SourceGguf,
+    original: gguf_mod.format.TensorInfo,
+    len: u64,
+    tensor: TensorPlan,
+    scratch: []u8,
+) !void {
+    const dtype = ggufDenseDtype(original.tensor_type) orelse return error.UnsupportedTensorType;
+    const block_width = gguf_mod.tensor_types.valuesPerBlock(tensor.tensor_type) orelse return error.UnsupportedTensorType;
+    const packed_width = gguf_mod.tensor_types.bytesPerBlock(tensor.tensor_type) orelse return error.UnsupportedTensorType;
+    const block_bytes = block_width * denseElementSize(dtype);
+    if (len % block_bytes != 0) return error.InvalidTensorShape;
+    const read_capacity = scratch.len - scratch.len % block_bytes;
+    const encode = quantizationBlockEncoder(tensor.quantization);
+    var values: [256]f32 = undefined;
+    var output_buffer: [64 * 1024]u8 = undefined;
+    var writer = file.writerStreaming(io, &output_buffer);
+    var consumed: u64 = 0;
+    while (consumed < len) {
+        const chunk = scratch[0..@intCast(@min(read_capacity, len - consumed))];
+        try c_file.readRegionFromFd(source.region.fd, chunk, original.data_offset + consumed);
+        var cursor: usize = 0;
+        while (cursor < chunk.len) : (cursor += block_bytes) {
+            const block = chunk[cursor..][0..block_bytes];
+            const decoded = values[0..block_width];
+            switch (dtype) {
+                .f32 => decodePinnedBlock(f32, block, decoded),
+                .f16 => decodePinnedBlock(f16, block, decoded),
+                .bf16 => decodePinnedBlock(u16, block, decoded),
+                else => unreachable,
+            }
+            const packed_block = try writer.interface.writableSlice(packed_width);
+            encode(values[0..block_width], packed_block);
+        }
+        consumed += chunk.len;
+    }
+    try writer.interface.flush();
+}
+
+fn decodePinnedBlock(comptime T: type, bytes: []const u8, decoded: []f32) void {
+    for (decoded, 0..) |*value, index| value.* = decodeDenseElemAsF32(T, bytes, index);
 }
 
 fn isGlinerBundleExportManifest(manifest: manifest_mod.ModelManifest) bool {
@@ -1713,7 +1919,12 @@ fn buildPlannedExport(
         const parsed = &parsed_source_gguf.?.parsed;
         const metadata = gguf_mod.metadata.View.init(parsed);
         if (std.mem.eql(u8, metadata.getString("general.architecture") orelse "", "qwen35")) {
-            return buildQwen35GgufExport(allocator, manifest, parsed, quantization, requested_projector_format, filter);
+            var planned = try buildQwen35GgufExport(allocator, manifest, parsed, quantization, requested_projector_format, filter);
+            errdefer planned.deinit(allocator);
+            planned.pinned_decoder_path = try allocator.dupe(u8, manifest.gguf_path.?);
+            planned.pinned_decoder = parsed_source_gguf;
+            parsed_source_gguf = null;
+            return planned;
         }
     }
 
@@ -1907,8 +2118,10 @@ const SourceGguf = struct {
     fn init(allocator: std.mem.Allocator, path: []const u8) !SourceGguf {
         var region = try c_file.MmapRegion.init(allocator, path);
         errdefer region.deinit();
+        region.preserveFileCacheOnDeinit();
         var parsed = try gguf_mod.format.parse(allocator, region.data);
         errdefer parsed.deinit(allocator);
+        try gguf_mod.format.validateTensorDataRanges(&parsed, region.data.len);
         return .{
             .allocator = allocator,
             .region = region,
@@ -1938,7 +2151,14 @@ fn buildQwen35GgufExport(
         if (std.mem.eql(u8, entry.key, "split.count")) return error.UnsupportedSplitGgufExport;
     }
 
-    const projector_format = try resolveRequestedProjectorFormat(allocator, manifest.gguf_projector_path, requested_projector_format);
+    var projector = if (manifest.gguf_projector_path) |path| try SourceGguf.init(allocator, path) else null;
+    errdefer if (projector) |*source_projector| source_projector.deinit();
+    const projector_format = if (projector) |*source_projector|
+        try resolveDetectedProjectorFormat(projector_format_mod.detectFile(&source_projector.parsed), requested_projector_format)
+    else if (requested_projector_format == .clip)
+        return error.MissingProjectorSource
+    else
+        null;
     const projector_path = if (manifest.gguf_projector_path) |path| try allocator.dupe(u8, path) else null;
     errdefer if (projector_path) |path| allocator.free(path);
 
@@ -1947,7 +2167,7 @@ fn buildQwen35GgufExport(
     var initialized: usize = 0;
     errdefer for (tensors[0..initialized]) |*tensor| tensor.deinit(allocator);
     var changed = false;
-    for (source.tensors, tensors) |tensor, *plan| {
+    for (source.tensors, tensors, 0..) |tensor, *plan, index| {
         const mode = qwen35GgufTensorQuantization(tensor, quantization, filter);
         const source_name = try allocator.dupe(u8, tensor.name);
         errdefer allocator.free(source_name);
@@ -1959,6 +2179,7 @@ fn buildQwen35GgufExport(
             .dimensions = try allocator.dupe(u64, tensor.dimensions),
             .tensor_type = if (mode == .none) tensor.tensor_type else tensorTypeForQuantizationMode(mode),
             .quantization = mode,
+            .source_tensor_index = index,
         };
         initialized += 1;
         changed = changed or mode != .none;
@@ -1986,6 +2207,7 @@ fn buildQwen35GgufExport(
             .tensors = tensors,
         },
         .projector_source_path = projector_path,
+        .pinned_projector = projector,
         .projector_format = projector_format,
     };
 }
@@ -3752,24 +3974,26 @@ fn resolveRequestedProjectorFormat(
     requested: ProjectorFormat,
 ) !?ResolvedProjectorFormat {
     if (projector_source_path) |path| {
-        const detected_kind = try projector_format_mod.detectPath(allocator, path);
-        const detected: ResolvedProjectorFormat = if (projector_format_mod.isAntfly(detected_kind))
-            .antfly
-        else if (projector_format_mod.isClip(detected_kind))
-            .clip
-        else
-            return error.UnsupportedProjectorFormat;
-
-        return switch (requested) {
-            .auto => detected,
-            .antfly => if (detected == .antfly) .antfly else error.UnsupportedRequestedProjectorFormat,
-            .clip => if (detected == .clip) .clip else error.UnsupportedRequestedProjectorFormat,
-        };
+        return try resolveDetectedProjectorFormat(try projector_format_mod.detectPath(allocator, path), requested);
     }
 
     return switch (requested) {
         .auto, .antfly => .antfly,
         .clip => null,
+    };
+}
+
+fn resolveDetectedProjectorFormat(kind: projector_format_mod.Kind, requested: ProjectorFormat) !ResolvedProjectorFormat {
+    const detected: ResolvedProjectorFormat = if (projector_format_mod.isAntfly(kind))
+        .antfly
+    else if (projector_format_mod.isClip(kind))
+        .clip
+    else
+        return error.UnsupportedProjectorFormat;
+    return switch (requested) {
+        .auto => detected,
+        .antfly => if (detected == .antfly) .antfly else error.UnsupportedRequestedProjectorFormat,
+        .clip => if (detected == .clip) .clip else error.UnsupportedRequestedProjectorFormat,
     };
 }
 
@@ -4051,8 +4275,10 @@ fn cloneMetadataEntries(
         for (cloned[0..len]) |*entry| entry.deinit(allocator);
     }
     for (entries) |entry| {
+        const key = try allocator.dupe(u8, entry.key);
+        errdefer allocator.free(key);
         cloned[len] = .{
-            .key = try allocator.dupe(u8, entry.key),
+            .key = key,
             .value = try cloneMetadataValue(allocator, entry.value),
         };
         len += 1;
@@ -5547,15 +5773,23 @@ fn writeDenseRecordQuantized(
     const row_count = quantizedRowCount(record.descriptor.shape, transform, row_width) orelse return error.UnsupportedQuantizedTensorShape;
     if (row_width % 32 != 0) return error.UnsupportedQuantizedTensorShape;
 
+    const tensor_type = tensorTypeForQuantizationMode(quantization);
+    const block_width = gguf_mod.tensor_types.valuesPerBlock(tensor_type) orelse return error.UnsupportedTensorType;
+    const packed_width = gguf_mod.tensor_types.bytesPerBlock(tensor_type) orelse return error.UnsupportedTensorType;
+    if (row_width % block_width != 0) return error.UnsupportedQuantizedTensorShape;
     const scratch = try allocator.alloc(f32, row_width);
     defer allocator.free(scratch);
+    const encoded = try allocator.alloc(u8, try std.math.mul(usize, row_width / block_width, packed_width));
+    defer allocator.free(encoded);
+    const encode = quantizationBlockEncoder(quantization);
 
     var buffer: [64 * 1024]u8 = undefined;
     var writer = file.writerStreaming(io, &buffer);
     for (0..row_count) |row_index| {
         try decodeDenseRowToF32(dense_record, transform, row_index, row_width, scratch);
-        const encoded = try quantizeDenseRow(allocator, quantization, scratch);
-        defer allocator.free(encoded);
+        for (0..row_width / block_width) |block| {
+            encode(scratch[block * block_width ..][0..block_width], encoded[block * packed_width ..][0..packed_width]);
+        }
         try writer.interface.writeAll(encoded);
     }
     try writer.interface.flush();
@@ -5660,22 +5894,22 @@ fn writeDenseRecordTransposed2d(
     try file.writeStreamingAll(io, transposed);
 }
 
-fn quantizeDenseRow(allocator: std.mem.Allocator, quantization: QuantizationMode, row: []const f32) ![]u8 {
+fn quantizationBlockEncoder(quantization: QuantizationMode) *const fn ([]const f32, []u8) void {
     return switch (quantization) {
-        .q1_0 => gguf_mod.quant_codec.quantizeQ1_0FromF32(allocator, row),
-        .q2_k => gguf_mod.quant_codec.quantizeQ2_KFromF32(allocator, row),
-        .q3_k => gguf_mod.quant_codec.quantizeQ3_KFromF32(allocator, row),
-        .q4_0 => gguf_mod.quant_codec.quantizeQ4_0FromF32(allocator, row),
-        .q4_1 => gguf_mod.quant_codec.quantizeQ4_1FromF32(allocator, row),
-        .q5_0 => gguf_mod.quant_codec.quantizeQ5_0FromF32(allocator, row),
-        .q5_1 => gguf_mod.quant_codec.quantizeQ5_1FromF32(allocator, row),
-        .q4_k => gguf_mod.quant_codec.quantizeQ4_KFromF32(allocator, row),
-        .q5_k => gguf_mod.quant_codec.quantizeQ5_KFromF32(allocator, row),
-        .q6_k => gguf_mod.quant_codec.quantizeQ6_KFromF32(allocator, row),
-        .q8_k => gguf_mod.quant_codec.quantizeQ8_KFromF32(allocator, row),
-        .q8_0 => gguf_mod.quant_codec.quantizeQ8_0FromF32(allocator, row),
-        .q8_1 => gguf_mod.quant_codec.quantizeQ8_1FromF32(allocator, row),
-        .none => error.UnsupportedTensorType,
+        .q1_0 => gguf_mod.quant_codec.quantizeQ1_0Block,
+        .q2_k => gguf_mod.quant_codec.quantizeQ2_KBlock,
+        .q3_k => gguf_mod.quant_codec.quantizeQ3_KBlock,
+        .q4_0 => gguf_mod.quant_codec.quantizeQ4_0Block,
+        .q4_1 => gguf_mod.quant_codec.quantizeQ4_1Block,
+        .q5_0 => gguf_mod.quant_codec.quantizeQ5_0Block,
+        .q5_1 => gguf_mod.quant_codec.quantizeQ5_1Block,
+        .q4_k => gguf_mod.quant_codec.quantizeQ4_KBlock,
+        .q5_k => gguf_mod.quant_codec.quantizeQ5_KBlock,
+        .q6_k => gguf_mod.quant_codec.quantizeQ6_KBlock,
+        .q8_k => gguf_mod.quant_codec.quantizeQ8_KBlock,
+        .q8_0 => gguf_mod.quant_codec.quantizeQ8_0Block,
+        .q8_1 => gguf_mod.quant_codec.quantizeQ8_1Block,
+        .none => unreachable,
     };
 }
 
@@ -5782,7 +6016,7 @@ fn decodeDenseElemAsF32(comptime T: type, raw_bytes: []const u8, elem_index: usi
         return @bitCast(bits);
     }
     const offset = elem_index * 2;
-    const bits: u16 = @bitCast([2]u8{ raw_bytes[offset], raw_bytes[offset + 1] });
+    const bits = std.mem.readInt(u16, raw_bytes[offset .. offset + 2][0..2], .little);
     if (T == f16) {
         const half: f16 = @bitCast(bits);
         return @floatCast(half);
@@ -6292,7 +6526,7 @@ test "Qwen35 GGUF export quantizes dense matrices and preserves projector and hy
         .{ .key = "qwen35.ssm.time_step_rank", .value = .{ .u32 = 16 } },
     };
     const specs = [_]gguf_mod.writer.TensorSpec{
-        .{ .name = "blk.0.attn_qkv.weight", .dimensions = &.{ 256, 2 }, .tensor_type = .{ .known = .BF16 } },
+        .{ .name = "blk.0.attn_qkv.weight", .dimensions = &.{ 256, 513 }, .tensor_type = .{ .known = .BF16 } },
         .{ .name = "blk.0.ssm_conv1d.weight", .dimensions = &.{ 256, 2 }, .tensor_type = .{ .known = .BF16 } },
         .{ .name = "blk.0.ffn_up.weight", .dimensions = &.{ 256, 2 }, .tensor_type = .{ .known = .BF16 } },
     };
@@ -6303,9 +6537,9 @@ test "Qwen35 GGUF export quantizes dense matrices and preserves projector and hy
     defer allocator.free(data);
     @memset(data, 0);
     @memcpy(data[0..layout.header_bytes.len], layout.header_bytes);
-    for (layout.offsets) |tensor_offset| {
+    for (layout.offsets, specs) |tensor_offset, spec| {
         const start = offset + @as(usize, @intCast(tensor_offset));
-        for (0..512) |index| {
+        for (0..@intCast(spec.dimensions[0] * spec.dimensions[1])) |index| {
             const bf16: u16 = if (index % 2 == 0) 0x3f80 else 0xbf80;
             std.mem.writeInt(u16, data[start + index * 2 ..][0..2], bf16, .little);
         }
@@ -6313,9 +6547,49 @@ test "Qwen35 GGUF export quantizes dense matrices and preserves projector and hy
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = data });
     try writeMinimalProjectorFixture(allocator, projector, .clip);
 
-    try exportModelDirToGgufFilteredWithProjector(allocator, dir_path, output, output_projector, .clip, .q4_k, .{
+    const original_projector = try c_file.readFile(allocator, projector);
+    defer allocator.free(original_projector);
+
+    const q8_path = try std.fs.path.join(allocator, &.{ dir_path, "q8", "model.gguf" });
+    defer allocator.free(q8_path);
+    try exportModelDirToGguf(allocator, dir_path, q8_path, .q8_0);
+    var q8 = try SourceGguf.init(allocator, q8_path);
+    defer q8.deinit();
+    try std.testing.expectEqual(gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }, q8.parsed.tensors[0].tensor_type);
+    const q8_projector_path = try defaultProjectorOutputPath(allocator, q8_path);
+    defer allocator.free(q8_projector_path);
+    const q8_projector = try c_file.readFile(allocator, q8_projector_path);
+    defer allocator.free(q8_projector);
+    try std.testing.expectEqualSlices(u8, original_projector, q8_projector);
+
+    var plan = try buildPlannedExport(allocator, dir_path, .q4_k, .clip, .{
         .exclude_prefixes_csv = "blk.0.ffn",
     });
+    defer plan.deinit(allocator);
+    try std.testing.expectError(error.ConflictingExportPaths, writePlannedExport(allocator, dir_path, output, output, &plan));
+    try std.testing.expectError(error.ConflictingExportPaths, writePlannedExport(allocator, dir_path, projector, output_projector, &plan));
+    try std.testing.expectError(error.ConflictingExportPaths, writePlannedExport(allocator, dir_path, output, decoder, &plan));
+
+    try tmp.dir.createDirPath(io, "out");
+    const directory_output = try std.fs.path.join(allocator, &.{ dir_path, "out" });
+    defer allocator.free(directory_output);
+    const nested_output = try std.fs.path.join(allocator, &.{ output, "mmproj.gguf" });
+    defer allocator.free(nested_output);
+    try std.testing.expectError(error.InvalidExportPath, writePlannedExport(allocator, dir_path, directory_output, q8_projector_path, &plan));
+    try std.testing.expectError(error.ConflictingExportPaths, writePlannedExport(allocator, dir_path, output, nested_output, &plan));
+    try tmp.dir.symLink(io, "out", "out-alias", .{ .is_directory = true });
+    const aliased_output = try std.fs.path.join(allocator, &.{ dir_path, "out-alias", "model.gguf" });
+    defer allocator.free(aliased_output);
+    try std.testing.expectError(error.ConflictingExportPaths, writePlannedExport(allocator, dir_path, output, aliased_output, &plan));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "out/model.gguf", .{}));
+
+    // Atomically replace the paths after planning. The export must still read
+    // the original decoder and projector through their opened descriptors.
+    for ([_][]const u8{ "model.gguf", "mmproj.gguf" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "replacement", .data = "not a GGUF" });
+        try tmp.dir.rename("replacement", tmp.dir, name, io);
+    }
+    try writePlannedExport(allocator, dir_path, output, output_projector, &plan);
 
     var parsed = try SourceGguf.init(allocator, output);
     defer parsed.deinit();
@@ -6326,23 +6600,24 @@ test "Qwen35 GGUF export quantizes dense matrices and preserves projector and hy
     try std.testing.expect(view.getU64("general.file_type") == null);
     const quantized = parsed.parsed.tensors[0];
     try std.testing.expectEqual(gguf_mod.tensor_types.TensorType{ .known = .Q4_K }, quantized.tensor_type);
-    try std.testing.expectEqualSlices(u64, &.{ 256, 2 }, quantized.dimensions);
+    try std.testing.expectEqualSlices(u64, &.{ 256, 513 }, quantized.dimensions);
     var row: [256]f32 = undefined;
     for (&row, 0..) |*value, index| value.* = if (index % 2 == 0) 1 else -1;
     const expected_row = try gguf_mod.quant_codec.quantizeQ4_KFromF32(allocator, &row);
     defer allocator.free(expected_row);
     const start: usize = @intCast(quantized.data_offset);
-    try std.testing.expectEqualSlices(u8, expected_row, parsed.region.data[start..][0..expected_row.len]);
+    for (0..513) |row_index| {
+        const row_start = start + row_index * expected_row.len;
+        try std.testing.expectEqualSlices(u8, expected_row, parsed.region.data[row_start..][0..expected_row.len]);
+    }
     for (parsed.parsed.tensors[1..], layout.offsets[1..]) |tensor, source_offset| {
         try std.testing.expectEqual(gguf_mod.tensor_types.TensorType{ .known = .BF16 }, tensor.tensor_type);
         try std.testing.expectEqualSlices(u8, data[offset + @as(usize, @intCast(source_offset)) ..][0..1024], parsed.region.data[@intCast(tensor.data_offset)..][0..1024]);
     }
 
-    const projector_source = try c_file.readFile(allocator, projector);
-    defer allocator.free(projector_source);
     const projector_copy = try c_file.readFile(allocator, output_projector);
     defer allocator.free(projector_copy);
-    try std.testing.expectEqualSlices(u8, projector_source, projector_copy);
+    try std.testing.expectEqualSlices(u8, original_projector, projector_copy);
 }
 
 test "multimodal export synthesizes projector gguf from integrated tensors" {
