@@ -5406,6 +5406,7 @@ pub const SessionRegistry = struct {
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
         guard: Mutation,
+        connection_id: ?[32]u8,
         scope: @import("antfly_local_sources").sql_session.Scope,
         isolation: ?@import("antfly_local_sources").sql_session.Isolation,
         mode: ?@import("antfly_local_sources").sql_session.ReadMode,
@@ -5415,7 +5416,7 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, guard.id)) orelse return error.SqlTransactionNotActive;
         errdefer candidate.deinit(alloc);
-        if (!principalsEqual(candidate.principal, scope.principal) or candidate.connection_id != null)
+        if (!principalsEqual(candidate.principal, scope.principal) or !std.meta.eql(candidate.connection_id, connection_id))
             return error.SqlTransactionNotActive;
         const expected = try guard.version(candidate);
         try self.checkTenure(alloc, guard);
@@ -14249,28 +14250,30 @@ test "SQL transaction options update only the untouched owner session" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(null);
     defer registry.deinit(alloc);
-    const session = try registry.beginForPrincipal(alloc, .{ .sql = .{
+    const connection: [32]u8 = @splat(4);
+    const session = try registry.beginForPrincipalWithSettings(alloc, .{ .sql = .{
         .database = "app",
         .namespace = "public",
         .isolation = .read_committed,
         .mode = .read_write,
-    } }, 9, "alice");
+    } }, 9, "alice", &.{}, connection);
     const scope: @import("antfly_local_sources").sql_session.Scope = .{ .database = "app", .principal = "alice" };
     const guard = try registry.mutation(alloc, session.txn_id, 9);
     var invalid_guard = guard;
     invalid_guard.owner = 10;
     var wrong_scope = scope;
     wrong_scope.principal = "bob";
-    try std.testing.expectError(error.SqlTransactionNotActive, registry.setSqlTransactionOptions(alloc, guard, wrong_scope, .repeatable_read, .read_only));
-    try std.testing.expectError(error.SessionLeaseLost, registry.setSqlTransactionOptions(alloc, invalid_guard, scope, .repeatable_read, .read_only));
-    try registry.setSqlTransactionOptions(alloc, guard, scope, .repeatable_read, .read_only);
-    try registry.setSqlTransactionOptions(alloc, guard, scope, null, .read_only);
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.setSqlTransactionOptions(alloc, guard, connection, wrong_scope, .repeatable_read, .read_only));
+    try std.testing.expectError(error.SessionLeaseLost, registry.setSqlTransactionOptions(alloc, invalid_guard, connection, scope, .repeatable_read, .read_only));
+    try std.testing.expectError(error.SqlTransactionNotActive, registry.setSqlTransactionOptions(alloc, guard, null, scope, .repeatable_read, .read_only));
+    try registry.setSqlTransactionOptions(alloc, guard, connection, scope, .repeatable_read, .read_only);
+    try registry.setSqlTransactionOptions(alloc, guard, connection, scope, null, .read_only);
     var state = (try registry.getSqlState(alloc, session.txn_id)).?;
     defer state.deinit(alloc);
     try std.testing.expect(state.metadata.isolation == .repeatable_read);
     try std.testing.expect(state.metadata.mode == .read_only);
     _ = (try registry.createNamedSavepoint(alloc, guard, "started")).?;
-    try std.testing.expectError(error.ActiveSqlTransaction, registry.setSqlTransactionOptions(alloc, guard, scope, null, .read_write));
+    try std.testing.expectError(error.ActiveSqlTransaction, registry.setSqlTransactionOptions(alloc, guard, connection, scope, null, .read_write));
 }
 
 test "durable SQL session rejects duplicate savepoint ids without double freeing overlays" {

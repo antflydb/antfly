@@ -1706,7 +1706,7 @@ pub const Adapter = struct {
         try credential.validate();
         const lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
         defer lease.release();
-        try self.server.txn_sessions.setSqlTransactionOptions(self.server.alloc, try credential.transactionGuard(id), .{
+        try self.server.txn_sessions.setSqlTransactionOptions(self.server.alloc, try credential.transactionGuard(id), credential.native_connection, .{
             .principal = credential.sessionPrincipal(),
             .database = request.database orelse "default",
             .namespace = request.session_namespace orelse request.namespace orelse "public",
