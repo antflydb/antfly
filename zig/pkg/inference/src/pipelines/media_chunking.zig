@@ -4054,15 +4054,16 @@ test "model aware media fails a partial video request on an audio source version
 }
 
 test "model aware media can build optional WebM audio independently of video indexing" {
+    const codecs = @import("inference_audio");
     const a = std.testing.allocator;
     const encoded = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.opus", a, .limited(1024 * 1024));
     defer a.free(encoded);
-    var ogg = try audio.ogg.parsePacketsAlloc(a, encoded);
+    var ogg = try codecs.ogg.parsePacketsAlloc(a, encoded);
     defer ogg.deinit();
     const packets = try a.alloc([]const u8, ogg.packets.len - 2);
     defer a.free(packets);
     for (packets, ogg.packets[2..]) |*out, packet| out.* = packet.bytes;
-    const webm = try audio.webm.buildOpusTestFileAlloc(a, ogg.packets[0].bytes, packets);
+    const webm = try codecs.webm.buildOpusTestFileAlloc(a, ogg.packets[0].bytes, packets);
     defer a.free(webm);
     const Provider = struct {
         fn read(raw: *anyopaque, offset: u64, out: []u8, _: media.source.Control) !usize {
