@@ -629,7 +629,10 @@ pub const DirectoryBuilder = struct {
         if (self.failure != null) return;
         const suspended = if (self.pool) |pool| pool.swapReclaimer(null) else null;
         defer if (self.pool) |pool| pool.setReclaimer(suspended);
-        self.collectBlock(input, elem, discard, prefix, ticks, scale) catch |err| self.fail(err);
+        self.collectBlock(input, elem, discard, prefix, ticks, scale) catch |err| self.fail(switch (err) {
+            error.SharedAdmissionExceeded => error.AudioTooLarge,
+            else => err,
+        });
     }
 
     fn collectBlock(self: *DirectoryBuilder, input: *Source, elem: Webm.Element, discard: ?Webm.Element, prefix: []const u8, ticks: u64, scale: u64) !void {
@@ -884,4 +887,13 @@ test "WebM joint video and audio index reuses the block prefix" {
     defer video_only.deinit();
     try std.testing.expectEqualSlices(Webm.Packet, video.packets, video_only.packets);
     try std.testing.expectError(error.ResourceLimitExceeded, denied.borrowDirectory());
+
+    var pool = @import("admission.zig").Pool{ .limits = .{} };
+    var constrained = Source{ .allocator = a, .identity = "audio-padding", .storage = .{ .borrowed = &.{0xff} }, .admission_pool = &pool };
+    var optional = DirectoryBuilder{ .allocator = a, .limits = .{}, .pool = &pool };
+    defer optional.deinit();
+    const observer = optional.observer();
+    observer.tracks(observer.context, track_bytes);
+    observer.block(observer.context, &constrained, .{ .id = block_id, .payload = 0, .end = 6, .unknown = false }, .{ .id = discard_padding_id, .payload = 0, .end = 1, .unknown = false }, "\x82\x00\x01\x00\xf8\xff", 0, default_timestamp_scale_ns);
+    try std.testing.expectError(error.AudioTooLarge, optional.borrowDirectory());
 }

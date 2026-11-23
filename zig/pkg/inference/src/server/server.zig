@@ -15956,7 +15956,7 @@ pub const Node = struct {
                 fn read(raw: *anyopaque, offset: u64, out: []u8, check: media.source.Control) !usize {
                     try check.check();
                     const provider: *scraping.PinnedRange = @ptrCast(@alignCast(raw));
-                    return provider.readAt(offset, out);
+                    return provider.readAtWithProgress(offset, out, check.failed_prefix);
                 }
             };
             try request.limits.validate();

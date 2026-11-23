@@ -39,8 +39,9 @@ pub const Registry = struct {
         }
     }
     pub fn tryAcquire(self: *Registry, a: std.mem.Allocator, key: [32]u8, control: Control) !?Lease {
-        try control.check();
-        if (!self.mutex.tryLock()) return null;
+        // Wait only for registry bookkeeping. An active build for this
+        // key is handled by the caller at its first point of use.
+        try control.lockWithPoll(&self.mutex, 100 * std.time.ns_per_us);
         defer self.mutex.unlock();
         const entry = if (self.entries.get(key)) |current| current else blk: {
             if (self.entries.count() >= 256) return null;
@@ -99,6 +100,12 @@ test "model aware media speaker flights serialize one identity and release cance
     var cancel: Cancel = .{};
     try std.testing.expectError(error.Cancelled, registry.acquire(a, @splat(1), .{ .ptr = &cancel, .check_fn = Cancel.check }));
     try std.testing.expectEqual(@as(usize, 1), owner.entry.refs);
+    {
+        try std.testing.expect(registry.mutex.tryLock());
+        defer registry.mutex.unlock();
+        var metadata_wait: Cancel = .{};
+        try std.testing.expectError(error.Cancelled, registry.tryAcquire(a, @splat(2), .{ .ptr = &metadata_wait, .check_fn = Cancel.check }));
+    }
     const independent = try registry.acquire(a, @splat(2), .{});
     independent.deinit();
     const Waiter = struct {

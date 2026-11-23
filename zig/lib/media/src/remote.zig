@@ -242,6 +242,7 @@ pub const ReadAhead = struct {
             prefix.* += cached;
         };
         const required = minimum - cached;
+        if (required > self.max_bytes -| self.charged_bytes) return error.RemoteReadBudgetExceeded;
         const limit = self.max_request_bytes orelse if (self.upstream.accepts_full_read_size) required else self.window_bytes;
         if (required > @min(self.window_bytes, limit)) return cached + try self.readRequired(offset + cached, suffix[0..required], limit, control);
         return cached + try self.fillWindow(offset + cached, suffix, required, @max(required, fill_bytes -| cached), control);
@@ -874,4 +875,24 @@ test "object cancellation after validated transfer settles the completed prefix"
         try std.testing.expectEqual(@as(usize, 0), root.retained_bytes);
         if (wrapped) try std.testing.expectEqual(@as(u64, 4), cache.transferred_bytes);
     }
+}
+
+test "small cache fill rejects an insufficient wire allowance before fetching" {
+    const Provider = struct {
+        fn read(_: *anyopaque, _: u64, _: []u8, _: source.Control) !usize {
+            return error.UnexpectedRead;
+        }
+    };
+    var marker: u8 = 0;
+    var cache = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 8 },
+        .window_bytes = 8,
+        .max_bytes = 3,
+    };
+    defer cache.deinit();
+    var input = source.Source{ .allocator = std.testing.allocator, .identity = "short-budget", .storage = .{ .range = cache.range() } };
+    try std.testing.expectError(error.RemoteReadBudgetExceeded, input.readSparse(0, 4));
+    try std.testing.expectEqual(@as(usize, 0), cache.reads);
+    try std.testing.expect(cache.buffer == null);
 }

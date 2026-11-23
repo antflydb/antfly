@@ -1206,9 +1206,26 @@ pub const PinnedRange = struct {
         };
     }
     pub fn readAt(self: *PinnedRange, offset: u64, out: []u8) !usize {
-        return self.readAtInternal(offset, out) catch |err| transportError(&self.transport, err);
+        return self.readAtWithProgress(offset, out, null);
     }
-    fn readAtInternal(self: *PinnedRange, offset: u64, out: []u8) !usize {
+
+    /// Report a validated local prefix when cancellation interrupts a read.
+    pub fn readAtWithProgress(self: *PinnedRange, offset: u64, out: []u8, failed_prefix: ?*usize) !usize {
+        return self.readAtInternal(offset, out, failed_prefix) catch |err| transportError(&self.transport, err);
+    }
+
+    fn readLocalRange(self: *PinnedRange, local: *const LocalFile, offset: u64, out: []u8, done: *usize) anyerror!void {
+        while (done.* < out.len) {
+            try self.context.check();
+            const n = try local.file.readPositional(self.context.io, &.{out[done.*..]}, offset + done.*);
+            if (n == 0) return error.SourceVersionChanged;
+            done.* += n;
+        }
+        try local.check(self.context.io);
+        try self.context.check();
+    }
+
+    fn readAtInternal(self: *PinnedRange, offset: u64, out: []u8, failed_prefix: ?*usize) !usize {
         try self.context.check();
         if (self.metadata_only) return error.InvalidSourceReference;
         if (offset > self.length or out.len == 0 or out.len > self.length - offset) return error.InvalidRemoteRange;
@@ -1220,14 +1237,16 @@ pub const PinnedRange = struct {
                 try validateOpenFilePathSecurity(self.allocator, self.context.io, local.file, self.security);
                 try local.check(self.context.io);
                 var done: usize = 0;
-                while (done < out.len) {
-                    try self.context.check();
-                    const n = try local.file.readPositional(self.context.io, &.{out[done..]}, offset + done);
-                    if (n == 0) return error.SourceVersionChanged;
-                    done += n;
-                }
-                try local.check(self.context.io);
-                try self.context.check();
+                self.readLocalRange(local, offset, out, &done) catch |err| {
+                    if (failed_prefix) |prefix| {
+                        if (done != 0 and (err == error.Canceled or err == error.Cancelled or err == error.Timeout or err == error.DeadlineExceeded)) {
+                            if (local.check(self.context.io)) |_| {
+                                prefix.* = done;
+                            } else |_| {}
+                        }
+                    }
+                    return err;
+                };
             },
             .http => |*client| {
                 const headers = try self.allocator.alloc([2][]const u8, self.headers.len + 3);
@@ -3368,6 +3387,37 @@ test "local source cancellation during hashing releases verification and publish
     for (cache.flights) |flight| try std.testing.expectEqual(@as(usize, 0), flight.references);
     const range = try PinnedRange.createWithLocalCache(a, .{ .io = base }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
     defer range.destroy();
+}
+
+test "pinned local range reports a validated prefix when cancelled after a positional read" {
+    const a = std.testing.allocator;
+    const base = std.testing.io;
+    var fixture = try LocalSourceFixture.init(a, "0123456789");
+    defer fixture.deinit();
+    const paths = [_][]u8{fixture.path};
+    const security = ContentSecurityConfig{ .allowed_paths = &paths };
+    var cache: LocalVerificationCache = .{};
+    const cold = try PinnedRange.createWithLocalCache(a, .{ .io = base }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
+    cold.destroy();
+    const Cancel = struct {
+        var cancelled: std.atomic.Value(bool) = .init(false);
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const n = try std.testing.io.vtable.fileReadPositional(raw, file, &.{data[0][0..2]}, offset);
+            cancelled.store(true, .release);
+            return n;
+        }
+    };
+    Cancel.cancelled.store(false, .release);
+    var table = base.vtable.*;
+    table.fileReadPositional = Cancel.read;
+    const observed = std.Io{ .userdata = base.userdata, .vtable = &table };
+    const range = try PinnedRange.createWithLocalCache(a, .{ .io = observed, .cancellation = CancellationToken.fromAtomic(&Cancel.cancelled) }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
+    defer range.destroy();
+    var bytes: [4]u8 = undefined;
+    var prefix: usize = 0;
+    try std.testing.expectError(error.Canceled, range.readAtWithProgress(0, &bytes, &prefix));
+    try std.testing.expectEqual(@as(usize, 2), prefix);
+    try std.testing.expectEqualStrings("01", bytes[0..prefix]);
 }
 
 test "warm local receipts bypass busy and saturated verification flights" {
