@@ -20798,8 +20798,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     for (inputs, spans) |ct, span| {
         if (span.bytes == 0) continue;
         const source: buffer_mod.DeviceBuffer = .{ .ptr = tensorFromCt(ct).buffer.ptr, .len = span.bytes };
+        // A held publication forces eager execution into independent storage.
+        const retained_input = held and tensorFromCt(ct) == existing_output.?;
         if (source.ptr == 0 or CudaCompute.stageBufferOverlap(source, arena.buffers[0]) or
-            CudaCompute.stageBufferOverlap(source, arena.buffers[1])) return null;
+            (!retained_input and CudaCompute.stageBufferOverlap(source, arena.buffers[1]))) return null;
     }
     var execution_scope = if (replay) null else try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
     if (capture) try SourceLinearTemporary.validateArenaCapture(self, &execution_scope.?);
@@ -60647,6 +60649,19 @@ test "public source audio linear recreates input bank through actual learning ca
     const eager = (try scoped.audioExecution(key, &.{ updated, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
     defer cb.free(eager);
     try std.testing.expect(tensorFromCt(eager).buffer.ptr != tensorFromCt(direct).buffer.ptr);
+
+    var handoff_transfers = transfer_audit.Audit{};
+    const handoff = observed: {
+        try transfer_audit.begin(&handoff_transfers);
+        defer transfer_audit.end();
+        break :observed (try scoped.audioExecution(key, &.{ direct, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+    };
+    defer cb.free(handoff);
+    try std.testing.expect(tensorFromCt(handoff).buffer.ptr != tensorFromCt(direct).buffer.ptr);
+    try std.testing.expectEqual(@as(u64, 0), handoff_transfers.device_copy_bytes);
+    const handoff_values = try cb.toFloat32(handoff, std.testing.allocator);
+    defer std.testing.allocator.free(handoff_values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, handoff_values);
 
     try compute.embedding_gemma2_execution.clear(compute.allocator, &compute.ctx);
     try std.testing.expectEqual(output_bytes, domain.controller.snapshot().backend_scratch_bytes);
