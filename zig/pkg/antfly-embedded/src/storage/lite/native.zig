@@ -1370,6 +1370,31 @@ test "lite epoch readers preserve snapshots across foreign writer publications" 
     try std.testing.expect((try writer.check()).valid);
 }
 
+test "lite reader failed full snapshot capture preserves another pin at the same sequence" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "full-snapshot-failure.aflite");
+    defer allocator.free(path);
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var coordinator = ReaderCoordinator.init(failing.allocator(), io);
+    defer coordinator.deinit();
+    var writer = try NativeFile.createWithIo(allocator, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    writer.reader_coordinator = &coordinator;
+    try writer.putDocument("keep", "value");
+    var snapshot = try writer.captureFullReadSnapshot();
+    defer snapshot.close();
+
+    const entry = writer.inode_lock_ref.load(.acquire).?;
+    const sequence = writer.activeCheckpoint().commit_sequence;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, writer.captureFullReadSnapshot());
+    try std.testing.expectEqual(@as(?u64, sequence), inode_lock.minimumReaderSequence(entry, io));
+    try std.testing.expectEqual(@as(?u64, sequence), inode_lock.minimumMetadataReaderSequence(entry, io));
+}
+
 test "issue1362 full snapshots retain allocator metadata while same-owner writers reuse pages" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -11875,8 +11900,6 @@ pub const NativeFile = struct {
             .resource_manager = self.page_cache.resource_manager,
         });
         errdefer reader.close();
-        reader.reader_pin_entry = entry;
-        reader.reader_pin_sequence = guard_sequence;
         const identity = reader.dataIdentity() orelse return error.EnrichmentWaitCanceled;
         // §9.7a: a redo-log file's *inactive* checkpoint slot is never
         // synchronized once `enableRedoLog` bootstraps it -- ordinary
@@ -11935,7 +11958,9 @@ pub const NativeFile = struct {
             reader_slot.redo_folded_through = 0;
             break :blk std.meta.eql(self_slot, reader_slot);
         } else std.meta.eql(self.header, reader.header);
-        if ((self.durable_header == null and !headers_equivalent) or !std.meta.eql(self.dataIdentity(), @as(?inode_lock.FileIdentity, identity))) return error.EnrichmentWaitCanceled;
+        if ((self.durable_header == null and !headers_equivalent) or
+            !std.meta.eql(entry.identity, identity) or
+            !std.meta.eql(self.dataIdentity(), @as(?inode_lock.FileIdentity, identity))) return error.EnrichmentWaitCanceled;
         reader.header = self.header;
         if (coordinated) {
             // Same self-conflict `acquireReaderFence` guards against:
@@ -11953,6 +11978,10 @@ pub const NativeFile = struct {
             // regardless of `indexed_reclamation`.
             reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, try reader.regionForInode(), identity, reader.metadataReuseFrontier(), self.headerFingerprint());
         }
+        // All fallible setup is complete. Until here the guard is owned
+        // by this function, independently of the reader's cleanup.
+        reader.reader_pin_entry = entry;
+        reader.reader_pin_sequence = guard_sequence;
         return reader;
     }
 

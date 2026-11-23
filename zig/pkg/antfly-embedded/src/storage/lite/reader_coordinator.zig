@@ -166,6 +166,7 @@ pub const Coordinator = struct {
         defer self.mutex.unlock(self.io);
         var slot: ?u32 = null;
         var shared = false;
+        var promoted_metadata = false;
         if (region) |r| {
             // The region's own convention (shared_lock_region.zig's
             // `ReaderSlot.pinned_sequence` doc) is that 0 means "not
@@ -200,7 +201,10 @@ pub const Coordinator = struct {
                 {
                     slot = existing.slot;
                     shared = true;
-                    if (metadata and !existing.metadata) r.pinMetadataReader(slot.?, pinned_sequence);
+                    if (metadata and !existing.metadata) {
+                        r.pinMetadataReader(slot.?, pinned_sequence);
+                        promoted_metadata = true;
+                    }
                     break;
                 }
             }
@@ -217,6 +221,11 @@ pub const Coordinator = struct {
             if (metadata) r.unpinMetadataReader(s);
             r.unpinReader(s);
             r.releaseReaderSlot(s);
+        };
+        errdefer if (promoted_metadata) {
+            for (self.readers.items) |other| {
+                if (other.region == region and other.slot == slot and other.metadata) break;
+            } else region.?.unpinMetadataReader(slot.?);
         };
         const fence = try self.allocator.create(Fence);
         errdefer self.allocator.destroy(fence);
@@ -253,7 +262,6 @@ pub const Coordinator = struct {
                 }
             };
             self.allocator.destroy(fence);
-            self.mutex.unlock(self.io);
             if (region) |r| if (slot) |s| {
                 if (shared_by_others) {
                     if (metadata and !metadata_still_needed) r.unpinMetadataReader(s);
@@ -263,6 +271,7 @@ pub const Coordinator = struct {
                     r.releaseReaderSlot(s);
                 }
             };
+            self.mutex.unlock(self.io);
             self.release();
             return;
         };
@@ -471,6 +480,21 @@ test "lite reader registration claims a region slot per reader and the frontier 
     try std.testing.expectEqual(@as(?u64, 30), fixture.region.minimumPinnedSequence());
     second.close();
     try std.testing.expectEqual(@as(?u64, null), fixture.region.minimumPinnedSequence());
+}
+
+test "lite reader failed registration rolls back shared-slot metadata promotion" {
+    var fixture = try RegistrationFixture.init();
+    defer fixture.deinit();
+    var reader = try fixture.reader(10, false);
+    defer reader.close();
+
+    const original_allocator = fixture.coordinator.allocator;
+    var failing = std.testing.FailingAllocator.init(original_allocator, .{ .fail_index = 0 });
+    fixture.coordinator.allocator = failing.allocator();
+    defer fixture.coordinator.allocator = original_allocator;
+    try std.testing.expectError(error.OutOfMemory, fixture.reader(10, true));
+    try std.testing.expectEqual(@as(?u64, 10), fixture.region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), fixture.region.minimumMetadataPinnedSequence());
 }
 
 test "lite reader registration metadata pin is independent of the data frontier" {
