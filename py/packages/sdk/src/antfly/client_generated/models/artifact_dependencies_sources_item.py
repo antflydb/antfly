@@ -21,12 +21,14 @@ class ArtifactDependenciesSourcesItem:
         kind (ArtifactDependenciesSourcesItemKind | Unset):
         tracking (ArtifactDependenciesSourcesItemTracking | Unset):
         ranked (bool | Unset):
+        traversal (bool | Unset): A live graph traversal (`graph_queries` traverse).
     """
 
     name: str | Unset = UNSET
     kind: ArtifactDependenciesSourcesItemKind | Unset = UNSET
     tracking: ArtifactDependenciesSourcesItemTracking | Unset = UNSET
     ranked: bool | Unset = UNSET
+    traversal: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -42,6 +44,8 @@ class ArtifactDependenciesSourcesItem:
 
         ranked = self.ranked
 
+        traversal = self.traversal
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -53,6 +57,8 @@ class ArtifactDependenciesSourcesItem:
             field_dict["tracking"] = tracking
         if ranked is not UNSET:
             field_dict["ranked"] = ranked
+        if traversal is not UNSET:
+            field_dict["traversal"] = traversal
 
         return field_dict
 
@@ -77,11 +83,14 @@ class ArtifactDependenciesSourcesItem:
 
         ranked = d.pop("ranked", UNSET)
 
+        traversal = d.pop("traversal", UNSET)
+
         artifact_dependencies_sources_item = cls(
             name=name,
             kind=kind,
             tracking=tracking,
             ranked=ranked,
+            traversal=traversal,
         )
 
         artifact_dependencies_sources_item.additional_properties = d

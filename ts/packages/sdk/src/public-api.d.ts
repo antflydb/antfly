@@ -9237,10 +9237,12 @@ export interface components {
             sources?: {
                 name?: string;
                 /** @enum {string} */
-                kind?: "document" | "query" | "graph";
+                kind?: "document" | "query";
                 /** @enum {string} */
                 tracking?: "live" | "snapshot";
                 ranked?: boolean;
+                /** @description A live graph traversal (`graph_queries` traverse). */
+                traversal?: boolean;
             }[];
             /**
              * @description Present when `freshness=require_current` was requested: true when a
@@ -18539,6 +18541,7 @@ export interface components {
             merge_config?: Record<string, never>;
             reranker?: Record<string, never>;
             exclusion_query?: Record<string, never>;
+            /** @description Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{"$source": "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query engine as a snapshot. */
             graph_queries?: Record<string, never>;
             /** @description Ranked queries: member count. */
             limit?: number;
@@ -18551,36 +18554,10 @@ export interface components {
             /** @default 10 */
             k?: number;
         };
-        /** @description Bounded breadth-first traversal over the edges of a graph index. By default only explicitly written edges are traversed; `include_generated` also follows field-derived and enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and direction. */
-        EnrichmentContextGraph: {
-            table?: string;
-            graph_index: string;
-            /** @description JSON pointer to the start node key; omitted means the dependent row itself. */
-            start_from?: string;
-            edge_types?: string[];
-            /**
-             * @default out
-             * @enum {string}
-             */
-            direction?: "out" | "in" | "both";
-            /** @default 1 */
-            depth?: number;
-            /**
-             * @description Maximum edges per visited node; exceeding it fails explicitly.
-             * @default 100
-             */
-            max_fanout?: number;
-            /**
-             * @description Also traverse field-derived and enrichment-generated edges.
-             * @default false
-             */
-            include_generated?: boolean;
-        };
-        /** @description One named context source: exactly one of `document` (a referenced row), `query` (a filter or a ranked retrieval), or `graph` (bounded traversal over edges). `tracking` decides the freshness guarantee. A query whose every clause decides a row's membership from that row alone (a `filter_query`, optionally a top-N `order_by`) is tracked live: subscriptions invalidate dependents exactly and they can be `current`. A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `graph_queries`, `limit`, or the `text`/`vector` shorthands) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one. */
+        /** @description One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one. */
         EnrichmentContextSource: {
             document?: components["schemas"]["EnrichmentContextDocument"];
             query?: components["schemas"]["EnrichmentContextQuery"];
-            graph?: components["schemas"]["EnrichmentContextGraph"];
             /** @description Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected. */
             fields: string[];
             /**
@@ -18590,7 +18567,7 @@ export interface components {
             required?: boolean;
             /**
              * Format: uint32
-             * @description Query and graph sources: maximum members. Exceeding it fails explicitly; with `order_by` it is the declared top-N.
+             * @description Query sources: maximum members (for a traversal, rows reached). Exceeding it fails explicitly; with `order_by` it is the declared top-N.
              * @default 100
              */
             max_documents?: number;
@@ -18756,7 +18733,7 @@ export interface components {
             producer_json?: string;
             /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
             neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
-            /** @description Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters and ranked queries) at declaration (document and graph sources, and the `text`/`vector` shorthands, are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies. */
+            /** @description Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph operations, and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies. */
             context_sources?: {
                 [key: string]: components["schemas"]["EnrichmentContextSource"];
             };
@@ -37589,7 +37566,7 @@ export interface operations {
                         context_sources?: {
                             [key: string]: {
                                 /** @enum {string} */
-                                kind?: "document" | "query" | "graph";
+                                kind?: "document" | "query";
                                 /** @enum {string} */
                                 tracking?: "live" | "snapshot";
                                 reason?: string;

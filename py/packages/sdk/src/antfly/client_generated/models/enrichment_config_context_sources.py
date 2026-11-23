@@ -23,8 +23,9 @@ class EnrichmentConfigContextSources:
     distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table
     creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute
     as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into
-    query sources (filters and ranked queries) at declaration (document and graph sources, and the `text`/`vector`
-    shorthands, are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies.
+    query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph operations,
+    and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the enrichment to re-capture
+    changed policies.
 
     """
 

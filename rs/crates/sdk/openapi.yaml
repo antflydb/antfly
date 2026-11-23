@@ -7588,7 +7588,6 @@ paths:
                           enum:
                             - document
                             - query
-                            - graph
                         tracking:
                           type: string
                           enum:
@@ -28361,7 +28360,6 @@ components:
                 enum:
                   - document
                   - query
-                  - graph
               tracking:
                 type: string
                 enum:
@@ -28369,6 +28367,9 @@ components:
                   - snapshot
               ranked:
                 type: boolean
+              traversal:
+                type: boolean
+                description: A live graph traversal (`graph_queries` traverse).
         current:
           type: boolean
           description: >
@@ -44041,6 +44042,15 @@ components:
           type: object
         graph_queries:
           type: object
+          description: 'Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent
+            row (or `start: {keys: [{"$source": "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth`
+            (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and
+            `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal:
+            dependents watch every visited node''s edges and every reached row, members render with depth,
+            edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside
+            it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`,
+            `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query
+            engine as a snapshot.'
         limit:
           type: integer
           minimum: 1
@@ -44062,71 +44072,26 @@ components:
           minimum: 1
           maximum: 1000
           default: 10
-    EnrichmentContextGraph:
-      type: object
-      additionalProperties: false
-      required:
-        - graph_index
-      description: Bounded breadth-first traversal over the edges of a graph index. By default only explicitly
-        written edges are traversed; `include_generated` also follows field-derived and enrichment-generated
-        edges, whose changes invalidate dependents when their edge artifacts are written or removed. Generated
-        edges must not depend on the consuming enrichment. Members render with depth, edge type, and direction.
-      properties:
-        table:
-          type: string
-        graph_index:
-          type: string
-        start_from:
-          type: string
-          description: JSON pointer to the start node key; omitted means the dependent row itself.
-        edge_types:
-          type: array
-          maxItems: 32
-          items:
-            type: string
-        direction:
-          type: string
-          enum:
-            - out
-            - in
-            - both
-          default: out
-        depth:
-          type: integer
-          minimum: 1
-          maximum: 3
-          default: 1
-        max_fanout:
-          type: integer
-          minimum: 1
-          maximum: 1000
-          default: 100
-          description: Maximum edges per visited node; exceeding it fails explicitly.
-        include_generated:
-          type: boolean
-          default: false
-          description: Also traverse field-derived and enrichment-generated edges.
     EnrichmentContextSource:
       type: object
       additionalProperties: false
       required:
         - fields
-      description: 'One named context source: exactly one of `document` (a referenced row), `query` (a
-        filter or a ranked retrieval), or `graph` (bounded traversal over edges). `tracking` decides the
-        freshness guarantee. A query whose every clause decides a row''s membership from that row alone
-        (a `filter_query`, optionally a top-N `order_by`) is tracked live: subscriptions invalidate dependents
-        exactly and they can be `current`. A query with any ranking clause (`full_text_search`, `semantic_search`,
-        `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `graph_queries`, `limit`,
-        or the `text`/`vector` shorthands) depends on the whole corpus and is a snapshot: its dependents
-        are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source''s
-        effective tracking and, for a snapshot, the clause that made it one.'
+      description: 'One named context source: exactly one of `document` (a referenced row) or `query`
+        (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee.
+        A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents
+        exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`)
+        and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the
+        rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`,
+        `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, the `text`/`vector` shorthands,
+        or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot:
+        its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports
+        each source''s effective tracking and, for a snapshot, the clause that made it one.'
       properties:
         document:
           $ref: '#/components/schemas/EnrichmentContextDocument'
         query:
           $ref: '#/components/schemas/EnrichmentContextQuery'
-        graph:
-          $ref: '#/components/schemas/EnrichmentContextGraph'
         fields:
           type: array
           minItems: 1
@@ -44152,8 +44117,8 @@ components:
           minimum: 1
           maximum: 10000
           default: 100
-          description: 'Query and graph sources: maximum members. Exceeding it fails explicitly; with
-            `order_by` it is the declared top-N.'
+          description: 'Query sources: maximum members (for a traversal, rows reached). Exceeding it fails
+            explicitly; with `order_by` it is the declared top-N.'
         max_candidates:
           type: integer
           format: uint32
@@ -44456,9 +44421,10 @@ components:
             Lite) and by distributed tables, where context sources are declared through the artifact enrichment
             endpoint (not inline at table creation) and admission resolves table names and rejects cross-table
             generated-input cycles. Context reads execute as the declaring principal: it must be able
-            to read every source table, and its row filter on each is conjoined into query sources (filters
-            and ranked queries) at declaration (document and graph sources, and the `text`/`vector` shorthands,
-            are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies.'
+            to read every source table, and its row filter on each is conjoined into query sources (filters,
+            traversals, and ranked queries) at declaration (document sources, ranked graph operations,
+            and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the
+            enrichment to re-capture changed policies.'
         refresh:
           $ref: '#/components/schemas/EnrichmentRefreshConfig'
         execution:

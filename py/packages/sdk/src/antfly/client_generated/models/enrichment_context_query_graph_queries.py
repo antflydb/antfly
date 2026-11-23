@@ -11,7 +11,15 @@ T = TypeVar("T", bound="EnrichmentContextQueryGraphQueries")
 
 @_attrs_define
 class EnrichmentContextQueryGraphQueries:
-    """ """
+    """Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{"$source":
+    "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout`
+    (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated
+    edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with
+    depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the
+    reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics,
+    deeper traversals, several operations) runs in the query engine as a snapshot.
+
+    """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

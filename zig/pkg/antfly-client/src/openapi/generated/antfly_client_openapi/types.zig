@@ -15709,7 +15709,7 @@ pub const EnrichmentConfig = struct {
     producer_json: ?[]const u8 = null,
     /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
     neighbor_context: ?EnrichmentNeighborContextConfig = null,
-    /// Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters and ranked queries) at declaration (document and graph sources, and the `text`/`vector` shorthands, are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies.
+    /// Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters, traversals, and ranked queries) at declaration (document sources, ranked graph operations, and the `text`/`vector` shorthands are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies.
     context_sources: ?std.json.ArrayHashMap(EnrichmentContextSource) = null,
     refresh: ?EnrichmentRefreshConfig = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
@@ -15878,76 +15878,6 @@ pub const EnrichmentContextDocument = struct {
     }
 };
 
-/// Bounded breadth-first traversal over the edges of a graph index. By default only explicitly written edges are traversed; `include_generated` also follows field-derived and enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and direction.
-pub const EnrichmentContextGraph = struct {
-    table: ?[]const u8 = null,
-    graph_index: []const u8,
-    /// JSON pointer to the start node key; omitted means the dependent row itself.
-    start_from: ?[]const u8 = null,
-    edge_types: ?[]const []const u8 = null,
-    direction: ?[]const u8 = null,
-    depth: ?i64 = null,
-    /// Maximum edges per visited node; exceeding it fails explicitly.
-    max_fanout: ?i64 = null,
-    /// Also traverse field-derived and enrichment-generated edges.
-    include_generated: ?bool = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "table", "table", true },
-        .{ "graph_index", "graph_index", false },
-        .{ "start_from", "start_from", true },
-        .{ "edge_types", "edge_types", true },
-        .{ "direction", "direction", true },
-        .{ "depth", "depth", true },
-        .{ "max_fanout", "max_fanout", true },
-        .{ "include_generated", "include_generated", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.table) |value| {
-            try jw.objectField("table");
-            try jw.write(value);
-        }
-        try jw.objectField("graph_index");
-        try jw.write(self.graph_index);
-        if (self.start_from) |value| {
-            try jw.objectField("start_from");
-            try jw.write(value);
-        }
-        if (self.edge_types) |value| {
-            try jw.objectField("edge_types");
-            try jw.write(value);
-        }
-        if (self.direction) |value| {
-            try jw.objectField("direction");
-            try jw.write(value);
-        }
-        if (self.depth) |value| {
-            try jw.objectField("depth");
-            try jw.write(value);
-        }
-        if (self.max_fanout) |value| {
-            try jw.objectField("max_fanout");
-            try jw.write(value);
-        }
-        if (self.include_generated) |value| {
-            try jw.objectField("include_generated");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// A filter (tracked live) or a ranked retrieval (a snapshot). Any ranking clause makes the whole query a public QueryRequest executed by the table's query engine, with `{"$source":"/pointer"}` bindings anywhere; `limit` (at most 1000) is then the member count, and paging (`offset`, `search_after`, `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected. Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in `embeddings` instead.
 pub const EnrichmentContextQuery = struct {
     /// Table queried; omitted means the enrichment's own table.
@@ -15966,6 +15896,7 @@ pub const EnrichmentContextQuery = struct {
     merge_config: ?std.json.ArrayHashMap(std.json.Value) = null,
     reranker: ?std.json.ArrayHashMap(std.json.Value) = null,
     exclusion_query: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Graph operations (QueryRequest shape). Exactly one `traverse` from the dependent row (or `start: {keys: [{"$source": "/pointer"}]}`) with only `edge_types`, `direction`, `max_depth` (at most 3), and the context options `max_fanout` (edges per visited node, default 100) and `include_generated` (also follow field-derived and enrichment-generated edges) is a live traversal: dependents watch every visited node's edges and every reached row, members render with depth, edge type, and direction, and `max_documents` bounds the rows reached. A `filter_query` beside it narrows the reached rows and stays live. Anything else (`match`, shortest paths, `edge_filter`, `edge_weight`, `limit`, metrics, deeper traversals, several operations) runs in the query engine as a snapshot.
     graph_queries: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Ranked queries: member count.
     limit: ?i64 = null,
@@ -16094,16 +16025,15 @@ pub const EnrichmentContextQuery = struct {
     }
 };
 
-/// One named context source: exactly one of `document` (a referenced row), `query` (a filter or a ranked retrieval), or `graph` (bounded traversal over edges). `tracking` decides the freshness guarantee. A query whose every clause decides a row's membership from that row alone (a `filter_query`, optionally a top-N `order_by`) is tracked live: subscriptions invalidate dependents exactly and they can be `current`. A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `graph_queries`, `limit`, or the `text`/`vector` shorthands) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one.
+/// One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query` (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, the `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one.
 pub const EnrichmentContextSource = struct {
     document: ?EnrichmentContextDocument = null,
     query: ?EnrichmentContextQuery = null,
-    graph: ?EnrichmentContextGraph = null,
     /// Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected.
     fields: []const []const u8,
     /// Document sources only: a missing referenced document fails the rebuild explicitly instead of rendering null.
     required: ?bool = null,
-    /// Query and graph sources: maximum members. Exceeding it fails explicitly; with `order_by` it is the declared top-N.
+    /// Query sources: maximum members (for a traversal, rows reached). Exceeding it fails explicitly; with `order_by` it is the declared top-N.
     max_documents: ?u32 = null,
     /// Query sources with residual predicates (range, prefix, match, similar) or `order_by`: maximum candidate rows examined after equality filtering. Exceeding it fails explicitly.
     max_candidates: ?u32 = null,
@@ -16119,7 +16049,6 @@ pub const EnrichmentContextSource = struct {
     pub const openApiFieldMetadata = .{
         .{ "document", "document", true },
         .{ "query", "query", true },
-        .{ "graph", "graph", true },
         .{ "fields", "fields", false },
         .{ "required", "required", true },
         .{ "max_documents", "max_documents", true },
@@ -16146,10 +16075,6 @@ pub const EnrichmentContextSource = struct {
         }
         if (self.query) |value| {
             try jw.objectField("query");
-            try jw.write(value);
-        }
-        if (self.graph) |value| {
-            try jw.objectField("graph");
             try jw.write(value);
         }
         try jw.objectField("fields");

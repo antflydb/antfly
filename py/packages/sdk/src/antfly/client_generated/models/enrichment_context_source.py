@@ -11,7 +11,6 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.enrichment_context_document import EnrichmentContextDocument
-    from ..models.enrichment_context_graph import EnrichmentContextGraph
     from ..models.enrichment_context_query import EnrichmentContextQuery
 
 
@@ -20,14 +19,15 @@ T = TypeVar("T", bound="EnrichmentContextSource")
 
 @_attrs_define
 class EnrichmentContextSource:
-    """One named context source: exactly one of `document` (a referenced row), `query` (a filter or a ranked retrieval), or
-    `graph` (bounded traversal over edges). `tracking` decides the freshness guarantee. A query whose every clause
-    decides a row's membership from that row alone (a `filter_query`, optionally a top-N `order_by`) is tracked live:
-    subscriptions invalidate dependents exactly and they can be `current`. A query with any ranking clause
-    (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`,
-    `graph_queries`, `limit`, or the `text`/`vector` shorthands) depends on the whole corpus and is a snapshot: its
-    dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's
-    effective tracking and, for a snapshot, the clause that made it one.
+    """One named context source: exactly one of `document` (a referenced row) or `query` (a filter, a graph traversal, or a
+    ranked retrieval). `tracking` decides the freshness guarantee. A query whose membership is decided row by row is
+    tracked live: subscriptions invalidate dependents exactly and they can be `current`. That covers a `filter_query`
+    (optionally with a top-N `order_by`) and one plain bounded `graph_queries` traverse (optionally with a
+    `filter_query` narrowing the rows it reaches). A query with any ranking clause (`full_text_search`,
+    `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `limit`, the
+    `text`/`vector` shorthands, or `graph_queries` beyond one plain bounded traverse) depends on the whole corpus and is
+    a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each
+    source's effective tracking and, for a snapshot, the clause that made it one.
 
         Attributes:
             fields (list[str]): Projected fields consumed by the producer (dotted paths). Only these fields, predicate
@@ -44,15 +44,10 @@ class EnrichmentContextSource:
                 (`offset`, `search_after`, `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected.
                 Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in
                 `embeddings` instead.
-            graph (EnrichmentContextGraph | Unset): Bounded breadth-first traversal over the edges of a graph index. By
-                default only explicitly written edges are traversed; `include_generated` also follows field-derived and
-                enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or
-                removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and
-                direction.
             required (bool | Unset): Document sources only: a missing referenced document fails the rebuild explicitly
                 instead of rendering null. Default: False.
-            max_documents (int | Unset): Query and graph sources: maximum members. Exceeding it fails explicitly; with
-                `order_by` it is the declared top-N. Default: 100.
+            max_documents (int | Unset): Query sources: maximum members (for a traversal, rows reached). Exceeding it fails
+                explicitly; with `order_by` it is the declared top-N. Default: 100.
             max_candidates (int | Unset): Query sources with residual predicates (range, prefix, match, similar) or
                 `order_by`: maximum candidate rows examined after equality filtering. Exceeding it fails explicitly. Default:
                 1000.
@@ -70,7 +65,6 @@ class EnrichmentContextSource:
     fields: list[str]
     document: EnrichmentContextDocument | Unset = UNSET
     query: EnrichmentContextQuery | Unset = UNSET
-    graph: EnrichmentContextGraph | Unset = UNSET
     required: bool | Unset = False
     max_documents: int | Unset = 100
     max_candidates: int | Unset = 1000
@@ -89,10 +83,6 @@ class EnrichmentContextSource:
         query: dict[str, Any] | Unset = UNSET
         if not isinstance(self.query, Unset):
             query = self.query.to_dict()
-
-        graph: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.graph, Unset):
-            graph = self.graph.to_dict()
 
         required = self.required
 
@@ -123,8 +113,6 @@ class EnrichmentContextSource:
             field_dict["document"] = document
         if query is not UNSET:
             field_dict["query"] = query
-        if graph is not UNSET:
-            field_dict["graph"] = graph
         if required is not UNSET:
             field_dict["required"] = required
         if max_documents is not UNSET:
@@ -145,7 +133,6 @@ class EnrichmentContextSource:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.enrichment_context_document import EnrichmentContextDocument
-        from ..models.enrichment_context_graph import EnrichmentContextGraph
         from ..models.enrichment_context_query import EnrichmentContextQuery
 
         d = dict(src_dict)
@@ -164,13 +151,6 @@ class EnrichmentContextSource:
             query = UNSET
         else:
             query = EnrichmentContextQuery.from_dict(_query)
-
-        _graph = d.pop("graph", UNSET)
-        graph: EnrichmentContextGraph | Unset
-        if isinstance(_graph, Unset):
-            graph = UNSET
-        else:
-            graph = EnrichmentContextGraph.from_dict(_graph)
 
         required = d.pop("required", UNSET)
 
@@ -200,7 +180,6 @@ class EnrichmentContextSource:
             fields=fields,
             document=document,
             query=query,
-            graph=graph,
             required=required,
             max_documents=max_documents,
             max_candidates=max_candidates,

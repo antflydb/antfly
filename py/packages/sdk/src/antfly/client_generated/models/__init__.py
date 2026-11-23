@@ -461,8 +461,6 @@ from .enrichment_config import EnrichmentConfig
 from .enrichment_config_context_sources import EnrichmentConfigContextSources
 from .enrichment_config_embedding_input import EnrichmentConfigEmbeddingInput
 from .enrichment_context_document import EnrichmentContextDocument
-from .enrichment_context_graph import EnrichmentContextGraph
-from .enrichment_context_graph_direction import EnrichmentContextGraphDirection
 from .enrichment_context_query import EnrichmentContextQuery
 from .enrichment_context_query_embeddings import EnrichmentContextQueryEmbeddings
 from .enrichment_context_query_exclusion_query import EnrichmentContextQueryExclusionQuery
@@ -3209,8 +3207,6 @@ __all__ = (
     "EnrichmentConfigContextSources",
     "EnrichmentConfigEmbeddingInput",
     "EnrichmentContextDocument",
-    "EnrichmentContextGraph",
-    "EnrichmentContextGraphDirection",
     "EnrichmentContextQuery",
     "EnrichmentContextQueryEmbeddings",
     "EnrichmentContextQueryExclusionQuery",
