@@ -21389,16 +21389,19 @@ int antfly_metal_packed_projection_is_cached(termite_metal_decode_runtime *runti
     if (!runtime || !handle) return 0;
     AntflyMetalPackedProjection *entry = handle;
     if (entry->provider != runtime || !entry->origin || entry->origin != atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire)) return 0;
-    int roots = 0;
-    for (size_t i = 0; i < TERMITE_METAL_LINEAR_SLOT_CAPACITY; ++i) {
-        if (runtime->dense_pair_packed_weight_buffers[i] == (__bridge id<MTLBuffer>)entry->weight) roots |= 1;
-        if (runtime->dense_pair_packed_bias_buffers[i] == (__bridge id<MTLBuffer>)entry->bias) roots |= 2;
+    // Publication installs compatibility aliases only at the lead slot.
+    const size_t slot = entry->slots[0];
+    id<MTLBuffer> weight = (__bridge id<MTLBuffer>)entry->weight;
+    id<MTLBuffer> bias = (__bridge id<MTLBuffer>)entry->bias;
+    if (entry->count == 2 && slot < TERMITE_METAL_LINEAR_SLOT_CAPACITY) {
+        return (runtime->dense_pair_packed_weight_buffers[slot] == weight ? 1 : 0) |
+            (runtime->dense_pair_packed_bias_buffers[slot] == bias ? 2 : 0);
     }
-    for (size_t i = 0; i < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY; ++i) {
-        if (runtime->dense_qkv_packed_weight_buffers[i] == (__bridge id<MTLBuffer>)entry->weight) roots |= 1;
-        if (runtime->dense_qkv_packed_bias_buffers[i] == (__bridge id<MTLBuffer>)entry->bias) roots |= 2;
+    if (entry->count == 3 && slot < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY) {
+        return (runtime->dense_qkv_packed_weight_buffers[slot] == weight ? 1 : 0) |
+            (runtime->dense_qkv_packed_bias_buffers[slot] == bias ? 2 : 0);
     }
-    return roots;
+    return 0;
 }
 
 // The caller owns independent funding for BOTH supplied roots. This function
@@ -21471,17 +21474,9 @@ int antfly_metal_packed_projection_forget(termite_metal_decode_runtime *runtime,
     // The lead slot can already refer to a newer pack. Retire only aliases
     // rooted in this entry, including the MPS views that retain its buffers.
     const size_t slot = entry->slots[0];
-    id<MTLBuffer> weight = (__bridge id<MTLBuffer>)entry->weight;
-    id<MTLBuffer> bias = (__bridge id<MTLBuffer>)entry->bias;
-    if (entry->count == 2 && slot < TERMITE_METAL_LINEAR_SLOT_CAPACITY &&
-        runtime->dense_pair_packed_weight_buffers[slot] == weight &&
-        runtime->dense_pair_packed_bias_buffers[slot] == bias) {
-        antfly_metal_clear_dense_pair_pack(runtime, slot);
-    }
-    if (entry->count == 3 && slot < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY &&
-        runtime->dense_qkv_packed_weight_buffers[slot] == weight &&
-        runtime->dense_qkv_packed_bias_buffers[slot] == bias) {
-        antfly_metal_clear_dense_qkv_pack(runtime, slot);
+    if (antfly_metal_packed_projection_is_cached(runtime, entry) == 3) {
+        if (entry->count == 2) antfly_metal_clear_dense_pair_pack(runtime, slot);
+        else antfly_metal_clear_dense_qkv_pack(runtime, slot);
     }
     antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->weight, entry, true);
     antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->bias, entry, true);

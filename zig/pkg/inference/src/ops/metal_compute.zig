@@ -12688,18 +12688,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return self.compute.audio_capture == null and metal_runtime.hasActiveFrame(self.compute.provider_impl.raw_decode_runtime);
         }
         fn encodeInFrame(self: *const @This(), request: ProjectionPack.Request, input: MetalTensor, rows: usize, outputs: []const MetalTensor, scratch: MetalTensor) !void {
-            for ([_]?*MetalCompute{ self.compute, self.compute.borrowedProjectionPackSource() }) |owner_candidate| {
-                const cache_owner = owner_candidate orelse continue;
-                platform.sync.lockYielding(&cache_owner.packed_projection_mutex);
-                defer cache_owner.packed_projection_mutex.unlock();
-                const pack = cache_owner.packedProjection(request) orelse continue;
-                const runtime = self.compute.provider_impl.raw_decode_runtime.?;
-                const recording = try metal_runtime.DenseFrameRecording.retainActive(runtime);
-                defer recording.release();
-                const entry = metal_runtime.PackedProjectionEntry{ .runtime = runtime, .handle = pack.entry, .request = request };
-                return entry.encodeAssigned(recording, input, rows, outputs, scratch);
-            }
-            return error.PreparedRegionBindingChanged;
+            const pack = self.compute.lockInstalledProjectionPack(request) orelse return error.PreparedRegionBindingChanged;
+            defer pack.unlock();
+            const runtime = self.compute.provider_impl.raw_decode_runtime.?;
+            const recording = try metal_runtime.DenseFrameRecording.retainActive(runtime);
+            defer recording.release();
+            const entry = metal_runtime.PackedProjectionEntry{ .runtime = runtime, .handle = pack.owner.entry, .request = request };
+            return entry.encodeAssigned(recording, input, rows, outputs, scratch);
         }
         fn matches(raw: *anyopaque, request: region.Validate) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -13452,15 +13447,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return source;
     }
 
-    fn hasInstalledProjectionPack(self: *MetalCompute, request: ProjectionPack.Request) bool {
-        if (request.count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return false;
+    const LockedProjectionPack = struct {
+        mutex: *std.atomic.Mutex,
+        owner: *ProjectionPack.Owner,
+
+        fn unlock(self: LockedProjectionPack) void {
+            self.mutex.unlock();
+        }
+    };
+
+    /// Selection and encoding use the same lookup. Keep the creator locked
+    /// until SDK encoding establishes its independent use of the pack.
+    fn lockInstalledProjectionPack(self: *MetalCompute, request: ProjectionPack.Request) ?LockedProjectionPack {
+        if (request.count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return null;
         for ([_]?*MetalCompute{ self, self.borrowedProjectionPackSource() }) |candidate| {
             const cache_owner = candidate orelse continue;
-            platform.sync.lockYielding(&cache_owner.packed_projection_mutex);
-            defer cache_owner.packed_projection_mutex.unlock();
-            if (cache_owner.packedProjection(request) != null) return true;
+            const mutex = &cache_owner.packed_projection_mutex;
+            platform.sync.lockYielding(mutex);
+            if (cache_owner.packedProjection(request)) |owner| return .{ .mutex = mutex, .owner = owner };
+            mutex.unlock();
         }
-        return false;
+        return null;
+    }
+
+    fn hasInstalledProjectionPack(self: *MetalCompute, request: ProjectionPack.Request) bool {
+        const pack = self.lockInstalledProjectionPack(request) orelse return false;
+        pack.unlock();
+        return true;
     }
 
     fn packedProjection(self: *MetalCompute, request: ProjectionPack.Request) ?*ProjectionPack.Owner {
