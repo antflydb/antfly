@@ -1719,12 +1719,12 @@ test "SQL command producer native cold restart reenrolls an idle durable HTTP co
             return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
         }
     };
-    for ([_]@FieldType(FaultPort, "mode"){ .expired, .rejected }, 0..) |mode, ordinal| {
+    for ([_]@FieldType(FaultPort, "mode"){ .expired, .rejected }) |mode| {
         var retired = (try producer.load(&source, a, connection)).?;
         defer retired.deinit();
         var registration = original.value.registration;
         registration.replaces = retired.value.retiredNativeBackend();
-        registration.lease.backend.id = id(800 + ordinal);
+        registration.lease.backend.fence += 1;
         registration.lease.expires_at_ms = hooks.now_ms + producer.execution_lease_ms;
         registration.nonce = native.nonce();
         try producer.create(&source, "alice", registration, actor, owner.instance, try native.head(), native.nonce(), hooks.now_ms, retired.value.revision);
@@ -1738,18 +1738,36 @@ test "SQL command producer native cold restart reenrolls an idle durable HTTP co
         try std.testing.expect(failed.value.registration_absent);
         try std.testing.expect(failed.value.retiredNativeBackend().?.eql(original.value.registration.lease.backend));
     }
-    try owner.enroll(a, native.database);
-    var successor = (try producer.load(&source, a, connection)).?;
-    defer successor.deinit();
-    try std.testing.expectEqual(.idle, successor.value.phase);
-    try std.testing.expect(!successor.value.registration.lease.backend.eql(original.value.registration.lease.backend));
-    try std.testing.expect(successor.value.registration.replaces.?.eql(original.value.registration.lease.backend));
-    var old_cut = try native.port().snapshot(a, original.value);
-    defer old_cut.deinit();
-    try std.testing.expectEqual(.retired, old_cut.value.scope.?.state);
-    var command = try owner.take(a, @splat(42));
-    try std.testing.expect(command.fence.backend.eql(successor.value.registration.lease.backend));
-    try command.finish(a);
+    for (0..4) |ordinal| {
+        var preceding = (try producer.load(&source, a, connection)).?;
+        defer preceding.deinit();
+        const old_backend = preceding.value.retiredNativeBackend();
+        try owner.enroll(a, native.database);
+        var successor = (try producer.load(&source, a, connection)).?;
+        defer successor.deinit();
+        const backend = successor.value.registration.lease.backend;
+        try std.testing.expectEqual(.idle, successor.value.phase);
+        try std.testing.expectEqual(original.value.registration.lease.backend.id, backend.id);
+        try std.testing.expectEqual(@as(u64, ordinal) + 2, backend.fence);
+        try std.testing.expect(successor.value.registration.replaces.?.eql(old_backend.?));
+        const bytes = try Native.call(&native, a, .{ .sql_lock_read = .{
+            .incarnation = backend.incarnation,
+            .standalone = true,
+            .actor = actor,
+            .database = 1,
+            .backend = old_backend,
+        } });
+        defer a.free(bytes);
+        var old_cut = try std.json.parseFromSlice(authority.Snapshot, a, bytes, .{});
+        defer old_cut.deinit();
+        try std.testing.expect(old_cut.value.scope == null and old_cut.value.owner == null);
+        try std.testing.expectError(error.CatalogGenerationChanged, native.submit(original.value, .{ .register = original.value.registration }));
+        var command = try owner.take(a, @splat(42));
+        try std.testing.expect(command.fence.backend.eql(backend));
+        try command.finish(a);
+        hooks.now_ms = successor.value.registration.lease.expires_at_ms + 1;
+        try native.until(&source, .retired, hooks.now_ms);
+    }
 }
 
 test "SQL command producer native ingress discovers one database enrolls exact owners and never reissues a body" {

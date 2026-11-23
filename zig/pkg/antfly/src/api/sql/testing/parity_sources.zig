@@ -35,6 +35,7 @@ pub fn Tables(comptime count: usize) type {
         captures: usize = 0,
         catalog_revision: u64 = 7,
         catalog_epoch: ?local.system_catalog_relation_reconciliation.Epoch = null,
+        catalog_reads: std.atomic.Value(usize) = .init(0),
         catalog_stamp_reads: std.atomic.Value(usize) = .init(0),
         native_reads: std.atomic.Value(usize) = .init(0),
         lookup_calls: std.atomic.Value(usize) = .init(0),
@@ -61,6 +62,7 @@ pub fn Tables(comptime count: usize) type {
         pub fn systemCatalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, input: @import("../../../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
+            if (self.catalog_epoch != null) _ = self.catalog_reads.fetchAdd(1, .monotonic);
             if (input == .setting_snapshot and self.catalog_epoch != null)
                 return std.json.Stringify.valueAlloc(a, local.sql_setting_catalog.RawSnapshot.init(input.setting_snapshot, 1, &.{}), .{});
             if (input == .policy_publication_status) return a.dupe(u8, "null");

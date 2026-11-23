@@ -761,7 +761,7 @@ pub const Session = struct {
         try req.check();
     }
 
-    const GuardedSelect = enum { opened, declined, recheck };
+    const GuardedSelect = enum { opened, declined, recheck, stale };
 
     fn tryOpenGuardedSelect(self: *Session, portal: *Portal) !GuardedSelect {
         const description = portal.description;
@@ -774,7 +774,7 @@ pub const Session = struct {
             error.CatalogGenerationChanged, error.SettingCatalogChanged => {
                 self.diagnostic.clearNotices();
                 self.diagnostic = .{ .notice_allocator = self.alloc };
-                return .recheck;
+                return .stale;
             },
             else => return err,
         };
@@ -783,11 +783,11 @@ pub const Session = struct {
         return .opened;
     }
 
-    fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal, describe_only: bool) !backend.Description {
+    fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal, describe_only: bool, known_stale: bool) !backend.Description {
         const bound = portal.description;
         var probe = bound;
         if (describe_only) probe.stamp = portal.describe_stamp orelse bound.stamp;
-        if (try self.descriptionCurrent(alloc, portal.statement, probe)) return probe;
+        if (!known_stale and try self.descriptionCurrent(alloc, portal.statement, probe)) return probe;
         const current = try self.rebindCached(alloc, portal.statement, bound);
         if (bound.binding_guard) |before| {
             if (if (bound.stamp) |s| s.catalog else null) |previous| {
@@ -1857,7 +1857,7 @@ pub const Session = struct {
                         defer self.request_search_path = previous_path;
                         var scratch = std.heap.ArenaAllocator.init(self.alloc);
                         defer scratch.deinit();
-                        const current = try self.checkedPortalDescription(scratch.allocator(), portal, true);
+                        const current = try self.checkedPortalDescription(scratch.allocator(), portal, true, false);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
@@ -1906,7 +1906,7 @@ pub const Session = struct {
                     self.read_receipt_budget = .{};
                     const guarded = try self.tryOpenGuardedSelect(portal);
                     if (guarded != .opened)
-                        portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal, false);
+                        portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal, false, guarded == .stale);
                     portal.describe_stamp = portal.description.stamp;
                     portal.stream_opened = true;
                     if (portal.description.copy_in != null) {
@@ -1921,7 +1921,7 @@ pub const Session = struct {
                         return;
                     }
                     if (self.session_id) |id| portal.session_id = try portal.arena.allocator().dupe(u8, id);
-                    if (guarded == .recheck and self.source.vtable.open_stream != null and
+                    if ((guarded == .recheck or guarded == .stale) and self.source.vtable.open_stream != null and
                         try commands.settingCommand(portal.arena.allocator(), portal.statement) == null)
                         try self.openPortalStream(portal, null);
                 }

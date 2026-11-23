@@ -24,6 +24,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -322,33 +323,32 @@ def evidence_runs(gate_ids, gates):
 
 
 def run_gate(command, *, cwd, timeout):
-    waiting = False
     terminated = False
 
-    def terminate(signum, _frame):
+    def terminate(_signum, _frame):
         nonlocal terminated
         terminated = True
-        if waiting:
-            raise SystemExit(128 + signum)
 
     previous = signal.signal(signal.SIGTERM, terminate)
     try:
         with subprocess.Popen(command, cwd=cwd, start_new_session=True) as child:
+            deadline = time.monotonic() + timeout
             try:
-                waiting = True
-                if terminated:
-                    raise SystemExit(128 + signal.SIGTERM)
-                status = child.wait(timeout=timeout)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit):
-                waiting = False
+                while not terminated:
+                    # Observe the leader without reaping it. Its PID pins the
+                    # group ID until cleanup, even if only descendants remain.
+                    if os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    time.sleep(min(remaining, 0.05))
+            finally:
                 try:
                     os.killpg(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                child.wait()
-                raise
-            finally:
-                waiting = False
+                status = child.wait()
         if terminated:
             raise SystemExit(128 + signal.SIGTERM)
         if status:

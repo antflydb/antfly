@@ -644,9 +644,13 @@ pub fn register(backing: A, txn: anytype, ns: ledger.Namespace, registration: Re
         if (prior.state != .active) return error.LockOwnerBusy;
         return;
     }
-    if (try connection(a, txn, ns, registration.lease.node, registration.connection)) |prior| {
+    const predecessor = try connection(a, txn, ns, registration.lease.node, registration.connection);
+    if (predecessor) |prior| {
         const expected = registration.replaces orelse return error.LockOwnerChanged;
+        const successor = registration.lease.backend;
         if (!prior.registration.lease.backend.eql(expected) or prior.state != .retired or
+            !std.mem.eql(u8, &successor.id, &expected.id) or successor.fence <= expected.fence or
+            successor.fence - expected.fence != 1 or
             prior.registration.lease.database != registration.lease.database or
             !std.mem.eql(u8, &prior.registration.lease.principal, &registration.lease.principal)) return error.LockOwnerChanged;
     } else if (registration.replaces != null) return error.LockOwnerChanged;
@@ -667,6 +671,10 @@ pub fn register(backing: A, txn: anytype, ns: ledger.Namespace, registration: Re
     @memcpy(binding[0..16], &registration.lease.backend.id);
     std.mem.writeInt(u64, binding[16..24], registration.lease.backend.fence, .little);
     try txn.put(try connectionKey(&buffer, ns, registration.lease.node, registration.connection), &binding);
+    if (predecessor) |prior| {
+        try ledger.reclaimSuperseded(a, txn, ns, prior.registration.lease);
+        try txn.delete(try key(&buffer, ns, prior.registration.lease.backend));
+    }
 }
 const RegistrationContext = struct {
     pub fn requireLease(_: @This(), _: anytype, _: ledger.Lease) !void {}

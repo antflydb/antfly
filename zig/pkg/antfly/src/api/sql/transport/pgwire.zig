@@ -5478,7 +5478,7 @@ fn verifyBindingGuard(guard: []const u8, revision: u64, table: catalog.Table) !v
     var found = false;
     while (try targets.next()) |target| {
         if (target.id == table.id and (target.graph_revision != 0) == (table.graph != null) and std.mem.eql(u8, target.name, table.physical_name)) {
-            if (target.graph_revision != graphRevision(table) or target.version != table.schema_version) return error.CatalogGenerationChanged;
+            if (!BindingEntryContext.eql(.{}, BindingEntry.of(table), .{ .id = target.id, .name = target.name, .version = target.version, .column_lineage = target.column_lineage, .graph_revision = target.graph_revision }, 0)) return error.CatalogGenerationChanged;
             found = true;
         }
     }
@@ -5501,6 +5501,9 @@ test "SQL pgwire prepared identity rejects same shaped table replacement before 
     const other: catalog.Table = .{ .id = 55, .physical_name = "other_docs", .schema_version = 3, .columns = &.{} };
     const many = try encodeBindingGuard(std.testing.allocator, 7, &.{ BindingEntry.of(table), BindingEntry.of(other) });
     defer std.testing.allocator.free(many);
+    var same_version = table;
+    same_version.column_lineage = table.schema_version + 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, verifyBindingGuard(guard, 7, same_version));
     const recreated_column = try bindingGuard(std.testing.allocator, 8, replacement);
     defer std.testing.allocator.free(recreated_column);
     try std.testing.expect(!sameBindingTargets(guard, recreated_column));
@@ -5893,6 +5896,12 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
     // Bind re-enters the compatibility path before delivering any rows.
     source.catalog_epoch = .{ .incarnation = @splat(1), .revision = 1 };
     const Frames = struct {
+        var admission_attempts: usize = 0;
+        fn observeAdmission(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
+            admission_attempts += 1;
+            return Adapter.openStream(raw, alloc, identity, request);
+        }
+
         fn write(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
             try out.writeByte(tag);
             try out.writeInt(u32, @intCast(payload.len + 4), .big);
@@ -5906,8 +5915,12 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
             return valid;
         }
     };
-    for ([_]bool{ false, true }) |change| {
+    var baseline: [2]usize = undefined;
+    for ([_]bool{ false, true }) |guarded| for ([_]bool{ false, true }, 0..) |change, scenario| {
+        source.catalog_revision = 7;
         source.catalog_stamp_reads.store(0, .monotonic);
+        source.catalog_reads.store(0, .monotonic);
+        Frames.admission_attempts = 0;
         var input: std.Io.Writer.Allocating = .init(a);
         defer input.deinit();
         const startup = "user\x00copy-reader\x00database\x00default\x00\x00";
@@ -5926,6 +5939,8 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
         const Protocol = @import("../../../pgwire/protocol.zig");
         var backend = adapter.backend();
         var vtable = backend.vtable.*;
+        vtable.open_stream = Frames.observeAdmission;
+        vtable.guarded_select_stream = guarded;
         if (change) vtable.description_current = Frames.bindThenChange;
         backend.vtable = &vtable;
         var session: Protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = backend, .reader = &reader, .writer = &output.writer };
@@ -5943,10 +5958,14 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
             if (tag == 'D') rows += 1;
         }
         try std.testing.expectEqual(@as(usize, 1), rows);
-        try std.testing.expectEqual(@as(usize, if (change) 4 else 2), source.catalog_stamp_reads.load(.monotonic));
-    }
-    source.catalog_epoch = null;
-    source.catalog_revision = 7;
+        try std.testing.expectEqual(@as(usize, 2 + @as(usize, @intFromBool(change)) + @as(usize, @intFromBool(!guarded))), source.catalog_stamp_reads.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, if (change and guarded) 2 else 1), Frames.admission_attempts);
+        const catalog_calls = source.catalog_reads.load(.monotonic);
+        if (!guarded) baseline[scenario] = catalog_calls else if (!change) {
+            try std.testing.expectEqual(baseline[scenario] - 1, catalog_calls);
+        }
+        std.debug.print("PGWIRE_PREPARED_ADMISSION guarded={} stale={} metadata_calls={d} admissions={d}\n", .{ guarded, change, catalog_calls, Frames.admission_attempts });
+    };
 }
 
 test "SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows" {

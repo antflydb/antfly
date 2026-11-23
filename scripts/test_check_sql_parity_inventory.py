@@ -42,32 +42,42 @@ from check_sql_parity_inventory import (
 class ParityInventoryTest(unittest.TestCase):
     def test_timed_out_gate_kills_its_process_group_and_waits(self):
         command = ["zig", "build"]
-        timeout = subprocess.TimeoutExpired(command, 1)
         with (
             patch("check_sql_parity_inventory.subprocess.Popen") as spawn,
             patch("check_sql_parity_inventory.os.killpg") as kill_group,
+            patch("check_sql_parity_inventory.os.waitid", return_value=None),
         ):
             child = spawn.return_value.__enter__.return_value
             child.pid = 123
-            child.wait.side_effect = [timeout, -signal.SIGKILL]
+            child.wait.return_value = -signal.SIGKILL
             with self.assertRaises(subprocess.TimeoutExpired):
-                run_gate(command, cwd=Path("."), timeout=1)
+                run_gate(command, cwd=Path("."), timeout=0)
         spawn.assert_called_once_with(command, cwd=Path("."), start_new_session=True)
         kill_group.assert_called_once_with(123, signal.SIGKILL)
-        self.assertEqual(child.wait.call_count, 2)
+        self.assertEqual(child.wait.call_count, 1)
 
-    def test_sigterm_reaps_gate_with_live_grandchild(self):
+    def assert_gate_signal_cleanup(self, *, leader_exits):
         gate = (
             "import os, subprocess, sys; "
             "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
             "print(os.getpid(), flush=True); "
-            "__import__('time').sleep(60)"
+            + ("" if leader_exits else "__import__('time').sleep(60)")
         )
         runner = (
             "from check_sql_parity_inventory import run_gate; "
             "from pathlib import Path; import sys; "
             "run_gate([sys.executable, '-c', sys.argv[1]], cwd=Path.cwd(), timeout=60)"
         )
+        if leader_exits:
+            runner = (
+                "import os, signal\n"
+                "waitid = os.waitid\n"
+                "def observe(*args):\n"
+                "    result = waitid(*args)\n"
+                "    if result: os.kill(os.getpid(), signal.SIGTERM)\n"
+                "    return result\n"
+                "os.waitid = observe\n"
+            ) + runner
         with subprocess.Popen(
             [sys.executable, "-c", runner, gate],
             cwd=Path(__file__).resolve().parent,
@@ -78,7 +88,8 @@ class ParityInventoryTest(unittest.TestCase):
                 readable, _, _ = select.select([supervisor.stdout], [], [], 10)
                 self.assertTrue(readable, "gate did not report startup")
                 group = int(supervisor.stdout.readline())
-                supervisor.terminate()
+                if not leader_exits:
+                    supervisor.terminate()
                 # Both descendants inherit the write end, so EOF proves
                 # the entire group stopped, even after the supervisor exited.
                 supervisor.communicate(timeout=10)
@@ -90,6 +101,12 @@ class ParityInventoryTest(unittest.TestCase):
                         os.killpg(group, signal.SIGKILL)
                 if supervisor.poll() is None:
                     supervisor.kill()
+
+    def test_sigterm_reaps_gate_with_live_grandchild(self):
+        self.assert_gate_signal_cleanup(leader_exits=False)
+
+    def test_sigterm_reaps_gate_after_leader_exits(self):
+        self.assert_gate_signal_cleanup(leader_exits=True)
 
     @classmethod
     def setUpClass(cls):
