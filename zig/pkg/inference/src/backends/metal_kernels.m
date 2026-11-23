@@ -32652,7 +32652,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create_for_quant_form
         runtime->q8_0_pair_activation_mm_f16_output_pipeline = (disable_runtime_q8_mm || disable_runtime_q8_pair_activation_mm) ? nil : termite_metal_make_pipeline(device, library, @"termite_q8_0_pair_activation_multiply_mm_out_f16");
         runtime->q8_0_pair_activation_mm_sg_v2_pipeline = disable_runtime_q8_pair_activation_sg_v2 ? nil : termite_metal_make_pipeline(device, library, @"termite_q8_0_pair_activation_mm_sg_v2");
         runtime->q8_0_pair_activation_mm_sg_v2_f16_output_pipeline = disable_runtime_q8_pair_activation_sg_v2 ? nil : termite_metal_make_pipeline(device, library, @"termite_q8_0_pair_activation_mm_sg_v2_out_f16");
-        termite_metal_load_pipeline_catalog(runtime, device, library, precise_library, antfly_metal_index_q8_0_activation_multiply_reduce_pipeline, antfly_metal_index_rope_broadcast_pipeline - antfly_metal_index_q8_0_activation_multiply_reduce_pipeline + 1u);
+        termite_metal_load_pipeline_catalog(runtime, device, library, precise_library, antfly_metal_index_q8_0_activation_multiply_reduce_pipeline, antfly_metal_index_add_mul_scalar_pipeline - antfly_metal_index_q8_0_activation_multiply_reduce_pipeline + 1u);
         const BOOL missing_required_pipeline = termite_metal_missing_required_pipeline(runtime);
         BOOL missing_requested_generated_pipeline =
             (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_ATTENTION_1X_GENERATED")) && runtime->attention_1x_generated_pipeline == nil) ||
@@ -33288,7 +33288,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     memset(runtime->last_frame_blit_source_counts, 0, sizeof(runtime->last_frame_blit_source_counts));
     // The runtime is calloc/free storage: ARC does not destroy its strong
     // fields automatically. Retire these optional and shared-library PSOs too.
-    termite_metal_clear_pipeline_catalog(runtime, antfly_metal_clear_index_compressed_attention_store_local_pipeline, antfly_metal_clear_index_rope_broadcast_pipeline - antfly_metal_clear_index_compressed_attention_store_local_pipeline + 1u);
+    termite_metal_clear_pipeline_catalog(runtime, antfly_metal_clear_index_compressed_attention_store_local_pipeline, antfly_metal_clear_index_add_mul_scalar_pipeline - antfly_metal_clear_index_compressed_attention_store_local_pipeline + 1u);
     runtime->precise_library = nil;
     runtime->library = nil;
     runtime->queue = nil;
@@ -58798,7 +58798,7 @@ int antfly_metal_decoder_output_available(termite_metal_decode_runtime *runtime,
         case 2: return runtime->scaled_add_scale_pipeline != nil;
         case 3: return runtime->multiply_add_pipeline != nil;
         case 4: return runtime->multiply_add2_pipeline != nil;
-        case 5: return runtime->add_mul_scalar_pipeline != nil;
+        case 5: return runtime->precise_library_safe && runtime->add_mul_scalar_pipeline != nil;
         default: return 0;
     }
 }

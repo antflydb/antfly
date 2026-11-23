@@ -568,10 +568,25 @@ fn matchAddMulScalar(
     if (!shapesEqual(add_node.output_shape, graph.node(add_node.inputs[0]).output_shape)) return null;
     if (!shapesEqual(add_node.output_shape, graph.node(add_node.inputs[1]).output_shape)) return null;
 
-    const scalar_shape = graph.node(scalar_id).output_shape;
-    if (add_node.output_shape.dtype != .f32 or scalar_shape.dtype != .f32) return null;
-    if (!isScalarLikeShape(scalar_shape)) return null;
-    return .{ .add_lhs = add_node.inputs[0], .add_rhs = add_node.inputs[1], .scalar = scalar_id };
+    const scalar_node = graph.node(scalar_id);
+    var scalar = if (isScalarLikeShape(scalar_node.output_shape))
+        scalar_id
+    else if (scalar_node.op == .broadcast_in_dim and scalar_node.num_inputs == 1 and shapesEqual(scalar_node.output_shape, add_node.output_shape))
+        scalar_node.inputs[0]
+    else
+        return null;
+    // A scalar's singleton reshape does not change the only element consumed
+    // by the fused kernel. ONNX broadcasts commonly introduce such a view.
+    while (scalar != null_node and scalar < graph.nodeCount()) {
+        const source = graph.node(scalar);
+        if (add_node.output_shape.dtype != .f32 or source.output_shape.dtype != .f32 or !isScalarLikeShape(source.output_shape)) return null;
+        if (source.op != .reshape or source.num_inputs != 1) {
+            return .{ .add_lhs = add_node.inputs[0], .add_rhs = add_node.inputs[1], .scalar = scalar };
+        }
+        if (source.inputs[0] >= scalar) return null;
+        scalar = source.inputs[0];
+    }
+    return null;
 }
 
 fn isAddLike(op: OpCode) bool {
@@ -3760,6 +3775,35 @@ test "fuse detects add multiplied by scalar" {
     const out_id = result.graph.outputs.items[0];
     try std.testing.expectEqual(@as(usize, 3), result.graph.node(out_id).num_inputs);
     try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = .{} }, result.graph.node(out_id).op);
+}
+
+test "fuse detects add multiplied by an explicitly broadcast scalar" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const shape = Shape.init(.f32, &.{ 2, 4 });
+    const lhs = try builder.parameter("lhs", shape);
+    const rhs = try builder.parameter("rhs", shape);
+    const scale = try builder.parameter("scale", Shape.init(.f32, &.{1}));
+    const scalar_view = try builder.reshape(scale, Shape.init(.f32, &.{ 1, 1 }));
+    const broadcast = try graph.addNode(.{
+        .op = .{ .broadcast_in_dim = .{
+            .target_shape = shape,
+            .broadcast_axes = .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .num_axes = 2,
+        } },
+        .output_shape = shape,
+        .inputs = .{ scalar_view, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try graph.markOutput(try builder.mul(try builder.add(lhs, rhs), broadcast));
+
+    var result = try fuse(allocator, &graph);
+    defer result.deinit();
+    const output = result.graph.node(result.graph.outputs.items[0]);
+    try std.testing.expectEqualDeep(OpCode{ .fused_add_mul_scalar = .{} }, output.op);
+    try std.testing.expectEqualDeep(Shape.init(.f32, &.{1}), result.graph.node(output.inputs[2]).output_shape);
 }
 
 test "fuse skips add multiplied by non-scalar tensor" {

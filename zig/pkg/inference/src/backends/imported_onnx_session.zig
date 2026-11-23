@@ -7555,7 +7555,7 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar },
         if (consumed) try graph.markOutput(try builder.neg(product));
     } else if (kind == .fused_scalar) {
         const sum = try builder.add(input_node, rhs_node);
-        const scalar = try builder.scalarConst(.f32, 2);
+        const scalar = try builder.parameter("scale", Shape.init(.f32, &.{1}));
         try graph.markOutput(try builder.mul(sum, scalar));
     } else {
         const normalized = try builder.rmsNorm(input_node, rhs_node, 64, 1e-5);
@@ -7586,12 +7586,21 @@ fn qualifyCompleteMetalPrimitive(comptime kind: enum { rms, dot, fused_scalar },
     defer input.deinit();
     var gamma = try Tensor.initFloat32(a, "gamma", rhs_shape, &gains);
     defer gamma.deinit();
-    const inputs = [_]Tensor{ input, gamma };
-    var proof = (try prepared_mod.prepare(session, .{ .tensors = &inputs }, a, null)) orelse return error.MissingPreparedMetalFrame;
+    var scale: ?Tensor = if (kind == .fused_scalar) try Tensor.initFloat32(a, "scale", &.{1}, &.{2}) else null;
+    defer if (scale) |*value| value.deinit();
+    const inputs: []const Tensor = if (scale) |value| &.{ input, gamma, value } else &.{ input, gamma };
+    var proof = (try prepared_mod.prepare(session, .{ .tensors = inputs }, a, null)) orelse return error.MissingPreparedMetalFrame;
     defer proof.deinit();
+    if (kind == .fused_scalar and !proof.hasCompleteOwnedPayload()) {
+        const pool = if (proof.routes) |routes| routes.pool else return error.MissingPreparedKernelRoute;
+        std.debug.print("Metal fused scalar frame unavailable: coverage={any}, owned frame={}\n", .{ pool.payload_coverage, pool.metal_frame_dispatch });
+        for (impl.executable.graph.nodes.items, impl.executable.analysis.reachable, 0..) |node, active, index| {
+            if (active) std.debug.print("Metal fused scalar node {d}: {s} {any}\n", .{ index, @tagName(node.op), node.output_shape });
+        }
+    }
     try std.testing.expectEqual(!consumed, proof.hasCompleteOwnedPayload());
     if (consumed) return;
-    var result = (try session.runResident(&inputs, a)) orelse return error.MissingResidentResult;
+    var result = (try session.runResident(inputs, a)) orelse return error.MissingResidentResult;
     defer result.deinit();
     if (kind == .fused_scalar) {
         for (impl.executable.graph.nodes.items, impl.executable.analysis.reachable) |node, active| {
