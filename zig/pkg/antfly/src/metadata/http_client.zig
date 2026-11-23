@@ -1464,7 +1464,7 @@ pub const MetadataHttpClient = struct {
             // Older peers reject an unknown private Call tag before dispatch.
             // Only this exact response permits the authoritative legacy read;
             // permission, identity and ordinary validation failures stay errors.
-            400 => if ((input == .lake_source_owner_read or input == .policy_definition_read or (input == .resolve_many and input.resolve_many.include_source_epoch)) and std.mem.eql(u8, response.body, "invalid catalog request"))
+            400 => if ((input == .lake_source_owner_read or input == .policy_definition_read or (input == .sql_lock_read and input.sql_lock_read.retired_connection != null) or (input == .resolve_many and input.resolve_many.include_source_epoch)) and std.mem.eql(u8, response.body, "invalid catalog request"))
                 error.UnsupportedOperation
             else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .relational_index_owner_decision or
@@ -6645,10 +6645,24 @@ test "metadata.lake index owner projection read negotiates older peers without w
     client.setting_authority_issuer = "owner-read-issuer";
     const owner: @import("../system_catalog/server_call.zig").Call = .{ .lake_source_owner_read = 4 };
     try std.testing.expectError(error.UnsupportedOperation, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+    const lock_types = @import("../system_catalog/lock_authority.zig");
+    const scope: lock_types.Query = .{
+        .incarnation = @splat(1),
+        .standalone = false,
+        .actor = .{ .session_user = .bootstrap, .credential = "" },
+        .database = 7,
+        .backend = .{ .incarnation = @splat(1), .id = @splat(2), .fence = 1 },
+    };
+    var combined = scope;
+    combined.retired_connection = .{ .id = @splat('a'), .node = 1 };
+    try std.testing.expectError(error.UnsupportedOperation, client.readSystemCatalog("http://metadata.invalid", .{ .sql_lock_read = combined }, 25, null));
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .{ .sql_lock_read = scope }, 25, null));
     try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
     executor.body = "InvalidCatalogName";
+    try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .{ .sql_lock_read = combined }, 25, null));
     try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
     executor.status = 403;
+    try std.testing.expectError(error.Forbidden, client.readSystemCatalog("http://metadata.invalid", .{ .sql_lock_read = combined }, 25, null));
     try std.testing.expectError(error.Forbidden, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
     executor.status = 503;
     executor.body = "NotLeader";

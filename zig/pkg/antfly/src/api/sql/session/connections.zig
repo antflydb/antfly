@@ -21,6 +21,7 @@ const std = @import("std");
 const transactions = @import("../../transactions.zig");
 const record = @import("connection_record.zig");
 const prepared = @import("prepared.zig");
+const RequestAdmission = @import("antfly_local_sources").common_request_admission.RequestAdmission;
 const settings = @import("antfly_local_sources").sql_setting_catalog;
 
 const directory_key = "\x00sql-connection-directory-v1";
@@ -55,7 +56,11 @@ pub fn loadWithCommand(store: *transactions.DurableSessionStore, alloc: std.mem.
 /// beginning ID has never escaped in an HTTP response. Retire an existing
 /// unexecuted session and its beginning fence in one transaction. An uncertain commit remains fenced until a terminal
 /// decision is visible; a missing record is never interpreted as an abort.
-pub fn loadReconciled(
+pub fn loadReconciled(store: *transactions.DurableSessionStore, registry: *transactions.SessionRegistry, alloc: std.mem.Allocator, id: [32]u8, principal: []const u8, owner_node_id: u64, now_ms: u64) !Owned {
+    return loadReconciledWithAdmission(store, registry, alloc, id, principal, owner_node_id, now_ms, null, .reconcile);
+}
+
+pub fn loadReconciledWithAdmission(
     store: *transactions.DurableSessionStore,
     registry: *transactions.SessionRegistry,
     alloc: std.mem.Allocator,
@@ -63,9 +68,26 @@ pub fn loadReconciled(
     principal: []const u8,
     owner_node_id: u64,
     now_ms: u64,
+    admission: ?*RequestAdmission,
+    mode: enum { reconcile, idle_only },
 ) !Owned {
     var owned = try load(store, alloc, id, principal, owner_node_id, now_ms);
     errdefer owned.deinit();
+    if (owned.value.state == .idle) return owned;
+    if (mode == .idle_only) return error.SqlSessionExecutionBudgetUnsupported;
+    var lease: ?RequestAdmission.Lease = null;
+    defer if (lease) |*held| held.release();
+    if (admission) |capacity| {
+        const lifecycle = store.probeConnectionLifecycle(owned.value.active_txn orelse return owned) catch |err| switch (err) {
+            error.Unsupported => null,
+            else => return err,
+        };
+        if (lifecycle) |state| {
+            if (!std.meta.eql(state.connection_id, @as(?[32]u8, id))) return error.InvalidSqlConnection;
+            if (owned.value.state != .beginning and !state.terminal) return owned;
+        }
+        lease = capacity.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+    }
     if (!try reconcile(store, registry, owned.value, now_ms, null)) return owned;
     const result = try load(store, alloc, id, principal, owner_node_id, now_ms);
     owned.deinit();
@@ -357,6 +379,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
         defer alloc.free(encoded);
         try txn.put(directory_key, encoded);
         try record.putTxn(txn, alloc, value);
+        try @import("../execution/resource_routing.zig").putOwnership(txn, .connection, &value.id, value.owner_node_id);
         return 0;
     }
     const id: [32]u8 = switch (action) {
@@ -477,6 +500,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
                 const connection_key = try record.key(&id);
                 try @import("command_producer.zig").forgetRetiredTxn(alloc, txn, id);
                 try txn.delete(&connection_key);
+                try @import("../execution/resource_routing.zig").deleteOwnership(txn, .connection, &id);
                 try removeDirectoryEntry(txn, alloc, id, if (action == .expire) action.expire.cutoff_ms else null);
             }
             break :blk removed;
@@ -648,7 +672,14 @@ test "HTTP connection recovers a durable pre-response BEGIN fence without an esc
     try std.testing.expectEqual(record.State.beginning, fenced.value.state);
     try std.testing.expectError(error.SqlConnectionBusy, mutate(&store, .{ .discard = id }, "alice", 7, 2));
     _ = try registry.beginForPrincipalWithSettingsAndId(alloc, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice", &.{}, id, txn_id);
-    var recovered = try loadReconciled(&store, &registry, std.heap.page_allocator, id, "alice", 7, 2);
+    try std.testing.expectError(error.SqlSessionExecutionBudgetUnsupported, loadReconciledWithAdmission(&store, &registry, alloc, id, "alice", 7, 2, null, .idle_only));
+    {
+        var pending = try load(&store, alloc, id, "alice", 7, 2);
+        defer pending.deinit();
+        try std.testing.expectEqual(record.State.beginning, pending.value.state);
+        try std.testing.expect(try registry.hasSession(alloc, txn_id));
+    }
+    var recovered = try loadReconciledWithAdmission(&store, &registry, std.heap.page_allocator, id, "alice", 7, 2, null, .reconcile);
     defer recovered.deinit();
     try std.testing.expectEqual(record.State.idle, recovered.value.state);
     try std.testing.expect(recovered.value.active_txn == null);
@@ -884,7 +915,13 @@ test "HTTP connection reconciles a durable aborted coordinator decision" {
     const status_json = try std.json.Stringify.valueAlloc(response_alloc, status, .{});
     const generated_status = try std.json.parseFromSlice(metadata_openapi.TransactionSessionStatus, response_alloc, status_json, .{});
     try std.testing.expectEqualStrings("aborted", generated_status.value.disposition);
-    var reconciled = try loadReconciled(&store, &registry, alloc, id, "alice", 7, 2);
+    var admission = RequestAdmission.init(1);
+    {
+        var held = admission.tryAcquireLease().?;
+        defer held.release();
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, loadReconciledWithAdmission(&store, &registry, alloc, id, "alice", 7, 2, &admission, .reconcile));
+    }
+    var reconciled = try loadReconciledWithAdmission(&store, &registry, alloc, id, "alice", 7, 2, &admission, .reconcile);
     defer reconciled.deinit();
     try std.testing.expectEqual(record.State.idle, reconciled.value.state);
     _ = try registry.cleanupExpired(alloc, std.math.maxInt(u64));

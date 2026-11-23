@@ -282,9 +282,9 @@ class ParityInventoryTest(unittest.TestCase):
             case for case in inventory["entries"] if case["family"] != "read"
         )
         ledger = copy.deepcopy(self.ledger)
-        next(entry for entry in ledger["entries"] if entry["id"] == outside_family["id"])[
-            "status"
-        ] = "unresolved"
+        next(
+            entry for entry in ledger["entries"] if entry["id"] == outside_family["id"]
+        )["status"] = "unresolved"
         read_bytes = Path.read_bytes
 
         def read_fixture(path):

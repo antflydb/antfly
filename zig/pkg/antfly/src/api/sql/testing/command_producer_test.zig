@@ -50,6 +50,8 @@ const Native = struct {
     calls: usize = 0,
     outcome_reads: usize = 0,
     scope_reads: usize = 0,
+    reject_retired_connection: bool = false,
+    topology_version: u16 = protocol.current_version,
     failure: ?enum { admit, prepare, commit, handoff, ack, cancel } = null,
     fail_before: bool = false,
     block_ack: bool = false,
@@ -112,6 +114,7 @@ const Native = struct {
             },
             .sql_lock_read => |query| blk: {
                 self.scope_reads += 1;
+                if (self.reject_retired_connection and query.retired_connection != null) return error.UnsupportedOperation;
                 break :blk self.metadata.sqlLockRead(alloc, group, query, .{ .setting_admin = true });
             },
             .sql_lock_outcome => |request| blk: {
@@ -182,7 +185,7 @@ fn setup(metadata: *storage.RaftApplyStore, source: *transactions.DurableSession
     native.standalone = standalone;
     try metadata.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
     if (standalone) try metadata.replaceStandaloneCatalog(group, try metadata.standaloneRevision(), &.{}, &.{}, "{\"epoch\":1,\"tables\":[],\"ranges\":[]}");
-    const activation = try std.json.Stringify.valueAlloc(a, protocol.Activation{ .version = protocol.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    const activation = try std.json.Stringify.valueAlloc(a, protocol.Activation{ .version = native.topology_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
     defer a.free(activation);
     try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
     const node: u64 = if (standalone) 0 else 9;
@@ -672,6 +675,9 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                         native.connection_expiry_ms = 3600001;
                         native.database = "default";
                     }
+                    // Ordinary scoped commits also complete while the newer
+                    // supersession decoder is available but inactive.
+                    if (fault == null) native.topology_version = protocol.sql_idle_session_reenrollment_version - 1;
                     try setup(&metadata, &durable, true, &native);
                     try native.until(&durable, .idle, 2);
                     const ticket = try begin(&native, &durable, 60);
@@ -731,17 +737,38 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                             .runtime = ingress.runtime(),
                         };
                         try controller.enroll(a, "default");
+                        var command = try controller.take(a, @splat(42));
+
                         var successor = (try producer.load(&durable, a, connection)).?;
                         defer successor.deinit();
+                        try native.submit(successor.value, .{ .effect = .{ .command = command.ticket.command, .effect = .{
+                            .backend = command.fence.backend,
+                            .sequence = 1,
+                            .nonce = native.nonce(),
+                            .action = .{ .try_acquire = .{ .resource = @splat(7), .mode = .{ .advisory = .exclusive }, .scope = .session } },
+                        } } });
                         var before_ack = try native.port().snapshot(a, successor.value);
                         defer before_ack.deinit();
+                        try std.testing.expectEqual(@as(u32, 1), before_ack.value.owner.?.resources);
                         var seal = try std.json.parseFromSlice(transactions.ExternalPreparationSeal, a, bytes.external_preparation.?, .{});
                         defer seal.deinit();
+                        // An old receiver can still serve the plain read, but
+                        // absence without a supersession proof must retain the receipt.
+                        native.reject_retired_connection = true;
+                        const legacy_reads = native.scope_reads;
+                        try std.testing.expectError(error.InvalidSqlBackendResponse, owner.acknowledgeReceipt(region.allocator(), seal.value.identity));
+                        try std.testing.expectEqual(legacy_reads + 2, native.scope_reads);
+                        const legacy_cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
+                        try std.testing.expectEqual(@as(usize, 1), legacy_cut.receipts.len);
+                        native.reject_retired_connection = false;
+                        const reads_before = native.scope_reads;
                         try owner.acknowledgeReceipt(region.allocator(), seal.value.identity);
+                        try std.testing.expectEqual(reads_before + 1, native.scope_reads);
                         var after_ack = try native.port().snapshot(a, successor.value);
                         defer after_ack.deinit();
                         try std.testing.expectEqualDeep(before_ack.value.scope, after_ack.value.scope);
                         try std.testing.expectEqualDeep(before_ack.value.owner, after_ack.value.owner);
+                        try command.finish(a);
                         cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
                         try std.testing.expectEqual(@as(usize, 0), cut.receipts.len);
                     }
@@ -2757,7 +2784,7 @@ test "SQL command producer native autocommit advisory reads lazily decide and re
         var catalog_ready = false;
         while (@import("antfly_platform").time.monotonicNs() < bootstrap_deadline) {
             catalog_bootstrap.next_round_at_ns = 0;
-            _ = try catalog_bootstrap.step(&metadata, a, group, @splat('1'), 0, @import("antfly_platform").time.monotonicNs(), .background);
+            _ = try catalog_bootstrap.step(&metadata, a, group, @splat('1'), 0, @import("antfly_platform").time.monotonicNs(), .startup);
             const work = try metadata.relationReconciliationWork(group);
             if (work.current) |state| if (state.phase == .ready and state.coverage == .constraint_names and work.root != null and work.root.?.eql(local.system_catalog_relation_reconciliation.Generation.of(&state))) {
                 catalog_ready = true;
@@ -3385,6 +3412,16 @@ test "SQL command producer native population read cancellation retains the paren
                 var pending = (try durable.load(transaction_id)).?;
                 defer pending.deinit(a);
                 try std.testing.expect(pending.external_preparation != null and !pending.terminal_abort and !pending.external_receipt_acknowledged);
+                var previous = (try producer.load(&durable, a, connection)).?;
+                defer previous.deinit();
+                var replacement = previous.value.registration;
+                replacement.replaces = replacement.lease.backend;
+                replacement.lease.backend.fence += 1;
+                replacement.nonce = native.nonce();
+                try std.testing.expectError(error.SqlConnectionAlreadyExists, producer.create(&durable, "alice", replacement, actor, id(992), try native.head(), native.nonce(), 2, previous.value.revision));
+                var original = try native.port().snapshot(a, previous.value);
+                defer original.deinit();
+                try std.testing.expectEqual(transaction_id, original.value.scope.?.transaction.?.id);
                 canceled.store(false, .release);
                 native.block_cancel = false;
                 native.cancel_on_block = null;
