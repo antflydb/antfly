@@ -100,6 +100,21 @@ pub fn lookupSnapshotRows(
     context: operation.RequestContext,
     options: configured.BindingObjectStoreOpenOptions,
 ) !?[]?std.json.Value {
+    return (try lookupDynamicRows(a, table, snapshot_id, metadata, keys, requested, keys_only, context, options)) orelse
+        try lookupTypedRows(a, table, snapshot_id, metadata, keys, requested, keys_only, context, options);
+}
+
+fn lookupDynamicRows(
+    a: std.mem.Allocator,
+    table: catalog.Table,
+    snapshot_id: i64,
+    metadata: @FieldType(configured.BindingObjectStoreOpenOptions, "retained_catalog_metadata"),
+    keys: []const []const u8,
+    requested: []const LookupKey,
+    keys_only: bool,
+    context: operation.RequestContext,
+    options: configured.BindingObjectStoreOpenOptions,
+) !?[]?std.json.Value {
     const sources = @import("antfly_local_sources");
     const Datum = sources.sql_scalar.Datum;
     const dynamic = sources.sql_dynamic_filter;
@@ -164,4 +179,98 @@ pub fn lookupSnapshotRows(
         if (page.after == null) break;
     }
     return result;
+}
+
+// Resolve typed SQL equality in one pinned scan. Each key column contributes
+// a conservative range, while tuple hashing and equality reject cross-key matches.
+fn lookupTypedRows(
+    a: std.mem.Allocator,
+    table: catalog.Table,
+    snapshot_id: i64,
+    metadata: @FieldType(configured.BindingObjectStoreOpenOptions, "retained_catalog_metadata"),
+    keys: []const []const u8,
+    requested: []const LookupKey,
+    keys_only: bool,
+    context: operation.RequestContext,
+    options: configured.BindingObjectStoreOpenOptions,
+) ![]?std.json.Value {
+    const sources = @import("antfly_local_sources");
+    const scalar = sources.sql_scalar;
+    const values = sources.sql_lake_values;
+    const hashKey = sources.sql_operators.HashJoin.keyHash;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const columns = try scratch.alloc(catalog.Column, keys.len);
+    const ranges = try scratch.alloc(catalog.Condition, keys.len * 2);
+    const entries = try scratch.alloc([]scalar.Datum, requested.len);
+    const links = try scratch.alloc(?usize, requested.len);
+    var heads: std.AutoHashMap(u64, usize) = .init(scratch);
+    for (keys, columns) |key, *column| column.* = try table.column(key);
+    for (requested, entries, links, 0..) |item, *entry, *link, index| {
+        if (item.row != .object) return error.InvalidLakeKey;
+        entry.* = try scratch.alloc(scalar.Datum, keys.len);
+        for (columns, entry.*, 0..) |column, *datum, col| {
+            const raw = item.row.object.get(column.name) orelse return error.InvalidLakeKey;
+            if (raw == .null) return error.InvalidLakeKey;
+            const value = try values.conditionValue(scratch, raw, column);
+            datum.* = try values.comparisonDatum(scratch, scalar.Datum.fromJson(value), column);
+            const lower = &ranges[col * 2];
+            const upper = &ranges[col * 2 + 1];
+            if (index == 0 or try scalar.compareDatums(datum.*, lower.operand.?) == .lt)
+                lower.* = .{ .column = column.name, .op = .gte, .value = raw, .operand = datum.* };
+            if (index == 0 or try scalar.compareDatums(datum.*, upper.operand.?) == .gt)
+                upper.* = .{ .column = column.name, .op = .lte, .value = raw, .operand = datum.* };
+        }
+        const hash = (try hashKey(entry.*)) orelse return error.InvalidLakeKey;
+        const bucket = try heads.getOrPut(hash);
+        link.* = if (bucket.found_existing) bucket.value_ptr.* else null;
+        bucket.value_ptr.* = index;
+    }
+    const result = try a.alloc(?std.json.Value, requested.len);
+    @memset(result, null);
+    if (requested.len == 0) return result;
+    const fields = if (keys_only) keys else all: {
+        const names = try scratch.alloc([]const u8, table.columns.len);
+        for (table.columns, names) |column, *name| name.* = column.name;
+        break :all names;
+    };
+    const cursor = try openSnapshot(scratch, table, snapshot_id, metadata, .{ .fields = fields, .conditions = ranges, .limit = 4 }, context, options);
+    defer cursor.close(cursor.ptr);
+    var row_arena = std.heap.ArenaAllocator.init(a);
+    defer row_arena.deinit();
+    const tuple = try scratch.alloc(scalar.Datum, keys.len);
+    const json = @import("../metadata/changefeed_json.zig");
+    var retained_bytes: u64 = 0;
+    while (true) {
+        try context.ensureActive();
+        const page = try cursor.next(cursor.ptr, a, 4);
+        defer page.deinit();
+        for (page.rows) |row| {
+            _ = row_arena.reset(.retain_capacity);
+            const row_alloc = row_arena.allocator();
+            for (columns, tuple) |column, *datum| {
+                const cell = try row.cell(column.name);
+                datum.* = try values.storedComparisonDatum(row_alloc, .{ .value = cell.value, .sql_null = cell.sql_null }, column);
+            }
+            const hash = (try hashKey(tuple)) orelse continue;
+            var candidate = heads.get(hash);
+            var image: ?std.json.Value = null;
+            while (candidate) |index| : (candidate = links[index]) {
+                for (tuple, entries[index]) |left, right| {
+                    if (try scalar.compareDatums(left, right) != .eq) break;
+                } else {
+                    if (result[index] != null) return error.InvalidLakeKey;
+                    if (image == null) {
+                        retained_bytes +|= try json.size(row.value);
+                        if (retained_bytes > @import("../metadata/changefeed_delivery.zig").max_page_bytes)
+                            return error.IcebergChangefeedImageBudgetExceeded;
+                        image = try sources.api_json_helpers.cloneJsonValue(a, row.value);
+                    }
+                    result[index] = image;
+                }
+            }
+        }
+        if (page.after == null) return result;
+    }
 }
