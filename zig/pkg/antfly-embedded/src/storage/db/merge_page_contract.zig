@@ -18,7 +18,7 @@
 //! opt into this protocol. Live DB snapshots are not an acceptable fallback.
 const std = @import("std");
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
-const Attempt = @import("relational_integrity_handoff_contract.zig").MergeCopyAttempt;
+const Attempt = @import("relational/integrity/handoff_contract.zig").MergeCopyAttempt;
 
 pub const key = "\x00\x00__metadata__:raftmerge:page";
 pub const max_rows = 128;
@@ -108,7 +108,7 @@ pub const Source = struct {
     provenance_required: bool = false,
 
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
-        try @import("relational_integrity_json.zig").write(self, stream);
+        try @import("relational/integrity/json.zig").write(self, stream);
     }
 
     pub fn eql(a: Source, b: Source) bool {
@@ -211,7 +211,7 @@ pub const Progress = struct {
     provenance_pending: bool = false,
 
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
-        try @import("relational_integrity_json.zig").write(self, stream);
+        try @import("relational/integrity/json.zig").write(self, stream);
     }
     pub fn matches(self: Progress, context: anytype) bool {
         return self.transition_id == context.transition_id and self.donor_group_id == context.donor_group_id and
@@ -578,7 +578,7 @@ pub fn validateRequest(request: anytype) !void {
     // their storage keys. The receipt still verifies the exact prior cursor
     // and strictly advancing object position.
     if (command.phase == .tail or (command.phase == .artifacts and command.next_snapshot_position != null)) previous = "";
-    const integrity_contract = @import("relational_integrity_contract.zig");
+    const integrity_contract = @import("relational/integrity/contract.zig");
     for (command.integrity) |effect| {
         try ordered(&previous, effect.key);
         _ = integrity_contract.parseKey(effect.key) catch return error.InvalidMergePage;
@@ -689,7 +689,7 @@ pub fn validateRange(alloc: std.mem.Allocator, state: anytype, request: anytype)
         if (!merged.contains(owner) or state.receiver_base_range.contains(owner)) return error.KeyOutOfRange;
     }
     for (request.merge_page.?.integrity) |effect| {
-        const parsed = try @import("relational_integrity_contract.zig").parseKey(effect.key);
+        const parsed = try @import("relational/integrity/contract.zig").parseKey(effect.key);
         if (!merged.contains(&parsed.address.routing) or state.receiver_base_range.contains(&parsed.address.routing)) return error.KeyOutOfRange;
     }
     for (request.merge_page.?.artifact_effects) |effect| {

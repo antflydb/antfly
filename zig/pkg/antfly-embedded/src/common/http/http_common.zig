@@ -40,6 +40,7 @@ pub const Method = enum {
     POST,
     PUT,
     DELETE,
+    PATCH,
 };
 
 /// Listener-owned signal that remains valid for the lifetime of one request.

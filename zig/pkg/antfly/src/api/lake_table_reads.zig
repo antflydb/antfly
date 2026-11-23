@@ -16,7 +16,7 @@
 //! Public typed rows share SQL's authorized external binding and cursor.
 const std = @import("std");
 const catalog = @import("antfly_local_sources").sql_catalog;
-const Adapter = @import("sql_execution.zig").Adapter;
+const Adapter = @import("sql/execution/execution.zig").Adapter;
 const helpers = @import("http_route_helpers.zig");
 
 pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("antfly_local_sources").system_catalog_domain.Target, expected_id: u64, request: helpers.OwnedScanKeysRequest) !?[]u8 {

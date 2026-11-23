@@ -189,6 +189,20 @@ pub const Primary = struct {
         shard_id: u64,
         table_id: u64,
     ) !?u64 {
+        return self.findMatchingRecordFromWithCodec(from_lsn, kind, null, payload, shard_id, table_id);
+    }
+
+    /// Distinct codecs may share a metadata kind; identical payload bytes
+    /// alone cannot certify that an earlier record is replayable as intended.
+    pub fn findMatchingRecordFromWithCodec(
+        self: *Primary,
+        from_lsn: u64,
+        kind: replication_record.RecordKind,
+        codec: ?replication_record.PayloadCodec,
+        payload: []const u8,
+        shard_id: u64,
+        table_id: u64,
+    ) !?u64 {
         if (from_lsn == 0) return null;
         const last = self.lastLsn();
         if (from_lsn > last) return null;
@@ -196,7 +210,7 @@ pub const Primary = struct {
         while (true) {
             var entry = (try self.log.entryAt(self.alloc, lsn)) orelse return error.WalNoLongerRetained;
             defer entry.deinit(self.alloc);
-            if (entry.record.kind == kind and
+            if (entry.record.kind == kind and (codec == null or entry.record.payload_codec == codec.?) and
                 entry.record.shard_id == shard_id and
                 entry.record.table_id == table_id and
                 std.mem.eql(u8, entry.record.payload, payload))

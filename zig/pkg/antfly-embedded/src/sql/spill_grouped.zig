@@ -207,6 +207,7 @@ pub const Grouped = struct {
             try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), entry.row.row.values[0] }, .ordinal = ordinal });
         }
         if (state.kind == .pattern_set and state.patterns.?.has_null) try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
+        if (state.collection) |collection| if (collection.has_null) try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
     }
     /// Sparse checkpoints keep slot ownership through spill instead of
     /// allocating/encoding empty states for every other aggregate column.
@@ -474,14 +475,12 @@ pub const Grouped = struct {
             const index = self.partition_index;
             self.partition_index += 1;
             if (self.partitions[index] == null and self.partition_inputs[index].items.len == 0) continue;
-            var retained = self.bytes / 2;
-            for (self.specs) |spec| if (spec.input_element == .numeric) {
-                // Exact finalization can own a coefficient, a rendered result
-                // and downstream sort payload simultaneously. Reserve shared
-                // headroom for delivery before retaining this hash partition.
-                if (@import("memory_budget.zig").headroom(self.a)) |available| retained = @min(retained, available / 4);
-                break;
-            };
+            // Partition reduction, spill handoff and downstream delivery
+            // all charge the same statement budget. Admit hash state against
+            // live headroom even for fixed-width reducers nested in a plan.
+            const workspace = self.bytes / 2;
+            const available = @import("memory_budget.zig").headroom(self.a) orelse self.bytes *| 2;
+            const retained = @min(workspace, available / 4);
             self.local = try operators.Grouped.create(self.a, self.specs, .{ .bytes = retained, .groups = std.math.maxInt(usize) });
             if (self.partitions[index]) |*file| {
                 try self.loadFile(file, 0);
@@ -782,6 +781,10 @@ pub const Grouped = struct {
                             try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .values = &.{.{}}, .ordinal = distinct_ordinal });
                             distinct_ordinal += 1;
                         };
+                        if (incoming.collection) |collection| if (collection.has_null) {
+                            try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .values = &.{.{}}, .ordinal = distinct_ordinal });
+                            distinct_ordinal += 1;
+                        };
                     } else try @import("aggregate_partial.zig").merge(state, incoming);
                 }
             } else {
@@ -790,7 +793,7 @@ pub const Grouped = struct {
                     if (bitmapSpec(spec)) {
                         try self.bitmapValue(&bitmap, states, slot, input, &bitmap_ordinal, exact);
                     } else if (spec.distinct) {
-                        if (!input.sql_null or spec.kind == .pattern_set) {
+                        if (!input.sql_null or spec.kind == .pattern_set or spec.kind == .array_agg) {
                             try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), input }, .values = &.{input}, .ordinal = distinct_ordinal });
                             distinct_ordinal += 1;
                         }
@@ -850,7 +853,7 @@ pub const Grouped = struct {
         for (keys, output_keys) |key, *copy| copy.* = try operators.cloneDatum(out, key);
         const aggregates = if (exact) try @import("aggregate_partial.zig").encode(out, states) else try out.alloc(Datum, states.len);
         if (!exact) for (states, @constCast(aggregates), pattern_sets) |*state, *copy, set| {
-            copy.* = if (set) |patterns| .{ .patterns = &patterns.interface, .sql_null = false } else try operators.cloneDatum(out, try state.finish());
+            copy.* = if (set) |patterns| Datum.fromParts(.null, false, &patterns.interface) else if (state.kind == .array_agg or operators.Aggregate.integerNumericOutput(state.kind, state.input_type, state.input_element)) try state.finishOutput(out) else try operators.cloneDatum(out, try state.finish());
         };
         self.output_count += 1;
         return .{ .keys = output_keys, .aggregates = aggregates, .ordinal = ordinal };
@@ -1150,7 +1153,7 @@ test "SQL exact NUMERIC raw and checkpoint blocks reduce typed columns" {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const pa = arena.allocator();
-        var work: @import("array_value.zig").Budget = .{};
+        var work: @import("array/value.zig").Budget = .{};
         const input = try scalar.numericTextLeaky(pa, "1.25", &work);
         var states: [2]operators.Aggregate = undefined;
         for (&states, specs) |*state, spec| state.* = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);

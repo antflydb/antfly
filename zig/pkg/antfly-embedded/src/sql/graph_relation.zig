@@ -157,7 +157,7 @@ fn graphComparison(a: A, binding: Binding, original: cypher.ast.Projection, cond
     const kind = expressionType(binding, item.expression);
     if (kind != .integer and kind != .number and kind != .string and kind != .boolean) return null;
     const datum = condition.datum();
-    if (datum.numeric != null or datum.array != null or datum.patterns != null) return null;
+    if (datum.numeric != null or datum.array != null or datum.extension_kind != .none) return null;
     const predicate = try a.create(cypher.ast.Expr);
     const span = item.expression.span;
     if (condition.op == .is_null or condition.op == .is_not_null) {

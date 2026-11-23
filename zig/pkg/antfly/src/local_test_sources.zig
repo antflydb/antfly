@@ -16,7 +16,7 @@
 //! Test-only server fixtures used by local implementation tests.
 pub const api_agent_tools = @import("api/agent_tools.zig");
 pub const api_distributed_graph = @import("api/distributed_graph.zig");
-pub const api_relational_index_status = @import("api/relational_index_status.zig");
+pub const api_relational_index_status = @import("api/relational_index/status.zig");
 pub const api_relational_row_merge = @import("api/relational_row_merge.zig");
 pub const api_table_router = @import("api/table_router.zig");
 pub const api_tables = @import("api/tables.zig");
@@ -31,6 +31,7 @@ pub const raft_transport_http_snapshot = @import("raft/transport/http_snapshot.z
 pub const raft_transport_routes = @import("raft/transport/routes.zig");
 pub const raft_transport_std_http_listener = @import("raft/transport/std_http_listener.zig");
 pub const storage_artifact_publication_dispatch = @import("storage/artifact_publication_dispatch.zig");
+pub const storage_relational_index_raft_apply = @import("storage/relational_index_raft_apply_test.zig");
 pub const storage_hot_standby_db_commit = @import("storage/hot_standby/db_commit.zig");
 pub const storage_hot_standby_effects = @import("storage/hot_standby/effects.zig");
 pub const storage_hot_standby_primary = @import("storage/hot_standby/primary.zig");

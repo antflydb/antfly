@@ -395,23 +395,25 @@ pub const Attribute = struct {
 
     fn attrs(self: Attribute, alloc: std.mem.Allocator) !std.json.ObjectMap {
         const column = self.column;
-        const element: Element = column.element_type orelse switch (column.type) {
-            .integer => .int64,
-            .number => .float64,
-            .boolean => .boolean,
-            .json => .jsonb,
-            .uuid => .uuid,
-            .string, .datetime => .text,
-            .array => return error.InvalidSqlBackendResponse,
+        const wire = @import("../pgwire/backend.zig");
+        const pg_values = @import("../pgwire/values.zig");
+        const descriptor: wire.Column = .{
+            .name = column.name,
+            .type = switch (column.type) {
+                inline else => |kind| @field(wire.Type, @tagName(kind)),
+            },
+            .element_type = column.element_type,
+            .temporal_kind = column.temporal_kind,
+            .numeric_modifier = column.numeric_modifier,
+            .enum_view = column.enum_view,
+            .domain_view = column.domain_view,
         };
-        const oid: u32 = if (column.type == .array) element.arrayOid() else if (column.type == .datetime) 1184 else element.oid();
-        const length: i64 = for (types) |item| {
-            if (item.oid == oid) break item.length;
-        } else return error.InvalidSqlBackendResponse;
-        const modifier: i64 = if (column.numeric_modifier) |m|
-            try m.postgres()
+        const oid = if (column.domain_view) |domain|
+            try pg_values.parameterOid(try local.sql_scalar.domainType(domain))
         else
-            -1;
+            try pg_values.columnOid(descriptor);
+        const length = pg_values.columnTypeSize(descriptor);
+        const modifier = try pg_values.columnModifier(descriptor);
         var values: std.json.ObjectMap = .empty;
         try values.put(alloc, "attrelid", .{ .integer = self.relation });
         try values.put(alloc, "attname", .{ .string = try alloc.dupe(u8, column.name) });

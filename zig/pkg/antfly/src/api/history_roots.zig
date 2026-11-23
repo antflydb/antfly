@@ -458,8 +458,7 @@ pub const Source = struct {
         budget.cancellation = context.cancellation;
         var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
         errdefer session.deinit();
-        var roots: std.ArrayList(Root) = .empty;
-        defer roots.deinit(a);
+        var root_count: usize = 0;
         for (definition.tables) |expected| {
             try budget.checkpoint();
             const index = session.table_id_indexes.get(expected.table_id) orelse return error.ChangefeedResynchronizationRequired;
@@ -470,7 +469,21 @@ pub const Source = struct {
             const view = try session.tableRoutingView(table.name, budget);
             if (!view.covers_keyspace) return error.TopologyChanged;
             const ranges = session.table_range_refs.get(table.table_id) orelse return error.TopologyChanged;
-            if (ranges.ranges.len > control.max_roots - roots.items.len) return error.InvalidChangefeed;
+            if (ranges.ranges.len > control.max_roots - root_count) return error.InvalidChangefeed;
+            root_count += ranges.ranges.len;
+        }
+
+        // The pinned routing cut makes the final size exact. One allocation
+        // owns the result, with no geometric growth or final duplicate copy.
+        const roots = try a.alloc(Root, root_count);
+        errdefer a.free(roots);
+        var offset: usize = 0;
+        for (definition.tables) |expected| {
+            if (expected.contract == .writable_iceberg_rows) continue;
+            const index = session.table_id_indexes.get(expected.table_id).?;
+            const table = session.snapshot.value.tables[index];
+            const view = try session.tableRoutingView(table.name, budget);
+            const ranges = session.table_range_refs.get(table.table_id).?;
             for (ranges.ranges, 0..) |range, ordinal| {
                 try budget.checkpointIndex(ordinal);
                 const shard = tables.rangeDocIdentityShardId(range.*);
@@ -483,7 +496,8 @@ pub const Source = struct {
                 const route: catalog_api.CatalogGroupRoute = .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = shard, .range_id = range_id } };
                 const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = session.snapshot.value.metadata_group_id, .metadata_incarnation = session.snapshot.value.metadata_incarnation, .catalog_revision = session.snapshot.value.catalog_revision, .table_id = table.table_id, .topology_epoch = view.topology_epoch, .route = route };
                 try fence.validate();
-                try roots.append(a, .{ .namespace = namespace, .physical_range_id = range.range_id, .table_name = table.name, .table_binding = expected.binding, .fence = fence });
+                roots[offset] = .{ .namespace = namespace, .physical_range_id = range.range_id, .table_name = table.name, .table_binding = expected.binding, .fence = fence };
+                offset += 1;
             }
         }
         const order = struct {
@@ -495,10 +509,10 @@ pub const Source = struct {
                 };
             }
         }.less;
-        std.mem.sort(Root, roots.items, {}, order);
+        std.mem.sort(Root, roots, {}, order);
         if (mode != .physical) {
             var previous: ?control.Namespace = null;
-            for (roots.items) |*root| {
+            for (roots) |*root| {
                 const namespace = root.namespace;
                 if (previous != null and std.mem.eql(u8, &previous.?, &namespace)) {
                     if (mode == .unique) return error.TopologyChanged;
@@ -507,11 +521,11 @@ pub const Source = struct {
                 }
                 previous = namespace;
             }
-            if (mode == .admission) std.mem.sort(Root, roots.items, {}, order);
+            if (mode == .admission) std.mem.sort(Root, roots, {}, order);
         }
         try budget.checkpoint();
         try context.ensureActive();
-        return .{ .allocator = a, .session = session, .roots = try a.dupe(Root, roots.items) };
+        return .{ .allocator = a, .session = session, .roots = roots };
     }
     pub const RelationalFrameRead = struct {
         root_index: usize,

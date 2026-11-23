@@ -84,6 +84,27 @@ Antfly keeps a last-known-good in-memory snapshot during an invalid or missing
 file reload and exposes stale/reload health without returning values. Updates
 are written atomically and consumers refresh generation-aware credentials.
 
+## SQL preparation authority
+
+SQL preparation and temporary-relation owner grants use the private
+`antfly.sql_preparation.secret` and `antfly.sql_preparation.issuer` pair. Configure
+both values together in a secret source shared by the API and native data
+receivers. These credentials are loaded at startup; restart the affected
+processes after changing them. A partial or invalid pair fails closed.
+
+A normal standalone server with a writable local secret store provisions and
+persists a private SQL authority automatically when no explicit SQL or
+trusted-principal pair is configured. Restart reuses that authority. Read-only
+and hot-standby startup do not generate it, and clustered nodes require
+configured credentials rather than independently generated keys.
+
+The private SQL pair does not enable public authentication or authenticate node
+transport. Existing explicitly configured trusted-principal credentials remain
+a fallback when no dedicated SQL pair is present. Node transport credentials
+cannot substitute for SQL preparation authority. SQL operations that require
+this authority report SQLSTATE `55000` with a configuration hint when it is
+unavailable.
+
 ## Recommended production setup
 
 Mount a secret-store file from the platform secret manager as read-only to the

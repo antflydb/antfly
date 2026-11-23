@@ -1,0 +1,139 @@
+{
+  "postgres_major": 18,
+  "entries": [
+    {
+      "table": "t",
+      "mode": "none",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c69630074006400010169640000000017ffffffff",
+        "49000000644e0001740000000131"
+      ]
+    },
+    {
+      "table": "t",
+      "mode": "stored",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c69630074006400020169640000000017ffffffff00670000000017ffffffff",
+        "49000000644e0002740000000131740000000132"
+      ]
+    },
+    {
+      "table": "t",
+      "mode": "mixed",
+      "change": "insert",
+      "sqlstate": "0A000"
+    },
+    {
+      "table": "ordinary",
+      "mode": "none",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c6963006f7264696e617279006400010169640000000017ffffffff",
+        "49000000644e0001740000000131"
+      ]
+    },
+    {
+      "table": "ordinary",
+      "mode": "stored",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c6963006f7264696e617279006400010169640000000017ffffffff",
+        "49000000644e0001740000000131"
+      ]
+    },
+    {
+      "table": "ordinary",
+      "mode": "mixed",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c6963006f7264696e617279006400010169640000000017ffffffff",
+        "49000000644e0001740000000131"
+      ]
+    },
+    {
+      "table": "onlygen",
+      "mode": "none",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c6963006f6e6c7967656e00640000",
+        "49000000644e0000"
+      ]
+    },
+    {
+      "table": "onlygen",
+      "mode": "stored",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c6963006f6e6c7967656e0064000100670000000017ffffffff",
+        "49000000644e0001740000000131"
+      ]
+    },
+    {
+      "table": "onlygen",
+      "mode": "mixed",
+      "change": "insert",
+      "sqlstate": "0A000"
+    },
+    {
+      "table": "keygen",
+      "mode": "none",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c6963006b657967656e006400010069640000000017ffffffff",
+        "49000000644e0001740000000131"
+      ]
+    },
+    {
+      "table": "keygen",
+      "mode": "stored",
+      "change": "insert",
+      "types": "BRIC",
+      "messages": [
+        "52000000647075626c6963006b657967656e006400020069640000000017ffffffff01670000000017ffffffff",
+        "49000000644e0002740000000131740000000132"
+      ]
+    },
+    {
+      "table": "keygen",
+      "mode": "mixed",
+      "change": "insert",
+      "sqlstate": "0A000"
+    },
+    {
+      "table": "t",
+      "mode": "none",
+      "change": "truncate",
+      "types": "BRTC",
+      "messages": [
+        "52000000647075626c69630074006400010169640000000017ffffffff",
+        "54000000010000000064"
+      ]
+    },
+    {
+      "table": "t",
+      "mode": "stored",
+      "change": "truncate",
+      "types": "BRTC",
+      "messages": [
+        "52000000647075626c69630074006400020169640000000017ffffffff00670000000017ffffffff",
+        "54000000010000000064"
+      ]
+    },
+    {
+      "table": "t",
+      "mode": "mixed",
+      "change": "truncate",
+      "sqlstate": "0A000"
+    }
+  ]
+}

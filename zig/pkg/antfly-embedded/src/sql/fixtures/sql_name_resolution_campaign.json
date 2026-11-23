@@ -1,0 +1,30 @@
+{
+  "format": 1,
+  "entries": [
+    {"id": "sql-1228", "sqlstate": "42703", "missing_column": "amount_sum"},
+    {"id": "sql-1233", "sqlstate": "42703", "missing_column": "quantity_sum"},
+    {"id": "sql-1234", "sqlstate": "42703", "missing_column": "quantity_sum"},
+    {"id": "sql-1235", "sqlstate": "42703", "missing_column": "quantity_sum"},
+    {"id": "sql-1238", "sqlstate": "42703", "missing_column": "quantity_sum"},
+    {"id": "sql-1239", "sqlstate": "42703", "missing_column": "quantity_sum"},
+    {"id": "sql-1333", "sqlstate": "42703", "missing_column": "order_amount"},
+    {"id": "sql-1582", "sqlstate": "42703", "missing_column": "row_count"}
+  ],
+  "document_schema": {
+    "version": 1,
+    "storage_mode": "document",
+    "default_type": "doc",
+    "document_schemas": {
+      "doc": {"schema": {"type": "object", "properties": {"status": {"type": "string"}}, "additionalProperties": false}}
+    }
+  },
+  "document_rows": [
+    {"key": "a", "value": {"status": "active"}},
+    {"key": "b", "value": {"status": "active"}},
+    {"key": "c", "value": {"status": "closed"}}
+  ],
+  "controls": [
+    {"sql": "SELECT -amount AS amount FROM usage_records ORDER BY amount ASC LIMIT 1", "first_integer": "-72"},
+    {"sql": "SELECT -amount AS amount FROM usage_records ORDER BY (amount + 0) ASC LIMIT 1", "first_integer": "0"}
+  ]
+}

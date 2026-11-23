@@ -126,7 +126,7 @@ pub const Command = struct {
         return hash.finalResult();
     }
     pub fn jsonStringify(self: Command, stream: anytype) @TypeOf(stream.*).Error!void {
-        try @import("db/relational_integrity_json.zig").write(self, stream);
+        try @import("db/relational/integrity/json.zig").write(self, stream);
     }
 };
 
@@ -149,7 +149,7 @@ pub fn operationsDigest(request: anytype) Digest {
     stream.beginObject() catch unreachable;
     inline for (.{ "writes", "deletes", "transforms", "graph_writes", "graph_deletes", "predicates", "integrity", "integrity_commands", "relational_activation", "relational_retirement", "relational_index_maintenance", "relational_schema_version", "relational_integrity_generation_set", "restore_staging_scope", "restore_staging_plan_id", "relational_repair", "schema_version", "normalized_graph_rows" }) |name| {
         stream.objectField(name) catch unreachable;
-        @import("db/relational_integrity_json.zig").write(@field(request, name), &stream) catch unreachable;
+        @import("db/relational/integrity/json.zig").write(@field(request, name), &stream) catch unreachable;
     }
     stream.endObject() catch unreachable;
     return output.hash.finalResult();

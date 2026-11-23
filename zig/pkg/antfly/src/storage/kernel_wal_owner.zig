@@ -72,6 +72,14 @@ pub fn close(raw: ?*anyopaque) callconv(.c) void {
     alloc.destroy(handle);
 }
 
+pub fn admitAppendBytes(raw: ?*anyopaque, version: u32, data_len: u64) callconv(.c) abi.Status {
+    if (version != abi.abi_version) return .invalid_abi;
+    const handle = asHandle(raw) orelse return .invalid_argument;
+    const len = std.math.cast(usize, data_len) orelse return .invalid_argument;
+    handle.wal.admitAppendBytes(len) catch |err| return statusFromError(err);
+    return .ok;
+}
+
 pub fn append(
     raw: ?*anyopaque,
     request: *const abi.WalAppendRequest,

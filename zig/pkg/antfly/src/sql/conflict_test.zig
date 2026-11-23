@@ -272,7 +272,7 @@ test "SQL secondary arbiter retains native owner identity and opaque atomic guar
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
         if (std.mem.startsWith(u8, action, "DO UPDATE")) {
-            try std.testing.expectError(error.DuplicateSqlRow, runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+            try std.testing.expectError(error.SqlConflictCardinalityViolation, runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
             try std.testing.expectEqual(@as(usize, 0), fixture.commits);
         } else {
             var result = try runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{});
@@ -621,7 +621,10 @@ test "SQL deferred scalar has no outer-row binding scope" {
     var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=(SELECT excluded.n FROM items)", .{});
     defer compiled.deinit();
     var fixture: Fixture = .{ .guarded = true, .dynamic = true };
-    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+    // This deliberately unsupported outer scope remains fail-closed. An
+    // absent relation qualifier is distinct from a missing column on a
+    // visible relation; this test does not claim PostgreSQL parity for it.
+    try std.testing.expectError(error.UndefinedTable, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
 }
 
 test "SQL uncorrelated deferred scalar is computed once for multiple conflict owners" {
@@ -760,7 +763,13 @@ test "SQL conflict unsupported arbiters and generated assignments fail before re
         var fixture: Fixture = .{};
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(if (index == 1) error.SqlGeneratedColumnWrite else error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+        const expected: anyerror = switch (index) {
+            0 => error.UnsupportedSqlShape,
+            1 => error.SqlGeneratedColumnWrite,
+            2 => error.SqlSystemColumnWrite,
+            else => unreachable,
+        };
+        try std.testing.expectError(expected, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
         try std.testing.expectEqual(@as(usize, 0), fixture.commits);
     }
 }

@@ -32,7 +32,7 @@ fn integerRange(t: scalar.Type) Fact {
 }
 fn datum(value: scalar.Datum) Fact {
     if (value.sql_null) return .{ .safe = true };
-    if (value.numeric != null or value.array != null or value.patterns != null) return .{};
+    if (value.numeric != null or value.array != null or value.extension_kind != .none) return .{};
     return switch (value.value) {
         .integer => |n| .{ .safe = true, .low = n, .high = n },
         .null, .string, .bool => .{ .safe = true },
@@ -164,7 +164,7 @@ pub fn predicate(a: std.mem.Allocator, bound: *const binding.Bound, table: @impo
         if (slot < start) continue;
         if (slot - start >= constants.len) return null;
         const value = constants[slot - start];
-        if (value.numeric != null or value.array != null or value.patterns != null) return null;
+        if (value.numeric != null or value.array != null or value.extension_kind != .none) return null;
         instruction.operation = .{ .literal = if (value.sql_null) .null else value.value };
     };
     var remaining: usize = 1024;

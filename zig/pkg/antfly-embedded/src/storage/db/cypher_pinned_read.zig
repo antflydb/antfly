@@ -27,7 +27,7 @@ const A = std.mem.Allocator;
 pub const Snapshot = struct {
     a: A,
     primary: docstore.DocStore.Txn,
-    indexes: ?@import("relational_index_catalog.zig").WriteSnapshot = null,
+    indexes: ?@import("relational/indexes/catalog.zig").WriteSnapshot = null,
     schema_version: u32,
     population_upper_bound: ?u64 = null,
     byte_range: types.ByteRange,

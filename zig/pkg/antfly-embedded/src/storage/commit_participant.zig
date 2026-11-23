@@ -346,6 +346,8 @@ pub fn WriterViewQueue(comptime ViewType: type) type {
 pub const Participant = struct {
     ptr: *anyopaque,
     queued: ?Queued = null,
+    /// Request a real source position for a control-only commit.
+    stage_control_on_empty: bool = false,
     /// Fallible accounting covers physical mutations, including stamps staged
     /// by the host and private metadata staged by this participant.
     charge: ?*const fn (*anyopaque, []const u8, ?[]const u8) anyerror!void = null,
@@ -428,16 +430,20 @@ pub const List = struct {
     /// every other `Participant` implementation in this tree keeps a
     /// pointer back into its own owning value.
     pub fn participant(self: *List) Participant {
-        for (self.items[0..self.len]) |p| {
-            if (p.queued != null) return .{
-                .ptr = self,
-                .reset = reset,
-                .observe = observe,
-                .stage = stage,
-                .queued = .{ .ptr = self, .validate = validateQueued, .reject = rejectQueued, .complete = completeQueued },
-            };
+        var control = false;
+        var queued = false;
+        for (self.items[0..self.len]) |item| {
+            control = control or item.stage_control_on_empty;
+            queued = queued or item.queued != null;
         }
-        return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+        return .{
+            .ptr = self,
+            .stage_control_on_empty = control,
+            .reset = reset,
+            .observe = observe,
+            .stage = stage,
+            .queued = if (queued) .{ .ptr = self, .validate = validateQueued, .reject = rejectQueued, .complete = completeQueued } else null,
+        };
     }
 };
 

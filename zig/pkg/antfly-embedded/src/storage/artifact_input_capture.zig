@@ -231,6 +231,36 @@ pub const Capture = struct {
             while (affected.next()) |document| try guard.check(txn, document.*);
         }
         if (self.documents.count() == 0 and self.artifacts.count() == 0) {
+            if (self.participant) |participant| {
+                if (participant.stage_control_on_empty) {
+                    // Terminal metadata is a real owner effect. Reuse a source cut
+                    // already advanced by this accepting transaction, otherwise issue
+                    // exactly one native control cut here before durable commit.
+                    errdefer self.poisoned = true;
+                    const owner = (try authority.load(txn)) orelse return error.OnlineSourceScopeChanged;
+                    self.staging = true;
+                    defer self.staging = false;
+                    const position: publication.Position = switch (owner.kind) {
+                        .raft => ordered: {
+                            const marker = self.raft_marker orelse return error.RetainedEffectsFenceMismatch;
+                            const actual: publication.Position = .{ .raft = .{ .term = std.mem.readInt(u64, marker[0..8], .little), .index = std.mem.readInt(u64, marker[8..16], .little) } };
+                            try actual.validate();
+                            break :ordered actual;
+                        },
+                        .native => native: {
+                            if (self.raft_marker != null) return error.OnlineSourceScopeChanged;
+                            const sequence = if (retained_advanced or self.native_position != null) owner.sequence else try authority.advance(txn, owner.namespace, null);
+                            if (self.native_position) |observed| if (observed != sequence) return error.OnlineSourceScopeChanged;
+                            break :native .{ .native = .{ .namespace = publication.namespaceFromBytes(owner.namespace), .sequence = sequence } };
+                        },
+                    };
+                    const encoded = try position.encode();
+                    var view_txn = txn;
+                    try participant.stage(participant.ptr, @import("commit_participant.zig").View.from(&view_txn), &encoded);
+                    self.staged = true;
+                    return;
+                }
+            }
             // Nothing for this capture's OWN bookkeeping to do: no document
             // or artifact revision was touched in this transaction, which
             // is the ordinary case for every write with no active

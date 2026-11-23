@@ -113,7 +113,7 @@ pub const Request = struct {
         }
     }
     pub fn jsonStringify(self: Request, stream: anytype) !void {
-        try @import("relational_integrity_json.zig").write(self, stream);
+        try @import("relational/integrity/json.zig").write(self, stream);
     }
 };
 
@@ -158,7 +158,7 @@ pub const SourceStatus = struct {
     retained_head: u64,
     retained_reclaimed: u64 = 0,
     retained_reclaimable: u64 = 0,
-    fence: ?@import("relational_integrity_topology_contract.zig").Fence,
+    fence: ?@import("relational/integrity/topology_contract.zig").Fence,
     next_epoch: u64,
     drained: bool,
     /// REF3 captures rows/timestamps/integrity, not independently authored

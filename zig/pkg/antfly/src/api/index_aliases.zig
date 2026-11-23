@@ -47,7 +47,7 @@ pub fn executeObserved(server: anytype, a: A, table: []const u8, name: []const u
         return response;
     }
     if (comptime @hasDecl(@TypeOf(server.*), "ensureIndexAliasAdmission")) try server.ensureIndexAliasAdmission(context);
-    const relational = @import("relational_index_mutation.zig");
+    const relational = @import("relational_index/mutation.zig");
     if (try relational.contains(scratch, before.schema_json, name)) return error.IndexAliasNameConflict;
     if (try relational.contains(scratch, before.schema_json, request.index)) return error.UnsupportedOperation;
     var readiness: std.json.Value = .null;

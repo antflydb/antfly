@@ -1,0 +1,52 @@
+{
+  "format": 1,
+  "cases": [
+    {
+      "id": "sql-0072",
+      "sql": "VACUUM usage_records",
+      "command_tag": "VACUUM"
+    },
+    {
+      "id": "sql-0073",
+      "sql": "VACUUM (FULL, VERBOSE, ANALYZE) usage_records",
+      "command_tag": "VACUUM"
+    },
+    {
+      "id": "sql-0074",
+      "sql": "ANALYZE usage_records",
+      "command_tag": "ANALYZE"
+    },
+    {
+      "id": "sql-0075",
+      "sql": "ANALYZE VERBOSE usage_records (status, amount)",
+      "command_tag": "ANALYZE"
+    },
+    {
+      "id": "sql-0076",
+      "sql": "REINDEX TABLE usage_records",
+      "command_tag": "REINDEX"
+    },
+    {
+      "id": "sql-0077",
+      "sql": "REINDEX INDEX CONCURRENTLY usage_records_status_idx",
+      "command_tag": "REINDEX"
+    }
+  ],
+  "rows": [
+    [
+      1,
+      "pending",
+      10
+    ],
+    [
+      2,
+      "done",
+      20
+    ],
+    [
+      3,
+      null,
+      30
+    ]
+  ]
+}
