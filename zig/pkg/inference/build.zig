@@ -2078,43 +2078,9 @@ pub fn build(b: *std.Build) void {
 
     const wasm_compute_tests = b.addTest(.{
         .name = "wasm-compute-tests",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/inference.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = tests.root_module,
         .filters = &.{"wasm_compute:"},
     });
-    wasm_compute_tests.root_module.addImport("antfly_document_runs", runtime_graph.document_runs_mod);
-    wasm_compute_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
-    wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
-    wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);
-    wasm_compute_tests.root_module.addImport("inference_audio", inference_audio_mod);
-    wasm_compute_tests.root_module.addImport("inference_chunker", inference_chunker_mod);
-    wasm_compute_tests.root_module.addImport("jinja", jinja_mod);
-    wasm_compute_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
-    wasm_compute_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
-    wasm_compute_tests.root_module.addImport("inference_linalg", inference_linalg_mod);
-    wasm_compute_tests.root_module.addImport("antfly_tile", runtime_graph.tile_mod);
-    wasm_compute_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
-    wasm_compute_tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
-    wasm_compute_tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
-    wasm_compute_tests.root_module.addImport("antfly_image", antfly_image_mod);
-    wasm_compute_tests.root_module.addImport("ml", ml_mod);
-    wasm_compute_tests.root_module.addImport("onnx_graph", onnx.graph);
-    wasm_compute_tests.root_module.addImport("onnx_data", onnx.data);
-    wasm_compute_tests.root_module.addImport("pjrt", runtime_graph.qualification_pjrt_mod);
-    wasm_compute_tests.root_module.addImport("prometheus", prometheus_mod);
-    wasm_compute_tests.root_module.addImport("structlog", structlog_mod);
-    wasm_compute_tests.root_module.addImport("antfly_reader_config", reader_config_mod);
-    if (client_mod) |mod| {
-        wasm_compute_tests.root_module.addImport("inference_client", mod);
-    }
-    if (enable_system_blas) {
-        configureSystemBlas(b, wasm_compute_tests.root_module, target, blas_root);
-    }
-    configureMetal(b, wasm_compute_tests.root_module, target, enable_metal);
-    wasm_compute_tests.root_module.link_libc = true;
     const run_wasm_compute_tests = b.addRunArtifact(wasm_compute_tests);
     const test_wasm_compute_step = b.step("test-wasm-compute", "Run focused WasmCompute backend tests");
     test_wasm_compute_step.dependOn(&run_wasm_compute_tests.step);
