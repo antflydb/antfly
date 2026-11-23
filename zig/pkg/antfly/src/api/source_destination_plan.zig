@@ -296,7 +296,9 @@ test "completion frozen plan source destination manifest owns exact admission an
         index: u64 = 8,
         mutations: usize = 0,
         chunk_reads: usize = 0,
-        lose_seal: bool = true,
+        begins: usize = 0,
+        uploaded_chunks: usize = 0,
+        lose: ?@FieldType(@import("source_plan_operations.zig").wire.native.Command, "action") = .begin,
         fn cut(self: *@This()) [32]u8 {
             var result: [32]u8 = @splat(0);
             std.mem.writeInt(u64, result[0..8], 1, .little);
@@ -316,8 +318,13 @@ test "completion frozen plan source destination manifest owns exact admission an
             defer decoded.deinit();
             const result = try control.apply(alloc, &self.txn, decoded.request, self.cut());
             var reply: @import("source_plan_operations.zig").wire.ControlReply = .{ .request_digest = try request.digest(alloc), .receipt = .{ .term = 1, .index = self.index }, .outcome = .{ .applied = result } };
-            if (request.command.action == .seal and self.lose_seal) {
-                self.lose_seal = false;
+            switch (request.command.action) {
+                .begin => self.begins += 1,
+                .chunk => self.uploaded_chunks += 1,
+                else => {},
+            }
+            if (self.lose == request.command.action) {
+                self.lose = null;
                 reply.outcome = null;
             }
             return reply;
@@ -340,6 +347,18 @@ test "completion frozen plan source destination manifest owns exact admission an
     const transfer = try parsed.value.transfer(fence, ports);
     var record: @import("../metadata/source_artifact_control.zig").Record = .{ .reservation = @splat(10), .spec = delivery_plan.artifact.? };
     try std.testing.expectError(error.SourceOutcomeUnresolved, transfer.seal(a, record, frozen.bytes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), native.begins);
+    try std.testing.expectEqual(@as(usize, 0), native.uploaded_chunks);
+    try std.testing.expectEqual(null, try transfer.recoverSeal(a, record, .{}));
+    native.lose = .chunk;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, transfer.seal(a, record, frozen.bytes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), native.begins);
+    try std.testing.expectEqual(@as(usize, 1), native.uploaded_chunks);
+    try std.testing.expectEqual(null, try transfer.recoverSeal(a, record, .{}));
+    native.lose = .seal;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, transfer.seal(a, record, frozen.bytes, .{}));
+    try std.testing.expectEqual(@as(usize, 1), native.begins);
+    try std.testing.expectEqual(parsed.value.artifact.chunk_hashes.len, native.uploaded_chunks);
     const mutations_after_seal = native.mutations;
     const seal = (try transfer.recoverSeal(a, record, .{})).?;
     try std.testing.expectEqual(mutations_after_seal, native.mutations);

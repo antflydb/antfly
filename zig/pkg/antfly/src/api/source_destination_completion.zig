@@ -76,7 +76,22 @@ pub fn recover(
         } }, context);
         return mutate(svc, a, binding, catalog_digest, current, .{ .reclaim_superseded_payload = payload.digest }, context);
     }
-    const record = current.artifact_control.?.current orelse return;
+    const record = current.artifact_control.?.current orelse {
+        if (!current.closing or current.pending_no_admission_receipt == null) return;
+        const pending = current.pending orelse return error.SourcePendingWork;
+        var parsed = try @import("source_destination_plan.zig").parse(a, pending.delivery_manifest, pending.plan_digest);
+        defer parsed.deinit();
+        if (parsed.value.retained_payload) |reference| {
+            var store = admission.retained_payload_store orelse return error.SourcePayloadStorageUnavailable;
+            const cancellation: @import("source_payload_retention.zig").Cancellation = .{ .context = context };
+            const sweep = try reference.sweep(&store, current.payload_cleanup_cursor orelse "", cancellation.token());
+            if (!sweep.done) return mutate(svc, a, binding, catalog_digest, current, .{ .checkpoint_payload_cleanup = .{
+                .manifest_digest = pending.plan_digest,
+                .cursor = sweep.cursor[0..sweep.cursor_len],
+            } }, context);
+        }
+        return mutate(svc, a, binding, catalog_digest, current, .{ .discard_fenced_pending = pending.identity(binding) }, context);
+    };
 
     if (current.pending) |pending| {
         if (record.phase == .garbage) {
@@ -116,7 +131,10 @@ pub fn recover(
             else => return err,
         };
         if (record.phase == .reserved) {
-            if (current.closing) return;
+            if (current.closing) {
+                if (!pending.retain_payload) return;
+                return mutate(svc, a, binding, catalog_digest, current, .{ .fence_unsealed_delivery_attempt = record.reservation }, context);
+            }
             const transfer = try manifest.transfer(fence, admission.artifacts);
             const stamp = (try transfer.recoverSeal(a, record, context)) orelse stamp: {
                 const reference = manifest.retained_payload orelse return;

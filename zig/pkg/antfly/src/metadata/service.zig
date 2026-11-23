@@ -12593,7 +12593,14 @@ pub const MetadataHttpService = struct {
                     .version = 1,
                     .expected_table_binding = binding,
                 }, context);
-                found_checkpoint = found_checkpoint or std.meta.eql(captured.owner, authority.owner);
+                if (std.mem.eql(u8, name, authority.table_name)) {
+                    if (authority.requireOwner(captured.owner)) |_| {
+                        found_checkpoint = true;
+                    } else |err| switch (err) {
+                        error.SourceBindingConflict => {},
+                        else => return err,
+                    }
+                }
                 if (sealed) try roots.append(scratch, .{ .name = name, .fence = fence, .owner = captured.owner });
             }
         }
@@ -12682,7 +12689,9 @@ pub const MetadataHttpService = struct {
             var latest = try control.parse(a, after);
             defer latest.deinit();
             if (latest.value.revision != state.revision) return;
-        } else if ((state.pending != null and (state.pending_no_admission_receipt == null or state.closing)) or
+        } else if (state.pending != null and state.closing and state.pending_no_admission_receipt != null) {
+            return @import("../api/source_destination_completion.zig").recover(self, admission, a, state, control.digest(table.replication_sources_json), context);
+        } else if ((state.pending != null and state.pending_no_admission_receipt == null) or
             state.outstanding.len != 0) return;
         if (state.closing) {
             try self.retireNativeReplicationSourceRoots(a, catalog, admission, table, state, context);

@@ -408,9 +408,14 @@ pub const State = struct {
         if (self.payload_cleanup_cursor) |cursor| {
             if (!text(cursor, max_payload_cleanup_cursor_bytes, false)) return error.InvalidSourceControl;
             if (self.superseded_payload == null) {
-                const record = if (self.artifact_control) |ledger| ledger.current orelse return error.InvalidSourceControl else return error.InvalidSourceControl;
-                if (self.pending != null or record.phase != .garbage or record.recovery == null)
-                    return error.InvalidSourceControl;
+                const ledger = self.artifact_control orelse return error.InvalidSourceControl;
+                if (self.pending != null) {
+                    if (!self.closing or self.pending_no_admission_receipt == null or ledger.current != null)
+                        return error.InvalidSourceControl;
+                } else {
+                    const record = ledger.current orelse return error.InvalidSourceControl;
+                    if (record.phase != .garbage or record.recovery == null) return error.InvalidSourceControl;
+                }
             }
         }
         if (self.superseded_payload) |payload| {
@@ -527,6 +532,7 @@ pub const Mutation = union(enum) {
     /// Win the actor CAS against that seal to prove the attempt was unadmitted.
     fence_unsealed_delivery_attempt: Digest,
     reclaim_superseded_payload: Digest,
+    discard_fenced_pending: Digest,
     checkpoint_payload_cleanup: struct { manifest_digest: Digest, cursor: []const u8 },
     fence_delivery_attempt: struct { reservation_digest: Digest, no_admission_receipt: []const u8 },
     retire_artifact: struct { reservation_digest: Digest, proof: Digest, reason: enum { unsealed, not_admitted, committed } },
@@ -575,7 +581,7 @@ pub const Mutation = union(enum) {
             },
             .seal_artifact => |seal| if (!nonzero(seal.reservation_digest) or !nonzero(seal.stamp)) return error.InvalidSourceControl,
             .checkpoint_payload_cleanup => |progress| if (!nonzero(progress.manifest_digest) or !text(progress.cursor, max_payload_cleanup_cursor_bytes, true)) return error.InvalidSourceControl,
-            .fence_unsealed_delivery_attempt, .reclaim_superseded_payload => |id| if (!nonzero(id)) return error.InvalidSourceControl,
+            .fence_unsealed_delivery_attempt, .reclaim_superseded_payload, .discard_fenced_pending => |id| if (!nonzero(id)) return error.InvalidSourceControl,
             .fence_delivery_attempt => |fence| if (!nonzero(fence.reservation_digest) or !text(fence.no_admission_receipt, 8192, false)) return error.InvalidSourceControl,
             .retire_artifact => |retirement| if (!nonzero(retirement.reservation_digest) or !nonzero(retirement.proof)) return error.InvalidSourceControl,
             .reclaim_artifact => |reclaimed| if (!nonzero(reclaimed.reservation_digest) or !nonzero(reclaimed.proof)) return error.InvalidSourceControl,
@@ -784,8 +790,13 @@ pub const Mutation = union(enum) {
             .checkpoint_payload_cleanup => |progress| {
                 const payload = state.superseded_payload orelse payload: {
                     const ledger = state.artifact_control orelse return error.SourcePendingWork;
+                    if (state.pending) |pending| {
+                        if (!state.closing or state.pending_no_admission_receipt == null or ledger.current != null)
+                            return error.SourcePendingWork;
+                        break :payload artifact_control.RecoveryManifest{ .digest = pending.plan_digest, .bytes = pending.delivery_manifest };
+                    }
                     const record = ledger.current orelse return error.SourcePendingWork;
-                    if (state.pending != null or record.phase != .garbage) return error.SourcePendingWork;
+                    if (record.phase != .garbage) return error.SourcePendingWork;
                     break :payload record.recovery orelse return error.SourcePendingWork;
                 };
                 if (!std.meta.eql(payload.digest, progress.manifest_digest)) return error.SourcePayloadConflict;
@@ -796,6 +807,18 @@ pub const Mutation = union(enum) {
                 const payload = state.superseded_payload orelse return state;
                 if (!std.meta.eql(payload.digest, id)) return error.SourcePayloadConflict;
                 next.superseded_payload = null;
+                next.payload_cleanup_cursor = null;
+            },
+            .discard_fenced_pending => |id| {
+                const pending = state.pending orelse return error.SourcePendingWork;
+                const scope = state.scope orelse return error.SourceBindingConflict;
+                const ledger = state.artifact_control orelse return error.SourcePendingWork;
+                if (!state.closing or state.pending_no_admission_receipt == null or
+                    state.superseded_payload != null or ledger.current != null)
+                    return error.SourcePendingWork;
+                if (!std.meta.eql(pending.identity(scope), id)) return error.SourcePayloadConflict;
+                next.pending = null;
+                next.pending_no_admission_receipt = null;
                 next.payload_cleanup_cursor = null;
             },
             .fence_unsealed_delivery_attempt => |id| {
@@ -1627,7 +1650,7 @@ pub fn requiredProtocol(mutation: Mutation) u16 {
         .bind_checkpoint, .fence_checkpoint => checkpoint_authority.protocol_version,
         .reserve => |reservation| if (reservation.retain_payload) retained_payload_protocol_version else if (reservation.retain_manifest) manifest_protocol_version else if (reservation.artifact != null) artifact_control.protocol_version else protocol_version,
         .replan => |plan| if (plan.retain_payload) retained_payload_protocol_version else if (plan.retain_manifest) manifest_protocol_version else if (plan.artifact != null) artifact_control.protocol_version else protocol_version,
-        .fence_unsealed_delivery_attempt, .fence_delivery_attempt, .reclaim_superseded_payload, .checkpoint_payload_cleanup => retained_payload_protocol_version,
+        .fence_unsealed_delivery_attempt, .fence_delivery_attempt, .reclaim_superseded_payload, .checkpoint_payload_cleanup, .discard_fenced_pending => retained_payload_protocol_version,
         .seal_artifact, .retire_artifact, .reclaim_artifact => artifact_control.protocol_version,
         else => protocol_version,
     };
@@ -2127,4 +2150,16 @@ test "source control retained manifests survive acceptance without profile downg
     state = try (Mutation{ .reclaim_superseded_payload = restaged.plan_digest }).apply(ca, state);
     try std.testing.expect(state.superseded_payload == null);
     try std.testing.expect(state.payload_cleanup_cursor == null);
+
+    const closing_id = state.pending.?.identity(scope);
+    const discard: Mutation = .{ .discard_fenced_pending = closing_id };
+    try std.testing.expectError(error.SourcePendingWork, discard.apply(ca, state));
+    state = try (Mutation{ .close = {} }).apply(ca, state);
+    state = try (Mutation{ .fence_unsealed_delivery_attempt = closing_id }).apply(ca, state);
+    try std.testing.expectError(error.SourcePendingWork, discard.apply(ca, state));
+    state = try (Mutation{ .reclaim_artifact = .{ .reservation_digest = closing_id, .proof = @splat(22) } }).apply(ca, state);
+    state = try (Mutation{ .checkpoint_payload_cleanup = .{ .manifest_digest = replacement.plan_digest, .cursor = "closing" } }).apply(ca, state);
+    state = try discard.apply(ca, state);
+    try std.testing.expect(state.closing and !state.retired and state.pending == null and state.payload_cleanup_cursor == null);
+    try std.testing.expectEqual(@as(u64, 1), state.committed.sequence);
 }
