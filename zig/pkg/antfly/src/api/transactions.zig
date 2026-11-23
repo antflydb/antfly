@@ -2002,7 +2002,7 @@ pub const DurableSessionStore = struct {
         return value[0..16].*;
     }
 
-    fn existingObservationReference(self: *DurableSessionStore, id: [16]u8) !?[16]u8 {
+    pub fn existingObservationReference(self: *DurableSessionStore, id: [16]u8) !?[16]u8 {
         var buf: [128]u8 = undefined;
         const key = try self.observationRegistrationKey(id, &buf);
         return switch (self.backend) {
@@ -5596,6 +5596,48 @@ pub const SessionRegistry = struct {
         return try statuses.toOwnedSlice(alloc);
     }
 
+    /// Returns Unsupported when a legacy record needs an admitted full read.
+    pub fn probeOwnerNodeId(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?u64 {
+        const stripe = self.sessionLock(txn_id);
+        stripe.lock();
+        defer stripe.unlock();
+        if (!self.durableMissIsAuthoritative()) {
+            self.mutex.lock();
+            const cached = if (self.sessions.getPtr(txn_id)) |session| session.owner_node_id else null;
+            self.mutex.unlock();
+            if (cached) |owner| return owner;
+        }
+        const durable = self.durable orelse return null;
+        return switch (durable.backend) {
+            .docstore => |store| result: {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                break :result try probeDurableOwner(&read, durable.alloc, txn_id);
+            },
+            .runtime => |store| result: {
+                var read = try store.beginRead();
+                defer read.abort();
+                break :result try probeDurableOwner(&read, durable.alloc, txn_id);
+            },
+        };
+    }
+
+    fn probeDurableOwner(read: anytype, alloc: std.mem.Allocator, id: db_mod.types.TxnId) !?u64 {
+        const key = try makeSessionKey(alloc, id);
+        defer alloc.free(key);
+        var scope = try read.openReadScope(alloc);
+        defer scope.close();
+        const bytes = scope.probePrefix(key, reader_prefix_len) catch |err| switch (err) {
+            error.NotFound => return null,
+            error.EndOfStream => return error.Unsupported,
+            else => return err,
+        };
+        if (try parseConnectionPrefix(bytes)) |payload| return std.mem.readInt(u64, payload[1..9], .little);
+        if (try parseSqlPrefix(bytes, sql_field)) |payload| return std.mem.readInt(u64, payload[1..9], .little);
+        const payload = (try parseReaderPrefix(bytes)) orelse return error.Unsupported;
+        return std.mem.readInt(u64, payload[1..9], .little);
+    }
+
     pub fn getOwnerNodeId(self: *SessionRegistry, _: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?u64 {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
@@ -8283,14 +8325,19 @@ fn parseSqlPrefix(bytes: []const u8, name: []const u8) !?[payload_len]u8 {
 fn checkReaderPrefix(bytes: []const u8, principal: []const u8, owner: u64) !bool {
     if (try parseConnectionPrefix(bytes)) |payload| return checkReaderIdentity(payload[0..41], principal, owner);
     if (try parseSqlPrefix(bytes, sql_field)) |payload| return checkReaderIdentity(payload[0..41], principal, owner);
+    const payload = (try parseReaderPrefix(bytes)) orelse return false;
+    return checkReaderIdentity(&payload, principal, owner);
+}
+
+fn parseReaderPrefix(bytes: []const u8) !?[reader_payload_len]u8 {
     const header: []const u8 = sessionRecordHeader(bytes);
-    if (!std.mem.startsWith(u8, bytes, header) or !std.mem.startsWith(u8, bytes[header.len..], reader_field)) return false;
+    if (!std.mem.startsWith(u8, bytes, header) or !std.mem.startsWith(u8, bytes[header.len..], reader_field)) return null;
     const encoded = bytes[header.len + reader_field.len ..];
     if (encoded.len < 2 * reader_payload_len + 2 or !std.mem.startsWith(u8, encoded[2 * reader_payload_len ..], "\",")) return error.InvalidTransactionSessionRecord;
     var payload: [reader_payload_len]u8 = undefined;
     _ = std.fmt.hexToBytes(&payload, encoded[0 .. 2 * reader_payload_len]) catch return error.InvalidTransactionSessionRecord;
     if (payload[0] > 1) return error.InvalidTransactionSessionRecord;
-    return checkReaderIdentity(&payload, principal, owner);
+    return payload;
 }
 
 fn checkReaderIdentity(payload: *const [41]u8, principal: []const u8, owner: u64) !bool {
@@ -10875,7 +10922,9 @@ test "SQL session metadata for a retained reader checks the shared session and l
     try std.testing.expect(!lifecycle.terminal);
     bounded.prefix = packed_session[0..@max(connection_prefix_len, reader_prefix_len)];
     try checkDurableReaderSession(a, &bounded, key, id, "alice", 7);
+    try std.testing.expectEqual(@as(?u64, 7), try SessionRegistry.probeDurableOwner(&bounded, a, id));
     bounded.prefix = raw[0..reader_prefix_len];
+    try std.testing.expectEqual(@as(?u64, 7), try SessionRegistry.probeDurableOwner(&bounded, a, id));
     const old_fields = std.mem.indexOf(u8, raw, "\"owner_node_id\"").?;
     const legacy = try std.mem.concat(a, u8, &.{ "{", raw[old_fields..] });
     defer a.free(legacy);

@@ -10282,7 +10282,10 @@ pub const ApiHttpServer = struct {
         const previous_ns = self.last_session_cleanup_ns.load(.acquire);
         const periodic = previous_ns == 0 or now_ns -| previous_ns >= interval_ns;
         if (!periodic and !self.txn_sessions.hasSessionCleanupBacklog(tagged_sql_only)) return;
-        if (periodic) self.last_session_cleanup_ns.store(now_ns, .release);
+        if (periodic and self.last_session_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
+        errdefer if (periodic) {
+            _ = self.last_session_cleanup_ns.cmpxchgStrong(now_ns, previous_ns, .acq_rel, .acquire);
+        };
         _ = if (tagged_sql_only)
             try self.txn_sessions.cleanupExpiredTaggedSqlDecisions(self.alloc, now_ns -| ttl_ns)
         else
@@ -14329,6 +14332,7 @@ pub const ApiHttpServer = struct {
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8 = null,
         sql_fence: ?[]const u8 = null,
+        bounded_owner_lookup: bool = false,
         content_type: ?[]const u8,
         body: []const u8,
     };
@@ -14369,7 +14373,7 @@ pub const ApiHttpServer = struct {
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,
-        })) orelse return null;
+        }, request.bounded_owner_lookup)) orelse return null;
         defer response.deinit(self.alloc);
 
         return try self.cloneForwardedResponse(response);
@@ -14424,21 +14428,36 @@ pub const ApiHttpServer = struct {
         return try self.cloneForwardedResponse(response);
     }
 
-    fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
+    pub fn sessionRoutingOwner(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !?u64 {
+        return self.txn_sessions.probeOwnerNodeId(txn_id) catch |err| switch (err) {
+            error.Unsupported => fallback: {
+                var read = try self.acquireSqlExecution(false);
+                defer read.release();
+                break :fallback try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id);
+            },
+            else => return err,
+        };
+    }
+
+    fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest, bounded_owner_lookup: bool) !?http_common.HttpResponse {
         // A replicated receipt read has its own linearizable barrier. Its
         // availability must not depend on the original execution owner's life.
         if (req.method == .GET and self.txn_sessions.durableMissIsAuthoritative()) return null;
-        const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse
+        const router = self.cfg.session_router orelse return null;
+        const session_executor = self.cfg.session_executor orelse return null;
+        const owner = if (bounded_owner_lookup)
+            try self.sessionRoutingOwner(txn_id)
+        else
+            try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id);
+        const owner_node_id = owner orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null
             else
                 transactions_api.sessionOwnerNodeId(txn_id);
         if (owner_node_id == 0) return null;
-        const router = self.cfg.session_router orelse return null;
-        const session_executor = self.cfg.session_executor orelse return null;
         if (owner_node_id == router.localNodeId()) return null;
         const base_uri = (try router.nodeBaseUri(self.alloc, owner_node_id)) orelse {
-            if (try self.tryAdoptSession(txn_id)) return null;
+            if (try self.adoptRoutedSession(txn_id, bounded_owner_lookup)) return null;
             return null;
         };
         defer self.alloc.free(base_uri);
@@ -14452,9 +14471,21 @@ pub const ApiHttpServer = struct {
             .content_type = req.content_type,
             .body = req.body,
         }) catch |err| {
-            if (try self.tryAdoptSession(txn_id)) return null;
+            const adopted = self.adoptRoutedSession(txn_id, bounded_owner_lookup) catch |adopt_error| switch (adopt_error) {
+                // The remote execution may have started. Preserve the
+                // transport error when local recovery cannot be admitted.
+                error.SqlWriteCapacityUnavailable => return err,
+                else => return adopt_error,
+            };
+            if (adopted) return null;
             return err;
         };
+    }
+
+    fn adoptRoutedSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, bounded_owner_lookup: bool) !bool {
+        var read = if (bounded_owner_lookup) try self.acquireSqlExecution(false) else null;
+        defer if (read) |*lease| lease.release();
+        return self.tryAdoptSession(txn_id);
     }
 
     pub fn extensionRouteMutatesMetadata(method: contextual_operations.Method, path: []const u8) bool {

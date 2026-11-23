@@ -1898,12 +1898,14 @@ pub const AntflyApiHandler = struct {
             .DELETE => .delete,
             else => return error.UnsupportedMethod,
         };
+        const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         var response = (try self.api_server.forwardSessionOperation(txn_id, .{
             .method = method,
             .target = ctx.request.uri.raw,
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
             .sql_fence = ctx.header("X-Antfly-SQL-Fence"),
+            .bounded_owner_lookup = std.mem.eql(u8, path, "/sql") or std.mem.startsWith(u8, path, "/sql/"),
             .content_type = ctx.header("content-type"),
             .body = body,
         })) orelse return null;
@@ -7129,6 +7131,15 @@ pub const AntflyApiHandler = struct {
         }
     };
 
+    fn sqlRoutingOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return rejectBeforeSQLExecution(ctx, try ctx.status(503).json(sql_wire.SQLDiagnostic{
+            .code = "53300",
+            .message = "SQL routing read capacity is temporarily exhausted.",
+            .retryable = true,
+        }));
+    }
+
     fn sqlOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("Retry-After", "1");
         if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
@@ -7427,7 +7438,10 @@ pub const AntflyApiHandler = struct {
                     };
                 } else {
                     const id = try distributed_txn.parseTxnIdHex(encoded);
-                    owner = (try self.api_server.txn_sessions.getOwnerNodeId(self.api_server.alloc, id)) orelse owner;
+                    owner = (self.api_server.sessionRoutingOwner(id) catch |err| switch (err) {
+                        error.SqlWriteCapacityUnavailable => return sqlRoutingOverloadedResponse(ctx),
+                        else => return err,
+                    }) orelse owner;
                 }
             }
             if (resource_owner) |prior| {
@@ -7446,7 +7460,11 @@ pub const AntflyApiHandler = struct {
                 ctx.header(@import("antfly_public_limits").Execution.spill_header) != null)
                 return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "per-request execution budgets require a one-shot SQL statement" });
             const id = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL session_id must be a 32-character transaction id" });
-            if (try self.forwardTransactionSession(ctx, id, body)) |response| {
+            const forwarded = self.forwardTransactionSession(ctx, id, body) catch |err| switch (err) {
+                error.SqlWriteCapacityUnavailable => return sqlRoutingOverloadedResponse(ctx),
+                else => return err,
+            };
+            if (forwarded) |response| {
                 completion.unknown = true; // Fail closed if an older owner omits its witness.
                 return response;
             }
@@ -15542,7 +15560,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var native = try storage.runtimeStore(alloc, .{ .name = "http-sql-connection-routes-test" });
     defer native.deinit();
     var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &native);
-    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable, .write_max_concurrent_requests = 1 }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable, .write_max_concurrent_requests = 1, .query_max_concurrent_requests = 1 }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const Route = struct {
@@ -15780,6 +15798,15 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         const completion = try AntflyApiHandler.requestCompletion(&ctx);
         try std.testing.expect(!completion.unknown);
         try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+        {
+            var read = try server.acquireSqlExecution(false);
+            defer read.release();
+            var retry_completion: @import("../pgwire/completion.zig").Completion = .{};
+            defer retry_completion.deinit(alloc);
+            try @import("sql_completion.zig").observeTransaction(&server, alloc, &retry_completion, txn_id);
+            try std.testing.expectEqual(@as(usize, 1), retry_completion.outcomes.items.len);
+            try std.testing.expectEqualStrings(completion.outcomes.items[0].reference_id.?, retry_completion.outcomes.items[0].reference_id.?);
+        }
         const max_window = @import("completion_outbox.zig").max_window;
         try durable.reserveRegistrations(max_window);
         defer durable.releaseRegistrations(max_window);

@@ -105,8 +105,6 @@ pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
 }
 
 pub fn observeTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
-    var read = try server.acquireSqlExecution(false);
-    defer read.release();
     try registerTransaction(server, alloc, completion, id, true);
 }
 
@@ -135,16 +133,27 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
     errdefer if (outcome.reference_id == null) discardOutcome(completion, alloc, index);
     const encoded = try alloc.alloc(u8, 32);
     errdefer if (outcome.reference_id == null) alloc.free(encoded);
-    var seed: [8]u8 = undefined;
-    try server.inferenceIo().randomSecure(&seed);
     const local_node = if (server.cfg.session_router) |router| router.localNodeId() else 0;
-    const local = server.txn_sessions.durable_scope == .cluster_shared or
-        ((try server.txn_sessions.getOwnerNodeId(alloc, id)) orelse @import("transactions.zig").sessionOwnerNodeId(id)) == local_node;
-    if (observe_only and !local) return error.CompletionWrongOwner;
-    const reference = if (local)
-        if (observe_only) try store.createLocalObservedRegistration(seed, outcome.*, id) else try store.createLocalPreparedRegistration(seed, outcome.*, id)
-    else
-        try store.createPreparedRegistration(seed, outcome.*);
+    const existing = if (observe_only) try store.existingObservationReference(id) else null;
+    var local = true;
+    const reference = existing orelse fresh: {
+        var read = if (observe_only)
+            server.acquireSqlExecution(false) catch |err| {
+                if (try store.existingObservationReference(id)) |current| break :fresh current;
+                return err;
+            }
+        else
+            null;
+        defer if (read) |*lease| lease.release();
+        local = server.txn_sessions.durable_scope == .cluster_shared or
+            ((try server.txn_sessions.getOwnerNodeId(alloc, id)) orelse @import("transactions.zig").sessionOwnerNodeId(id)) == local_node;
+        if (observe_only and !local) return error.CompletionWrongOwner;
+        var seed: [8]u8 = undefined;
+        try server.inferenceIo().randomSecure(&seed);
+        if (!local) break :fresh try store.createPreparedRegistration(seed, outcome.*);
+        if (observe_only) break :fresh try store.createLocalObservedRegistration(seed, outcome.*, id);
+        break :fresh try store.createLocalPreparedRegistration(seed, outcome.*, id);
+    };
     if (!observe_only) completion.capacity.remaining -= 1;
     completion.execution_owned = true;
     @memcpy(encoded, &std.fmt.bytesToHex(reference, .lower));
@@ -153,7 +162,7 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
     if (completion.join_begin == null) completion.join_begin = completion.outcomes.items.len - 1;
     if (local) return;
     const floor = try store.registrationFloor();
-    if (!try ownerAction(server, alloc, .{ .transaction_id = id, .reference_id = reference, .action = if (observe_only) .observe else .prepare, .managed = true, .retired_through = floor }, true)) return error.CompletionUnavailable;
+    if (!try ownerAction(server, alloc, .{ .transaction_id = id, .reference_id = reference, .action = .prepare, .managed = true, .retired_through = floor }, true)) return error.CompletionUnavailable;
     try store.putRegistration(reference, .{ .outcome = .{ .transaction_id = outcome.transaction_id }, .phase = .registered, .prepared = true, .execution_admitted = true });
 }
 fn metadataTarget(input: operation.SQLCompletionOwner) refs.Owner {
