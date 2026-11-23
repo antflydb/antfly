@@ -8596,6 +8596,21 @@ fn xprocReapBounded(pid: std.c.pid_t, timeout_ms: i64) !void {
     }
 }
 
+fn xprocStopMaintenance(owner: *Owner) void {
+    owner.stopping.store(true, .release);
+    owner.wake.set(h.handleLockIo());
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+}
+
+fn xprocReleaseWithoutFold(owner: *Owner) void {
+    if (owner.writer_lane.takeParkedForLocalPeer()) |release| {
+        var owned = release;
+        WriterLane.finishLocalPeerRelease(&owned);
+    }
+}
+
 fn xprocRunTest(filter: []const u8, environment: *const std.process.Environ.Map) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -8997,8 +9012,9 @@ test "capi native separate writer processes refresh full-text in place" {
     const peer_path_env = "ANTFLY_TEST_FULL_TEXT_PEER_PATH";
     if (std.c.getenv(peer_path_env)) |child_path| {
         const child = try open(std.mem.span(child_path), .{ .profile = .native, .busy_timeout_ms = 10_000 }, false);
+        const child_owner = child.lite_connection.?.owner;
+        xprocStopMaintenance(child_owner);
         const child_id = try api.publishHandle(child);
-        defer api.antfly_db_close(child_id);
         for (0..8) |sequence| {
             var request_buffer: [256]u8 = undefined;
             const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"doc-{d}\":{{\"text\":\"childwrote{d}\"}}}},\"sync_level\":\"full_index\"}}", .{ sequence % 2, sequence });
@@ -9006,7 +9022,9 @@ test "capi native separate writer processes refresh full-text in place" {
             defer api.antfly_buffer_free_zero(&out);
             try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(child_id, .fromSlice(request), &out));
         }
-        return;
+        xprocReleaseWithoutFold(child_owner);
+        // Closing the owner can fold the very suffix the parent must adopt.
+        std.c._exit(0);
     }
     const a = std.testing.allocator;
     var tmp = try api.TestDirectory.init("xproc-fts-in-place");
@@ -9016,6 +9034,7 @@ test "capi native separate writer processes refresh full-text in place" {
     defer a.free(path);
     const wrapper = try open(path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, true);
     const owner = wrapper.lite_connection.?.owner;
+    xprocStopMaintenance(owner);
     const id = try api.publishHandle(wrapper);
     defer api.antfly_db_close(id);
     var deleted = false;
@@ -9045,6 +9064,7 @@ test "capi native separate writer processes refresh full-text in place" {
 
     const in_place_before = owner.test_in_place_refresh_count.load(.acquire);
     const runtime_before = owner.current.?;
+    xprocReleaseWithoutFold(owner);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     try environment.put(peer_path_env, path);
@@ -9068,21 +9088,6 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
     if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
     const options: api.LiteResolvedOpenOptions = .{ .profile = .native, .busy_timeout_ms = 10_000 };
     const Dense = struct {
-        fn stopMaintenance(owner: *Owner) void {
-            owner.stopping.store(true, .release);
-            owner.wake.set(h.handleLockIo());
-            if (owner.worker) |worker| worker.join();
-            owner.worker = null;
-            owner.stopping.store(false, .release);
-        }
-
-        fn releaseWithoutFold(owner: *Owner) void {
-            if (owner.writer_lane.takeParkedForLocalPeer()) |release| {
-                var owned = release;
-                WriterLane.finishLocalPeerRelease(&owned);
-            }
-        }
-
         fn write(handle: anytype, key: []const u8, vector: []const u8) !void {
             var request: [512]u8 = undefined;
             const json = try std.fmt.bufPrint(
@@ -9133,7 +9138,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
             const mode = std.meta.stringToEnum(PeerMode, mode_name) orelse return error.InvalidPeerMode;
             const child = try open(child_path, opts, false);
             const owner = child.lite_connection.?.owner;
-            stopMaintenance(owner);
+            xprocStopMaintenance(owner);
             const id = try api.publishHandle(child);
             try write(id, key, vector);
             const root = owner.current.?;
@@ -9142,7 +9147,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
                 .replace_posting_checkpoint => try replacePostingCheckpoint(root),
                 .fold_redo => try foldRedo(root),
             }
-            releaseWithoutFold(owner);
+            xprocReleaseWithoutFold(owner);
             // A normal close can fold redo and change the boundary the parent tests.
             std.c._exit(0);
         }
@@ -9178,7 +9183,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
         const setup = try open(path, options, true);
         const setup_connection = setup.lite_connection.?;
         const setup_owner = setup_connection.owner;
-        Dense.stopMaintenance(setup_owner);
+        xprocStopMaintenance(setup_owner);
         const setup_id = try api.publishHandle(setup);
         defer api.antfly_db_close(setup_id);
         var deleted = false;
@@ -9192,7 +9197,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
     }
     const wrapper = try open(path, options, false);
     const owner = wrapper.lite_connection.?.owner;
-    Dense.stopMaintenance(owner);
+    xprocStopMaintenance(owner);
     const id = try api.publishHandle(wrapper);
     var parent_open = true;
     defer if (parent_open) api.antfly_db_close(id);
@@ -9201,7 +9206,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
     const runtime_before = owner.current.?;
     try std.testing.expect(runtime_before.db.core.index_manager.densePostingWalAuthoritativeByName("vec"));
     const count_before = owner.test_in_place_refresh_count.load(.acquire);
-    Dense.releaseWithoutFold(owner);
+    xprocReleaseWithoutFold(owner);
 
     try Dense.peerWrite(path, "peer", "[0,8,0,0,0,0,0,0]", .append);
     try Dense.expectHit(id, "\"peer\"", "[0,8,0,0,0,0,0,0]");
@@ -9209,7 +9214,7 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
     try std.testing.expect(owner.current.? == runtime_before);
     try Dense.write(id, "parent", "[0,0,8,0,0,0,0,0]");
     try std.testing.expect(owner.current.? == runtime_before);
-    Dense.releaseWithoutFold(owner);
+    xprocReleaseWithoutFold(owner);
     const before_replacement = owner.test_in_place_refresh_count.load(.acquire);
     try Dense.peerWrite(path, "replacement", "[0,0,0,8,0,0,0,0]", .replace_posting_checkpoint);
     try Dense.expectHit(id, "\"replacement\"", "[0,0,0,8,0,0,0,0]");
