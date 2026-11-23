@@ -215,6 +215,7 @@ pub const NativeTieOrder = struct {
 pub const LogicalSourceOpener = *const fn (?*anyopaque, Allocator) anyerror!?LogicalSourceReader;
 
 pub const SearchTextQueryExecutor = struct {
+    worker_stop: ?*const std.atomic.Value(bool) = null,
     open_logical_sources: ?LogicalSourceOpener = null,
     load_many_stored_values: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
 
@@ -311,6 +312,7 @@ pub const SearchTextQueryExecutor = struct {
         alloc: Allocator,
         generation: ?u64,
     ) anyerror!?doc_set.ResolvedDocSet = null,
+    postprocess_controlled: ?*const fn (?*anyopaque, Allocator, types.SearchRequest, types.SearchResult, bool, *const std.atomic.Value(bool)) anyerror!types.SearchResult = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -318,6 +320,12 @@ pub const SearchTextQueryExecutor = struct {
         raw: types.SearchResult,
         chunk_backed: bool,
     ) anyerror!types.SearchResult,
+
+    fn postprocessResult(self: @This(), a: Allocator, req: types.SearchRequest, raw: types.SearchResult, chunk_backed: bool) !types.SearchResult {
+        if (self.worker_stop) |stop| if (self.postprocess_controlled) |run|
+            return run(self.ctx, a, req, raw, chunk_backed, stop);
+        return self.postprocess(self.ctx, a, req, raw, chunk_backed);
+    }
 };
 
 pub const SearchTextStatsExecutor = struct {
@@ -755,21 +763,30 @@ pub const ComposedComponent = struct {
 };
 pub const ComposedComponentBatch = struct {
     alloc: Allocator,
-    results: []?types.SearchResult,
+    results: []?types.SearchResult = &.{},
     execution_ns: []u64 = &.{},
+    pair: ?struct { results: [2]?types.SearchResult, execution_ns: [2]u64 } = null,
     position: usize = 0,
+
+    fn slots(self: *@This()) []?types.SearchResult {
+        return if (self.pair) |*pair| &pair.results else self.results;
+    }
+
     pub fn deinit(self: *@This()) void {
-        for (self.results) |*result| if (result.*) |*owned| owned.deinit();
+        for (self.slots()) |*result| if (result.*) |*owned| owned.deinit();
         self.alloc.free(self.results);
         self.alloc.free(self.execution_ns);
     }
     pub fn lastExecutionNs(self: *const @This()) ?u64 {
-        return if (self.position != 0 and self.execution_ns.len == self.results.len) self.execution_ns[self.position - 1] else null;
+        if (self.position == 0) return null;
+        if (self.pair) |*pair| return pair.execution_ns[self.position - 1];
+        return if (self.execution_ns.len == self.results.len) self.execution_ns[self.position - 1] else null;
     }
     fn take(self: *@This()) !types.SearchResult {
-        if (self.position >= self.results.len) return error.InvalidQueryRequest;
-        const result = self.results[self.position] orelse return error.InvalidQueryRequest;
-        self.results[self.position] = null;
+        const results = self.slots();
+        if (self.position >= results.len) return error.InvalidQueryRequest;
+        const result = results[self.position] orelse return error.InvalidQueryRequest;
+        results[self.position] = null;
         self.position += 1;
         return result;
     }
@@ -784,45 +801,46 @@ fn namedTextComponentRequest(req: types.SearchRequest, name: []const u8, query: 
     return child;
 }
 
-fn composedComponents(a: Allocator, req: types.SearchRequest) ![]ComposedComponent {
-    var components: std.ArrayList(ComposedComponent) = .empty;
-    errdefer components.deinit(a);
+fn composedComponents(buffer: []ComposedComponent, req: types.SearchRequest) []ComposedComponent {
+    var components: std.ArrayList(ComposedComponent) = .initBuffer(buffer);
     if (req.full_text_queries.len == 0) {
-        if (req.full_text) |text| try components.append(a, .{ .request = req, .query = .{ .text = text } }) else if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) try components.append(a, .{ .request = req, .query = .default_text });
+        if (req.full_text) |text| components.appendAssumeCapacity(.{ .request = req, .query = .{ .text = text } }) else if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) components.appendAssumeCapacity(.{ .request = req, .query = .default_text });
     } else {
         for (req.full_text_queries) |named| {
             const child = namedTextComponentRequest(req, named.index_name, named.query);
-            try components.append(a, .{ .request = child, .query = .{ .text = named.query } });
+            components.appendAssumeCapacity(.{ .request = child, .query = .{ .text = named.query } });
         }
     }
     var vectors = req;
     vectors.full_text = null;
     if (vectors.dense_queries.len == 0 and vectors.dense != null) {
-        try components.append(a, .{ .request = vectors, .query = .{ .dense = vectors.dense.? } });
+        components.appendAssumeCapacity(.{ .request = vectors, .query = .{ .dense = vectors.dense.? } });
     } else {
         for (vectors.dense_queries) |named| {
             var child = vectors;
             child.index_name = named.index_name;
-            try components.append(a, .{ .request = child, .query = .{ .dense = named.query } });
+            components.appendAssumeCapacity(.{ .request = child, .query = .{ .dense = named.query } });
         }
     }
     if (vectors.sparse_queries.len == 0 and vectors.sparse != null) {
-        try components.append(a, .{ .request = vectors, .query = .{ .sparse = vectors.sparse.? } });
+        components.appendAssumeCapacity(.{ .request = vectors, .query = .{ .sparse = vectors.sparse.? } });
     } else {
         for (vectors.sparse_queries) |named| {
             var child = vectors;
             child.index_name = named.index_name;
-            try components.append(a, .{ .request = child, .query = .{ .sparse = named.query } });
+            components.appendAssumeCapacity(.{ .request = child, .query = .{ .sparse = named.query } });
         }
     }
-    return components.toOwnedSlice(a);
+    return components.items;
 }
 
 pub const ComposedSearchExecutor = struct {
     ctx: ?*anyopaque,
     /// Optional independent component executions. Results must retain input
     /// order; fusion, graph dependencies and transforms remain on the caller.
-    search_components: ?*const fn (?*anyopaque, Allocator, []const ComposedComponent) anyerror!ComposedComponentBatch = null,
+    /// Returning null declines admission and uses the ordinary serial path.
+    search_components: ?*const fn (?*anyopaque, Allocator, []const ComposedComponent) anyerror!?ComposedComponentBatch = null,
+    component_ctx: ?*anyopaque = null,
     resolve_structured_doc_filter: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -1136,9 +1154,13 @@ pub fn searchComposed(
         // The optional single-dense profile sink is caller-owned mutable state.
         // Its existing serial executor remains authoritative when enabled.
         if (executor.search_dense_profiled == null or executor.dense_profile_sink == null) {
-            const components = try composedComponents(alloc, shared_req);
-            defer alloc.free(components);
-            if (components.len > 1) component_batch = try run(executor.ctx, alloc, components);
+            const count = composedTextSourceCount(shared_req) + composedEmbeddingSourceCount(shared_req);
+            if (count > 1) {
+                var pair: [2]ComposedComponent = undefined;
+                const buffer: []ComposedComponent = if (count == pair.len) &pair else try alloc.alloc(ComposedComponent, count);
+                defer if (count != pair.len) alloc.free(buffer);
+                component_batch = try run(executor.component_ctx orelse executor.ctx, alloc, composedComponents(buffer, shared_req));
+            }
         }
     }
 
@@ -16821,7 +16843,7 @@ pub fn searchTextQuery(
                     .ctx = executor.ctx,
                     .live_filter = executor.live_filter_doc_set.?,
                     .generation = effective_req.identity_read_generation,
-                    .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                    .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
                     .materialize_after = @max(1024, snapshot.liveDocCount() / 128),
                     .controlled_filter = executor.live_filter_doc_set_controlled,
                 };
@@ -16844,7 +16866,7 @@ pub fn searchTextQuery(
                         .ctx = executor.ctx,
                         .live_filter = TextLiveVisibilityProducer.identityFilter,
                         .generation = effective_req.identity_read_generation,
-                        .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                        .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
                         .materialize_after = @max(1024, snapshot.liveDocCount() / 128),
                         .skip_live_filter = true,
                     };
@@ -16932,7 +16954,7 @@ pub fn searchTextQuery(
             (chunk_backed or try snapshot.hasDocOrdinalCoverage()),
         .text_snapshot_for_doc_num_projection = snapshot,
         .text_project_parent_keys = chunk_backed and executor.native_key == null,
-        .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+        .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
         .apply_live_all_docs = apply_broad_live_all_docs,
     });
     defer native_constraints.deinit(alloc);
@@ -16962,7 +16984,7 @@ pub fn searchTextQuery(
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = effective_req.identity_read_generation,
             .text_project_parent_keys = chunk_backed and executor.native_key == null,
-            .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+            .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
         });
     }
     const resolved_filter_ns = if (bench_query_profile) platform_time.monotonicNs() - resolved_filter_start_ns else 0;
@@ -17008,7 +17030,7 @@ pub fn searchTextQuery(
             .window_len = 0,
             .total_ns = platform_time.monotonicNs() - total_start_ns,
         }) else null;
-        return executor.postprocess(executor.ctx, alloc, requestAfterNativeFilters(
+        return executor.postprocessResult(alloc, requestAfterNativeFilters(
             effective_req,
             native_constraints.filter_query_json_resolved,
             native_constraints.exclusion_query_json_resolved,
@@ -17043,7 +17065,7 @@ pub fn searchTextQuery(
         effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
     {
         try checkSearchRequestDeadline(effective_req);
-        const total = try search_mod.countMatchesPreparedWithControl(alloc, snapshot, search_query, effective_req.text_navigation_plan, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs });
+        const total = try search_mod.countMatchesPreparedWithControl(alloc, snapshot, search_query, effective_req.text_navigation_plan, .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs });
         try checkSearchRequestDeadline(effective_req);
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
     }
@@ -17077,7 +17099,7 @@ pub fn searchTextQuery(
             else => return err,
         };
         if (membership_filter) |filter| {
-            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }), .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns });
+            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter.withControl(.{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }), .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns });
             defer membership.deinit(alloc);
 
             const cost_decision = sortedSegmentSelectiveCandidateDocValuesDecision(effective_req, membership.candidate_count, snapshot);
@@ -17167,7 +17189,7 @@ pub fn searchTextQuery(
                 alloc,
                 effective_req,
                 snapshot,
-                filter.withControl(.{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }),
+                filter.withControl(.{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }),
                 executor,
                 field_sort_plan,
             );
@@ -17255,12 +17277,12 @@ pub fn searchTextQuery(
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
-            try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
+            try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
         else
             try search_mod.execute(alloc, snapshot, .{
                 .doc_num_predicate = doc_predicate,
                 .query = search_query,
-                .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership },
+                .control = .{ .worker_stop = executor.worker_stop, .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
                 .offset = if (collect_window_candidates) 0 else paging.offset,
                 .include_stored = load_stored_in_search_engine,
@@ -17296,6 +17318,9 @@ pub fn searchTextQuery(
         }
 
         for (result.hits, 0..) |hit, i| {
+            if (i % 256 == 0) {
+                try (QueryExecutionControl{ .worker_stop = executor.worker_stop }).check();
+            }
             if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
             if (!chunk_backed) if (executor.project_doc_num) |project_doc_num| if (try project_doc_num(executor.ctx, alloc, snapshot, hit.doc_id)) |key| {
@@ -17357,7 +17382,7 @@ pub fn searchTextQuery(
         const postprocess_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         const exhaustive_candidate_window = candidate_limit >= full_candidate_limit and
             result.hits.len == @as(usize, result.total_hits);
-        var out = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
+        var out = try executor.postprocessResult(alloc, postprocess_req, .{
             .alloc = alloc,
             .hits = hits,
             .total_hits = result.total_hits,
@@ -40351,7 +40376,7 @@ test "external lake metadata navigation composed batches preserve component sema
         fn graph(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: *types.SearchResult, _: []const graph_exec.NamedResultSet) !void {
             return error.UnexpectedGraphAttachment;
         }
-        fn batch(_: ?*anyopaque, alloc: Allocator, components: []const ComposedComponent) !ComposedComponentBatch {
+        fn batch(_: ?*anyopaque, alloc: Allocator, components: []const ComposedComponent) !?ComposedComponentBatch {
             try std.testing.expectEqual(@as(usize, 2), components.len);
             try std.testing.expect(components[0].query == .text and components[1].query == .dense);
             try std.testing.expect(components[0].request.full_text != null and components[1].request.full_text == null);
