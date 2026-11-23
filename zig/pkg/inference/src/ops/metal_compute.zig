@@ -22817,7 +22817,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return tensor;
     }
     fn audioFreezePlan(self: *MetalCompute, plan: *audio_tape.Plan) !void {
-        const bytes = plan.count * (@sizeOf(audio_tape.Node) + 2 * @sizeOf(?CT)) + plan.constant_count * @sizeOf(audio_tape.Constant);
+        const bytes = try plan.learnedMetadataBytes();
         const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
         self.data.prefetch.lock();
         cache.reserve(.host, bytes) catch |err| {
@@ -22830,23 +22830,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             cache.noteRelease(.host, bytes);
             self.data.prefetch.unlock();
         }
-        const a = std.heap.c_allocator;
-        const nodes = try a.dupe(audio_tape.Node, plan.nodes[0..plan.count]);
-        errdefer a.free(nodes);
-        const constants = try a.dupe(audio_tape.Constant, plan.constants[0..plan.constant_count]);
-        errdefer a.free(constants);
-        const outputs = try a.alloc(?CT, plan.count);
-        errdefer a.free(outputs);
-        @memset(outputs, null);
-        const workspaces = try a.alloc(?CT, plan.count);
-        @memset(workspaces, null);
-        plan.workspaces = workspaces;
-        plan.nodes = nodes;
-        plan.constants = constants;
-        plan.storage.outputs = outputs;
-        plan.metadata_owned = true;
-        plan.metadata_bytes += bytes;
-        plan.storage.host_bytes += bytes;
+        try plan.freezeLearnedMetadata(bytes);
     }
     const audio_schedule_bank_limit = 64 * 1024 * 1024;
 

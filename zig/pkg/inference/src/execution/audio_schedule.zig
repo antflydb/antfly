@@ -182,7 +182,7 @@ pub const Plan = struct {
     selection: Selection = .{},
     storage: @import("prepared_tensor_storage.zig").Storage = .{ .host_bytes = @sizeOf(Plan) },
     metadata_bytes: usize = @sizeOf(Plan),
-    metadata_owned: bool = false,
+    metadata_views: ?[]?CT = null,
     retry_after: u64 = 0,
     retry_delay: u8 = 1,
     workspaces: []?CT = &.{},
@@ -200,13 +200,44 @@ pub const Plan = struct {
     last_use: [capacity]u16 = @splat(0),
     next_id: u16 = 0,
     output: u16 = 0,
+    /// Exact retained request for the learned schedule. Publication happens
+    /// after every array is allocated so a failed reservation can be retried.
+    pub fn learnedMetadataBytes(self: *const Plan) !usize {
+        if (self.metadata_views != null or self.count > self.nodes.len or
+            self.count > instruction_capacity or self.constant_count > self.constants.len) return error.AudioScheduleInvalid;
+        const nodes = try std.math.mul(usize, self.count, @sizeOf(Node) + 2 * @sizeOf(?CT));
+        const constants = try std.math.mul(usize, self.constant_count, @sizeOf(Constant));
+        return std.math.add(usize, nodes, constants);
+    }
+
+    pub fn freezeLearnedMetadata(self: *Plan, reserved_bytes: usize) !void {
+        const bytes = try self.learnedMetadataBytes();
+        if (reserved_bytes != bytes) return error.AudioScheduleInvalid;
+        const metadata_bytes = try std.math.add(usize, self.metadata_bytes, bytes);
+        const host_bytes = try std.math.add(usize, self.storage.host_bytes, bytes);
+        const a = std.heap.c_allocator;
+        const nodes = try a.dupe(Node, self.nodes[0..self.count]);
+        errdefer a.free(nodes);
+        const constants = try a.dupe(Constant, self.constants[0..self.constant_count]);
+        errdefer a.free(constants);
+        const views = try a.alloc(?CT, 2 * self.count);
+        @memset(views, null);
+
+        self.nodes = nodes;
+        self.constants = constants;
+        self.storage.outputs = views[0..self.count];
+        self.workspaces = views[self.count..];
+        self.metadata_views = views;
+        self.metadata_bytes = metadata_bytes;
+        self.storage.host_bytes = host_bytes;
+    }
+
     pub fn deinit(self: *Plan) void {
         self.dropPrepared();
-        if (self.metadata_owned) {
+        if (self.metadata_views) |views| {
             std.heap.c_allocator.free(self.nodes);
             std.heap.c_allocator.free(self.constants);
-            std.heap.c_allocator.free(self.storage.outputs);
-            std.heap.c_allocator.free(self.workspaces);
+            std.heap.c_allocator.free(views);
         }
     }
     pub fn dropPrepared(self: *Plan) void {
@@ -412,7 +443,7 @@ pub const Capture = struct {
     nodes: [instruction_capacity]Node = undefined,
     constants: [512]Constant = undefined,
     pub fn init(plan: *Plan, inputs: []const CT) Capture {
-        std.debug.assert(!plan.metadata_owned);
+        std.debug.assert(plan.metadata_views == null);
         plan.last_use = @splat(0);
         plan.count = 0;
         plan.constant_count = 0;
@@ -805,6 +836,22 @@ test "embeddinggemma2 audio arena splits and coalesces expired lifetimes" {
     plan.count = 3;
     try std.testing.expectEqual(@as(usize, 8192), try plan.layout());
     try std.testing.expectEqual(@as(?usize, 4096), nodes[2].arena_offset);
+}
+
+test "learned audio metadata requires the exact reservation before publishing views" {
+    var nodes = [_]Node{.{ .output = 1, .args = .{ .clampScalar = .{ .input = 0, .min_value = null, .max_value = null } } }};
+    var plan = Plan{ .nodes = &nodes, .count = nodes.len };
+    const bytes = try plan.learnedMetadataBytes();
+    try std.testing.expectError(error.AudioScheduleInvalid, plan.freezeLearnedMetadata(bytes - 1));
+    try std.testing.expect(plan.metadata_views == null and plan.nodes.ptr == nodes[0..].ptr);
+    try plan.freezeLearnedMetadata(bytes);
+    defer plan.deinit();
+    try std.testing.expectEqual(@sizeOf(Plan) + bytes, plan.storage.host_bytes);
+    try std.testing.expectEqual(@sizeOf(Plan) + bytes, plan.metadata_bytes);
+    try std.testing.expectEqual(@as(usize, 1), plan.storage.outputs.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.workspaces.len);
+    try std.testing.expect(plan.storage.outputs[0] == null and plan.workspaces[0] == null);
+    try std.testing.expectError(error.AudioScheduleInvalid, plan.freezeLearnedMetadata(bytes));
 }
 
 test "embeddinggemma2 audio arena randomized lifetimes never overlap live outputs" {
