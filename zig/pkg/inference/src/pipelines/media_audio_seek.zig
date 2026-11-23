@@ -87,7 +87,7 @@ pub const Index = union(enum) {
             .max_metadata_bytes = @min(max_bytes, read_limit),
             .max_index_bytes = max_bytes,
             .max_packet_bytes = read_limit,
-        }, coded_extent_limit) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
+        }, coded_extent_limit, error.AudioTooLarge) catch |err| return if (err == error.OutOfMemory and bounded.denied) error.AudioTooLarge else err;
         defer directory.deinit();
         return initWebmDirectory(a, directory, source, max_frames, max_bytes, bounded.live, admission);
     }
@@ -1074,9 +1074,9 @@ test "model aware media range WebM audio skips unrelated payload and rebinds cac
     var cache: Cache = .{};
     defer cache.deinit();
     source.storage.range.immutable_binding = @splat(42);
-    cache.remember(std.heap.smp_allocator, Cache.audioKey(&source, 1024, 64 * 1024).?, .{ .audio = track.seek.? }, admission);
+    cache.remember(std.heap.smp_allocator, Cache.audioKey(&source, .embedded, 1024, 64 * 1024).?, .{ .audio = track.seek.? }, admission);
     {
-        const entry = cache.get(Cache.audioKey(&source, 1024, 64 * 1024).?).?;
+        const entry = cache.get(Cache.audioKey(&source, .embedded, 1024, 64 * 1024).?).?;
         try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
         var pinned = @import("media_chunking_audio_source.zig").Track.fromCachedAudio(a, &source, .{}, &cache, entry);
         defer pinned.deinit();

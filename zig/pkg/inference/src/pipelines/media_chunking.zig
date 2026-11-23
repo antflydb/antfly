@@ -878,8 +878,15 @@ pub const Runner = struct {
             try self.soundWindows(try wav.provider());
             return;
         };
-        const seek_audio = if (audio.detectFormatFromMime(mime)) |format| format == .mp3 or format == .flac or format == .ogg or format == .opus else false;
-        const audio_key = if (seek_audio) @import("media_index_cache.zig").Cache.audioKey(&source, self.request.limits.max_index_packets, self.request.max_working_bytes) else null;
+        const Cache = @import("media_index_cache.zig").Cache;
+        const parser: ?Cache.AudioParser = if (audio.detectFormatFromMime(mime)) |format| switch (format) {
+            .mp3 => .mp3,
+            .flac => .flac,
+            .ogg => .ogg,
+            .opus => .opus,
+            else => null,
+        } else null;
+        const audio_key = if (parser) |family| Cache.audioKey(&source, family, self.request.limits.max_index_packets, self.request.max_working_bytes) else null;
         var audio_build: ?@import("media_speaker_flights.zig").Registry.Lease = null;
         defer if (audio_build) |lease| lease.deinit();
         if (audio_key) |key| if (self.request.index_cache) |cache| {
@@ -1026,7 +1033,13 @@ pub const Runner = struct {
             observed.builder.deinit();
             owner.observed = null;
         }
-        owner.track = track catch |err| {
+        const resolved = track catch |err| retry: {
+            if (err != error.AudioDirectoryNeedsRead) break :retry err;
+            // The cold video scan only inspected resident bytes. Resolve missing
+            // audio geometry at the same point as an ordinary audio index miss.
+            break :retry Track.initCached(self.allocator, owner.source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission);
+        };
+        owner.track = resolved catch |err| {
             if (abort(err) and err != error.AudioTooLarge) return err;
             self.audio_failure = err;
             return;
@@ -1133,7 +1146,7 @@ pub const Runner = struct {
             return self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
         }
         if (webm and source.storage == .range and self.pageNeedsAudio()) {
-            const audio_key = Cache.audioKey(source, count, self.request.max_working_bytes);
+            const audio_key = Cache.audioKey(source, .embedded, count, self.request.max_working_bytes);
             audio_owner.warm = if (audio_key) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
             var collect_audio = audio_owner.warm == null;
             if (collect_audio and self.request.index_cache_admission != null) if (audio_key) |key| if (self.request.index_cache) |cache| {
@@ -1658,7 +1671,7 @@ pub const Runner = struct {
 };
 pub fn abort(err: anyerror) bool {
     return switch (err) {
-        error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded, error.OutOfMemory, error.MemoryBudgetExceeded, error.SharedAdmissionExceeded, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable, error.InferenceAdmissionQueueFull, error.QueueFull, error.ResourceLimitExceeded, error.AudioTooLarge, error.StreamTooLong, error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded, error.ChunkWorkingBudgetExceeded, error.ChunkDependencyBudgetExceeded, error.ChunkCodedWindowBudgetExceeded, error.ChunkEventBudgetExceeded => true,
+        error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded, error.OutOfMemory, error.MemoryBudgetExceeded, error.SharedAdmissionExceeded, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable, error.InferenceAdmissionQueueFull, error.QueueFull, error.ResourceLimitExceeded, error.AudioTooLarge, error.StreamTooLong, error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded, error.ChunkWorkingBudgetExceeded, error.ChunkDependencyBudgetExceeded, error.ChunkCodedWindowBudgetExceeded, error.ChunkEventBudgetExceeded, error.SourceVersionChanged => true,
         else => false,
     };
 }
@@ -3056,7 +3069,7 @@ test "model aware media audio pages reuse admitted indexes and bind only the cur
         try std.testing.expectError(error.Cancelled, replay.run());
         try std.testing.expectEqual(old_reads, next.read_bytes);
         source.storage.range.immutable_binding = @splat(2);
-        try std.testing.expect(cache.get(Cache.audioKey(&source, request.limits.max_index_packets, request.max_working_bytes).?) == null);
+        try std.testing.expect(cache.get(Cache.audioKey(&source, if (mp3) .mp3 else .flac, request.limits.max_index_packets, request.max_working_bytes).?) == null);
         try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
         try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
     }
@@ -3967,4 +3980,33 @@ test "model aware media video admission can reclaim optional audio geometry" {
     try video_window.resize(.{ .host_bytes = 128 });
     try std.testing.expectEqual(@as(usize, 0), memory.live);
     try std.testing.expectError(error.AudioTooLarge, builder.borrowDirectory());
+}
+
+test "model aware media fails a partial video request on an audio source version mismatch" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn read(_: *anyopaque, _: u64, _: []u8, _: media.source.Control) !usize {
+            return error.SourceVersionChanged;
+        }
+    };
+    var marker: u8 = 0;
+    var source = media.source.Source{
+        .allocator = a,
+        .identity = "pinned-webm",
+        .storage = .{ .range = .{ .context = &marker, .read_at = Fixture.read, .length = 4 } },
+    };
+    var result = Qualification{};
+    var runner = try Runner.init(a, .{
+        .input = .{ .binary = .{ .mime_type = "video/webm", .data = &.{} } },
+        .allow_partial = true,
+    }, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
+    var builder = media.webm_audio.DirectoryBuilder{ .allocator = a, .limits = .{}, .failure = error.AudioDirectoryNeedsRead };
+    var memory = media.admission.TrackedAllocator{ .backing = a, .reservation = try runner.pool.acquire(.{}), .limit = 1 };
+    defer memory.reservation.deinit();
+    var owner = Runner.VideoAudio{ .source = &source, .observed = .{ .builder = &builder, .memory = &memory } };
+    runner.video_audio = &owner;
+    defer runner.finishVideoAudio(&owner);
+    try std.testing.expectError(error.SourceVersionChanged, runner.prepareVideoAudio());
+    try std.testing.expect(runner.audio_failure == null);
+    try std.testing.expect(owner.observed == null);
 }

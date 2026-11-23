@@ -132,7 +132,7 @@ pub const ReadAhead = struct {
     sparse_pressure: u2 = 0,
     sparse_miss: ?u64 = null,
     pub fn range(self: *ReadAhead) source.Range {
-        return .{ .context = self, .read_at = readAt, .sparse_read_at = readSparseAt, .sparse_read_preferring = if (self.upstream.accepts_full_read_size or self.upstream.sparse_read_preferring != null) readSparsePreferring else null, .isolated_read_at = readIsolatedAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
+        return .{ .context = self, .read_at = readAt, .peek_at = peekAt, .sparse_read_at = readSparseAt, .sparse_read_preferring = if (self.upstream.accepts_full_read_size or self.upstream.sparse_read_preferring != null) readSparsePreferring else null, .isolated_read_at = readIsolatedAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
     }
     pub fn deinit(self: *ReadAhead) void {
         if (self.buffer) |bytes| self.allocator.free(bytes);
@@ -268,13 +268,18 @@ pub const ReadAhead = struct {
         return done;
     }
 
+    fn peekAt(context: *anyopaque, offset: u64, out: []u8) usize {
+        const self: *ReadAhead = @ptrCast(@alignCast(context));
+        const count = self.cachedPrefix(offset, out.len);
+        if (count == 0) return 0;
+        const delta: usize = @intCast(offset - self.start);
+        @memcpy(out[0..count], self.buffer.?[delta..][0..count]);
+        return count;
+    }
+
     fn copyCached(self: *ReadAhead, offset: u64, out: []u8) usize {
-        const cached = self.cachedPrefix(offset, out.len);
-        if (cached != 0) {
-            const delta: usize = @intCast(offset - self.start);
-            @memcpy(out[0..cached], self.buffer.?[delta..][0..cached]);
-            self.hits += 1;
-        }
+        const cached = peekAt(self, offset, out);
+        if (cached != 0) self.hits += 1;
         return cached;
     }
 
@@ -921,4 +926,40 @@ test "a miss after request exhaustion preserves the forward window" {
     defer cached.deinit();
     try std.testing.expectEqualSlices(u8, "bcd", cached.bytes);
     try std.testing.expectEqual(@as(usize, 1), cache.reads);
+}
+
+test "resident peeks preserve source and transport budgets and the forward window" {
+    const Fixture = struct {
+        const bytes = "0123456789";
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var cache = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Fixture.read, .length = Fixture.bytes.len, .accepts_full_read_size = true },
+        .window_bytes = 4,
+        .max_reads = 1,
+        .max_bytes = 4,
+    };
+    defer cache.deinit();
+    var input = source.Source{
+        .allocator = std.testing.allocator,
+        .identity = "resident",
+        .storage = .{ .range = cache.range() },
+        .limits = .{ .max_reads = 1, .max_total_bytes = 1 },
+    };
+    var first = try input.read(1, 1);
+    first.deinit();
+    var buf: [4]u8 = undefined;
+    const n = try input.peek(3, &buf);
+    try std.testing.expectEqualStrings("34", buf[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), try input.peek(5, &buf));
+    try std.testing.expectEqual(@as(usize, 1), input.reads);
+    try std.testing.expectEqual(@as(u64, 1), input.total_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.reads);
+    try std.testing.expectEqual(@as(u64, 4), cache.charged_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.hits);
 }

@@ -66,6 +66,8 @@ pub const Range = struct {
     /// RemoteReadBudgetExceeded rejects a request before transferring bytes.
     /// A provider that transferred a prefix can report it as a short read.
     read_at: *const fn (*anyopaque, u64, []u8, Control) anyerror!usize,
+    /// Copy an already validated prefix without I/O or provider accounting.
+    peek_at: ?*const fn (*anyopaque, u64, []u8) usize = null,
     sparse_read_at: ?*const fn (*anyopaque, u64, []u8, Control) anyerror!usize = null,
     /// Accept optional output capacity beyond a caller's required prefix.
     sparse_read_preferring: ?*const fn (*anyopaque, u64, []u8, usize, Control) anyerror!usize = null,
@@ -154,6 +156,27 @@ pub const Source = struct {
     pub fn readControlled(self: *Source, offset: u64, size: usize, caller: Control) !Lease {
         return self.readWithControl(offset, size, caller, null, .normal);
     }
+    /// Copy resident bytes without consuming the logical or transport budget.
+    pub fn peek(self: *Source, offset: u64, out: []u8) !usize {
+        try self.checkControl();
+        if (offset > self.length() or out.len > self.length() - offset) return error.UnexpectedEndOfSource;
+        switch (self.storage) {
+            .borrowed => |bytes| {
+                @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+                return out.len;
+            },
+            .range => |range| {
+                const copy = range.peek_at orelse return 0;
+                const owner = self.physical orelse self;
+                if (!range.concurrent) try owner.provider_gate.lock(self.control);
+                defer if (!range.concurrent) owner.provider_gate.unlock();
+                const n = copy(range.context, offset, out);
+                if (n > out.len) return error.InvalidSourceRead;
+                return n;
+            },
+        }
+    }
+
     /// Reads a small or isolated span without the transport's normal read-ahead.
     pub fn readSparse(self: *Source, offset: u64, size: usize) !Lease {
         return self.readSparseControlled(offset, size, .{});

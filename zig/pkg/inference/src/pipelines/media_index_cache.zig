@@ -176,13 +176,16 @@ pub const Cache = struct {
         hash.final(&result);
         return result;
     }
-    pub fn audioKey(source: *const media.source.Source, max_packets: usize, max_bytes_: usize) ?[32]u8 {
+    pub const AudioParser = enum(u8) { embedded, mp3, flac, ogg, opus };
+
+    pub fn audioKey(source: *const media.source.Source, parser: AudioParser, max_packets: usize, max_bytes_: usize) ?[32]u8 {
         const binding = switch (source.storage) {
             .range => |range| range.immutable_binding orelse return null,
             .borrowed => return null,
         };
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("media-audio-seek-v2");
+        hash.update("media-audio-seek-v3");
+        hash.update(&.{@backingInt(parser)});
         hash.update(&binding);
         for ([_]u64{ source.length(), max_packets, max_bytes_ }) |n| {
             var raw: [8]u8 = undefined;
@@ -770,8 +773,9 @@ test "model aware media pinned audio keys ignore request-local identity aliases"
         }
     };
     var source = media.source.Source{ .allocator = std.testing.allocator, .identity = "resource", .storage = .{ .range = .{ .context = &marker, .read_at = Provider.read, .length = 100, .immutable_binding = @splat(1) } } };
-    const key = Cache.audioKey(&source, 10, 100).?;
+    const key = Cache.audioKey(&source, .embedded, 10, 100).?;
     source.identity = "video chunk fingerprint";
-    try std.testing.expectEqual(key, Cache.audioKey(&source, 10, 100).?);
-    try std.testing.expect(!std.mem.eql(u8, &key, &Cache.audioKey(&source, 11, 100).?));
+    try std.testing.expect(!std.mem.eql(u8, &key, &Cache.audioKey(&source, .flac, 10, 100).?));
+    try std.testing.expectEqual(key, Cache.audioKey(&source, .embedded, 10, 100).?);
+    try std.testing.expect(!std.mem.eql(u8, &key, &Cache.audioKey(&source, .embedded, 11, 100).?));
 }
