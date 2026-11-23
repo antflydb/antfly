@@ -32033,7 +32033,10 @@ pub const RaftApplyStore = struct {
                 .lookup => |lookup| std.json.Stringify.valueAlloc(backing, try journal.readSlotView(scratch, &txn, realm, lookup.name), .{}),
                 .outcome => |control| std.json.Stringify.valueAlloc(backing, try journal.readControlOutcome(scratch, &txn, control), .{}),
                 .check_publications => |check| blk: {
-                    _ = try resolveSlotPublications(scratch, &txn, group, realm, check.names);
+                    _ = resolveSlotPublications(scratch, &txn, group, realm, check.names) catch |err| switch (err) {
+                        error.PublicationNotFound => break :blk backing.dupe(u8, "false"),
+                        else => return err,
+                    };
                     break :blk backing.dupe(u8, "true");
                 },
                 .ready => |probe| std.json.Stringify.valueAlloc(backing, try journal.feedReadiness(scratch, &txn, probe, platform_time.realtimeNs()), .{}),
@@ -87039,6 +87042,8 @@ test "SQL logical replication installation metadata worker discovers the exact c
     try std.testing.expectEqual(@as(u64, 1), slot_result.slot.reference.birth);
     const slot_head = try restored.sqlPublicationCaptureWork(scratch, group_id, .{ .slot = .{ .head = slot_realm } }, .{ .setting_admin = true });
     try std.testing.expectEqualStrings("1", slot_head);
+    const missing_publication = try restored.sqlPublicationCaptureWork(scratch, group_id, .{ .slot = .{ .check_publications = .{ .realm = slot_realm, .names = &.{"absent"} } } }, .{ .setting_admin = true });
+    try std.testing.expectEqualStrings("false", missing_publication);
 
     const identity_read: installation.WorkRequest = .{ .slot = .{ .identity = slot_realm } };
     try std.testing.expectEqualStrings("null", try restored.sqlPublicationCaptureWork(scratch, group_id, identity_read, .{ .setting_admin = true }));

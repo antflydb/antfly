@@ -1837,10 +1837,12 @@ pub const Adapter = struct {
 
     fn openStream(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
         const self: *Adapter = @ptrCast(@alignCast(raw));
-        if (try wire.replication_commands.parsePublication(alloc, request.statement, publication_control.max_tables)) |publication| {
-            var parsed = publication;
-            parsed.deinit();
-            return null;
+        if (self.replicationFactory() != null) {
+            if (try wire.replication_commands.parsePublication(alloc, request.statement, publication_control.max_tables)) |publication| {
+                var parsed = publication;
+                parsed.deinit();
+                return null;
+            }
         }
         var job = StreamJob{ .adapter = self, .alloc = alloc, .credential = @ptrCast(@alignCast(identity.context)), .request = request };
         try job.dispatch();
@@ -3766,7 +3768,13 @@ const Job = struct {
         }
         var preparation = self.adapter.server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
-        if (try wire.replication_commands.parsePublication(self.alloc, self.request.statement, publication_control.max_tables)) |publication| {
+        // A retained-spool listener uses its publication catalog. The
+        // journal-backed listener uses the SQL catalog DDL and its capture plan.
+        const retained_publication = if (self.adapter.replicationFactory() != null)
+            try wire.replication_commands.parsePublication(self.alloc, self.request.statement, publication_control.max_tables)
+        else
+            null;
+        if (retained_publication) |publication| {
             var parsed = publication;
             defer parsed.deinit();
             if (self.request.session_id != null) return error.UnsupportedSqlExecution;
