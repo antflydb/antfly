@@ -3074,35 +3074,31 @@ pub const DurableSessionStore = struct {
     }
 
     pub fn registrationRecoveryPageControlled(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize, context: RoutingContext) !Outbox.RecoveryPage {
+        const mutation = self.mutationMutex();
+        while (!mutation.tryLock()) {
+            try context.ensureActive();
+            platform_time.yieldBriefly();
+        }
+        defer mutation.unlock();
         try context.ensureActive();
         return switch (self.backend) {
             .docstore => |store| result: {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
-                break :result try self.readRegistrationRecoveryPage(&txn, alloc, after, limit, context);
+                break :result try self.readRegistrationRecoveryPage(&txn, alloc, after, limit);
             },
             .runtime => |store| result: {
                 var txn = try self.beginRoutingRead(store, context);
                 defer txn.abort();
-                break :result try self.readRegistrationRecoveryPage(&txn, alloc, after, limit, context);
+                break :result try self.readRegistrationRecoveryPage(&txn, alloc, after, limit);
             },
         };
     }
 
-    fn readRegistrationRecoveryPage(self: *DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, after: u64, limit: usize, context: RoutingContext) !Outbox.RecoveryPage {
-        const mutation = self.mutationMutex();
-        const before = cutoff: {
-            while (!mutation.tryLock()) {
-                try context.ensureActive();
-                platform_time.yieldBriefly();
-            }
-            defer mutation.unlock();
-            try context.ensureActive();
-            if (self.registration_recovery_before == null)
-                self.registration_recovery_before = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).next;
-            break :cutoff self.registration_recovery_before.?;
-        };
-        return self.registrationOutbox().recoveryPage(txn, alloc, before, after, limit);
+    fn readRegistrationRecoveryPage(self: *DurableSessionStore, txn: anytype, alloc: std.mem.Allocator, after: u64, limit: usize) !Outbox.RecoveryPage {
+        if (self.registration_recovery_before == null)
+            self.registration_recovery_before = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).next;
+        return self.registrationOutbox().recoveryPage(txn, alloc, self.registration_recovery_before.?, after, limit);
     }
     pub const ObservationIndexEntry = struct { transaction_id: [16]u8, reference: [16]u8 };
     pub const ObservationRetirementPage = struct { entries: []ObservationIndexEntry, next_after: ?[]u8 };
