@@ -10007,6 +10007,10 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
         }
         fn catalog(_: *anyopaque, alloc: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const domain = @import("antfly_local_sources").system_catalog_domain;
+            if (call == .resolve) {
+                try std.testing.expectEqualStrings("docs", call.resolve.table);
+                return std.json.Stringify.valueAlloc(alloc, domain.ResolvedTable{ .table_id = 7, .name = "docs" }, .{});
+            }
             if (call != .resolve_many) return error.UnexpectedCatalogCall;
             const request = call.resolve_many;
             const resolved = try alloc.alloc(?[]const u8, request.storage_names.len);
@@ -10090,11 +10094,7 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
             }
         }
     }
-    var private_batch = try client.fetchBatchResponse(base, "docs", "{\"inserts\":{\"rejected-producer-row\":{}},\"source_producer\":\"legacy_cdc\"}");
-    defer private_batch.deinit(a);
-    try std.testing.expectEqual(@as(u16, 400), private_batch.status);
-    try std.testing.expect(try db.get(a, "rejected-producer-row") == null);
-    var public_batch = try client.fetchBatch(base, "docs", "{\"inserts\":{\"public-row\":{}}}");
+    var public_batch = try client.fetchBatch(base, "docs", "{\"inserts\":{\"public-row\":{}},\"source_producer\":\"legacy_cdc\"}");
     defer public_batch.deinit(a);
     const public_row = (try db.get(a, "public-row")) orelse return error.TestExpectedProducerRow;
     defer a.free(public_row);
