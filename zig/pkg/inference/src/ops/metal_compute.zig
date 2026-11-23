@@ -12044,6 +12044,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const direct = @import("../execution/assigned_kernel_route.zig");
         const backend = ops.ComputeBackend{ .ptr = self, .vtable = table };
         if (request.descriptor.operation == .gather) return direct.prepareHostGather(backend, request, directRouteSupported);
+        if (request.descriptor.operation == .linear) {
+            // Only the genuine cold metadata scope can acquire a new pin.
+            // A missing slot retains the original allocating route.
+            if (!self.ownsMetadataIndex() or !DenseProjectionProfile.noFrame(self)) return null;
+            return PreparedDenseLinear.prepare(self, request, table);
+        }
         return direct.prepare(backend, request, directRouteSupported);
     }
 
@@ -12063,12 +12069,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         fn supported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
             const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-            return descriptor.operation == .linear and descriptor.operation.linear.rows == 1 and DenseProjectionProfile.noFrame(self) and supportsAssignedDescriptor(descriptor);
+            return descriptor.operation == .linear and descriptor.operation.linear.rows == 1 and self.audio_capture == null and
+                self.provider_impl.hasDecoderRuntime() and supportsAssignedDescriptor(descriptor);
         }
         fn supportedRegion(raw: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
             const self: *MetalCompute = @ptrCast(@alignCast(raw));
             if (descriptor.operation != .linear or !supportsAssignedDescriptor(descriptor)) return false;
-            return if (descriptor.operation.linear.rows == 1) supported(raw, descriptor) else self.packed_projection_profile != null and self.projectionScopeValid();
+            return if (descriptor.operation.linear.rows == 1) DenseProjectionProfile.noFrame(self) and supported(raw, descriptor) else self.packed_projection_profile != null and self.projectionScopeValid();
         }
         fn selectedSlot(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding) ?usize {
             // Activation inputs may be planned, but the prepared immutable
@@ -55801,6 +55808,33 @@ const PreparedDenseRegionFixture = struct {
                 try graph.markOutput(output);
                 expected[index] = try reference.toFloat32(reference_output, a);
                 produced += 1;
+            }
+            if (count == 2) {
+                const route = @import("../execution/kernel_route.zig");
+                const implementation = route.Implementation{ .context = cb.ptr, .table = cb.vtable };
+                const output = graph.outputs.items[0];
+                const descriptor = ops.kernel_descriptor.lower(&graph, output) orelse return error.MissingProjectionDescriptor;
+                const facts = [_]route.Binding{
+                    .{ .tensor = .{ .value = values[0], .implementation = implementation } },
+                    .{ .tensor = .{ .value = values[1], .implementation = implementation } },
+                    .{ .tensor = .{ .value = values[2], .implementation = implementation } },
+                };
+                const request = route.Prepare{
+                    .allocator = a,
+                    .implementation = implementation,
+                    .descriptor = &descriptor,
+                    .inputs = &facts,
+                    .output = .{ .allocation = 0, .node = output, .epoch = 1, .logical = shape, .writable_bytes = 64 * @sizeOf(f32) },
+                };
+                const prepare_route = cb.vtable.kernels.?.prepareKernelRoute.?;
+                try std.testing.expect((try prepare_route(cb.ptr, request)) == null);
+                const operation = @import("../execution/backend_operation.zig");
+                var scope: operation.Scope = .{};
+                defer scope.deinitChecked() catch unreachable;
+                try operation.enterInto(&cb, &graph, null, .metadata, &scope);
+                var assigned = (try prepare_route(cb.ptr, request)) orelse return error.MissingPreparedKernelRoute;
+                defer assigned.deinit();
+                try assigned.validate(.{ .inputs = &facts, .output = request.output });
             }
             if (count == 3) {
                 const slab = (try cb.allocUninitF32Shape(&.{ 2, 64 })) orelse return error.MissingPhysicalStorage;
