@@ -100,6 +100,7 @@ pub const CudaTensor = struct {
     // both the direct allocation and its retained shared-admission lease.
     model_constant: bool = false,
     model_constant_quota: CacheQuota = .none,
+    retained_output_quota: CacheQuota = .none,
     cache_retirement_slot: ?*@import("cache_retirement.zig").PreparedQuotas.Slot = null,
     gemma4_projector_constant: bool = false,
     gemma4_projector_weight: bool = false,
@@ -7269,7 +7270,8 @@ pub const CudaCompute = struct {
                 CacheRetirement.word(&hash, @intFromPtr(pair.end));
             }
             leases += try CacheRetirement.leaseWord(&hash, arena.quota.peek(), &controller);
-            leases += try CacheRetirement.leaseWord(&hash, arena.output_quota.peek(), &controller);
+            CacheRetirement.word(&hash, if (arena.retained_output) |output| @intFromPtr(output.owner) else 0);
+            leases += try CacheRetirement.leaseWord(&hash, arena.outputLease(), &controller);
         }
         if (selection.full()) {
             CacheRetirement.word(&hash, expected.audio_plans.clock);
@@ -18298,6 +18300,10 @@ fn freeTensorWithCleanup(ctx: *anyopaque, tensor: CT, cleanup: @import("../../ex
     if (retirement) |owner| {
         const physical_lease = cuda_tensor.physical_lease;
         const auxiliary_leases = cuda_tensor.auxiliary_leases;
+        if (cuda_tensor.retained_output_quota.hasLease()) {
+            freeRetainedAudioOutput(cuda_tensor, cleanup);
+            return;
+        }
         owner.freeStorage(cuda_tensor);
         const allocator = owner.allocator;
         allocator.destroy(cuda_tensor);
@@ -18333,6 +18339,7 @@ fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     borrowed.resident_references = .init(1);
     borrowed.model_constant = false;
     borrowed.model_constant_quota = .none;
+    borrowed.retained_output_quota = .none;
     borrowed.cache_retirement_slot = null;
     borrowed.owns_buffer = false;
     borrowed.owns_tc_quant = false;
@@ -20635,7 +20642,60 @@ fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer
     }
 }
 
-fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
+fn freeRetainedAudioOutput(tensor: *CudaTensor, cleanup: CacheCleanup) void {
+    const owner = tensor.storage_retirement.?;
+    const quota = &tensor.retained_output_quota;
+    const slot = tensor.cache_retirement_slot;
+    if (slot) |value| {
+        value.validateCleanup(cleanup) catch platform.inference_process_supervisor.restartWorker();
+    } else quota.validateCleanup(cleanup) catch platform.inference_process_supervisor.restartWorker();
+
+    owner.freeStorage(tensor);
+    if (slot) |value| {
+        quota.finishRetainedAfterSdkDeath(value, cleanup) catch platform.inference_process_supervisor.restartWorker();
+    } else quota.releaseAfterSdkDeath(cleanup) catch platform.inference_process_supervisor.restartWorker();
+    owner.allocator.destroy(tensor);
+    owner.release();
+}
+
+fn dropAudioGraphOutput(raw: *anyopaque, cleanup: CacheCleanup) void {
+    const tensor: *CudaTensor = @ptrCast(@alignCast(raw));
+    const previous = tensor.resident_references.fetchSub(1, .acq_rel);
+    std.debug.assert(previous != 0);
+    if (previous == 1) freeRetainedAudioOutput(tensor, cleanup);
+}
+
+fn retainAudioGraphBacking(self: *CudaCompute, bank: *buffer_mod.DeviceBuffer, quota: *CacheQuota, input: *const CudaTensor, bytes: usize) !@import("retained_execution_cache.zig").RetainedOutput {
+    std.debug.assert(quota.* == .prepared and !bank.borrowed and bank.len >= bytes);
+    const retirement = try storageRetirement(self, bank.allocation_bytes);
+    const allocator = retirement.allocator;
+    const tensor = try allocator.create(CudaTensor);
+    errdefer allocator.destroy(tensor);
+    const shape = try allocator.dupe(i64, input.shape);
+    errdefer allocator.free(shape);
+    try retirement.adoptBuffers(&self.ctx, &.{bank.*});
+    retirement.retain();
+    tensor.* = .{
+        .storage_retirement = retirement,
+        .retained_output_quota = quota.*,
+        .immutable_cache_backing = true,
+        .buffer = bank.*,
+        .dtype = .f32,
+        .shape = shape,
+        .elem_count = input.elem_count,
+    };
+    tensor.buffer.len = bytes;
+    quota.* = .none;
+    bank.* = .{ .ptr = bank.ptr, .len = bank.len, .borrowed = true };
+    return .{
+        .owner = tensor,
+        .quota = &tensor.retained_output_quota,
+        .retirement_slot = &tensor.cache_retirement_slot,
+        .release = dropAudioGraphOutput,
+    };
+}
+
+fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: CacheCleanup) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
     self.audio_execution_active = true;
@@ -20657,7 +20717,15 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const input_bytes = cache_base.input_bytes;
     if (input_bytes > 128 * 1024 * 1024) return null;
     const base_key = cache_base.key;
-    const plan_cleanup: CacheCleanup = .{ .boundary = if (self.ctx.prepared_cache_funding) |funding| funding.boundary else null };
+    // Use the receiving invocation's cleanup when available. An installed
+    // prepared funding scope supplies its own live epoch for legacy callers.
+    var plan_cleanup = cleanup;
+    if (self.ctx.prepared_cache_funding) |funding| if (funding.boundary) |epoch| {
+        if (cleanup.boundary) |current| {
+            if (current.record != epoch.record or current.nonce != epoch.nonce)
+                return error.BackendOperationCleanupChanged;
+        } else plan_cleanup.boundary = epoch;
+    };
     const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
     if (entry.disabled) return null;
     var canonical: [20]CT = undefined;
@@ -20718,7 +20786,11 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), cache_request.arena.sizes)) orelse return null;
     arena.pollTiming(&self.ctx);
     // The sealed allocation plan above is the audio route's capture proof.
-    const action = arena.graphAction(true);
+    const existing_output: ?*CudaTensor = if (arena.retained_output) |retained| @ptrCast(@alignCast(retained.owner)) else null;
+    // A publication can remain live across requests. Do not launch a graph
+    // that would overwrite it. The same plan can execute into a new result.
+    const held = if (existing_output) |tensor| tensor.resident_references.load(.acquire) != 1 else false;
+    const action = if (held) .eager else arena.graphAction(true);
     const capture = action == .capture;
     const replay = action == .replay;
     // Establish scratch and input custody before allocating the result or
@@ -20734,8 +20806,21 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     // Eager execution can bind the final write even when the learned
     // allocation has padding. The shape and element count stay logical.
     const published_directly = !replay and !capture;
+    if (!published_directly and storage.external_output and cleanup.boundary != null and arena.output_quota == .prepared) {
+        // Optional promotion. Failure before custody transfer keeps the fully
+        // funded fixed bank and the established publication-copy path.
+        arena.retained_output = retainAudioGraphBacking(self, &arena.buffers[1], &arena.output_quota, first_input, output_bytes) catch null;
+    }
+    const retained_output: ?*CudaTensor = if (!published_directly and cleanup.boundary != null)
+        if (arena.retained_output) |retained| @ptrCast(@alignCast(retained.owner)) else null
+    else
+        null;
     const backing_bytes = if (published_directly) output.bytes else output_bytes;
-    const out = try self.createEmbeddingGemma2TensorWithBacking(first_input.shape, first_input.elem_count, .f32, backing_bytes);
+    const out = if (retained_output) |tensor| block: {
+        const previous = tensor.resident_references.fetchAdd(1, .acq_rel);
+        std.debug.assert(previous == 1);
+        break :block @as(CT, @ptrCast(tensor));
+    } else try self.createEmbeddingGemma2TensorWithBacking(first_input.shape, first_input.elem_count, .f32, backing_bytes);
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
     const output_bank = if (published_directly) tensorFromCt(out).buffer else if (storage.external_output) arena.buffers[1] else try audioBufferView(arena.buffers[0], output.offset, output.bytes);
@@ -20810,7 +20895,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         try arena.launch(&self.ctx);
         if (replay) self.audio_graph_replays += 1;
     }
-    if (!published_directly) {
+    if (!published_directly and retained_output == null) {
         const result = try audioBufferView(output_bank, 0, output_bytes);
         try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
     }
@@ -60375,6 +60460,80 @@ test "public source audio linear recreates input bank through actual learning ca
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 5), run.calls);
     try std.testing.expectEqual(@as(u64, 5), compute.audio_arena_executes);
+
+    // A separate key learns the same operations but obtains a separate,
+    // prepared output allocation for its actual capture and replay.
+    const key = 0x304;
+    try std.testing.expect(try cb.audioStorage(true));
+    defer _ = cb.audioStorage(false) catch false;
+    for (0..2) |_| {
+        const result = (try cb.audioExecution(key, &.{ identity, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+        cb.free(result);
+    }
+    const metadata: CudaCompute.AudioCacheInput = .{ .shape = &.{ 2, 2 }, .elements = 4 };
+    const request = (try compute.audioCacheRequest(key, &.{ metadata, metadata })) orelse return error.TestUnexpectedResult;
+    const output_bytes = request.arena.sizes[1];
+    try std.testing.expect(output_bytes != 0);
+    const funding = try @import("prepared_cache.zig").Funding.createWithAllocator(std.testing.allocator, .{ .requests = &.{request} });
+    defer funding.finishOutsideExecution();
+    const domain = try @import("../../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    funding.admission = .{ .controller = &domain.controller, .limits = .{}, .check_live_memory = false };
+    try funding.noteMiss(0, .{ .backend_scratch_bytes = request.arena.sizes[0] + output_bytes }, 0);
+    funding.state = .snapped;
+    try funding.fundOutsideExecution(&pin);
+
+    var sink = try @import("../../execution/retirement_sink.zig").Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    var guard_open = true;
+    defer if (guard_open) guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const invocation = @import("../../execution/invocation_context.zig").Context{ .cleanup = .{ .boundary = &epoch } };
+    var scoped = cb;
+    scoped.call_context = &invocation;
+    {
+        try funding.bind(&epoch);
+        compute.ctx.prepared_cache_funding = funding;
+        defer CudaCompute.unbindCacheFunding(&scoped, &compute, funding);
+        const recorded = (try scoped.audioExecution(key, &.{ identity, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+        defer scoped.free(recorded);
+        try std.testing.expect(tensorFromCt(recorded).storage_retirement != null);
+    }
+    var transfers = transfer_audit.Audit{};
+    const direct = observed: {
+        try transfer_audit.begin(&transfers);
+        defer transfer_audit.end();
+        break :observed (try scoped.audioExecution(key, &.{ identity, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+    };
+    var direct_live = true;
+    defer if (direct_live) scoped.free(direct);
+    try std.testing.expect(tensorFromCt(direct).storage_retirement != null);
+    try std.testing.expectEqual(@as(u64, 2 * @sizeOf([4]f32)), transfers.device_copy_bytes);
+    const updated = try cb.fromFloat32Shape(&.{ 2, 3, 4, 5 }, &.{ 2, 2 });
+    defer cb.free(updated);
+    const eager = (try scoped.audioExecution(key, &.{ updated, identity }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+    defer cb.free(eager);
+    try std.testing.expect(tensorFromCt(eager).buffer.ptr != tensorFromCt(direct).buffer.ptr);
+
+    try compute.embedding_gemma2_execution.clear(compute.allocator, &compute.ctx);
+    try std.testing.expectEqual(output_bytes, domain.controller.snapshot().backend_scratch_bytes);
+    const direct_values = try cb.toFloat32(direct, std.testing.allocator);
+    defer std.testing.allocator.free(direct_values);
+    try std.testing.expectEqualSlices(f32, &identity_values, direct_values);
+    const eager_values = try cb.toFloat32(eager, std.testing.allocator);
+    defer std.testing.allocator.free(eager_values);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 3, 4, 5 }, eager_values);
+    scoped.free(direct);
+    direct_live = false;
+    try std.testing.expectEqual(output_bytes, domain.controller.snapshot().backend_scratch_bytes);
+    guard.finish();
+    guard_open = false;
+    _ = @import("../../execution/resource_retirement.zig").poll();
+    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().backend_scratch_bytes);
 }
 
 test "source GEMM row descriptors reject missing physical input before opaque CUDA access" {

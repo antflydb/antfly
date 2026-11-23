@@ -22484,7 +22484,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         moved = true;
         return ct;
     }
-    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
+    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, _: @import("../execution/cleanup_context.zig").Context) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.require_f32_linears or disableRuntimeElementwise() or self.shared_provider_lease_io == null or self.audio_capture != null or inputs.len == 0 or inputs.len > 20 or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_AUDIO_PLAN")) return null;
         var hash = std.hash.Wyhash.init(key);

@@ -13213,6 +13213,7 @@ pub const StagedExecution = struct {
     cuda_policy: CudaPolicy = .{},
     cuda_policy_set: bool = false,
     cleanup_owner: @import("cleanup_owner.zig").Owner = .{},
+    cuda_invocation: @import("invocation_context.zig").Context = .{ .cleanup = .{} },
     model_retention: ?*Session.ModelLifetime = null,
     cold_prepared: bool = false,
     managed: ?@import("../backends/compute_provider.zig").ManagedComputeBackend = null,
@@ -13768,6 +13769,10 @@ pub const StagedExecution = struct {
                 const compute = try self.cudaStageCompute();
                 self.cuda_policy = CudaPolicy.from(compute.ctx.video_cache_budget.admission);
                 self.cuda_policy_set = true;
+                // The stage owns this epoch across cohort yields. Borrow it
+                // through the actual receiving header for scoped tensor frees.
+                self.cuda_invocation = .{ .cleanup = self.current() };
+                self.cb.call_context = &self.cuda_invocation;
             } else return error.CudaNotEnabled;
         } else {
             if (self.cb.kind() != .metal) return;
@@ -14047,6 +14052,7 @@ pub const StagedExecution = struct {
             if (self.managed) |*managed| {
                 if (!self.active) cleanup(self);
                 if (self.cb.embedding_stage == &self.hook) self.cb.embedding_stage = null;
+                if (self.cb.call_context == &self.cuda_invocation) self.cb.call_context = null;
                 if (self.cb.native_weight_cache) |loan| {
                     if (loan.ptr == @as(*anyopaque, @ptrCast(self)) and loan.prepare == nativeWeightCache) self.cb.native_weight_cache = null;
                 }

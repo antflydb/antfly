@@ -25,6 +25,29 @@ const prepared = @import("prepared_cache.zig");
 const CacheQuota = @import("cache_quota.zig").Quota;
 const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 
+/// A graph-owned reference to independently retained output storage. The
+/// backing descriptor in the arena is borrowed and remains address-stable.
+pub const RetainedOutput = struct {
+    owner: *anyopaque,
+    quota: *CacheQuota,
+    retirement_slot: *?*@import("cache_retirement.zig").PreparedQuotas.Slot,
+    release: *const fn (*anyopaque, Cleanup) void,
+
+    fn validateCleanup(self: RetainedOutput, current: Cleanup) !void {
+        if (self.retirement_slot.*) |slot| {
+            try slot.validateCleanup(current);
+        } else {
+            try self.quota.validateCleanup(current);
+        }
+    }
+
+    fn park(self: RetainedOutput, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
+        std.debug.assert(self.retirement_slot.* == null);
+        if (self.quota.peek()) |lease|
+            self.retirement_slot.* = quotas.reserve(lease) catch unreachable;
+    }
+};
+
 pub fn Program(comptime Recipe: type) type {
     return struct {
         pub const packed_limit = Recipe.packed_limit;
@@ -74,6 +97,7 @@ pub fn Program(comptime Recipe: type) type {
             buffers: [11]Buffer = @splat(.{}),
             quota: CacheQuota = .none,
             output_quota: CacheQuota = .none,
+            retained_output: ?RetainedOutput = null,
             graph: driver.CUgraphExec = null,
             warm: bool = false,
             disabled: bool = false,
@@ -158,8 +182,11 @@ pub fn Program(comptime Recipe: type) type {
                 for (self.buffers, sizes) |buffer, size| if (buffer.len != size) return false;
                 return true;
             }
+            pub fn outputLease(self: *const Arena) ?memory.AdmissionLease {
+                return if (self.retained_output) |output| output.quota.peek() else self.output_quota.peek();
+            }
             pub fn hasBacking(self: *const Arena) bool {
-                return self.bytes() != 0 or self.logical_upload != null or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease() or self.output_quota.hasLease();
+                return self.bytes() != 0 or self.logical_upload != null or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease() or self.output_quota.hasLease() or self.retained_output != null;
             }
             pub fn attentionWorkspacesMatch(self: *const Arena, attention: usize, global_attention: usize, global_generation: u64, blas: usize) bool {
                 return self.attention_workspace == attention and self.global_attention_workspace == global_attention and self.global_attention_generation == global_generation and self.blas_workspace == blas;
@@ -253,6 +280,7 @@ pub fn Program(comptime Recipe: type) type {
             }
             fn deinit(self: *Arena, ctx: *Context) void {
                 self.quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker(); // BEFORE graph/event/buffer SDK destruction
+                std.debug.assert(self.retained_output == null); // only prepared output can be retained
                 self.output_quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 if (self.timing) |*pair| {
                     ctx.destroyEventChecked(&pair.start) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
@@ -390,7 +418,7 @@ pub fn Program(comptime Recipe: type) type {
                 var count: usize = 0;
                 for (self.arenas) |arena_value| {
                     count += try quotas.scanLease(arena_value.quota.peek(), controller);
-                    count += try quotas.scanLease(arena_value.output_quota.peek(), controller);
+                    count += try quotas.scanLease(arena_value.outputLease(), controller);
                 }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| count += try quotas.scanLease(entry.value_ptr.quota.peek(), controller);
@@ -399,7 +427,7 @@ pub fn Program(comptime Recipe: type) type {
             pub fn parkRetirementLeases(self: *Cache, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
                 for (&self.arenas) |*entry| {
                     entry.quota.park(quotas);
-                    entry.output_quota.park(quotas);
+                    if (entry.retained_output) |output| output.park(quotas) else entry.output_quota.park(quotas);
                 }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| entry.value_ptr.quota.park(quotas);
@@ -407,7 +435,7 @@ pub fn Program(comptime Recipe: type) type {
             pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
                 for (self.arenas) |entry| {
                     try entry.quota.validateCleanup(current);
-                    try entry.output_quota.validateCleanup(current);
+                    if (entry.retained_output) |output| try output.validateCleanup(current) else try entry.output_quota.validateCleanup(current);
                 }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| try entry.value_ptr.quota.validateCleanup(current);
@@ -442,6 +470,7 @@ pub fn Program(comptime Recipe: type) type {
                         entry.logical_upload = null;
                     }
                     try entry.quota.releaseAfterSdkDeath(current);
+                    if (entry.retained_output) |output| output.release(output.owner, current);
                     try entry.output_quota.releaseAfterSdkDeath(current);
                     entry.* = .{};
                 }
@@ -465,6 +494,7 @@ pub fn Program(comptime Recipe: type) type {
                 for (&self.arenas) |*entry| {
                     if (entry.logical_upload) |upload| std.heap.smp_allocator.destroy(upload);
                     entry.quota.releaseOutsideExecution();
+                    if (entry.retained_output) |output| output.release(output.owner, .{ .outside_execution = true });
                     entry.output_quota.releaseOutsideExecution();
                 }
                 var iterator = self.weights.iterator();
@@ -554,7 +584,7 @@ pub fn Program(comptime Recipe: type) type {
                 self.clock +|= 1;
                 const selected = preview orelse return null;
                 if (!selected.hit and ctx.prepared_cache_funding == null) {
-                    for (self.arenas, 0..) |value, index| if (selected.victims & (@as(u8, 1) << @intCast(index)) != 0 and (value.quota == .prepared or value.output_quota == .prepared)) return null;
+                    for (self.arenas, 0..) |value, index| if (selected.victims & (@as(u8, 1) << @intCast(index)) != 0 and (value.quota == .prepared or value.output_quota == .prepared or value.retained_output != null)) return null;
                 }
                 if (!selected.hit and selected.victims != 0 and ctx.prepared_cache_funding != null) return null;
                 const entry = &self.arenas[selected.index];

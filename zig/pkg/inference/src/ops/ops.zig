@@ -2981,7 +2981,7 @@ pub const ComputeBackend = struct {
         audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         audioPad: ?*const fn (ctx: *anyopaque, input: CT, p: AudioPadParams) anyerror!?CT = null,
-        audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT = null,
+        audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context) anyerror!?CT = null,
         audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,
         audioBatchLayoutsEnabled: ?*const fn (ctx: *anyopaque) bool = null,
@@ -5753,7 +5753,8 @@ pub const ComputeBackend = struct {
             _ = set(self.ptr, previous);
         };
         try self.checkExecutionControl();
-        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run });
+        const cleanup = if (self.call_context) |invocation| invocation.cleanup else @import("../execution/cleanup_context.zig").Context{};
+        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, cleanup });
         errdefer if (result) |ct| self.free(ct);
         try self.checkExecutionControl();
         return result;
@@ -7800,6 +7801,34 @@ test "decoder assigned output contracts decline legacy providers before submissi
     _ = try cb.decoderRuntimeApplyMultiplyAdd(&.{ .lhs = value, .rhs = value, .addend = value, .dim = 1 });
     _ = try cb.decoderRuntimeApplyMultiplyAdd2(&.{ .lhs0 = value, .rhs0 = value, .lhs1 = value, .rhs1 = value, .dim = 1 });
     try std.testing.expectEqual(@as(usize, 4), submissions);
+}
+
+test "audio execution forwards caller cleanup authority" {
+    const Cleanup = @import("../execution/cleanup_context.zig").Context;
+    const Invocation = @import("../execution/invocation_context.zig").Context;
+    const Epoch = @import("../execution/retirement_sink.zig").Epoch;
+    const Fixture = struct {
+        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: Cleanup) anyerror!?CT {
+            const observed: *Cleanup = @ptrCast(@alignCast(raw));
+            observed.* = cleanup;
+            return try run(context, &.{});
+        }
+        fn body(_: *anyopaque, _: []const CT) anyerror!CT {
+            return @ptrFromInt(16);
+        }
+    };
+    var table = @import("native_compute.zig").vtable_impl;
+    table.audioExecution = Fixture.execute;
+    var observed: Cleanup = .{};
+    var cb = ComputeBackend{ .ptr = &observed, .vtable = &table };
+    const epoch: Epoch = undefined;
+    const invocation: Invocation = .{ .cleanup = .{ .boundary = &epoch } };
+    cb.call_context = &invocation;
+    try std.testing.expect((try cb.audioExecution(0, &.{}, &observed, Fixture.body)) != null);
+    try std.testing.expect(observed.boundary == &epoch);
+    cb.call_context = null;
+    try std.testing.expect((try cb.audioExecution(0, &.{}, &observed, Fixture.body)) != null);
+    try std.testing.expect(observed.boundary == null and !observed.outside_execution);
 }
 
 test "explicit invocation header free forwards caller cleanup and raw fallback never recurses" {
