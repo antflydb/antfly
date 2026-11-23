@@ -1148,6 +1148,7 @@ pub const SharedRedoOverlay = struct {
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (self.reclaimed_through > min_sequence_exclusive) return error.ReadSnapshotReclaimed;
         var list = std.ArrayListUnmanaged([]u8).empty;
         errdefer {
             for (list.items) |key| allocator.free(key);
@@ -2056,4 +2057,21 @@ test "redo overlay microbenchmark: a narrow prefix probe against 10k entries (th
         "OVERLAY_PREFIX_PROBE total_entries={d} iterations={d} ns_per_probe={d}\n",
         .{ total, iterations, elapsed_ns / iterations },
     );
+}
+
+test "redo overlay change scan refuses a reclaimed history" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(alloc);
+    try overlay.appendVersion(alloc, io, 2, "retired", 2, try owned_allocator.dupe(u8, "first"), false, 0, 0);
+    try overlay.appendVersion(alloc, io, 2, "retained", 3, try owned_allocator.dupe(u8, "second"), false, 0, 0);
+    overlay.reclaim(alloc, io, 2);
+    try std.testing.expectError(error.ReadSnapshotReclaimed, overlay.changedKeysAfterAlloc(alloc, io, 2, 1, 4));
+
+    const changed = try overlay.changedKeysAfterAlloc(alloc, io, 2, 2, 4);
+    defer alloc.free(changed);
+    defer for (changed) |key| alloc.free(key);
+    try std.testing.expectEqual(@as(usize, 1), changed.len);
+    try std.testing.expectEqualStrings("retained", changed[0]);
 }

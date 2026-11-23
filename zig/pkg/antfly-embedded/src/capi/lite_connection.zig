@@ -2951,12 +2951,18 @@ pub const Owner = struct {
         if (shared.hasSiblingVersionsAfter(io, since, origin)) return false;
         const Root = native.OverlayRoot;
         {
-            const changed = try shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.metadata), since, origin);
+            const changed = shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.metadata), since, origin) catch |err| switch (err) {
+                error.ReadSnapshotReclaimed => return false,
+                else => return err,
+            };
             defer freeKeys(changed);
             for (changed) |key| if (!routineMetadataKey(key)) return false;
         }
         {
-            const changed = try shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.documents), since, origin);
+            const changed = shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.documents), since, origin) catch |err| switch (err) {
+                error.ReadSnapshotReclaimed => return false,
+                else => return err,
+            };
             defer freeKeys(changed);
             for (changed) |key| if (!routineDocumentKey(key)) return false;
         }
@@ -2965,7 +2971,10 @@ pub const Owner = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         var scopes = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(Catalog.Mutation)).empty;
-        const changed = try shared.changedKeysAfterAlloc(scratch, io, @backingInt(Root.index), since, origin);
+        const changed = shared.changedKeysAfterAlloc(scratch, io, @backingInt(Root.index), since, origin) catch |err| switch (err) {
+            error.ReadSnapshotReclaimed => return false,
+            else => return err,
+        };
         for (changed) |key| {
             const scope = nativeCatalogScopeOf(key) orelse return false;
             const record = key["\x00ncat/".len + scope.len + 1 ..];
