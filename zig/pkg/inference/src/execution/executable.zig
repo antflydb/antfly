@@ -2811,6 +2811,47 @@ test "direct executable diagnostics replace success with actual failed invocatio
     try std.testing.expect(!@import("runtime_observation.zig").kernelEnabled());
 }
 
+/// Verify the executable uses the same ordered placement as the physical
+/// plan. Exact provider identity and the device-zero default are shared by
+/// each provider proof. Backend-specific executor evidence is checked next.
+fn attestOwnedDeviceSchedule(
+    pool: *const @import("physical_buffers.zig").Pool,
+    plan: *const @import("../graph/multi_executor.zig").DevicePartitionPlan,
+    mesh: *const @import("../graph/device_mesh.zig").DeviceMesh,
+    default: *const ops.ComputeBackend,
+    reachable: []const bool,
+) bool {
+    const count = reachable.len;
+    if (pool.plan.node_positions.len != count or plan.base.node_assignment.len != count or
+        plan.device_assignment.len != plan.base.partitions.len) return false;
+    var default_count: usize = 0;
+    for (mesh.devices, 0..) |device, index| {
+        for (mesh.devices[0..index]) |previous| if (previous.id == device.id) return false;
+        if (device.backend.ptr == default.ptr and device.backend.vtable == default.vtable) {
+            if (device.id != 0 or device.kind != default.kind()) return false;
+            default_count += 1;
+        }
+    }
+    if (default_count != 1) return false;
+
+    var ordinal: usize = 0;
+    for (plan.base.partitions, plan.device_assignment, 0..) |part, device_id, partition_index| {
+        var active = false;
+        for (part.node_ids) |id| {
+            if (id >= count or plan.base.node_assignment[id] != partition_index or pool.plan.node_positions[id] != ordinal) return false;
+            ordinal += 1;
+            active = active or reachable[id];
+        }
+        if (!active) continue;
+        const device = mesh.device(device_id) orelse return false;
+        if (device.kind != part.backend) return false;
+        for (pool.backends) |backend| {
+            if (backend.ptr == device.backend.ptr and backend.vtable == device.backend.vtable) break;
+        } else return false;
+    }
+    return ordinal == count;
+}
+
 fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").graph.Graph, analysis: interpreter.CachedAnalysis) !void {
     if (comptime @import("build_options").enable_wasm) return;
     const pool = executable.runtime.physical_pool orelse return;
@@ -2827,16 +2868,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
             const mesh = executable.runtime.mesh orelse return;
             const entry = executable.runtime.runtime_cache_entry orelse return;
             const compiled = entry.compiled_partitions orelse return;
-            if (plan.device_assignment.len != plan.base.partitions.len or plan.base.node_assignment.len != graph.nodeCount() or analysis.reachable.len != graph.nodeCount() or pool.plan.transfers.len != 0) return;
-            var targets: usize = 0;
-            for (mesh.devices, 0..) |device, index| {
-                for (mesh.devices[0..index]) |previous| if (previous.id == device.id) return;
-                if (device.backend.ptr == executable.runtime.default_backend.ptr and device.backend.vtable == executable.runtime.default_backend.vtable) {
-                    if (device.id != 0 or device.kind != .metal) return;
-                    targets += 1;
-                }
-            }
-            if (targets != 1) return;
+            if (pool.plan.transfers.len != 0 or !attestOwnedDeviceSchedule(pool, &plan, &mesh, executable.runtime.default_backend, analysis.reachable)) return;
             const Executor = @import("../graph/metal_partition_executor.zig").MetalPartitionExecutor;
             const projection_head = ops.kernel_descriptor.metalRowProjectionHead(graph) or
                 if (ops.kernel_descriptor.metalProjectionHead(graph)) |head| head.linears[0].operation.linear.rows > 1 else false;
@@ -2879,16 +2911,6 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
                     if (active_partitions != 1 or !Executor.ownsPartition(actual, graph, executable.runtime.default_backend)) return;
                 } else if (!try Executor.attestOwnedFrameDispatch(actual, graph, executable.runtime.default_backend, part.node_ids, analysis.reachable, analysis.last_use)) return;
             }
-            for (analysis.reachable, 0..) |active, id| {
-                if (!active) continue;
-                const assigned = plan.base.node_assignment[id];
-                if (assigned >= plan.base.partitions.len) return;
-                var count: usize = 0;
-                for (plan.base.partitions[assigned].node_ids) |node| if (node == id) {
-                    count += 1;
-                };
-                if (count != 1) return;
-            }
             pool.metal_projection_region_candidate = projection_head and active_partitions == 1;
             pool.metal_frame_dispatch = !projection_head;
             return;
@@ -2899,22 +2921,7 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
     if (@import("cuda_owned_coverage.zig").services(executable.runtime.default_backend.*) != null) {
         const plan = executable.runtime.plan orelse return;
         const mesh = executable.runtime.mesh orelse return;
-        if (plan.device_assignment.len != plan.base.partitions.len or plan.base.node_assignment.len != graph.nodeCount() or analysis.reachable.len != graph.nodeCount()) return;
-        // The runtime always catalogs an independently owned Native fallback
-        // when available. Its mere presence does not execute or transfer data.
-        // However runtimeInputDevice(null source_backend) resolves to literal
-        // DeviceId0, and explicit inputs resolve through the first exact owner
-        // match. Require one unambiguous target at0 and EVERY active part at0.
-        // Unused catalog entries keep their existing fallback behavior.
-        var target_entries: usize = 0;
-        for (mesh.devices, 0..) |entry, entry_index| {
-            for (mesh.devices[0..entry_index]) |previous| if (previous.id == entry.id) return;
-            if (entry.backend.ptr == executable.runtime.default_backend.ptr and entry.backend.vtable == executable.runtime.default_backend.vtable) {
-                if (entry.id != 0 or entry.kind != .cuda) return;
-                target_entries += 1;
-            }
-        }
-        if (target_entries != 1) return;
+        if (!attestOwnedDeviceSchedule(pool, &plan, &mesh, executable.runtime.default_backend, analysis.reachable)) return;
         for (plan.base.partitions, 0..) |part, index| {
             var active = false;
             for (part.node_ids) |id| {
@@ -2927,16 +2934,6 @@ fn configureOwnedCoverage(executable: *Executable, graph: *const @import("ml").g
             if (part.backend != .cuda or part.executor != null or plan.device_assignment[index] != 0) return;
             const device = mesh.device(plan.device_assignment[index]) orelse return;
             if (device.kind != .cuda or device.backend.ptr != executable.runtime.default_backend.ptr or device.backend.vtable != executable.runtime.default_backend.vtable) return;
-        }
-        for (analysis.reachable, 0..) |active, id| {
-            if (!active) continue;
-            const assigned = plan.base.node_assignment[id];
-            if (assigned >= plan.base.partitions.len) return;
-            var count: usize = 0;
-            for (plan.base.partitions[assigned].node_ids) |node| if (node == id) {
-                count += 1;
-            };
-            if (count != 1) return;
         }
         pool.cuda_frame_dispatch = true;
         return;
@@ -3939,8 +3936,10 @@ test "Metal Frame coverage refuses input rooted aliases and keeps tuned linear e
     var projection = ml.graph.Builder.init(&projection_graph);
     const px = try projection.parameter("x", ml.graph.Shape.init(.f32, &.{ 128, 64 }));
     const pw = try projection.parameter("w", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+    const pw2 = try projection.parameter("w2", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
     try projection_graph.markOutput(try projection.linearNoBias(px, pw, 128, 64, 64));
-    var projection_program = try ModelProgram.init(a, &projection_graph, &.{ .{ .name = "x", .node_id = px, .kind = .input }, .{ .name = "w", .node_id = pw, .kind = .input } });
+    try projection_graph.markOutput(try projection.linearNoBias(px, pw2, 128, 64, 64));
+    var projection_program = try ModelProgram.init(a, &projection_graph, &.{ .{ .name = "x", .node_id = px, .kind = .input }, .{ .name = "w", .node_id = pw, .kind = .input }, .{ .name = "w2", .node_id = pw2, .kind = .input } });
     defer projection_program.deinit();
     var tuned = try prepare(a, &projection_program, &cb, .partitioned);
     defer tuned.deinit();
