@@ -101,7 +101,11 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const aarch64_cpu_http_release = ctx.target.result.os.tag == .linux and
         ctx.target.result.cpu.arch == .aarch64 and !ctx.hasAccelerator() and
         (ctx.optimize == .fast or ctx.optimize == .small) and ctx.strip;
-    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (linux_cuda_http_release) 14 * 1024 else if (aarch64_cpu_http_release) 13 * 1024 else http_default_memory_gib * 1024;
+    // GB10/aarch64 CUDA ReleaseFast without stripping measured 26.84 GB.
+    const aarch64_cuda_http_unstripped = ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.backend.enable_cuda and
+        ctx.optimize == .fast and !ctx.strip;
+    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else if (aarch64_cuda_http_unstripped) 32 * 1024 else if (linux_cuda_http_release) 14 * 1024 else if (aarch64_cpu_http_release) 13 * 1024 else http_default_memory_gib * 1024;
     const http_server = b.addExecutable(.{
         .name = "antfly-inference-http-server",
         .max_rss = http_compile_memory_mb * 1024 * 1024,
