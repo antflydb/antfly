@@ -1952,7 +1952,7 @@ pub const AntflyApiHandler = struct {
         else
             self.runDurableSQLRouting(ctx.io, http_server_mod.ApiHttpServer.forwardSQLResourceOperation, .{ self.api_server, id, kind, request, &forwarded })) catch |err| {
             if (forwarded) completion.unknown = true;
-            if (!forwarded and err == error.SqlWriteCapacityUnavailable) return sqlRoutingOverloadedResponse(ctx);
+            if (!forwarded and err == error.SqlWriteCapacityUnavailable) return try sqlRoutingOverloadedResponse(ctx);
             if (err == error.SqlConnectionWrongOwner) return try rejectBeforeSQLExecution(ctx, try ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "08003", .message = "SQL resources must have the same issuing node" }));
             return err;
         };
