@@ -240,6 +240,11 @@ pub const storage_backup_bundle_io = @import("storage/backup_bundle_io.zig");
 pub const storage_backup_codec = @import("storage/backup_codec.zig");
 pub const storage_backup_restore = @import("storage/backup_restore.zig");
 pub const storage_byte_range = @import("storage/byte_range.zig");
+pub const storage_committed_history = @import("storage/committed_history.zig");
+pub const storage_history_recovery_wire = @import("storage/history_recovery_wire.zig");
+pub const storage_history_decision_wire = @import("storage/history_decision_wire.zig");
+pub const storage_history_admission_wire = @import("storage/history_admission_wire.zig");
+pub const storage_history_publication_wire = @import("storage/history_publication_wire.zig");
 pub const storage_commit_participant = @import("storage/commit_participant.zig");
 pub const storage_coordinated_ttl = @import("storage/coordinated_ttl.zig");
 pub const storage_coverage_identity = @import("storage/coverage_identity.zig");
@@ -904,3 +909,20 @@ pub const storage_db_transform_read_plan = @import("storage/db/transform_read_pl
 pub const storage_read_session_contract = @import("storage/read_session_contract.zig");
 
 pub const storage_read_session_values = @import("storage/read_session_values.zig");
+
+pub const storage_transaction_completion = @import("storage/transaction_completion.zig");
+pub const storage_source_legacy_inventory = @import("storage/source_legacy_inventory.zig");
+pub const storage_source_legacy_terminal_ordered = @import("storage/source_legacy_terminal_ordered.zig");
+pub const storage_source_producer_policy = @import("storage/source_producer_policy.zig");
+pub const storage_source_scope_retirement = @import("storage/source_scope_retirement.zig");
+pub const storage_source_scope_retirement_ordered = @import("storage/source_scope_retirement_ordered.zig");
+pub const storage_source_scope_ordered = @import("storage/source_scope_ordered.zig");
+pub const storage_source_scope_control = @import("storage/source_scope_control.zig");
+pub const storage_source_scope = @import("storage/source_scope.zig");
+pub const storage_source_checkpoint = @import("storage/source_checkpoint.zig");
+pub const storage_source_plan_storage = @import("storage/source_plan_storage.zig");
+
+pub const storage_source_plan_control = @import("storage/source_plan_control.zig");
+pub const storage_source_checkpoint_read = @import("storage/source_checkpoint_read.zig");
+
+pub const storage_source_plan_wire = @import("storage/source_plan_wire.zig");

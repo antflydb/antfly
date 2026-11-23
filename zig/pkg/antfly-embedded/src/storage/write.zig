@@ -377,6 +377,7 @@ pub fn corruptEmbeddingArtifactInDb(
 }
 
 pub const ManagedDbOpenOptions = struct {
+    online_source_authority: ?@import("source_authority.zig").Kind = null,
     /// Private restore installs its historical read schema before physical
     /// projections. The ordinary empty producer config must not drop persisted
     /// projections on reopen; exact reservation reconciliation follows open.
@@ -766,6 +767,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     resolved.identity_namespace = namespace;
                     resolved.prefer_existing_identity_namespace = namespace != null;
                     resolved.enrichment = enrichment_cfg;
+                    resolved.online_source_authority = open_options.online_source_authority orelse resolved.online_source_authority;
                     resolved.replication_write_gate = open_options.replication_write_gate;
                     resolved.replication_async_effect_mirror = null;
                     resolved.replication_async_batch_mirror = null;
@@ -795,6 +797,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     .identity_namespace = namespace,
                     .prefer_existing_identity_namespace = namespace != null,
                     .enrichment = enrichment_cfg,
+                    .online_source_authority = open_options.online_source_authority,
                     .replication_write_gate = open_options.replication_write_gate,
                     .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
                     .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
@@ -818,6 +821,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
                             .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
@@ -839,6 +843,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
                             .enrichment = enrichment_cfg,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
                             .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
@@ -865,6 +870,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .replication_async_effect_mirror = open_options.replication_async_effect_mirror,
                             .replication_async_batch_mirror = open_options.replication_async_batch_mirror,
@@ -886,6 +892,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
+                        .online_source_authority = open_options.online_source_authority,
                         .replication_write_gate = open_options.replication_write_gate,
                         .schema_before_index_load = schema_before_index_load,
                         .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -930,6 +937,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
                             .enrichment = enrichment_cfg,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .schema_before_index_load = schema_before_index_load,
                             .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -953,6 +961,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .schema_before_index_load = schema_before_index_load,
                             .start_resolver_workers = !open_options.defer_resolver_workers,
@@ -977,6 +986,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
                             .enrichment = enrichment_cfg,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .open_mode = .query_readonly,
                             .start_index_workers = false,
@@ -996,6 +1006,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .open_mode = .query_readonly,
                             .start_index_workers = false,
@@ -1016,6 +1027,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
                             .enrichment = enrichment_cfg,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .open_mode = .status_only,
                             .start_index_workers = false,
@@ -1035,6 +1047,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                             .remote_content = remote,
                             .identity_namespace = namespace,
                             .prefer_existing_identity_namespace = namespace != null,
+                            .online_source_authority = open_options.online_source_authority,
                             .replication_write_gate = open_options.replication_write_gate,
                             .open_mode = .status_only,
                             .start_index_workers = false,
