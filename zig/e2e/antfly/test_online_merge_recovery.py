@@ -697,6 +697,7 @@ class CdcUploadFault(OwnerLinkFault):
         self.merge_permitted = False
         self.acceptance_upload = None
         self.committed_transactions = {}
+        self.source_transactions = {}
         self.reclaimed = threading.Event()
         self.replacement = None
         self.upload_observations = deque(maxlen=32)
@@ -731,6 +732,24 @@ class CdcUploadFault(OwnerLinkFault):
             transaction = body.get("_transaction", {})
             phase = transaction.get("phase")
             path = body.get("_fault_path", "")
+            if self.window == "cdc_accepted" and phase == "begin_source_scope_v1":
+                scope = transaction["source_scope"]
+                self.source_transactions[transaction["txn_id"]] = (
+                    scope["binding"],
+                    int(scope["token"]),
+                )
+            certified_source = None
+            if self.window == "cdc_accepted" and phase == "publish_completion_v1":
+                txn_id = transaction["txn_id"]
+                source = self.source_transactions.get(txn_id)
+                if source is not None:
+                    envelope = json.loads(transaction["completion_certificate"])
+                    manifest = envelope["certificate"]["manifest"]
+                    if self.wire_bytes(manifest["transaction_id"]).hex() == txn_id:
+                        certified_source = source
+                        self.committed_transactions.setdefault(source[1], set()).add(
+                            txn_id
+                        )
             if self.window == "cdc_accepted":
                 if (
                     self.original is None
@@ -743,10 +762,9 @@ class CdcUploadFault(OwnerLinkFault):
                     self.acceptance_upload = body
                 if self.acceptance_upload is None:
                     return False
-                if phase == "publish_completion_v1" and transaction[
-                    "txn_id"
-                ] in self.committed_transactions.get(
-                    self.upload_token(self.acceptance_upload), ()
+                if certified_source == (
+                    self.acceptance_upload["command"]["spec"]["binding"],
+                    self.upload_token(self.acceptance_upload),
                 ):
                     # The original coordinator committed its native checkpoint
                     # before any participant can publish this certificate.
