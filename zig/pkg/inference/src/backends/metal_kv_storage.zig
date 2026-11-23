@@ -969,51 +969,19 @@ pub const MetalKvStorage = struct {
         if (prepared != 0) return error.DeviceKvCapacityPreparationFailed;
         defer metal_runtime.antfly_metal_kv_growth_discard(stage);
 
-        const Attachment = struct {
-            runtime: *metal_runtime.RawMetalDecodeRuntime,
-            buffer: *anyopaque,
-            fn beginScope(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT) !retirement.Scope.Begun {
-                const value: *@This() = @ptrCast(@alignCast(raw));
-                var origin: u64 = 0;
-                const pending = metal_runtime.antfly_metal_output_retirement_begin(value.runtime, &origin, retirement.Queue.createIdentity);
-                if (pending < 0) return error.InvalidResourceRetirement;
-                metal_runtime.antfly_metal_output_retirement_end(value.runtime);
-                // These freshly allocated buffers have not been encoded yet.
-                // Unrelated frame/reuse-pool batches do not own this claim.
-                return .{ .origin = .{ .identity = origin }, .pending_batches = 0 };
-            }
-            fn end(_: *anyopaque) void {}
-            fn attach(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload) !void {
-                const value: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidResourceRetirement;
-                const buffers = [_]*anyopaque{value.buffer};
-                const witnesses = metal_runtime.antfly_metal_prepare_retirement_witnesses(&buffers, buffers.len, payload) orelse return error.OutOfMemory;
-                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
-                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
-            }
-            fn attachPrepared(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload, metadata: *retirement.BackendPreparation) !void {
-                const value: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidResourceRetirement;
-                const buffers = [_]*anyopaque{value.buffer};
-                const witnesses = try metadata.armMetal(null, &buffers, payload);
-                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
-                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
-            }
-            const table = retirement.Scope.VTable{ .begin = beginScope, .attach = attach, .attach_prepared = attachPrepared, .end = end, .notify = metal_runtime.antfly_metal_request_retirement_poll };
-        };
         for (plan.layers[0..plan.count], 0..) |layer, index| {
             const planned_planes = [_]storage_runtime.device_capacity.Plane{ layer.keys, layer.values };
             for (planned_planes, 0..) |plane, which| if (plane.new_length != 0) {
                 const buffer = metal_runtime.antfly_metal_kv_growth_buffer(stage.?, index, which) orelse return error.InvalidResourceRetirement;
                 const owner = claim.ownerAt(index, which);
                 owner.measure(cleanup, metal_runtime.termite_metal_buffer_allocated_size(buffer));
-                var attachment = Attachment{ .runtime = self.runtime, .buffer = buffer };
-                const begun = try Attachment.beginScope(&attachment, &.{});
-                var scope = retirement.Scope{ .context = &attachment, .origin = begun.origin, .pending_batches = begun.pending_batches, .outputs = &.{}, .active = true, .vtable = &Attachment.table };
-                defer scope.end();
-                if (begun.pending_batches != 0) return error.SharedKvCopyDuringFrame;
-                try owner.charge.attach(&scope);
-                scope.end();
+                var origin: u64 = 0;
+                const pending = metal_runtime.antfly_metal_output_retirement_begin(self.runtime, &origin, retirement.Queue.createIdentity);
+                if (pending < 0) return error.InvalidResourceRetirement;
+                metal_runtime.antfly_metal_output_retirement_end(self.runtime);
+                // The new buffers have never been encoded. Unrelated frames
+                // and the reuse pool do not own any part of their charge.
+                try metal_runtime.attachStandaloneRetirement(owner.charge, &.{buffer}, .{ .identity = origin }, true, metal_runtime.antfly_metal_request_retirement_poll);
             };
         }
         const copied = metal_runtime.antfly_metal_kv_growth_copy_checked(stage);
@@ -1566,37 +1534,6 @@ pub const MetalKvStorage = struct {
                 return self.reservation.?.partition(allocator, bytes);
             }
         };
-        const Attachment = struct {
-            buffer: *anyopaque,
-            origin: retirement.Queue,
-            fn begin(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT) !retirement.Scope.Begun {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                return .{ .origin = self.origin, .pending_batches = 0 };
-            }
-            fn attach(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidResourceRetirement;
-                const handles = [_]*anyopaque{self.buffer};
-                const prepared = metal_runtime.antfly_metal_prepare_retirement_witnesses(&handles, 1, payload) orelse return error.OutOfMemory;
-                defer metal_runtime.antfly_metal_discard_retirement_witnesses(prepared);
-                if (metal_runtime.antfly_metal_buffer_retirement_attach(prepared) != 0) return error.InvalidResourceRetirement;
-            }
-            fn attachPrepared(raw: *anyopaque, _: []const @import("../ops/ops.zig").CT, nodes: []retirement.Node, payload: retirement.Payload, metadata: *retirement.BackendPreparation) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                if (nodes.len != 0) return error.InvalidResourceRetirement;
-                const handles = [_]*anyopaque{self.buffer};
-                const witnesses = try metadata.armMetal(null, &handles, payload);
-                defer metal_runtime.antfly_metal_discard_retirement_witnesses(witnesses);
-                if (metal_runtime.antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
-            }
-            fn end(_: *anyopaque) void {}
-            const table = retirement.Scope.VTable{ .begin = begin, .attach = attach, .attach_prepared = attachPrepared, .end = end, .notify = metal_runtime.antfly_metal_request_retirement_poll };
-            fn bind(self: *@This(), owner: *capacity.BackingOwner) !void {
-                var scope = retirement.Scope{ .context = self, .origin = self.origin, .pending_batches = 0, .outputs = &.{}, .active = true, .vtable = &table };
-                defer scope.end();
-                try owner.charge.attach(&scope);
-            }
-        };
 
         /// Pure pre-join description: no SDK handles, allocation or lane access.
         pub fn describeCoverage(target: cold.Target, dtype: pool_mod.KvDType, window: capacity.Window, mode: banks.Mode, geometry: []const capacity.LayerGeometry) !?banks.Descriptor {
@@ -1748,14 +1685,12 @@ pub const MetalKvStorage = struct {
             const origin = retirement.Queue.init();
             // Roots in claim/retiring remain live until after this Gate unwinds.
             if (retiring) |r| for (r.owners, old_handles[0..old_count]) |*owner, buffer| {
-                var attachment = Attachment{ .buffer = buffer, .origin = origin };
-                try attachment.bind(owner);
+                try metal_runtime.attachStandaloneRetirement(owner.charge, &.{buffer}, origin, true, metal_runtime.antfly_metal_request_retirement_poll);
             };
             for (slots[0..self.count], 0..) |slot, index| {
                 const buffers = [2]*anyopaque{ slot.keys, slot.values };
                 for (buffers, 0..) |buffer, which| {
-                    var attachment = Attachment{ .buffer = buffer, .origin = origin };
-                    try attachment.bind(claim.ownerAt(index, which));
+                    try metal_runtime.attachStandaloneRetirement(claim.ownerAt(index, which).charge, &.{buffer}, origin, true, metal_runtime.antfly_metal_request_retirement_poll);
                 }
             }
             if (metal_runtime.antfly_metal_initialize_leased_kv_slots(runtime, &slots, self.count) != 0) return error.DeviceKvCapacityPreparationFailed;

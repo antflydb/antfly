@@ -51091,6 +51091,46 @@ pub extern fn antfly_metal_set_retirement_poll(callback: *const fn () callconv(.
 pub extern fn antfly_metal_request_retirement_poll() callconv(.c) void;
 pub extern fn antfly_metal_prepare_retirement_witnesses_with_frames(runtime: *RawMetalDecodeRuntime, buffers: [*]const *anyopaque, count: usize, payload: @import("../execution/resource_retirement.zig").Payload) ?*anyopaque;
 
+/// Attach a charge to already allocated SDK roots without observing or
+/// joining any unrelated runtime frame or reuse pool.
+pub fn attachStandaloneRetirement(
+    charge: *@import("../execution/resource_retirement.zig").Charge,
+    roots: []const *anyopaque,
+    origin: @import("../execution/resource_retirement.zig").Queue,
+    comptime allow_unprepared: bool,
+    comptime notify: *const fn () callconv(.c) void,
+) !void {
+    const retirement = @import("../execution/resource_retirement.zig");
+    const CT = @import("../ops/ops.zig").CT;
+    const Attachment = struct {
+        roots: []const *anyopaque,
+        fn begin(_: *anyopaque, _: []const CT) !retirement.Scope.Begun {
+            return error.InvalidResourceRetirement;
+        }
+        fn publish(witnesses: *anyopaque) !void {
+            defer antfly_metal_discard_retirement_witnesses(witnesses);
+            if (antfly_metal_buffer_retirement_attach(witnesses) != 0) return error.InvalidResourceRetirement;
+        }
+        fn attach(raw: *anyopaque, _: []const CT, nodes: []retirement.Node, payload: retirement.Payload) !void {
+            if (!allow_unprepared or nodes.len != 0) return error.InvalidResourceRetirement;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try publish(antfly_metal_prepare_retirement_witnesses(self.roots.ptr, self.roots.len, payload) orelse return error.OutOfMemory);
+        }
+        fn attachPrepared(raw: *anyopaque, _: []const CT, nodes: []retirement.Node, payload: retirement.Payload, metadata: *retirement.BackendPreparation) !void {
+            if (nodes.len != 0) return error.InvalidResourceRetirement;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try publish(try metadata.armMetal(null, self.roots, payload));
+        }
+        fn end(_: *anyopaque) void {}
+        const table = retirement.Scope.VTable{ .begin = begin, .attach = attach, .attach_prepared = attachPrepared, .end = end, .notify = notify };
+    };
+    if (roots.len == 0) return error.InvalidResourceRetirement;
+    var attachment = Attachment{ .roots = roots };
+    var scope = retirement.Scope{ .context = &attachment, .origin = origin, .outputs = &.{}, .active = true, .vtable = &Attachment.table };
+    defer scope.end();
+    try charge.attach(&scope);
+}
+
 pub const RawInitialKvSlot = extern struct {
     slot: usize,
     old_keys: ?*anyopaque,
