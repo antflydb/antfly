@@ -69,7 +69,7 @@ const LocalSchemaProgressProvider = struct {
 };
 const default_public_port: u16 = 8080;
 const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
-const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "If-Match" };
+const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "If-Match", "Idempotency-Key" };
 const cors_default_exposed_headers = [_][]const u8{
     "X-Request-ID",
     "Retry-After",
@@ -80,6 +80,7 @@ const cors_default_exposed_headers = [_][]const u8{
     "X-RateLimit-Remaining",
     "X-RateLimit-Reset",
     "X-Antfly-Next-Cursor",
+    "Antfly-Changefeed-Cursor",
 };
 const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
@@ -4029,6 +4030,36 @@ const LocalStandaloneMetadata = struct {
         return .{ .ptr = self, .checkpoint_fn = cdcPermitCheckpoint, .deadline_fn = cdcPermitDeadline };
     }
 
+    const LakeStreamRequest = antfly.metadata_replication_backfill.ExternalStreamDestination.Request;
+
+    fn checkLakeStreamOwner(raw: *anyopaque, request: LakeStreamRequest) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(raw));
+        try cdcPermitCheckpoint(self, .stream_step);
+        const service = CdcService{ .metadata = self };
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const store = try service.store();
+        const table = (try store.getTable(self.alloc, CdcService.group, request.table.table_id)) orelse return error.CatalogGenerationChanged;
+        defer CdcService.tm.freeTable(self.alloc, table);
+        if (table.object_storage_generation != request.table.object_storage_generation or
+            !std.mem.eql(u8, table.schema_json, request.table.schema_json) or
+            !std.mem.eql(u8, table.replication_sources_json, request.table.replication_sources_json)) return error.CatalogGenerationChanged;
+        const current = (try store.getReplicationSourceStatus(self.alloc, CdcService.group, table.table_id, request.cutover.source_ordinal)) orelse return error.ReplicationCutoverAuthorityLost;
+        defer CdcService.tm.freeReplicationSourceStatus(self.alloc, current);
+        if (!antfly.metadata_service.replicationCutoverAuthorityMatches(current, request.cutover)) return error.ReplicationCutoverAuthorityLost;
+        if (request.cutover.retired_cutover_authority_id != 0 and
+            !antfly.metadata_service.replicationCutoverRetirementMatches(current, request.cutover)) return error.ReplicationCutoverAuthorityLost;
+        const definition = try @import("../metadata/source_control.zig").definitionDigest(self.alloc, table.replication_sources_json, request.cutover.source_ordinal);
+        if (!try store.legacyReplicationSourceIntakeAllowed(self.alloc, CdcService.group, table.table_id, request.cutover.source_ordinal, definition)) return error.SourcePendingWork;
+    }
+
+    fn resolveLakeStreamOwner(raw: *anyopaque, a: std.mem.Allocator, request: LakeStreamRequest) !@import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(raw));
+        const data = self.data_server orelse return error.UnsupportedReplicationRoute;
+        const server = if (data.http_server) |*api| api else return error.UnsupportedReplicationRoute;
+        return server.lakeStreamOwnerOptions(.{ .allocator = a, .table = request.table, .request = .{ .deadline_ns = request.deadline_ns } });
+    }
+
     /// One snapshot round then one streaming round, the same sequence and
     /// coordinators cluster metadata runs from its leader. The snapshot and
     /// streaming resume cursors live on `self.cdc` (the scheduler), not on
@@ -4049,11 +4080,17 @@ const LocalStandaloneMetadata = struct {
         var cursors = self.cdc.loadCursors();
         defer self.cdc.storeCursors(cursors.snapshot, cursors.streaming);
 
+        var lake_owner: @import("../serverless/lake_ingestion.zig").StreamOwner = .{
+            .ptr = self,
+            .resolve = resolveLakeStreamOwner,
+            .check = checkLakeStreamOwner,
+        };
         const summary = backfill.runSnapshotRound(self.alloc, service, .{
             .alloc = self.alloc,
             .io = io,
             .registry = &self.cdc.registry,
             .write_source = write_source,
+            .external_destination = lake_owner.port(),
             .secret_store = server.write_source.secret_store,
             .work_permit = self.cdcWorkPermit(),
             .destination_authorizer = server.write_source.destination_authorizer,
@@ -4071,6 +4108,7 @@ const LocalStandaloneMetadata = struct {
             .io = io,
             .registry = &self.cdc.registry,
             .write_source = write_source,
+            .external_destination = lake_owner.port(),
             .secret_store = server.write_source.secret_store,
             .work_permit = self.cdcWorkPermit(),
             .destination_authorizer = server.write_source.destination_authorizer,
@@ -4222,6 +4260,15 @@ const LocalStandaloneMetadata = struct {
             defer tm.freeTable(alloc, table);
             if (!std.mem.eql(u8, table.replication_sources_json, expected_replication_sources_json)) return error.ReplicationSourceConfigChanged;
             return error.ReplicationCutoverAuthorityLost;
+        }
+
+        pub fn legacyReplicationSourceIntakeAllowed(self: CdcService, table_id: u64, ordinal: u32, definition: [32]u8) !bool {
+            const m = self.metadata;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            try refreshLocked(m);
+            const lifecycle = try self.store();
+            return lifecycle.legacyReplicationSourceIntakeAllowed(m.alloc, group, table_id, ordinal, definition);
         }
 
         pub fn replicationSourceAuthorityCurrent(
@@ -9889,6 +9936,16 @@ test "standalone cdc accepts Postgres replication sources" {
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "tickets", .{ .replication_sources_json = owned_sources });
     const created = metadata.findTableByNameLocked("tickets") orelse return error.TestExpectedTable;
     try std.testing.expect(std.mem.indexOf(u8, created.replication_sources_json, "public.tickets") != null);
+    const source_control = @import("../metadata/source_control.zig");
+    const definition = try source_control.definitionDigest(alloc, created.replication_sources_json, 0);
+    const cdc_service = LocalStandaloneMetadata.CdcService{ .metadata = &metadata };
+    try std.testing.expect(try cdc_service.legacyReplicationSourceIntakeAllowed(created.table_id, 0, definition));
+    const scope: source_control.Scope = .{ .table_id = created.table_id, .source_id = @splat(71), .source_ordinal = 0, .generation = 1, .definition = definition, .provider = @splat(72), .destination = .native, .destination_binding = @splat(73) };
+    const configured = try source_control.encodeWrite(alloc, .{ .table_id = scope.table_id, .source_id = scope.source_id, .expected_revision = 0, .expected_binding = scope.identity(), .expected_catalog_digest = source_control.digest(created.replication_sources_json), .mutation = .{ .configure = scope } });
+    defer alloc.free(configured);
+    try cdc_service.apply(.{ .apply_source_control = configured });
+    try std.testing.expect(!try cdc_service.legacyReplicationSourceIntakeAllowed(scope.table_id, 0, definition));
+
     // Tables without sources, and an explicit empty list, are unaffected.
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "plain", .{});
     const empty_sources = try alloc.dupe(u8, "[]");
@@ -10752,7 +10809,7 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings(
-            "X-Request-ID, Retry-After, ETag, X-Antfly-Raft-Mutation-Outcome, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor",
+            "X-Request-ID, Retry-After, ETag, X-Antfly-Raft-Mutation-Outcome, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor, Antfly-Changefeed-Cursor",
             response.headers.get("Access-Control-Expose-Headers").?,
         );
     }
@@ -10762,12 +10819,12 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
             .OPTIONS,
             "https://any.example",
             "POST",
-            "content-type, AUTHORIZATION",
+            "content-type, AUTHORIZATION, idempotency-key",
         );
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 204), response.status.code);
         try std.testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS, PATCH", response.headers.get("Access-Control-Allow-Methods").?);
-        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin, If-Match", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin, If-Match, Idempotency-Key", response.headers.get("Access-Control-Allow-Headers").?);
         try std.testing.expectEqualStrings("3600", response.headers.get("Access-Control-Max-Age").?);
     }
     {

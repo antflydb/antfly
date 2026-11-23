@@ -216,7 +216,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
         }
         fn parallelReducers(specs: []const operators.AggregateSpec) bool {
             for (specs) |spec| {
-                if (spec.distinct or spec.kind == .pattern_set) return false;
+                if (spec.distinct or (spec.kind == .pattern_set or spec.kind == .array_agg)) return false;
                 // Preserve ordered floating SUM/AVG behavior. Exact integer
                 // and NUMERIC states can be merged without rounding changes.
                 if ((spec.kind == .sum or spec.kind == .avg) and spec.input_type != .integer and spec.input_element != .numeric) return false;

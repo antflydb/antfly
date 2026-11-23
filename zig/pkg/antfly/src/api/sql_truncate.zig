@@ -344,8 +344,10 @@ pub fn executeBound(server: *server_mod.ApiHttpServer, identity: ?server_mod.Aut
     }
     const principal = server_mod.storedDestinationPrincipal(identity);
     try server.requireEmptyGenerationAuthority(principal, names);
+    const restore_io = server.restore_job_store.io orelse return error.SqlTruncateCoordinatorRequired;
+    if (server.restore_job_store.replicated == null) return error.SqlTruncateCoordinatorRequired;
     var random: [16]u8 = undefined;
-    try (server.restore_job_store.io orelse return error.AsyncRestoreUnavailable).randomSecure(&random);
+    try restore_io.randomSecure(&random);
     const key = std.fmt.bytesToHex(random, .lower);
     const idempotency_namespace = try std.fmt.allocPrint(a, "sql-truncate:{s}", .{principal});
     const job_id = try jobs.jobIdForIdempotency(a, idempotency_namespace, &key);
