@@ -50,6 +50,7 @@ pub fn lookupSnapshotRow(
     metadata: @FieldType(configured.BindingObjectStoreOpenOptions, "retained_catalog_metadata"),
     keys: []const []const u8,
     key: std.json.Value,
+    keys_only: bool,
     context: operation.RequestContext,
     options: configured.BindingObjectStoreOpenOptions,
 ) !?std.json.Value {
@@ -57,8 +58,11 @@ pub fn lookupSnapshotRow(
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const fields = try scratch.alloc([]const u8, table.columns.len);
-    for (table.columns, fields) |column, *field| field.* = column.name;
+    const fields = if (keys_only) keys else all: {
+        const names = try scratch.alloc([]const u8, table.columns.len);
+        for (table.columns, names) |column, *field| field.* = column.name;
+        break :all names;
+    };
     const conditions = try scratch.alloc(catalog.Condition, keys.len);
     for (keys, conditions) |name, *condition| {
         const value = key.object.get(name) orelse return error.InvalidLakeKey;

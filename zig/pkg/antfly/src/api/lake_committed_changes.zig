@@ -110,7 +110,8 @@ pub const GroupCache = struct {
         refs: std.atomic.Value(usize) = .init(1),
         arena: std.heap.ArenaAllocator,
         group: IndexedGroup,
-        image_window_hint: std.atomic.Value(usize) = .init(64),
+        row_window_hint: std.atomic.Value(usize) = .init(64),
+        key_window_hint: std.atomic.Value(usize) = .init(64),
         used: u64 = 0,
 
         fn release(self: *Owner) void {
@@ -549,18 +550,24 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 @min(batch.changes.len, @as(usize, from) + @min(limits.events, 64));
             if (from > stop or stop > batch.changes.len or stop - from > 64)
                 return error.ChangefeedResynchronizationRequired;
-            const hint = if (bound == null and next.cached != null)
-                next.cached.?.image_window_hint.load(.monotonic)
+            const keys_only = if (comptime @hasDecl(Policy, "requiresRowImages"))
+                state.definition.?.projection != .rows and selector.predicates.len == 0 and
+                    !try self.policy.requiresRowImages(selector.table_id)
             else
-                64;
+                false;
+            const cache_hint = if (bound == null)
+                if (next.cached) |cached| (if (keys_only) &cached.key_window_hint else &cached.row_window_hint) else null
+            else
+                null;
+            const hint = if (cache_hint) |cached| cached.load(.monotonic) else 64;
             stop = @min(stop, from + hint);
             var reduced = false;
             while (true) {
-                const rendered = self.boundedPageWindow(a, state, selector, next, start, from, stop, bound != null, limits, request) catch |err| switch (err) {
+                const rendered = self.boundedPageWindow(a, state, selector, next, start, from, stop, keys_only, bound != null, limits, request) catch |err| switch (err) {
                     error.IcebergChangefeedImageBudgetExceeded => {
                         if (bound != null or stop - from <= 1) return error.ChangefeedBackpressure;
                         const smaller = (stop - from) / 2;
-                        if (next.cached) |cached| _ = cached.image_window_hint.fetchMin(smaller, .monotonic);
+                        if (cache_hint) |cached| _ = cached.fetchMin(smaller, .monotonic);
                         stop = from + smaller;
                         reduced = true;
                         continue;
@@ -568,16 +575,16 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                     else => return err,
                 };
                 if (bound == null and !reduced and hint < 64 and stop - from == hint) {
-                    if (next.cached) |cached| {
+                    if (cache_hint) |cached| {
                         const wider = @min(64, hint + @max(1, hint / 8));
-                        _ = cached.image_window_hint.cmpxchgStrong(hint, wider, .monotonic, .monotonic);
+                        _ = cached.cmpxchgStrong(hint, wider, .monotonic, .monotonic);
                     }
                 }
                 return rendered;
             }
         }
 
-        fn boundedPageWindow(self: *Self, a: A, state: control.State, selector: control.Table, next: CommittedGroup, start: control.Position, from: usize, stop: usize, replaying: bool, limits: delivery.Limits, request: Context) !Page {
+        fn boundedPageWindow(self: *Self, a: A, state: control.State, selector: control.Table, next: CommittedGroup, start: control.Position, from: usize, stop: usize, keys_only: bool, replaying: bool, limits: delivery.Limits, request: Context) !Page {
             const batch = next.indexed.committed.group.batch;
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
@@ -595,11 +602,6 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 index.* = if (entry != null) keys.items.len else null;
                 if (entry) |key| try keys.append(scratch, key);
             }
-            const keys_only = if (comptime @hasDecl(Policy, "requiresRowImages"))
-                mode == .keys_and_versions and selector.predicates.len == 0 and
-                    !try self.policy.requiresRowImages(selector.table_id)
-            else
-                false;
             const prior_images = if (next.indexed.committed.interval.parent) |parent|
                 cursor.lookupSnapshotRows(scratch, next.before_table.?, parent, self.metadata, batch.key_fields, keys.items, keys_only, request, self.options) catch |err| switch (err) {
                     error.IcebergChangefeedImageBudgetExceeded => if (replaying or stop - from == 1) null else return err,
@@ -626,13 +628,13 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 const before = if (prior_images) |images|
                     images[index]
                 else if (next.indexed.committed.interval.parent) |parent|
-                    try lookup(row_alloc, next.before_table.?, parent, self.metadata, batch.key_fields, key.row, request, self.options)
+                    try lookup(row_alloc, next.before_table.?, parent, self.metadata, batch.key_fields, key.row, keys_only, request, self.options)
                 else
                     null;
                 const after = if (committed_images) |images|
                     images[index]
                 else
-                    try lookup(row_alloc, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, key.row, request, self.options);
+                    try lookup(row_alloc, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, key.row, keys_only, request, self.options);
                 const authorized = try self.policy.imagesFor(row_alloc, selector.table_id, identity, before, after, request);
                 const effect = (try projection.project(row_alloc, selector, mode, authorized.before, authorized.after)) orelse continue;
                 const event: native.Event = .{

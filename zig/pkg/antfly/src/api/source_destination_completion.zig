@@ -53,17 +53,13 @@ pub fn recover(
     svc: anytype,
     admission: @import("source_destination_admission.zig").Admission,
     a: std.mem.Allocator,
-    binding: source.Scope,
+    current: source.State,
     catalog_digest: source.Digest,
     context: Context,
 ) !void {
-    const raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
-    defer a.free(raw);
-    var state = try source.parse(a, raw);
-    defer state.deinit();
-    const current = state.value;
-    if (!current.scope_fencing or !current.manifest_retention or current.retired or
-        !std.meta.eql(current.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;
+    const binding = current.scope orelse return error.SourceBindingConflict;
+    if (!current.scope_fencing or !current.manifest_retention or current.retired)
+        return error.SourceBindingConflict;
     const record = current.artifact_control.?.current orelse return;
 
     if (current.pending) |pending| {

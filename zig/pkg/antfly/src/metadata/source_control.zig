@@ -433,6 +433,7 @@ pub fn isNativeSnapshotScopedCheckpoint(checkpoint: []const u8) bool {
 
 pub const Mutation = union(enum) {
     observe_stream_failure: ?StreamFailure,
+    observe_qualified_stream_failure: ?StreamFailure,
     observe_completion_wait: u64,
     observe_completion_stall: u64,
     observe_qualified_completion_stall: u64,
@@ -472,7 +473,7 @@ pub const Mutation = union(enum) {
 
     pub fn validate(self: Mutation) !void {
         switch (self) {
-            .observe_stream_failure => |failure| if (failure) |value| try value.validate(),
+            .observe_stream_failure, .observe_qualified_stream_failure => |failure| if (failure) |value| try value.validate(),
             .observe_completion_wait, .observe_completion_stall, .observe_qualified_completion_stall => |observed| if (observed == 0) return error.InvalidSourceControl,
             .begin_legacy_handover => |handover| {
                 try handover.scope.validate();
@@ -534,8 +535,10 @@ pub const Mutation = union(enum) {
                     next.completion_wait_independent = self == .observe_qualified_completion_stall;
                 }
             },
-            .observe_stream_failure => |failure| {
+            .observe_stream_failure, .observe_qualified_stream_failure => |failure| {
                 if (!state.scope_fencing or state.closing or state.retired) return error.SourceBindingConflict;
+                if (self == .observe_qualified_stream_failure and state.completion_wait_since_ms != null)
+                    next.completion_wait_independent = true;
                 next.stream_failure = if (failure) |value| .{
                     .code = try a.dupe(u8, value.code),
                     .terminal = value.terminal,
@@ -1469,7 +1472,7 @@ pub fn requiredProtocol(mutation: Mutation) u16 {
         .observe_stream_failure => scoped_stream_lifecycle_protocol_version,
         .observe_completion_wait => scoped_completion_health_protocol_version,
         .observe_completion_stall => independent_completion_stall_protocol_version,
-        .observe_qualified_completion_stall => qualified_completion_stall_protocol_version,
+        .observe_qualified_completion_stall, .observe_qualified_stream_failure => qualified_completion_stall_protocol_version,
         .close, .enable_scope_fencing => closing_protocol_version,
         .certify_native_bootstrap => native_bootstrap_protocol_version,
         .certify_native_snapshot_pages => scoped_snapshot_protocol_version,
@@ -1794,8 +1797,8 @@ test "source control scope fencing pins idle bindings until closing retirement a
     var independent = try (Mutation{ .reserve = reservation }).apply(ca, state);
     independent = try (Mutation{ .seal_artifact = .{ .reservation_digest = reservation_id, .stamp = @splat(8) } }).apply(ca, independent);
     independent = try (Mutation{ .accept = .{ .reservation_digest = reservation_id, .receipt = "accepted" } }).apply(ca, independent);
-    independent = try (Mutation{ .observe_qualified_completion_stall = 100_000 }).apply(ca, independent);
-    independent = try (Mutation{ .observe_stream_failure = .{ .code = completion_wait_error, .terminal = false, .observed_at_ms = 110_000 } }).apply(ca, independent);
+    independent = try (Mutation{ .observe_completion_wait = 100_000 }).apply(ca, independent);
+    independent = try (Mutation{ .observe_qualified_stream_failure = .{ .code = completion_wait_error, .terminal = false, .observed_at_ms = 110_000 } }).apply(ca, independent);
     independent = try (Mutation{ .observe_qualified_completion_stall = 130_000 }).apply(ca, independent);
     try std.testing.expectEqual(@as(?u64, 130_000), independent.completion_stalled_at_ms);
     independent = try (Mutation{ .commit = .{ .sequence = 1, .receipt_digest = digest("accepted"), .reference = "committed" } }).apply(ca, independent);

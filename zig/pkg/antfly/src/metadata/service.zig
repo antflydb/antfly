@@ -11489,7 +11489,10 @@ pub const MetadataHttpService = struct {
             .secret = self.internal_service_secret,
             .issuer = self.internal_service_issuer,
         };
-        const raw = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
+        // The worker's ReadIndex above covers both the scope lookup and this
+        // state read. Revalidate binding here and revision on every mutation.
+        try context.ensureActive();
+        const raw = try store.getSourceControl(a, self.metadata_group_id, scope.table_id, scope.source_id);
         defer a.free(raw);
         var state = try control.parse(a, raw);
         defer state.deinit();
@@ -11510,7 +11513,7 @@ pub const MetadataHttpService = struct {
         const admission = hosted.sourceAdmission();
         if (state.artifact_control.?.current) |record| {
             try ensureCdcWorkPermit(self);
-            try @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), context);
+            try @import("../api/source_destination_completion.zig").recover(self, admission, a, state, control.digest(table.replication_sources_json), context);
             if (record.phase != .reserved or state.closing) return;
             const after = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
             defer a.free(after);
@@ -11612,15 +11615,22 @@ pub const MetadataHttpService = struct {
         const control = @import("source_control.zig");
         const scope = state.scope orelse return error.SourceBindingConflict;
         try ensureCdcWorkPermit(self);
-        control.mutateOnService(self, a, .{
+        var write: control.Write = .{
             .table_id = scope.table_id,
             .source_id = scope.source_id,
             .expected_revision = state.revision,
             .expected_binding = scope.identity(),
             .expected_catalog_digest = control.digest(table.replication_sources_json),
-            .mutation = .{ .observe_stream_failure = failure },
-        }, context) catch |err| switch (err) {
-            error.TableTopologyProtocolUpgradeRequired => {},
+            .mutation = .{ .observe_qualified_stream_failure = failure },
+        };
+        control.mutateOnService(self, a, write, context) catch |err| switch (err) {
+            error.TableTopologyProtocolUpgradeRequired => {
+                write.mutation = .{ .observe_stream_failure = failure };
+                control.mutateOnService(self, a, write, context) catch |legacy_err| switch (legacy_err) {
+                    error.TableTopologyProtocolUpgradeRequired => {},
+                    else => return legacy_err,
+                };
+            },
             else => return err,
         };
     }
