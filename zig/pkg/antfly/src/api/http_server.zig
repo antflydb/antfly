@@ -66003,7 +66003,8 @@ test "SQL pgwire native restart discards unpublished subscriptions without claim
         completion.deinit(a);
         completion = .{};
     }
-    try std.testing.expectEqual(@as(u64, 4), try durable.registrationFloor());
+    // The injected live publication also consumed and retired a sequence.
+    try std.testing.expectEqual(@as(u64, 5), try durable.registrationFloor());
 }
 
 test "SQL policy publication submission distinguishes preflight refusal from unknown durable admission" {
