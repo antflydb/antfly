@@ -8867,7 +8867,10 @@ pub const DataServer = struct {
         // Reuse the Raft host's transport unless the caller supplied one.
         if (api_server_cfg.session_router == null) api_server_cfg.session_router = self.dataReadGroupRouter();
         if (api_server_cfg.session_executor == null) {
-            if (self.data_raft) |raft| api_server_cfg.session_executor = raft.host.http_host.request_executor;
+            if (self.data_raft) |raft| {
+                api_server_cfg.session_executor = raft.host.http_host.request_executor;
+                if (raft.host.http_host.executor) |executor| api_server_cfg.configureDefaultSqlPeerTransport(executor.cfg);
+            }
         }
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHotStandbyPublicGateState();
@@ -67445,7 +67448,7 @@ fn implementationTests() type {
                 const io = virtual_io.io();
                 var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
                     .backend = .manual,
-                    .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.request_forward_workers_per_request },
+                    .lane_limits = .{ .request_forward = @import("antfly_runtime_fs").threaded_io_limits.sql_request_forward_workers_per_request },
                     .borrowed_io = .{ .general = io, .control = io, .request_forward = io },
                 });
                 defer runtime.deinit();
