@@ -768,7 +768,7 @@ pub const Schedule = struct {
         errdefer a.free(values);
         const implementation = route.Implementation{ .context = builder.backend.ptr, .table = builder.backend.vtable };
         const bindings = input_facts.InputSource{ .indexed = .{ .entries = builder.bindings.items, .planes = builder.planes.items, .implementation = implementation } };
-        const immutable = input_facts.InputSource{ .indexed = .{ .entries = builder.immutable_resident.items, .planes = builder.planes.items, .implementation = implementation } };
+        const immutable = input_facts.InputSource{ .indexed = .{ .entries = builder.immutable_resident.items, .planes = builder.planes.items, .implementation = implementation, .tensors_by_node = if (builder.backend.kind() == .metal) values else null } };
         return createPrepared(a, builder.backend, definition, values, immutable, bindings);
     }
     /// Values and planes belong to this request. Only the frozen pure recipe
@@ -790,7 +790,7 @@ pub const Schedule = struct {
             if (entry.plane) |index| planes[index] = try currentPlane(cb, parameter, current);
         }
         const implementation = route.Implementation{ .context = cb.ptr, .table = cb.vtable };
-        const immutable = input_facts.InputSource{ .indexed = .{ .entries = definition.immutable_recipe, .planes = planes, .implementation = implementation } };
+        const immutable = input_facts.InputSource{ .indexed = .{ .entries = definition.immutable_recipe, .planes = planes, .implementation = implementation, .tensors_by_node = if (cb.kind() == .metal) values else null } };
         const runtime = input_facts.InputSource{ .indexed = .{ .entries = definition.runtime_recipe, .planes = planes, .implementation = implementation } };
         return createPrepared(a, cb.*, definition, values, immutable, runtime);
     }
