@@ -773,6 +773,22 @@ class CdcUploadFault(OwnerLinkFault):
                     return True
                 return False
             if self.original is None:
+                first = self.first_chunk
+                if (
+                    self.window == "cdc_chunk"
+                    and first is not None
+                    and command is not None
+                    and command["action"] == "chunk"
+                    and command["ordinal"] == 1
+                    and body["source_owner"] == first["source_owner"]
+                    and command["spec"] == first["command"]["spec"]
+                ):
+                    # The uploader cannot ask for the second chunk until the
+                    # first is confirmed by apply or a qualified read. Stop
+                    # before forwarding so the donor still has a partial upload.
+                    self.original = first
+                    self.reply_dropped.set()
+                    return True
                 return False
             donor = self.original["_fault_path"].rsplit("/source-plan/", 1)[0]
             if path.startswith(donor + "/") and (
@@ -881,6 +897,32 @@ class CdcUploadFault(OwnerLinkFault):
                     self.reclaimed.set()
             if command["action"] == "begin" and command["spec"]["attempt"] != old:
                 self.replacement = body
+
+
+def test_cdc_chunk_fault_blocks_second_chunk_after_unconfirmed_reply():
+    fault = CdcUploadFault("cdc_chunk")
+    fault.armed = True
+    spec = {"attempt": "first", "chunk_hashes": ["first", "second"]}
+    first = {
+        "_fault_path": "/internal/groups/7/source-plan/control-v1",
+        "operation": "submit",
+        "source_owner": {"group_id": 7},
+        "command": {"action": "chunk", "ordinal": 0, "spec": spec},
+    }
+    response = requests.Response()
+    response.status_code = 200
+    response._content = b'{"outcome": null}'
+    fault.observe_response(0, first, response)
+    assert not fault.drop_reply(0, first)
+
+    second = first | {"command": first["command"] | {"ordinal": 1}}
+    other_attempt = second | {
+        "command": second["command"] | {"spec": spec | {"attempt": "other"}}
+    }
+    assert not fault.block(0, other_attempt)
+    assert fault.block(0, second)
+    assert fault.reply_dropped.is_set()
+    assert fault.original is first
 
 
 @pytest.fixture
