@@ -1291,6 +1291,9 @@ pub const Runner = struct {
                 defer if (!required_audio) self.pool.setReclaimer(null);
                 var reader = try media.webm.Reader.initObserved(self.allocator, source, .{ .max_packets = count, .max_index_bytes = self.request.max_working_bytes }, builder.observer());
                 defer reader.deinit();
+                if (required_audio and builder.failure == null) {
+                    builder.resolve(source) catch |err| builder.fail(err);
+                }
                 if (builder.failure) |err| {
                     if (err == error.OutOfMemory) {
                         if (memory.denied) |denied| {
