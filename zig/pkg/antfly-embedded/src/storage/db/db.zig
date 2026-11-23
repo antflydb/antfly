@@ -7731,7 +7731,13 @@ pub const DB = struct {
         const alloc = std.testing.allocator;
         var directory = try TestDirectory.init("idle-lsm-maintenance");
         defer directory.cleanup();
-        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .executor = .{ .backend = .manual } });
+        // With no LSM backend or pending source pins, neither poll has work
+        // to admit. This isolates admission from startup reclamation debt.
+        var db = try DB.open(alloc, directory.path(), .{
+            .primary_backend = .{ .mem = .{} },
+            .start_index_workers = false,
+            .executor = .{ .backend = .manual },
+        });
         defer db.close();
 
         // The fixture owns no source pins. Retire the initial cleanup probe
