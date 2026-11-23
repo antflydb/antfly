@@ -308,6 +308,10 @@ pub const SharedRedoOverlay = struct {
     /// (they were dropped or folded into a checkpoint it cannot see), so
     /// `pinUnlessReclaimed` refuses it rather than let it read a gap.
     reclaimed_through: u64 = 0,
+    // Keys borrow the maps. Reclaim and rollback remove records before
+    // freeing a key. Old prefixes are compacted in batches.
+    changes: std.ArrayListUnmanaged(Change) = .empty,
+    changes_start: usize = 0,
     /// Every currently live reader's pinned sequence, across every
     /// `NativeFile`/`ReadGeneration` referencing this overlay -- the
     /// in-process half of `minimumPinnedSequence`, unified here so an
@@ -341,8 +345,21 @@ pub const SharedRedoOverlay = struct {
     /// `create` with no syscall either way.
     entry_pool: EntryPool = .empty,
 
+    const Change = struct { sequence: u64, key: []const u8, origin: u32, root: u8 };
+
+    fn changeEnd(self: *const SharedRedoOverlay, sequence: u64) usize {
+        var start = self.changes_start;
+        var end = self.changes.items.len;
+        while (start < end) {
+            const middle = start + (end - start) / 2;
+            if (self.changes.items[middle].sequence <= sequence) start = middle + 1 else end = middle;
+        }
+        return start;
+    }
+
     pub fn deinit(self: *SharedRedoOverlay, _: Allocator) void {
         const allocator = owned_allocator;
+        self.changes.deinit(allocator);
         var scopes = self.scope_latest.keyIterator();
         while (scopes.next()) |scope| allocator.free(scope.*);
         self.scope_latest.deinit(allocator);
@@ -690,6 +707,8 @@ pub const SharedRedoOverlay = struct {
         // inside the same lock -- never race this one.
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        const track_change = sequence > self.reclaimed_through;
+        if (track_change) try self.changes.ensureUnusedCapacity(allocator, 1);
         self.noteScopeLocked(root, key, sequence, is_delete);
         const node = try self.entry_pool.create(allocator);
         errdefer self.entry_pool.destroy(node);
@@ -710,6 +729,7 @@ pub const SharedRedoOverlay = struct {
             // this window (the `else` branch below) supersedes nothing.
             self.pending_retirement_versions += 1;
         } else {
+            errdefer _ = self.maps[root].remove(key);
             const owned_key = try allocator.dupe(u8, key);
             errdefer allocator.free(owned_key);
             const ordered_node = try allocator.create(OrderedNode);
@@ -719,6 +739,13 @@ pub const SharedRedoOverlay = struct {
             gop.key_ptr.* = owned_key;
         }
         gop.value_ptr.* = node;
+        if (track_change) {
+            const index = if (self.changes.items.len == self.changes_start or self.changes.items[self.changes.items.len - 1].sequence <= sequence)
+                self.changes.items.len
+            else
+                self.changeEnd(sequence);
+            self.changes.insertAssumeCapacity(index, .{ .sequence = sequence, .key = gop.key_ptr.*, .origin = origin, .root = root });
+        }
     }
 
     /// Undoes a single, still-in-flight transaction's own append onto
@@ -740,6 +767,16 @@ pub const SharedRedoOverlay = struct {
         defer self.mutex.unlock(io);
         const slot = self.maps[root].getPtr(key) orelse return;
         const node = slot.*;
+        var index = self.changeEnd(node.sequence);
+        while (index > self.changes_start) {
+            index -= 1;
+            const change = self.changes.items[index];
+            if (change.sequence != node.sequence) break;
+            if (change.root == root and change.origin == node.origin and std.mem.eql(u8, change.key, key)) {
+                _ = self.changes.orderedRemove(index);
+                break;
+            }
+        }
         if (node.older) |older| {
             slot.* = older;
             // This append superseded `older` (`appendVersion`'s own
@@ -774,6 +811,7 @@ pub const SharedRedoOverlay = struct {
         defer self.mutex.unlock(io);
 
         const allocator = owned_allocator;
+        self.changes.items.len = if (from == 0) self.changes_start else self.changeEnd(from - 1);
         for (&self.maps, 0..) |*map, root| {
             var entries = map.iterator();
             while (entries.next()) |entry| {
@@ -1126,15 +1164,8 @@ pub const SharedRedoOverlay = struct {
     pub fn hasSiblingVersionsAfter(self: *SharedRedoOverlay, io: std.Io, min_sequence_exclusive: u64, own_origin: u32) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        for (&self.maps) |*map| {
-            var it = map.iterator();
-            while (it.next()) |kv| {
-                var node: ?*VersionedOverlayEntry = kv.value_ptr.*;
-                while (node) |n| : (node = n.older) {
-                    if (n.sequence <= min_sequence_exclusive) break;
-                    if (n.origin != 0 and n.origin != own_origin) return true;
-                }
-            }
+        for (self.changes.items[self.changeEnd(min_sequence_exclusive)..]) |change| {
+            if (change.origin != 0 and change.origin != own_origin) return true;
         }
         return false;
     }
@@ -1154,16 +1185,14 @@ pub const SharedRedoOverlay = struct {
             for (list.items) |key| allocator.free(key);
             list.deinit(allocator);
         }
-        var it = self.maps[root].iterator();
-        while (it.next()) |kv| {
-            var node: ?*VersionedOverlayEntry = kv.value_ptr.*;
-            const changed = while (node) |n| : (node = n.older) {
-                if (n.sequence <= min_sequence_exclusive) break false;
-                if (n.origin == 0 or n.origin != own_origin) break true;
-            } else false;
-            if (!changed) continue;
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(allocator);
+        for (self.changes.items[self.changeEnd(min_sequence_exclusive)..]) |change| {
+            if (change.root != root or (change.origin != 0 and change.origin == own_origin)) continue;
+            const slot = try seen.getOrPut(allocator, change.key);
+            if (slot.found_existing) continue;
             try list.ensureUnusedCapacity(allocator, 1);
-            list.appendAssumeCapacity(try allocator.dupe(u8, kv.key_ptr.*));
+            list.appendAssumeCapacity(try allocator.dupe(u8, change.key));
         }
         return try list.toOwnedSlice(allocator);
     }
@@ -1325,6 +1354,13 @@ pub const SharedRedoOverlay = struct {
         const min_pin = self.minPinLocked();
         const floor = @min(self.durable_checkpoint_sequence, min_pin orelse self.durable_checkpoint_sequence);
         self.reclaimed_through = @max(self.reclaimed_through, floor);
+        self.changes_start = self.changeEnd(self.reclaimed_through);
+        if (self.changes_start >= self.changes.items.len - self.changes_start) {
+            const retained = self.changes.items[self.changes_start..];
+            std.mem.copyForwards(Change, self.changes.items[0..retained.len], retained);
+            self.changes.items.len = retained.len;
+            self.changes_start = 0;
+        }
         for (&self.maps, 0..) |*map, root_index| {
             const root: u8 = @intCast(root_index);
             // Collected rather than removed mid-iteration: this map's
@@ -2074,4 +2110,23 @@ test "redo overlay change scan refuses a reclaimed history" {
     defer for (changed) |key| alloc.free(key);
     try std.testing.expectEqual(@as(usize, 1), changed.len);
     try std.testing.expectEqualStrings("retained", changed[0]);
+}
+
+test "redo overlay change index excludes rolled back versions and discarded suffixes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+    try overlay.appendVersionFrom(9, io, 2, "kept", 2, try owned_allocator.dupe(u8, "v"), false, 0, 0);
+    try overlay.appendVersionFrom(9, io, 2, "kept", 3, try owned_allocator.dupe(u8, "v2"), false, 0, 0);
+    overlay.removeLastVersion(a, io, 2, "kept");
+    try overlay.appendVersionFrom(9, io, 2, "suffix", 4, try owned_allocator.dupe(u8, "v"), false, 0, 0);
+    overlay.discardUnsealedSuffix(io, 4);
+    try std.testing.expect(!overlay.hasSiblingVersionsAfter(io, 2, 1));
+
+    const changed = try overlay.changedKeysAfterAlloc(a, io, 2, 1, 1);
+    defer a.free(changed);
+    defer for (changed) |key| a.free(key);
+    try std.testing.expectEqual(@as(usize, 1), changed.len);
+    try std.testing.expectEqualStrings("kept", changed[0]);
 }

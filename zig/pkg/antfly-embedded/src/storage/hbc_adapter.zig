@@ -5261,6 +5261,7 @@ pub const HBCIndex = struct {
 
     /// Borrowed only by private synchronous construction owners. close() joins
     /// any native work before the owner may release this callback.
+    idle_inline_writer: ?*HBCIndex = null,
     construction_cancellation: ?@import("antfly_cancellation").CancellationToken = null,
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -6559,6 +6560,17 @@ pub const HBCIndex = struct {
     /// metadata and caches. The serving index stays on its durable root.
     pub fn forkInlineWriter(self: *HBCIndex) !HBCIndex {
         if (self.leann != null or self.env_owner != .native_catalog) return error.StagedPublicationUnsupported;
+        if (self.idle_inline_writer) |writer| {
+            try writer.env_owner.native_catalog.resumeWriterView();
+            errdefer writer.env_owner.native_catalog.parkWriterView();
+            var txn = try writer.store.beginRead();
+            defer txn.abort();
+            writer.metadata = IndexMetadata.decode(try txn.get(.meta, meta_key));
+            writer.refreshPublishedSearchState();
+            self.idle_inline_writer = null;
+            defer self.alloc.destroy(writer);
+            return writer.*;
+        }
         const backend = try self.alloc.create(native_catalog_backend.Backend);
         errdefer self.alloc.destroy(backend);
         backend.* = try self.env_owner.native_catalog.forkWriterView();
@@ -6576,6 +6588,20 @@ pub const HBCIndex = struct {
         config.max_cached_vectors = 0;
         config.max_cached_metadata = 0;
         return initOwnedRuntime(self.alloc, self.cache_path, config, opened, store, metadata);
+    }
+
+    /// Keep the writer's immutable configuration and work buffers. Release
+    /// its catalog and cached data before another path can mutate the index.
+    pub fn parkInlineWriter(self: *HBCIndex, writer: *HBCIndex) bool {
+        std.debug.assert(self.idle_inline_writer == null);
+        const parked = self.alloc.create(HBCIndex) catch return false;
+        writer.clearAllCaches();
+        vectorindex_spfresh_index.clearFlatCentroidDirectory(writer);
+        writer.env_owner.native_catalog.parkWriterView();
+        parked.* = writer.*;
+        self.idle_inline_writer = parked;
+        writer.* = undefined;
+        return true;
     }
 
     fn initOwnedRuntime(alloc: Allocator, path: []const u8, config: HBCConfig, opened: EnvOwner, store: vectorindex_store.NamespaceStore, metadata: IndexMetadata) !HBCIndex {
@@ -8518,6 +8544,11 @@ pub const HBCIndex = struct {
     }
 
     fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
+        if (self.idle_inline_writer) |writer| {
+            writer.close();
+            self.alloc.destroy(writer);
+            self.idle_inline_writer = null;
+        }
         if (self.native_posting_startup_snapshot) |*snapshot| snapshot.deinit();
         self.native_posting_startup_snapshot = null;
         if (self.leann) |store| {
@@ -15404,16 +15435,23 @@ pub const HBCIndex = struct {
         {
             const submit_calls = test_sink.submit_calls;
             var writer = try idx.forkInlineWriter();
-            defer writer.close();
-            var first = try writer.insertWithMetadataStaged(11, &.{ 1.0, 0.0 }, "");
-            defer writer.abortStagedWrite(&first);
-            try writer.advancePrivateStagedWrite(&first);
-            var next = try writer.insertWithMetadataStaged(12, &.{ 0.0, 1.0 }, "");
-            defer writer.abortStagedWrite(&next);
-            try writer.advancePrivateStagedWrite(&next);
-            try std.testing.expectEqual(@as(u64, 2), writer.publishedActiveCount());
-            try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
-            try std.testing.expectEqual(submit_calls, test_sink.submit_calls);
+            {
+                var first = try writer.insertWithMetadataStaged(11, &.{ 1.0, 0.0 }, "");
+                defer writer.abortStagedWrite(&first);
+                try writer.advancePrivateStagedWrite(&first);
+                var next = try writer.insertWithMetadataStaged(12, &.{ 0.0, 1.0 }, "");
+                defer writer.abortStagedWrite(&next);
+                try writer.advancePrivateStagedWrite(&next);
+                try std.testing.expectEqual(@as(u64, 2), writer.publishedActiveCount());
+                try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
+                try std.testing.expectEqual(submit_calls, test_sink.submit_calls);
+            }
+            try std.testing.expect(idx.parkInlineWriter(&writer));
+            const reused_backend = idx.idle_inline_writer.?.env_owner.native_catalog;
+            var reused = try idx.forkInlineWriter();
+            defer reused.close();
+            try std.testing.expectEqual(reused_backend, reused.env_owner.native_catalog);
+            try std.testing.expectEqual(@as(u64, 0), reused.publishedActiveCount());
         }
 
         // --- Insert, staged ---

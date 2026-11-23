@@ -20257,3 +20257,56 @@ test "lite group commit rejects primary writes that depend on a rejected member"
     try std.testing.expectError(error.NotFound, read.get("first"));
     try std.testing.expectError(error.NotFound, read.get("second"));
 }
+
+test "lite group commit queued metadata reads the preceding member at the tip" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "queued-counter.aflite");
+    defer alloc.free(path);
+    var store = try Store.create(alloc, path, true);
+    defer store.close();
+    const key = try @import("../internal_keys.zig").derivedCoverageOutcomeCountKeyAlloc(alloc, "vec", 1, "produced");
+    defer alloc.free(key);
+
+    const Callback = struct {
+        key: []const u8,
+
+        fn validate(_: *anyopaque) anyerror!void {}
+        fn reject(_: *anyopaque) void {}
+        fn complete(_: *anyopaque, _: anyerror!u64) void {}
+
+        fn apply(ptr: *anyopaque, view: @import("../commit_participant.zig").View) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const previous = view.get(self.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            const count = if (previous) |bytes| try @import("../internal_keys.zig").decodeDerivedCoverageOutcomeCount(bytes) else 0;
+            var encoded: [8]u8 = undefined;
+            _ = @import("../internal_keys.zig").encodeDerivedCoverageOutcomeCount(&encoded, count + 1);
+            try view.putReplay(self.key, &encoded);
+        }
+    };
+
+    var callback = Callback{ .key = key };
+    const participant: @import("../commit_participant.zig").Queued = .{
+        .ptr = &callback,
+        .validate = Callback.validate,
+        .apply = Callback.apply,
+        .reject = Callback.reject,
+        .complete = Callback.complete,
+    };
+    var first = try store.beginWrite();
+    try first.setQueuedParticipant(participant);
+    const first_ticket = try first.commitStaged();
+    var second = try store.beginWrite();
+    try second.setQueuedParticipant(participant);
+    const second_ticket = try second.commitStaged();
+    try first_ticket.wait();
+    try second_ticket.wait();
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 2), try @import("../internal_keys.zig").decodeDerivedCoverageOutcomeCount(try read.get(key)));
+}

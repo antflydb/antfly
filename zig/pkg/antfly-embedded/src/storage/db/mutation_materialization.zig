@@ -4314,6 +4314,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         self.entry.inline_writer.reject();
                     };
                 } else |_| {}
+                const queue = &self.entry.inline_writer;
+                if (queue.pending == 1 and self.entry.index.parkInlineWriter(&queue.view.?)) queue.view = null;
                 self.entry.inline_writer.completed(outcome);
             }
 

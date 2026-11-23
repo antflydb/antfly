@@ -382,6 +382,7 @@ pub const Backend = struct {
     /// until the coordinator has completed every dependent publication.
     writer_view_active: std.atomic.Value(bool) = .init(false),
     writer_view_parent: ?*Backend = null,
+    writer_view_parked: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     /// Set when an externally committed write could not be applied to the
     /// in-memory mirror (`invalidateMirror`): the mirror no longer matches
@@ -454,6 +455,29 @@ pub const Backend = struct {
         };
     }
 
+    /// Discard the private tree while retaining the runtime allocations.
+    /// The index apply guard excludes preparation and durable publication.
+    pub fn parkWriterView(self: *Backend) void {
+        const parent = self.writer_view_parent.?;
+        std.debug.assert(!self.writer_view_parked and self.state.refs == 1);
+        self.state.state.deinit(self.allocator);
+        self.writer_view_parked = true;
+        parent.writer_view_active.store(false, .release);
+    }
+
+    pub fn resumeWriterView(self: *Backend) !void {
+        const parent = self.writer_view_parent.?;
+        std.debug.assert(self.writer_view_parked and self.state.refs == 1);
+        if (parent.writer_view_active.swap(true, .acq_rel)) return error.IndexApplyBusy;
+        errdefer parent.writer_view_active.store(false, .release);
+        lockBackend(parent);
+        defer parent.mutex.unlock();
+        if (parent.mirror_invalid.load(.acquire)) return error.IndexMirrorInvalid;
+        self.state.state = parent.state.state.clone();
+        self.mirror_invalid.store(false, .release);
+        self.writer_view_parked = false;
+    }
+
     fn loadTree(allocator: Allocator, sink: Sink, scope: []const u8) !ordered.Tree {
         var tree: ordered.Tree = .empty;
         errdefer tree.release(allocator);
@@ -515,7 +539,9 @@ pub const Backend = struct {
         releaseState(self.allocator, self.state);
         self.mutex.unlock();
         self.allocator.free(self.scope);
-        if (self.writer_view_parent) |parent| parent.writer_view_active.store(false, .release);
+        if (self.writer_view_parent) |parent| {
+            if (!self.writer_view_parked) parent.writer_view_active.store(false, .release);
+        }
         self.* = undefined;
     }
 
