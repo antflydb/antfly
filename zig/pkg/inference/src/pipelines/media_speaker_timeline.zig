@@ -45,8 +45,9 @@ pub const Block = struct {
     fn release(self: *Block) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
             const a = self.allocator;
-            if (self.lease) |*owned| owned.release();
+            var lease = self.lease;
             a.destroy(self);
+            if (lease) |*owned| owned.release();
         }
     }
 };

@@ -52110,6 +52110,10 @@ const MediaOutputExecution = struct {
     speaker_lease: ?runtime.tier.memory.AdmissionLease = null,
     speaker_video: ?struct { budget: usize, source: [32]u8, version: []const u8, cacheable: bool } = null,
     speaker_video_leases: [16]?runtime.tier.memory.AdmissionLease = @splat(null),
+    speaker_timeline_leases: [16]?runtime.tier.memory.AdmissionLease = @splat(null),
+    parked_speakers: [16]?speaker_checkpoint.timeline.Timeline = @splat(null),
+    parked_speaker_leases: [16]?runtime.tier.memory.AdmissionLease = @splat(null),
+    parked_aliases: [16]?usize = @splat(null),
     speaker_provider: ?audio_providers.Provider = null,
     speaker_fork: ?audio_providers.Fork = null,
     speaker_scratch: std.mem.Allocator = undefined,
@@ -52311,10 +52315,6 @@ const MediaOutputExecution = struct {
     fn wantsSpeakerAnalysis(self: *const MediaOutputExecution, target: outputs.Target) bool {
         return target.hasDiarization() and ((self.speaker_outputs and target.execute) or (self.speaker_turns and std.mem.eql(u8, target.name, self.config.boundary_model)));
     }
-    fn speakerState(self: *MediaOutputExecution, name: []const u8) !*SpeakerState {
-        for (self.config.targets, 0..) |target, i| if (std.mem.eql(u8, name, target.name)) return self.speaker_states[i] orelse return error.SpeakerAnalysisUnavailable;
-        return error.InvalidChunkOutputs;
-    }
     fn speakerBoundary(raw: *anyopaque, start: i64, end: i64) !speakers.Span {
         const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
         const state = self.speaker_states[try self.boundaryIndex()] orelse return error.SpeakerAnalysisUnavailable;
@@ -52437,33 +52437,98 @@ const MediaOutputExecution = struct {
         const reserve = if (required) 0 else self.uninitializedRequiredSpeakerBytes();
         const remaining = video.budget -| self.videoSpeakerBytes() -| reserve;
         if (remaining < minimum_speaker_bytes) return error.ChunkWorkingBudgetExceeded;
-        var lease = try self.node.model_manager.admitHostPreflight(speaker_state_bytes);
+        var lease = try self.node.model_manager.admitHostPreflight(@sizeOf(SpeakerState));
         errdefer lease.release();
+        var timeline_lease = try self.node.model_manager.admitHostPreflight(speaker_root_bytes);
+        errdefer timeline_lease.release();
         const state = try self.makeSpeakerState(index, identity, video.cacheable, remaining);
         errdefer self.destroySpeakerState(state, self.allocator);
         if (speakerStateBytes(state) > remaining) return error.ChunkWorkingBudgetExceeded;
         state.required_video = required;
         self.speaker_states[index] = state;
         self.speaker_video_leases[index] = lease;
+        self.speaker_timeline_leases[index] = timeline_lease;
+    }
+
+    fn releaseParkedSpeaker(self: *MediaOutputExecution, index: usize) void {
+        if (self.parked_speakers[index]) |*timeline| timeline.deinit(self.allocator);
+        self.parked_speakers[index] = null;
+        if (self.parked_speaker_leases[index]) |*lease| lease.release();
+        self.parked_speaker_leases[index] = null;
+        for (&self.parked_aliases) |*alias| if (alias.* == index) {
+            alias.* = null;
+        };
     }
 
     fn reclaimOptionalSpeakers(self: *MediaOutputExecution, result: *chunks.VideoSpeakerResult) bool {
         if (self.speaker_video == null) return false;
-        var reclaimed = false;
-        for (0..self.speaker_states.len) |i| {
-            const state = self.speaker_states[i] orelse continue;
-            if (state.required_video) continue;
-            for (&self.speaker_states, &self.speaker_video_leases, 0..) |*candidate, *reservation, index| {
+        var victim: ?usize = null;
+        for (self.speaker_states, 0..) |candidate, i| {
+            const state = candidate orelse continue;
+            if (state.required_video or !self.leader(i)) continue;
+            if (victim == null or speakerCoverage(state) < speakerCoverage(self.speaker_states[victim.?].?)) victim = i;
+        }
+        if (victim) |index| {
+            const state = self.speaker_states[index].?;
+            var owner = index;
+            for (self.speaker_states, 0..) |candidate, i| {
+                if (candidate == state and self.speaker_video_leases[i] != null) owner = i;
+            }
+            const coverage = speakerCoverage(state);
+            if (coverage > self.parkedCoverage(index)) {
+                if (self.parked_speakers[owner] != null) self.releaseParkedSpeaker(owner);
+                self.parked_speakers[owner] = state.timeline;
+                self.parked_speaker_leases[owner] = self.speaker_timeline_leases[owner];
+                self.speaker_timeline_leases[owner] = null;
+                state.timeline.blocks = .empty;
+                state.timeline.count = 0;
+            }
+            for (&self.speaker_states, 0..) |*candidate, i| {
                 if (candidate.* != state) continue;
                 candidate.* = null;
-                if (reservation.*) |*lease| lease.release();
-                reservation.* = null;
-                result.failures[index] = .{ .cause = error.ChunkWorkingBudgetExceeded, .covered_through_ns = 0 };
+                if (self.parked_speakers[owner] != null) self.parked_aliases[i] = owner;
+                result.failures[i] = .{ .cause = error.ChunkWorkingBudgetExceeded, .covered_through_ns = self.parkedCoverage(i) };
             }
             self.destroySpeakerState(state, self.allocator);
-            reclaimed = true;
+            if (self.speaker_video_leases[owner]) |*lease| lease.release();
+            self.speaker_video_leases[owner] = null;
+            if (self.speaker_timeline_leases[owner]) |*lease| lease.release();
+            self.speaker_timeline_leases[owner] = null;
+            return true;
         }
-        return reclaimed;
+        // If freeing mutable state was insufficient, release one retained
+        // timeline. Other recipes can still serve their committed coverage.
+        for (self.parked_speakers, 0..) |timeline, index| {
+            if (timeline == null) continue;
+            for (self.parked_aliases, 0..) |alias, i| {
+                if (alias == index and self.speaker_states[i] == null)
+                    result.failures[i] = .{ .cause = error.ChunkWorkingBudgetExceeded, .covered_through_ns = 0 };
+            }
+            self.releaseParkedSpeaker(index);
+            return true;
+        }
+        return false;
+    }
+
+    fn parkedCoverage(self: *const MediaOutputExecution, index: usize) i64 {
+        const alias = self.parked_aliases[index] orelse return 0;
+        const timeline = self.parked_speakers[alias] orelse return 0;
+        return if (timeline.len() == 0) 0 else timeline.at(timeline.len() - 1).end_ns;
+    }
+
+    fn speakerOutputTimeline(self: *MediaOutputExecution, name: []const u8) !speaker_checkpoint.timeline.Timeline {
+        for (self.config.targets, 0..) |target, i| {
+            if (!std.mem.eql(u8, target.name, name)) continue;
+            const state = self.speaker_states[i];
+            if (self.parked_aliases[i]) |alias| {
+                if (self.parked_speakers[alias]) |timeline| {
+                    if (state == null or self.parkedCoverage(i) > speakerCoverage(state.?)) return timeline;
+                }
+            }
+            if (state) |active| return active.timeline;
+            return error.SpeakerAnalysisUnavailable;
+        }
+        return error.InvalidChunkOutputs;
     }
 
     fn speakerStateBytes(state: *const SpeakerState) usize {
@@ -52474,6 +52539,9 @@ const MediaOutputExecution = struct {
         var bytes: usize = 0;
         for (self.speaker_states, 0..) |candidate, i| if (candidate) |state| {
             if (self.leader(i)) bytes += speakerStateBytes(state);
+        };
+        for (self.parked_speakers) |timeline| if (timeline) |parked| {
+            bytes += speaker_root_bytes + parked.blocks.items.len * @sizeOf(speaker_checkpoint.timeline.Block);
         };
         return bytes;
     }
@@ -52560,16 +52628,23 @@ const MediaOutputExecution = struct {
         }
         for ([_]bool{ true, false }) |required_phase| {
             for (self.config.targets, 0..) |target, index| {
-                if (wanted[index] == null) continue;
+                const through = wanted[index] orelse continue;
+                if (self.speaker_states[index] == null and self.parkedCoverage(index) >= through) continue;
                 const is_required = target.required and !self.allow_partial;
                 if (required_phase != is_required) continue;
                 self.admitVideoSpeaker(index, is_required) catch |err| {
                     if (is_required) {
                         if (!speakerExtensionPressure(err) or !self.reclaimOptionalSpeakers(result)) return err;
-                        try self.admitVideoSpeaker(index, true);
+                        while (true) {
+                            self.admitVideoSpeaker(index, true) catch |retry_err| {
+                                if (!speakerExtensionPressure(retry_err) or !self.reclaimOptionalSpeakers(result)) return retry_err;
+                                continue;
+                            };
+                            break;
+                        }
                     } else {
                         if (chunks.abort(err) and !speakerExtensionPressure(err)) return err;
-                        result.failures[index] = .{ .cause = err, .covered_through_ns = 0 };
+                        result.failures[index] = .{ .cause = err, .covered_through_ns = self.parkedCoverage(index) };
                     }
                 };
             }
@@ -52597,10 +52672,10 @@ const MediaOutputExecution = struct {
         };
         for (wanted, 0..) |goal, index| if (goal) |through| {
             const state = self.speaker_states[index] orelse continue;
-            if (self.enough(state, window.start, through, false)) {
+            if (self.enough(state, window.start, through, false) or self.parkedCoverage(index) >= through) {
                 result.failures[index] = null;
             } else if (result.failures[index]) |*failure| {
-                failure.covered_through_ns = speakerCoverage(state);
+                failure.covered_through_ns = @max(speakerCoverage(state), self.parkedCoverage(index));
             }
         };
     }
@@ -52635,6 +52710,25 @@ const MediaOutputExecution = struct {
     fn ensureSpeakers(raw: *anyopaque, _: std.mem.Allocator, start: i64, end: i64, stop_at_turn: bool) !void {
         const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
         return self.ensureSpeakerWork(start, end, stop_at_turn, null);
+    }
+
+    fn refreshSpeakerState(self: *MediaOutputExecution, state: *SpeakerState, snapshot: speaker_checkpoint.Snapshot, optional: bool) !void {
+        const video = self.speaker_video orelse return state.restore(self.allocator, snapshot);
+        const count = if (snapshot.shared) |view|
+            view.blocks.len
+        else
+            std.math.divCeil(usize, snapshot.spans.len, speaker_checkpoint.timeline.block_size) catch unreachable;
+        if (count > state.timeline.max_blocks) return error.ChunkWorkingBudgetExceeded;
+        const block_bytes = @sizeOf(speaker_checkpoint.timeline.Block);
+        const final = speaker_state_bytes + @max(1, count) * block_bytes;
+        const transient = count * @sizeOf(*speaker_checkpoint.timeline.Block);
+        const reserve = if (optional) self.uninitializedRequiredSpeakerBytes() else 0;
+        const available = video.budget -| self.videoSpeakerBytes() -| reserve;
+        const peak_growth = if (snapshot.shared != null) (final -| speakerStateBytes(state)) + transient else final - speaker_state_bytes + transient;
+        if (peak_growth > available) return error.ChunkWorkingBudgetExceeded;
+        var lease = if (transient == 0) null else try self.node.model_manager.admitHostPreflight(transient);
+        defer if (lease) |*admission| admission.release();
+        try state.restore(self.allocator, snapshot);
     }
 
     fn ensureSpeakerWork(self: *MediaOutputExecution, start: i64, end: i64, stop_at_turn: bool, work: ?VideoSpeakerWork) !void {
@@ -52710,9 +52804,16 @@ const MediaOutputExecution = struct {
             if (self.node.host_caches.media_index_cache.get(state.identity)) |entry| {
                 defer self.node.host_caches.media_index_cache.release(entry);
                 if (entry.data == .speaker_analysis and entry.data.speaker_analysis.next_window > state.next_window) {
-                    state.restore(self.allocator, entry.data.speaker_analysis) catch |err| {
-                        if (eligible[i] or !speakerExtensionPressure(err)) return err;
-                        sharing[i] = false;
+                    const optional = work != null and (work.?.optional or !eligible[i]);
+                    self.refreshSpeakerState(state, entry.data.speaker_analysis, optional) catch |err| {
+                        if (!speakerExtensionPressure(err)) return err;
+                        if (optional) {
+                            var scoped = work.?;
+                            scoped.optional = true;
+                            try self.failSpeakerExtension(scoped, i, err);
+                            eligible[i] = false;
+                            sharing[i] = false;
+                        }
                         continue;
                     };
                     state.memory_window = state.next_window;
@@ -52890,26 +52991,33 @@ const MediaOutputExecution = struct {
     }
     fn acquireSpeakerEmbedder(self: *MediaOutputExecution, scratch: std.mem.Allocator, i: usize, work: ?VideoSpeakerWork) !@import("../pipelines/speaker_model_cache.zig").Cache.Lease {
         const resolved = &self.resolved[i];
-        return self.node.pinnedSpeakerEmbedder(scratch, resolved.speaker_path.?, resolved.speaker_revision, self.io, self.control) catch |err| {
-            if (!self.reclaimForRequiredSpeaker(work, err)) return err;
-            return self.node.pinnedSpeakerEmbedder(scratch, resolved.speaker_path.?, resolved.speaker_revision, self.io, self.control);
-        };
+        while (true) {
+            return self.node.pinnedSpeakerEmbedder(scratch, resolved.speaker_path.?, resolved.speaker_revision, self.io, self.control) catch |err| {
+                if (!self.reclaimForRequiredSpeaker(work, err)) return err;
+                continue;
+            };
+        }
     }
 
     fn embedSpeakerWindow(self: *MediaOutputExecution, state: *SpeakerState, scratch: std.mem.Allocator, window: []const f32, work: ?VideoSpeakerWork) ![]f32 {
         const model = state.embedder.?.model();
-        return model.embedAlloc(scratch, window, self.control) catch |err| {
-            if (!self.reclaimForRequiredSpeaker(work, err)) return err;
-            return model.embedAlloc(scratch, window, self.control);
-        };
+        while (true) {
+            return model.embedAlloc(scratch, window, self.control) catch |err| {
+                if (!self.reclaimForRequiredSpeaker(work, err)) return err;
+                continue;
+            };
+        }
     }
 
     fn appendSpeakerWorkSpan(self: *MediaOutputExecution, state: *SpeakerState, span: speakers.Span, work: ?VideoSpeakerWork) !void {
         const optional = if (work) |video_work| video_work.optional else false;
-        self.appendSpeakerSpan(state, span, optional) catch |err| {
-            if (!self.reclaimForRequiredSpeaker(work, err)) return err;
-            try self.appendSpeakerSpan(state, span, false);
-        };
+        while (true) {
+            self.appendSpeakerSpan(state, span, optional) catch |err| {
+                if (!self.reclaimForRequiredSpeaker(work, err)) return err;
+                continue;
+            };
+            return;
+        }
     }
 
     fn speakerSamples(raw: *anyopaque) ?usize {
@@ -53029,6 +53137,8 @@ const MediaOutputExecution = struct {
         };
         if (self.speaker_lease) |*lease| lease.release();
         for (&self.speaker_video_leases) |*maybe| if (maybe.*) |*lease| lease.release();
+        for (&self.speaker_timeline_leases) |*maybe| if (maybe.*) |*lease| lease.release();
+        for (0..self.parked_speakers.len) |index| self.releaseParkedSpeaker(index);
         for (self.resolved[0..self.initialized]) |value| {
             if (value.path.len != 0) a.free(value.path);
             if (value.speaker_path) |speaker_path| a.free(speaker_path);
@@ -53372,8 +53482,8 @@ const MediaOutputExecution = struct {
             },
             .diarize => {
                 if (payload != .pcm) return error.ModelDoesNotSupportAudioInput;
-                const state = try self.speakerState(target.name);
-                value.speaker_spans = try state.timeline.slice(a, value.start_ns orelse return error.InvalidChunkCoordinates, value.end_ns orelse return error.InvalidChunkCoordinates);
+                const timeline = try self.speakerOutputTimeline(target.name);
+                value.speaker_spans = try timeline.slice(a, value.start_ns orelse return error.InvalidChunkCoordinates, value.end_ns orelse return error.InvalidChunkCoordinates);
                 value.speaker_scope = .source;
                 // Source preparation already verified the immutable timeline
                 // against the pinned speaker bytes; there is no ASR manifest.
@@ -53393,7 +53503,7 @@ const MediaOutputExecution = struct {
                     // the last token past a sample-exact window tail.
                     if (start_ns >= end) continue;
                     if (target.hasDiarization()) {
-                        try appendSpeakerTranscript(a, &spans, (try self.speakerState(target.name)).timeline, segment, origin, start_ns, @min(end_ns, end));
+                        try appendSpeakerTranscript(a, &spans, try self.speakerOutputTimeline(target.name), segment, origin, start_ns, @min(end_ns, end));
                     } else try spans.append(a, .{ .text = segment.text orelse "", .start_ns = start_ns, .end_ns = @min(end_ns, end) });
                 };
                 if (spans.items.len == 0 and response.text != null and response.text.?.len != 0) try spans.append(a, .{ .text = response.text.?, .start_ns = origin, .end_ns = end });
@@ -53520,6 +53630,8 @@ test "model aware media reclaims optional speaker state for required timeline gr
     execution.speaker_states[0] = &required;
     execution.speaker_states[1] = optional;
     defer if (execution.speaker_states[1]) |state| execution.destroySpeakerState(state, a);
+    defer execution.releaseParkedSpeaker(1);
+    try optional.timeline.append(a, .{ .start_ns = 0, .end_ns = 1, .speaker_index = null });
     execution.speaker_video = .{ .budget = execution.videoSpeakerBytes(), .source = @splat(0), .version = "", .cacheable = false };
     var result = MediaOutputExecution.chunks.VideoSpeakerResult{};
     const work = MediaOutputExecution.VideoSpeakerWork{
@@ -53532,6 +53644,13 @@ test "model aware media reclaims optional speaker state for required timeline gr
     try std.testing.expectEqual(@as(usize, block_size + 1), required.timeline.len());
     try std.testing.expect(execution.speaker_states[1] == null);
     try std.testing.expectEqual(error.ChunkWorkingBudgetExceeded, result.failures[1].?.cause);
+    try std.testing.expectEqual(@as(i64, 1), result.failures[1].?.covered_through_ns);
+    const parked = try execution.speakerOutputTimeline("optional");
+    try std.testing.expectEqual(@as(i64, 1), parked.at(0).end_ns);
+    execution.speaker_video.?.budget = execution.videoSpeakerBytes();
+    const snapshot = required.snapshot(1);
+    try std.testing.expectError(error.ChunkWorkingBudgetExceeded, execution.refreshSpeakerState(&required, snapshot, false));
+    try std.testing.expectEqual(@as(usize, block_size + 1), required.timeline.len());
 }
 
 test "model aware media schedules video speaker recipes by priority and mask and reuses PCM" {
