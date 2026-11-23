@@ -79,7 +79,19 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
             // a separate result buffer to an operation that can remain a view.
             if (plan.contiguous()) return false;
         },
-        .gather => |gather| if (gather.axis != 0 or descriptor.input_shapes[0].rank() != 2 or descriptor.input_shapes[1].dtype != .f32) return false,
+        .gather => |gather| switch (descriptor.input_shapes[1].dtype) {
+            .f32 => if (gather.axis != 0 or descriptor.input_shapes[0].rank() != 2) return false,
+            .i32, .i64 => {
+                const source = descriptor.input_shapes[0];
+                const indices = descriptor.input_shapes[1];
+                if (source.dtype != .f32 or descriptor.elements() > std.math.maxInt(u32) or !gather.matchesOutput(source, indices, descriptor.output_shape)) return false;
+                const geometry = kernel_geometry.GatherAxis.init(std.math.maxInt(u32), source.dims[0..source.rank()], gather.axis) catch return false;
+                const count = indices.numElements() orelse return false;
+                if (count <= 0 or !std.meta.eql(geometry, gather.geometry) or
+                    (geometry.count(@intCast(count)) catch return false) != descriptor.elements()) return false;
+            },
+            else => return false,
+        },
         .broadcast => |layout| {
             if (layout.input_rank == 0 or layout.input_rank != layout.output_rank) return false;
             for (0..layout.input_rank) |axis| {
@@ -11660,9 +11672,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return @ptrCast(buf);
     }
 
+    fn hostInputMetalDType(dtype: ops.GraphDType) ?metal_tensor_mod.DType {
+        return switch (dtype) {
+            .f32 => .f32,
+            .i32 => .i32,
+            .i64 => .i64,
+            else => null,
+        };
+    }
+
     fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (request.dtype != .f32) return null;
+        const dtype = hostInputMetalDType(request.dtype) orelse return null;
+        if (dtype != .f32 and (request.storage.usage != .host_input or request.layout_source != null)) return null;
         if (request.storage.backend.ptr != ctx or request.storage.backend.kind() != .metal) return error.InvalidPhysicalStorageBackend;
         const storage = toBuf(request.storage.tensor);
         if (request.layout_source) |prototype| {
@@ -11670,7 +11692,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const physical = original.metal_tensor orelse return null;
             const backing = storage.metal_tensor orelse return null;
             if (physical.dtype != .f32 or bufHasAnyQuantizedStorage(original) or physical.deviceByteLen() > request.storage.byte_size) return null;
-            var view = try MetalTensor.deviceLeasedView(self.allocator, &backing, request.storage, physical.shape());
+            var view = try MetalTensor.deviceLeasedView(self.allocator, &backing, request.storage, physical.shape(), .f32);
             const result = self.ctFromOwnedMetalTensor(view) catch |err| {
                 view.deinit();
                 return err;
@@ -11681,7 +11703,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (bufHasAnyQuantizedStorage(storage) or hasHostView(storage)) return null;
         const source = if (storage.metal_tensor) |*tensor| tensor else return null;
-        var view = try MetalTensor.deviceLeasedView(self.allocator, source, request.storage, request.shape);
+        var view = try MetalTensor.deviceLeasedView(self.allocator, source, request.storage, request.shape, dtype);
         errdefer self.retireTemporaryWorkspaceValue(&view);
         return self.ctFromOwnedMetalTensor(view);
     }
@@ -11693,29 +11715,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // the ordinary preparation path and never to descriptor admission.
     fn hostInputRequirementsOp(ctx: *anyopaque, logical: @import("ml").graph.Shape) anyerror!?@import("../execution/host_ingress.zig").Requirements {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (logical.dtype != .f32 or self.audio_capture != null) return null;
+        if (self.audio_capture != null) return null;
+        const profile: u32 = switch (logical.dtype) {
+            .f32 => 1,
+            .i32 => 2,
+            .i64 => 3,
+            else => return null,
+        };
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         if (!metal_runtime.antfly_metal_host_input_shared_supported(runtime)) return null;
         const count = logical.numElements() orelse return null;
         if (count <= 0) return null;
-        const bytes = try std.math.mul(usize, @intCast(count), @sizeOf(f32));
+        const bytes = try std.math.mul(usize, @intCast(count), logical.dtype.byteSize());
         // The Shared SDK bank is already charged as device storage. There is
         // no separately allocated pinned/staging host payload to double count.
-        return .{ .bytes = bytes, .host_bytes = 0, .host_backing_bytes = 0, .profile = 1, .requires_managed_operation = true };
+        return .{ .bytes = bytes, .host_bytes = 0, .host_backing_bytes = 0, .alignment = @intCast(logical.dtype.byteSize()), .profile = profile, .requires_managed_operation = true };
     }
     const host_input_table: @import("../execution/host_ingress.zig").Upload.VTable = .{ .write = writeHostInput, .deinit = destroyHostInput };
     fn destroyHostInput(_: *anyopaque) void {}
     fn writeHostInput(ctx: *anyopaque, output: CT, assigned: @import("../execution/kernel_route.zig").AssignedOutput, values: []const u8) !void {
         const physical = if (toBuf(output).metal_tensor) |*tensor| tensor else return error.InvalidHostIngressAuthority;
         const lease = physical.physicalLease() orelse return error.InvalidHostIngressAuthority;
-        if (lease.backend.ptr != ctx or !acceptsPhysicalImplementation(lease.backend.vtable) or physical.dtype != .f32 or values.len != assigned.slot.writable_bytes or !lease.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region)) return error.InvalidHostIngressAuthority;
+        if (lease.backend.ptr != ctx or !acceptsPhysicalImplementation(lease.backend.vtable) or lease.usage != .host_input or physical.dtype != (hostInputMetalDType(assigned.slot.logical.dtype) orelse return error.InvalidHostIngressAuthority) or values.len != assigned.slot.writable_bytes or !lease.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region)) return error.InvalidHostIngressAuthority;
         const base = toBuf(lease.tensor).metal_tensor orelse return error.InvalidHostIngressAuthority;
         const offset = std.math.add(usize, base.deviceByteOffset(), assigned.region.byte_offset) catch return error.InvalidHostIngressAuthority;
         const shape = toBuf(output).logical_shape orelse return error.InvalidHostIngressAuthority;
-        if (physical.deviceHandle() != base.deviceHandle() or physical.deviceByteOffset() != offset or physical.elemCount() != values.len / @sizeOf(f32) or !std.mem.eql(i64, shape, assigned.slot.logical.dims[0..assigned.slot.logical.rank()])) return error.InvalidHostIngressAuthority;
+        if (physical.deviceHandle() != base.deviceHandle() or physical.deviceByteOffset() != offset or physical.deviceByteLen() != values.len or !std.mem.eql(i64, shape, assigned.slot.logical.dims[0..assigned.slot.logical.rank()])) return error.InvalidHostIngressAuthority;
         if (!metal_runtime.antfly_metal_buffer_is_shared(physical.deviceHandle())) return error.InvalidHostIngressAuthority;
         // Upload's managed-scope validation precedes this callback. The C
         // Shared branch performs memcpy and one logical upload audit only.
+        lease.invalidateHostIndices();
         try physical.uploadBytes(values);
     }
     fn createHostInputOp(ctx: *anyopaque, request: @import("../execution/host_ingress.zig").Create) anyerror!?@import("../execution/host_ingress.zig").Upload {
@@ -11939,9 +11968,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (self.audio_capture != null or !self.provider_impl.hasDecoderRuntime() or !supportsAssignedDescriptor(descriptor)) return false;
         return switch (descriptor.operation) {
-            // Slot-prepared linears, dot vendor schedules, and data-dependent
-            // gathers need separate provider contracts.
-            .linear, .gather => false,
+            // Slot-prepared linears need a separate provider contract.
+            .linear => false,
+            .gather => (descriptor.input_shapes[1].dtype == .i32 or descriptor.input_shapes[1].dtype == .i64) and
+                metal_runtime.antfly_metal_typed_gather_ready(self.provider_impl.raw_decode_runtime) != 0,
             .dot => |dot| (dot.m < 8 or dot.n < 128 or dot.k < 128) and
                 metal_runtime.termite_metal_decode_runtime_dot_general_2d_f32_ready(self.provider_impl.raw_decode_runtime) != 0,
             .norm => |norm| !disableRuntimeElementwise() and
@@ -11960,7 +11990,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const implementation = request.implementation orelse return null;
         if (implementation.context != @as(*anyopaque, @ptrCast(self)) or !kernel_backend_impl.accepts(implementation.table)) return null;
         const table: *const ops.ComputeBackend.VTable = @ptrCast(@alignCast(implementation.table));
-        return @import("../execution/assigned_kernel_route.zig").prepare(ops.ComputeBackend{ .ptr = self, .vtable = table }, request, directRouteSupported);
+        const direct = @import("../execution/assigned_kernel_route.zig");
+        const backend = ops.ComputeBackend{ .ptr = self, .vtable = table };
+        if (request.descriptor.operation == .gather) return direct.prepareHostGather(backend, request, directRouteSupported);
+        return direct.prepare(backend, request, directRouteSupported);
     }
 
     /// The generic direct owner proves dense bindings and output geometry;
@@ -12943,11 +12976,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!supportsAssignedDescriptor(descriptor)) return false;
         if (descriptor.operation == .add_mul_scalar and !metal_runtime.assignedAddMulScalarAvailable(self.provider_impl)) return false;
         if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
+        const typed_gather = descriptor.operation == .gather and descriptor.input_shapes[1].dtype != .f32;
         for (request.inputs, 0..) |input, index| {
             const buf = toBuf(input);
-            if (buf.integer_storage or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf)) return false;
+            const typed_index = typed_gather and index == 1;
+            if (buf.integer_storage != typed_index or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf)) return false;
             const tensor = buf.metal_tensor orelse return false;
-            if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
+            if (!tensor.isDevice() or tensor.dtype != (if (typed_index) hostInputMetalDType(descriptor.input_shapes[index].dtype).? else .f32) or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
+            if (typed_gather) {
+                const shape = descriptor.input_shapes[index];
+                if (tensor.ndim() != shape.rank()) return false;
+                for (tensor.shape(), shape.dims[0..shape.rank()]) |actual, expected| if (actual != expected) return false;
+            }
+        }
+        if (typed_gather) {
+            const route = request.prepared_route orelse return false;
+            const direct = @import("../execution/assigned_kernel_route.zig");
+            if (!acceptsPhysicalImplementation(route.implementation.table) or
+                !direct.belongsToProgram(route, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(route.implementation.table)) }, directRouteSupported) or
+                route.vtable.host_input_constraint == null) return false;
+            try direct.validateDescriptor(route, descriptor);
+            if (!directRouteSupported(ctx, descriptor) or request.auxiliaries.len != 0) return false;
+            const indices = toBuf(request.inputs[1]).metal_tensor.?;
+            const lease = indices.physicalLease() orelse return error.MissingCurrentHostIndexProof;
+            const issued = (request.assigned_inputs orelse return error.MissingCurrentHostIndexProof)[1] orelse return error.MissingCurrentHostIndexProof;
+            const base = toBuf(lease.tensor).metal_tensor orelse return error.MissingCurrentHostIndexProof;
+            if (lease.backend.ptr != ctx or lease.usage != .host_input or indices.deviceHandle() != base.deviceHandle() or indices.deviceByteOffset() != base.deviceByteOffset() or
+                !lease.hostInputMatches(issued, descriptor.operation.gather.geometry.extent, request.input_generation, indices.deviceByteLen())) return error.MissingCurrentHostIndexProof;
         }
         var mutable_layer_norm = false;
         var rms_clamped = false;
@@ -13046,6 +13101,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             .slice => |map| (try metal_runtime.decoderRuntimeSliceTypedDeviceInto(self.provider_impl, input, try map.plan(descriptor.input_shapes[0], descriptor.output_shape), out_tensor)) != null,
             .gather => |gather| blk: {
+                if (typed_gather) break :blk (try metal_runtime.decoderRuntimeGatherTypedDeviceInto(self.provider_impl, input, toBuf(request.inputs[1]).metal_tensor.?, gather.axis, out_tensor)) != null;
                 const shape = ops.kernel_descriptor.nativeDimensions(i32, descriptor.output_shape);
                 break :blk (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDeviceInto(self.provider_impl, input, toBuf(request.inputs[1]).metal_tensor.?, gather.geometry.extent, gather.geometry.suffix, @intCast(descriptor.input_shapes[1].numElements().?), shape[0..descriptor.output_shape.rank()], out_tensor)) != null;
             },
@@ -57704,6 +57760,37 @@ test "Metal owned shared ingress requires actual managed authority and refuses p
     // Only the deliberately allocated ordinary bank above is new SDK payload;
     // upload and every refusal allocate neither staging nor replacement storage.
     try std.testing.expectEqual(before.device_owned_buffers_created + 1, metal_tensor_mod.memoryStatsSnapshot().device_owned_buffers_created);
+    inline for (.{ i32, i64 }, .{ ops.GraphDType.i32, ops.GraphDType.i64 }) |Int, dtype| {
+        const typed = ml.graph.Shape.init(dtype, &.{2});
+        const byte_count = 2 * @sizeOf(Int);
+        const requirements = (try cb.vtable.kernels.?.hostInputRequirements.?(cb.ptr, typed)) orelse return error.MissingHostIngress;
+        try std.testing.expectEqual(byte_count, requirements.bytes);
+        try std.testing.expectEqual(@as(usize, 0), requirements.host_bytes);
+        var typed_slot = slot;
+        typed_slot.logical = typed;
+        typed_slot.writable_bytes = byte_count;
+        const typed_bank = (try physical.Lease.createAdmittedWithUsage(a, cb, byte_count, null, .activation, null, .host_input)) orelse return error.MissingHostBank;
+        defer typed_bank.release();
+        try typed_bank.bindAllocationSlot(slot.allocation, slot.epoch, byte_count);
+        const typed_view = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = typed_bank, .shape = &.{2}, .dtype = dtype })) orelse return error.MissingPhysicalView;
+        defer cb.free(typed_view);
+        const typed_upload = (try cb.vtable.kernels.?.createHostInput.?(cb.ptr, .{
+            .allocator = a,
+            .implementation = upload.implementation,
+            .requirements = requirements,
+            .slot = typed_slot,
+            .index_bounds = .{ .extent = @as(usize, 1) << 25 },
+        })) orelse return error.MissingHostIngress;
+        defer typed_upload.deinit();
+        const typed_destination = @import("../execution/kernel_route.zig").AssignedOutput{ .slot = typed_slot, .region = try typed_bank.writableRegion(slot.allocation, slot.epoch, byte_count) };
+        const exact = [_]Int{ -16_777_217, 16_777_219 };
+        try typed_upload.writeWithOperation(typed_view, typed_destination, std.mem.sliceAsBytes(&exact), &token);
+        const invalid = [_]Int{ -1, 33_554_432 };
+        try std.testing.expectError(error.IndexOutOfBounds, typed_upload.writeWithOperation(typed_view, typed_destination, std.mem.sliceAsBytes(&invalid), &token));
+        var raw: [byte_count]u8 = undefined;
+        try MetalCompute.toBuf(typed_view).metal_tensor.?.downloadBytesInto(&raw);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&exact), &raw);
+    }
     try numerical.finish();
     // A real unsubmitted foreign frame must remain owned by its caller. Shared
     // bank eligibility cannot reinterpret its scope or cancel it on rejection.

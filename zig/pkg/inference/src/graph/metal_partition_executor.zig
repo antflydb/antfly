@@ -1605,8 +1605,11 @@ pub const MetalPartitionExecutor = struct {
             if (id >= reachable.len) return false;
             if (!reachable[id]) continue;
             const node = graph.node(id);
+            if (node.op == .parameter) {
+                if (!@import("../execution/host_ingress.zig").rawDType(node.output_shape.dtype)) return false;
+                continue;
+            }
             if (node.output_shape.dtype != .f32) return false;
-            if (node.op == .parameter) continue;
             if (node.op == .constant) {
                 // The ORIGINAL executor materializes constants before beginFrame.
                 // Only the declared F32 Shared-stage/Private-bank constructor is
@@ -1629,7 +1632,12 @@ pub const MetalPartitionExecutor = struct {
             // the route separately verifies its exact specialized pipeline.
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
             if (descriptor) |value| switch (value.operation) {
-                .linear, .gather => return false,
+                .linear => return false,
+                .gather => {
+                    // The selected route requires checked host indices. Keep
+                    // the tuned gather-after-bias owner for composite graphs.
+                    if (value.input_shapes[1].dtype == .f32 or graph.node(node.inputs[0]).op == .add) return false;
+                },
                 .dot => {
                     // A terminal standalone dot cannot be subsumed by a
                     // neighboring projection or grouped head schedule.

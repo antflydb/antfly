@@ -53684,6 +53684,10 @@ static int termite_metal_decode_runtime_typed_binary_dispatch(termite_metal_deco
     }
 }
 
+int antfly_metal_typed_gather_ready(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && runtime->gather_typed_pipeline != nil;
+}
+
 int termite_metal_decode_runtime_gather_typed_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params) {
     return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, indices_handle, indices_offset, indices_bytes, output_handle, output_offset, output_bytes, params, 6, runtime != NULL ? runtime->gather_typed_pipeline : nil);
 }

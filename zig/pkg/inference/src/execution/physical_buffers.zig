@@ -2540,6 +2540,12 @@ pub const Frame = struct {
                 self.retired = true;
                 return err;
             };
+            if (cb.kind() == .metal) if (plan.index_bounds) |bounds| {
+                lease.certifyHostIndices(assigned, bounds.extent) catch |err| {
+                    self.retired = true;
+                    return err;
+                };
+            };
             self.host_bound_inputs[self.bound_host_input_count] = .{ .node_id = input.node_id, .value = value, .source_backend = cb };
             self.bound_host_input_count += 1;
         }

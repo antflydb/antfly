@@ -714,16 +714,16 @@ pub const MetalTensor = struct {
     /// A view pins the plan's backing lease, and every retained metadata view
     /// shares that pin. The original backing reference remains independent.
     /// Allocate the ownership record before taking the pin so OOM is atomic.
-    pub fn deviceLeasedView(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, dims: []const i32) !MetalTensor {
+    pub fn deviceLeasedView(allocator: std.mem.Allocator, source: *const MetalTensor, lease: *@import("../ops/physical_storage.zig").Lease, dims: []const i32, dtype: DType) !MetalTensor {
         const device = source.device orelse return error.UnsupportedTensorType;
         const handle = source.deviceHandle() orelse return error.ReleasedDeviceBuffer;
-        if (source.dtype != .f32 or dims.len > max_dims) return error.UnsupportedTensorType;
+        if (dims.len > max_dims or device.byte_offset % dtype.byteSize() != 0) return error.UnsupportedTensorType;
         var elements: usize = 1;
         for (dims) |extent| {
             if (extent < 0) return error.InvalidTensorShape;
             elements = try std.math.mul(usize, elements, @intCast(extent));
         }
-        const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+        const bytes = try std.math.mul(usize, elements, dtype.byteSize());
         if (bytes > device.byte_len) return error.InvalidTensorShape;
         const ref = try allocator.create(DeviceBufferRef);
         ref.* = .{
@@ -740,7 +740,7 @@ pub const MetalTensor = struct {
         };
         lease.retain();
         memoryAdd(.device_borrowed_tensors_created, 1);
-        return deviceView(ref, device.byte_offset, bytes, dims, .f32);
+        return deviceView(ref, device.byte_offset, bytes, dims, dtype);
     }
 
     /// True only for storage whose execution-plan lease pins every view and

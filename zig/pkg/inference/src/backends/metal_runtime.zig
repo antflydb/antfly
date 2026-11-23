@@ -7710,10 +7710,18 @@ pub fn decoderRuntimeCumulativeSumF32Device(self: anytype, input: MetalTensor, a
 pub extern fn termite_metal_decode_runtime_cumulative_sum_f32_device(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, outer: usize, width: usize, inner: usize, exclusive: u32, reverse: u32, integer: u32, output: ?*anyopaque, output_offset: usize) c_int;
 
 pub fn decoderRuntimeGatherTypedDevice(self: anytype, input: MetalTensor, indices: MetalTensor, axis: u8, shape: []const i32) !?MetalTensor {
+    return decoderRuntimeGatherTypedDeviceImpl(self, input, indices, axis, shape, null);
+}
+
+pub fn decoderRuntimeGatherTypedDeviceInto(self: anytype, input: MetalTensor, indices: MetalTensor, axis: u8, output: MetalTensor) !?MetalTensor {
+    return decoderRuntimeGatherTypedDeviceImpl(self, input, indices, axis, output.shape(), output);
+}
+
+fn decoderRuntimeGatherTypedDeviceImpl(self: anytype, input: MetalTensor, indices: MetalTensor, axis: u8, shape: []const i32, assigned: ?MetalTensor) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (axis >= input.shape().len or indices.dtype == .f32) return error.InvalidTensorShape;
-    var output = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, input.dtype, .private, shape);
-    errdefer output.deinit();
+    var output = assigned orelse try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, input.dtype, .private, shape);
+    errdefer if (assigned == null) output.deinit();
     if (output.elemCount() == 0) return output;
     var inner: usize = 1;
     for (input.shape()[axis + 1 ..]) |dim| inner = try std.math.mul(usize, inner, @intCast(dim));
@@ -7726,8 +7734,10 @@ pub fn decoderRuntimeGatherTypedDevice(self: anytype, input: MetalTensor, indice
         @backingInt(indices.dtype),
     };
     const rc = termite_metal_decode_runtime_gather_typed_device(runtime, input.deviceHandle(), input.deviceByteOffset(), input.deviceByteLen(), indices.deviceHandle(), indices.deviceByteOffset(), indices.deviceByteLen(), output.deviceHandle(), output.deviceByteOffset(), output.deviceByteLen(), &params);
+    if (assigned != null) return if (rc == 0) output else null;
     return finishDeviceOutput(&output, rc);
 }
+pub extern fn antfly_metal_typed_gather_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
 extern fn termite_metal_decode_runtime_gather_typed_device(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, input_bytes: usize, indices: ?*anyopaque, indices_offset: usize, indices_bytes: usize, output: ?*anyopaque, output_offset: usize, output_bytes: usize, params: *const [6]u32) c_int;
 
 pub fn decoderRuntimeIntegerBinaryDevice(self: anytype, lhs: MetalTensor, rhs: MetalTensor, kind: u32) !?MetalTensor {

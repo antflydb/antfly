@@ -548,14 +548,17 @@ fn metalGatherHasResidentShape(query: CapabilityQuery) bool {
         .gather => |attrs| attrs,
         else => return false,
     };
-    if (attrs.elements or attrs.nd) return false;
-    if (attrs.axis != 0) return false;
+    if (attrs.elements or attrs.nd or attrs.batch_dims != 0) return false;
     const input_shape = nodeInputShape(query, 0) orelse return false;
     const indices_shape = nodeInputShape(query, 1) orelse return false;
     if (input_shape.dtype != .f32) return false;
-    if (input_shape.rank() != 2) return false;
-    if (indices_shape.rank() + 1 > ml.graph.shape.max_rank) return false;
-    return shapeHasConcreteElements(input_shape) and shapeHasConcreteElements(indices_shape);
+    if (!shapeHasConcreteElements(input_shape) or !shapeHasConcreteElements(indices_shape)) return false;
+    return switch (indices_shape.dtype) {
+        .f32 => attrs.axis == 0 and input_shape.rank() == 2 and indices_shape.rank() + 1 <= ml.graph.shape.max_rank,
+        .i32, .i64 => attrs.axis < input_shape.rank() and
+            @as(usize, input_shape.rank()) - 1 + indices_shape.rank() <= ml.graph.shape.max_rank,
+        else => false,
+    };
 }
 
 fn metalReduceHasResidentShape(query: CapabilityQuery) bool {
@@ -1513,16 +1516,19 @@ test "metal eager graph capability decisions are attrs and shape aware" {
     nd_query.op.gather.nd = true;
     try std.testing.expect(!decideMetalEagerGraph(nd_query).can_execute);
 
-    const invalid_gather_query = CapabilityQuery{
+    const axis1_gather_query = CapabilityQuery{
         .graph = &gather_graph,
         .node_id = gather_axis1,
         .op = gather_graph.node(gather_axis1).op,
         .tensor_descs = gather_seeds,
     };
+    try std.testing.expect(decideMetalEagerGraph(axis1_gather_query).can_execute);
+    try std.testing.expect(!metalEagerGraphNodeIsHostAssisted(axis1_gather_query));
+    var invalid_gather_query = axis1_gather_query;
+    invalid_gather_query.op.gather.axis = 2;
     const invalid_gather_decision = decideMetalEagerGraph(invalid_gather_query);
     try std.testing.expect(!invalid_gather_decision.can_execute);
     try std.testing.expectEqual(CapabilityReason.unsupported_op, invalid_gather_decision.reason);
-    try std.testing.expect(!metalEagerGraphNodeIsHostAssisted(invalid_gather_query));
 
     var argmax_graph = Graph.init(allocator);
     defer argmax_graph.deinit();

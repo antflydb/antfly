@@ -5515,7 +5515,7 @@ noinline fn validateFreshPreparedRouteFacts(target: *ImportedOnnxSession, routes
     try routes.validateWithClaims(facts.inputs, claims);
 }
 
-fn importedTypedHostIngress(backend_type: BackendType) !void {
+fn importedTypedHostIngress(backend_type: BackendType, comptime Index: type, comptime axis: u8) !void {
     const a = std.testing.allocator;
     if (backend_type == .cuda) {
         var probe = @import("compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (@as(anyerror, err)) {
@@ -5527,9 +5527,15 @@ fn importedTypedHostIngress(backend_type: BackendType) !void {
     var graph = Graph.init(a);
     defer graph.deinit();
     var b = ml.graph.Builder.init(&graph);
-    const indices = try b.parameter("indices", Shape.init(.i64, &.{2}));
-    const table = try b.tensorConst(&.{ 1, 2, 3, 4, 5, 6 }, Shape.init(.f32, &.{ 3, 2 }));
-    try graph.markOutput(try b.gather(table, indices, Shape.init(.f32, &.{ 2, 2 })));
+    const dtype = @field(ml.graph.DType, @typeName(Index));
+    const wire_type = @field(@import("tensor.zig").DType, @typeName(Index));
+    const indices = try b.parameter("indices", Shape.init(dtype, &.{2}));
+    const table = try b.tensorConst(&.{ 1, 2, 3, 4, 5, 6 }, Shape.init(.f32, if (axis == 0) &.{ 3, 2 } else &.{ 2, 3 }));
+    const output_node = try b.gather(table, indices, Shape.init(.f32, &.{ 2, 2 }));
+    graph.nodeMut(output_node).op.gather.axis = axis;
+    try graph.markOutput(output_node);
+    const first_expected: []const f32 = if (axis == 0) &.{ 5, 6, 1, 2 } else &.{ 3, 1, 6, 4 };
+    const second_expected: []const f32 = if (axis == 0) &.{ 3, 4, 1, 2 } else &.{ 2, 1, 5, 4 };
     const bytes = try onnx_graph.exportGraph(a, &graph, .{});
     defer a.free(bytes);
     var dir = std.testing.tmpDir(.{});
@@ -5540,36 +5546,65 @@ fn importedTypedHostIngress(backend_type: BackendType) !void {
     var session = try createSessionWithOptions(a, path, backend_type, .{ .graph_runtime_strategy = .partitioned });
     var open = true;
     defer if (open) session.close();
-    var storage: [17]u8 = undefined;
-    const offset: usize = if (@intFromPtr(&storage) % 8 == 0) 1 else 0;
-    const raw = storage[offset..][0..16];
-    const selected = [_]i64{ 2, 0 };
+    if (backend_type == .metal) {
+        const impl: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+        const runtime = impl.shared_backend_ctx.ctx.metal_hosted.compute.provider_impl.raw_decode_runtime;
+        if (!@import("metal_runtime.zig").antfly_metal_host_input_shared_supported(runtime)) return error.SkipZigTest;
+        try std.testing.expect(session.configureExecutionDiagnostics(true));
+    }
+    const bytes_per_pair = @sizeOf([2]Index);
+    var storage: [bytes_per_pair + 1]u8 align(@alignOf(Index)) = undefined;
+    const raw = storage[1..];
+    const selected = [_]Index{ 2, 0 };
     @memcpy(raw, std.mem.sliceAsBytes(&selected));
-    const input = Tensor{ .data = raw, .dtype = .i64, .shape = &.{2}, .name = "indices", .allocator = a, .owns_data = false, .owns_shape = false };
+    const input = Tensor{ .data = raw, .dtype = wire_type, .shape = &.{2}, .name = "indices", .allocator = a, .owns_data = false, .owns_shape = false };
     {
         var invocation = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)).?;
         defer invocation.deinit();
         const routes = invocation.routes orelse return error.MissingPreparedKernelRoute;
         try std.testing.expectEqual(@as(usize, 1), routes.pool.host_input_plans.len);
-        try std.testing.expectEqual(ml.graph.DType.i64, routes.pool.host_input_plans[0].shape.dtype);
-        try std.testing.expectEqual(@as(usize, 16), routes.pool.host_input_plans[0].requirements.bytes);
-        if (backend_type == .native) try std.testing.expect(invocation.hasCompleteOwnedPayload());
+        try std.testing.expectEqual(dtype, routes.pool.host_input_plans[0].shape.dtype);
+        try std.testing.expectEqual(bytes_per_pair, routes.pool.host_input_plans[0].requirements.bytes);
+        if (backend_type != .cuda and !invocation.hasCompleteOwnedPayload()) {
+            std.debug.print("typed gather coverage={any}, metal_frame={}\n", .{ routes.pool.payload_coverage, routes.pool.metal_frame_dispatch });
+            return error.MissingOwnedGatherPayload;
+        }
     }
     const legacy = try session.vtable.run(session.ptr, &.{input}, a);
     defer {
         for (legacy) |*value| value.deinit();
         a.free(legacy);
     }
-    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 1, 2 }, legacy[0].asFloat32());
+    try std.testing.expectEqualSlices(f32, first_expected, legacy[0].asFloat32());
     for (0..3) |iteration| {
-        const current = [_]i64{ if (iteration % 2 == 0) 2 else 1, 0 };
+        const current = [_]Index{ if (iteration % 2 == 0) 2 else 1, 0 };
         @memcpy(raw, std.mem.sliceAsBytes(&current));
         const output = try session.run(&.{input}, a);
         defer {
             for (output) |*value| value.deinit();
             a.free(output);
         }
-        try std.testing.expectEqualSlices(f32, if (iteration % 2 == 0) &.{ 5, 6, 1, 2 } else &.{ 3, 4, 1, 2 }, output[0].asFloat32());
+        try std.testing.expectEqualSlices(f32, if (iteration % 2 == 0) first_expected else second_expected, output[0].asFloat32());
+    }
+    if (backend_type == .metal) {
+        @memcpy(raw, std.mem.sliceAsBytes(&[_]Index{ -1, 0 }));
+        var resident = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        defer resident.deinit();
+        const stats = session.executionDiagnostics().?.execution.?;
+        try std.testing.expectEqual(@as(u64, 1), stats.assigned_kernel_dispatches);
+        try std.testing.expectEqual(@as(u64, 0), stats.actual_download_bytes);
+        @memcpy(raw, std.mem.sliceAsBytes(&[_]Index{ if (Index == i64) 9_007_199_254_740_993 else 16_777_217, 0 }));
+        try std.testing.expectError(error.IndexOutOfBounds, session.run(&.{input}, a));
+        @memcpy(raw, std.mem.sliceAsBytes(&[_]Index{ 1, 0 }));
+        var next = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        defer next.deinit();
+        const second = try next.backend.toFloat32(next.outputs[0], a);
+        defer a.free(second);
+        try std.testing.expectEqualSlices(f32, second_expected, second);
+        const first = try resident.backend.toFloat32(resident.outputs[0], a);
+        defer a.free(first);
+        try std.testing.expectEqualSlices(f32, first_expected, first);
+        @memcpy(raw, std.mem.sliceAsBytes(&selected));
     }
     const held = try session.run(&.{input}, a);
     defer {
@@ -5578,14 +5613,21 @@ fn importedTypedHostIngress(backend_type: BackendType) !void {
     }
     session.close();
     open = false;
-    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 1, 2 }, held[0].asFloat32());
+    try std.testing.expectEqualSlices(f32, first_expected, held[0].asFloat32());
 }
+test "Imported Metal provider qualified typed host ingress preserves public gather semantics" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    try importedTypedHostIngress(.metal, i32, 1);
+    try importedTypedHostIngress(.metal, i64, 0);
+}
+
 test "Imported Native provider qualified typed host ingress preserves public gather semantics" {
-    try importedTypedHostIngress(.native);
+    try importedTypedHostIngress(.native, i64, 0);
 }
 test "Imported CUDA provider qualified typed host ingress preserves public gather semantics" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
-    try importedTypedHostIngress(.cuda);
+    try importedTypedHostIngress(.cuda, i64, 0);
 }
 test "Imported mixed unsupported boolean entries retain whole entry legacy import" {
     const a = std.testing.allocator;
