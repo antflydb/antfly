@@ -192,7 +192,7 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         const a = arena.allocator();
         const audio_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, options.transcribe_audio, a, .limited(32 * 1024 * 1024));
         var forced_scratch: [3]@typeInfo(@TypeOf(prompt.automatic_ids)).pointer.child = undefined;
-        const forced_ids = try prompt.resolveWithTimestamps(&forced_scratch, null, options.transcribe_timestamps);
+        const forced_ids = try prompt.resolveWithTimestamps(&forced_scratch, options.transcribe_language, options.transcribe_timestamps);
         var pipeline = inference.pipelines.transcription.TranscriptionPipeline.init(a, session, session, model.getTokenizer(), .{
             .pjrt_decoder_cache = options.pjrt.decoder_cache,
             .max_length = config.max_target_positions,
@@ -271,7 +271,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
             .max_length = config.max_target_positions,
             .max_output_tokens = max_output_tokens,
             .configured_eos_token_id = config.eos_token_id,
-            .automatic_language = true,
+            .automatic_language = options.transcribe_language == null,
+            .requested_language = options.transcribe_language,
             .configured_warmup_iterations = options.warmup,
             .configured_measured_iterations = options.iterations,
             .persistent_model_load_in_lifecycle = false,

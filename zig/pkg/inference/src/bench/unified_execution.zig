@@ -56,6 +56,7 @@ const Options = struct {
     resident: bool = false,
     incremental_source: bool = false,
     transcribe_audio: []const u8 = "",
+    transcribe_language: ?[]const u8 = null,
     transcribe_mode: enum { performance, correctness } = .performance,
     transcribe_max_output_tokens: usize = 0,
     transcribe_cold_timeout_seconds: u32 = 120,
@@ -91,6 +92,11 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--transcribe-cold-timeout-seconds")) {
             options.transcribe_cold_timeout_seconds = try std.fmt.parseInt(u32, value, 10);
             if (options.transcribe_cold_timeout_seconds == 0 or options.transcribe_cold_timeout_seconds > 1800) return error.InvalidArgument;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--transcribe-language")) {
+            if (value.len == 0) return error.InvalidArgument;
+            options.transcribe_language = value;
             continue;
         }
         if (std.mem.eql(u8, arg, "--transcribe-max-output-tokens")) {
@@ -155,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
     if (options.extraction_request != null and (options.generate_text != null or options.embedding_pool != null or options.transcribe_audio.len != 0 or options.decoder_steps != 0 or options.primitive != null or options.resident or options.incremental_source or options.soak_seconds != 0)) return error.InvalidExtractionGeometry;
     if ((options.generate_image != null or options.generate_audio != null or options.generate_video != null) and options.generate_text == null) return error.InvalidGenerationGeometry;
     if (options.generate_video != null and (options.generate_image != null or options.generate_audio != null)) return error.InvalidGenerationGeometry;
-    if (options.transcribe_audio.len == 0 and (options.transcribe_timestamps or options.transcribe_require_eos or options.transcribe_output_format != .json or options.transcribe_mode != .performance or options.transcribe_max_output_tokens != 0)) return error.InvalidTranscriptionGeometry;
+    if (options.transcribe_audio.len == 0 and (options.transcribe_language != null or options.transcribe_timestamps or options.transcribe_require_eos or options.transcribe_output_format != .json or options.transcribe_mode != .performance or options.transcribe_max_output_tokens != 0)) return error.InvalidTranscriptionGeometry;
     if (options.transcribe_audio.len != 0 and (options.incremental_source or (options.backend != .native and options.backend != .metal and options.backend != .cuda and options.backend != .xla) or options.batch != 1 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0 or options.source_proof != .off or options.source_trace_constructor or options.source_pipelined_steps != 0 or options.decoder_model_dir.len != 0)) return error.InvalidTranscriptionGeometry;
     const pjrt_task: inference.pjrt_options.Options.Task = if (options.transcribe_audio.len != 0)
         .transcription
