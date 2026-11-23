@@ -31,10 +31,29 @@ const platform = @import("antfly_platform");
 pub const Owner = struct {
     allocator: std.mem.Allocator,
     plan: Plan = .{},
+    executable: ?Executable = null,
     quota: Quota = .none,
     managed: bool = false,
     retiring: bool = false,
     node: retirement.Node = undefined,
+
+    pub const Executable = struct { key: u64, storage: arena.Layout };
+
+    pub fn seal(self: *Owner, output: u64, key: u64, input_bytes: usize) bool {
+        if (!self.plan.finish(output)) return false;
+        const storage = self.plan.layout(input_bytes) catch return false;
+        var hash = std.hash.Wyhash.init(key);
+        for (self.plan.events[0..self.plan.event_count]) |event| {
+            hash.update(std.mem.asBytes(&event.slot));
+            const flag: u32 = @intFromBool(event.allocate);
+            hash.update(std.mem.asBytes(&flag));
+            const allocation = self.plan.allocations[event.slot];
+            hash.update(std.mem.asBytes(&allocation.bytes));
+            hash.update(std.mem.asBytes(&allocation.offset));
+        }
+        self.executable = .{ .key = hash.final(), .storage = storage };
+        return true;
+    }
 
     pub fn create(a: std.mem.Allocator) !*Owner {
         const self = try a.create(Owner);

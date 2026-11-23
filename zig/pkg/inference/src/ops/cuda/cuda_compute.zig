@@ -7928,17 +7928,8 @@ pub const CudaCompute = struct {
         }
         return .{ .key = hash.final(), .input_bytes = input_bytes };
     }
-    fn audioArenaRequestFromPlan(self: *const CudaCompute, base: AudioCacheBase, plan: *const @import("audio_execution_plan.zig").Plan, storage: @import("../../execution/stream_workspace.zig").Layout) CacheFunding.Request {
-        var layout = std.hash.Wyhash.init(base.key);
-        for (plan.events[0..plan.event_count]) |event| {
-            layout.update(std.mem.asBytes(&event.slot));
-            const flag: @TypeOf(self.embedding_gemma2_policy.arithmeticBits()) = @intFromBool(event.allocate);
-            layout.update(std.mem.asBytes(&flag));
-            const allocation = plan.allocations[event.slot];
-            layout.update(std.mem.asBytes(&allocation.bytes));
-            layout.update(std.mem.asBytes(&allocation.offset));
-        }
-        return .{ .arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .grid_x = @intCast(layout.final()), .sizes = .{ storage.bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
+    fn audioArenaRequest(executable: @import("audio_execution_plan.zig").Owner.Executable) CacheFunding.Request {
+        return .{ .arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .grid_x = @intCast(executable.key), .sizes = .{ executable.storage.bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
     }
     /// Read the SAME already learned allocation/event layout without creating a
     /// cache entry, touching its LRU, or replaying numerical work for planning.
@@ -7947,10 +7938,8 @@ pub const CudaCompute = struct {
         const base = try self.audioCacheBase(key, inputs, null);
         if (base.input_bytes > 128 * 1024 * 1024) return null;
         for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled) {
-            const plan = if (entry.owner) |owner| &owner.plan else return null;
-            const storage = plan.layout(base.input_bytes) catch return null;
-            if (storage.output == null) return null;
-            return self.audioArenaRequestFromPlan(base, plan, storage);
+            const owner = entry.owner orelse return null;
+            return audioArenaRequest(owner.executable orelse return null);
         };
         return null;
     }
@@ -20657,15 +20646,17 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const result = tensorFromCt(out);
         if (!audioOutputMatches(first_input, result, output_bytes) or
             self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before or
-            !plan.finish(result.buffer.ptr)) entry.disabled = true;
+            !owner.seal(result.buffer.ptr, base_key, input_bytes)) entry.disabled = true;
         return out;
     }
-    const plan = &entry.owner.?.plan;
-    const storage = plan.layout(input_bytes) catch return null;
+    const owner = entry.owner.?;
+    const plan = &owner.plan;
+    const executable = owner.executable orelse return null;
+    const storage = executable.storage;
     const output = storage.output orelse return null;
     if (output_bytes == 0 or output_bytes > output.bytes) return null;
     // The same complete event ABI drives preflight and actual arena lookup.
-    const cache_request = self.audioArenaRequestFromPlan(cache_base, plan, storage);
+    const cache_request = CudaCompute.audioArenaRequest(executable);
     const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
     arena.pollTiming(&self.ctx);
     // The sealed allocation plan above is the audio route's capture proof.
@@ -60659,12 +60650,18 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     try std.testing.expectEqual(original.input_bytes, candidate.input_bytes);
     // The old plan would overflow funding if inspected under the new policy.
     try std.testing.expect((try compute.audioCacheRequest(42, &inputs)) == null);
-    var plan: @import("audio_execution_plan.zig").Plan = .{};
-    plan.allocate(1024, 0x1000);
-    try std.testing.expect(plan.finish(0x1000));
-    const old_arena = compute.audioArenaRequestFromPlan(original, &plan, try plan.layout(original.input_bytes));
-    const new_arena = compute.audioArenaRequestFromPlan(candidate, &plan, try plan.layout(candidate.input_bytes));
+    const Owner = @import("audio_execution_plan.zig").Owner;
+    var learned: Owner = .{ .allocator = std.testing.allocator };
+    learned.plan.allocate(1024, 0x1000);
+    try std.testing.expect(learned.seal(0x1000, original.key, original.input_bytes));
+    var updated: Owner = .{ .allocator = std.testing.allocator };
+    updated.plan.allocate(1024, 0x2000);
+    try std.testing.expect(updated.seal(0x2000, candidate.key, candidate.input_bytes));
+    const old_arena = CudaCompute.audioArenaRequest(learned.executable.?);
+    const new_arena = CudaCompute.audioArenaRequest(updated.executable.?);
     try std.testing.expect(old_arena.arena.grid_x != new_arena.arena.grid_x);
+    compute.audio_plans.entries[0] = .{ .key = candidate.key, .stamp = 1, .warmed = true, .owner = &updated };
+    try std.testing.expectEqualDeep(new_arena, (try compute.audioCacheRequest(42, &inputs)).?);
 }
 
 test "GLiDE CUDA weight upload consumes keys on early allocation failure" {
