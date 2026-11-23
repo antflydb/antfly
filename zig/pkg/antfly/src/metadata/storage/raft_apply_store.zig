@@ -16040,20 +16040,33 @@ pub const RaftApplyStore = struct {
         return @import("../source_legacy_intake.zig").allowed(a, &txn, group_id, table_id, ordinal, definition);
     }
     pub fn nativeSourceRecoveryScope(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !?source_control.Scope {
-        const id = source_control.nativeBootstrapSourceId(table_id, ordinal, definition);
-        const raw = try self.getSourceControl(a, group_id, table_id, id);
-        defer a.free(raw);
-        var parsed = try source_control.parse(a, raw);
-        defer parsed.deinit();
-        const state = parsed.value;
-        const scope = state.scope orelse return null;
-        if (!std.meta.eql(scope.source_id, id) or scope.table_id != table_id or
-            scope.source_ordinal != ordinal or !std.meta.eql(scope.definition, definition))
-            return error.SourceBindingConflict;
-        if (scope.destination != .native or !state.scope_fencing) return null;
-        if (state.retired and (state.native_bootstrap_checkpoint == null or
-            state.checkpoint_authority.?.retirement != null)) return null;
-        return scope;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var status_buffer: [224]u8 = undefined;
+        const status_key = try replicationSourceStatusKeyForGroup(&status_buffer, group_id, table_id, ordinal);
+        if (try stagingGet(&txn, status_key)) |bytes| {
+            const status = try decodeReplicationSourceStatusRecord(a, bytes);
+            defer metadata_table_manager.freeReplicationSourceStatus(a, status);
+            // The atomic handover claim guarantees the canonical actor ID.
+            // Other scoped writers can have an explicitly assigned identity.
+            if (std.mem.eql(u8, status.phase, source_control.legacy_handover_phase)) {
+                const id = source_control.nativeBootstrapSourceId(table_id, ordinal, definition);
+                var buffer: [256]u8 = undefined;
+                const raw = (try stagingGet(&txn, try source_control.keyForGroup(&buffer, group_id, table_id, id))) orelse
+                    return error.SourceBindingConflict;
+                var parsed = try source_control.parse(a, raw);
+                defer parsed.deinit();
+                const state = parsed.value;
+                const scope = state.scope orelse return error.SourceBindingConflict;
+                if (!std.meta.eql(scope.source_id, id) or scope.table_id != table_id or
+                    scope.source_ordinal != ordinal or !std.meta.eql(scope.definition, definition) or
+                    scope.destination != .native or !state.scope_fencing) return error.SourceBindingConflict;
+                if (state.retired and (state.native_bootstrap_checkpoint == null or
+                    state.checkpoint_authority.?.retirement != null)) return null;
+                return scope;
+            }
+        }
+        return @import("../source_legacy_intake.zig").find(a, &txn, group_id, table_id, ordinal, definition, .recovery);
     }
 
     /// The service establishes ReadIndex before calling. Every captured field,

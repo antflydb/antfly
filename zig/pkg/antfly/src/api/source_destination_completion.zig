@@ -105,7 +105,14 @@ pub fn recover(
     const fence = try retainedRoute(admission.coordinator.recovery, a, manifest, context);
     if (current.committed.sequence != current.accepted.sequence) {
         const worker: Completion = .{ .recovery = admission.coordinator.recovery };
-        if (try worker.run(a, current, current.accepted.reference, fence, context) != .complete) return;
+        if (try worker.run(a, current, current.accepted.reference, fence, context) != .complete) {
+            // Routine propagation can span several rounds. Once the original
+            // attempt is old enough, publish an unresolved recovery error.
+            const now = @import("antfly_platform").time.realtimeNs();
+            if (now -| manifest.begin_timestamp >= 30 * std.time.ns_per_s)
+                return error.SourceOutcomeUnresolved;
+            return;
+        }
         const reference = try std.fmt.allocPrint(a, "{x}:{d}", .{ &manifest.admission_digest, manifest.commit_version });
         defer a.free(reference);
         return mutate(svc, a, binding, catalog_digest, current, .{ .commit = .{

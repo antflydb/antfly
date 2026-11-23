@@ -11564,6 +11564,9 @@ pub const MetadataHttpService = struct {
 
     fn recordScopedStreamError(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, err: anyerror, context: api_operation.RequestContext) !void {
         if (state.closing or state.retired or metadata_replication_backfill.replicationErrorEndsRound(err)) return;
+        if (state.stream_failure) |previous| {
+            if (previous.terminal or std.mem.eql(u8, previous.code, @errorName(err))) return;
+        }
         const control = @import("source_control.zig");
         const scope = state.scope orelse return;
         var reporting = context;
