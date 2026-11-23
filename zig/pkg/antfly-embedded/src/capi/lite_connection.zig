@@ -8596,6 +8596,19 @@ fn xprocReapBounded(pid: std.c.pid_t, timeout_ms: i64) !void {
     }
 }
 
+fn xprocRunTest(filter: []const u8, environment: *const std.process.Environ.Map) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const executable = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(executable);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ executable, "--timeout-ms=120000", filter },
+        .environ_map = environment,
+    });
+    defer child.kill(io);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try child.wait(io));
+}
+
 fn xprocParkForever() noreturn {
     while (true) {
         var no_fds: [0]std.c.pollfd = .{};
@@ -8981,6 +8994,20 @@ test "capi redo refresh rejects physical index changes at the same page bound" {
 test "capi native separate writer processes refresh full-text in place" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
     if (!Owner.in_place_refresh_enabled) return error.SkipZigTest;
+    const peer_path_env = "ANTFLY_TEST_FULL_TEXT_PEER_PATH";
+    if (std.c.getenv(peer_path_env)) |child_path| {
+        const child = try open(std.mem.span(child_path), .{ .profile = .native, .busy_timeout_ms = 10_000 }, false);
+        const child_id = try api.publishHandle(child);
+        defer api.antfly_db_close(child_id);
+        for (0..8) |sequence| {
+            var request_buffer: [256]u8 = undefined;
+            const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"doc-{d}\":{{\"text\":\"childwrote{d}\"}}}},\"sync_level\":\"full_index\"}}", .{ sequence % 2, sequence });
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(child_id, .fromSlice(request), &out));
+        }
+        return;
+    }
     const a = std.testing.allocator;
     var tmp = try api.TestDirectory.init("xproc-fts-in-place");
     defer tmp.cleanup();
@@ -9016,48 +9043,12 @@ test "capi native separate writer processes refresh full-text in place" {
     try Search.write(id, "doc-0", "parentfirst");
     try std.testing.expect(try Search.found(id, "parentfirst", "\"doc-0\""));
 
-    const writes = 8;
-    const Child = struct {
-        fn run(child_path: []const u8, result_fd: std.c.fd_t) noreturn {
-            const child = open(child_path, .{ .profile = .native, .busy_timeout_ms = 10_000 }, false) catch xprocParkForever();
-            const child_id = api.publishHandle(child) catch xprocParkForever();
-            var request_buffer: [256]u8 = undefined;
-            for (0..writes) |sequence| {
-                const request = std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"doc-{d}\":{{\"text\":\"childwrote{d}\"}}}},\"sync_level\":\"full_index\"}}", .{ sequence % 2, sequence }) catch xprocParkForever();
-                var out: h.capi.Buffer = .{};
-                const code = api.antfly_db_batch_json(child_id, .fromSlice(request), &out);
-                api.antfly_buffer_free_zero(&out);
-                if (code != .ok) {
-                    const report: [1]u8 = .{1};
-                    _ = std.c.write(result_fd, &report, report.len);
-                    xprocParkForever();
-                }
-            }
-            api.antfly_db_close(child_id);
-            const report: [1]u8 = .{0};
-            _ = std.c.write(result_fd, &report, report.len);
-            xprocParkForever();
-        }
-    };
     const in_place_before = owner.test_in_place_refresh_count.load(.acquire);
     const runtime_before = owner.current.?;
-    var fds: [2]std.c.fd_t = undefined;
-    try std.testing.expectEqual(0, std.c.pipe(&fds));
-    const pid = std.c.fork();
-    if (pid == 0) {
-        _ = std.posix.system.close(fds[0]);
-        Child.run(path, fds[1]);
-    }
-    try std.testing.expect(pid > 0);
-    _ = std.posix.system.close(fds[1]);
-    defer {
-        _ = std.c.kill(pid, std.c.SIG.KILL);
-        _ = std.c.waitpid(pid, null, 0);
-        _ = std.posix.system.close(fds[0]);
-    }
-    var report: [1]u8 = undefined;
-    try xprocReadBounded(fds[0], &report, 600_000);
-    try std.testing.expectEqual(@as(u8, 0), report[0]);
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    try environment.put(peer_path_env, path);
+    try xprocRunTest("capi native separate writer processes refresh full-text in place", &environment);
 
     // The child's last writes are current; everything it overwrote is gone.
     try std.testing.expect(try Search.found(id, "childwrote6", "\"doc-0\""));
@@ -9158,21 +9149,13 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
 
         fn peerWrite(child_path: []const u8, key: []const u8, vector: []const u8, mode: PeerMode) !void {
             const allocator = std.testing.allocator;
-            const io = std.testing.io;
-            const executable = try std.process.executablePathAlloc(io, allocator);
-            defer allocator.free(executable);
             var environment = std.process.Environ.Map.init(allocator);
             defer environment.deinit();
             try environment.put(peer_path_env, child_path);
             try environment.put(peer_key_env, key);
             try environment.put(peer_vector_env, vector);
             try environment.put(peer_mode_env, @tagName(mode));
-            var child = try std.process.spawn(io, .{
-                .argv = &.{ executable, "--timeout-ms=120000", "capi Lite physical v2 peer ANN" },
-                .environ_map = &environment,
-            });
-            defer child.kill(io);
-            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try child.wait(io));
+            try xprocRunTest("capi Lite physical v2 peer ANN", &environment);
         }
 
         fn expectHit(handle: anytype, quoted_key: []const u8, vector: []const u8) !void {
