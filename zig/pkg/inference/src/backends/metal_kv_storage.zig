@@ -682,16 +682,22 @@ pub const MetalKvStorage = struct {
                     }
                 }
             }
+            // A long cyclic write can cover the same address more than once.
+            // Publish only the final turn of the ring so each GPU lane owns a distinct row.
+            const suffix_count = if (ring_page_count > 0) @min(write.suffix_token_count, required_tokens) else write.suffix_token_count;
+            const skipped_bytes = (write.suffix_token_count - suffix_count) * v_row_stride * @sizeOf(f32);
+            const key_offset = std.math.add(usize, k.byte_offset, skipped_bytes) catch break :paged -9999;
+            const value_offset = std.math.add(usize, v.byte_offset, skipped_bytes) catch break :paged -9999;
             break :paged metal_runtime.termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
                 self.runtime,
                 slot,
                 @backingInt(self.format),
                 k.handle,
-                k.byte_offset,
+                key_offset,
                 v.handle,
-                v.byte_offset,
+                value_offset,
                 write.total_token_count,
-                write.suffix_token_count,
+                suffix_count,
                 num_kv_heads,
                 head_dim,
                 key_row_bytes,
@@ -2269,6 +2275,66 @@ test "Metal KV sequence release removes more bindings than one slot batch" {
     storage.releaseSequenceSlots(target_sequence);
     try std.testing.expectEqual(@as(usize, 1), storage.slot_map.count());
     try std.testing.expect(storage.slot_map.contains(.{ .sequence_id = 8, .layer_index = 0 }));
+}
+
+test "Metal compressed cyclic append writes only the newest physical rows" {
+    if (!build_options.enable_metal or builtin.os.tag != .macos or !metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    if (!MetalKvStorage.splitSwaKvRingEnabled()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const metal = metal_runtime.termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer metal_runtime.termite_metal_decode_runtime_destroy(metal);
+    if (metal_runtime.termite_metal_decode_runtime_ready(metal) == 0) return error.SkipZigTest;
+
+    const width = 64;
+    const tokens = 7;
+    const ring_tokens = 4;
+    var runtime = try storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .int8,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = width,
+        .store_cpu_bytes = false,
+    });
+    defer runtime.deinit();
+    const owner = try MetalKvStorage.create(allocator, metal, .int8, 1, width, 2);
+    runtime.setDeviceWriteHook(owner.deviceWriteHook());
+    const sequence = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(sequence, tokens);
+
+    var rows: [tokens][width]f32 = undefined;
+    for (&rows, 1..) |*row, index| @memset(row, @floatFromInt(index));
+    const input = metal_runtime.termite_metal_buffer_alloc(metal, @sizeOf(@TypeOf(rows)), 0) orelse return error.MetalBufferAllocFailed;
+    defer metal_runtime.termite_metal_buffer_release(input);
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_upload(metal, input, 0, &rows, @sizeOf(@TypeOf(rows))));
+    const ref = storage_runtime.DeviceKvRef{ .handle = input, .byte_offset = 0, .byte_len = @sizeOf(@TypeOf(rows)) };
+    try runtime.writeLayerKvSuffixDevice(.{
+        .sequence_id = sequence,
+        .layer_index = 0,
+        .total_token_count = tokens,
+        .suffix_token_count = tokens,
+        .position_offset = 0,
+        .num_kv_heads = 1,
+        .head_dim = width,
+        .sliding_window = 2,
+        .max_inflight_tokens = 1,
+        .allow_swa_ring = true,
+    }, ref, ref);
+
+    const binding = owner.slot_map.get(.{ .sequence_id = sequence, .layer_index = 0 }).?;
+    try std.testing.expectEqual(@as(usize, 2), binding.ring_page_count);
+    const info = try owner.slotInfo(binding.slot);
+    var physical_values: [ring_tokens][width]f32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, info.v_handle, 0, &physical_values, @sizeOf(@TypeOf(physical_values))));
+    var physical_keys: [ring_tokens][width + @sizeOf(f32)]u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, info.encoded_key_handle, 0, &physical_keys, @sizeOf(@TypeOf(physical_keys))));
+    for (physical_values, physical_keys, [_]f32{ 5, 6, 7, 4 }) |values, keys, expected| {
+        for (values) |value| try std.testing.expectEqual(expected, value);
+        const scale: f32 = @bitCast(std.mem.readInt(u32, keys[0..4], .little));
+        try std.testing.expectApproxEqAbs(expected / 127, scale, 0.000001);
+        for (keys[4..]) |key| try std.testing.expectEqual(@as(u8, 127), key);
+    }
 }
 
 test "Metal paged KV hooks sharing a runtime lease disjoint slots" {

@@ -64391,160 +64391,24 @@ static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_k
             return -7;
     }
 
-    const size_t last_logical_block = (total_tokens - 1u) / page_size;
-    if (last_logical_block >= block_count) return -8;
-    size_t capacity_tokens = 0;
-    for (size_t i = 0; i < block_count; i++) {
-        const size_t block_start = (size_t)block_table[i];
-        if (block_start > SIZE_MAX - page_size) return -9;
-        const size_t block_end = block_start + page_size;
-        if (block_end > capacity_tokens) capacity_tokens = block_end;
-    }
-    if (capacity_tokens == 0) return -10;
-    const size_t encoded_bytes = capacity_tokens * key_row_bytes;
-    const size_t v_element_bytes = (format == 3u) ? sizeof(uint16_t) : sizeof(float);
-    const size_t v_bytes = capacity_tokens * v_row_stride * v_element_bytes;
-    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return -11;
-
     @autoreleasepool {
         id<MTLBuffer> k_buffer = (__bridge id<MTLBuffer>)k_handle;
         id<MTLBuffer> v_buffer = (__bridge id<MTLBuffer>)v_handle;
-        if (k_buffer == nil || v_buffer == nil) return -12;
-
-        const size_t values_per_row = num_kv_heads * head_dim;
-        const size_t suffix_start = total_tokens - suffix_tokens;
-        const size_t raw_source_row_bytes = values_per_row * sizeof(float);
-        const size_t raw_v_source_row_bytes = v_row_stride * sizeof(float);
-
-        if (format == 2u) {
-            BOOL encoder_owned = YES;
-            id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
-            if (encoder == nil) return -14;
-            const int rc = termite_metal_encode_paged_f32_kv_seed_on_encoder(
-                runtime,
-                encoder,
-                slot,
-                k_buffer,
-                k_offset,
-                v_buffer,
-                v_offset,
-                total_tokens,
-                suffix_tokens,
-                num_kv_heads,
-                head_dim,
-                key_row_bytes,
-                v_row_stride,
-                kv_position_offset,
-                block_table,
-                block_count,
-                page_size,
-                -14);
-            termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
-            if (rc != 0) return rc;
-        } else if (format == 3u) {
-            BOOL encoder_owned = YES;
-            id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(
-                runtime,
-                command_buffer,
-                TERMITE_METAL_COMPUTE_SOURCE_ATTENTION,
-                &encoder_owned);
-            if (encoder == nil) return -15;
-            const int rc = termite_metal_encode_paged_quantized_kv_seed_on_encoder(
-                runtime,
-                encoder,
-                slot,
-                format,
-                k_buffer,
-                k_offset,
-                v_buffer,
-                v_offset,
-                total_tokens,
-                suffix_tokens,
-                num_kv_heads,
-                head_dim,
-                key_row_bytes,
-                base_key_row_bytes,
-                v_row_stride,
-                kv_position_offset,
-                block_table,
-                block_count,
-                page_size,
-                -16);
-            termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
-            if (rc != 0) return rc;
-        } else {
-            id<MTLComputePipelineState> pipeline = nil;
-            switch (format) {
-                case 0u: pipeline = runtime->encode_polar4_key_pipeline; break;
-                case 1u: pipeline = runtime->encode_turbo3_key_pipeline; break;
-                case 4u: pipeline = runtime->encode_int8_per_head_pipeline; break;
-                default: return -19;
-            }
-            if (pipeline == nil) return -20;
-            termite_metal_encode_key_params params = {
-                .rows = 1u,
-                .num_kv_heads = (uint32_t)num_kv_heads,
-                .head_dim = (uint32_t)head_dim,
-                .key_row_bytes = (uint32_t)key_row_bytes,
-                .base_key_row_bytes = (uint32_t)base_key_row_bytes,
-            };
-            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-            if (params_buffer == nil) return -21;
-            size_t int8_tg_size = 1u;
-            while (int8_tg_size < head_dim && int8_tg_size < 256u) int8_tg_size <<= 1u;
-            if (format == 4u && int8_tg_size < head_dim) return -22;
-            const size_t residual_bytes = (num_kv_heads * 32u + 7u) / 8u;
-            const size_t compressed_work_items = format == 0u ? base_key_row_bytes : (base_key_row_bytes + residual_bytes);
-            for (size_t logical = suffix_start; logical < total_tokens; logical++) {
-                const size_t logical_block = logical / page_size;
-                const size_t token_in_block = logical - logical_block * page_size;
-                const size_t physical_token = (size_t)block_table[logical_block] + token_in_block;
-                const size_t source_row = logical - suffix_start;
-                id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-                if (encoder == nil) return -23;
-                antfly_metal_set_compute_pipeline(encoder, (pipeline));
-                termite_metal_bind_three_buffers_only(encoder, k_buffer, (k_offset + source_row * raw_source_row_bytes), runtime->attention_span_encoded_key_buffers[slot], (physical_token * key_row_bytes), params_buffer, 0);
-                if (format == 4u) {
-                    antfly_metal_dispatch_threads(encoder, MTLSizeMake(int8_tg_size, num_kv_heads, 1), MTLSizeMake(int8_tg_size, 1, 1));
-                } else {
-                    antfly_metal_dispatch_threads(encoder, MTLSizeMake(compressed_work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, compressed_work_items), 1, 1));
-                }
-                [encoder endEncoding];
-            }
-
-            termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_ATTENTION_SPAN);
-            id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
-            if (blit == nil) return -24;
-            for (size_t logical = suffix_start; logical < total_tokens; logical++) {
-                const size_t logical_block = logical / page_size;
-                const size_t token_in_block = logical - logical_block * page_size;
-                const size_t physical_token = (size_t)block_table[logical_block] + token_in_block;
-                const size_t source_row = logical - suffix_start;
-                [blit copyFromBuffer:v_buffer
-                        sourceOffset:(v_offset + source_row * raw_v_source_row_bytes)
-                            toBuffer:runtime->attention_span_v_buffers[slot]
-                   destinationOffset:(physical_token * v_row_stride * sizeof(float))
-                                size:raw_v_source_row_bytes];
-            }
-            [blit endEncoding];
-        }
-
-        runtime->attention_span_slot_tokens[slot] = total_tokens;
-        runtime->attention_span_slot_key_row_bytes[slot] = key_row_bytes;
-        runtime->attention_span_slot_v_row_stride[slot] = v_row_stride;
-        runtime->attention_span_slot_position_offset[slot] = kv_position_offset;
-        if (slot == 0) {
-            runtime->attention_span_encoded_key_buffer = runtime->attention_span_encoded_key_buffers[slot];
-            runtime->attention_span_v_buffer = runtime->attention_span_v_buffers[slot];
-            runtime->attention_span_encoded_key_capacity = runtime->attention_span_encoded_key_capacities[slot];
-            runtime->attention_span_v_capacity = runtime->attention_span_v_capacities[slot];
-            runtime->attention_span_tokens = total_tokens;
-            runtime->attention_span_key_row_bytes = key_row_bytes;
-            runtime->attention_span_v_row_stride = v_row_stride;
-            runtime->attention_span_position_offset = kv_position_offset;
-        }
-
-        return 0;
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(
+            runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
+        if (encoder == nil) return -14;
+        const int rc = format == 2u
+            ? termite_metal_encode_paged_f32_kv_seed_on_encoder(
+                runtime, encoder, slot, k_buffer, k_offset, v_buffer, v_offset, total_tokens,
+                suffix_tokens, num_kv_heads, head_dim, key_row_bytes, v_row_stride,
+                kv_position_offset, block_table, block_count, page_size, -14)
+            : termite_metal_encode_paged_quantized_kv_seed_on_encoder(
+                runtime, encoder, slot, format, k_buffer, k_offset, v_buffer, v_offset, total_tokens,
+                suffix_tokens, num_kv_heads, head_dim, key_row_bytes, base_key_row_bytes, v_row_stride,
+                kv_position_offset, block_table, block_count, page_size, -16);
+        termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+        return rc;
     }
 }
 
@@ -74873,8 +74737,10 @@ void antfly_metal_kv_growth_discard(void *raw) {
 typedef void *(*antfly_metal_kv_growth_allocate_fn)(void *, termite_metal_decode_runtime *, size_t);
 static void *antfly_metal_kv_growth_allocate(void *unused, termite_metal_decode_runtime *runtime, size_t bytes) {
     (void)unused;
-    id<MTLBuffer> buffer = termite_metal_workspace_buffer(runtime, bytes, MTLResourceStorageModePrivate);
-    return buffer ? (__bridge_retained void *)buffer : NULL;
+    @autoreleasepool {
+        id<MTLBuffer> buffer = termite_metal_workspace_buffer(runtime, bytes, MTLResourceStorageModePrivate);
+        return buffer ? (__bridge_retained void *)buffer : NULL;
+    }
 }
 // The allocator supplies freshly owned standalone private buffers. Production
 // always selects the canonical SDK allocator; tests exercise its error boundary
