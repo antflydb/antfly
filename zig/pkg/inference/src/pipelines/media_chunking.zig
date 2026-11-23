@@ -88,6 +88,7 @@ pub const VideoSpeakerResult = struct {
 pub const SpeakerAnalysis = struct {
     context: *anyopaque,
     prepare: *const fn (*anyopaque, std.mem.Allocator, @import("media_chunking_audio.zig").Provider, usize, [32]u8, []const u8, bool) anyerror!void,
+    prepare_video: ?*const fn (*anyopaque, std.mem.Allocator, @import("media_chunking_audio.zig").Provider, usize, [32]u8, []const u8, bool) anyerror!void = null,
     ensure: ?*const fn (*anyopaque, std.mem.Allocator, i64, i64, bool) anyerror!void = null,
     ensure_video: ?*const fn (*anyopaque, VideoSpeakerWindow, ?@import("media_chunking_audio.zig").Provider, *VideoSpeakerResult) anyerror!void = null,
     samples: ?*const fn (*anyopaque) ?usize = null,
@@ -630,13 +631,14 @@ pub const Runner = struct {
     fn finishSpeakers(self: *Runner) void {
         if (self.request.speaker_analysis) |analysis| if (analysis.close) |close| close(analysis.context);
     }
-    fn prepareSpeakers(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
+    fn prepareSpeakers(self: *Runner, provider: @import("media_chunking_audio.zig").Provider, video_input: bool) !void {
         if (self.request.speaker_analysis) |analysis| {
             const cacheable = if (self.request.native_source) |source| switch (source.storage) {
                 .range => |range| range.immutable_binding != null,
                 .borrowed => false,
             } else true;
-            try analysis.prepare(analysis.context, self.allocator, provider, self.request.max_working_bytes, self.summary.identity.source, self.request.source_version, cacheable);
+            const prepare = if (video_input) analysis.prepare_video orelse analysis.prepare else analysis.prepare;
+            try prepare(analysis.context, self.allocator, provider, self.request.max_working_bytes, self.summary.identity.source, self.request.source_version, cacheable);
         }
     }
     fn acknowledgeAudioStart(provider: @import("media_chunking_audio.zig").Provider, offset_ns: i64) void {
@@ -665,7 +667,7 @@ pub const Runner = struct {
 
     fn emitSoundWindows(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
         defer self.finishSpeakers();
-        try self.prepareSpeakers(provider);
+        try self.prepareSpeakers(provider, false);
         if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
         const final = if (provider.final_samples) |length| length(provider.context) else provider.samples;
         const ceiling_ns = @divFloor(@as(u128, final orelse provider.samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate);
@@ -1148,7 +1150,7 @@ pub const Runner = struct {
                 owner.speaker_reader = reader;
                 if (!video_groups or optional) speaker_provider = owner.speaker_reader.?.provider();
             }
-            self.prepareSpeakers(speaker_provider) catch |err| {
+            self.prepareSpeakers(speaker_provider, true) catch |err| {
                 if (!owner.optional_speakers or !optionalAudioPressure(err)) return err;
                 self.video_speaker_failure = err;
             };
