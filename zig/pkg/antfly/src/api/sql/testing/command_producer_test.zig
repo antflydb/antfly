@@ -657,7 +657,7 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                     native.fail_before = before;
                     var user: ?@import("../../http_server.zig").AuthenticatedIdentity = null;
                     var owner: @import("../session/session.zig").Coordinator = .{ .server = &server, .identity = &user, .context = .{ .sql_command_fence = &fence } };
-                    const result = try @import("../session/session.zig").Coordinator.commit(&owner, .{ .principal = "alice", .database = "default", .namespace = "public" }, txn_id);
+                    const result = try @import("../session/session.zig").Coordinator.commit(&owner, .{ .principal = "alice", .database = "default", .namespace = "public" }, try server.txn_sessions.mutation(a, txn_id, 0));
                     try std.testing.expectEqualDeep(txn_id, result.reconciliation_id);
                     try std.testing.expect(result.outcome == .committed or result.outcome == .aborted or result.outcome == .unknown);
                     if (fault == null) try std.testing.expectEqual(.committed, result.outcome);
@@ -1450,9 +1450,10 @@ test "SQL command producer native savepoint publication atomically rewinds SQL a
         }
         // SQL release is durable before native reparenting begins. No public
         // legacy path may mutate savepoints through this in-flight owner.
-        try std.testing.expectError(error.SqlConnectionBusy, registry.createNamedSavepoint(a, txn, "bypass"));
-        try std.testing.expectError(error.SqlConnectionBusy, registry.rollbackToNamedSavepoint(a, txn, "outer"));
-        try std.testing.expectError(error.SqlConnectionBusy, registry.releaseNamedSavepoint(a, txn, "outer"));
+        const guard = try registry.mutation(a, txn, if (native.standalone) 0 else 9);
+        try std.testing.expectError(error.SqlConnectionBusy, registry.createNamedSavepoint(a, guard, "bypass"));
+        try std.testing.expectError(error.SqlConnectionBusy, registry.rollbackToNamedSavepoint(a, guard, "outer"));
+        try std.testing.expectError(error.SqlConnectionBusy, registry.releaseNamedSavepoint(a, guard, "outer"));
         {
             const pinned = try registry.nativeSqlCut(a, txn);
             defer if (pinned.cut) |cut| cut.release();
@@ -2588,7 +2589,7 @@ test "SQL command producer native autocommit advisory reads lazily decide and re
         var catalog_ready = false;
         while (@import("antfly_platform").time.monotonicNs() < bootstrap_deadline) {
             catalog_bootstrap.next_round_at_ns = 0;
-            _ = try catalog_bootstrap.step(&metadata, a, group, @splat('1'), 0, @import("antfly_platform").time.monotonicNs());
+            _ = try catalog_bootstrap.step(&metadata, a, group, @splat('1'), 0, @import("antfly_platform").time.monotonicNs(), .startup);
             const work = try metadata.relationReconciliationWork(group);
             if (work.current) |state| if (state.phase == .ready and state.coverage == .constraint_names and work.root != null and work.root.?.eql(local.system_catalog_relation_reconciliation.Generation.of(&state))) {
                 catalog_ready = true;
@@ -2757,7 +2758,7 @@ test "SQL command producer native sealed execution fences completion before the 
                 native.fail_before = true;
                 // Stop after the durable seal and unknown native admission,
                 // before Adapter.commit can write the logical uncertain marker.
-                const outcome = try session_api.Coordinator.commit(&coordinator, scope, txn_id);
+                const outcome = try session_api.Coordinator.commit(&coordinator, scope, try server.txn_sessions.mutation(a, txn_id, 0));
                 try std.testing.expectEqual(local.sql_session.CommitOutcome.unknown, outcome.outcome);
                 try producer.finish(&durable, "alice", source.value, instance, ticket, try native.head(), native.nonce());
             }
