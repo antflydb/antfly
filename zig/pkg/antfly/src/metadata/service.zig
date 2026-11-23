@@ -10929,7 +10929,7 @@ pub const MetadataHttpService = struct {
         if (track_receipt) try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
         var accepted_index: ?u64 = null;
         var dispatch_error: ?anyerror = null;
-        try request.ensureActive();
+        try request.ensureDeadlineActive();
         self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
             dispatch_error = err;
         };
@@ -15497,7 +15497,9 @@ pub const MetadataHttpService = struct {
             platform_time.yieldBriefly();
         }
         errdefer self.unlockRuntime();
-        try request.ensureActive();
+        // Cancellation callbacks can consult metadata leadership and take
+        // this same lock. Only the clock is sampled after acquisition.
+        try request.ensureDeadlineActive();
     }
 
     fn lockRuntime(self: *MetadataHttpService) void {
