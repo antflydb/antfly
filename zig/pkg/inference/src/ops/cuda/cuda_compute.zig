@@ -25510,6 +25510,8 @@ fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_t
         return error.InvalidShape;
     }
 
+    var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
+    defer if (prefill_profile_scope) |*scope| scope.end();
     if (isF16Weight(weight_tensor) and reducedRowPairProjection(self)) {
         errdefer self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
         try runReducedProjection(self, device, input_tensor, weight_tensor, null, rows, in_dim, out_dim, .identity);
@@ -25517,8 +25519,6 @@ fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_t
         self.stats.launch_linear += 1;
         return;
     }
-    var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
-    defer if (prefill_profile_scope) |*scope| scope.end();
     const bf16_mirror = weightBf16MirrorForRows(self, weight_tensor, rows);
     if (bf16_mirror == null and try tryQ4VendorPrefill(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim)) {
         // Bounded vendor expansion needs no persistent TC repack.
@@ -40405,6 +40405,8 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
     const q = tensorFromCt(request.inputs[0]).buffer;
     const k = tensorFromCt(request.inputs[1]).buffer;
     const v = tensorFromCt(request.inputs[2]).buffer;
+    var prefill_profile_scope = beginPrefillProfile(self, .attention, plan.queries);
+    defer if (prefill_profile_scope) |*scope| scope.end();
     if (plan.grouped) {
         const query_position = keys - plan.queries;
         var r = kernels_mod.GqaAttentionRequest{ .dst = output.buffer, .q = q, .k = k, .v = v, .batch = 1, .q_seq_len = plan.queries, .kv_seq_len = keys, .num_heads = plan.heads, .num_kv_heads = plan.kv_heads, .head_dim = plan.dimension, .query_position_offset = query_position, .sliding_window = plan.sliding_window, .total_sequence_len = keys };
@@ -61643,9 +61645,17 @@ fn qualifyFunctionalGroupedProgramSized(compact: bool, owned_inputs: bool, compt
             try std.testing.expectError(error.InvalidInputShape, executable.run(a, .{ .runtime_inputs = try program.remapInputs(&invalid_inputs), .prepared_routes = selected, .activation_readbacks = .forbidden }));
             for (selected.?.pool.frames.items) |frame| try std.testing.expectEqual(@as(usize, 0), frame.stats.input_copies);
         }
+        const profile_ordinary_attention = suffix == 0 and !owned_inputs and iteration == 0;
+        if (profile_ordinary_attention) compute.runtime_policy.prefill_profile = true;
         var result = try executable.run(a, .{ .runtime_inputs = try program.remapInputs(&inputs), .prepared_routes = selected, .execution_control = if (owned_inputs) .{ .native_call_policy = .in_process, .io = std.testing.io } else null, .output_placement = .producer, .activation_readbacks = .forbidden });
-        if (owned_inputs) try std.testing.expectEqual(@as(u64, 3), result.stats.physical_input_copies);
         defer result.deinit(&executable.runtime);
+        if (profile_ordinary_attention) {
+            drainCudaProfile(compute);
+            compute.runtime_policy.prefill_profile = false;
+            try std.testing.expectEqual(@as(usize, depth), compute.stats.prefill_profile_events);
+            try std.testing.expectEqual(@as(usize, 0), compute.stats.profile_collection_failures);
+        }
+        if (owned_inputs) try std.testing.expectEqual(@as(u64, 3), result.stats.physical_input_copies);
         captures += result.stats.physical_graph_captures;
         replays += result.stats.physical_graph_replays;
         if (key_count == null and owned_inputs and iteration == 3 and (captures == 0 or replays == 0)) {
