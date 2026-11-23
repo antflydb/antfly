@@ -3896,8 +3896,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.sparse_embeddings.len == 1 and
                 materialized_derived_batch.?.deleted_keys.len == 0 and
-                materialized_derived_batch.?.overwritten_doc_keys.len == 0 and
-                materialized_derived_batch.?.changed_artifact_keys.len == 0)
+                inlineVectorWriteOnlyTouchesItself(materialized_derived_batch.?, materialized_derived_batch.?.sparse_embeddings[0].doc_key, materialized_derived_batch.?.sparse_embeddings[0].artifact_key))
             {
                 const write = materialized_derived_batch.?.sparse_embeddings[0];
                 const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = write.index_name, .kind = .sparse_vector };
@@ -3940,8 +3939,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 opts.transaction_resolution == null and materialized_derived_batch != null and
                 materialized_derived_batch.?.dense_embeddings.len == 1 and
                 materialized_derived_batch.?.deleted_keys.len == 0 and
-                materialized_derived_batch.?.overwritten_doc_keys.len == 0 and
-                materialized_derived_batch.?.changed_artifact_keys.len == 0)
+                inlineVectorWriteOnlyTouchesItself(materialized_derived_batch.?, materialized_derived_batch.?.dense_embeddings[0].doc_key, materialized_derived_batch.?.dense_embeddings[0].artifact_key))
             {
                 var write = materialized_derived_batch.?.dense_embeddings[0];
                 // `buildDerivedBatch` deliberately zeroes `.vector` whenever
@@ -4506,9 +4504,42 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // lease. Once released, another process (or another instance on
             // this inode) can write, and this runtime's in-memory index state
             // would then be stale.
+            // An inline index install still runs on this runtime after the
+            // wait. Releasing the lease before it let a same-process reopen
+            // retire the generation under work that still held its
+            // resources, and corrupted page-shaped values (8-thread indexed
+            // `lite-mp-bench`); hold it.
             const commits_after_wait = (effective_req.sync_level != .write and effective_req.sync_level != .propose) or opts.document_child_range_dispatcher != null;
             if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
+            }
+            // Graph, sparse and dense publications read-modify-write their
+            // mirrors at prepare, so each holds its index's apply guard until
+            // its mirror carries the write. Install them once staged rather
+            // than once durable: the group applies writes in staging order,
+            // so the next writer of the index prepares from a mirror that
+            // already includes this one, and the guard no longer spans the
+            // fsync. A write that then fails to become durable leaves the
+            // outcome uncertain, which reopens the runtime.
+            var graph_installed = false;
+            var sparse_installed = false;
+            var dense_installed = false;
+            if (primary_ticket != null or txn_ticket != null) {
+                if (inline_graph_publication) |prepared| {
+                    prepared.install();
+                    inline_graph_publication = null;
+                    graph_installed = true;
+                }
+                if (inline_sparse_publication) |prepared| {
+                    prepared.install();
+                    inline_sparse_publication = null;
+                    sparse_installed = true;
+                }
+                if (inline_dense_publication) |prepared| {
+                    prepared.install();
+                    inline_dense_publication = null;
+                    dense_installed = true;
+                }
             }
             // WS3: wait for the primary write's durability only now, with the
             // apply lock (and, above `batchInternalPreparedOwned`, the capi
@@ -4608,23 +4639,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (inline_graph_publication) |prepared| {
                 prepared.install();
                 inline_graph_publication = null;
-                if (S.ownerField(self, "executor").*.hasWorkers()) {
-                    _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
-                }
+                graph_installed = true;
             }
             if (inline_sparse_publication) |prepared| {
                 prepared.install();
                 inline_sparse_publication = null;
-                if (S.ownerField(self, "executor").*.hasWorkers()) {
-                    _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
-                }
+                sparse_installed = true;
             }
             if (inline_dense_publication) |prepared| {
                 prepared.install();
                 inline_dense_publication = null;
-                if (S.ownerField(self, "executor").*.hasWorkers()) {
-                    _ = S.ownerField(self, "executor").*.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
-                }
+                dense_installed = true;
+            }
+            if (S.ownerField(self, "executor").*.hasWorkers()) {
+                const executor = S.ownerField(self, "executor").*;
+                if (graph_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
+                if (sparse_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
+                if (dense_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
             }
             // Same durability boundary as the inline text publications just
             // above, for the algebraic ones. Mirror each now-durable
@@ -7193,4 +7224,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
     };
+}
+
+/// An inline vector publication's batch may overwrite its own document and
+/// change its own embedding artifact (an authored vector replacing the
+/// previous one: the publication removes the old copy itself), but touch
+/// nothing else the general path would have to apply.
+fn inlineVectorWriteOnlyTouchesItself(batch: anytype, doc_key: []const u8, artifact_key: ?[]const u8) bool {
+    for (batch.overwritten_doc_keys) |key| if (!std.mem.eql(u8, key, doc_key)) return false;
+    for (batch.changed_artifact_keys) |key| {
+        const own = artifact_key orelse return false;
+        if (!std.mem.eql(u8, key, own)) return false;
+    }
+    return true;
 }

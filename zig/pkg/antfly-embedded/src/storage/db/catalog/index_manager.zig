@@ -293,6 +293,11 @@ const default_text_projection_source_build_target_bytes: usize = 8 * 1024 * 1024
 const default_text_build_memory_target_bytes: usize = 96 * 1024 * 1024;
 const default_text_doc_scratch_retained_bytes: usize = 1024 * 1024;
 const force_merge_max_segments_at_once = 16;
+/// Level-0 folds: at least this many records, at most this many records
+/// and bytes per merge.
+const level0_fold_min_records = 4;
+const level0_fold_max_records = 256;
+const level0_fold_max_bytes: u64 = 8 * 1024 * 1024;
 
 const TextSegmentSinkBuildContext = struct {
     alloc: Allocator,
@@ -3451,6 +3456,22 @@ pub const IndexManager = struct {
 
         pub fn unlock(self: *ManagedIndexApplyGuard) void {
             self.mutex.unlock();
+            self.manager.catalog_mutex.unlockShared();
+            self.* = undefined;
+        }
+
+        /// Releases only the index's own mutex: the catalog stays shared,
+        /// so the index (and its entry's address) outlives the guard.
+        /// `relockIndex` takes it back; `unlockCatalog` ends the guard.
+        pub fn unlockIndex(self: *ManagedIndexApplyGuard) void {
+            self.mutex.unlock();
+        }
+
+        pub fn relockIndex(self: *ManagedIndexApplyGuard) void {
+            self.manager.lockAtomicWithBackoff(self.mutex);
+        }
+
+        pub fn unlockCatalog(self: *ManagedIndexApplyGuard) void {
             self.manager.catalog_mutex.unlockShared();
             self.* = undefined;
         }
@@ -17259,6 +17280,63 @@ pub const IndexManager = struct {
         return null;
     }
 
+    /// What a scope another process committed under needs from this
+    /// process's loaded indexes.
+    pub const ScopeRefresh = enum {
+        /// A loaded full-text index owned it and now reads its tip.
+        refreshed,
+        /// No index here can refresh it in place: reopen the runtime.
+        reopen,
+        /// No index here that refreshes in place owns it (another
+        /// database's, or a kind that does not refresh in place).
+        not_loaded,
+    };
+
+    /// Refreshes the loaded index whose native-catalog scope is `scope`
+    /// from the file, under that index's apply guard. Versioned full-text
+    /// and sparse indexes refresh in place; other kinds reopen.
+    pub fn refreshIndexScopeFromTip(self: *IndexManager, scope: []const u8) !ScopeRefresh {
+        const name = name: {
+            self.catalog_mutex.lockShared();
+            defer self.catalog_mutex.unlockShared();
+            for (self.text_indexes.items) |*entry| {
+                const owned = entry.persistent.nativeCatalogScope() orelse continue;
+                if (!std.mem.eql(u8, owned, scope)) continue;
+                if (!entry.persistent.versioned) return .reopen;
+                break :name try self.alloc.dupe(u8, entry.config.name);
+            }
+            for (self.sparse_indexes.items) |*entry| {
+                const owned = entry.index.nativeCatalogScope() orelse continue;
+                if (!std.mem.eql(u8, owned, scope)) continue;
+                const name = try self.alloc.dupe(u8, entry.config.name);
+                defer self.alloc.free(name);
+                return self.refreshSparseIndexFromTipCatalogLocked(name);
+            }
+            return .not_loaded;
+        };
+        defer self.alloc.free(name);
+        var guard = try self.lockManagedIndexApply(.{ .name = name, .kind = .full_text });
+        defer guard.unlock();
+        const entry = self.textIndexEntry(name) orelse return .reopen;
+        entry.persistent.refreshFromTip() catch |err| switch (err) {
+            error.UnsupportedRefresh => return .reopen,
+            else => return err,
+        };
+        return .refreshed;
+    }
+
+    /// Caller holds the catalog shared; this takes the index's own mutex.
+    fn refreshSparseIndexFromTipCatalogLocked(self: *IndexManager, name: []const u8) !ScopeRefresh {
+        const entry = self.sparseIndex(name) orelse return .reopen;
+        self.lockAtomicWithBackoff(entry.apply_mutex);
+        defer entry.apply_mutex.unlock();
+        entry.index.refreshFromTip() catch |err| switch (err) {
+            error.UnsupportedRefresh => return .reopen,
+            else => return err,
+        };
+        return .refreshed;
+    }
+
     pub fn textIndexEntry(self: *IndexManager, name: ?[]const u8) ?*TextIndex {
         if (name) |index_name| {
             return self.textIndexEntryByName(index_name);
@@ -22324,6 +22402,7 @@ pub const IndexManager = struct {
         store: *docstore_mod.DocStore,
         index_name: []const u8,
         delete_keys: []const []const u8,
+        delete_versions: []const u64,
         prepared: *PreparedTextMapperPublication,
         opts: IndexBatchOptions,
     ) !void {
@@ -22333,7 +22412,7 @@ pub const IndexManager = struct {
 
             var stats = TextBatchMutationStats{};
             if (delete_keys.len > 0) {
-                stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);
+                stats.noteDelete((try self.deleteTextBatchEntryVersioned(entry, delete_keys, delete_versions)).deleted_any);
             }
             if (prepared.observed_field_analyzers.len > 0) {
                 try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
@@ -24448,6 +24527,13 @@ pub const IndexManager = struct {
                 defer if (resume_from) |buf| self.alloc.free(buf);
 
                 var rebuild_from_scratch_after_interruption = false;
+                // An index from before per-copy versions is rebuilt from the
+                // primary rows (docs/design/lite-performance/lite-full-text-storage.md).
+                if (allow_full_text_backfill and resume_from == null and entry.persistent.needs_version_rebuild) {
+                    try apply_state.invalidateProjectionCompletion(self.alloc, store);
+                    try entry.persistent.resetAllForRebuild();
+                    rebuild_from_scratch_after_interruption = true;
+                }
                 if (allow_full_text_backfill and resume_from != null) {
                     try apply_state.invalidateProjectionCompletion(self.alloc, store);
                     try entry.persistent.resetAllForRebuild();
@@ -27013,6 +27099,9 @@ pub const IndexManager = struct {
                 publication_deletes.bitmaps,
             ) catch |err| switch (err) {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                // At the tip an input was no longer active, or a live key had
+                // two copies: stale, like any other; it is planned again.
+                error.IndexScopeChanged => false,
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
                     logTextMergeFailure("apply", task.index_name, mapped_err);
@@ -27029,6 +27118,9 @@ pub const IndexManager = struct {
                 publication_deletes.bitmaps,
             ) catch |err| switch (err) {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
+                // At the tip an input was no longer active, or a live key had
+                // two copies: stale, like any other; it is planned again.
+                error.IndexScopeChanged => false,
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
                     logTextMergeFailure("apply", task.index_name, mapped_err);
@@ -27138,7 +27230,26 @@ pub const IndexManager = struct {
         if (infos.items.len < 2) return null;
 
         const policy = activeTextMergePolicy();
-        const planned = (try policy.plan(self.alloc, infos.items)) orelse blk: {
+        // Inline writes publish one small level-0 record each. Fold them
+        // wide and first: a tier-sized merge of ten cannot keep up with
+        // them, and producer admission counts every one.
+        const level0_plan = level0: {
+            var picked = std.ArrayListUnmanaged(usize).empty;
+            errdefer picked.deinit(self.alloc);
+            var bytes: u64 = 0;
+            for (infos.items) |info| {
+                if (!persistent_mod.isL0SegmentId(snap.segments[info.index].id)) continue;
+                if (picked.items.len >= level0_fold_max_records or bytes + info.size > level0_fold_max_bytes) break;
+                try picked.append(self.alloc, info.index);
+                bytes += info.size;
+            }
+            if (picked.items.len < level0_fold_min_records) {
+                picked.deinit(self.alloc);
+                break :level0 null;
+            }
+            break :level0 try picked.toOwnedSlice(self.alloc);
+        };
+        const planned = level0_plan orelse (try policy.plan(self.alloc, infos.items)) orelse blk: {
             // The tiered policy found nothing to merge (for example every
             // eligible segment floors to the same effective size under
             // floor_segment_size, or no pair fits under max_segment_size)
@@ -28912,8 +29023,29 @@ pub const IndexManager = struct {
         self: *IndexManager,
         store: *docstore_mod.DocStore,
         entry: *TextIndex,
-        docs: []const mapper.MapperDoc,
+        unversioned_docs: []const mapper.MapperDoc,
     ) !TextBatchMutationStats {
+        // A versioned index needs every copy's version; documents indexed
+        // here without one (rebuilds, keyed batch writes) take rebuild
+        // versions at the store's current replay cut.
+        var versioned_docs: []mapper.MapperDoc = &.{};
+        defer if (versioned_docs.len != 0) self.alloc.free(versioned_docs);
+        const docs = if (entry.persistent.versioned and unversioned_docs.len != 0) blk: {
+            versioned_docs = try self.alloc.dupe(mapper.MapperDoc, unversioned_docs);
+            var missing: u64 = 0;
+            for (versioned_docs) |doc| {
+                if (doc.doc_version == null) missing += 1;
+            }
+            if (missing != 0) {
+                const reserved = try entry.persistent.reserveRebuildVersions(store.lastReplaySequence(0), missing);
+                var n = reserved.first;
+                for (versioned_docs) |*doc| if (doc.doc_version == null) {
+                    doc.doc_version = try persistent_mod.DocVersion.ofRebuild(reserved.cut, n);
+                    n += 1;
+                };
+            }
+            break :blk versioned_docs;
+        } else unversioned_docs;
         const source_target_bytes = textProjectionSourceBuildTargetBytes();
         if (docs.len <= max_text_projection_docs_per_segment_build and estimatedMapperDocsBytes(docs) <= source_target_bytes) {
             return try self.indexTextProjectionDocs(store, entry, docs);
@@ -29557,6 +29689,12 @@ pub const IndexManager = struct {
     }
 
     fn deleteTextBatchEntry(self: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
+        return try self.deleteTextBatchEntryVersioned(entry, keys, &.{});
+    }
+
+    /// `versions` (parallel to `keys`, or empty for deletes of whatever is
+    /// current) apply to a versioned index; see `PersistentIndex.deleteVersioned`.
+    fn deleteTextBatchEntryVersioned(self: *IndexManager, entry: *TextIndex, keys: []const []const u8, versions: []const u64) !TextBatchMutationStats {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -29567,6 +29705,10 @@ pub const IndexManager = struct {
             };
             break :blk mapped;
         } else keys;
+        if (entry.persistent.versioned) {
+            try entry.persistent.deleteVersioned(effective, versions);
+            return .{ .deleted_any = effective.len != 0 };
+        }
         const delete_infos = try entry.persistent.deleteByIdsTracked(effective);
         defer entry.persistent.freeDeleteInfos(delete_infos);
         entry.recordCommittedDeletes(delete_infos);
@@ -44642,7 +44784,7 @@ test "text publication admission refreshes a projection revision change" {
     defer prepared.deinit();
     var guard = try manager.lockManagedIndexApply(.{ .name = config.name, .kind = .full_text });
     defer guard.unlock();
-    try manager.applyPreparedTextMapperPublicationByNameWithOptions(&store, config.name, &.{}, &prepared, .{});
+    try manager.applyPreparedTextMapperPublicationByNameWithOptions(&store, config.name, &.{}, &.{}, &prepared, .{});
     try std.testing.expectEqual(@as(u32, 1), manager.textIndex(config.name).?.snapshot().liveDocCount());
 }
 
@@ -50090,8 +50232,10 @@ test "text merge native admission excludes streamed document coordinate and ordi
     const path_z = try a.dupeSentinel(u8, path, 0);
     defer a.free(path_z);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{ .soft_limit_bytes = 10 * 1024 * 1024, .hard_limit_bytes = 10 * 1024 * 1024 };
-    // Preserve the actual 10 MiB merge-memory ceiling without requiring a
+    // 12 MiB: the native estimate includes each input's inverse ordinal
+    // directory (one u64 pair per live row, #1752), about 0.4 MiB here.
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 12 * 1024 * 1024 };
+    // Preserve an actual merge-memory ceiling without requiring a
     // production-sized free-disk reserve on the compiler's shared volume.
     var resources = resource_manager_mod.ResourceManager.init(.{
         .budgets = budgets,
@@ -50136,11 +50280,11 @@ test "text merge native admission excludes streamed document coordinate and ordi
     try std.testing.expect(entry.persistent.io != null);
     var legacy: u64 = 8 * 1024 * 1024;
     for (snap.segments) |*segment| legacy += try IndexManager.estimateTextMergeWorkingSetBytes(segment, false, false);
-    try std.testing.expect(legacy > 10 * 1024 * 1024);
+    try std.testing.expect(legacy > 12 * 1024 * 1024);
     var reservation = (try manager.reserveTextMergeBuffers(&entry.persistent, snap, &.{ 0, 1 }, .strict)).?;
     defer reservation.release();
 
-    try std.testing.expect(reservation.bytes < 10 * 1024 * 1024);
+    try std.testing.expect(reservation.bytes < 12 * 1024 * 1024);
     std.debug.print("NATIVE_MERGE_ADMISSION documents=100000 native={d} legacy={d}\n", .{ reservation.bytes, legacy });
     reservation.release();
     // Exercise execution and publication under that actual admission, with

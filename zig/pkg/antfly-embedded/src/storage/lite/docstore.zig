@@ -4280,7 +4280,7 @@ pub const Store = struct {
         try std.testing.expect(!store.file.header.indexed_reclamation);
         try store.file.putDocument("alpha", "one");
 
-        const inode = (try store.file.file.stat(std.testing.io)).inode;
+        const identity = store.file.dataIdentity().?;
         const region = (try store.file.regionForInode()).?;
         try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
 
@@ -4292,7 +4292,7 @@ pub const Store = struct {
         // two live fences on the one inode -- the open-time one
         // (never released) and the window one `acquireReaderFence`
         // installed over it.
-        try std.testing.expectEqual(@as(u64, 1), coordinator.readerStats(inode, region).count);
+        try std.testing.expectEqual(@as(u64, 1), coordinator.readerStats(identity, region).count);
         read.abort();
         aborted = true;
         // The bug: before the fix, the leaked open-time fence kept this
@@ -5007,7 +5007,7 @@ pub const Store = struct {
         }
         status.allocator_work = self.file.allocator_work;
         if (self.file.reader_coordinator) |coordinator| {
-            const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode, try self.file.regionForInode());
+            const readers = coordinator.readerStats(self.file.dataIdentity() orelse return error.InvalidTransactionState, try self.file.regionForInode());
             status.coordinated_reader_count = readers.count;
             status.poisoned_coordinated_readers = readers.poisoned;
             status.oldest_coordinated_reader_age_ms = readers.oldest_age_ms;
@@ -5138,7 +5138,7 @@ pub const Store = struct {
     /// reopen on the next access still has to do the work later.
     fn reopenRegionAfterGenerationSwap(self: *Store) void {
         const io = self.file.runtime();
-        if (self.file.inode_lock_ref.load(.acquire)) |entry| _ = inode_lock.ensureRegion(entry, io) catch {};
+        if (self.file.inode_lock_ref.load(.acquire)) |entry| inode_lock.warmRegion(entry, io) catch {};
     }
 
     /// `from_background_worker`: see `maintainOnceWithCancel`'s own doc
@@ -5545,6 +5545,10 @@ pub const Store = struct {
     /// all live readers and writers. The prepared store remains valid only so
     /// its retired descriptor can be closed by normal teardown.
     pub fn replaceWithPreparedGeneration(self: *Store, prepared: *Store) !native.GenerationPublicationOutcome {
+        return self.replaceWithPreparedGenerationAt(prepared, null);
+    }
+
+    pub fn replaceWithPreparedGenerationAt(self: *Store, prepared: *Store, canonical_destination: ?[]const u8) !native.GenerationPublicationOutcome {
         if (self == prepared) return error.InvalidArgument;
         // The finalized disposable owner is about to surrender its descriptor.
         // Join before taking its mutex: maintenance can need that mutex while
@@ -5594,7 +5598,7 @@ pub const Store = struct {
             self.requestReassessment();
             self.maintenance_policy.assessed_retirement_bytes = self.file.retirement_activity_bytes;
         };
-        return try self.file.replaceWithPreparedGeneration(&prepared.file);
+        return self.file.replaceWithPreparedGenerationAt(&prepared.file, canonical_destination);
     }
 
     /// Refuse a predictably inadmissible rewrite before allocating/copying its
@@ -7385,8 +7389,7 @@ const RuntimeStore = struct {
         errdefer file.close();
         // An independently restored path can reuse a replay generation. Its
         // checkpoint cannot certify visibility for the retained namespace.
-        if ((try file.file.stat(io)).inode != (try store.file.file.stat(io)).inode)
-            return error.EnrichmentSourceChanged;
+        if (!file.sameDataFile(&store.file)) return error.EnrichmentSourceChanged;
         file.page_cache_policy = .metadata_only;
         return .{ .file = file, .prefix = self.prefix, .arena = .init(store.allocator) };
     }
@@ -7516,6 +7519,10 @@ pub const Txn = struct {
     // `PrimaryCommitContext.apply`). Encoded keys are owned by
     // `index_catalog_arena`, created lazily on first use.
     index_catalog_pending: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
+    /// Resolvers staged with `putIndexCatalogBatch`, run in the group apply
+    /// before `index_catalog_pending`, at the tip (`native_catalog_backend.Resolver`).
+    /// Scopes live in `index_catalog_arena`.
+    index_catalog_resolvers: std.ArrayListUnmanaged(ScopedResolver) = .empty,
     index_catalog_delete_prefix: ?[]const u8 = null,
     index_catalog_arena: ?std.heap.ArenaAllocator = null,
     read_only: bool = true,
@@ -7751,8 +7758,15 @@ pub const Txn = struct {
         return self.commit();
     }
 
+    pub const ScopedResolver = struct {
+        scope: []const u8,
+        resolver: *@import("../native_catalog_backend.zig").Resolver,
+    };
+
     const PrimaryCommitContext = struct {
         mutations: []const native.DocumentMutation,
+        allocator: Allocator = undefined,
+        index_resolvers: []const ScopedResolver = &.{},
         // WS4 phase 2: index-catalog-root mutations (segment/range/active-
         // set records, projection seal, progress) applied in this SAME
         // `apply` invocation -- i.e. the same native transaction/commit --
@@ -7768,6 +7782,7 @@ pub const Txn = struct {
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             try file.putDocumentBatch(context.mutations);
+            for (context.index_resolvers) |scoped| try @import("native_catalog_sink.zig").applyResolver(context.allocator, file, scoped.scope, scoped.resolver);
             if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
             if (context.index_catalog_delete_prefix) |prefix| try file.deleteIndexCatalogPrefix(prefix, null);
         }
@@ -7866,7 +7881,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_delete_prefix == null) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_resolvers.items.len == 0 and self.index_catalog_delete_prefix == null) {
             self.abort();
             return .{};
         }
@@ -7906,7 +7921,7 @@ pub const Txn = struct {
         // `StagedCommit.wait()`/`abort()`, both of which run after the
         // group's `apply` callback has already consumed it, mirroring how
         // `mutations` above borrows `self.pending`'s own buffers.
-        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix };
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .allocator = allocator, .index_resolvers = self.index_catalog_resolvers.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -8723,6 +8738,10 @@ pub const Txn = struct {
         const a = self.index_catalog_arena.?.allocator();
         try self.index_catalog_pending.ensureUnusedCapacity(a, mutations.len);
         for (mutations) |m| {
+            if (@import("../native_catalog_backend.zig").isResolution(m.namespace)) {
+                try self.index_catalog_resolvers.append(a, .{ .scope = try a.dupe(u8, scope), .resolver = try @import("../native_catalog_backend.zig").resolverOf(m) });
+                continue;
+            }
             const key = try @import("native_catalog_sink.zig").durableKeyAlloc(a, scope, m.namespace, m.key);
             self.index_catalog_pending.appendAssumeCapacity(.{
                 .key = key,
@@ -8730,6 +8749,26 @@ pub const Txn = struct {
                 .is_delete = m.is_delete,
             });
         }
+    }
+
+    /// One index-catalog record as this transaction sees it: what it staged
+    /// with `putIndexCatalogBatch` (the latest staging wins; a staged delete
+    /// hides the committed record), over the committed index-catalog root at
+    /// the transaction's checkpoint. Writer authority makes that checkpoint
+    /// the file's tip, so a write's read-modify-write of index state never
+    /// depends on any process's in-memory copy.
+    pub fn getIndexCatalogAlloc(self: *Txn, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+        const durable_key = try @import("native_catalog_sink.zig").durableKeyAlloc(self.allocator, scope, namespace, key);
+        defer self.allocator.free(durable_key);
+        var i = self.index_catalog_pending.items.len;
+        while (i > 0) {
+            i -= 1;
+            const staged = self.index_catalog_pending.items[i];
+            if (!std.mem.eql(u8, staged.key, durable_key)) continue;
+            return if (staged.is_delete) null else try allocator.dupe(u8, staged.value);
+        }
+        const file = try self.readFile();
+        return try file.getIndexCatalogRecordAtCheckpointAlloc(allocator, durable_key, self.checkpoint);
     }
 
     /// Removes the scope at commit, including catalog edits staged in
@@ -8745,6 +8784,7 @@ pub const Txn = struct {
         if (self.index_catalog_arena) |*arena| arena.deinit();
         self.index_catalog_arena = null;
         self.index_catalog_pending = .empty;
+        self.index_catalog_resolvers = .empty;
         self.index_catalog_delete_prefix = null;
     }
 
@@ -10619,6 +10659,92 @@ test "lite native docstore putIndexCatalogBatch publishes primary and index-cata
     const active_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_active_key)).?;
     defer allocator.free(active_value);
     try std.testing.expectEqualStrings("1", active_value);
+}
+
+/// Churns small redo commits and folds with page reuse on, runs foreground
+/// allocator proofs while background maintenance reclaims, and reports
+/// whether the reopened file still checks clean.
+fn churnWithProofsThenReopenValid(catalog: bool) !bool {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-proof-churn.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .io = std.testing.io, .use_redo_log = true, .reclamation = .{ .page_reuse = true } });
+    var closed = false;
+    defer if (!closed) store.close();
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [12]u8 = undefined;
+    for (0..1500) |round| {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        const key = try std.fmt.bufPrint(&key_buf, "worker-{d}-{d}", .{ round % 8, (round * 7919) % 1024 });
+        try txn.put(key, "primary-value-primary-value");
+        if (catalog) {
+            std.mem.writeInt(u64, value_buf[0..8], round, .big);
+            std.mem.writeInt(u32, value_buf[8..12], @intCast(round % 13), .big);
+            try txn.putIndexCatalogBatch("idx/index", &.{.{ .namespace = "docmap", .key = key, .value = &value_buf }});
+        }
+        try txn.commit();
+        if (round % 250 == 249) try store.checkpointRedoLog();
+    }
+    try store.checkpointRedoLog();
+    // Each proof installs a read window while background reclaim runs.
+    for (0..20) |_| _ = try store.file.check();
+    store.close();
+    closed = true;
+    var reopened = try Store.open(allocator, path, true);
+    defer reopened.close();
+    const report = try reopened.file.check();
+    if (!report.valid) std.debug.print("reopened check issue: {s}\n", .{report.issue orelse "?"});
+    return report.valid;
+}
+
+// An allocator proof's read window belongs to the thread that installed it.
+// Background reclaim reading through a foreground proof's window got the
+// proof's bytes for other pages (durable free-map corruption) or a buffer
+// freed under it.
+test "lite native docstore allocator proofs during background reclaim keep the file consistent" {
+    for (0..6) |i| try std.testing.expect(try churnWithProofsThenReopenValid(i % 2 == 1));
+}
+
+// A write reads index state at its own tip: committed records, then what
+// it staged itself, latest staging first and deletes hiding records.
+test "lite native docstore reads index-catalog records at the transaction tip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-index-catalog-tip.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    {
+        var txn = try store.beginWrite();
+        try txn.putIndexCatalogBatch("idx1", &.{
+            .{ .namespace = "meta", .key = "next_seg_id", .value = "7" },
+            .{ .namespace = "docmap", .key = "doc:a", .value = "seg1" },
+        });
+        try txn.commit();
+    }
+
+    var txn = try store.beginWrite();
+    defer txn.abort();
+    const committed = (try txn.getIndexCatalogAlloc(allocator, "idx1", "meta", "next_seg_id")).?;
+    defer allocator.free(committed);
+    try std.testing.expectEqualStrings("7", committed);
+    // Scope and namespace are part of the key.
+    try std.testing.expect((try txn.getIndexCatalogAlloc(allocator, "idx2", "meta", "next_seg_id")) == null);
+    try std.testing.expect((try txn.getIndexCatalogAlloc(allocator, "idx1", "docmap", "next_seg_id")) == null);
+
+    try txn.putIndexCatalogBatch("idx1", &.{.{ .namespace = "meta", .key = "next_seg_id", .value = "8" }});
+    try txn.putIndexCatalogBatch("idx1", &.{.{ .namespace = "meta", .key = "next_seg_id", .value = "9" }});
+    const staged = (try txn.getIndexCatalogAlloc(allocator, "idx1", "meta", "next_seg_id")).?;
+    defer allocator.free(staged);
+    try std.testing.expectEqualStrings("9", staged);
+
+    try txn.putIndexCatalogBatch("idx1", &.{.{ .namespace = "docmap", .key = "doc:a", .is_delete = true }});
+    try std.testing.expect((try txn.getIndexCatalogAlloc(allocator, "idx1", "docmap", "doc:a")) == null);
 }
 
 test "lite native docstore skips redo folding for an empty index scope" {

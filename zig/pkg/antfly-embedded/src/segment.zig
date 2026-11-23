@@ -92,9 +92,14 @@ pub const SectionType = enum(u16) {
     index_sort = 6,
     index_sort_bounds = 7,
     doc_key_range = 8,
+    doc_versions = 9,
 };
 
 pub const doc_ordinals_field = "\x00__antfly_doc_ordinals";
+/// Each document copy's version (see
+/// docs/design/lite-performance/lite-full-text-storage.md): unique to the
+/// copy and unchanged by merges. Zero means none.
+pub const doc_versions_field = "\x00__antfly_doc_versions";
 const inverse_ordinals_section: SectionType = .synonym;
 const max_inverse_ordinal_docs = 4 * 1024 * 1024;
 
@@ -553,6 +558,18 @@ pub const SegmentWriter = struct {
         try self.addSectionOwned(field_idx, .doc_ordinals, data);
         owns_forward = false;
         self.addInverseOrdinals(field_idx, ordinals) catch {};
+    }
+
+    pub fn addDocVersions(self: *SegmentWriter, versions: []const u64) !void {
+        if (versions.len != self.doc_count) return error.InvalidSegment;
+        const data = try encodeDocVersionsAlloc(self.alloc, versions);
+        if (data.len == 0) {
+            self.alloc.free(data);
+            return;
+        }
+        errdefer self.alloc.free(data);
+        const field_idx = try self.addField(doc_versions_field);
+        try self.addSectionOwned(field_idx, .doc_versions, data);
     }
 
     fn addInverseOrdinals(self: *SegmentWriter, field_idx: u16, ordinals: []const u32) !void {
@@ -2438,6 +2455,27 @@ pub const SegmentReader = struct {
         return try decodeDocOrdinal(section, doc_idx);
     }
 
+    /// The version of document `doc_idx`, or null when the segment has no
+    /// version column or the copy has none.
+    pub fn docVersion(self: *const SegmentReader, doc_idx: u32) !?u64 {
+        const reader = try VersionReader.init(self);
+        const version = try reader.at(doc_idx);
+        return if (version == 0) null else version;
+    }
+
+    /// Every document's version (0: none), or null without a version column.
+    pub fn docVersionsAlloc(self: *const SegmentReader, alloc: Allocator) !?[]u64 {
+        const reader = try VersionReader.init(self);
+        const view = reader.view orelse return null;
+        if (reader.count != self.doc_count) return error.InvalidSegment;
+        const bytes = try alloc.alloc(u8, @as(usize, reader.count) * 8);
+        defer alloc.free(bytes);
+        try view.readInto(5, bytes);
+        const out = try alloc.alloc(u64, reader.count);
+        for (out, 0..) |*version, i| version.* = std.mem.readInt(u64, bytes[i * 8 ..][0..8], .big);
+        return out;
+    }
+
     pub const DocKeyRange = struct {
         min_key: []const u8,
         max_key: []const u8,
@@ -4040,6 +4078,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
     for (inputs) |input| {
         for (input.reader.fields) |*f| {
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
+            if (std.mem.eql(u8, f.name, doc_versions_field)) continue;
             if (std.mem.eql(u8, f.name, index_sort_field)) continue;
             if (std.mem.eql(u8, f.name, doc_key_range_field)) continue;
             try field_set.put(alloc, f.name, {});
@@ -4161,6 +4200,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         if (inverse) |pairs| try appendMergedInverseOrdinals(alloc, sink, &built_field, pairs);
         try built_fields.append(alloc, built_field);
     }
+    try appendMergedDocVersions(alloc, sink, &built_fields, inputs, null, doc_count);
     if (try mergeDocKeyRangeSectionsAlloc(alloc, inputs)) |merged_key_range| {
         defer alloc.free(merged_key_range);
         var built_field = BuiltField{ .name = doc_key_range_field };
@@ -4218,6 +4258,7 @@ fn writeSortedMergedSegmentToSink(
     for (inputs) |input| {
         for (input.reader.fields) |*f| {
             if (std.mem.eql(u8, f.name, doc_ordinals_field)) continue;
+            if (std.mem.eql(u8, f.name, doc_versions_field)) continue;
             if (std.mem.eql(u8, f.name, index_sort_field)) continue;
             if (std.mem.eql(u8, f.name, doc_key_range_field)) continue;
             try field_set.put(alloc, f.name, {});
@@ -4304,6 +4345,7 @@ fn writeSortedMergedSegmentToSink(
         if (inverse) |pairs| try appendMergedInverseOrdinals(alloc, sink, &built_field, pairs);
         try built_fields.append(alloc, built_field);
     }
+    try appendMergedDocVersions(alloc, sink, &built_fields, inputs, plan.ordered(), doc_count);
     if (try mergeDocKeyRangeSectionsAlloc(alloc, inputs)) |merged_key_range| {
         defer alloc.free(merged_key_range);
         var built_field = BuiltField{ .name = doc_key_range_field };
@@ -6679,6 +6721,95 @@ fn writeMergedDocOrdinals(alloc: Allocator, sink: *SegmentSink, inputs: []const 
     return true;
 }
 
+pub fn encodeDocVersionsAlloc(alloc: Allocator, versions: []const u64) ![]u8 {
+    if (std.mem.allEqual(u64, versions, 0)) return try alloc.alloc(u8, 0);
+    const out = try alloc.alloc(u8, 5 + versions.len * 8);
+    out[0] = 1;
+    std.mem.writeInt(u32, out[1..5], @intCast(versions.len), .big);
+    for (versions, 0..) |version, i| std.mem.writeInt(u64, out[5 + i * 8 ..][0..8], version, .big);
+    return out;
+}
+
+const VersionReader = struct {
+    view: ?@import("segment_source.zig").View = null,
+    count: u32 = 0,
+
+    fn init(reader: *const SegmentReader) !VersionReader {
+        const View = @import("segment_source.zig").View;
+        const view = if (reader.native) |native| blk: {
+            const section = (try native.range.sectionView(doc_versions_field, .doc_versions)) orelse return .{};
+            break :blk try View.init(native.metadata_cache.?.borrowedSource(), section.offset, section.length);
+        } else blk: {
+            const bytes = (try reader.getSection(doc_versions_field, .doc_versions)) orelse return .{};
+            break :blk try View.init(.{ .contiguous = bytes }, 0, bytes.len);
+        };
+        if (view.length < 5) return error.InvalidSegment;
+        var header: [5]u8 = undefined;
+        try view.readInto(0, &header);
+        if (header[0] != 1) return error.UnsupportedVersion;
+        const count = std.mem.readInt(u32, header[1..5], .big);
+        if (view.length != 5 + @as(u64, count) * 8) return error.InvalidSegment;
+        return .{ .view = view, .count = count };
+    }
+
+    fn at(self: VersionReader, doc: u32) !u64 {
+        const view = self.view orelse return 0;
+        if (doc >= self.count) return 0;
+        var bytes: [8]u8 = undefined;
+        try view.readInto(5 + @as(u64, doc) * 8, &bytes);
+        return std.mem.readInt(u64, &bytes, .big);
+    }
+};
+
+/// The merged output's version column, in output order: each output
+/// document keeps its input copy's version.
+fn appendMergedDocVersions(alloc: Allocator, sink: *SegmentSink, built_fields: *std.ArrayListUnmanaged(BuiltField), inputs: []const MergeInput, records: ?SortedRecords, doc_count: u32) !void {
+    var local_readers: [16]VersionReader = undefined;
+    const readers = if (inputs.len <= local_readers.len) local_readers[0..inputs.len] else try alloc.alloc(VersionReader, inputs.len);
+    defer if (inputs.len > local_readers.len) alloc.free(readers);
+    var any = false;
+    for (inputs, readers) |input, *reader| {
+        reader.* = if (inputHasLiveDocs(input)) try VersionReader.init(input.reader) else .{};
+        any = any or reader.view != null;
+    }
+    if (!any) return;
+    const start = sink.len();
+    sink.beginSection();
+    try sink.appendByte(1);
+    try sinkAppendU32BE(sink, doc_count);
+    var buffer: [8 * 1024]u8 = undefined;
+    var used: usize = 0;
+    var written: u32 = 0;
+    var iterator = if (records) |ordered| ordered.iterator() else null;
+    var input_idx: usize = 0;
+    var live: ?LiveDocs = if (inputs.len != 0) LiveDocs.init(&inputs[0], 0, inputs[0].reader.doc_count) else null;
+    while (true) {
+        const ref: ?SortedMergeDoc = if (iterator) |*it| try it.next() else blk: {
+            while (input_idx < inputs.len) {
+                if (live.?.next()) |doc| break :blk .{ .ref = .{ .input_idx = input_idx, .doc_id = doc } };
+                input_idx += 1;
+                if (input_idx < inputs.len) live = LiveDocs.init(&inputs[input_idx], 0, inputs[input_idx].reader.doc_count);
+            }
+            break :blk null;
+        };
+        const record = (ref orelse break).ref;
+        if (record.input_idx >= readers.len) return error.InvalidSegment;
+        std.mem.writeInt(u64, buffer[used..][0..8], try readers[record.input_idx].at(record.doc_id), .big);
+        used += 8;
+        written += 1;
+        if (used == buffer.len) {
+            try sink.appendSlice(&buffer);
+            used = 0;
+        }
+    }
+    if (used != 0) try sink.appendSlice(buffer[0..used]);
+    if (written != doc_count) return error.InvalidSegment;
+    var built_field = BuiltField{ .name = doc_versions_field };
+    errdefer built_field.deinit(alloc);
+    try built_field.sections.append(alloc, .{ .section_type = .doc_versions, .offset = start, .length = sink.len() - start, .checksum = try sink.crc32Range(start, sink.len() - start) });
+    try built_fields.append(alloc, built_field);
+}
+
 fn appendMergedInverseOrdinals(alloc: Allocator, sink: *SegmentSink, field: *BuiltField, pairs: []u64) !void {
     for (pairs) |pair| if (pair >> 32 == 0) return;
     std.mem.sort(u64, pairs, {}, std.sort.asc(u64));
@@ -7621,6 +7752,64 @@ test "segment doc ordinal sidecar roundtrip and merge preserve live order" {
     try std.testing.expectEqual(@as(u32, 2), merged_reader.doc_count);
     try std.testing.expectEqual(@as(?u32, 11), try merged_reader.docOrdinal(0));
     try std.testing.expectEqual(@as(?u32, 13), try merged_reader.docOrdinal(1));
+}
+
+// A copy's version never changes: merges carry it to the output, in output
+// order, for exactly the live documents.
+test "segment doc versions roundtrip and merge carry each live copy version" {
+    const alloc = std.testing.allocator;
+
+    var sw1 = SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    try sw1.addStoredDoc("a", "{}");
+    try sw1.addStoredDoc("b", "{}");
+    try sw1.addDocVersions(&.{ (5 << 24) | 0, (5 << 24) | 1 });
+    const seg1 = try sw1.build();
+    defer alloc.free(seg1);
+
+    var sw2 = SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    try sw2.addStoredDoc("c", "{}");
+    try sw2.addDocVersions(&.{9 << 24});
+    const seg2 = try sw2.build();
+    defer alloc.free(seg2);
+
+    // No column when no copy has a version.
+    var sw3 = SegmentWriter.init(alloc);
+    defer sw3.deinit();
+    try sw3.addStoredDoc("d", "{}");
+    try sw3.addDocVersions(&.{0});
+    const seg3 = try sw3.build();
+    defer alloc.free(seg3);
+    var reader3 = try SegmentReader.init(alloc, seg3);
+    defer reader3.deinit();
+    try std.testing.expect((try reader3.docVersionsAlloc(alloc)) == null);
+    try std.testing.expectEqual(@as(?u64, null), try reader3.docVersion(0));
+
+    var reader1 = try SegmentReader.init(alloc, seg1);
+    defer reader1.deinit();
+    try std.testing.expectEqual(@as(?u64, (5 << 24) | 1), try reader1.docVersion(1));
+    var reader2 = try SegmentReader.init(alloc, seg2);
+    defer reader2.deinit();
+    var deleted = roaring.RoaringBitmap.init(alloc);
+    defer deleted.deinit();
+    try deleted.add(0);
+
+    const merged = try mergeSegmentInputs(alloc, &.{
+        .{ .reader = &reader1, .deleted = deleted },
+        .{ .reader = &reader2 },
+    });
+    defer alloc.free(merged);
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    const versions = (try merged_reader.docVersionsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(versions);
+    try std.testing.expectEqualSlices(u64, &.{ (5 << 24) | 1, 9 << 24 }, versions);
+    // The version field is not merged as a text field.
+    for (merged_reader.fields) |field| {
+        if (!std.mem.eql(u8, field.name, doc_versions_field)) continue;
+        try std.testing.expectEqual(@as(usize, 1), field.sections.len);
+    }
 }
 
 test "segment index sort metadata roundtrip" {
