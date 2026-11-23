@@ -29,9 +29,17 @@ pub const StatusDetail = error_abi.Detail;
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
 // Combines the current control contract with retained document capabilities.
-pub const abi_version: u32 = 24;
+pub const abi_version: u32 = 25;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
+
+/// Runs a synchronous callback under a worker reservation in the owning runtime.
+pub const RequestForwardLaneSource = extern struct {
+    context: *anyopaque,
+    with_lane: *const fn (*anyopaque, *anyopaque, Callback) callconv(.c) bool,
+
+    pub const Callback = *const fn (*anyopaque, *const native_abi.IoBorrow) callconv(.c) void;
+};
 
 pub const RuntimeIoBorrows = extern struct {
     version: u32 = abi_version,
@@ -40,6 +48,7 @@ pub const RuntimeIoBorrows = extern struct {
     api_network: ?*const native_abi.IoBorrow = null,
     api_filesystem: ?*const native_abi.IoBorrow = null,
     durable: ?*const native_abi.IoBorrow = null,
+    request_forward: ?*const RequestForwardLaneSource = null,
 };
 
 pub const CreateContext = extern struct {

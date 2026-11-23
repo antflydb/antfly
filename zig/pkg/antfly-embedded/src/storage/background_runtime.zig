@@ -1376,6 +1376,15 @@ pub const BackendRuntime = struct {
         }
     };
 
+    /// Request paths that must remain independent of durable work require an
+    /// explicit forwarding lane from borrowed or manually configured runtimes.
+    pub fn acquireDedicatedRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
+        if (self.borrowed_receivers) |*borrowed| {
+            if (borrowed.request_forward == null) return error.BackendRuntimeUnavailable;
+        } else if (self.backend == .manual) return error.BackendRuntimeUnavailable;
+        return self.acquireRequestForwardLane();
+    }
+
     pub fn acquireRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
         const capacity = self.lane_limits.request_forward / threaded_io_limits.request_forward_workers_per_request;
         _ = self.request_forward_lane_gate.tryAcquireBounded(capacity) orelse

@@ -1524,6 +1524,7 @@ pub const RuntimeIoViews = struct {
     api_network: ?std.Io = null,
     api_filesystem: ?std.Io = null,
     durable: ?std.Io = null,
+    request_forward: ?@import("kernel_abi.zig").RequestForwardLaneSource = null,
 };
 
 test "imported runtime I/O views override raw runtime including unavailable views" {
@@ -4138,7 +4139,6 @@ pub const ApiHttpServer = struct {
     sql_observation_retirement_after: ?[]u8 = null,
     sql_completion_consumer_active: std.atomic.Value(bool) = .init(false),
     write_admission: RequestAdmission,
-    sql_forward_admission: RequestAdmission = RequestAdmission.init(16),
     inference_admission: RequestAdmission,
     source: StatusSource,
     metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
@@ -4557,12 +4557,6 @@ pub const ApiHttpServer = struct {
         if (cfg.imported_runtime_io) |views| return views.api_filesystem;
         const runtime = cfg.backend_runtime orelse return null;
         return runtime.apiFilesystemIo();
-    }
-
-    /// Imported views preserve the owning archive's executor state. Rebuilding
-    /// Threaded's vtable from a foreign runtime pointer splits wakeup/TLS state.
-    pub fn sqlForwardIo(self: *const ApiHttpServer) ?std.Io {
-        return configuredApiNetworkIo(self.cfg);
     }
 
     pub fn configuredDurableIo(cfg: ApiHttpServerConfig) ?std.Io {
@@ -14462,9 +14456,24 @@ pub const ApiHttpServer = struct {
         // Resource close is bodyless. The handler's synthetic decoding body
         // must not be sent on DELETE (std.http.Client forbids that framing).
         if (outgoing.method == .DELETE) outgoing.body = "";
+        var timeout_buffer: [20]u8 = undefined;
         if (control) |value| {
-            outgoing.timeout_ms = try value.timeoutMs();
+            const remaining_ms = try value.timeoutMs();
+            outgoing.timeout_ms = remaining_ms;
             outgoing.cancellation = value.cancellation;
+            const limits = @import("antfly_public_limits").Execution;
+            var timeout_header: ?*http_common.RequestHeader = null;
+            for (headers.items) |*header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, limits.timeout_header)) continue;
+                if (timeout_header != null) return error.InvalidExecutionBudget;
+                timeout_header = header;
+            }
+            if (timeout_header) |header| {
+                const requested_ms = try limits.positive(header.value, limits.max_timeout_ms);
+                const budget_ms: u32 = @intCast(@min(requested_ms, remaining_ms));
+                header.value = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{budget_ms});
+                outgoing.timeout_ms = budget_ms;
+            }
         } else outgoing.timeout_ms = sql_forward_max_timeout_ms;
         forwarded.* = true;
         var response = try executor.execute(self.alloc, outgoing);
@@ -63979,6 +63988,12 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
             try std.testing.expectEqualStrings("forwarded", request.header("X-Antfly-SQL-Resource-Hop").?);
             if (request.method == .DELETE) try std.testing.expectEqualStrings("", request.body) else try std.testing.expectEqualStrings("{\"statement\":\"SELECT 1\"}", request.body);
             try std.testing.expect(std.mem.startsWith(u8, request.uri, "http://issuer/"));
+            if (request.cancellation != null) {
+                const timeout = request.timeout_ms.?;
+                try std.testing.expect(timeout > 0 and timeout <= 5000);
+                const raw_budget = request.header(@import("antfly_public_limits").Execution.timeout_header).?;
+                try std.testing.expectEqual(timeout, try std.fmt.parseUnsigned(u32, raw_budget, 10));
+            }
             const headers = try alloc.alloc(http_common.Header, 1);
             headers[0] = .{ .name = try alloc.dupe(u8, "X-Antfly-SQL-Completion"), .value = try alloc.dupe(u8, "owner-witness") };
             return .{ .status = 200, .body = try alloc.dupe(u8, "{}"), .headers = headers };
@@ -64005,6 +64020,25 @@ test "SQL pgwire native HTTP resources forward once with original authority and 
     var closed = (try server.forwardSQLResourceOperation(&handle, .prepared, close_request, &forwarded)).?;
     defer closed.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    var budgeted = req;
+    budgeted.headers = &.{
+        .{ .name = trusted_principal_header, .value = "signed-principal" },
+        .{ .name = "X-Antfly-SQL-Fence", .value = "fence" },
+        .{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = "30000" },
+    };
+    const cancellation: http_common.RequestCancellation = .{};
+    const control: ApiHttpServer.SQLForwardControl = .{
+        .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
+        .cancellation = &cancellation,
+    };
+    var capped = (try server.forwardSQLResourceToOwner(1, budgeted, &forwarded, control)).?;
+    defer capped.deinit(a);
+
+    budgeted.headers = &.{.{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = "invalid" }};
+    forwarded = false;
+    try std.testing.expectError(error.InvalidExecutionBudget, server.forwardSQLResourceToOwner(1, budgeted, &forwarded, control));
+    try std.testing.expect(!forwarded);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
     const own = @import("sql_resource_routing.zig").encode(2, @splat(4));
     try std.testing.expect((try server.forwardSQLResourceOperation(&own, .prepared, req, &forwarded)) == null);
 }

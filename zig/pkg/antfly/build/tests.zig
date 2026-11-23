@@ -2592,6 +2592,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "HTTP connection publishes",
         "durable SQL session rejects malformed connection id without leaking principal",
         "httpx SQL connection routes preserve settings and retire prepared resources",
+        "SQL pgwire native HTTP resources forward once with original authority and witness",
+        "SQL pgwire native HTTP connection capacity proves no execution and failed forwarding stays unknown",
+        "API imported runtime capability struct retains versioned C layout",
+        "API kernel runtime I/O receivers validate capability layout and domains",
+        "API kernel forward lane reserves owning runtime capacity",
     };
     const sql_connection_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,

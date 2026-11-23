@@ -51,17 +51,19 @@ const RuntimeIoReceivers = struct {
     api_network: ?runtime_io_abi.Receiver = null,
     api_filesystem: ?runtime_io_abi.Receiver = null,
     durable: ?runtime_io_abi.Receiver = null,
+    request_forward: ?abi.RequestForwardLaneSource = null,
 
     fn init(self: *@This(), borrows: *const abi.RuntimeIoBorrows) !void {
         if (!abi.validContext(abi.RuntimeIoBorrows, borrows.version, borrows.struct_size))
             return error.UnsupportedVersion;
+        self.request_forward = if (borrows.request_forward) |source| source.* else null;
         inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
             @field(self, field) = if (@field(borrows, field)) |borrow| try borrow.receive() else null;
         }
     }
 
     fn views(self: *@This()) server_mod.RuntimeIoViews {
-        var result: server_mod.RuntimeIoViews = .{};
+        var result: server_mod.RuntimeIoViews = .{ .request_forward = self.request_forward };
         inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
             @field(result, field) = if (@field(self, field)) |*receiver| receiver.io() else null;
         }
@@ -1087,19 +1089,41 @@ test "API kernel failed fallible create releases unpublished state" {
 test "API kernel runtime I/O receivers validate capability layout and domains" {
     var receivers: RuntimeIoReceivers = .{};
     var borrow = abi.native_abi.IoBorrow.init(&std.testing.io);
+    const Grant = struct {
+        fn withLane(raw: *anyopaque, context: *anyopaque, callback: abi.RequestForwardLaneSource.Callback) callconv(.c) bool {
+            const lane: *const abi.native_abi.IoBorrow = @ptrCast(@alignCast(raw));
+            callback(context, lane);
+            return true;
+        }
+
+        fn inspect(raw: *anyopaque, lane: *const abi.native_abi.IoBorrow) callconv(.c) void {
+            const received: *bool = @ptrCast(@alignCast(raw));
+            var receiver = lane.receive() catch return;
+            const io = receiver.io();
+            received.* = io.userdata == std.testing.io.userdata and io.vtable == std.testing.io.vtable;
+        }
+    };
+    var source: abi.RequestForwardLaneSource = .{ .context = &borrow, .with_lane = Grant.withLane };
     var borrows: abi.RuntimeIoBorrows = .{
         .api = &borrow,
         .api_network = &borrow,
         .api_filesystem = &borrow,
         .durable = &borrow,
+        .request_forward = &source,
     };
     try receivers.init(&borrows);
+    source = undefined; // The receiver owns a copy of the capability.
     const views = receivers.views();
+    const grant = views.request_forward.?;
+    var received = false;
+    try std.testing.expect(grant.with_lane(grant.context, &received, Grant.inspect));
+    try std.testing.expect(received);
     inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
         const io = @field(views, field).?;
         try std.testing.expect(io.userdata == std.testing.io.userdata);
         try std.testing.expect(io.vtable == std.testing.io.vtable);
     }
+    borrows.request_forward = null;
     borrows.version -= 1;
     try std.testing.expectError(error.UnsupportedVersion, receivers.init(&borrows));
     borrows.version = abi.abi_version;

@@ -7199,11 +7199,30 @@ pub const AntflyApiHandler = struct {
     }
 
     fn runSQLForwarding(self: *AntflyApiHandler, network: std.Io, preparation: ?*http_server_mod.RequestAdmission.Lease, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
-        const io = self.api_server.sqlForwardIo() orelse return error.SqlWriteCapacityUnavailable;
-        var lease = self.api_server.sql_forward_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+        if (self.api_server.cfg.imported_runtime_io) |views| {
+            const source = views.request_forward orelse return error.SqlWriteCapacityUnavailable;
+            const Call = struct {
+                args: @TypeOf(args),
+                network: std.Io,
+                preparation: ?*http_server_mod.RequestAdmission.Lease,
+                result: anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload = error.SqlWriteCapacityUnavailable,
+
+                fn invoke(raw: *anyopaque, borrow: *const @import("kernel_abi.zig").native_abi.IoBorrow) callconv(.c) void {
+                    const call: *@This() = @ptrCast(@alignCast(raw));
+                    var receiver = borrow.receive() catch return;
+                    if (call.preparation) |held| held.release();
+                    call.result = runSQLRoutingTask(receiver.io(), call.network, task, call.args);
+                }
+            };
+            var call: Call = .{ .args = args, .network = network, .preparation = preparation };
+            if (!source.with_lane(source.context, &call, Call.invoke)) return error.SqlWriteCapacityUnavailable;
+            return call.result;
+        }
+        const runtime = self.api_server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+        var lease = runtime.acquireDedicatedRequestForwardLane() catch return error.SqlWriteCapacityUnavailable;
         defer lease.release();
         if (preparation) |held| held.release();
-        return runSQLRoutingTask(io, network, task, args);
+        return runSQLRoutingTask(lease.io(), network, task, args);
     }
 
     fn runSQLRoutingTask(io: std.Io, network: std.Io, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
@@ -7348,17 +7367,20 @@ pub const AntflyApiHandler = struct {
         if (try self.forwardSQLResource(ctx, &connection_id, .connection, "{}", null, null)) |response| return response;
         const store = self.api_server.txn_sessions.durable orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "durable SQL connection storage unavailable" });
         const principal = http_server_mod.transactionPrincipal(identity) orelse "";
-        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
-        var connection = @import("sql_connections.zig").loadReconciled(store, &self.api_server.txn_sessions, self.api_server.alloc, connection_id, principal, self.api_server.localSessionNodeId(), now_ms, &self.api_server.query_admission) catch |err| {
-            var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
-        };
-        connection.deinit();
-        _ = @import("sql_connections.zig").mutate(store, .{ .close = connection_id }, principal, self.api_server.localSessionNodeId(), now_ms) catch |err| {
-            var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
-        };
+        const cancellation = requestCancellation(ctx);
+        try self.runDurableSQLRouting(ctx.io, closeLocalSQLConnection, .{ self.api_server, store, connection_id, principal, &cancellation });
         return ctx.status(200).json(struct {}{});
+    }
+
+    fn closeLocalSQLConnection(server: *ApiHttpServer, store: *transactions_api.DurableSessionStore, connection_id: [32]u8, principal: []const u8, cancellation: *const http_common.RequestCancellation) !void {
+        try cancellation.token().check();
+        const connections = @import("sql_connections.zig");
+        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+        const node = server.localSessionNodeId();
+        var connection = try connections.loadReconciled(store, &server.txn_sessions, server.alloc, connection_id, principal, node, now_ms, &server.query_admission);
+        connection.deinit();
+        try cancellation.token().check();
+        _ = try connections.mutate(store, .{ .close = connection_id }, principal, node, now_ms);
     }
 
     fn attachSQLCompletion(response: *httpx.Response, completion: @import("../pgwire/completion.zig").Completion) !void {
@@ -15862,6 +15884,16 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var foreign_close = try Route.call(alloc, &handler, bob_auth, .close, connection_id, null);
     defer foreign_close.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), foreign_close.status);
+    {
+        server.cfg.imported_runtime_io = .{ .durable = std.Io.failing };
+        defer server.cfg.imported_runtime_io = null;
+        var overloaded = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
+        defer overloaded.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), overloaded.status);
+        var diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, overloaded.body, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("53300", diagnostic.value.code);
+    }
     var closed = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
     defer closed.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), closed.status);
@@ -23325,6 +23357,18 @@ test "SQL pgwire native gzip capacity refusal proves no execution" {
     try std.testing.expect(response.headers.get("X-Antfly-SQL-Completion") != null);
 }
 
+fn testRequestForwardSource(io: *std.Io) @import("kernel_abi.zig").RequestForwardLaneSource {
+    const abi = @import("kernel_abi.zig");
+    return .{ .context = io, .with_lane = struct {
+        fn withLane(raw: *anyopaque, context: *anyopaque, callback: abi.RequestForwardLaneSource.Callback) callconv(.c) bool {
+            const owner_io: *std.Io = @ptrCast(@alignCast(raw));
+            const borrow: abi.native_abi.IoBorrow = .init(owner_io);
+            callback(context, &borrow);
+            return true;
+        }
+    }.withLane };
+}
+
 test "SQL pgwire native HTTP connection capacity proves no execution and failed forwarding stays unknown" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -23334,6 +23378,7 @@ test "SQL pgwire native HTTP connection capacity proves no execution and failed 
     var storage = try @import("antfly_local_sources").storage_docstore.DocStore.open(a, path, .{});
     defer storage.close();
     var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var transport_io = std.testing.io;
     var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
     defer api.deinit();
     var handler: AntflyApiHandler = .{ .api_server = &api };
@@ -23371,6 +23416,15 @@ test "SQL pgwire native HTTP connection capacity proves no execution and failed 
     var request = try httpx.Request.init(a, .DELETE, uri);
     defer request.deinit();
     try request.headers.set("X-Antfly-SQL-Fence", "remote-test");
+    {
+        var rejected_ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer rejected_ctx.deinit();
+        var rejected = try handler.closeSQLConnection(&rejected_ctx, &remote);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 503), rejected.status.code);
+        try std.testing.expect(!(try AntflyApiHandler.requestCompletion(&rejected_ctx)).unknown);
+    }
+    api.cfg.imported_runtime_io.?.request_forward = testRequestForwardSource(&transport_io);
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
     var response = try handler.closeSQLConnection(&ctx, &remote);
@@ -23596,7 +23650,6 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             try std.testing.expectEqualStrings("route-test", req.header("X-Antfly-SQL-Fence").?);
             try std.testing.expect(req.timeout_ms.? > 0 and req.timeout_ms.? <= 5000);
             try std.testing.expect(req.cancellation != null);
-            try std.testing.expectEqual(@as(usize, 1), fixture.api.sql_forward_admission.stats().in_flight);
             try std.testing.expectEqual(@as(usize, 0), fixture.api.sql_preparation_admission.stats().in_flight);
             // This pool has one slot. The transport must leave it available.
             var future = try fixture.durable_io.concurrent(noop, .{});
@@ -23656,6 +23709,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     defer durable_pool.deinit();
     var transport_pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
     defer transport_pool.deinit();
+    var transport_io = transport_pool.io();
     var fixture: Fixture = .{ .durable_io = durable_pool.io() };
     var payload: [65]u8 = @splat(0);
     std.mem.writeInt(u64, payload[1..9], 7, .little);
@@ -23673,7 +23727,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var api = ApiHttpServer.init(alloc, .{
         .session_store = &durable,
         .session_store_scope = .cluster_shared,
-        .imported_runtime_io = .{ .durable = durable_pool.io(), .api_network = transport_pool.io() },
+        .imported_runtime_io = .{ .durable = durable_pool.io(), .request_forward = testRequestForwardSource(&transport_io) },
         .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.nodeUri } },
         .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
     }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
