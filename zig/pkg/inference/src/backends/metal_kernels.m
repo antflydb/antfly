@@ -3836,7 +3836,7 @@ static int termite_metal_encode_head_rms_rope_on_encoder(termite_metal_decode_ru
 static int termite_metal_encode_attention_f32_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> q_buffer, size_t q_offset, id<MTLBuffer> k_buffer, size_t k_offset, id<MTLBuffer> v_buffer, size_t v_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t q_len, size_t kv_tokens, size_t num_heads, size_t num_kv_heads, size_t head_dim, size_t query_position_offset, size_t kv_position_offset, size_t sliding_window, size_t total_sequence_len, int failure_code);
 static int termite_metal_encode_dense_linear_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, size_t slot, id<MTLBuffer> input_buffer, size_t input_offset, size_t in_dim, size_t out_dim, id<MTLBuffer> output_buffer, size_t output_offset, int failure_code);
 static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_key_device_slot(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, size_t slot, uint32_t format, void *k_handle, size_t k_offset, void *v_handle, size_t v_offset, size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads, size_t head_dim, size_t key_row_bytes, size_t base_key_row_bytes, size_t v_row_stride, size_t kv_position_offset, const uint32_t *block_table, size_t block_count, size_t page_size);
-static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, size_t slot, uint32_t format, id<MTLBuffer> k_buffer, size_t k_offset, id<MTLBuffer> v_buffer, size_t v_offset, size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads, size_t head_dim, size_t key_row_bytes, size_t base_key_row_bytes, size_t v_row_stride, size_t kv_position_offset, const uint32_t *block_table, size_t block_count, size_t page_size, int failure_code);
+static int termite_metal_encode_paged_kv_seed_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, size_t slot, uint32_t format, id<MTLBuffer> k_buffer, size_t k_offset, id<MTLBuffer> v_buffer, size_t v_offset, size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads, size_t head_dim, size_t key_row_bytes, size_t base_key_row_bytes, size_t v_row_stride, size_t kv_position_offset, const uint32_t *block_table, size_t block_count, size_t page_size, int failure_code);
 static int termite_metal_encode_paged_f32_kv_seed_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, size_t slot, id<MTLBuffer> k_buffer, size_t k_offset, id<MTLBuffer> v_buffer, size_t v_offset, size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads, size_t head_dim, size_t key_row_bytes, size_t v_row_stride, size_t kv_position_offset, const uint32_t *block_table, size_t block_count, size_t page_size, int failure_code);
 static int termite_metal_encode_rms_norm_add_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, size_t norm_slot, id<MTLBuffer> residual_buffer, size_t residual_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t hidden_size, float eps, int failure_code);
 static int termite_metal_encode_rms_norm_add_sumsq_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> sumsq_buffer, size_t sumsq_offset, size_t sumsq_partials, size_t norm_slot, id<MTLBuffer> residual_buffer, size_t residual_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t hidden_size, float eps, int failure_code);
@@ -30343,7 +30343,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
 	                                failure_code);
 	                            if (rc != 0) break;
 	                        } else if (paged_format == 0u || paged_format == 1u || paged_format == 4u) {
-	                            rc = termite_metal_encode_paged_quantized_kv_seed_on_encoder(
+	                            rc = termite_metal_encode_paged_kv_seed_on_encoder(
                                 runtime,
                                 encoder,
                                 paged_slot,
@@ -30445,7 +30445,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
 	                                    failure_code);
 	                                if (rc != 0) break;
 	                            } else if (paged_format == 0u || paged_format == 1u || paged_format == 4u) {
-	                                rc = termite_metal_encode_paged_quantized_kv_seed_on_encoder(
+	                                rc = termite_metal_encode_paged_kv_seed_on_encoder(
                                     runtime,
                                     encoder,
                                     paged_slot,
@@ -30847,7 +30847,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
 	    if (rc == 0 && use_paged_kv) {
 	        if (paged_suffix_tokens != 0) {
 	            if (rc == 0 && (paged_format == 0u || paged_format == 1u || paged_format == 4u)) {
-                rc = termite_metal_encode_paged_quantized_kv_seed_on_encoder(
+                rc = termite_metal_encode_paged_kv_seed_on_encoder(
                     runtime,
                     encoder,
                     paged_slot,
@@ -64398,21 +64398,16 @@ static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_k
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(
             runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
         if (encoder == nil) return -14;
-        const int rc = format == 2u
-            ? termite_metal_encode_paged_f32_kv_seed_on_encoder(
-                runtime, encoder, slot, k_buffer, k_offset, v_buffer, v_offset, total_tokens,
-                suffix_tokens, num_kv_heads, head_dim, key_row_bytes, v_row_stride,
-                kv_position_offset, block_table, block_count, page_size, -14)
-            : termite_metal_encode_paged_quantized_kv_seed_on_encoder(
-                runtime, encoder, slot, format, k_buffer, k_offset, v_buffer, v_offset, total_tokens,
-                suffix_tokens, num_kv_heads, head_dim, key_row_bytes, base_key_row_bytes, v_row_stride,
-                kv_position_offset, block_table, block_count, page_size, -16);
+        const int rc = termite_metal_encode_paged_kv_seed_on_encoder(
+            runtime, encoder, slot, format, k_buffer, k_offset, v_buffer, v_offset, total_tokens,
+            suffix_tokens, num_kv_heads, head_dim, key_row_bytes, base_key_row_bytes, v_row_stride,
+            kv_position_offset, block_table, block_count, page_size, -16);
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
         return rc;
     }
 }
 
-static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
+static int termite_metal_encode_paged_kv_seed_on_encoder(
     termite_metal_decode_runtime *runtime,
     id<MTLComputeCommandEncoder> encoder,
     size_t slot,
@@ -64440,21 +64435,21 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
     if (suffix_tokens > total_tokens || num_kv_heads == 0 || head_dim == 0 || key_row_bytes == 0 || base_key_row_bytes == 0 || v_row_stride == 0) return failure_code;
     if (block_count == 0 || page_size == 0) return failure_code;
     if (total_tokens > UINT32_MAX || suffix_tokens > UINT32_MAX || num_kv_heads > UINT32_MAX || head_dim > UINT32_MAX || key_row_bytes > UINT32_MAX || base_key_row_bytes > UINT32_MAX || page_size > UINT32_MAX) return failure_code;
-    if (format != 0u && format != 1u && format != 3u && format != 4u) return failure_code;
-    const BOOL f16_kv = format == 3u;
+    if (k_offset % sizeof(float) != 0 || v_offset % sizeof(float) != 0) return failure_code;
+    const BOOL dense_kv = format == 2u || format == 3u;
+    const size_t value_element_bytes = format == 3u ? sizeof(uint16_t) : sizeof(float);
     id<MTLComputePipelineState> key_pipeline = nil;
-    if (!f16_kv) {
-        switch (format) {
-            case 0u: key_pipeline = runtime->encode_polar4_key_pipeline; break;
-            case 1u: key_pipeline = runtime->encode_turbo3_key_pipeline; break;
-            case 4u: key_pipeline = runtime->encode_int8_per_head_pipeline; break;
-            default: break;
-        }
-        if (key_pipeline == nil || runtime->paged_f32_v_seed_pipeline == nil) return failure_code;
-    } else {
-        if (runtime->paged_f16_kv_seed_pipeline == nil) return failure_code;
-        if (key_row_bytes % sizeof(uint16_t) != 0) return failure_code;
+    switch (format) {
+        case 0u: key_pipeline = runtime->encode_polar4_key_pipeline; break;
+        case 1u: key_pipeline = runtime->encode_turbo3_key_pipeline; break;
+        case 2u: key_pipeline = runtime->paged_f32_kv_seed_pipeline; break;
+        case 3u: key_pipeline = runtime->paged_f16_kv_seed_pipeline; break;
+        case 4u: key_pipeline = runtime->encode_int8_per_head_pipeline; break;
+        default: return failure_code;
     }
+    if (key_pipeline == nil) return failure_code;
+    if (dense_kv ? key_row_bytes % value_element_bytes != 0 : runtime->paged_f32_v_seed_pipeline == nil)
+        return failure_code;
 
     const size_t last_logical_block = (total_tokens - 1u) / page_size;
     if (last_logical_block >= block_count) return failure_code;
@@ -64475,27 +64470,31 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         v_offset > v_buffer.length || suffix_tokens > (v_buffer.length - v_offset) / raw_v_source_row_bytes ||
         block_count > SIZE_MAX / sizeof(uint32_t)) return failure_code;
 
-    const size_t value_element_bytes = f16_kv ? sizeof(uint16_t) : sizeof(float);
     const size_t value_row_bytes = v_row_stride * value_element_bytes;
-    const size_t key_row_halfs = key_row_bytes / sizeof(uint16_t);
+    const size_t key_row_elements = key_row_bytes / value_element_bytes;
     const size_t max_indexed_elements = (size_t)UINT32_MAX + 1u;
     if (capacity_tokens > SIZE_MAX / key_row_bytes || capacity_tokens > SIZE_MAX / value_row_bytes ||
         capacity_tokens > max_indexed_elements / v_row_stride || suffix_tokens > UINT32_MAX / v_row_stride)
         return failure_code;
-    if (f16_kv && (key_row_halfs < values_per_row || v_row_stride < values_per_row ||
-        capacity_tokens > max_indexed_elements / key_row_halfs || suffix_tokens > UINT32_MAX / values_per_row))
+    if (dense_kv && (key_row_elements < values_per_row || v_row_stride < values_per_row ||
+        capacity_tokens > max_indexed_elements / key_row_elements || suffix_tokens > UINT32_MAX / values_per_row))
         return failure_code;
     const size_t residual_bytes = num_kv_heads * 4u;
     const size_t work_per_row = format == 4u ? num_kv_heads : base_key_row_bytes + (format == 1u ? residual_bytes : 0u);
-    if (!f16_kv && (work_per_row > UINT32_MAX / suffix_tokens ||
+    if (!dense_kv && (work_per_row > UINT32_MAX / suffix_tokens ||
         (format == 4u ? head_dim > 256u || num_kv_heads * (head_dim + 4u) > key_row_bytes : work_per_row > key_row_bytes)))
         return failure_code;
 
     const size_t encoded_bytes = capacity_tokens * key_row_bytes;
     const size_t v_bytes = capacity_tokens * value_row_bytes;
-    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return failure_code;
     const size_t block_table_bytes = block_count * sizeof(uint32_t);
     id<MTLBuffer> block_table_buffer = nil;
+    if (block_table_bytes > 4096u) {
+        block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        if (block_table_buffer == nil) return failure_code;
+        if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
+    }
+    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return failure_code;
     termite_metal_planned_encoder_range accesses[4];
     if (termite_metal_planned_range_make(k_buffer, k_offset, suffix_tokens * raw_source_row_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], failure_code) != 0 ||
         termite_metal_planned_range_make(v_buffer, v_offset, suffix_tokens * raw_v_source_row_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], failure_code) != 0 ||
@@ -64506,28 +64505,22 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         return failure_code;
     }
 
-    if (f16_kv) {
+    if (dense_kv) {
         termite_metal_paged_f32_kv_seed_params params = {
             .total_tokens = (uint32_t)total_tokens,
             .suffix_tokens = (uint32_t)suffix_tokens,
             .values_per_row = (uint32_t)values_per_row,
             .page_size = (uint32_t)page_size,
-            .key_row_floats = (uint32_t)key_row_halfs,
+            .key_row_floats = (uint32_t)key_row_elements,
             .v_row_stride = (uint32_t)v_row_stride,
         };
-        antfly_metal_set_compute_pipeline(encoder, (runtime->paged_f16_kv_seed_pipeline));
+        antfly_metal_set_compute_pipeline(encoder, key_pipeline);
         termite_metal_bind_four_buffers_only(encoder, k_buffer, k_offset, v_buffer, v_offset, runtime->attention_span_encoded_key_buffers[slot], 0, runtime->attention_span_v_buffers[slot], 0);
-        if (block_table_bytes <= 4096u) {
-            [encoder setBytes:block_table length:block_table_bytes atIndex:4];
-        } else {
-            block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-            if (block_table_buffer == nil) return failure_code;
-            if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
-            [encoder setBuffer:block_table_buffer offset:0 atIndex:4];
-        }
+        if (block_table_buffer != nil) [encoder setBuffer:block_table_buffer offset:0 atIndex:4];
+        else [encoder setBytes:block_table length:block_table_bytes atIndex:4];
         [encoder setBytes:&params length:sizeof(params) atIndex:5];
         const size_t total = suffix_tokens * (values_per_row > v_row_stride ? values_per_row : v_row_stride);
-        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->paged_f16_kv_seed_pipeline, total), 1, 1));
+        antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(key_pipeline, total), 1, 1));
     } else {
 
         size_t int8_group = 1u;
@@ -64540,11 +64533,7 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
             .base_key_row_bytes = (uint32_t)base_key_row_bytes,
         };
         const uint32_t mapping[2] = { (uint32_t)suffix_start, (uint32_t)page_size };
-        if (block_table_bytes > 4096u) {
-            block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-            if (block_table_buffer == nil) return failure_code;
-            if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
-        }
+
 
         antfly_metal_set_compute_pipeline(encoder, key_pipeline);
         termite_metal_bind_two_buffers(encoder, k_buffer, k_offset, runtime->attention_span_encoded_key_buffers[slot], 0, &key_params, sizeof(key_params));
@@ -64613,91 +64602,10 @@ static int termite_metal_encode_paged_f32_kv_seed_on_encoder(
     size_t page_size,
     int failure_code
 ) {
-    if (runtime == NULL || encoder == nil || k_buffer == nil || v_buffer == nil || block_table == NULL) return failure_code;
-    if (slot >= TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY) return failure_code;
-    if (runtime->paged_f32_kv_seed_pipeline == nil) return failure_code;
-    if (total_tokens == 0 || suffix_tokens == 0) return suffix_tokens == 0 ? 0 : failure_code;
-    if (suffix_tokens > total_tokens || num_kv_heads == 0 || head_dim == 0 || key_row_bytes == 0 || v_row_stride == 0) return failure_code;
-    if (block_count == 0 || page_size == 0 || key_row_bytes % sizeof(float) != 0) return failure_code;
-    if (total_tokens > UINT32_MAX || suffix_tokens > UINT32_MAX || page_size > UINT32_MAX) return failure_code;
-    if (num_kv_heads > UINT32_MAX || head_dim > UINT32_MAX || key_row_bytes > UINT32_MAX || v_row_stride > UINT32_MAX) return failure_code;
-    const size_t values_per_row = num_kv_heads * head_dim;
-    if (values_per_row == 0 || values_per_row > UINT32_MAX) return failure_code;
-    const size_t key_row_floats = key_row_bytes / sizeof(float);
-    if (key_row_floats < values_per_row || key_row_floats > UINT32_MAX || v_row_stride < values_per_row) return failure_code;
-    if (k_offset % sizeof(float) != 0 || v_offset % sizeof(float) != 0) return failure_code;
-    if (block_count > SIZE_MAX / sizeof(uint32_t)) return failure_code;
-
-    const size_t last_logical_block = (total_tokens - 1u) / page_size;
-    if (last_logical_block >= block_count) return failure_code;
-    size_t capacity_tokens = 0;
-    for (size_t i = 0; i < block_count; i++) {
-        const size_t block_start = (size_t)block_table[i];
-        if (block_start > SIZE_MAX - page_size) return failure_code;
-        const size_t block_end = block_start + page_size;
-        if (block_end > capacity_tokens) capacity_tokens = block_end;
-    }
-    if (capacity_tokens == 0) return failure_code;
-
-    const size_t raw_k_source_bytes = suffix_tokens * values_per_row * sizeof(float);
-    const size_t raw_v_source_bytes = suffix_tokens * v_row_stride * sizeof(float);
-    if (k_offset > k_buffer.length || raw_k_source_bytes > k_buffer.length - k_offset) return failure_code;
-    if (v_offset > v_buffer.length || raw_v_source_bytes > v_buffer.length - v_offset) return failure_code;
-
-    const size_t encoded_bytes = capacity_tokens * key_row_bytes;
-    const size_t v_bytes = capacity_tokens * v_row_stride * sizeof(float);
-    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return failure_code;
-    termite_metal_planned_encoder_range accesses[4];
-    if (termite_metal_planned_range_make(k_buffer, k_offset, raw_k_source_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], failure_code) != 0 ||
-        termite_metal_planned_range_make(v_buffer, v_offset, raw_v_source_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], failure_code) != 0 ||
-        termite_metal_planned_range_make(runtime->attention_span_encoded_key_buffers[slot], 0, runtime->attention_span_encoded_key_buffers[slot].length, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], failure_code) != 0 ||
-        termite_metal_planned_range_make(runtime->attention_span_v_buffers[slot], 0, runtime->attention_span_v_buffers[slot].length, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], failure_code) != 0 ||
-        termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 4, failure_code) != 0)
-    {
-        return failure_code;
-    }
-
-    termite_metal_paged_f32_kv_seed_params params = {
-        .total_tokens = (uint32_t)total_tokens,
-        .suffix_tokens = (uint32_t)suffix_tokens,
-        .values_per_row = (uint32_t)values_per_row,
-        .page_size = (uint32_t)page_size,
-        .key_row_floats = (uint32_t)key_row_floats,
-        .v_row_stride = (uint32_t)v_row_stride,
-    };
-    const size_t block_table_bytes = block_count * sizeof(uint32_t);
-    id<MTLBuffer> block_table_buffer = nil;
-
-    antfly_metal_set_compute_pipeline(encoder, (runtime->paged_f32_kv_seed_pipeline));
-    termite_metal_bind_four_buffers_only(encoder, k_buffer, k_offset, v_buffer, v_offset, runtime->attention_span_encoded_key_buffers[slot], 0, runtime->attention_span_v_buffers[slot], 0);
-    if (block_table_bytes <= 4096u) {
-        [encoder setBytes:block_table length:block_table_bytes atIndex:4];
-    } else {
-        block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (block_table_buffer == nil) return failure_code;
-        if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
-        [encoder setBuffer:block_table_buffer offset:0 atIndex:4];
-    }
-    [encoder setBytes:&params length:sizeof(params) atIndex:5];
-    const size_t total = suffix_tokens * (values_per_row > v_row_stride ? values_per_row : v_row_stride);
-    antfly_metal_dispatch_threads(encoder, MTLSizeMake(total, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->paged_f32_kv_seed_pipeline, total), 1, 1));
-
-    runtime->attention_span_slot_tokens[slot] = total_tokens;
-    runtime->attention_span_slot_key_row_bytes[slot] = key_row_bytes;
-    runtime->attention_span_slot_v_row_stride[slot] = v_row_stride;
-    runtime->attention_span_slot_position_offset[slot] = kv_position_offset;
-    if (slot == 0) {
-        runtime->attention_span_encoded_key_buffer = runtime->attention_span_encoded_key_buffers[slot];
-        runtime->attention_span_v_buffer = runtime->attention_span_v_buffers[slot];
-        runtime->attention_span_encoded_key_capacity = runtime->attention_span_encoded_key_capacities[slot];
-        runtime->attention_span_v_capacity = runtime->attention_span_v_capacities[slot];
-        runtime->attention_span_tokens = total_tokens;
-        runtime->attention_span_key_row_bytes = key_row_bytes;
-        runtime->attention_span_v_row_stride = v_row_stride;
-        runtime->attention_span_position_offset = kv_position_offset;
-    }
-    (void)block_table_buffer;
-    return 0;
+    return termite_metal_encode_paged_kv_seed_on_encoder(
+        runtime, encoder, slot, 2u, k_buffer, k_offset, v_buffer, v_offset, total_tokens,
+        suffix_tokens, num_kv_heads, head_dim, key_row_bytes, key_row_bytes, v_row_stride,
+        kv_position_offset, block_table, block_count, page_size, failure_code);
 }
 
 int termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
@@ -68425,7 +68333,7 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
 	                        page_size,
 	                        -31);
 	                } else if (paged_encoder != nil && (paged_format == 0u || paged_format == 1u || paged_format == 3u || paged_format == 4u)) {
-                    rc = termite_metal_encode_paged_quantized_kv_seed_on_encoder(
+                    rc = termite_metal_encode_paged_kv_seed_on_encoder(
                         runtime,
                         paged_encoder,
                         paged_slot,
@@ -73940,7 +73848,7 @@ int termite_metal_decode_runtime_seed_paged_suffix_on_frame(
             (__bridge id<MTLBuffer>)k_handle, k_offset, (__bridge id<MTLBuffer>)v_handle, v_offset,
             total_tokens, suffix_tokens, num_kv_heads, head_dim, key_row_bytes, v_row_stride,
             kv_position_offset, block_table, block_count, page_size, -7)
-        : termite_metal_encode_paged_quantized_kv_seed_on_encoder(runtime, encoder, slot, format,
+        : termite_metal_encode_paged_kv_seed_on_encoder(runtime, encoder, slot, format,
             (__bridge id<MTLBuffer>)k_handle, k_offset, (__bridge id<MTLBuffer>)v_handle, v_offset,
             total_tokens, suffix_tokens, num_kv_heads, head_dim, key_row_bytes, base_key_row_bytes,
             v_row_stride, kv_position_offset, block_table, block_count, page_size, -7);
