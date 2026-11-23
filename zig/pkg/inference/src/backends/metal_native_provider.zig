@@ -462,18 +462,24 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.embedding_binding_retry = 0;
         return bytes;
     }
+    /// Caller holds the provider lease and residency lock.
+    pub fn dropAudioSchedule(self: *MetalNativeProvider, index: usize) usize {
+        const entry = &self.audio_schedules[index];
+        const plan = entry.* orelse return 0;
+        const bytes = plan.host_bytes + plan.backend_bytes;
+        plan.deinit();
+        if (self.embeddinggemma2_cache_admission) |cache| {
+            cache.noteRelease(.host, plan.host_bytes);
+            cache.noteRelease(.backend, plan.backend_bytes);
+        }
+        std.heap.c_allocator.destroy(plan);
+        entry.* = null;
+        return bytes;
+    }
+
     fn clearAudioSchedules(self: *MetalNativeProvider) usize {
         var bytes: usize = 0;
-        for (&self.audio_schedules) |*entry| if (entry.*) |plan| {
-            bytes += plan.host_bytes + plan.backend_bytes;
-            plan.deinit();
-            if (self.embeddinggemma2_cache_admission) |cache| {
-                cache.noteRelease(.host, plan.host_bytes);
-                cache.noteRelease(.backend, plan.backend_bytes);
-            }
-            std.heap.c_allocator.destroy(plan);
-            entry.* = null;
-        };
+        for (0..self.audio_schedules.len) |index| bytes += self.dropAudioSchedule(index);
         return bytes;
     }
     /// Caller owns the shared provider execution lease and residency lock.

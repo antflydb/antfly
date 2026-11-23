@@ -23288,6 +23288,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!recurrent) return null;
             if (p.audio_schedules[victim]) |old| {
                 if (!old.disabled and p.audio_schedule_clock - old.stamp < 8) return null;
+                // A pending frame can retain the plan backing after an eviction.
+                // Keep its charge until the provider reaches a quiescent boundary.
+                if (old.backend_bytes != 0 and
+                    (metal_runtime.hasActiveFrame(p.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(p.raw_decode_runtime))) return null;
             }
 
             self.data.prefetch.lock();
@@ -23296,13 +23300,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (p.embeddinggemma2_cache_admission) |bound| {
                 if (bound != cache) return null;
             }
-            if (p.audio_schedules[victim]) |old| {
-                old.deinit();
-                cache.noteRelease(.host, old.host_bytes);
-                cache.noteRelease(.backend, old.backend_bytes);
-                std.heap.c_allocator.destroy(old);
-                p.audio_schedules[victim] = null;
-            }
+            _ = p.dropAudioSchedule(victim);
             cache.reserve(.host, @sizeOf(audio_tape.Plan)) catch return null;
             const plan = std.heap.c_allocator.create(audio_tape.Plan) catch {
                 cache.noteRelease(.host, @sizeOf(audio_tape.Plan));
@@ -53014,8 +53012,26 @@ test "embeddinggemma2 Metal audio instruction schedule binds fresh inputs and re
         try cb.decoderRuntimeSubmitAndWaitFrame();
         // Alias relationships are part of the learned schedule contract.
         try std.testing.expect(try cb.audioExecution(42, &.{ x, x }, &run, Run.call) == null);
-        for (100..132) |key| try std.testing.expect(try cb.audioExecution(key, &.{ x, y }, &run, Run.call) == null);
-        for (100..132) |key| if (try cb.audioExecution(key, &.{ x, y }, &run, Run.call)) |out| cb.free(out);
+        for (100..115) |key| try std.testing.expect(try cb.audioExecution(key, &.{ x, y }, &run, Run.call) == null);
+        for (100..115) |key| if (try cb.audioExecution(key, &.{ x, y }, &run, Run.call)) |out| cb.free(out);
+        const schedules = &compute.provider_impl.audio_schedules;
+        const victim_index = for (schedules, 0..) |entry, index| {
+            if (entry) |plan| if (plan.backend_bytes != 0) break index;
+        } else return error.TestUnexpectedResult;
+        const victim = schedules[victim_index].?;
+        const victim_key = victim.key;
+        victim.stamp = 0;
+        const charged_backend = store.tier_cache.?.backend_bytes;
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        try std.testing.expect(try cb.audioExecution(200, &.{ x, y }, &run, Run.call) == null);
+        try std.testing.expect(try cb.audioExecution(200, &.{ x, y }, &run, Run.call) == null);
+        try std.testing.expectEqual(victim_key, schedules[victim_index].?.key);
+        try std.testing.expectEqual(charged_backend, store.tier_cache.?.backend_bytes);
+        try cb.decoderRuntimeCancelFrame();
+        const replacement = (try cb.audioExecution(200, &.{ x, y }, &run, Run.call)) orelse return error.TestUnexpectedResult;
+        cb.free(replacement);
+        try std.testing.expect(victim_key != schedules[victim_index].?.key);
+        try std.testing.expect(store.tier_cache.?.backend_bytes < charged_backend);
         var count: usize = 0;
         for (compute.provider_impl.audio_schedules) |entry| if (entry != null) {
             count += 1;
