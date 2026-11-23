@@ -2392,7 +2392,7 @@ fn checkPromptReplacementRows(backend_value: ComputeBackend, _: ComputeBackend) 
         defer a.free(scaled_values);
         var expected = base_values;
         for (&expected) |*value| value.* *= 1.25;
-        @memcpy(expected[4..12], &.{ 41, 42, 43, 44, 51, 52, 53, 54 });
+        @memcpy(expected[4..12], &[_]f32{ 41, 42, 43, 44, 51, 52, 53, 54 });
         try std.testing.expectEqualSlices(f32, &expected, scaled_values);
     }
     // Unit-scale host producers still need an explicit current-provider
