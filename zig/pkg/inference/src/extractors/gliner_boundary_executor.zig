@@ -2186,6 +2186,54 @@ test "boundary qualification native full-context groups fit head budgets before 
     std.debug.print("native-head admission: windows={} words={} admitted_batch={} planned_bytes={}\n", .{ usage.window_count, receiver.words, receiver.batch, planned.intermediate_bytes });
 }
 
+test "GLiNER CUDA long document preflight shrinks groups to fit the encoder budget" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"probe","schema":{"entities":["x"]},"options":{"long_document":{"mode":"window","window_words":5,"overlap_words":0}},"inputs":[{"content":"Ada met Bob and Carl met Dan today"}]}
+    , .{});
+    defer request.deinit();
+    const item = &request.items[0];
+    var tokenizer = QualificationGeometryTest.TokenizerProbe{ .one_token_words = true };
+    const config = QualificationGeometryTest.config();
+    var identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1;
+    identity.backbone = config.backbone;
+    const Receiver = struct {
+        largest_group: usize = 0,
+
+        pub fn observe(_: *@This(), _: usize, _: usize, _: usize, _: *const processor.PreparedBatch) !void {}
+        pub fn observeWindowGroup(self: *@This(), batch: *const processor.PreparedBatch) void {
+            self.largest_group = @max(self.largest_group, batch.samples.len);
+        }
+    };
+    var options = long_executor.Options{ .identity = identity, .limits = .{ .window_batch_size = 2 } };
+    var receiver = Receiver{};
+    const control = try long_executor.planGeometry(.cuda, a, &config, tokenizer.tokenizer(), item, options, &receiver);
+    try std.testing.expectEqual(@as(usize, 2), control.window_count);
+    try std.testing.expectEqual(@as(usize, 2), receiver.largest_group);
+
+    // A budget just below the CUDA two-row plan still fits one CUDA row and
+    // both Metal rows. Derive it from the tokenized rows and actual planner.
+    var one = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = "Ada met Bob and", .schema = &item.compiled }}, .{});
+    defer one.deinit();
+    var two = try processor.prepare(a, tokenizer.tokenizer(), &.{
+        .{ .text = "Ada met Bob and", .schema = &item.compiled },
+        .{ .text = "Carl met Dan today", .schema = &item.compiled },
+    }, .{});
+    defer two.deinit();
+    const schemas = [_]*const @TypeOf(item.compiled){ &item.compiled, &item.compiled };
+    const cuda_one = try device_request.plan(&config, &one, schemas[0..1], .{ .backend = .cuda });
+    const cuda_two = try device_request.plan(&config, &two, &schemas, .{ .backend = .cuda });
+    const metal_two = try device_request.plan(&config, &two, &schemas, .{ .backend = .metal });
+    options.device.max_encoder_device_bytes = cuda_two.encoder.device_upper_bound_bytes - 1;
+    try std.testing.expect(options.device.max_encoder_device_bytes >= cuda_one.encoder.device_upper_bound_bytes);
+    try std.testing.expect(options.device.max_encoder_device_bytes >= metal_two.encoder.device_upper_bound_bytes);
+
+    receiver = .{};
+    const constrained = try long_executor.planGeometry(.cuda, a, &config, tokenizer.tokenizer(), item, options, &receiver);
+    try std.testing.expectEqual(control.window_count, constrained.window_count);
+    try std.testing.expectEqual(@as(usize, 1), receiver.largest_group);
+}
+
 test "gliner microbatch preflight includes record callback downloads" {
     const a = std.testing.allocator;
     var request = try wire.parseJson(a,

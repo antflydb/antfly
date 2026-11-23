@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Check prepared GLiNER outputs against upstream Python CUDA BF16.
 
 The classification fixtures use the recorded hotel schema (6-way intent,
@@ -204,6 +217,12 @@ def main():
         raise ValueError("Reference must record the stock CUDA BF16 reduction setting")
     native = (run_decide_serving(args.serving_bench, args.model, manifest, args.out.parent)
               if args.serving_bench else json.loads(args.native.read_text()))
+    if args.native:
+        stats = native.get("cuda") or {}
+        required = ("gliner25_bf16_attention_calls", "gliner25_bf16_ffn_calls")
+        if (native.get("backend") != "cuda" or native.get("encoder_dtype") != "bf16"
+                or any(type(stats.get(name)) is not int or stats[name] <= 0 for name in required)):
+            raise ValueError("Prepared report did not execute CUDA BF16 attention and FFN")
     if native.get("incomplete", False):
         raise ValueError("Incomplete native run cannot qualify")
     ids = [c["id"] for c in manifest["cases"]]

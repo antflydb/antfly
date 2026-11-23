@@ -1,11 +1,28 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from qualify_gliner25_bf16 import compare
+from qualify_gliner25_bf16 import compare, main, sha
 
 
 FIXTURE = {"inputs": [{"shape": [1, 64]}, {}, {"shape": [1, 14]}],
@@ -21,6 +38,43 @@ def logits(topic):
 
 
 class Bf16QualificationTests(unittest.TestCase):
+    def test_prepared_report_requires_cuda_bf16_attention_and_ffn(self):
+        fixture = dict(FIXTURE, id="case")
+        values = [logits(0.2).tolist()]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, reference, native, output = (root / name for name in
+                                                   ("manifest", "reference", "native", "output"))
+            manifest.write_text(json.dumps({"model_sha256": "model", "cases": [fixture]}))
+            reference.write_text(json.dumps({
+                "precision": "bf16", "dtype": "torch.bfloat16", "model_sha256": "model",
+                "manifest_sha256": sha(manifest), "inference_mode": True, "autocast": False,
+                "matmul_settings": {"allow_bf16_reduced_precision_reduction": True},
+                "cases": [{"id": "case", "logits": values}],
+            }))
+            report = {"backend": "cuda", "encoder_dtype": "bf16", "cuda": {
+                "gliner25_bf16_attention_calls": 1, "gliner25_bf16_ffn_calls": 1,
+            }, "cases": [{"id": "case", "logits": values, "physical_forwards": 1}]}
+            argv = ["qualify", "--manifest", str(manifest), "--reference", str(reference),
+                    "--native", str(native), "--out", str(output)]
+            with patch("sys.argv", argv):
+                fp32 = {"precision": "fp32", "encoder_dtype": "f32", "cuda": {
+                    "gliner25_bf16_attention_calls": 0, "gliner25_bf16_ffn_calls": 0,
+                }}
+                for update in (fp32, {"backend": "native"}, {"encoder_dtype": "f32"},
+                               {"cuda": None}, {"cuda": {"gliner25_bf16_attention_calls": 1,
+                                                         "gliner25_bf16_ffn_calls": 0}},
+                               {"cuda": {"gliner25_bf16_attention_calls": 0,
+                                         "gliner25_bf16_ffn_calls": 1}}):
+                    with self.subTest(update=update):
+                        native.write_text(json.dumps(report | update))
+                        with self.assertRaisesRegex(ValueError, "did not execute CUDA BF16"):
+                            main()
+                        self.assertFalse(output.exists())
+                native.write_text(json.dumps(report))
+                main()
+                self.assertTrue(json.loads(output.read_text())["passed"])
+
     def test_threshold_crossing_requires_explicit_bounded_policy(self):
         ref, actual = logits(0.398), logits(0.413)
         self.assertFalse(compare(actual, ref, FIXTURE, 0.02)["passed"])

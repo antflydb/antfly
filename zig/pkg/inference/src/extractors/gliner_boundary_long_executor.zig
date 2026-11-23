@@ -588,7 +588,7 @@ fn prepareDocument(backend: compute.BackendKind, allocator: Allocator, config: *
     const process_options = qualification.windowProcessor(item, options.processor, planning, qualification.sequenceLimit(config, @min(options.engine.limits.max_sequence_tokens, options.engine.limits.max_batch_tokens, options.processor.max_batch_tokens)), options.control);
     var engine_options = options.engine;
     engine_options.control = options.control;
-    var device_options = device_request.Options{ .precision = options.identity.precision, .execution_policy = options.metal_execution_policy, .limits = options.device, .pipeline = options.pipeline };
+    var device_options = device_request.Options{ .backend = backend, .precision = options.identity.precision, .execution_policy = options.metal_execution_policy, .limits = options.device, .pipeline = options.pipeline };
     // The service encoder policy is shared by both execution backends.
     device_options.limits.encoder = options.engine.limits;
     device_options.pipeline.max_output_values = options.limits.merge.max_input_candidates;

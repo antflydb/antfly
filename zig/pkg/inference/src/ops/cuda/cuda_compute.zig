@@ -28145,7 +28145,7 @@ fn gliner25RelativeKey(self: *CudaCompute, request: *const ops.DebertaBf16Projec
     const key: @import("gliner25_relative_cache.zig").Key = .{ .sources = sources, .generation = self.gliner_relative_generation, .sequence = request.sequence, .rows = request.rows, .hidden = request.hidden, .layout = @backingInt(policy.layout), .eps_bits = @bitCast(policy.normalization_eps), .buckets = policy.position_buckets, .positions = policy.max_position };
     // A hit was already proved to reference resident immutable model weights
     // at publication. Keep the O(weight-count) membership scan cold-only.
-    if (self.gliner_relative_cache.get(key) != null) return key;
+    if (self.gliner_relative_cache.contains(key)) return key;
     for (handles) |handle| {
         const source = tensorFromCt(handle);
         var resident = self.resident_weights.valueIterator();
@@ -28219,7 +28219,9 @@ fn gliner25Bf16Projections(ctx: *anyopaque, request: *const ops.DebertaBf16Proje
         weights[i] = weight.buffer;
         biases[i] = bias.buffer;
     }
-    const cache_key = gliner25RelativeKey(self, request);
+    // Captured work can outlive a later cache eviction. Keep its relative
+    // operands private even if the driver capture was started externally.
+    const cache_key = if (request.relative_policy != null and !try self.ctx.streamCaptureActive()) gliner25RelativeKey(self, request) else null;
     if (cache_key) |key| {
         if (self.gliner_relative_cache.get(key)) |cached| {
             self.stats.gliner25_bf16_relative_cache_hits += 1;

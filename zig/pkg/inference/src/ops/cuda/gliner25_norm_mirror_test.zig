@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const Context = @import("context.zig").CudaContext;
 const Buffer = @import("buffer.zig").DeviceBuffer;
@@ -135,6 +148,64 @@ test "GLiNER BF16 norm mirror preserves F32 results and RNE bits for every reduc
                 const raw: u32 = @bitCast(want);
                 try std.testing.expectEqual(@as(u16, @intCast((raw + 0x7fff + ((raw >> 16) & 1)) >> 16)), rounded);
             }
+        }
+    }
+}
+
+test "GLiNER BF16 normalization and dot+bias agree with the reference" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| {
+        if (@import("antfly_platform").env.getenvBool("TERMITE_REQUIRE_CUDA_TESTS")) return err;
+        return error.SkipZigTest;
+    };
+    defer ctx.deinit();
+    if (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9) return error.SkipZigTest;
+    var module = @import("gliner25_bf16_full.zig").Module{ .flags = @import("../../models/gliner25_bf16_policy.zig").qualified_flags };
+    try module.init(&ctx);
+    defer module.deinit(&ctx);
+
+    const rows = 3;
+    const width = 1024;
+    const count = rows * width;
+    var input: [count]f32 = undefined;
+    var dot: [count]u16 = undefined;
+    for (&input, &dot, 0..) |*x, *d, index| {
+        x.* = @as(f32, @floatFromInt(index / width)) + (if (index % 256 < 128) @as(f32, 2) else 6);
+        d.* = @truncate(@as(u32, @bitCast(x.* - 0.25)) >> 16);
+    }
+    const residual: [count]f32 = @splat(0.5);
+    const bias: [width]f32 = @splat(0.25);
+    const gamma: [width]f32 = @splat(1);
+    const beta: [width]f32 = @splat(0);
+    const host = [_][]const u8{ std.mem.asBytes(&input), std.mem.asBytes(&dot), std.mem.asBytes(&residual), std.mem.asBytes(&bias), std.mem.asBytes(&gamma), std.mem.asBytes(&beta) };
+    var buffers: [host.len]Buffer = @splat(.{});
+    defer for (&buffers) |*buffer| buffer.free(&ctx);
+    for (&buffers, host) |*buffer, values| {
+        buffer.* = try Buffer.alloc(&ctx, values.len);
+        try buffer.copyFromHost(&ctx, values);
+    }
+
+    var output = try Buffer.alloc(&ctx, count * @sizeOf(f32));
+    defer output.free(&ctx);
+    var mirror = try Buffer.alloc(&ctx, count * @sizeOf(u16));
+    defer mirror.free(&ctx);
+    for ([_]bool{ false, true }) |fused_bias| {
+        if (fused_bias) {
+            try module.normDotBias(&ctx, output, mirror, .{ buffers[1], buffers[3], buffers[2], buffers[4], buffers[5] }, rows, width, 1e-5);
+        } else {
+            try module.norm(&ctx, output, mirror, .{ buffers[0], buffers[2], buffers[4], buffers[5] }, rows, width, 1e-5);
+        }
+        var actual: [count]f32 = undefined;
+        var bits: [count]u16 = undefined;
+        try output.copyToHost(&ctx, std.mem.asBytes(&actual));
+        try mirror.copyToHost(&ctx, std.mem.asBytes(&bits));
+        try ctx.synchronize();
+        for (actual, bits, 0..) |value, word, index| {
+            // Each row has two equally sized populations separated by four.
+            // Normalizing with epsilon and rounding to BF16 gives +/-1.
+            const expected: f32 = if (index % 256 < 128) -1 else 1;
+            try std.testing.expectEqual(expected, value);
+            try std.testing.expectEqual(@as(u16, @truncate(@as(u32, @bitCast(expected)) >> 16)), word);
         }
     }
 }

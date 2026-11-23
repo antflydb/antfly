@@ -17,7 +17,7 @@
   "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Thu_Mar_19_11:12:51_PM_PDT_2026\nCuda compilation tools, release 13.2, V13.2.78\nBuild cuda_13.2.r13.2/compiler.37668154_0",
   "precision": "FP32 storage and I/O; BF16x3 or TF32x3 arithmetic with FP32 accumulation",
   "source_sha256": {
-    "gliner25_fast_f32.cu": "6abb49ecdf837a546cb7876ae4b2019a75d07346964a9576cc7831b49f078ff1",
+    "gliner25_fast_f32.cu": "84e73e4c47b3ddead76d3109bdb22b2ff38c185d6884f59c119b96409f53b815",
     "gliner25_fast_f32_mma.cuh": "60e5636e61b7102dea094df4a914323ff8d90ed69816784c448945117db08695"
   },
   "symbols": [

@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Experimental full-BF16 graph boundaries, independent of the FP32 route.
 #include <cuda_bf16.h>
 #include <math.h>
@@ -27,6 +40,8 @@ template<bool bf16_dot> __device__ __forceinline__ void norm_core(
  for(unsigned s=128;s;s>>=1){if(tid<s)sums[tid]+=sums[tid+s];__syncthreads();}
  const float mean=sums[0]/float(width);float square=0;
  for(unsigned d=tid;d<width;d+=blockDim.x){unsigned i=row*width+d;float x=(norm_input<bf16_dot>(a,b,projection_bias,i,width,flags))-mean;square+=x*x;}
+ // All warps must consume the mean before reusing the reduction buffer.
+ __syncthreads();
  sums[tid]=square;__syncthreads();
  for(unsigned s=128;s;s>>=1){if(tid<s)sums[tid]+=sums[tid+s];__syncthreads();}
  float variance=sums[0]/float(width),m=mean,inv;
