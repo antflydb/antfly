@@ -3483,6 +3483,7 @@ fn metadataSessionReadPrefixPage(read: *MetadataSessionRead, prefix: []const u8,
 const MetadataSessionCursor = struct {
     read: *MetadataSessionRead,
     cursor: antfly.capi_dependencies.storage_docstore.DocStore.Txn.CursorAdapter,
+    keys_only: ?bool = null,
 };
 
 pub fn metadataSessionCursorOpen(read_ptr: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
@@ -3521,7 +3522,14 @@ pub fn metadataSessionCursorInvoke(ptr: ?*anyopaque, request: *const kernel_owne
         const at_upper = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
         if ((!std.mem.startsWith(u8, key, read.prefix) and !at_upper) or key.len > read.prefix.len + 512) return .invalid_argument;
     }
-    if (request.length == 1) state.cursor.setKeysOnly();
+    if (request.length > 1) return .invalid_argument;
+    const keys_only = request.length == 1;
+    if (state.keys_only) |selected| {
+        if (selected != keys_only) return .invalid_argument;
+    } else {
+        if (keys_only) state.cursor.setKeysOnly();
+        state.keys_only = keys_only;
+    }
     var entry = switch (request.operation) {
         .first => state.cursor.seekAtOrAfter(read.prefix),
         .last => state.cursor.seekAtOrBefore(upper_bound),
@@ -3537,7 +3545,7 @@ pub fn metadataSessionCursorInvoke(ptr: ?*anyopaque, request: *const kernel_owne
     }
     var row = entry orelse return .not_found;
     if (!std.mem.startsWith(u8, row.key, read.prefix)) return .not_found;
-    if (request.length == 1) row.value = &.{};
+    if (keys_only) row.value = &.{};
     return encodeMetadataSessionCursorEntry(read, row, out_value);
 }
 

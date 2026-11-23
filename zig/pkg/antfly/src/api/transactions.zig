@@ -2995,6 +2995,10 @@ pub const DurableSessionStore = struct {
     }
 
     pub fn compactDetachedSqlSessionTxn(self: *DurableSessionStore, txn: anytype, session: Session) !void {
+        // The command loan and recovery observer both use the exact external
+        // seal through completion, even after the connection detaches. The
+        // tagged expiry queue retires it after ACK and the observation TTL.
+        if (session.external_preparation != null) return;
         if (!session.prepared_completion_only or !sessionCompletionSettled(session) or !sessionCanExpire(session)) return;
         const key = try makeSessionKey(self.alloc, session.txn_id);
         defer self.alloc.free(key);
@@ -14475,6 +14479,7 @@ fn sessionCanExpire(session: Session) bool {
 }
 
 fn sessionCompletionSettled(session: Session) bool {
+    if (session.external_preparation != null and !session.external_receipt_acknowledged) return false;
     if (session.terminal_abort) return true;
     if (session.terminal_commit) |terminal| return terminal.status == .committed and !terminal.repair_required;
     // A named PREPARE settles the source session after the receiving native
