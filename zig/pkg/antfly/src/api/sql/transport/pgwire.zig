@@ -1631,7 +1631,14 @@ pub const Adapter = struct {
     fn startConnection(raw: *anyopaque, a: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !void {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         if (!self.server.source.vtable.supports_sql_command_ownership) return;
-        var job: Job = .{ .adapter = self, .alloc = a, .credential = @ptrCast(@alignCast(identity.context)), .request = request, .kind = .notification_connect };
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        if (credential.trusted_identity) |admitted| {
+            // A federated principal can administer its publication without
+            // holding the native identity required for notification enrollment.
+            // Native SQL execution still checks that identity at admission.
+            if (admitted.live_user_manager == null or admitted.user_instance_id == null) return;
+        }
+        var job: Job = .{ .adapter = self, .alloc = a, .credential = credential, .request = request, .kind = .notification_connect };
         try self.dispatch(&job);
     }
 

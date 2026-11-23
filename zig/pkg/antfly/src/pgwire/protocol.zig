@@ -471,29 +471,33 @@ pub const Session = struct {
                         try owner.authorizeRequest(self.alloc, self.request("", &.{}, &.{}), null);
                     }
                     if (self.hooks) |hooks| try hooks.register(hooks.context, self);
-                    if (self.source.vtable.start_connection) |start_connection| {
-                        if (self.backend_pid <= 0) {
-                            var pid_bytes: [4]u8 = undefined;
-                            try self.io.randomSecure(&pid_bytes);
-                            self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
+                    // Logical startup already authorized its replication owner.
+                    // Native SQL connection enrollment belongs to SQL sessions.
+                    if (self.replication_mode == .normal) {
+                        if (self.source.vtable.start_connection) |start_connection| {
+                            if (self.backend_pid <= 0) {
+                                var pid_bytes: [4]u8 = undefined;
+                                try self.io.randomSecure(&pid_bytes);
+                                self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
+                            }
+                            var accepted = false;
+                            for (0..8) |_| {
+                                start_connection(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{})) catch |err| {
+                                    if (err != error.SqlBackendPidInUse) return err;
+                                    if (self.hooks) |hooks| {
+                                        try (hooks.rekey orelse return err)(hooks.context, self);
+                                    } else {
+                                        var pid_bytes: [4]u8 = undefined;
+                                        try self.io.randomSecure(&pid_bytes);
+                                        self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
+                                    }
+                                    continue;
+                                };
+                                accepted = true;
+                                break;
+                            }
+                            if (!accepted) return error.SqlBackendPidInUse;
                         }
-                        var accepted = false;
-                        for (0..8) |_| {
-                            start_connection(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{})) catch |err| {
-                                if (err != error.SqlBackendPidInUse) return err;
-                                if (self.hooks) |hooks| {
-                                    try (hooks.rekey orelse return err)(hooks.context, self);
-                                } else {
-                                    var pid_bytes: [4]u8 = undefined;
-                                    try self.io.randomSecure(&pid_bytes);
-                                    self.backend_pid = @intCast(1 + std.mem.readInt(u32, &pid_bytes, .little) % std.math.maxInt(i32));
-                                }
-                                continue;
-                            };
-                            accepted = true;
-                            break;
-                        }
-                        if (!accepted) return error.SqlBackendPidInUse;
                     }
                     if (self.replication_mode == .logical and self.replication == null) {
                         const open = self.source.vtable.open_replication orelse return error.UnsupportedReplicationMode;
@@ -3028,16 +3032,23 @@ pub const Session = struct {
     fn complete(self: *Session, result: backend.Result) !void {
         try self.flushNotices();
         for (result.notices) |notice| try self.sendNotice(notice);
-        if (result.ddl_receipt_json != null and result.catalog_receipt_json != null) return error.InvalidResult;
-        if (result.catalog_receipt_json orelse result.ddl_receipt_json) |receipt| {
-            var bytes = std.Io.Writer.Allocating.init(self.alloc);
-            defer bytes.deinit();
-            const pending = std.mem.eql(u8, result.command_tag, "DDL PENDING");
-            const unknown = pending and result.mutation_outcome == null;
-            try bytes.writer.writeAll(if (unknown) "SERROR\x00C40003\x00MDDL admission outcome is unknown; do not replay; inspect receipt\x00D" else if (pending) "SERROR\x00C55000\x00MDDL operation was durably admitted but is not ready; do not replay; inspect receipt\x00D" else "SNOTICE\x00C01000\x00MDDL operation committed; inspect receipt for validation readiness\x00D");
-            try bytes.writer.writeAll(receipt);
-            try bytes.writer.writeAll("\x00\x00");
-            try self.message(if (pending) 'E' else 'N', bytes.written());
+        const pending = std.mem.eql(u8, result.command_tag, "DDL PENDING");
+        const unknown = pending and result.mutation_outcome == null;
+        // Catalog admission and constraint activation have separate recovery
+        // receipts. Prefer admission for an unknown outcome and activation
+        // after commit. Emit the other receipt as a notice so both survive.
+        const first = if (unknown) result.catalog_receipt_json else result.ddl_receipt_json;
+        const second = if (unknown) result.ddl_receipt_json else result.catalog_receipt_json;
+        if (first != null) if (second) |receipt| {
+            try self.sendDdlReceipt('N', "SNOTICE\x00C01000\x00MAdditional DDL recovery receipt\x00D", receipt);
+        };
+        if (first orelse second) |receipt| {
+            try self.sendDdlReceipt(if (pending) 'E' else 'N', if (unknown)
+                "SERROR\x00C40003\x00MDDL admission outcome is unknown; do not replay; inspect receipt\x00D"
+            else if (pending)
+                "SERROR\x00C55000\x00MDDL operation was durably admitted but is not ready; do not replay; inspect receipt\x00D"
+            else
+                "SNOTICE\x00C01000\x00MDDL operation committed; inspect receipt for validation readiness\x00D", receipt);
             if (pending) return;
         }
         if (result.mutation_outcome) |outcome| {
@@ -3048,6 +3059,12 @@ pub const Session = struct {
             }
         }
         try self.command(result.command_tag);
+    }
+
+    fn sendDdlReceipt(self: *Session, tag: u8, prefix: []const u8, receipt: []const u8) !void {
+        const bytes = try std.mem.concat(self.alloc, u8, &.{ prefix, receipt, "\x00\x00" });
+        defer self.alloc.free(bytes);
+        try self.message(tag, bytes);
     }
 
     fn ready(self: *Session) !void {

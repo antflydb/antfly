@@ -60,7 +60,7 @@ class PgwireFailoverCluster(ThreeByThreeBackupCluster):
     def _data_command(self, index):
         command = super()._data_command(index)
         command[command.index("--config") + 1] = str(self.data_configs[index])
-        return command
+        return [*command, "--auth", "true"]
 
 
 @pytest.mark.e2e_resource("antfly_process")
@@ -115,10 +115,16 @@ def test_pg_recvlogical_resume_after_restart(
     }
     connection = ["-h", "127.0.0.1", "-p", str(port), "-U", "admin", "-d", "default"]
 
-    def sql(*statements, retry_uncommitted=False):
+    def writer_connection():
+        return [*connection[:5], "admin", *connection[6:]]
+
+    def writer_env():
+        return {**env, "PGPASSWORD": harness.AUTH_BOOTSTRAP_PASSWORD}
+
+    def sql(*statements, retry_uncommitted=False, publication_owner=False):
         args = [
             psql,
-            *connection,
+            *(connection if publication_owner else writer_connection()),
             "-X",
             "-v",
             "ON_ERROR_STOP=1",
@@ -129,7 +135,11 @@ def test_pg_recvlogical_resume_after_restart(
         expires = time.monotonic() + 12
         while True:
             result = subprocess.run(
-                args, env=env, text=True, capture_output=True, timeout=40
+                args,
+                env=env if publication_owner else writer_env(),
+                text=True,
+                capture_output=True,
+                timeout=40,
             )
             if result.returncode == 0:
                 return
@@ -246,6 +256,9 @@ def test_pg_recvlogical_resume_after_restart(
     if cross_node:
         secret = "pgwire-failover-principal-authority-secret-v1"
         issuer = "pgwire-failover"
+        monkeypatch.setenv(
+            "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD", harness.AUTH_BOOTSTRAP_PASSWORD
+        )
         monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_SECRET", secret)
         monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", issuer)
         server = PgwireFailoverCluster(binary, spool_config)
@@ -381,7 +394,7 @@ def test_pg_recvlogical_resume_after_restart(
             "int4|f|b||23",
             "23|int4|0|0|-1|N|",
             "1007|_int4|23|0|-1|A|",
-            '{"public"}|{"pg_catalog","public"}|',
+            "{public}|{pg_catalog,public}|",
             "public",
             "public",
             "app",
@@ -402,7 +415,7 @@ def test_pg_recvlogical_resume_after_restart(
         replica_identity = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -411,7 +424,7 @@ def test_pg_recvlogical_resume_after_restart(
                 "JOIN pg_catalog.pg_namespace n ON c.relnamespace=n.oid "
                 "WHERE n.nspname='public' AND c.relname='smoke'",
             ],
-            env=env,
+            env=writer_env(),
             text=True,
             timeout=40,
         )
@@ -419,7 +432,7 @@ def test_pg_recvlogical_resume_after_restart(
         names = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -431,13 +444,13 @@ def test_pg_recvlogical_resume_after_restart(
                 "WHERE n.nspname = 'public' AND c.relname = 'smoke'",
             ],
             text=True,
-            env=env,
+            env=writer_env(),
             timeout=40,
         ).splitlines()
         columns = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -450,7 +463,7 @@ def test_pg_recvlogical_resume_after_restart(
                 "WHERE c.relname = 'smoke' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
             ],
             text=True,
-            env=env,
+            env=writer_env(),
             timeout=40,
         ).splitlines()
         assert columns == [
@@ -466,7 +479,7 @@ def test_pg_recvlogical_resume_after_restart(
         primary_key = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -477,14 +490,14 @@ def test_pg_recvlogical_resume_after_restart(
                 "WHERE ct.relname = 'catalog_key_order' AND i.indisprimary",
             ],
             text=True,
-            env=env,
+            env=writer_env(),
             timeout=40,
         ).splitlines()
         assert primary_key == ["ordered_primary|i|2|2|1"]
         jdbc_keys = subprocess.check_output(
             [
                 psql,
-                *connection,
+                *writer_connection(),
                 "-XAt",
                 "-v",
                 "ON_ERROR_STOP=1",
@@ -500,7 +513,7 @@ def test_pg_recvlogical_resume_after_restart(
                 "WHERE r.a_attnum = (r.keys).x AND r.key_seq <= key_count ORDER BY r.key_seq",
             ],
             text=True,
-            env=env,
+            env=writer_env(),
             timeout=40,
         ).splitlines()
         assert jdbc_keys == [
@@ -509,7 +522,7 @@ def test_pg_recvlogical_resume_after_restart(
         ]
         assert catalog_publication() == []
         published = "smoke, smoke_other" if multi_table else "smoke"
-        sql(f"CREATE PUBLICATION changes FOR TABLE {published}")
+        sql(f"CREATE PUBLICATION changes FOR TABLE {published}", publication_owner=True)
         assert catalog_publication() == ["f|t|t|t|f"]
         assert catalog_slot() == []
         if export_snapshot:
@@ -927,8 +940,8 @@ def test_pg_recvlogical_resume_after_restart(
             assert not rejected_output.exists() or not rejected_output.read_bytes()
             slot("--drop-slot")
             assert catalog_slot() == []
-            sql("DROP PUBLICATION changes")
-            sql("CREATE PUBLICATION changes FOR TABLE smoke")
+            sql("DROP PUBLICATION changes", publication_owner=True)
+            sql("CREATE PUBLICATION changes FOR TABLE smoke", publication_owner=True)
             recreation_errors = set()
 
             def recreate_slot():
@@ -1063,8 +1076,8 @@ def test_pg_recvlogical_resume_after_restart(
             assert "ChangefeedResynchronizationRequired" in invalidated.stderr
             assert not discarded.exists() or not discarded.read_bytes()
             slot("--drop-slot")
-            sql("DROP PUBLICATION changes")
-            sql("CREATE PUBLICATION changes FOR TABLE smoke")
+            sql("DROP PUBLICATION changes", publication_owner=True)
+            sql("CREATE PUBLICATION changes FOR TABLE smoke", publication_owner=True)
             recreation_errors.clear()
             assert wait_until(recreate_slot, timeout_s=60), sorted(recreation_errors)
             replacement = tmp_path / "replacement-generation.bin"
@@ -1111,7 +1124,7 @@ def test_pg_recvlogical_resume_after_restart(
                     ).raise_for_status()
         slot("--drop-slot")
         assert catalog_slot() == []
-        sql("DROP PUBLICATION changes")
+        sql("DROP PUBLICATION changes", publication_owner=True)
         assert catalog_publication() == []
     except Exception:
         print(server.debug_logs())
