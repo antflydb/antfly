@@ -1,0 +1,610 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "entries": [
+    {
+      "id": "unnest-alias",
+      "sql": "SELECT * FROM unnest(ARRAY[1,2]) t",
+      "columns": [
+        "t"
+      ],
+      "column_oids": [
+        23
+      ],
+      "rows": [
+        [
+          "1"
+        ],
+        [
+          "2"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-zip",
+      "sql": "SELECT * FROM unnest(ARRAY[1,NULL,3]::int[], ARRAY['a']::text[], ARRAY[true,false]) WITH ORDINALITY t(x,y,z,n)",
+      "columns": [
+        "x",
+        "y",
+        "z",
+        "n"
+      ],
+      "column_oids": [
+        23,
+        25,
+        16,
+        20
+      ],
+      "rows": [
+        [
+          "1",
+          "a",
+          true,
+          "1"
+        ],
+        [
+          null,
+          null,
+          false,
+          "2"
+        ],
+        [
+          "3",
+          null,
+          null,
+          "3"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false
+        ],
+        [
+          true,
+          true,
+          false,
+          false
+        ],
+        [
+          false,
+          true,
+          true,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-bounds",
+      "sql": "SELECT * FROM unnest('[-1:0][5:6]={{1,2},{3,NULL}}'::int[]) WITH ORDINALITY t(v,n)",
+      "columns": [
+        "v",
+        "n"
+      ],
+      "column_oids": [
+        23,
+        20
+      ],
+      "rows": [
+        [
+          "1",
+          "1"
+        ],
+        [
+          "2",
+          "2"
+        ],
+        [
+          "3",
+          "3"
+        ],
+        [
+          null,
+          "4"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          true,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-null",
+      "sql": "SELECT * FROM unnest(NULL::text[]) WITH ORDINALITY",
+      "columns": [
+        "unnest",
+        "ordinality"
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "rows": [],
+      "sql_nulls": []
+    },
+    {
+      "id": "unnest-empty",
+      "sql": "SELECT * FROM unnest(ARRAY[]::int[])",
+      "columns": [
+        "unnest"
+      ],
+      "column_oids": [
+        23
+      ],
+      "rows": [],
+      "sql_nulls": []
+    },
+    {
+      "id": "unnest-null-zip",
+      "sql": "SELECT * FROM unnest(NULL::int[], ARRAY['x','y']) t(a,b)",
+      "columns": [
+        "a",
+        "b"
+      ],
+      "column_oids": [
+        23,
+        25
+      ],
+      "rows": [
+        [
+          null,
+          "x"
+        ],
+        [
+          null,
+          "y"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          true,
+          false
+        ],
+        [
+          true,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-partial-alias",
+      "sql": "SELECT * FROM unnest(ARRAY[1,2], ARRAY[3]) t(x)",
+      "columns": [
+        "x",
+        "unnest"
+      ],
+      "column_oids": [
+        23,
+        23
+      ],
+      "rows": [
+        [
+          "1",
+          "3"
+        ],
+        [
+          "2",
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          true
+        ]
+      ]
+    },
+    {
+      "id": "unnest-schema",
+      "sql": "SELECT * FROM pg_catalog.unnest(ARRAY[1,2]) t(x)",
+      "columns": [
+        "x"
+      ],
+      "column_oids": [
+        23
+      ],
+      "rows": [
+        [
+          "1"
+        ],
+        [
+          "2"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-numeric",
+      "sql": "SELECT * FROM unnest(ARRAY['9007199254740993.125'::numeric]) t",
+      "columns": [
+        "t"
+      ],
+      "column_oids": [
+        1700
+      ],
+      "rows": [
+        [
+          "9007199254740993.125"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-json-null",
+      "sql": "SELECT * FROM unnest(ARRAY['null'::jsonb, NULL::jsonb, '{\"a\":1}'::jsonb]) WITH ORDINALITY t(v,n)",
+      "columns": [
+        "v",
+        "n"
+      ],
+      "column_oids": [
+        3802,
+        20
+      ],
+      "rows": [
+        [
+          null,
+          "1"
+        ],
+        [
+          null,
+          "2"
+        ],
+        [
+          {
+            "a": 1
+          },
+          "3"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          true,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-uuid",
+      "sql": "SELECT * FROM unnest(ARRAY['550e8400-e29b-41d4-a716-446655440000'::uuid]) t",
+      "columns": [
+        "t"
+      ],
+      "column_oids": [
+        2950
+      ],
+      "rows": [
+        [
+          "550e8400-e29b-41d4-a716-446655440000"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-lateral",
+      "sql": "SELECT d._id, tag FROM things d, unnest(string_to_array(d._id || ' urgent', ' ')) AS tag WHERE tag = 'urgent' ORDER BY d._id",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "rows": [
+        [
+          "0",
+          "urgent"
+        ],
+        [
+          "1",
+          "urgent"
+        ],
+        [
+          "2",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-cross-lateral",
+      "sql": "SELECT d._id, tag FROM things d CROSS JOIN LATERAL unnest(string_to_array(d._id || ' urgent', ' ')) AS tag WHERE tag = 'urgent' ORDER BY d._id",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "rows": [
+        [
+          "0",
+          "urgent"
+        ],
+        [
+          "1",
+          "urgent"
+        ],
+        [
+          "2",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-inner-lateral",
+      "sql": "SELECT d._id, tag FROM things d JOIN LATERAL unnest(string_to_array(d._id || ' urgent', ' ')) AS tag ON true WHERE tag = 'urgent' ORDER BY d._id",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "rows": [
+        [
+          "0",
+          "urgent"
+        ],
+        [
+          "1",
+          "urgent"
+        ],
+        [
+          "2",
+          "urgent"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-left-lateral",
+      "sql": "SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(CASE WHEN d._id = '1' THEN ARRAY[]::text[] ELSE ARRAY[NULL]::text[] END) WITH ORDINALITY t(v,n) ON true ORDER BY d._id",
+      "columns": [
+        "_id",
+        "v",
+        "n"
+      ],
+      "column_oids": [
+        25,
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "0",
+          null,
+          "1"
+        ],
+        [
+          "1",
+          null,
+          null
+        ],
+        [
+          "2",
+          null,
+          "1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true,
+          false
+        ],
+        [
+          false,
+          true,
+          true
+        ],
+        [
+          false,
+          true,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-stored",
+      "sql": "SELECT d._id, tag FROM things d, unnest(d.tags) AS tag ORDER BY d._id, tag NULLS FIRST",
+      "columns": [
+        "_id",
+        "tag"
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "rows": [
+        [
+          "0",
+          null
+        ],
+        [
+          "0",
+          "urgent"
+        ],
+        [
+          "0",
+          "vip"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "id": "unnest-stored-left",
+      "sql": "SELECT d._id, t.v, t.n FROM things d LEFT JOIN unnest(d.tags) WITH ORDINALITY t(v,n) ON true ORDER BY d._id, t.n",
+      "columns": [
+        "_id",
+        "v",
+        "n"
+      ],
+      "column_oids": [
+        25,
+        25,
+        20
+      ],
+      "rows": [
+        [
+          "0",
+          "urgent",
+          "1"
+        ],
+        [
+          "0",
+          null,
+          "2"
+        ],
+        [
+          "0",
+          "vip",
+          "3"
+        ],
+        [
+          "1",
+          null,
+          null
+        ],
+        [
+          "2",
+          null,
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          true,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          true,
+          true
+        ],
+        [
+          false,
+          true,
+          true
+        ]
+      ]
+    }
+  ]
+}

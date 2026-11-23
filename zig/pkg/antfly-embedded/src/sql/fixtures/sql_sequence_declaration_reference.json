@@ -1,0 +1,488 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "entries": [
+    {
+      "id": "sql-0311",
+      "profile": "absent",
+      "sql": "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)"
+      ],
+      "sqlstate": null,
+      "command_tag": "CREATE SEQUENCE",
+      "before": null,
+      "after": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 1,
+        "cache": 1,
+        "cycle": false,
+        "last_value": 1,
+        "is_called": false,
+        "owned_by": null
+      },
+      "object_identity_unchanged": false
+    },
+    {
+      "id": "sql-0311",
+      "profile": "existing_sequence",
+      "sql": "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE SEQUENCE usage_records_id_seq START 100 CACHE 4 OWNED BY usage_records.id",
+        "SELECT nextval('usage_records_id_seq')"
+      ],
+      "sqlstate": "42P07",
+      "command_tag": "ERROR",
+      "before": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "after": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0311",
+      "profile": "existing_table",
+      "sql": "CREATE SEQUENCE usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE TABLE usage_records_id_seq(id text PRIMARY KEY)",
+        "INSERT INTO usage_records_id_seq(id) VALUES ('keep')"
+      ],
+      "sqlstate": "42P07",
+      "command_tag": "ERROR",
+      "before": {
+        "kind": "table",
+        "rows": [
+          [
+            "keep"
+          ]
+        ]
+      },
+      "after": {
+        "kind": "table",
+        "rows": [
+          [
+            "keep"
+          ]
+        ]
+      },
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0312",
+      "profile": "absent",
+      "sql": "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)"
+      ],
+      "sqlstate": null,
+      "command_tag": "CREATE SEQUENCE",
+      "before": null,
+      "after": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 1,
+        "cache": 1,
+        "cycle": false,
+        "last_value": 1,
+        "is_called": false,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "object_identity_unchanged": false
+    },
+    {
+      "id": "sql-0313",
+      "profile": "absent",
+      "sql": "CREATE SEQUENCE IF NOT EXISTS usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 32 NO CYCLE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)"
+      ],
+      "sqlstate": null,
+      "command_tag": "CREATE SEQUENCE",
+      "before": null,
+      "after": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 1,
+        "cache": 32,
+        "cycle": false,
+        "last_value": 1,
+        "is_called": false,
+        "owned_by": null
+      },
+      "object_identity_unchanged": false
+    },
+    {
+      "id": "sql-0313",
+      "profile": "existing_sequence",
+      "sql": "CREATE SEQUENCE IF NOT EXISTS usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 32 NO CYCLE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE SEQUENCE usage_records_id_seq START 100 CACHE 4 OWNED BY usage_records.id",
+        "SELECT nextval('usage_records_id_seq')"
+      ],
+      "sqlstate": null,
+      "command_tag": "CREATE SEQUENCE",
+      "before": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "after": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0313",
+      "profile": "existing_table",
+      "sql": "CREATE SEQUENCE IF NOT EXISTS usage_records_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 32 NO CYCLE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE TABLE usage_records_id_seq(id text PRIMARY KEY)",
+        "INSERT INTO usage_records_id_seq(id) VALUES ('keep')"
+      ],
+      "sqlstate": null,
+      "command_tag": "CREATE SEQUENCE",
+      "before": {
+        "kind": "table",
+        "rows": [
+          [
+            "keep"
+          ]
+        ]
+      },
+      "after": {
+        "kind": "table",
+        "rows": [
+          [
+            "keep"
+          ]
+        ]
+      },
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0314",
+      "profile": "existing_sequence",
+      "sql": "ALTER SEQUENCE usage_records_id_seq RESTART WITH 1000",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE SEQUENCE usage_records_id_seq START 100 CACHE 4 OWNED BY usage_records.id",
+        "SELECT nextval('usage_records_id_seq')"
+      ],
+      "sqlstate": null,
+      "command_tag": "ALTER SEQUENCE",
+      "before": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "after": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 1000,
+        "is_called": false,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0315",
+      "profile": "existing_sequence",
+      "sql": "ALTER SEQUENCE IF EXISTS usage_records_id_seq AS integer OWNED BY NONE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE SEQUENCE usage_records_id_seq START 100 CACHE 4 OWNED BY usage_records.id",
+        "SELECT nextval('usage_records_id_seq')"
+      ],
+      "sqlstate": null,
+      "command_tag": "ALTER SEQUENCE",
+      "before": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "after": {
+        "kind": "sequence",
+        "integer": "int32",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 2147483647,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": null
+      },
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0316",
+      "profile": "existing_sequence",
+      "sql": "DROP SEQUENCE usage_records_id_seq",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE SEQUENCE usage_records_id_seq START 100 CACHE 4 OWNED BY usage_records.id",
+        "SELECT nextval('usage_records_id_seq')"
+      ],
+      "sqlstate": null,
+      "command_tag": "DROP SEQUENCE",
+      "before": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "after": null,
+      "object_identity_unchanged": false
+    },
+    {
+      "id": "sql-0316",
+      "profile": "absent",
+      "sql": "DROP SEQUENCE usage_records_id_seq",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)"
+      ],
+      "sqlstate": "42P01",
+      "command_tag": "ERROR",
+      "before": null,
+      "after": null,
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0316",
+      "profile": "existing_table",
+      "sql": "DROP SEQUENCE usage_records_id_seq",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE TABLE usage_records_id_seq(id text PRIMARY KEY)",
+        "INSERT INTO usage_records_id_seq(id) VALUES ('keep')"
+      ],
+      "sqlstate": "42809",
+      "command_tag": "ERROR",
+      "before": {
+        "kind": "table",
+        "rows": [
+          [
+            "keep"
+          ]
+        ]
+      },
+      "after": {
+        "kind": "table",
+        "rows": [
+          [
+            "keep"
+          ]
+        ]
+      },
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0317",
+      "profile": "existing_sequence",
+      "sql": "DROP SEQUENCE IF EXISTS usage_records_id_seq CASCADE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE SEQUENCE usage_records_id_seq START 100 CACHE 4 OWNED BY usage_records.id",
+        "SELECT nextval('usage_records_id_seq')"
+      ],
+      "sqlstate": null,
+      "command_tag": "DROP SEQUENCE",
+      "before": {
+        "kind": "sequence",
+        "integer": "int64",
+        "increment": 1,
+        "minimum": 1,
+        "maximum": 9223372036854775807,
+        "start": 100,
+        "cache": 4,
+        "cycle": false,
+        "last_value": 103,
+        "is_called": true,
+        "owned_by": {
+          "namespace": "public",
+          "table": "usage_records",
+          "column": "id"
+        }
+      },
+      "after": null,
+      "object_identity_unchanged": false
+    },
+    {
+      "id": "sql-0317",
+      "profile": "absent",
+      "sql": "DROP SEQUENCE IF EXISTS usage_records_id_seq CASCADE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)"
+      ],
+      "sqlstate": null,
+      "command_tag": "DROP SEQUENCE",
+      "before": null,
+      "after": null,
+      "object_identity_unchanged": true
+    },
+    {
+      "id": "sql-0317",
+      "profile": "existing_table",
+      "sql": "DROP SEQUENCE IF EXISTS usage_records_id_seq CASCADE",
+      "setup": [
+        "CREATE TABLE usage_records(id bigint PRIMARY KEY)",
+        "INSERT INTO usage_records(id) VALUES (1)",
+        "CREATE TABLE usage_records_id_seq(id text PRIMARY KEY)",
+        "INSERT INTO usage_records_id_seq(id) VALUES ('keep')"
+      ],
+      "sqlstate": "42809",
+      "command_tag": "ERROR",
+      "before": {
+        "kind": "table",
+        "rows": [
+          [
+            "keep"
+          ]
+        ]
+      },
+      "after": {
+        "kind": "table",
+        "rows": [
+          [
+            "keep"
+          ]
+        ]
+      },
+      "object_identity_unchanged": true
+    }
+  ]
+}

@@ -72,7 +72,7 @@ const native_catalog_backend = @import("../native_catalog_backend.zig");
 const roaring = @import("../../encoding/roaring.zig");
 const persistent_mod = @import("../persistent.zig");
 const projection_seal = @import("../projection_seal.zig");
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 const resolver_lib = @import("antfly_resolver");
 const resource_manager_mod = @import("../resource_manager.zig");
 const result_collectors = @import("result_collectors.zig");
@@ -5008,7 +5008,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
                 .algebraic => {
                     if (ctx.projection_only) return error.InvalidShadowIndexKind;
-                    try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, batch, .{ .mode = .bulk_ingest });
+                    // Journal replay carries logical keys, not inline JSON.
+                    // Resolve the profile-specific primary namespace and pin
+                    // the row's declared layout through the shared collector.
+                    // A missing live row must not advance the index checkpoint.
+                    var writes = try collectDocumentWritesProfiled(ctx.alloc, ctx.store, ctx.index_manager, batch.documents, ctx.index_manager.byte_range, .{
+                        .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
+                        .relational_base_rows = ctx.relational_base_rows,
+                    }, null);
+                    defer writes.deinit();
+                    if (writes.missing_required != 0) return error.ReplayDocumentNotVisible;
+                    const documents = try ctx.alloc.alloc(derived_types.DerivedDocument, writes.items.len);
+                    defer ctx.alloc.free(documents);
+                    for (writes.items, documents) |write, *document| document.* = .{ .key = write.key, .action = .upsert, .cleaned_value = write.value };
+                    var prepared = batch;
+                    prepared.documents = documents;
+                    try ctx.index_manager.applyAlgebraicBatchByNameWithOptions(ctx.store, index_ref.name, prepared, .{ .mode = .bulk_ingest });
                 },
             }
             if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);

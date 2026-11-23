@@ -98,13 +98,57 @@ const RowPlan = struct {
         const mapping = self.ordinals orelse return self.input.cell(names[ordinal]);
         const source = mapping[ordinal] orelse return .{};
         const result = try self.input.typed_cells.?.at(source);
+        result.validateTemporal() catch return error.InvalidRetainedReadPage;
         if ((!try self.present(names, ordinal) and !result.sql_null) or
-            (result.sql_null and (result.value != .null or result.array != null or result.numeric != null)) or
-            (result.array != null and (result.value != .null or result.numeric != null or result.patterns != null)) or
-            (result.numeric != null and (result.value != .null or result.patterns != null))) return error.InvalidRetainedReadPage;
+            result.patterns() != null or
+            (result.sql_null and (result.value != .null or result.array != null or result.numeric != null or result.extension != null)) or
+            (result.array != null and (result.value != .null or result.numeric != null or result.extension != null)) or
+            (result.numeric != null and (result.value != .null or result.extension != null))) return error.InvalidRetainedReadPage;
         return result;
     }
 };
+
+test "retained read page validates tagged cell extensions before serialization" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const layout = try catalog.Row.TypedLayout.init(arena.allocator(), &.{"v"});
+    const instant: sources.sql_temporal_value.Value = .{ .timestamp = .{ .micros = 42 } };
+    var cells = [_]Datum{Datum.typedTemporal(&instant)};
+    const row: View.Row = .{ .id = "row", .version = 1, .schema_version = 1, .value = .null, .typed_cells = .{ .layout = layout, .values = &cells } };
+    const plan: RowPlan = .{ .input = &row, .ordinals = &.{0} };
+    try std.testing.expectEqual(@as(i64, 42), (try plan.value(&.{"v"}, 0)).temporal().?.timestamp.micros);
+    var extension_bytes: [64]u8 align(16) = undefined;
+    for ([_]Datum{
+        .{ .extension = &instant },
+        .{ .extension_kind = .temporal },
+        .{ .extension_kind = .temporal, .extension = &instant, .sql_null = true },
+        .{ .extension_kind = .patterns, .extension = &extension_bytes, .sql_null = false },
+        .{ .extension_kind = .temporal, .extension = &instant, .sql_null = false, .value = .{ .integer = 1 } },
+        .{ .numeric = @ptrCast(&extension_bytes), .sql_null = false, .value = .{ .integer = 1 } },
+    }) |invalid| {
+        cells[0] = invalid;
+        try std.testing.expectError(error.InvalidRetainedReadPage, plan.value(&.{"v"}, 0));
+    }
+    cells[0] = Datum.typedTemporal(&instant);
+    const encoded = try encodeVersion(std.testing.allocator, 7, &.{row}, null, .v2);
+    defer std.testing.allocator.free(encoded);
+    var decoded = try decode(std.testing.allocator, encoded, 7, 1, 1);
+    defer decoded.deinit();
+    const restored = try decoded.rows[0].cell("v");
+    try std.testing.expect(!restored.sql_null);
+    try std.testing.expectEqual(@as(i64, 42), restored.temporal().?.timestamp.micros);
+    const ranges = sources.sql_range_value;
+    var context: ranges.Context = .{ .alloc = arena.allocator() };
+    const range = try ranges.parseLeaky(&context, .numrange, "[1.00,10.000)");
+    cells[0] = Datum.typedRange(&range);
+    const range_encoded = try encodeVersion(std.testing.allocator, 8, &.{row}, null, .v2);
+    defer std.testing.allocator.free(range_encoded);
+    var range_decoded = try decode(std.testing.allocator, range_encoded, 8, 1, 1);
+    defer range_decoded.deinit();
+    const range_restored = try range_decoded.rows[0].cell("v");
+    try std.testing.expect(!range_restored.sql_null);
+    try std.testing.expectEqualStrings("[1.00,10.000)", try ranges.formatLeaky(&context, range_restored.range().?.*));
+}
 
 fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_memory_budget, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {
     if (rows.len > 4096) return error.InvalidRetainedReadPage;
@@ -155,8 +199,11 @@ fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_me
         try blob(w, row.id);
         try w.writeInt(u64, row.version, .little);
         try w.writeInt(u32, row.schema_version, .little);
-        try w.writeByte(@intFromBool(row.expected_content_digest != null));
-        if (row.expected_content_digest) |digest| try w.writeAll(&digest);
+        if (row.stale_frozen_birth and (row.expected_content_digest != null or row.expected_mutation_revision != null)) return error.InvalidRetainedReadPage;
+        const digest_present: u8 = if (row.stale_frozen_birth) 3 else if (row.expected_mutation_revision != null) 2 else @intFromBool(row.expected_content_digest != null);
+        try w.writeByte(digest_present);
+        if (row.expected_content_digest) |digest| try w.writeAll(&digest) else if (digest_present == 2) return error.InvalidRetainedReadPage;
+        if (row.expected_mutation_revision) |revision| try w.writeInt(u64, revision, .little);
         if (row.document) |document| {
             const json = try std.json.Stringify.valueAlloc(a, document, .{});
             try blob(w, json);
@@ -293,10 +340,12 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
         if (try r.int(u32) != schema_version) return error.InvalidRetainedReadPage;
         const has_digest = try r.int(u8);
         const digest: ?[32]u8 = switch (has_digest) {
-            0 => null,
-            1 => (try r.take(32))[0..32].*,
+            0, 3 => null,
+            1, 2 => (try r.take(32))[0..32].*,
             else => return error.InvalidRetainedReadPage,
         };
+        const revision: ?u64 = if (has_digest == 2) try r.int(u64) else null;
+        if (revision == 0) return error.InvalidRetainedReadPage;
         const document = if (try r.optional()) |json| try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .allocate = .alloc_if_needed, .parse_numbers = false }) else null;
         const presence = try a.alloc(bool, width);
         for (presence) |*flag| flag.* = switch (try r.int(u8)) {
@@ -304,7 +353,7 @@ pub fn decode(alloc: A, bytes: []const u8, sequence: u64, schema_version: u32, l
             1 => true,
             else => return error.InvalidRetainedReadPage,
         };
-        row.* = .{ .id = id, .version = version, .schema_version = schema_version, .value = .null, .typed_cells = .{ .layout = layout, .presence = presence }, .expected_content_digest = digest, .document = document };
+        row.* = .{ .id = id, .version = version, .schema_version = schema_version, .value = .null, .typed_cells = .{ .layout = layout, .presence = presence }, .expected_content_digest = digest, .expected_mutation_revision = revision, .stale_frozen_birth = has_digest == 3, .document = document };
     }
     var cache_blocks: std.ArrayList(spill.ColumnarBlock) = .empty;
     errdefer for (cache_blocks.items) |block| block.deinit();

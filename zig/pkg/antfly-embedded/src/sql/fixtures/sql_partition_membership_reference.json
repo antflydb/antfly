@@ -1,0 +1,89 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL original partition membership",
+  "rejection": {
+    "id": "sql-0421",
+    "source_entry_sha256": "d5d9118d511db7513dba1654750af3e663ca6130cd515716ecd7d5618960db9a",
+    "sql": "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at)",
+    "sqlstate": "0A000",
+    "message": "unique constraint on partitioned table must include all partitioning columns"
+  },
+  "steps": [
+    {
+      "sql": "CREATE TABLE usage_events(tenant_id text,id uuid,created_at timestamptz,PRIMARY KEY(tenant_id,id,created_at)) PARTITION BY RANGE(created_at)",
+      "rows": null,
+      "command_tag": "CREATE TABLE"
+    },
+    {
+      "sql": "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+      "rows": null,
+      "command_tag": "CREATE TABLE",
+      "id": "sql-0422",
+      "source_entry_sha256": "a9b58748636fe9739da717c23a671baff0ebbebe07302a409bd700074d1422f3"
+    },
+    {
+      "sql": "INSERT INTO usage_events VALUES('tenant','00000000-0000-0000-0000-000000000001','2026-06-01')",
+      "rows": null,
+      "command_tag": "INSERT 0 1"
+    },
+    {
+      "sql": "SELECT count(*) FROM usage_events",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "command_tag": "SELECT 1"
+    },
+    {
+      "sql": "ALTER TABLE usage_events DETACH PARTITION usage_events_2026",
+      "rows": null,
+      "command_tag": "ALTER TABLE",
+      "id": "sql-0424",
+      "source_entry_sha256": "f6b4cf503f064d9358c19e302c6c452591bf52da0956ffe51ececf40b3f10832"
+    },
+    {
+      "sql": "SELECT count(*) FROM usage_events",
+      "rows": [
+        [
+          0
+        ]
+      ],
+      "command_tag": "SELECT 1"
+    },
+    {
+      "sql": "SELECT count(*) FROM usage_events_2026",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "command_tag": "SELECT 1"
+    },
+    {
+      "sql": "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+      "rows": null,
+      "command_tag": "ALTER TABLE",
+      "id": "sql-0423",
+      "source_entry_sha256": "bb211230e32ed1c7188f148b74fefd39420885686a8b8ff0460b7440f0f6e5e1"
+    },
+    {
+      "sql": "SELECT count(*) FROM usage_events",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "command_tag": "SELECT 1"
+    },
+    {
+      "sql": "SELECT count(*) FROM usage_events_2026",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "command_tag": "SELECT 1"
+    }
+  ]
+}

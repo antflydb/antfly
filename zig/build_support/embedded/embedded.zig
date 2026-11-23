@@ -279,7 +279,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_inference_mod,
         "antfly-inference-core",
-        shared_library.nativeInferenceCompileMaxRss(b.graph.host.result, target.result, optimize, inference_compile_rss),
+        // Darwin -> Linux ARM64 Debug peaked at 13.02 GB.
+        if (b.graph.host.result.os.tag == .macos and target.result.os.tag == .linux and
+            target.result.cpu.arch == .aarch64 and optimize == .debug)
+            14 * 1024 * 1024 * 1024
+        else
+            shared_library.nativeInferenceCompileMaxRss(b.graph.host.result, target.result, optimize, inference_compile_rss),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -646,7 +651,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .root_module = capi_root_mod,
         // Keep this consumer's measured native floor separate from its
         // implementation partition; retain authored claims on other profiles.
-        .max_rss = @import("../../pkg/antfly/build/runtime_memory.zig").testCompileMaxRss(@import("../../pkg/antfly/build/test_owner_names.zig").capi_contract, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
+        .max_rss = @import("../../pkg/antfly/build/runtime_memory.zig").testCompileMaxRss(@import("../../pkg/antfly/build/test_owner_names.zig").capi_contract, b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos and optimize == .debug) 20 else if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024),
         .filters = selectTestFilters(b, &capi_compile_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -679,6 +684,18 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     run_capi_models.addArg("--require-no-skips");
     b.step("capi-local-model-test", "Qualify embedded inference with installed embedding, reranking and generation models")
         .dependOn(&run_capi_models.step);
+    if (options.server_integration_tests) {
+        const native_index_owner_tests = b.addTest(.{
+            .root_module = capi_root_mod,
+            .filters = &.{ "storage owner native index", "storage owner Raft index", "storage owner runtime status" },
+            .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        });
+        const index_owner_run = addFilteredTestRunArtifact(b, native_index_owner_tests);
+        b.step("native-index-owner-capi-test", "Verify private native index controls and Raft owner observations through the C ABI")
+            .dependOn(&index_owner_run.step);
+        b.step("index-owner-capi-test", "Verify authority-specific index owner contracts through the C ABI")
+            .dependOn(&index_owner_run.step);
+    }
     const maintenance_activity_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/capi/maintenance_activity.zig"),
         .target = target,

@@ -22,7 +22,7 @@ const Json = std.json.Value;
 /// PostgreSQL ignores SQL NULL search elements, flattens all array dimensions,
 /// and treats the empty search set as false for ANY and true for ALL. Reuse
 /// prepared typed cells directly: no JSON serialization or per-row key copies.
-pub fn existsKeys(value: Json, keys: @import("array_value.zig").Value, all: bool, work: *order.Budget) !bool {
+pub fn existsKeys(value: Json, keys: @import("array/value.zig").Value, all: bool, work: *order.Budget) !bool {
     if (keys.element_type != .text) return error.SqlTypeMismatch;
     for (0..keys.cardinality()) |array_cell_0| {
         const key = keys.flatCell(array_cell_0);

@@ -599,7 +599,7 @@ test "SQL no-I/O blocking cursors preserve arrays bound memory and unwind alloca
     const Scenario = struct {
         fn run(a: std.mem.Allocator) !void {
             const Datum = @import("scalar.zig").Datum;
-            var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+            var array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
             const cursor = try Cursor.createMemory(a, 1, 64 * 1024);
             defer cursor.close();
             try Cursor.append(cursor, &.{Datum.typedArray(&array)});
@@ -623,7 +623,7 @@ test "SQL sealed typed captures replay independent borrowed passes without a sec
         fn checkpoint(_: *anyopaque) !void {}
         fn run(a: std.mem.Allocator, disk: bool) !void {
             const Datum = @import("scalar.zig").Datum;
-            const arrays = @import("array_value.zig");
+            const arrays = @import("array/value.zig");
             var token: u8 = 0;
             var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &token, .checkpoint = checkpoint, .compression = .none };
             defer manager.deinit();
@@ -702,7 +702,7 @@ test "SQL replay freezes resident sorted owners and seals external sort windows 
                 const count: usize = if (disk) 256 else 8;
                 var top = try operators.TopK.initWithSpill(a, count, &.{.{ .descending = true }}, if (disk) 16 * 1024 else 64 * 1024, if (disk) &manager else null);
                 defer top.deinit();
-                var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+                var array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
                 for (0..count) |ordinal| {
                     const id = Datum.json(.{ .integer = @intCast(ordinal) });
                     try top.add(.{ .values = &.{ id, Datum.typedArray(&array) }, .keys = &.{id}, .ordinal = ordinal });
@@ -766,7 +766,7 @@ test "SQL forward borrowed sorted rows allocate nothing and retire before the ne
     defer cursor.close();
     var top = try @import("operators.zig").TopK.init(a, 4, &.{.{}}, 64 * 1024);
     defer top.deinit();
-    var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+    var array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
     for (0..4) |ordinal| try top.add(.{ .values = &.{Datum.typedArray(&array)}, .keys = &.{Datum.json(.{ .integer = @intCast(ordinal) })}, .ordinal = ordinal });
     try Cursor.takeSorted(cursor, &top, 1, 3, false);
     try std.testing.expectEqual(@as(usize, 1), cursor.sorted.?.released);
@@ -819,7 +819,7 @@ test "SQL array replay and no-I/O leases coexist without retiring borrowed sort 
     const Scenario = struct {
         fn run(a: std.mem.Allocator, sorted: bool) !void {
             const Datum = @import("scalar.zig").Datum;
-            var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+            var array = try @import("array/value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
             const cursor = try Cursor.createMemory(a, 1, 64 * 1024);
             var owned = true;
             defer if (owned) cursor.close();

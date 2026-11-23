@@ -1,0 +1,660 @@
+{
+  "format": 1,
+  "cases": [
+    {
+      "id": "sql-0342",
+      "sql": "CREATE ROLE app_writer",
+      "command_tag": "CREATE ROLE",
+      "postimage": {
+        "memberships": [],
+        "table_grants": [],
+        "defaults": [],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0332",
+      "sql": "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer",
+      "command_tag": "GRANT",
+      "postimage": {
+        "memberships": [],
+        "table_grants": [
+          [
+            "app_writer",
+            "INSERT",
+            false
+          ],
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0333",
+      "sql": "REVOKE INSERT ON TABLE usage_records FROM app_writer",
+      "command_tag": "REVOKE",
+      "postimage": {
+        "memberships": [],
+        "table_grants": [
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0334",
+      "sql": "GRANT readonly, reporting TO app_reader, app_writer",
+      "command_tag": "GRANT ROLE",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            false,
+            true,
+            true
+          ],
+          [
+            "readonly",
+            "app_writer",
+            false,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            false,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            false,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0335",
+      "sql": "GRANT readonly, reporting TO app_reader, app_writer WITH ADMIN OPTION",
+      "command_tag": "GRANT ROLE",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "readonly",
+            "app_writer",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0336",
+      "sql": "REVOKE readonly FROM app_writer",
+      "command_tag": "REVOKE ROLE",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0337",
+      "sql": "REVOKE ADMIN OPTION FOR readonly FROM app_writer CASCADE",
+      "command_tag": "REVOKE ROLE",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0338",
+      "sql": "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO readonly, app_writer WITH GRANT OPTION",
+      "command_tag": "ALTER DEFAULT PRIVILEGES",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "INSERT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "SELECT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "INSERT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "SELECT",
+            true
+          ]
+        ],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0339",
+      "sql": "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public REVOKE GRANT OPTION FOR INSERT ON TABLES FROM readonly CASCADE",
+      "command_tag": "ALTER DEFAULT PRIVILEGES",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "INSERT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "SELECT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "INSERT",
+            false
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "SELECT",
+            true
+          ]
+        ],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0340",
+      "sql": "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer",
+      "command_tag": "GRANT",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [
+          [
+            "app_writer",
+            "SELECT",
+            false
+          ]
+        ],
+        "defaults": [
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "INSERT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "SELECT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "INSERT",
+            false
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "SELECT",
+            true
+          ]
+        ],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0341",
+      "sql": "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer",
+      "command_tag": "REVOKE",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [],
+        "defaults": [
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "INSERT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "SELECT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "INSERT",
+            false
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "SELECT",
+            true
+          ]
+        ],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0350",
+      "sql": "DROP ROLE app_writer",
+      "sqlstate": "2BP01",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_writer",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [],
+        "defaults": [
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "INSERT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "app_writer",
+            "SELECT",
+            true
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "INSERT",
+            false
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "SELECT",
+            true
+          ]
+        ],
+        "writer_exists": true
+      }
+    },
+    {
+      "id": "sql-0350",
+      "sql": "DROP ROLE app_writer",
+      "command_tag": "DROP ROLE",
+      "postimage": {
+        "memberships": [
+          [
+            "readonly",
+            "app_reader",
+            true,
+            true,
+            true
+          ],
+          [
+            "reporting",
+            "app_reader",
+            true,
+            true,
+            true
+          ]
+        ],
+        "table_grants": [],
+        "defaults": [
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "INSERT",
+            false
+          ],
+          [
+            "app_owner",
+            "public",
+            "readonly",
+            "SELECT",
+            true
+          ]
+        ],
+        "writer_exists": false
+      }
+    }
+  ],
+  "identity_defaults": {
+    "insert": {
+      "tag": "INSERT 0 1",
+      "sqlstate": null
+    },
+    "update": {
+      "tag": "UPDATE 1",
+      "sqlstate": null
+    },
+    "after_update_ids": [
+      2
+    ],
+    "after_update_counter": 2,
+    "explicit_sequence": {
+      "tag": null,
+      "sqlstate": "42501"
+    },
+    "read": {
+      "tag": null,
+      "sqlstate": "42501"
+    },
+    "rls_denied_insert": {
+      "tag": null,
+      "sqlstate": "42501"
+    },
+    "rls_insert": {
+      "tag": "INSERT 0 1",
+      "sqlstate": null
+    },
+    "revoked_insert": {
+      "tag": null,
+      "sqlstate": "42501"
+    },
+    "revoked_update": {
+      "tag": null,
+      "sqlstate": "42501"
+    },
+    "before_restart_ids": [
+      2,
+      4
+    ],
+    "before_restart_counter": 4,
+    "recovered_counter": 4,
+    "cold_insert": {
+      "tag": "INSERT 0 1",
+      "sqlstate": null
+    },
+    "after_restart_ids": [
+      2,
+      4,
+      5
+    ],
+    "explicit_sequence_after_restart": {
+      "tag": null,
+      "sqlstate": "42501"
+    },
+    "membership_revoked_insert": {
+      "tag": null,
+      "sqlstate": "42501"
+    },
+    "membership_revoked_update": {
+      "tag": null,
+      "sqlstate": "42501"
+    },
+    "after_restart_counter": 5
+  }
+}

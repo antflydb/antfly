@@ -16,7 +16,7 @@
 //! Owned PostgreSQL string_to_array with linear-time, budgeted delimiter
 //! matching. Two passes allocate the exact flat shape and owned token strings.
 const std = @import("std");
-const arrays = @import("array_value.zig");
+const arrays = @import("array/value.zig");
 const A = std.mem.Allocator;
 
 fn writeJoined(a: A, value: *const arrays.Value, delimiter: []const u8, null_text: ?[]const u8, writer: *std.Io.Writer, byte_limit: usize, work: *arrays.Budget) !void {
@@ -54,7 +54,7 @@ fn writeJoined(a: A, value: *const arrays.Value, delimiter: []const u8, null_tex
             },
             .jsonb => try @import("jsonb_text.zig").write(a, cell.value, writer, byte_limit, work, 0),
             .numeric => {
-                const numeric = @import("numeric_value.zig");
+                const numeric = @import("numeric/value.zig");
                 var context: numeric.Context = .{ .alloc = a, .remaining = work.remaining, .max_output_bytes = byte_limit };
                 // Numeric work only decreases the initial usize budget. The
                 // context uses u64 on every target, including wasm32.

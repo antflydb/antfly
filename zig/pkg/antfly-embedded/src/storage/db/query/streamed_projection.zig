@@ -23,8 +23,8 @@ const native_writer = @import("../../native_writer.zig");
 test "public graph metric borrowed wire owner COUNT validates borrowed residual byte comparisons" {
     const a = std.testing.allocator;
     const schema = @import("../../schema.zig");
-    const predicates = @import("../relational_predicate.zig");
-    const KeyValue = @import("../relational_index_keys.zig").Value;
+    const predicates = @import("../relational/indexes/predicate.zig");
+    const KeyValue = @import("../relational/indexes/keys.zig").Value;
     const Op = @import("../../relational_index.zig").RelationalCheckOp;
     const samples = [_]?[]const u8{ null, "", "a", "A", "a\x00", "\x00a", "aa", "ab", "é" };
     for ([_]schema.RelationalColumnType{ .string, .blob }) |kind| {

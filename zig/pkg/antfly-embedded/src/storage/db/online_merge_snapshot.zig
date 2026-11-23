@@ -324,7 +324,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
             continue;
         }
         const key_len = try number(u32, &reader, position.object, position.offset);
-        const contract = @import("relational_integrity_contract.zig");
+        const contract = @import("relational/integrity/contract.zig");
         if (key_len != contract.key_len and key_len != contract.key_len + 32) return error.SourceSnapshotCorrupt;
         const key_offset = try std.math.add(u64, position.offset, 4);
         const length_offset = try std.math.add(u64, key_offset, key_len);
@@ -422,7 +422,7 @@ pub fn executeJson(db: *DB, alloc: Allocator, scope: source.Scope, receipt: page
             break :signed source_bytes;
         } else null;
         const value = if (flags == codec.doc_value_flag_relational_row) decoded: {
-            const version = try @import("relational_store.zig").rowSchemaVersion(raw);
+            const version = try @import("relational/rows/store.zig").rowSchemaVersion(raw);
             var view = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
             defer view.release();
             const row = try @import("algebraic/relational_row_codec.zig").ordinalRowViewSelective(raw, view.tableSchema().*, view.physicalLayout());

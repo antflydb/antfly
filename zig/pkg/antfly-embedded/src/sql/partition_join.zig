@@ -70,8 +70,8 @@ pub const Join = struct {
     probe_cost: [16]usize = @splat(0),
     outer_left: bool,
     outer_right: bool,
-    build: [16]?spill.Sequential = @splat(null),
-    probes: [16]?spill.Sequential = @splat(null),
+    build: []?spill.Sequential,
+    probes: []?spill.Sequential,
     partition: usize = 0,
     active: ?Task = null,
     pending: [8]Task = undefined,
@@ -187,8 +187,8 @@ pub const Join = struct {
     }
     fn finishInputs(self: *Join) !void {
         if (self.finished) return;
-        for (&self.build) |*file| if (file.*) |*open| try open.seal();
-        for (&self.probes) |*file| if (file.*) |*open| try open.seal();
+        for (self.build) |*file| if (file.*) |*open| try open.seal();
+        for (self.probes) |*file| if (file.*) |*open| try open.seal();
         if (self.parallel_builds) {
             var useful: usize = 0;
             var largest: usize = 0;
@@ -217,8 +217,6 @@ pub const Join = struct {
                 self.partition += 1;
                 const child = try Join.createWithLanes(self.manager, self.limits.bytes, self.limits.rows, 0, self.outer_left, self.outer_right, 1, true);
                 child.evaluation = self.evaluation;
-                child.partitions = 0;
-                child.finished = true;
                 child.active = .{ .build = self.build[index], .probes = self.probes[index], .used_bits = self.partitions - 1, .hashes = self.build_hashes[index] };
                 self.build[index] = null;
                 self.probes[index] = null;
@@ -314,14 +312,22 @@ pub const Join = struct {
         const a = manager.allocator();
         const self = try a.create(Join);
         errdefer a.destroy(self);
-        const filter = try a.alloc(u64, @max(16, @min(8192, bytes / 128)));
-        @memset(filter, 0);
         const target = @max(@as(usize, 1), bytes / 16);
         const wanted = @min(@as(u64, 16), @max(@as(u64, 2), build_bytes / target + 1));
-        const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
+        const partitions = if (assigned) 0 else std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
+        // A worker that receives an existing partition starts directly in
+        // reduction. Only the ingestion owner needs partition slots or a filter.
+        const build = try a.alloc(?spill.Sequential, partitions);
+        errdefer a.free(build);
+        const probes = try a.alloc(?spill.Sequential, partitions);
+        errdefer a.free(probes);
+        const filter = try a.alloc(u64, if (assigned) 0 else @max(16, @min(8192, bytes / 128)));
+        @memset(build, null);
+        @memset(probes, null);
+        @memset(filter, 0);
         const lanes = requested_lanes orelse @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
         const parallel = !assigned and bytes >= 512 * 1024 and lanes >= 2;
-        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (parallel) bytes / (lanes + 1) else bytes), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .scratch = .init(a), .candidate = .init(a), .residual_scratch = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = parallel };
+        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (parallel) bytes / (lanes + 1) else bytes), .rows = rows, .spill = manager }, .partitions = partitions, .build = build, .probes = probes, .finished = assigned, .outer_left = outer_left, .outer_right = outer_right, .scratch = .init(a), .candidate = .init(a), .residual_scratch = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = parallel };
         return self;
     }
     pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {
@@ -385,6 +391,8 @@ pub const Join = struct {
         self.residual_scratch.deinit();
         self.output_arena.deinit();
         self.a.free(self.filter);
+        self.a.free(self.probes);
+        self.a.free(self.build);
         self.a.destroy(self);
     }
     fn releaseNativeDiskLeases(self: *Join) void {
@@ -403,7 +411,7 @@ pub const Join = struct {
         if (self.hash) |hash| hash.deinit();
         self.hash = null;
         self.probe = null;
-        for (&self.build, &self.probes) |*build, *probe| {
+        for (self.build, self.probes) |*build, *probe| {
             if (build.*) |*file| file.close();
             if (probe.*) |*file| file.close();
             build.* = null;
@@ -493,7 +501,7 @@ pub const Join = struct {
                 var offset: u64 = 0;
                 while (offset < file.size) {
                     try self.manager.check();
-                    _ = self.scratch.reset(.free_all);
+                    _ = self.scratch.reset(.{ .retain_with_limit = @min(8192, self.workspace_bytes / 16) });
                     var input = try file.readInputBlockBorrowed(offset);
                     defer input.deinit();
                     const block = input.view();
@@ -580,34 +588,40 @@ pub const Join = struct {
             if (self.active.?.build) |*file| {
                 var offset: u64 = 0;
                 while (offset < file.size) {
-                    var input = try file.readInputBlock(offset);
-                    defer input.deinit();
-                    const block = input.view();
-                    _ = self.scratch.reset(.retain_capacity);
-                    const a = self.scratch.allocator();
-                    const values = try block.batch(a, false);
-                    var keys: [256][]const Datum = undefined;
-                    const key_cells = try a.alloc(Datum, block.count() * block.keyWidth());
-                    for (keys[0..block.count()], 0..) |*key, index| {
-                        const row = key_cells[index * block.keyWidth() ..][0..block.keyWidth()];
-                        for (row, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
-                        key.* = row;
-                    }
-                    const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
-                    offset += consumed;
-                    if (consumed == block.count()) continue;
+                    const full = blk: {
+                        // Retire this source lease before repartition closes
+                        // the parent file and opens destination files.
+                        var input = try file.readInputBlock(offset);
+                        defer input.deinit();
+                        const block = input.view();
+                        _ = self.scratch.reset(.retain_capacity);
+                        const a = self.scratch.allocator();
+                        const values = try block.batch(a, false);
+                        var keys: [256][]const Datum = undefined;
+                        const key_cells = try a.alloc(Datum, block.count() * block.keyWidth());
+                        for (keys[0..block.count()], 0..) |*key, index| {
+                            const row = key_cells[index * block.keyWidth() ..][0..block.keyWidth()];
+                            for (row, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
+                            key.* = row;
+                        }
+                        const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
+                        offset += consumed;
+                        break :blk consumed != block.count();
+                    };
+                    if (!full) continue;
+                    // The failed hash build has no published output. Release
+                    // it before allocating repartition buffers; retaining it
+                    // would spend the shared statement budget twice.
+                    self.hash.?.deinit();
+                    self.hash = null;
                     // Exact ingestion summaries include unread blocks. Do
                     // not decode/replay payloads merely to choose a split bit.
                     if (try self.split(self.active.?.hashes.differences())) {
-                        self.hash.?.deinit();
-                        self.hash = null;
                         repartitioned = true;
                         break;
                     }
                     // No useful hash split remains. Keep the typed partition
                     // and replay it per probe block, not per probe row.
-                    self.hash.?.deinit();
-                    self.hash = null;
                     try self.compactSkewInput(file);
                     if (self.active.?.probes) |*probes| try self.compactSkewInput(probes);
                     self.skew = try @import("skew_join.zig").Join.create(self.manager, self.outer_left, self.outer_right);
@@ -1136,12 +1150,19 @@ test "SQL partitioned join runtime filter preserves null and skew semantics" {
 
 test "SQL partitioned join recursively splits underestimated builds within file and memory quotas" {
     const Hook = struct {
-        fn check(_: *anyopaque) !void {}
+        checks: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            // A work bound catches repeated repartition/replay without a
+            // scheduler-dependent wall-clock timeout or smaller stress input.
+            if (self.checks > 100000) return error.UnexpectedJoinWorkAmplification;
+        }
     };
     var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 256 * 1024 };
     const a = budget.allocator();
-    var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var hook: Hook = .{};
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &hook, .checkpoint = Hook.check };
     defer manager.deinit();
     {
         // Deliberately underestimate bytes: two initial partitions cannot fit.
@@ -1176,6 +1197,7 @@ test "SQL partitioned join recursively splits underestimated builds within file 
         try std.testing.expectEqual(@as(usize, 951), rights);
         try std.testing.expect(join.repartitions > 0);
         try std.testing.expect(join.partitions_loaded > 2);
+        std.debug.print("PARTITION_UNDERESTIMATE rows=1100 matches={} repartitions={} loaded={} checks={} peak_bytes={}\n", .{ matches, join.repartitions, join.partitions_loaded, hook.checks, budget.peak });
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     try std.testing.expectEqual(@as(usize, 0), manager.files);
@@ -1207,7 +1229,7 @@ test "SQL complete parallel join partitions evaluate residuals and preserve both
                 const key = Datum.json(.{ .integer = @intCast(i) });
                 try join.add(false, &.{key}, &.{key}, i);
             }
-            for (&join.build, &join.probes) |*build, *probe| {
+            for (join.build, join.probes) |*build, *probe| {
                 if (build.*) |*file| try file.seal();
                 if (probe.*) |*file| try file.seal();
             }
@@ -1318,19 +1340,24 @@ test "SQL partition join child keeps its assigned workspace and prioritizes larg
     defer child.close();
     try std.testing.expectEqual(@as(usize, 1024 * 1024), child.limits.bytes);
     try std.testing.expect(!child.parallel_builds);
-    child.build[0] = try spill.Sequential.init(&manager, 128);
-    child.build[1] = try spill.Sequential.init(&manager, 128);
-    child.build_cost[0] = 100;
-    child.build_cost[1] = 200;
-    try std.testing.expectEqual(@as(?usize, 1), child.largestPartition());
-    child.probe_cost[0] = 1000;
-    try std.testing.expectEqual(@as(?usize, 0), child.largestPartition());
-    child.parallel_builds = true;
-    child.build_lanes = 8;
-    child.build_cost[1] = 700 * 1024;
-    try child.finishInputs();
-    try std.testing.expect(!child.parallel_builds);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), child.limits.bytes);
+    try std.testing.expectEqual(@as(usize, 0), child.build.len);
+    try std.testing.expectEqual(@as(usize, 0), child.probes.len);
+
+    const owner = try Join.createWithLanes(&manager, 1024 * 1024, 10000, 0, false, false, 1, false);
+    defer owner.close();
+    owner.build[0] = try spill.Sequential.init(&manager, 128);
+    owner.build[1] = try spill.Sequential.init(&manager, 128);
+    owner.build_cost[0] = 100;
+    owner.build_cost[1] = 200;
+    try std.testing.expectEqual(@as(?usize, 1), owner.largestPartition());
+    owner.probe_cost[0] = 1000;
+    try std.testing.expectEqual(@as(?usize, 0), owner.largestPartition());
+    owner.parallel_builds = true;
+    owner.build_lanes = 8;
+    owner.build_cost[1] = 700 * 1024;
+    try owner.finishInputs();
+    try std.testing.expect(!owner.parallel_builds);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), owner.limits.bytes);
 }
 
 test "SQL compact probe blocks retain rows through duplicate matches and early close" {
@@ -1569,8 +1596,6 @@ test "SQL native partition batches preserve frozen outer rows residuals and reta
                 try join.finishInputs();
                 const child = try Join.createWithLanes(&manager, join.limits.bytes, join.limits.rows, 0, true, true, 1, true);
                 child.evaluation = join.evaluation;
-                child.partitions = 0;
-                child.finished = true;
                 child.active = .{ .build = join.build[0], .probes = join.probes[0], .used_bits = join.partitions - 1, .hashes = join.build_hashes[0] };
                 join.build[0] = null;
                 join.probes[0] = null;

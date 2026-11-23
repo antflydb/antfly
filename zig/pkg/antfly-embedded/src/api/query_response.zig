@@ -59,6 +59,14 @@ pub const Delivery = struct {
         ptr: *anyopaque,
         consume: *const fn (*anyopaque, ResultView) anyerror!void,
     } = null,
+    /// Internal synchronous graph relation handoff. This preserves native
+    /// per-binding depth/distance without expanding the public graph schema.
+    /// The receiver must copy values before returning; the graph snapshot and
+    /// authorization lease remain owned by the producer throughout the call.
+    native_graph_result: ?struct {
+        ptr: *anyopaque,
+        consume: *const fn (*anyopaque, []const @import("../storage/db/types.zig").GraphSearchResult) anyerror!void,
+    } = null,
     start_fn: *const fn (*anyopaque, usize) anyerror!void,
     write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
     max_bytes: usize = std.math.maxInt(usize),
@@ -74,6 +82,16 @@ pub const Delivery = struct {
         load: *const fn (*anyopaque, std.mem.Allocator, []@import("../storage/db/types.zig").SearchHit) anyerror!void,
         release: *const fn (*anyopaque, []@import("../storage/db/types.zig").SearchHit) void,
     } = null,
+    /// Public typed rows do not attest graph enumeration or retained query
+    /// continuation. A native graph consumer instead receives the complete
+    /// engine relation and validates truncation before publishing SQL rows.
+    pub fn forQuery(requested: ?Delivery, has_retained_cut: bool, has_graph: bool) ?Delivery {
+        const sink = requested orelse return null;
+        if (has_graph and sink.native_graph_result != null) return sink;
+        if (has_retained_cut or has_graph) return null;
+        return sink;
+    }
+
     pub const Writer = struct {
         sink: Delivery,
         buffer: [16 * 1024]u8 = undefined,

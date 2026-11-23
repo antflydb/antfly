@@ -20,6 +20,7 @@ pub const vector_migration = @import("antfly_local_sources").common_vector_migra
 pub const table_storage = @import("antfly_local_sources").common_table_storage;
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
+pub const sql_preparation_authority_config = @import("antfly_local_sources").common_sql_preparation_authority_config;
 pub const secrets = @import("antfly_local_sources").common_secrets;
 pub const secret_contract = @import("antfly_local_sources").common_secret_contract;
 pub const secret_record = @import("antfly_local_sources").common_secret_record;
