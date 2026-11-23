@@ -13763,6 +13763,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const written: bool = switch (descriptor.operation) {
             .paged_attention => return false,
             .dense_attention_rows, .dense_attention_prefix => blk: {
+                const scope = attention_geometry.?.kind == .causal and self.beginActivePlannedComputeScopeIfPossible(.attention, .tail);
+                defer self.endActivePlannedComputeScope(scope);
                 try metal_runtime.decoderRuntimeDenseAttentionInto(
                     self.provider_impl.raw_decode_runtime.?,
                     attention_geometry.?,

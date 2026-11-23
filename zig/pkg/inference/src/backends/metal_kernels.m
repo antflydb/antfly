@@ -36851,7 +36851,21 @@ static int antfly_metal_apply_attention_f32_device(
             !termite_metal_concurrent_planned_dispatch_enabled(runtime) &&
             termite_metal_qwen_short_rows_enabled(runtime) &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_QWEN3_SMALL_ENCODER"));
-        id<MTLComputeCommandEncoder> encoder = short_embedding_encoder
+        const BOOL reuse_planned_encoder = planned && runtime->active_planned_compute_encoder != nil &&
+            runtime->active_frame_cb == command_buffer && !has_bias_input && !has_mask_input;
+        if (reuse_planned_encoder) {
+            termite_metal_planned_encoder_range accesses[5];
+            size_t access_count = 4;
+            if (termite_metal_planned_range_make(q_buffer, q_offset, q_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -12) != 0 ||
+                termite_metal_planned_range_make(k_buffer, k_offset, kv_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -12) != 0 ||
+                termite_metal_planned_range_make(v_buffer, v_offset, kv_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -12) != 0 ||
+                termite_metal_planned_range_make(output_buffer, output_offset, q_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -12) != 0) return -12;
+            if (workspace_bytes != 0 &&
+                termite_metal_planned_range_make(stage_k, workspace_offset, workspace_bytes,
+                    TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[access_count++], -12) != 0) return -12;
+            if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, access_count, -12) != 0) return -12;
+        }
+        id<MTLComputeCommandEncoder> encoder = (reuse_planned_encoder || short_embedding_encoder)
             ? termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned)
             : termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
         if (encoder == nil) return -12;
