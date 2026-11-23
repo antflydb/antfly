@@ -2567,9 +2567,12 @@ pub const Frame = struct {
             // pin, rather than allocating/refcounting it on every warm call.
             const functions = cb.vtable.kernels.?;
             const cache_view = self.pool.payload_coverage == .complete and
-                (cb.kind() == .native or (self.prepared_program and cb.kind() == .cuda)) and
+                (cb.kind() == .native or (self.prepared_program and (cb.kind() == .cuda or cb.kind() == .metal))) and
                 functions.hostInputViewExclusive != null and functions.accepts(cb.vtable);
-            const value = if (resource.private_view) |view| view else create: {
+            const value = if (resource.private_view) |view| reused: {
+                if (cb.kind() == .metal and !functions.hostInputViewExclusive.?(cb.ptr, view)) return error.InvalidHostIngressBinding;
+                break :reused view;
+            } else create: {
                 const view = try self.viewForShape(cb, lease, plan.shape);
                 if (cache_view) resource.private_view = view;
                 break :create view;

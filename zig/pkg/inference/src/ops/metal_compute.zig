@@ -11840,6 +11840,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         lease.invalidateHostIndices();
         try physical.uploadBytes(values);
     }
+    fn hostInputViewExclusiveOp(ctx: *anyopaque, value: CT) bool {
+        const buffer = toBuf(value);
+        const tensor = buffer.metal_tensor orelse return false;
+        const device = tensor.device orelse return false;
+        const lease = tensor.physicalLease() orelse return false;
+        if (buffer.resident_owner != ctx or lease.backend.ptr != ctx or !acceptsPhysicalImplementation(lease.backend.vtable) or
+            lease.usage != .host_input or tensor.isReadOnlyPhysical() or hasHostView(buffer) or
+            device.ref.released or device.ref.ref_count.load(.acquire) != 1 or device.ref.release_on_drop) return false;
+        const base = toBuf(lease.tensor).metal_tensor orelse return false;
+        return tensor.deviceHandle() == base.deviceHandle() and tensor.deviceByteOffset() == base.deviceByteOffset() and
+            tensor.deviceByteLen() <= base.deviceByteLen() and metal_runtime.antfly_metal_buffer_is_shared(tensor.deviceHandle());
+    }
+
     fn createHostInputOp(ctx: *anyopaque, request: @import("../execution/host_ingress.zig").Create) anyerror!?@import("../execution/host_ingress.zig").Upload {
         if (request.implementation.context != ctx or !acceptsPhysicalImplementation(request.implementation.table) or request.borrowed) return error.InvalidHostIngressBinding;
         const expected = (try hostInputRequirementsOp(ctx, request.slot.logical)) orelse return error.PreparedHostIngressBindingChanged;
@@ -41207,7 +41220,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return (descriptor.operation == .slice or descriptor.operation == .broadcast) and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .hostInputViewExclusive = hostInputViewExclusiveOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -58877,6 +58890,14 @@ test "Metal owned shared ingress requires actual managed authority and refuses p
     try bank.bindAllocationSlot(0, 7, 16);
     const view = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = bank, .shape = &.{4} })) orelse return error.MissingPhysicalView;
     defer cb.free(view);
+    const exclusive = cb.vtable.kernels.?.hostInputViewExclusive.?;
+    try std.testing.expect(exclusive(cb.ptr, view));
+    {
+        var retained = try MetalCompute.toBuf(view).metal_tensor.?.retainedCopy();
+        defer retained.deinit();
+        try std.testing.expect(!exclusive(cb.ptr, view));
+    }
+    try std.testing.expect(exclusive(cb.ptr, view));
     const values = [_]f32{ -1, 2, -3, 4 };
     const assigned = @import("../execution/kernel_route.zig").AssignedOutput{ .slot = slot, .region = try bank.writableRegion(0, 7, 16) };
     const before = metal_tensor_mod.memoryStatsSnapshot();
@@ -58895,6 +58916,7 @@ test "Metal owned shared ingress requires actual managed authority and refuses p
     try ordinary.bindAllocationSlot(0, 7, 16);
     const private = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = ordinary, .shape = &.{4} })) orelse return error.MissingPhysicalView;
     defer cb.free(private);
+    try std.testing.expect(!exclusive(cb.ptr, private));
     try std.testing.expectError(error.InvalidHostIngressAuthority, upload.writeWithOperation(private, .{ .slot = slot, .region = try ordinary.writableRegion(0, 7, 16) }, std.mem.sliceAsBytes(&values), &token));
     const full_view = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = bank, .shape = &.{8} })) orelse return error.MissingPhysicalView;
     defer cb.free(full_view);
