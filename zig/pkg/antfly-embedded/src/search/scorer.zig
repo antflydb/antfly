@@ -682,7 +682,7 @@ pub const WANDScorer = struct {
             if (front.current.?.doc_id != pivot_doc) {
                 self.pivots_advanced += 1;
                 collector.markLowerBound();
-                try self.advancePastWithChunkSkip(front, pivot_doc, threshold, false);
+                try self.advancePastWithChunkSkip(front, pivot_doc, threshold, false, collector);
                 active = reinsertWANDPrefix(terms, sorted[0..active], 1);
                 continue;
             }
@@ -776,7 +776,9 @@ pub const WANDScorer = struct {
         }
 
         var skipped_blocks: u64 = 0;
+        var iterations: usize = 1;
         while (true) {
+            try checkActive(collector, &iterations);
             var candidate_chunk: ?u32 = null;
             for (self.terms.items) |*term| {
                 if (term.block_cursor) |cursor| candidate_chunk = if (candidate_chunk) |current| @min(current, cursor.chunk_id) else cursor.chunk_id;
@@ -867,7 +869,9 @@ pub const WANDScorer = struct {
 
         var skipped_intervals: u64 = 0;
         var skipped_blocks: u64 = 0;
+        var iterations: usize = 1;
         while (true) {
+            try checkActive(collector, &iterations);
             var interval_end: ?u32 = null;
             for (self.terms.items) |term| {
                 const cursor = term.block_cursor orelse continue;
@@ -980,7 +984,7 @@ pub const WANDScorer = struct {
     /// outer-loop level, but advances within the loop still walk into them
     /// once before re-pivoting kicks them out. The hop straight to the next
     /// chunk start saves the per-doc work for those throwaway chunks.
-    fn advancePastWithChunkSkip(self: *WANDScorer, t: *TermState, target: u32, threshold: f32, allow_equal_prune: bool) !void {
+    fn advancePastWithChunkSkip(self: *WANDScorer, t: *TermState, target: u32, threshold: f32, allow_equal_prune: bool, collector: anytype) !void {
         try self.advancePast(t, target);
         if (t.block_max == null) return;
         // No threshold yet (collector still filling): can't compute a useful
@@ -995,8 +999,10 @@ pub const WANDScorer = struct {
         // know about the others, and uniform-distribution workloads hit
         // that case for nearly every advance.
         var others_max: ?f32 = null;
+        var iterations: usize = 1;
 
         while (!t.exhausted) {
+            try checkActive(collector, &iterations);
             const current_cursor = t.iter.currentBlockCursor() orelse return;
             const chunk_idx: u32 = @intCast(current_cursor.ordinal);
 
