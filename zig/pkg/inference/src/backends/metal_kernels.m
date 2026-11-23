@@ -3837,7 +3837,6 @@ static int termite_metal_encode_attention_f32_on_encoder(termite_metal_decode_ru
 static int termite_metal_encode_dense_linear_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, size_t slot, id<MTLBuffer> input_buffer, size_t input_offset, size_t in_dim, size_t out_dim, id<MTLBuffer> output_buffer, size_t output_offset, int failure_code);
 static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_key_device_slot(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer, size_t slot, uint32_t format, void *k_handle, size_t k_offset, void *v_handle, size_t v_offset, size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads, size_t head_dim, size_t key_row_bytes, size_t base_key_row_bytes, size_t v_row_stride, size_t kv_position_offset, const uint32_t *block_table, size_t block_count, size_t page_size);
 static int termite_metal_encode_paged_kv_seed_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, size_t slot, uint32_t format, id<MTLBuffer> k_buffer, size_t k_offset, id<MTLBuffer> v_buffer, size_t v_offset, size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads, size_t head_dim, size_t key_row_bytes, size_t base_key_row_bytes, size_t v_row_stride, size_t kv_position_offset, const uint32_t *block_table, size_t block_count, size_t page_size, int failure_code);
-static int termite_metal_encode_paged_f32_kv_seed_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, size_t slot, id<MTLBuffer> k_buffer, size_t k_offset, id<MTLBuffer> v_buffer, size_t v_offset, size_t total_tokens, size_t suffix_tokens, size_t num_kv_heads, size_t head_dim, size_t key_row_bytes, size_t v_row_stride, size_t kv_position_offset, const uint32_t *block_table, size_t block_count, size_t page_size, int failure_code);
 static int termite_metal_encode_rms_norm_add_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, size_t norm_slot, id<MTLBuffer> residual_buffer, size_t residual_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t hidden_size, float eps, int failure_code);
 static int termite_metal_encode_rms_norm_add_sumsq_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> sumsq_buffer, size_t sumsq_offset, size_t sumsq_partials, size_t norm_slot, id<MTLBuffer> residual_buffer, size_t residual_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t hidden_size, float eps, int failure_code);
 static int termite_metal_encode_rms_norm_add_scale_sumsq_on_encoder(termite_metal_decode_runtime *runtime, id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> input_buffer, size_t input_offset, id<MTLBuffer> sumsq_buffer, size_t sumsq_offset, size_t sumsq_partials, size_t norm_slot, id<MTLBuffer> residual_buffer, size_t residual_offset, id<MTLBuffer> output_buffer, size_t output_offset, size_t hidden_size, float eps, float scale, int failure_code);
@@ -30321,29 +30320,8 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
             switch (op.kind) {
                 case TERMITE_METAL_PLAN_OP_DECODE_KV_SEED:
                     if (use_paged_kv && paged_suffix_tokens != 0) {
-                        if (paged_format == 2u) {
-                            rc = termite_metal_encode_paged_f32_kv_seed_on_encoder(
-                                runtime,
-                                encoder,
-                                paged_slot,
-                                k_buffer,
-                                k_offset,
-                                v_buffer,
-                                v_offset,
-                                kv_tokens,
-                                paged_suffix_tokens,
-                                num_kv_heads,
-                                head_dim,
-                                paged_key_row_bytes,
-                                paged_v_row_stride,
-                                kv_position_offset,
-                                paged_block_table,
-                                paged_block_count,
-	                                paged_page_size,
-	                                failure_code);
-	                            if (rc != 0) break;
-	                        } else if (paged_format == 0u || paged_format == 1u || paged_format == 4u) {
-	                            rc = termite_metal_encode_paged_kv_seed_on_encoder(
+                        if (paged_format == 0u || paged_format == 1u || paged_format == 2u || paged_format == 4u) {
+                            rc = termite_metal_encode_paged_kv_seed_on_encoder(
                                 runtime,
                                 encoder,
                                 paged_slot,
@@ -30357,15 +30335,15 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
                                 num_kv_heads,
                                 head_dim,
                                 paged_key_row_bytes,
-                                paged_base_key_row_bytes,
+                                paged_format == 2u ? paged_key_row_bytes : paged_base_key_row_bytes,
                                 paged_v_row_stride,
                                 kv_position_offset,
                                 paged_block_table,
                                 paged_block_count,
-	                                paged_page_size,
-	                                failure_code);
-	                            if (rc != 0) break;
-	                        } else {
+                                paged_page_size,
+                                failure_code);
+                            if (rc != 0) break;
+                        } else {
 	                            if (termite_metal_decode_runtime_end_planned_compute_scope(runtime) != 0) {
 	                                rc = failure_code;
                                 break;
@@ -30423,29 +30401,8 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
                             break;
                         }
                         if (paged_suffix_tokens != 0 && !paged_kv_seed_encoded) {
-                            if (paged_format == 2u) {
-                                rc = termite_metal_encode_paged_f32_kv_seed_on_encoder(
-                                    runtime,
-                                    encoder,
-                                    paged_slot,
-                                    k_buffer,
-                                    k_offset,
-                                    v_buffer,
-                                    v_offset,
-                                    kv_tokens,
-                                    paged_suffix_tokens,
-                                    num_kv_heads,
-                                    head_dim,
-                                    paged_key_row_bytes,
-                                    paged_v_row_stride,
-                                    kv_position_offset,
-                                    paged_block_table,
-                                    paged_block_count,
-	                                    paged_page_size,
-	                                    failure_code);
-	                                if (rc != 0) break;
-	                            } else if (paged_format == 0u || paged_format == 1u || paged_format == 4u) {
-	                                rc = termite_metal_encode_paged_kv_seed_on_encoder(
+                            if (paged_format == 0u || paged_format == 1u || paged_format == 2u || paged_format == 4u) {
+                                rc = termite_metal_encode_paged_kv_seed_on_encoder(
                                     runtime,
                                     encoder,
                                     paged_slot,
@@ -30459,15 +30416,15 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
                                     num_kv_heads,
                                     head_dim,
                                     paged_key_row_bytes,
-                                    paged_base_key_row_bytes,
+                                    paged_format == 2u ? paged_key_row_bytes : paged_base_key_row_bytes,
                                     paged_v_row_stride,
                                     kv_position_offset,
                                     paged_block_table,
                                     paged_block_count,
-	                                    paged_page_size,
-	                                    failure_code);
-	                                if (rc != 0) break;
-	                            } else {
+                                    paged_page_size,
+                                    failure_code);
+                                if (rc != 0) break;
+                            } else {
 	                                if (termite_metal_decode_runtime_end_planned_compute_scope(runtime) != 0) {
 	                                    rc = failure_code;
                                     break;
@@ -64582,32 +64539,6 @@ static int termite_metal_encode_paged_kv_seed_on_encoder(
     return 0;
 }
 
-static int termite_metal_encode_paged_f32_kv_seed_on_encoder(
-    termite_metal_decode_runtime *runtime,
-    id<MTLComputeCommandEncoder> encoder,
-    size_t slot,
-    id<MTLBuffer> k_buffer,
-    size_t k_offset,
-    id<MTLBuffer> v_buffer,
-    size_t v_offset,
-    size_t total_tokens,
-    size_t suffix_tokens,
-    size_t num_kv_heads,
-    size_t head_dim,
-    size_t key_row_bytes,
-    size_t v_row_stride,
-    size_t kv_position_offset,
-    const uint32_t *block_table,
-    size_t block_count,
-    size_t page_size,
-    int failure_code
-) {
-    return termite_metal_encode_paged_kv_seed_on_encoder(
-        runtime, encoder, slot, 2u, k_buffer, k_offset, v_buffer, v_offset, total_tokens,
-        suffix_tokens, num_kv_heads, head_dim, key_row_bytes, key_row_bytes, v_row_stride,
-        kv_position_offset, block_table, block_count, page_size, failure_code);
-}
-
 int termite_metal_decode_runtime_update_attention_paged_from_f32_key_device_slot(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -65223,10 +65154,11 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         BOOL encoder_owned = YES;
         id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
         if (encoder == nil) return -12;
-        const int rc = termite_metal_encode_paged_f32_kv_seed_on_encoder(
+        const int rc = termite_metal_encode_paged_kv_seed_on_encoder(
             runtime,
             encoder,
             slot,
+            2u,
             k_buffer,
             k_offset,
             v_buffer,
@@ -65235,6 +65167,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
             suffix_tokens,
             num_kv_heads,
             head_dim,
+            key_row_bytes,
             key_row_bytes,
             v_row_stride,
             position_offset,
@@ -68312,27 +68245,7 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
             const size_t previous_region = termite_metal_enter_compute_region(runtime, TERMITE_METAL_COMPUTE_REGION_ATTENTION);
             if (suffix_tokens != 0) {
                 id<MTLComputeCommandEncoder> paged_encoder = runtime->active_planned_compute_encoder;
-                if (paged_encoder != nil && paged_format == 2u) {
-                    rc = termite_metal_encode_paged_f32_kv_seed_on_encoder(
-                        runtime,
-                        paged_encoder,
-                        paged_slot,
-                        k_buffer,
-                        k_offset,
-                        v_buffer,
-                        v_offset,
-                        kv_tokens,
-                        suffix_tokens,
-                        num_kv_heads,
-                        head_dim,
-                        paged_key_row_bytes,
-                        paged_v_row_stride,
-                        kv_position_offset,
-                        block_table,
-	                        block_count,
-	                        page_size,
-	                        -31);
-	                } else if (paged_encoder != nil && (paged_format == 0u || paged_format == 1u || paged_format == 3u || paged_format == 4u)) {
+                if (paged_encoder != nil && paged_format <= 4u) {
                     rc = termite_metal_encode_paged_kv_seed_on_encoder(
                         runtime,
                         paged_encoder,
@@ -68347,7 +68260,7 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_devic
                         num_kv_heads,
                         head_dim,
                         paged_key_row_bytes,
-                        paged_base_key_row_bytes,
+                        paged_format == 2u ? paged_key_row_bytes : paged_base_key_row_bytes,
                         paged_v_row_stride,
                         kv_position_offset,
                         block_table,
@@ -73843,15 +73756,11 @@ int termite_metal_decode_runtime_seed_paged_suffix_on_frame(
     if (termite_metal_decode_runtime_begin_planned_compute_scope(runtime,
             TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, TERMITE_METAL_COMPUTE_REGION_ATTENTION) != 0) return -6;
     id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-    const int rc = format == 2u
-        ? termite_metal_encode_paged_f32_kv_seed_on_encoder(runtime, encoder, slot,
-            (__bridge id<MTLBuffer>)k_handle, k_offset, (__bridge id<MTLBuffer>)v_handle, v_offset,
-            total_tokens, suffix_tokens, num_kv_heads, head_dim, key_row_bytes, v_row_stride,
-            kv_position_offset, block_table, block_count, page_size, -7)
-        : termite_metal_encode_paged_kv_seed_on_encoder(runtime, encoder, slot, format,
-            (__bridge id<MTLBuffer>)k_handle, k_offset, (__bridge id<MTLBuffer>)v_handle, v_offset,
-            total_tokens, suffix_tokens, num_kv_heads, head_dim, key_row_bytes, base_key_row_bytes,
-            v_row_stride, kv_position_offset, block_table, block_count, page_size, -7);
+    const int rc = termite_metal_encode_paged_kv_seed_on_encoder(runtime, encoder, slot, format,
+        (__bridge id<MTLBuffer>)k_handle, k_offset, (__bridge id<MTLBuffer>)v_handle, v_offset,
+        total_tokens, suffix_tokens, num_kv_heads, head_dim, key_row_bytes,
+        format == 2u ? key_row_bytes : base_key_row_bytes, v_row_stride,
+        kv_position_offset, block_table, block_count, page_size, -7);
     const int end_rc = termite_metal_decode_runtime_end_planned_compute_scope(runtime);
     return rc != 0 ? rc : end_rc;
 }
