@@ -52841,9 +52841,11 @@ pub const DB = struct {
                 else => return null,
             }
             // Chunk hydration and aggregation can perform long postprocessing
-            // outside the stoppable ranker. Keep those shapes on the caller.
-            if (text.request.include_stored or text.request.aggregations_json.len != 0 or
-                (self.db.core.textIndexIsChunkBacked(a, text.request.index_name) catch return null)) return null;
+            // outside the stoppable ranker. Resolve the same default index as
+            // the ranker, including when multiple text indexes exist.
+            if (text.request.include_stored or text.request.aggregations_json.len != 0) return null;
+            const text_entry = self.db.core.textIndexEntry(text.request.index_name) orelse return null;
+            if (self.db.core.textIndexIsChunkBacked(a, text_entry.config.name) catch return null) return null;
 
             const dense = components[1];
             const entry = self.db.core.denseIndex(dense.request.index_name) orelse return null;
