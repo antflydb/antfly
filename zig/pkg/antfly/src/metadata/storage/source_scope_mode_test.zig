@@ -653,15 +653,14 @@ pub fn run(a: A) !void {
     try std.testing.expectEqual(control.nativeBootstrapCatalogDigest(replacement), reseed.native_bootstrap_catalog_digest);
     try std.testing.expect(try target.nativeSourceRecoveryScope(a, group, source.table_id, 0, source.definition) == null);
     try std.testing.expect(!try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
-    // A bounded census must never turn an incomplete/corrupt scan into intake
-    // permission. Exercise the real cursor and persisted actor prefix.
-    const eligibility = @import("../source_legacy_intake.zig");
+    // Rebuild from a projection with more historical rows than the old
+    // request-time census could admit, preserving both positive and negative gates.
     {
         var txn = try target.store.beginWriteTxn();
         errdefer txn.abort();
         const empty = try control.encode(a, .{});
         defer a.free(empty);
-        for (0..eligibility.max_records + 1) |index| {
+        for (0..257) |index| {
             var id: control.Digest = @splat(0);
             std.mem.writeInt(u64, id[24..32], @intCast(index + 2), .big);
             var key_buffer: [256]u8 = undefined;
@@ -669,7 +668,9 @@ pub fn run(a: A) !void {
         }
         try txn.commit();
     }
-    try std.testing.expectError(error.SourceAdmissionBackpressure, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
+    try target.rebuildDerivedCatalogIndexes(group);
+    try std.testing.expect(try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
+    try std.testing.expect(!try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     {
         var txn = try target.store.beginWriteTxn();
         errdefer txn.abort();
@@ -677,16 +678,5 @@ pub fn run(a: A) !void {
         try txn.put(try control.keyForGroup(&key_buffer, group, source.table_id, @splat(0)), "!");
         try txn.commit();
     }
-    try std.testing.expectError(error.SourceControlCorrupt, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
-    {
-        const oversized = try a.alloc(u8, eligibility.max_bytes + 1);
-        defer a.free(oversized);
-        @memset(oversized, ' ');
-        var txn = try target.store.beginWriteTxn();
-        errdefer txn.abort();
-        var key_buffer: [256]u8 = undefined;
-        try txn.put(try control.keyForGroup(&key_buffer, group, source.table_id, @splat(0)), oversized);
-        try txn.commit();
-    }
-    try std.testing.expectError(error.SourceAdmissionBackpressure, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
+    try std.testing.expectError(error.SourceControlCorrupt, target.rebuildDerivedCatalogIndexes(group));
 }

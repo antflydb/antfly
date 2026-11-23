@@ -13424,7 +13424,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "18";
+const derived_catalog_index_version = "19";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -33178,7 +33178,7 @@ pub const RaftApplyStore = struct {
     /// The caller first establishes metadata ReadIndex. This only decides
     /// whether an old round may start; it never proves in-flight writers drained.
     pub fn legacyReplicationSourceIntakeAllowed(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !bool {
-        var txn = try self.store.beginReadTxn();
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         var key_buffer: [224]u8 = undefined;
         const key = try replicationSourceStatusKeyForGroup(&key_buffer, group_id, table_id, ordinal);
@@ -33188,10 +33188,10 @@ pub const RaftApplyStore = struct {
             if (source_control.isNativeBootstrapPhase(status.phase) or
                 std.mem.eql(u8, status.phase, source_control.legacy_handover_phase)) return false;
         }
-        return @import("../source_legacy_intake.zig").allowed(a, &txn, group_id, table_id, ordinal, definition);
+        return @import("../source_legacy_intake.zig").indexedAllowed(&txn, group_id, table_id, ordinal, definition);
     }
     pub fn nativeSourceRecoveryScope(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !?source_control.Scope {
-        var txn = try self.store.beginReadTxn();
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         var status_buffer: [224]u8 = undefined;
         const status_key = try replicationSourceStatusKeyForGroup(&status_buffer, group_id, table_id, ordinal);
@@ -33217,7 +33217,7 @@ pub const RaftApplyStore = struct {
                 return scope;
             }
         }
-        return @import("../source_legacy_intake.zig").find(a, &txn, group_id, table_id, ordinal, definition, .recovery);
+        return @import("../source_legacy_intake.zig").indexedRecovery(a, &txn, group_id, table_id, ordinal, definition);
     }
 
     /// The service establishes ReadIndex before calling. Every captured field,
@@ -33406,6 +33406,7 @@ pub const RaftApplyStore = struct {
             std.mem.writeInt(u64, &encoded_count, next_count, .little);
             try txn.put(work_key, &encoded_count);
         }
+        try @import("../source_legacy_intake.zig").indexTransition(txn, group_id, state, next);
         try txn.put(key, output);
         if (handover_status) |status| {
             const status_key = try replicationSourceStatusKeyForGroup(&handover_key_buffer, group_id, status.table_id, status.source_ordinal);
@@ -36414,6 +36415,9 @@ pub const RaftApplyStore = struct {
             if (std.mem.eql(u8, value, derived_catalog_index_version)) return false;
         }
 
+        var source_index_buffer: [160]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(txn, try std.fmt.bufPrint(&source_index_buffer, "\x00\x00__metadata_derived__:source_scope:{d}:", .{group_id}));
+        try @import("../source_legacy_intake.zig").rebuild(self.alloc, txn, group_id);
         try system_catalog_storage.rebuildNameIndex(self.alloc, txn, group_id);
         var alias_prefix_buf: [160]u8 = undefined;
         try self.deleteDerivedPrefixTxn(txn, try indexAliasTablePrefix(&alias_prefix_buf, group_id));
