@@ -12424,7 +12424,7 @@ fn makeRuntimeQ4StorageFromQ6K(
             const block_in = row_values[block_idx * target_values_per_block ..][0..target_values_per_block];
             const block_out = row_out[block_idx * target_block_bytes ..][0..target_block_bytes];
             switch (target) {
-                .Q4_K => quant_codec.quantizeQ4_KBlock(block_in, block_out),
+                .Q4_K => quant_codec.quantizeQ4_KBlockFast(block_in, block_out),
                 .Q4_0 => quant_codec.quantizeQ4_0Block(block_in, block_out),
                 else => unreachable,
             }

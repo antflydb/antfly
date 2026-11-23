@@ -242,9 +242,10 @@ pub const GgufAccess = struct {
         const tensor = gguf_mod.tensor_catalog.Catalog.init(&self.store.parsed).find(name) orelse return error.TensorNotFound;
         const byte_len_u64 = gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType;
         const byte_len: usize = @intCast(byte_len_u64);
-        const path = self.store.path orelse return error.MissingTensorStorePath;
-        const raw_bytes = try c_file.readRegion(allocator, path, tensor.data_offset, byte_len);
+        const source = self.store.mmap_region orelse return error.MissingTensorStoreMapping;
+        const raw_bytes = try allocator.alloc(u8, byte_len);
         errdefer allocator.free(raw_bytes);
+        try c_file.readRegionFromFd(source.fd, raw_bytes, tensor.data_offset);
 
         const shape = try allocator.alloc(i64, tensor.dimensions.len);
         errdefer allocator.free(shape);
@@ -770,7 +771,7 @@ test "safetensors access reads descriptor and dense bytes" {
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), tensor.asFloat32()[3], 1e-6);
 }
 
-test "gguf access reads descriptor and raw tensor bytes" {
+test "gguf access reads original tensor bytes after atomic replacement" {
     const allocator = std.testing.allocator;
 
     var data = std.ArrayListUnmanaged(u8).empty;
@@ -803,10 +804,18 @@ test "gguf access reads descriptor and raw tensor bytes" {
     const access = try openFromManifest(allocator, manifest);
     defer access.deinit();
 
+    const replacement = try std.fs.path.join(allocator, &.{ dir_path, "replacement.gguf" });
+    defer allocator.free(replacement);
+    const io = compat.testingIo();
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(io, .{ .sub_path = replacement, .data = "not a GGUF" });
+    try cwd.rename(replacement, cwd, path, io);
+
     var record = try access.getRecord(allocator, "tok_embeddings.weight");
     defer record.deinit();
     try std.testing.expectEqual(@as(usize, 8), record.descriptor.byte_len);
     try std.testing.expect(!record.descriptor.quantized);
+    try std.testing.expectEqualSlices(u8, data.items[data.items.len - 8 ..], record.raw_bytes);
 
     var tensor = (try record.materializeDense(allocator)).?;
     defer tensor.deinit();
