@@ -13020,6 +13020,23 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
     }
     try std.testing.expectEqual(warm_cache.backend_weight_bytes, cache.admissionAmounts().backend_weight_bytes);
     try std.testing.expectEqual(warm_cache.host_weight_bytes, cache.admissionAmounts().host_weight_bytes);
+    if (comptime count == 3) {
+        const dense = @import("../execution/dense_decoder_backend.zig");
+        const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
+        try std.testing.expect(try dense.hasPackedQkv(&target.cb, request.slots, width));
+        var source_scope = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .managed);
+        defer source_scope.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        const token = source_scope.token() orelse return error.ExpectedExplicitEngineOperation;
+        var borrower = try MetalCompute.initBorrowingSharedProvider(a, compute.data, std.testing.io, .{});
+        defer borrower.deinit();
+        try borrower.adoptEngineBorrowedOperation(token);
+        const receiving = borrower.computeBackend();
+        try std.testing.expect(try dense.hasPackedQkv(&receiving, request.slots, width));
+        var reordered = request.slots;
+        std.mem.swap(usize, &reordered[1], &reordered[2]);
+        try std.testing.expect(!try dense.hasPackedQkv(&receiving, reordered, width));
+        try std.testing.expect(!try dense.hasPackedQkv(&receiving, request.slots, width - 1));
+    }
     // Compatibility and assigned calls consume exactly the same physical
     // packed payload. The ordinary callback retains its original selector.
     if (comptime !with_bias) {
