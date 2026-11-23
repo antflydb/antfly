@@ -303,6 +303,13 @@ pub const PrimaryStoreOwner = union(enum) {
         };
     }
 
+    pub fn hasReadyLsmMaintenanceWorkBestEffort(self: *const PrimaryStoreOwner) bool {
+        return switch (self.*) {
+            .none, .mem => false,
+            .lsm => |owner| owner.handle.backend.readyMaintenanceScoreBestEffort(false) != 0,
+        };
+    }
+
     pub fn lsmMaintenanceDebtHint(self: *const PrimaryStoreOwner) u64 {
         return switch (self.*) {
             .none, .mem => 0,
@@ -380,10 +387,10 @@ pub const PrimaryStoreOwner = union(enum) {
         return true;
     }
 
-    pub fn runLsmMaintenanceStepBestEffort(self: *PrimaryStoreOwner) !bool {
+    pub fn runReadyLsmMaintenanceStepBestEffort(self: *PrimaryStoreOwner) !bool {
         return switch (self.*) {
             .none, .mem => false,
-            .lsm => |owner| try owner.handle.backend.runMaintenanceStepBestEffort(),
+            .lsm => |owner| try owner.handle.backend.runReadyMaintenanceStepBestEffort(false),
         };
     }
 };
