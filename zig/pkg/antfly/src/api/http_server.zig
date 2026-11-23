@@ -15986,7 +15986,7 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
         const filter = row_filter_json orelse return true;
         const source = self.table_reads orelse return false;
-        var lookup = (try source.lookup(self.alloc, physical_table_name, key, context, .read_index)) orelse return true;
+        var lookup = (try source.lookup(self.alloc, physical_table_name, key, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation }, .read_index)) orelse return true;
         defer lookup.deinit(self.alloc);
         return try self.docJsonMatchesRowFilter(key, lookup.json, filter);
     }
