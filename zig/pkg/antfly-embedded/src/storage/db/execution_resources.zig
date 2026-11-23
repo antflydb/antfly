@@ -113,11 +113,11 @@ const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig
 
 const schema_registry_mod = @import("schema_registry.zig");
 
-const relational_index_plans = @import("relational_index_plan.zig");
+const relational_index_plans = @import("relational/indexes/plan.zig");
 
 const transactions_mod = @import("../transactions.zig");
 
-const relational_store = @import("relational_store.zig");
+const relational_store = @import("relational/rows/store.zig");
 
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 
@@ -216,7 +216,6 @@ pub const AsyncContext = struct {
     store: *docstore_mod.DocStore,
     relational_base_rows: bool = false,
     snapshot_read_txn: ?*docstore_mod.DocStore.Txn = null,
-    applied_sequence_checkpoint_path: ?[]const u8 = null,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
@@ -251,6 +250,17 @@ pub const AsyncContext = struct {
     index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
+    /// Serializes the drain-then-commit applied-sequence flush as a whole
+    /// (flushPendingAppliedSequencesLocked / flushFinishedDenseAppliedSequenceLocked),
+    /// including the durable commit they run, which can yield through Io for
+    /// a WAL group-commit wait. applied_sequence_mutex above protects only
+    /// the coalescer's pending map itself (note/drain), a brief critical
+    /// section that never yields -- it must not be held across that commit.
+    /// std.Io.Mutex is safe to hold across a cooperative yield: a contending
+    /// caller parks through the DB's Io instead of busy-waiting the OS
+    /// thread the lock holder needs to run again to finish and release it.
+    /// See DETERMINISM_AUDIT.md.
+    applied_sequence_flush_mutex: std.Io.Mutex = .init,
     dense_admission: @import("dense_publication_admission.zig").Owner = .{},
     native_projection_owner: @import("native_projection_owner.zig").Owner = .{},
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
@@ -686,7 +696,6 @@ pub const BatchExecutionContext = struct {
     ordered_artifact_publication_required: bool = false,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     shard_manager: *shard_mod.ShardManager,
     change_journal: *change_journal_mod.Journal,
@@ -980,7 +989,7 @@ pub const PreparedRowEffects = struct {
 };
 
 pub const RelationalPriorMembership = struct {
-    const Source = @import("relational_index_predicate.zig").Source;
+    const Source = @import("relational/indexes/partial_predicate.zig").Source;
     alloc: Allocator,
     members: []bool,
     sources: []?Source,
@@ -1069,6 +1078,32 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+pub const NativeAtomicEffects = struct {
+    writes: []const docstore_mod.KVPair = &.{},
+    deletes: []const []const u8 = &.{},
+};
+
+pub const CheckedNativeAtomic = struct {
+    snapshot_owner: *snapshot_admission_mod.SnapshotAdmission.MutationLease,
+    replication_owner: *?MutationBarrier.SharedLease,
+    schema_namespace_generation: u64,
+    // DB-owned attempt/finalizer; process-local and never supplied by JSON.
+    ptr: *anyopaque,
+    finalize_fn: *const fn (*anyopaque) anyerror!NativeAtomicEffects,
+};
+
+/// WS3: lets a capi caller drop its own connection-level locks (the path
+/// gate's lease and the per-connection call-serializing mutex) across the
+/// primary write's durability wait, not just the DB apply lock. Invoked
+/// exactly once, from `mutation_commit.zig`'s `batchInternalPreparedOwned`,
+/// right after the apply lock releases and before the ticket is waited on;
+/// never invoked when there is no ticket to shield (the transaction-
+/// resolution commit path, which does not stage through this hook).
+pub const WriterLaneReleaseHook = struct {
+    ptr: *anyopaque,
+    release: *const fn (ptr: *anyopaque) void,
+};
+
 /// One synchronous prepared attempt's irreversible disposition. It is separate
 /// from the caller's cumulative progress marker: optimistic preparation may
 /// retry, while a committed attempt must propagate every later error unchanged.
@@ -1092,6 +1127,8 @@ pub const PreparationCapture = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    // Process-local checked plan, never serialized or derived from JSON.
+    checked_native_atomic: ?*const CheckedNativeAtomic = null,
     preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
@@ -1119,20 +1156,32 @@ pub const BatchExecutionOptions = struct {
     /// Internal progress marker; set only after the primary store accepts the
     /// write. Visibility admission errors must not invite replay of transforms.
     primary_committed: ?*bool = null,
+    /// Regression-B test hook: when set, the primary write's own ticket
+    /// (`mutation_commit.zig`'s `primary_ticket`) is waited on via
+    /// `waitSequence` instead of `wait`, and the resulting commit sequence
+    /// (0 on a backend with no such concept) is written here. See
+    /// `db.zig`'s `DB.batchWithCommittedSequence` and `lite/docstore.zig`'s
+    /// `Store.Ticket.waitSequence`.
+    committed_sequence_out: ?*u64 = null,
     /// Attempt-local borrow installed by batchInternalWithPreparationAllocator. Never
     /// retained by asynchronous publication or shared across retries.
     prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
+    force_only_incomplete_assets: bool = false,
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
     bypass_replication_write_gate: bool = false,
     replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
     ordered_apply_receipt: ?OrderedApplyReceipt = null,
+    ordered_history_commit_time_ns: i64 = 0,
+    /// Trusted native ingress classification; missing old transport stays unlabelled.
+    source_producer: @import("../source_producer_policy.zig").Producer = .unlabelled,
     /// Metadata-authorized native hidden-child receipt identity. Never
     /// writes the data-Raft watermark into a native source-authority root.
     native_initial_child_entry: ?OrderedApplyReceipt = null,
     native_fk_generation_entry: ?OrderedApplyReceipt = null,
+    native_fk_generation_control: bool = false,
     native_topology_position: ?@import("receipt_position.zig").Native = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
@@ -1142,15 +1191,55 @@ pub const BatchExecutionOptions = struct {
     extra_store_deletes: []const []const u8 = &.{},
     merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
+    prepared_graph_indexes: []const @import("prepared_graph_effects.zig").Index = &.{},
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
+    /// lite-single-commit-write-path.md §3.3c. `.none` (default): a
+    /// coordinated-constraint table's ordinary writes are refused on this
+    /// plain batch path (`error.ForeignKeyCoordinationRequired`) and the
+    /// integrity namespace stays protected -- the durable 3-commit
+    /// `beginTransaction`/`writeTransaction`/`commitTransaction` sequence
+    /// is the only way to write such a table. `.local_decision`: this call
+    /// is the first and only decider for `req.integrity_commands` (set
+    /// only by `capi/sql.zig`'s `commitCoordinated` single-call fast
+    /// path, never by a multi-statement SQL session spanning calls) --
+    /// `mutation_commit.zig`'s `prepareLocalIntegrityDecision` validates
+    /// and folds the resulting UNIQUE-claim writes into this same native
+    /// commit. Unlike replaying an already-decided remote write
+    /// (`live_replication_apply`/`scoped_restore_replication_apply`,
+    /// structural re-validation only), `.local_decision` still runs the
+    /// full `checkVersionPredicates`/`relational_integrity.prepare`/
+    /// `validatePreparedEffects` sequence, inside the same apply-exclusive
+    /// section as the commit, so two concurrent `.local_decision` writers
+    /// racing the same UNIQUE value can never both win.
+    integrity_authority: enum { none, local_decision } = .none,
+    /// lite-single-commit-write-path.md §7.6: only meaningful alongside
+    /// `.local_decision`. Lets `prepareLocalIntegrityDecision`'s own
+    /// RESTRICT check (`relational_integrity.requireEmpty`) tell a
+    /// genuinely live Reference apart from a dangling one left by the
+    /// fused FK multi-table coordinator's own non-atomic ride-along
+    /// `.attach` write, self-healing it (queuing its deletion in this
+    /// same commit) instead of refusing the parent change forever. `null`
+    /// preserves exact today's-behavior: any live Reference blocks.
+    relational_child_existence_check: ?@import("relational/integrity/integrity.zig").ChildExistenceCheck = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
+    /// WS3 in-process writer lane; see `WriterLaneReleaseHook`.
+    writer_lane_release_before_wait: ?WriterLaneReleaseHook = null,
 };
 
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    replication_resolution: ?transactions_mod.ReplicationOrderedPhase = null,
+    document_revision_references: []const @import("../document_revision_reservation.zig").Reference = &.{},
+    prepared_graph_effects_checked: bool = false,
+    external_decision_owner: ?transactions_mod.ExternalDecisionOwner = null,
+    legacy_terminal: ?transactions_mod.LegacyTerminalResolution = null,
+    legacy_outcome_write: ?@import("../docstore.zig").KVPair = null,
+    source_scope: ?@import("../source_scope.zig").Reference = null,
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
+    source_purpose: ?[32]u8 = null,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
     commit_version: u64,
@@ -1211,6 +1300,8 @@ pub const LocalExecutionState = struct {
     row_policy_bundle: ?row_policy_bundle_mod.Installed = null,
     /// Borrowed from the opaque owner handle; Lite leaves these unset and
     /// therefore cannot turn a raw local read into an authenticated one.
+    sql_preparation_secret: ?[]const u8 = null,
+    sql_preparation_issuer: ?[]const u8 = null,
     row_policy_authority_secret: ?[]const u8 = null,
     row_policy_authority_issuer: ?[]const u8 = null,
     row_policy_table_name: ?[]const u8 = null,
@@ -1220,8 +1311,9 @@ pub const LocalExecutionState = struct {
     merge_artifact_layout: @import("merge_artifact_catalog.zig").Cache = .{},
     source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
+    materialized_view_read_only: std.atomic.Value(bool) = .init(false),
     initial_child_hidden: std.atomic.Value(bool) = .init(false),
-    initial_child_bootstrap: ?@import("relational_initial_child_publication.zig").Bootstrap = null,
+    initial_child_bootstrap: ?@import("relational/integrity/initial_child_publication.zig").Bootstrap = null,
     vector_migration_reopen_required: std.atomic.Value(bool) = .init(false),
     graph_merge_import_recovery_pending: std.atomic.Value(bool) = .init(false),
     source_vectors: std.atomic.Value(?*vector_payload_store_mod.Store) = .init(null),
@@ -1248,7 +1340,7 @@ pub const LocalExecutionState = struct {
     /// reconciliation cost.
     schema_reconcile: @import("schema_reconcile_owner.zig").Owner = .{},
     relational_index_maintenance_cursor: std.atomic.Value(usize) = .init(0),
-    relational_index_maintenance_sweep: @import("relational_index_maintenance_sweep.zig").Sweep = .{},
+    relational_index_maintenance_sweep: @import("relational/indexes/maintenance_sweep.zig").Sweep = .{},
     relational_index_retry_after_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
     optional_runtime_workers_enabled: bool = false,
@@ -2078,7 +2170,7 @@ pub const PreparedEnrichments = struct {
         var output: std.Io.Writer.Allocating = .init(a);
         defer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
-        try @import("relational_integrity_json.zig").writeCompact(value, &stream);
+        try @import("relational/integrity/json.zig").writeCompact(value, &stream);
         const bytes = try output.toOwnedSlice();
         defer a.free(bytes);
         var digest: [32]u8 = undefined;
@@ -2096,7 +2188,7 @@ pub const PreparedEnrichments = struct {
     };
 
     pub fn jsonStringify(self: @This(), stream: anytype) !void {
-        return @import("relational_integrity_json.zig").writeCompact(self, stream);
+        return @import("relational/integrity/json.zig").writeCompact(self, stream);
     }
 };
 
@@ -2665,3 +2757,59 @@ pub const NoProgressDiagnostic = struct {
         self.* = undefined;
     }
 };
+
+test "a mutex held across a cooperative yield does not deadlock a single-worker Io scheduler" {
+    // Regression for the full-cluster VOPR hang this field's doc comment
+    // describes: flushPendingAppliedSequencesLocked holds
+    // applied_sequence_flush_mutex across the durable commit it runs,
+    // which can yield through Io for the WAL group-commit wait. VOPR's
+    // deterministic scenario runs on a single logical worker, the same
+    // shape `.async_limit = .nothing` forces here. Task A acquires the
+    // mutex, then cooperatively yields (io.sleep) while still holding it
+    // -- exactly `flushPendingAppliedSequencesLocked`'s shape -- before
+    // releasing. Task B starts after A has the lock and contends for it.
+    // A raw std.atomic.Mutex-style spin-then-real-`nanosleep` backoff
+    // (`lockAtomicWithBackoff`, used for every *other* mutex in this
+    // file) would deadlock here: that backoff's `nanosleep` blocks the
+    // only OS thread available to run task A forward to its own
+    // `io.sleep` wakeup and release, so task B would spin forever
+    // waiting for a lock whose holder can never run again. This test
+    // hangs (and the surrounding build step times out) if
+    // `std.Io.Mutex.lockUncancelable` regresses to anything that blocks
+    // the underlying OS thread instead of cooperatively parking.
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var mutex: std.Io.Mutex = .init;
+    var a_released = false;
+    var b_observed_a_released = false;
+
+    const TaskA = struct {
+        fn run(m: *std.Io.Mutex, task_io: std.Io, released: *bool) void {
+            m.lockUncancelable(task_io);
+            task_io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+            released.* = true;
+            m.unlock(task_io);
+        }
+    };
+    const TaskB = struct {
+        fn run(m: *std.Io.Mutex, task_io: std.Io, released: *const bool, observed: *bool) void {
+            // Give task A a chance to acquire the mutex first; this task
+            // must then block on the mutex itself, not on this sleep.
+            task_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            m.lockUncancelable(task_io);
+            observed.* = released.*;
+            m.unlock(task_io);
+        }
+    };
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, TaskA.run, .{ &mutex, io, &a_released });
+    try group.concurrent(io, TaskB.run, .{ &mutex, io, &a_released, &b_observed_a_released });
+    try group.await(io);
+
+    try std.testing.expect(a_released);
+    try std.testing.expect(b_observed_a_released);
+}

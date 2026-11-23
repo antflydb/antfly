@@ -207,13 +207,13 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, command, "insert")) return
     \\usage: antfly insert --table <table> --key <key> --document <json> [options]
     \\
-    \\  --sync-level <level>       propose|write|enrichments|full_text|full_index (default: write)
+    \\  --sync-level <level>       propose|write|query|enrichments|full_index (default: write)
     \\
     ;
     if (std.mem.eql(u8, command, "delete")) return
     \\usage: antfly delete --table <table> --key <key> [options]
     \\
-    \\  --sync-level <level>       propose|write|enrichments|full_text|full_index (default: write)
+    \\  --sync-level <level>       propose|write|query|enrichments|full_index (default: write)
     \\
     ;
     if (std.mem.eql(u8, command, "agents")) return

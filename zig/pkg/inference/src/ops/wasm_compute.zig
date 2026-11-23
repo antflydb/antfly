@@ -4010,18 +4010,6 @@ pub const WasmCompute = struct {
         return out_buf;
     }
 
-    fn gpuAdd(
-        a_buf: wasm_extern.GpuBufferId,
-        b_buf: wasm_extern.GpuBufferId,
-        out: []f32,
-    ) GpuTensor {
-        if (!build_options.enable_webgpu) unreachable;
-        const out_bytes: u32 = @intCast(out.len * @sizeOf(f32));
-        const out_buf = GpuTensor.create(out_bytes);
-        wasm_extern.add(a_buf, b_buf, out_buf.id, @intCast(out.len));
-        return out_buf;
-    }
-
     fn gpuGelu(
         inp_buf: wasm_extern.GpuBufferId,
         out: []f32,
@@ -4106,24 +4094,6 @@ pub const WasmCompute = struct {
             wasm_extern.logSoftmax(inp_buf, out_buf.id, @intCast(rows), @intCast(dim));
         } else {
             wasm_extern.softmax(inp_buf, out_buf.id, @intCast(rows), @intCast(dim));
-        }
-        return out_buf;
-    }
-
-    fn gpuReduceLastDim(
-        inp_buf: wasm_extern.GpuBufferId,
-        rows: usize,
-        dim: usize,
-        out: []f32,
-        comptime mode: enum { sum, max, mean },
-    ) GpuTensor {
-        if (!build_options.enable_webgpu) unreachable;
-        const out_bytes: u32 = @intCast(out.len * @sizeOf(f32));
-        const out_buf = GpuTensor.create(out_bytes);
-        switch (mode) {
-            .sum => wasm_extern.reduceSumLastDim(inp_buf, out_buf.id, @intCast(rows), @intCast(dim)),
-            .max => wasm_extern.reduceMaxLastDim(inp_buf, out_buf.id, @intCast(rows), @intCast(dim)),
-            .mean => wasm_extern.reduceMeanLastDim(inp_buf, out_buf.id, @intCast(rows), @intCast(dim)),
         }
         return out_buf;
     }
@@ -5427,27 +5397,31 @@ pub const WasmCompute = struct {
         .sampleLastRow = sampleLastRowOp,
         .linearNoBiasArgmaxLastRow = linearNoBiasArgmaxLastRowOp,
         .linearNoBiasArgmaxLastRowTensor = linearNoBiasArgmaxLastRowTensorOp,
-        .decoderRuntimePrepareGreedy = decoderRuntimePrepareGreedyOp,
-        .decoderRuntimeResetState = decoderRuntimeResetStateOp,
-        .decoderRuntimePrepareAbsoluteEmbeddings = decoderRuntimePrepareAbsoluteEmbeddingsOp,
-        .decoderRuntimeEmbedAbsolutePosition = decoderRuntimeEmbedAbsolutePositionOp,
-        .decoderRuntimePrepareLayerNorm = decoderRuntimePrepareLayerNormOp,
-        .decoderRuntimeApplyLayerNorm = decoderRuntimeApplyLayerNormOp,
-        .decoderRuntimePrepareRmsNorm = decoderRuntimePrepareRmsNormOp,
-        .decoderRuntimeApplyRmsNorm = decoderRuntimeApplyRmsNormOp,
-        .decoderRuntimeApplyLayerNormLinear = decoderRuntimeApplyLayerNormLinearOp,
-        .decoderRuntimeApplyLayerNormLinearArgmax = decoderRuntimeApplyLayerNormLinearArgmaxOp,
-        .decoderRuntimeApplyLayerNormLinearSample = decoderRuntimeApplyLayerNormLinearSampleOp,
-        .decoderRuntimeApplyRmsNormLinear = decoderRuntimeApplyRmsNormLinearOp,
-        .decoderRuntimeApplyRmsNormLinearArgmax = decoderRuntimeApplyRmsNormLinearArgmaxOp,
-        .decoderRuntimeApplyRmsNormLinearSample = decoderRuntimeApplyRmsNormLinearSampleOp,
-        .decoderRuntimePrepareLinear = decoderRuntimePrepareLinearOp,
-        .decoderRuntimeApplyLinear = decoderRuntimeApplyLinearOp,
-        .decoderRuntimeApplyLinearArgmax = decoderRuntimeApplyLinearArgmaxOp,
-        .decoderRuntimeApplyLinearPair = decoderRuntimeApplyLinearPairOp,
-        .decoderRuntimeApplyLinearQkv = decoderRuntimeApplyLinearQkvOp,
-        .decoderRuntimeApplyActivation = decoderRuntimeApplyActivationOp,
-        .decoderRuntimeApplyAdd = decoderRuntimeApplyAddOp,
+        .regions = .{
+            .decoder = .{
+                .prepareGreedy = decoderRuntimePrepareGreedyOp,
+                .resetState = decoderRuntimeResetStateOp,
+                .prepareAbsoluteEmbeddings = decoderRuntimePrepareAbsoluteEmbeddingsOp,
+                .embedAbsolutePosition = decoderRuntimeEmbedAbsolutePositionOp,
+                .prepareLayerNorm = decoderRuntimePrepareLayerNormOp,
+                .applyLayerNorm = decoderRuntimeApplyLayerNormOp,
+                .prepareRmsNorm = decoderRuntimePrepareRmsNormOp,
+                .applyRmsNorm = decoderRuntimeApplyRmsNormOp,
+                .applyLayerNormLinear = decoderRuntimeApplyLayerNormLinearOp,
+                .applyLayerNormLinearArgmax = decoderRuntimeApplyLayerNormLinearArgmaxOp,
+                .applyLayerNormLinearSample = decoderRuntimeApplyLayerNormLinearSampleOp,
+                .applyRmsNormLinear = decoderRuntimeApplyRmsNormLinearOp,
+                .applyRmsNormLinearArgmax = decoderRuntimeApplyRmsNormLinearArgmaxOp,
+                .applyRmsNormLinearSample = decoderRuntimeApplyRmsNormLinearSampleOp,
+                .prepareLinear = decoderRuntimePrepareLinearOp,
+                .applyLinear = decoderRuntimeApplyLinearOp,
+                .applyLinearArgmax = decoderRuntimeApplyLinearArgmaxOp,
+                .applyLinearPair = decoderRuntimeApplyLinearPairOp,
+                .applyLinearQkv = decoderRuntimeApplyLinearQkvOp,
+                .applyActivation = decoderRuntimeApplyActivationOp,
+                .applyAdd = decoderRuntimeApplyAddOp,
+            },
+        },
         .runDenseFfnResidual = runDenseFfnResidualOp,
         .runGatedFfnResidual = runGatedFfnResidualOp,
         .runAttention = runAttentionOp,

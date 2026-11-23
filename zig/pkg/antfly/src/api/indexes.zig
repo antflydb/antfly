@@ -86,6 +86,8 @@ pub fn addIndexToTableIndexesJsonWithIo(
     // endpoint; migration creates B, waits for completeness, then swaps A's alias.
     const privacy = @import("antfly_local_sources").privacy_catalog;
     try privacy.validateUserConfiguration(alloc, index_json);
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name) or
+        !@import("antfly_local_sources").api_index_metadata.isValidIndexName(index_name)) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     if (current.value != .object) return error.InvalidTableIndexMetadata;
@@ -380,6 +382,7 @@ pub fn addEnrichmentToTableIndexesJson(
     };
     if (config.value != .object) return error.InvalidExtensionEnrichment;
     try validateEmbeddingCardinality(root, enrichment_name, config.value);
+    try @import("enrichment_catalog_update.zig").inheritProducer(config.arena.allocator(), root, enrichment_name, &config.value);
     const inherited_producer = try inheritedInlineEmbeddingProducerAlloc(alloc, root, enrichment_name, config.value);
     defer if (inherited_producer) |value| alloc.free(value);
     if (inherited_producer) |value| try config.value.object.put(config.arena.allocator(), "producer_json", .{ .string = value });
@@ -946,7 +949,7 @@ pub fn encodeLakeIndexListWithProof(alloc: std.mem.Allocator, table: metadata_ta
         defer columns.deinit();
         if (schema.relational_indexes) |definitions| for (definitions.value) |definition| {
             if (configs.object.contains(definition.name)) return error.InvalidTableIndexMetadata;
-            const json = try @import("relational_index_mutation.zig").configForDefinition(a, definition, &columns);
+            const json = try @import("relational_index/mutation.zig").configForDefinition(a, definition, &columns);
             try configs.object.put(a, definition.name, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
         };
     }
@@ -8556,6 +8559,16 @@ fn consumerTests() type {
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, repaired, .{});
             defer parsed.deinit();
             try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("enrichments").?.array.items.len);
+            const policy_only = try addEnrichmentToTableIndexesJson(alloc, repaired, "units",
+                \\{"name":"units","kind":"asset","field":"url","content_type":"application/json","execution":{"max_output_tokens_per_item":8192}}
+            );
+            defer alloc.free(policy_only);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, policy_only);
+            var policy_parsed = try std.json.parseFromSlice(std.json.Value, alloc, policy_only, .{});
+            defer policy_parsed.deinit();
+            const declaration = policy_parsed.value.object.get("enrichments").?.array.items[0];
+            try std.testing.expectEqualStrings("{\"type\":\"document_extraction\",\"config\":{}}", declaration.object.get("producer_json").?.string);
+            try std.testing.expectEqual(@as(i64, 8192), declaration.object.get("execution").?.object.get("max_output_tokens_per_item").?.integer);
             const dropped = (try removeIndexFromTableIndexesJson(alloc, repaired, "document_text")).?;
             defer alloc.free(dropped);
             try validateArtifactEnrichmentsForTableIndexesJson(alloc, dropped);

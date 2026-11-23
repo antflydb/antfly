@@ -98,7 +98,7 @@ const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi 
 else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
-const relational_store = @import("../relational_store.zig");
+const relational_store = @import("../relational/rows/store.zig");
 
 var activity_epoch_salt = @import("antfly_platform").atomic.Value(u64).init(1);
 
@@ -7282,7 +7282,11 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
         if (!privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null) {
             var read = try runtime.store.beginProbe();
             defer read.abort();
-            if (try ordered_publication.authority(&read) == null) try requireLocalAssetSourceWithAllocator(runtime, alloc, &read, request.doc_key, request.upstream_artifact_name, parent, bytes);
+            if (try ordered_publication.authority(&read) == null) {
+                const upstream_source_text = try declaredSourceTextAlloc(runtime, request.doc_key, parent, request.upstream_artifact_name);
+                defer runtime.alloc.free(upstream_source_text);
+                try requireLocalAssetSourceWithAllocator(runtime, alloc, &read, request.doc_key, request.upstream_artifact_name, upstream_source_text, bytes);
+            }
         }
     };
     // A replay window can contain a newer update for the same document. Keep
@@ -7695,7 +7699,16 @@ fn mutateMediaPassOnce(runtime: *EnrichmentRuntime, cursor_key: []const u8, expe
         for (deletes) |key| try lease.guard_key(lease.ptr, key);
     }
     const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
-    var txn = try live.beginWrite();
+    // Ride-along, not a standalone commit+sync (lite-single-commit-write-path.md
+    // §3.2a): the media-pass cursor/page records are private worker
+    // preparation, never chunk artifacts, and are read back and resumed from
+    // on restart (see `media_pass.zig`'s doc comment) -- losing one in a
+    // crash just means a restart re-derives a bounded amount of recompute
+    // from the last durable cursor, exactly like the rebuild-from-progress
+    // ride-along work this design already covers. The next foreground
+    // group's fsync (or the idle-flush timer) makes this durable; it must
+    // never force its own sync.
+    var txn = try live.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
     const current = txn.get(cursor_key) catch |err| if (err == error.NotFound) null else return err;
@@ -7717,7 +7730,6 @@ fn mutateMediaPassOnce(runtime: *EnrichmentRuntime, cursor_key: []const u8, expe
     for (deletes) |key| txn.delete(key) catch |err| if (err != error.NotFound) return err;
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
     try txn.commit();
-    try live.sync(false);
 }
 
 fn retireMediaPassForDenseRequest(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest) !void {
@@ -8214,6 +8226,9 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
             cursor_bytes = retained_checkpoint;
             cursor = next;
         }
+        // Stop this attempt at the blocked ordinal. A later attempt can
+        // replay the acknowledged rows and recheck the provider's limits.
+        if (!replaying) if (page.terminal) |terminal| return terminal.failure();
         // Do not freeze retryable result receipts into an accepted immutable
         // parent. The saved page keeps healthy model work while only gaps retry.
         if (pending_index) return error.IncompleteChunkCoverage;
@@ -12607,6 +12622,7 @@ const SharedPdfWindowScheduler = struct {
         consumer.config = try document_extraction_mod.parseConfig(alloc, outer.config_json);
         consumer.owned_config = true;
         applyDocumentExtractionRuntimePolicy(&consumer.config);
+        try document_extraction_mod.applyExecutionPolicy(alloc, &consumer.config, request.execution_json);
         try document_extraction_mod.applySourceMetadataFromJson(alloc, &consumer.config, raw);
         if (!document_extraction_mod.ocrEnabledForRoute(consumer.config, "pdf")) return;
         // Custom dispatch may select a non-PDF extractor even for PDF bytes.
@@ -12707,6 +12723,7 @@ const SharedPdfWindowScheduler = struct {
             var other = document_extraction_mod.parseConfig(self.runtime.alloc, outer.config_json) catch continue;
             defer other.deinit(self.runtime.alloc);
             applyDocumentExtractionRuntimePolicy(&other);
+            try document_extraction_mod.applyExecutionPolicy(self.runtime.alloc, &other, request.execution_json);
             try document_extraction_mod.applySourceMetadataFromJson(self.runtime.alloc, &other, raw);
             if (other.routes.len != 0 or other.route_preset != .mixed_files or
                 !std.mem.eql(u8, config.credentials, other.credentials) or
@@ -15336,6 +15353,7 @@ const DocumentPreparationPipeline = struct {
             if (job.budgeted) |*budgeted|
                 job.reclaimer_id = try budgeted.reservation.manager.registerReclaimer(.document_extraction_working_set, job, Job.reclaim);
             applyDocumentExtractionRuntimePolicy(&job.config);
+            try document_extraction_mod.applyExecutionPolicy(description, &job.config, request.execution_json);
             if (self.runtime.config.remote_content) |remote| job.remote_snapshot = try remote.acquire();
             if (job.remote_snapshot) |snapshot| job.remote_config = snapshot.config.*;
             job.remote_config.runtime = null;
@@ -17585,7 +17603,9 @@ fn processAsset(
             if (!privacy.isProtectedArtifactName(request.upstream_artifact_name) and privacy.consumerPolicyVersion(request.upstream_artifact_name) == null) {
                 var read = try runtime.store.beginProbe();
                 defer read.abort();
-                try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, raw, value);
+                const upstream_source_text = try declaredSourceTextAlloc(runtime, request.doc_key, raw, request.upstream_artifact_name);
+                defer runtime.alloc.free(upstream_source_text);
+                try requireLocalAssetSource(runtime, &read, request.doc_key, request.upstream_artifact_name, upstream_source_text, value);
             }
         }
         break :blk bytes;
@@ -17711,7 +17731,14 @@ fn processAsset(
 
     if (producer_cfg.type == .copy) {
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, source_text);
-        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, source_text)) {
+        // Same reasoning as the generic producer's receipt below: key the
+        // reuse receipt on the declared source (`source_text`), not the
+        // whole primary document (`raw`), so an edit to an unrelated field
+        // doesn't invalidate it -- unless a graph index extracts relations
+        // from this artifact, in which case the receipt must track the
+        // exact primary revision (see `artifactFeedsGraph`'s doc comment).
+        const reuse_parent = if (runtime.index_manager.artifactFeedsGraph(artifact_name)) raw else source_text;
+        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, reuse_parent, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
             // The artifact exists and is current: produced coverage, so an
@@ -17723,7 +17750,7 @@ fn processAsset(
         const receipt_key = try local.key(runtime.alloc, key);
         defer runtime.alloc.free(receipt_key);
         const producer_recipe = local.requestRecipe(request);
-        const receipt = local.encode(producer_recipe, raw, source_text);
+        const receipt = local.encode(producer_recipe, reuse_parent, source_text);
         try storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe });
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
@@ -17783,7 +17810,19 @@ fn processAsset(
         const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
-            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
+            // Same reasoning as the `.copy` branch above: key the reuse
+            // receipt on the declared source (`source_text`), which
+            // `shouldSkipAssetProducer` just proved unchanged, not the
+            // whole primary document (`raw`) -- otherwise an edit to an
+            // unrelated field silently defeats the skip this check exists
+            // to provide (`storePutBatchGuarded`'s separate fencing digest,
+            // a few lines below in the write path, still keys on `raw` to
+            // guard against a genuinely concurrent primary change) --
+            // unless a graph index extracts relations from this artifact,
+            // in which case the receipt must track the exact primary
+            // revision (see `artifactFeedsGraph`'s doc comment).
+            const reuse_parent = if (runtime.index_manager.artifactFeedsGraph(artifact_name)) raw else source_text;
+            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, reuse_parent, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
                 try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
                 try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
                 // Private outputs also require their destination-owned witness.
@@ -17802,6 +17841,12 @@ fn processAsset(
                 runtime.alloc.free(producer_cfg.config_json);
                 producer_cfg.config_json = updated;
             }
+        }
+    }
+    if (producer_cfg.type == .reader or producer_cfg.type == .generator) {
+        if (try enrichment_types.withGenerationBudgetAlloc(runtime.alloc, producer_cfg.config_json, request.execution_json)) |updated| {
+            runtime.alloc.free(producer_cfg.config_json);
+            producer_cfg.config_json = updated;
         }
     }
     const config_json = producer_cfg.config_json;
@@ -18878,13 +18923,27 @@ fn repairMediaOutputPage(runtime: *EnrichmentRuntime, request: enrichment_types.
             batch.failure = err;
             break :blk null;
         };
-        for (chunks[first..end]) |chunk| repairMediaOutputPrepared(runtime, request, raw_doc, request.chunker_json, stage_prefix, name, chunk.metadata.?, current_output, &batch) catch |err| {
+        const covered_end = if (batch.page) |page| covered: {
+            const start = metadata.descriptor.ordinal;
+            if (page.start_ordinal != start or page.covered_through_ordinal <= start or page.covered_through_ordinal - start > end - first) return error.InvalidChunkOutput;
+            break :covered first + @as(usize, @intCast(page.covered_through_ordinal - start));
+        } else end;
+        // A failed retry without any coverage leaves current receipts intact.
+        if (batch.failure) |err| {
+            if (@import("inference_chunker").types.ChunkPage.Terminal.fromError(err) != null) return err;
+            switch (err) {
+                error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded => return err,
+                else => {},
+            }
+        }
+        for (chunks[first..covered_end]) |chunk| repairMediaOutputPrepared(runtime, request, raw_doc, request.chunker_json, stage_prefix, name, chunk.metadata.?, current_output, &batch) catch |err| {
             if (err != error.IncompleteChunkCoverage) return err;
             retry = true;
         };
         try persistMediaRepairs(runtime, request, raw_doc, stage_prefix, name, pending.updates.items);
         _ = decision_arena.reset(.retain_capacity);
-        first = end;
+        if (batch.page) |page| if (page.terminal) |terminal| return terminal.failure();
+        first = covered_end;
     }
     return retry;
 }
@@ -19494,7 +19553,24 @@ fn applyAssetProducerBatchOutput(
     const receipt_key = try local.key(runtime.alloc, item.artifact_key);
     defer runtime.alloc.free(receipt_key);
     const producer_recipe = local.requestRecipe(item.request);
-    const receipt = local.encode(producer_recipe, item.raw_doc, validated);
+    // This receipt's "parent" proves the output was produced from exactly
+    // this input, for `reusableLocalAsset`'s skip-the-provider check
+    // (`requireLocalAssetSource` reads it back). That input is the
+    // producer's own declared source (`item.source_text`, already what
+    // `shouldSkipAssetProducer`'s state-value check keys its skip decision
+    // on), not the whole primary document (`item.raw_doc`, which also
+    // carries fields the producer never saw, e.g. doc_key's own metadata
+    // consumed by nothing it depends on) -- the matching privacy witness a
+    // few lines above already makes exactly this choice for its own
+    // non-private-consumer case. Keying this receipt on `item.raw_doc`
+    // instead invalidated it on every unrelated field edit, silently
+    // defeating the skip (the duplicate work `shouldSkipAssetProducer`
+    // already proved is unnecessary) on every such edit -- unless a graph
+    // index extracts relations from this artifact, in which case the
+    // receipt must track the exact primary revision instead (see
+    // `IndexManager.artifactFeedsGraph`'s doc comment).
+    const receipt_parent = if (runtime.index_manager.artifactFeedsGraph(requestArtifactName(item.request))) item.raw_doc else item.source_text;
+    const receipt = local.encode(producer_recipe, receipt_parent, validated);
     try writes.append(runtime.alloc, .{ .key = receipt_key, .value = &receipt });
     try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe });
 
@@ -19600,6 +19676,7 @@ fn processDocumentExtractionAsset(
     var config = try document_extraction_mod.parseConfig(runtime.alloc, config_json);
     defer config.deinit(runtime.alloc);
     applyDocumentExtractionRuntimePolicy(&config);
+    try document_extraction_mod.applyExecutionPolicy(runtime.alloc, &config, request.execution_json);
     try document_extraction_mod.applySourceMetadataFromJson(runtime.alloc, &config, raw_doc);
 
     const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
@@ -19682,6 +19759,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -19712,6 +19790,7 @@ fn processDocumentExtractionAsset(
                 previous_child_ranges,
                 existing_state,
                 from_generation,
+                request.execution_json,
                 window,
             );
             try recordIsolatedRequestErrorFor(runtime, window, request, error.RemoteDocumentFetchFailed, scope.attemptNumber(runtime));
@@ -19744,6 +19823,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, raw_err, scope.attemptNumber(runtime));
@@ -19831,6 +19911,7 @@ fn processDocumentExtractionAsset(
                 previous_child_ranges,
                 existing_state,
                 from_generation,
+                request.execution_json,
                 window,
             );
             try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -19986,6 +20067,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -20143,6 +20225,7 @@ fn processDocumentExtractionAsset(
         ocr_failure_details[index] = summary.borrowed();
     }
     const streamed_extraction = document_extraction_mod.Result{
+        .execution_json = request.execution_json,
         .content_type = collect_ctx.info.content_type,
         .route_type = collect_ctx.info.route_type,
         .unsupported_reason = collect_ctx.info.unsupported_reason,
@@ -20214,6 +20297,7 @@ fn processDocumentExtractionAsset(
             previous_child_ranges,
             existing_state,
             from_generation,
+            request.execution_json,
             window,
         );
         try recordIsolatedRequestErrorFor(runtime, window, request, err, scope.attemptNumber(runtime));
@@ -20377,6 +20461,7 @@ fn writeDocumentExtractionFailureManifest(
     previous_child_ranges: []const types.DocumentArtifactChildRange,
     existing_state: ?[]const u8,
     from_generation: u64,
+    execution_json: []const u8,
     window: *GeneratedReplayWindow,
 ) !void {
     var previous_state = RuntimeDocumentExtractionPreviousState{};
@@ -20387,6 +20472,7 @@ fn writeDocumentExtractionFailureManifest(
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
     const failed_extraction = document_extraction_mod.Result{
+        .execution_json = execution_json,
         .content_type = @constCast(content_type),
         .route_type = @constCast("error"),
         .units = @constCast(empty_units[0..]),
@@ -37637,6 +37723,10 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldString(alloc, &out, &first, "source_fingerprint", fingerprint);
     try appendJsonFieldString(alloc, &out, &first, "content_type", extraction.content_type);
     try appendJsonFieldString(alloc, &out, &first, "route_type", extraction.route_type);
+    if (extraction.execution_json.len > 0) {
+        try appendJsonFieldName(alloc, &out, &first, "execution");
+        try out.appendSlice(alloc, extraction.execution_json);
+    }
     if (extraction.unsupported_reason.len > 0) {
         try appendJsonFieldString(alloc, &out, &first, "unsupported_reason", extraction.unsupported_reason);
     }
@@ -40757,6 +40847,100 @@ const LocalSourceFence = struct {
     producer_recipe: ?[32]u8 = null,
 };
 
+/// Recomputes what `name`'s own asset producer currently declares as its
+/// source text from `raw` -- the same quantity `processAsset`'s own
+/// self-check sites (the `.copy` branch, the generic producer branch, and
+/// `applyAssetProducerBatchOutput`) now encode their receipt's "parent"
+/// against (see their comments), rather than the whole primary document.
+/// `requireLocalAssetSource`'s callers that validate a *different*
+/// artifact's (`name`'s) receipt -- not their own -- must pass this, not
+/// `raw` directly, or the comparison permanently mismatches for any
+/// producer whose declared source narrows `raw` (almost all of them):
+/// the stored receipt was encoded against the producer's own source text,
+/// never against the whole document.
+///
+/// `name` can itself be a `source_artifact_name`-consuming producer (an
+/// asset chained off another asset, e.g. a `.copy` mirroring a `generator`'s
+/// output). In that shape its declared source is not extracted from `raw`
+/// at all -- it is whatever its own upstream most recently published
+/// (optionally narrowed by its own source_field/source_template on top of
+/// that, exactly as `processAsset`'s `consumes_upstream` block builds
+/// `source_text`) -- so this walks the chain one hop at a time rather than
+/// extracting from `raw` directly. A bounded hop count guards against a
+/// misconfigured catalog cycle; it is not expected to ever bind in practice
+/// (the catalog itself has no such cycles).
+///
+/// A grouped-source producer (`group_source_json` set) synthesizes its
+/// input from more than this helper can reconstruct here; fall back to
+/// `raw` there (and on any extraction error, or a missing upstream output)
+/// rather than guess -- a false "changed" signal only costs one harmless
+/// extra check, where a false "unchanged" would wrongly accept a stale
+/// witness.
+fn declaredSourceTextAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8, raw: []const u8, name: []const u8) ![]const u8 {
+    const entry = runtime.index_manager.getEnrichment(.asset, name) orelse return try runtime.alloc.dupe(u8, raw);
+    // `name`'s own source, and the value any source_field/source_template
+    // of its own narrows: `raw` directly, unless `name` itself consumes
+    // another asset (`source_artifact_name` set) rather than a field of
+    // `raw` -- mirrored from the same `consumes_upstream` shape in
+    // `processAsset`. One hop is enough regardless of how deep the chain
+    // above `name` goes: whatever `name`'s own immediate upstream most
+    // recently published is already the correct narrowing input, however
+    // that upstream itself arrived at it. A group root has no upstream
+    // asset of its own (`source_artifact_name` is empty), so this also
+    // narrows it the same way: its catalog `source_field` is the literal
+    // "_group_unit" key (see index_manager's group-kind compilation), and
+    // extracting that from `raw` below reproduces exactly the bytes
+    // `processAsset` hashed as both parent and output when it wrote this
+    // artifact's receipt. Returning `raw` unnarrowed here, as a prior
+    // version of this function did, hashed the whole grouped-unit document
+    // as "parent" while the receipt was written against only the
+    // "_group_unit" sub-object, so this check never matched and the
+    // consumer never advanced past `error.EnrichmentSourceChanged`.
+    const source_input = if (entry.source_artifact_name.len == 0) raw else blk: {
+        const upstream_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", entry.source_artifact_name);
+        defer runtime.alloc.free(upstream_key);
+        break :blk (try storeGetOptionalAllocWithRetry(runtime, upstream_key)) orelse return try runtime.alloc.dupe(u8, raw);
+    };
+    defer if (entry.source_artifact_name.len != 0) runtime.alloc.free(@constCast(source_input));
+    const base: []const u8 = base: {
+        if (entry.source_field.len == 0 and entry.source_template.len == 0) break :base try runtime.alloc.dupe(u8, source_input);
+        const synthetic = enrichment_types.GeneratedEnrichmentRequest{
+            .kind = .asset,
+            .index_name = "",
+            .doc_key = "",
+            .source_field = entry.source_field,
+            .source_template = entry.source_template,
+        };
+        const extracted = extractAssetSourceValue(runtime.alloc, runtime.config, source_input, synthetic) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return try runtime.alloc.dupe(u8, raw),
+        };
+        break :base extracted orelse return try runtime.alloc.dupe(u8, raw);
+    };
+    // Mirrors `processAsset`'s own composition: a non-`.copy` producer with
+    // neighbor-context configured joins its same-shard graph adjacency onto
+    // its source text before that text is ever hashed into a receipt (see
+    // the `.copy` early return above that comment in `processAsset`, and
+    // the `std.mem.join(alloc, "\n", &.{ source_text, block })` just below
+    // it) -- so the declared source `name` actually wrote its receipt
+    // against already includes this block, not just the extracted field.
+    if (entry.neighbor_context_json.len == 0) return base;
+    const producer_cfg = asset_producer_mod.parseProducerConfig(runtime.alloc, entry.producer_json) catch return base;
+    defer @constCast(&producer_cfg).deinit(runtime.alloc);
+    if (producer_cfg.type == .copy or !enrichment_config_validation.producerConsumesPromptText(producer_cfg.type)) return base;
+    const neighbor_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .asset,
+        .index_name = "",
+        .doc_key = doc_key,
+        .source_field = "",
+        .neighbor_context_json = entry.neighbor_context_json,
+    };
+    const block = (neighborContextBlockAlloc(runtime, neighbor_request) catch return base) orelse return base;
+    defer runtime.alloc.free(block);
+    defer runtime.alloc.free(@constCast(base));
+    return try std.mem.join(runtime.alloc, "\n", &.{ base, block });
+}
+
 fn requireLocalAssetSource(runtime: *EnrichmentRuntime, txn: anytype, doc_key: []const u8, name: []const u8, parent: []const u8, output: []const u8) !void {
     return requireLocalAssetSourceWithAllocator(runtime, runtime.alloc, txn, doc_key, name, parent, output);
 }
@@ -40767,7 +40951,7 @@ fn requireLocalAssetSourceWithAllocator(runtime: *EnrichmentRuntime, alloc: Allo
     const entry = runtime.index_manager.getEnrichment(.asset, name) orelse return error.InvalidEnrichmentConfig;
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
     defer alloc.free(key);
-    try local.require(alloc, txn, key, local.recipe(entry), parent, output);
+    try local.requireCompatible(alloc, txn, key, local.recipe(entry), local.legacyRecipe(entry), parent, output);
 }
 
 fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: LocalSourceFence) !void {
@@ -40793,7 +40977,9 @@ fn validateLocalSourceFence(runtime: *EnrichmentRuntime, txn: anytype, guard: Lo
         defer runtime.alloc.free(upstream_key);
         const output = txn.get(upstream_key) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
         if (!std.mem.eql(u8, &expected, &sourceRecordDigest(output))) return error.EnrichmentSourceChanged;
-        try requireLocalAssetSource(runtime, txn, guard.doc_key, guard.upstream_name, logical orelse return error.EnrichmentSourceChanged, output);
+        const upstream_source_text = try declaredSourceTextAlloc(runtime, guard.doc_key, logical orelse return error.EnrichmentSourceChanged, guard.upstream_name);
+        defer runtime.alloc.free(upstream_source_text);
+        try requireLocalAssetSource(runtime, txn, guard.doc_key, guard.upstream_name, upstream_source_text, output);
     }
 }
 
@@ -42767,8 +42953,28 @@ fn testOrderedDirectProducerCarry(dense: bool, reprocess_generation: u64) !void 
         defer decoded.deinit();
         index += 1;
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const retained = (try publication.historyAfter(alloc, &read, 0)) orelse return error.TestUnexpectedResult;
+        try expect.expectEqual(decoded.command.publication_digest, retained.publication_digest);
+        try expect.expectEqual(@as(u64, 1), try publication.historyHead(&read));
     }
     try Step.run(runtime, dense, request, &cache, &sources, &window);
+    try expect.expectEqual(@as(usize, 1), harness.provider_calls);
+    // Updating operational policy must preserve the exact authority and the
+    // accepted causal proof, not just a high-level config hash.
+    var policy_cfg = (try db.getEnrichment(alloc, .embedding, "model")).?;
+    defer policy_cfg.deinit(alloc);
+    policy_cfg.execution = .{ .batch_items = 2 };
+    _ = try db.upsertEnrichment(policy_cfg);
+    var updated_pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer updated_pin.release();
+    try expect.expect(updated_pin.plan().matchesArtifactInventory(catalog.catalogs));
+    var updated_request = updated_pin.plan().generated_templates[0];
+    updated_request.doc_key = "doc";
+    updated_request.reprocess_generation = reprocess_generation;
+    try Step.run(runtime, dense, updated_request, &cache, &sources, &window);
     try expect.expectEqual(@as(usize, 1), harness.provider_calls);
     const first = blk: {
         var read = try db.core.store.beginReadTxn();
@@ -45217,10 +45423,29 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
         .doc_key = "blocked",
         .source_field = "body",
         .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        // Must match byte-for-byte what `enrichmentFromPublic` serializes
+        // for the registered entry below via `std.json.Stringify.valueAlloc`
+        // with default options: `emit_null_optional_fields` defaults to
+        // `true`, so `EnrichmentExecutionConfig`'s unset `max_document_pages`
+        // is emitted as an explicit `null`, not omitted.
         .execution_json = "{\"batch_items\":8,\"batch_bytes\":1,\"max_document_pages\":null}",
         .sequence = 7,
     };
-    try manager.addEnrichment(&store, .{ .name = request.artifact_name, .kind = .asset, .field = request.source_field, .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 1 } });
+    // `applyAssetProducerBatchOutput`'s write fences every non-token asset
+    // write (`storePutBatchGuarded` -> `validateLocalSourceFence`) against
+    // a registered catalog entry whose recipe (producer_json/source_field/
+    // execution_json/...) matches this request's own fields exactly, and
+    // against a stored source document matching `item.raw_doc`'s digest
+    // (pre-existing fencing, unrelated to any change in this task -- this
+    // bare `IndexManager`/`mem_backend` fixture just never satisfied it).
+    // `Harness.item` always sets the same raw_doc regardless of doc_key, so
+    // one write covers every doc_key used below.
+    for ([_][]const u8{ "healthy-a", "healthy-b", "bounded-a", "bounded-b", "healthy-serial" }) |doc_key| {
+        const source_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+        defer alloc.free(source_key);
+        try storePutBatch(&runtime, &.{.{ .key = source_key, .value = "{\"body\":\"large retained document\"}" }}, &.{});
+    }
+    try manager.addEnrichment(&erased_store, .{ .name = "generated", .kind = .asset, .field = "body", .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 1 } });
     // There is deliberately no document in the store. Planning must retain
     // the request, not read/materialize it or invoke the provider.
     try processAssetOrDefer(&runtime, request, &queued, &prepared_sources, &window);
@@ -45252,12 +45477,14 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     try std.testing.expectEqual(requestFailureFingerprint(request), batch.retry_fingerprint);
     // Two individually admissible items must flush at the byte boundary even
     // though the item-count limit allows eight. Account for raw/state bytes,
-    // not just the much smaller text sent to the provider.
+    // not just the much smaller text sent to the provider. The recipe fence
+    // hashes execution_json too, so the registered entry must track this
+    // batch-size override to keep matching these requests' own fields.
+    _ = try manager.upsertEnrichment(&erased_store, .{ .name = "generated", .kind = .asset, .field = "body", .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 128 } });
     for ([_][]const u8{ "bounded-a", "bounded-b" }, 0..) |source, i| {
         var next = request;
         next.doc_key = source;
         next.execution_json = "{\"batch_items\":8,\"batch_bytes\":128,\"max_document_pages\":null}";
-        _ = try manager.upsertEnrichment(&store, .{ .name = next.artifact_name, .kind = .asset, .field = next.source_field, .producer_json = next.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 128 } });
         const item = try Harness.item(alloc, next, source);
         try std.testing.expect(assetProducerRetainedBytes(item) < 128);
         try std.testing.expect(assetProducerRetainedBytes(item) * 2 > 128);
@@ -45271,8 +45498,10 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     try std.testing.expectEqual(@as(u64, 4), harness.publications);
 
     // Serial compatibility must not let a retryable first item starve an
-    // independent sibling in the same bounded batch either.
-    _ = try manager.upsertEnrichment(&store, .{ .name = request.artifact_name, .kind = .asset, .field = request.source_field, .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 1 } });
+    // independent sibling in the same bounded batch either. `healthy_request`
+    // below reuses `request` unmodified, so the registered recipe must
+    // track back to its original execution_json.
+    _ = try manager.upsertEnrichment(&erased_store, .{ .name = "generated", .kind = .asset, .field = "body", .producer_json = request.producer_json, .execution = .{ .batch_items = 8, .batch_bytes = 1 } });
     const blocked = try Harness.item(alloc, request, "blocked");
     defer freeAssetProducerBatchItem(alloc, blocked);
     var healthy_request = request;
@@ -45425,7 +45654,12 @@ test "generic contextual asset publication keeps raw upstream identity" {
     defer alloc.free(upstream_key);
     const receipt_key = try local.key(alloc, upstream_key);
     defer alloc.free(receipt_key);
-    const parent = "{\"name\":\"Black Mountain College\"}";
+    // "upstream" is a `.copy` producer with `field: "name"`: its own
+    // receipt is encoded against the extracted field value ("Black
+    // Mountain College"), not the whole raw primary document -- see
+    // declaredSourceTextAlloc's doc comment and the .copy branch in
+    // processAsset it mirrors.
+    const parent = "Black Mountain College";
     const raw_upstream = "upstream input";
     const receipt = local.encode(local.recipe(upstream), parent, raw_upstream);
     try storePutBatchWithRetry(&runtime, &.{ .{ .key = upstream_key, .value = raw_upstream }, .{ .key = receipt_key, .value = &receipt } }, &.{});
@@ -47089,6 +47323,7 @@ test "model aware media pass resumes acknowledged pages after interruption and s
     const Fake = struct {
         calls: usize = 0,
         interrupted: bool = true,
+        terminal_first: bool = true,
         first_calls: usize = 0,
         stale: bool = false,
         revision: [64]u8 = @splat('4'),
@@ -47125,7 +47360,7 @@ test "model aware media pass resumes acknowledged pages after interruption and s
             errdefer a.free(plan);
             const fingerprint = try a.dupe(u8, "2222222222222222222222222222222222222222222222222222222222222222");
             errdefer a.free(fingerprint);
-            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1 };
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = ordinal, .covered_through_ordinal = ordinal + 1, .complete = ordinal == 1, .terminal = if (!probe and ordinal == 0 and self.terminal_first) .coded_window_budget_exceeded else null };
         }
     };
     var fake = Fake{};
@@ -47141,6 +47376,9 @@ test "model aware media pass resumes acknowledged pages after interruption and s
     var cfg = try chunking_types_mod.parseConfigFromSlice(alloc, request.chunker_json);
     defer cfg.deinit(alloc);
     cfg.max_chunks = 1;
+    try std.testing.expectError(error.ChunkCodedWindowBudgetExceeded, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    fake.terminal_first = false;
     try std.testing.expectError(error.ChunkRequestFailed, prepareModelPassChunks(&runtime, request, cfg, .{ .text = "original" }, source_key, sourceRecordDigest(raw), prefix));
     try std.testing.expectEqual(@as(usize, 1), fake.first_calls);
     fake.interrupted = false;
@@ -47266,14 +47504,26 @@ test "model aware media vector labels rebuild from stored vectors without media 
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, "{}");
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    // `IndexDocumentCheckpoint.mutate` fences every non-token asset write
+    // against the doc's own stored source record (see its `else` branch:
+    // no `producer_context` token here, so it reads `documentSourceStoreKeyAlloc`
+    // and compares against `item.raw_doc`'s digest). `processVectorLabels`
+    // below is called with `raw_doc = "{}"`, so the stored source must be
+    // exactly "{}" too, or the very first write returns EnrichmentSourceChanged
+    // before ever reaching the labels logic this test means to exercise.
+    const doc_source_key = try internal_keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(doc_source_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest }, .{ .key = doc_source_key, .value = "{}" } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const primary = try documentSourceStoreKeyAlloc(&runtime, "doc");
-    defer alloc.free(primary);
-    try storePutWithRetry(&runtime, primary, "{}");
+    // producer_json must match the registered "labels" enrichment's
+    // recipe exactly (validateLocalSourceFence hashes producer_json as
+    // part of the producer_recipe fence) -- the short form here used to
+    // omit the registered entry's "config" object entirely, which this
+    // fencing check (pre-existing, unrelated to any change in this task)
+    // now rejects as EnrichmentSourceChanged.
     var request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" };
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}", null, "{}", output_key, &window);
     {
@@ -47486,12 +47736,13 @@ test "model aware media output repairs retain healthy vectors and persist indepe
         calls: usize = 0,
         fail: bool = false,
         revision_override: ?[]const u8 = null,
+        page_cap: usize = std.math.maxInt(usize),
         recipe_template: *C.types.ModelMetadata,
         results: []const output_types.Result,
         fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: C.Input, cfg: chunking_types_mod.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!C.types.ChunkPage {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
-            try std.testing.expectEqual(@as(usize, 0), if (cfg.replay) |replay| replay.ordinal else 0);
+            const start = if (cfg.replay) |replay| replay.ordinal else 0;
             var config = try std.json.parseFromSlice(output_types.Config, a, cfg.outputs_json, .{});
             defer config.deinit();
             try std.testing.expect(!config.value.targets[0].execute and config.value.targets[1].execute == (cfg.replay != null));
@@ -47512,24 +47763,24 @@ test "model aware media output repairs retain healthy vectors and persist indepe
             var metadata = self.recipe_template.*;
             metadata.embedding = null;
             metadata.outputs_json = outputs_json;
-            const count: usize = if (cfg.replay != null) cfg.max_chunks else 1;
+            const count: usize = if (cfg.replay != null) @min(cfg.max_chunks, self.page_cap) else 1;
             const chunks = try a.alloc(C.Chunk, count);
             errdefer a.free(chunks);
             var initialized: usize = 0;
             errdefer for (chunks[0..initialized]) |*chunk| chunk.deinit(a);
             for (chunks, 0..) |*chunk, i| {
-                metadata.descriptor.ordinal = i;
-                const inference_id = try std.fmt.allocPrint(a, "{s}:{d}", .{ metadata.plan_id, i });
+                metadata.descriptor.ordinal = start + i;
+                const inference_id = try std.fmt.allocPrint(a, "{s}:{d}", .{ metadata.plan_id, start + i });
                 defer a.free(inference_id);
                 metadata.inference_id = inference_id;
-                chunk.* = .{ .id = @intCast(i), .mime_type = "audio/wav", .metadata = try metadata.clone(a), .owns_metadata = true };
+                chunk.* = .{ .id = @intCast(start + i), .mime_type = "audio/wav", .metadata = try metadata.clone(a), .owns_metadata = true };
                 initialized += 1;
             }
             const plan = try a.dupe(u8, metadata.plan_id);
             errdefer a.free(plan);
             const fingerprint = try a.dupe(u8, metadata.source_fingerprint);
             errdefer a.free(fingerprint);
-            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = 0, .covered_through_ordinal = count, .complete = true };
+            return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = try a.dupe(u8, "v1"), .start_ordinal = start, .covered_through_ordinal = start + count, .complete = cfg.replay == null or count == cfg.max_chunks };
         }
     };
     var fake = Fake{ .recipe_template = &recipe_template, .results = &initial };
@@ -47762,18 +48013,18 @@ test "model aware media output repairs retain healthy vectors and persist indepe
     defer alloc.free(multi_cursor);
     try storePutBatchWithRetry(&runtime, &.{ .{ .key = cursor_key, .value = multi_cursor }, .{ .key = page_key, .value = multi_page } }, &.{});
     const before_batch = fake.calls;
-    var pending = MediaRepairAccumulator{ .arena = std.heap.ArenaAllocator.init(alloc) };
-    defer pending.deinit();
-    var batch = MediaRepairBatch{ .pending = &pending, .page = try prepareMediaRepairPage(&runtime, parsed_config, .{ .text = "original" }, "speech", originals[0].metadata.?, 3) };
-    defer batch.page.?.deinit(alloc);
-    for (&originals) |chunk| try repairMediaOutputPrepared(&runtime, request, raw, config, prefix, "speech", chunk.metadata.?, null, &batch);
-    try persistMediaRepairs(&runtime, request, raw, prefix, "speech", pending.updates.items);
+    fake.page_cap = 2;
+    var repair_request = request;
+    repair_request.chunker_json = config;
+    const speech_target = output_types.Target{ .name = "speech", .kind = .transcribe, .model = "whisper" };
+    try std.testing.expect(!try repairMediaOutputPage(&runtime, repair_request, raw, parsed_config, .{ .text = "original" }, prefix, "speech", speech_target, null, &originals));
+    fake.page_cap = std.math.maxInt(usize);
     const saved_cursor = (try storeGetOptionalAllocWithRetry(&runtime, cursor_key)).?;
     defer alloc.free(saved_cursor);
     var decoded_cursor = try std.json.parseFromSlice(media_pass.Cursor, alloc, try media_pass.payload(saved_cursor), .{});
     defer decoded_cursor.deinit();
-    try std.testing.expectEqual(@as(u64, 1), decoded_cursor.value.mutation_revision);
-    try std.testing.expectEqual(before_batch + 1, fake.calls);
+    try std.testing.expectEqual(@as(u64, 2), decoded_cursor.value.mutation_revision);
+    try std.testing.expectEqual(before_batch + 2, fake.calls);
     const saved_bytes = (try storeGetOptionalAllocWithRetry(&runtime, page_key)).?;
     defer alloc.free(saved_bytes);
     var saved_page = try media_pass.decodePage(alloc, saved_bytes);
@@ -48378,6 +48629,16 @@ test "model aware media ordered vector windows are searchable with exact clocks 
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
+    // Unlike sibling tests in this file that copy this same activation
+    // sequence to pin an *old* catalog baseline (effect_protocol = 15),
+    // this test's own "vectors" index is exactly a chunk-generated dense
+    // vector config (artifact_inventory.zig's onlineGeneratedChunkVectorConfig),
+    // which naturally computes to the current max, 18 -- the floor
+    // processOrderedChunkVectorWithAllocator's own execution_revision !=
+    // null and effect_protocol < 18 check requires before it will even
+    // reach the chunk-embedding-target compatibility error this test
+    // expects (error.IncompatibleChunkEmbeddingTarget). Pinning 15 here
+    // instead hits the earlier, unrelated error.OnlineMergeArtifactTailsUnsupported.
     catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
@@ -48767,7 +49028,12 @@ test "model aware media terminal scalar output acknowledges failure without mode
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    // Execution-bound model outputs require the v18 publication fence.
+    // This catalog's "vectors" index is exactly artifact_inventory.zig's
+    // onlineGeneratedChunkVectorConfig shape, which computes to the current
+    // max (18), not the stale floor (15) a sibling test deliberately pins.
+    // Pinning 15 here trips processOrderedChunkVectorWithAllocator's
+    // execution_revision-gated floor check before reaching the terminal
+    // failure this test means to exercise.
     catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
@@ -49001,7 +49267,9 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, "{}");
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const doc_source_key = try internal_keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(doc_source_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest }, .{ .key = doc_source_key, .value = "{}" } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     const primary = try documentSourceStoreKeyAlloc(&runtime, "doc");
@@ -49116,7 +49384,9 @@ test "model aware media labels authenticate independently refreshed retained tex
     var builder = @import("../artifact_chunk_manifest.zig").Builder.init();
     try builder.append(0, payload);
     const manifest = builder.finish().encode();
-    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest } }, &.{});
+    const doc_source_key = try internal_keys.documentKeyAlloc(alloc, "doc");
+    defer alloc.free(doc_source_key);
+    try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = payload }, .{ .key = manifest_key, .value = &manifest }, .{ .key = doc_source_key, .value = "{}" } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
@@ -50850,7 +51120,12 @@ test "generic scalar chunks reject stale upstream and fence publication" {
     try storePutWithRetry(&runtime, upstream_key, bytes);
     const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .chunk_text, .index_name = "chunks", .artifact_name = "chunks", .doc_key = "doc", .upstream_artifact_name = "units", .source_field = "text", .chunk_size = 512 };
     try std.testing.expectError(error.ArtifactPublicationPending, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
-    const receipt = local.encode(local.recipe(entry), old_parent, bytes);
+    // "units" is a `.copy` producer with `field: "body"`: its receipt is
+    // encoded against the extracted field value, not the whole raw parent
+    // document -- `bytes` ("old revision content") is exactly that
+    // extraction from `old_parent`. See declaredSourceTextAlloc's doc
+    // comment.
+    const receipt = local.encode(local.recipe(entry), bytes, bytes);
     try storePutWithRetry(&runtime, receipt_key, &receipt);
     try std.testing.expectError(error.EnrichmentSourceChanged, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
     try storePutWithRetry(&runtime, parent_key, old_parent);
@@ -50862,6 +51137,83 @@ test "generic scalar chunks reject stale upstream and fence publication" {
     try std.testing.expectError(error.EnrichmentSourceChanged, storePutBatchGuarded(&runtime, &.{}, &.{}, .{ .doc_key = "doc", .digest = accepted.source_record_digest, .upstream_name = "units", .upstream_digest = accepted.upstream_digest }));
     // Cache reuse must validate the receipt again, not reuse the old proof.
     try std.testing.expectError(error.EnrichmentSourceChanged, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
+}
+
+// Regression for the grouped-source enrichment-catch-up stall: a group
+// root's declared source narrows to its own "_group_unit" sub-object (see
+// index_manager's `source_field = "_group_unit"` for `.kind == .group`),
+// exactly like any other `.copy` producer's `field` narrows its receipt to
+// the extracted value rather than the whole raw document (see the sibling
+// test above and declaredSourceTextAlloc's doc comment). Before the fix,
+// `declaredSourceTextAlloc` special-cased `entry.group_source_json.len > 0`
+// to return the whole raw group-unit document unnarrowed, which never
+// matched the receipt a group root's own production actually wrote -- a
+// downstream consumer's upstream check failed with `EnrichmentSourceChanged`
+// on every retry, forever, with nothing to make it converge.
+test "grouped source upstream receipt narrows to the group unit, not the whole raw document" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "group-upstream-revisions" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/group-upstream-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+    var cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+    defer freeWorkerChunkCache(alloc, &cache);
+
+    const groups = @import("../group_sources.zig");
+    const config = groups.Config{ .group_by = "thread", .order_by = "ordinal", .segment_by = "turn", .field = "text" };
+    try index_manager.addEnrichment(&store, .{ .name = "turns", .kind = .group, .source = config });
+    const local = @import("../artifact_local_publication.zig");
+    const entry = index_manager.getEnrichment(.asset, "turns").?;
+
+    const doc_key = "unit";
+    const parent_key = try documentSourceStoreKeyAlloc(&runtime, doc_key);
+    defer alloc.free(parent_key);
+    const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "turns");
+    defer alloc.free(upstream_key);
+    const receipt_key = try local.key(alloc, upstream_key);
+    defer alloc.free(receipt_key);
+
+    // The group-unit document the grouped planner materializes for a
+    // segment. Only its "_group_unit" sub-object is the group root's
+    // declared source.
+    const raw = "{\"_group_unit\":{\"text\":\"hello turn text\"}}";
+    // What a group root's `.copy` producer actually extracts and hashes as
+    // both parent and output: the "_group_unit" sub-object alone, not `raw`.
+    const narrowed = "{\"text\":\"hello turn text\"}";
+    try storePutWithRetry(&runtime, parent_key, raw);
+    try storePutWithRetry(&runtime, upstream_key, narrowed);
+    const receipt = local.encode(local.recipe(entry), narrowed, narrowed);
+    try storePutWithRetry(&runtime, receipt_key, &receipt);
+
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .chunk_text, .index_name = "chunks", .artifact_name = "chunks", .doc_key = doc_key, .upstream_artifact_name = "turns", .source_field = "text", .chunk_size = 512 };
+    const accepted = try getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null);
+    try std.testing.expectEqual(@as(usize, 1), accepted.chunks.len);
 }
 
 test "OCR sampling reuse gate requires current state before skipping extraction" {
@@ -51364,8 +51716,10 @@ test "embedding publication verifies large parents using bounded content authori
     var read = try db.core.store.beginReadTxn();
     var read_open = true;
     defer if (read_open) read.abort();
-    const content_key = revisions.contentKey(revisions.keyForPhysical(primary).?);
-    const old_proof = (try read.get(&content_key))[0..49].*;
+    // v2 revision records carry the content proof inline: a 9-byte revision
+    // header followed by the 49-byte proof, stored at the revision key.
+    const content_key = revisions.keyForPhysical(primary).?;
+    const old_proof = (try read.get(&content_key))[revisions.encoded_len_without_content..revisions.encoded_len_with_content].*;
     const Counting = struct {
         inner: *@TypeOf(read),
         parent: []const u8,
@@ -51390,7 +51744,16 @@ test "embedding publication verifies large parents using bounded content authori
     read_open = false;
     // A stale certificate from an earlier writer must fall back to current
     // source bytes, rather than trusting an obsolete matching digest.
-    try db.core.store.put(&content_key, &old_proof);
+    {
+        // Keep the current revision header but attach the earlier writer's
+        // proof, so the revision check rejects it as stale.
+        const current_record = try db.core.store.get(a, &content_key);
+        defer a.free(current_record);
+        var stale: [revisions.encoded_len_with_content]u8 = undefined;
+        @memcpy(stale[0..revisions.encoded_len_without_content], current_record[0..revisions.encoded_len_without_content]);
+        @memcpy(stale[revisions.encoded_len_without_content..], &old_proof);
+        try db.core.store.put(&content_key, &stale);
+    }
     read = try db.core.store.beginReadTxn();
     read_open = true;
     try std.testing.expect(!try embeddingSourceStillCurrent(runtime.alloc, &counted, write, null));
@@ -51399,7 +51762,16 @@ test "embedding publication verifies large parents using bounded content authori
     read_open = false;
     // Publication repairs even malformed disposable metadata using source
     // bytes checked under the writer; the next 1024 checks stay bounded.
-    try db.core.store.put(&content_key, "malformed");
+    {
+        // A malformed proof after a valid revision header: the revision stays
+        // readable while the disposable content authority is rejected.
+        const current_record = try db.core.store.get(a, &content_key);
+        defer a.free(current_record);
+        var malformed: [revisions.encoded_len_without_content + "malformed".len]u8 = undefined;
+        @memcpy(malformed[0..revisions.encoded_len_without_content], current_record[0..revisions.encoded_len_without_content]);
+        @memcpy(malformed[revisions.encoded_len_without_content..], "malformed");
+        try db.core.store.put(&content_key, &malformed);
+    }
     const current = try db.core.store.get(a, primary);
     defer a.free(current);
     var fresh = write;

@@ -55,11 +55,12 @@ pub const Plan = struct {
     bindings: std.StringHashMapUnmanaged(Binding),
 
     pub fn init(alloc: Allocator, source: catalogs.Catalogs, source_binding: catalogs.Binding, receiver: catalogs.Catalogs, receiver_binding: catalogs.Binding) !Plan {
-        if (!source_binding.compatible(receiver_binding) or
+        if (!source_binding.valid() or !receiver_binding.valid() or source_binding.effect_protocol != receiver_binding.effect_protocol or
             !std.mem.eql(u8, &source.digest(), &source_binding.digest) or
             !std.mem.eql(u8, &receiver.digest(), &receiver_binding.digest) or
-            !std.mem.eql(u8, &try source.semanticDigest(alloc), &source_binding.semantic_digest) or
-            !std.mem.eql(u8, &try receiver.semanticDigest(alloc), &receiver_binding.semantic_digest)) return error.ArtifactCatalogDrift;
+            !(try source.matchesSemanticDigest(alloc, source_binding.semantic_digest)) or
+            !(try receiver.matchesSemanticDigest(alloc, receiver_binding.semantic_digest)) or
+            !std.meta.eql(try source.semanticDigest(alloc), try receiver.semanticDigest(alloc))) return error.ArtifactCatalogDrift;
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const owned = arena.allocator();

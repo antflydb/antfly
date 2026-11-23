@@ -16,6 +16,22 @@
 const std = @import("std");
 const build_test_filters = @import("../../build_test_filters.zig");
 
+/// Reuse the owning test graph for semantic checks. No consumer requests the
+/// check artifact's emitted binary, so Zig checks types without generating it.
+/// This is separate from the runtime gate and never counts as test execution.
+pub fn addTestCheckStep(b: *std.Build, tests: *std.Build.Step.Compile, name: []const u8, description: []const u8) void {
+    const check = b.addTest(.{
+        .name = b.fmt("{s}-check", .{tests.name}),
+        .root_module = tests.root_module,
+        .filters = tests.filters,
+        .test_runner = tests.test_runner,
+        .use_llvm = tests.use_llvm,
+        .use_lld = tests.use_lld,
+    });
+    for (tests.step.dependencies.items) |dependency| check.step.dependOn(dependency);
+    b.step(name, description).dependOn(&check.step);
+}
+
 /// Keep test diagnostics without holding Zig's global terminal lock for the
 /// lifetime of the child. Explicit side effects preserve execution on every
 /// invocation even though stdout is retained as a captured output file.

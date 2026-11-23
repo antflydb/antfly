@@ -73,8 +73,8 @@ def main():
         first, last = gpu.buffer([0.0] * 512), gpu.buffer([0.0] * 512)
         x1, x2 = gpu.buffer([1.0] * 128), gpu.buffer([2.0] * 128)
         y1, y2 = gpu.buffer([0.0] * 128), gpu.buffer([0.0] * 128)
-        gpu.launch("lighton_conv", (1, 1), 128, x1, w, zero, first, y1, 1, 128, 0)
-        gpu.launch("lighton_conv", (1, 1), 128, x2, w, first, last, y2, 1, 128, 1)
+        gpu.launch("antfly_gdn_causal_conv", (1, 1), 128, x1, w, zero, first, y1, 1, 128, 0)
+        gpu.launch("antfly_gdn_causal_conv", (1, 1), 128, x2, w, first, last, y2, 1, 128, 1)
         actual = gpu.read(y2)
         expected = 3.0 / (1.0 + math.exp(-3.0))
         assert max(abs(v - expected) for v in actual) < 2e-5, {
@@ -165,7 +165,7 @@ def main():
                             if parallel
                             else "lighton_conv_cached_gates"
                             if cached
-                            else "lighton_conv",
+                            else "antfly_gdn_causal_conv",
                             (channels // 128, n if parallel else 1),
                             128,
                             *argv,

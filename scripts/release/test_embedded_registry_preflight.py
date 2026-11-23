@@ -65,6 +65,24 @@ class EmbeddedRegistryPreflightTests(unittest.TestCase):
         self.npm.assert_not_called()
         self.pypi.assert_not_called()
 
+    def test_maintenance_publication_uses_only_its_series_tag(self):
+        self.tags.return_value = "0.3.2"
+        self.preflight("0.3.3", "v0-3")
+        self.assertEqual(self.tags.call_count, 4)
+        for call in self.tags.call_args_list:
+            self.assertEqual(call.args[1], "v0-3")
+        for call in self.npm.call_args_list:
+            self.assertEqual(call.args[2], "v0-3")
+
+    def test_maintenance_tag_rejects_rollbacks_and_other_series(self):
+        for version, observed in (("0.3.3", "0.3.4"), ("0.4.0", "0.3.2")):
+            with self.subTest(version=version):
+                self.tags.return_value = observed
+                with self.assertRaises((ValueError, SystemExit)):
+                    self.preflight(version, "v0-3")
+        self.npm.assert_not_called()
+        self.pypi.assert_not_called()
+
     def test_newer_rc_and_exact_retry_are_allowed(self):
         for observed in (None, "0.0.0", "0.3.0-rc.0", "0.3.0-rc.1"):
             with self.subTest(observed=observed):
@@ -97,6 +115,6 @@ class EmbeddedRegistryPreflightTests(unittest.TestCase):
             self.preflight()
 
     def test_nightlies_cannot_publish_registry_versions(self):
-        with self.assertRaisesRegex(ValueError, "latest or next"):
+        with self.assertRaisesRegex(ValueError, "policy-owned npm tag"):
             self.preflight(tag="nightly")
         self.tags.assert_not_called()

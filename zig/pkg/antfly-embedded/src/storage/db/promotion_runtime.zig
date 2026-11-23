@@ -613,14 +613,16 @@ fn catchUpWindowMaybeSink(
         for (configs) |*cfg| cfg.deinit(gpa);
         gpa.free(configs);
     };
-    _ = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
+    const stats = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
         error.PromotionSinkUnavailable => return .{
             .max_seen = ctx.max_seen,
             .blocked_missing_sink = true,
         },
         else => return err,
     };
-    return .{ .max_seen = ctx.max_seen };
+    // A batch bounded by scanned work can end on records without this hint;
+    // they need nothing, so progress covers them too.
+    return .{ .max_seen = @max(ctx.max_seen, stats.last_sequence) };
 }
 
 /// Managed worker that catches the promoter up on changed resolution artifacts.

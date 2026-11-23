@@ -1,0 +1,165 @@
+{
+  "format": 1,
+  "postgres_major": 18,
+  "before_prepare": [
+    1,
+    true
+  ],
+  "after_prepare": [
+    1,
+    true
+  ],
+  "rejected_insert_effects": [
+    [
+      "23502",
+      [
+        2,
+        true
+      ]
+    ],
+    [
+      "23502",
+      [
+        3,
+        true
+      ]
+    ],
+    [
+      "23502",
+      [
+        4,
+        true
+      ]
+    ],
+    [
+      "23514",
+      [
+        5,
+        true
+      ]
+    ],
+    [
+      "23505",
+      [
+        6,
+        true
+      ]
+    ]
+  ],
+  "rows_after_rejections": [
+    [
+      1,
+      1
+    ]
+  ],
+  "batch_defaults": [
+    [
+      7,
+      2
+    ],
+    [
+      8,
+      3
+    ]
+  ],
+  "batch_rejection": "23502",
+  "batch_rejection_state": [
+    10,
+    true
+  ],
+  "rows_after_batch_rejection": [
+    [
+      1,
+      1
+    ],
+    [
+      7,
+      2
+    ],
+    [
+      8,
+      3
+    ]
+  ],
+  "source_first": [
+    42,
+    1,
+    2,
+    4
+  ],
+  "cancel_hidden": [
+    null,
+    null
+  ],
+  "allocation_while_hidden": 2,
+  "cancel_complete": [
+    null,
+    null
+  ],
+  "source_after_cancel": [
+    2,
+    true
+  ],
+  "copy_hidden": [
+    null,
+    null
+  ],
+  "second_hidden_allocation": 3,
+  "copy_first": [
+    42,
+    4,
+    2,
+    4
+  ],
+  "copy_visible": [
+    "counter_copy",
+    "counter_copy_id_seq"
+  ],
+  "source_identity": [
+    42,
+    true
+  ],
+  "copy_identity": [
+    42,
+    true
+  ],
+  "shared_counter": [
+    4,
+    true
+  ],
+  "source_restrict": "2BP01",
+  "source_retired": [
+    null,
+    null,
+    null
+  ],
+  "copy_rows_after_cascade": [
+    [
+      42,
+      4,
+      2,
+      4
+    ]
+  ],
+  "remaining_defaults": [
+    "quantity"
+  ],
+  "remaining_identity": "a",
+  "copy_next": [
+    45,
+    99,
+    1,
+    2
+  ],
+  "missing_retired_default": "23502",
+  "surviving_fk": "23503",
+  "copy_identity_after_failures": [
+    51,
+    true
+  ],
+  "parent_rows": [
+    1,
+    2,
+    9
+  ]
+}

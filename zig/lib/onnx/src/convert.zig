@@ -39,7 +39,9 @@ const NodeProto = proto.NodeProto;
 const TensorProto = proto.TensorProto;
 const ValueInfoProto = proto.ValueInfoProto;
 
-pub const ConvertError = ops.ConvertError || error{
+pub const CheckpointError = error{ Timeout, Canceled, Cancelled };
+
+pub const ConvertError = ops.ConvertError || CheckpointError || error{
     OutputNotFound,
     NodeNotFound,
     InputNotProvided,
@@ -98,6 +100,10 @@ pub const Model = struct {
     base_dir: ?[]const u8 = null,
     /// Borrowed only for synchronous conversion and initializer loading.
     external_reader: ?tensor_mod.ExternalDataReader = null,
+    conversion_checkpoint: ?struct {
+        context: *const anyopaque,
+        check: *const fn (*const anyopaque) CheckpointError!void,
+    } = null,
 
     // Pre-built indexes (populated in init)
     output_to_node: std.StringHashMapUnmanaged(u32),
@@ -109,7 +115,8 @@ pub const Model = struct {
     }
 
     /// Initialize a Model with a base directory for resolving external data.
-    /// `base_dir` is borrowed and must outlive the Model.
+    /// `base_dir` is borrowed and must outlive the Model. Proto ownership
+    /// transfers only on success; the caller still owns it on failure.
     pub fn initWithBaseDir(
         allocator: std.mem.Allocator,
         onnx_model: proto.ModelProto,
@@ -124,6 +131,11 @@ pub const Model = struct {
             .input_set = .empty,
         };
 
+        errdefer {
+            self.output_to_node.deinit(allocator);
+            self.initializer_map.deinit(allocator);
+            self.input_set.deinit(allocator);
+        }
         const onnx_graph = self.onnx.graph orelse return self;
 
         // Build output_name → node_index map
@@ -157,7 +169,8 @@ pub const Model = struct {
     /// accessed during conversion, then cached. For large models with many
     /// weights this avoids up-front TensorProto construction for weights
     /// that the converter never touches.
-    /// `base_dir` is borrowed and must outlive the Model.
+    /// `base_dir` is borrowed and must outlive the Model. Proto ownership
+    /// transfers only on success; the caller still owns it on failure.
     pub fn initFromLazy(
         allocator: std.mem.Allocator,
         lazy_model: proto.LazyModelProto,
@@ -424,29 +437,7 @@ pub const Model = struct {
         var param_names = std.ArrayListUnmanaged([]const u8).empty;
         defer param_names.deinit(allocator);
 
-        // Convert each output
-        var output_ids = std.ArrayListUnmanaged(NodeId).empty;
-        defer output_ids.deinit(allocator);
-
-        for (onnx_graph.outputs) |*output| {
-            if (output.name.len == 0) continue;
-            const node_id = try self.recursiveConvert(
-                allocator,
-                &builder,
-                &converted,
-                &param_names,
-                onnx_graph,
-                output.name,
-            );
-            try output_ids.append(allocator, node_id);
-            try inference_graph.markOutput(node_id);
-        }
-
-        return .{
-            .graph = inference_graph,
-            .output_ids = try output_ids.toOwnedSlice(allocator),
-            .parameter_names = try param_names.toOwnedSlice(allocator),
-        };
+        return self.finishConversion(allocator, &inference_graph, &builder, &converted, &param_names, onnx_graph);
     }
 
     /// Convert the ONNX graph creating parameter nodes for inputs automatically.
@@ -476,6 +467,18 @@ pub const Model = struct {
         dim_overrides: ?*const DimOverrides,
         input_shapes: ?*const std.StringHashMapUnmanaged(Shape),
     ) ConvertError!ConvertResult {
+        return self.convertToGraphWithBindings(allocator, dim_overrides, input_shapes, null);
+    }
+
+    pub const BooleanBinding = struct { name: []const u8, value: bool };
+
+    pub fn convertToGraphWithBindings(
+        self: *Model,
+        allocator: std.mem.Allocator,
+        dim_overrides: ?*const DimOverrides,
+        input_shapes: ?*const std.StringHashMapUnmanaged(Shape),
+        boolean: ?BooleanBinding,
+    ) ConvertError!ConvertResult {
         const onnx_graph = self.graph() orelse return error.OutputNotFound;
 
         var inference_graph = Graph.init(allocator);
@@ -495,34 +498,43 @@ pub const Model = struct {
 
             const shape = (if (input_shapes) |shapes| shapes.get(input.name) else null) orelse
                 inputShapeWithOverrides(input, dim_overrides) orelse Shape.init(.f32, &.{1});
+            if (boolean) |binding| if (std.mem.eql(u8, input.name, binding.name)) {
+                if (shape.dtype != .bool_ or shape.numElements() != 1) return error.ShapeMismatch;
+                const value = [_]u8{@intFromBool(binding.value)};
+                try converted.put(allocator, input.name, try builder.tensorConstBytes(&value, shape));
+                continue;
+            };
             const node_id = try builder.parameter(input.name, shape);
             try converted.put(allocator, input.name, node_id);
             try param_names.append(allocator, input.name);
         }
 
-        // Convert each output
+        return self.finishConversion(allocator, &inference_graph, &builder, &converted, &param_names, onnx_graph);
+    }
+
+    /// Complete either input-binding API with the same exactly-once output
+    /// conversion and result ownership transfer. The caller owns graph errors.
+    fn finishConversion(
+        self: *Model,
+        allocator: std.mem.Allocator,
+        inference_graph: *Graph,
+        builder: *Builder,
+        converted: *std.StringHashMapUnmanaged(NodeId),
+        param_names: *std.ArrayListUnmanaged([]const u8),
+        onnx_graph: *const GraphProto,
+    ) ConvertError!ConvertResult {
         var output_ids = std.ArrayListUnmanaged(NodeId).empty;
         defer output_ids.deinit(allocator);
-
         for (onnx_graph.outputs) |*output| {
             if (output.name.len == 0) continue;
-            const node_id = try self.recursiveConvert(
-                allocator,
-                &builder,
-                &converted,
-                &param_names,
-                onnx_graph,
-                output.name,
-            );
+            const node_id = try self.recursiveConvert(allocator, builder, converted, param_names, onnx_graph, output.name);
             try output_ids.append(allocator, node_id);
             try inference_graph.markOutput(node_id);
         }
-
-        return .{
-            .graph = inference_graph,
-            .output_ids = try output_ids.toOwnedSlice(allocator),
-            .parameter_names = try param_names.toOwnedSlice(allocator),
-        };
+        const owned_outputs = try output_ids.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_outputs);
+        const owned_parameters = try param_names.toOwnedSlice(allocator);
+        return .{ .graph = inference_graph.*, .output_ids = owned_outputs, .parameter_names = owned_parameters };
     }
 
     fn recursiveConvert(
@@ -534,6 +546,7 @@ pub const Model = struct {
         onnx_graph: *const GraphProto,
         name: []const u8,
     ) ConvertError!NodeId {
+        if (self.conversion_checkpoint) |checkpoint| try checkpoint.check(checkpoint.context);
         // Already converted?
         if (converted.get(name)) |id| {
             if (id == null_node) {
@@ -545,7 +558,10 @@ pub const Model = struct {
 
         // Is it an initializer (weight)?
         if (self.initializer_map.get(name)) |init_idx| {
-            const tensor = self.initializerAt(init_idx) catch return error.NodeNotFound;
+            const tensor = self.initializerAt(init_idx) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.NodeNotFound,
+            };
             const shape = try tensor_mod.tensorShape(tensor);
             const count = tensor_mod.numElements(tensor.dims);
 
@@ -609,6 +625,8 @@ pub const Model = struct {
         try converted.put(allocator, name, null_node);
         errdefer _ = converted.remove(name);
 
+        if (node.inputs.len > 16) return error.UnsupportedOp;
+
         // Recursively convert all inputs (up to 16 for ops like BatchNorm with 5)
         var input_ids: [16]NodeId = @splat(null_node);
         for (node.inputs, 0..) |input_name, i| {
@@ -625,6 +643,7 @@ pub const Model = struct {
                 onnx_graph,
                 input_name,
             ) catch |e| {
+                if (e == error.Timeout or e == error.Canceled or e == error.Cancelled) return e;
                 log.warn("{s} ({s}): failed to convert input '{s}': {}", .{
                     node.op_type, name, input_name, e,
                 });
@@ -636,9 +655,29 @@ pub const Model = struct {
         // Pass the parent `converted` map as an outer scope so that
         // If/Loop/Scan bodies can resolve implicit captures by name.
         const num_inputs = @min(node.inputs.len, 16);
-        var extra_outputs: [7]NodeId = @splat(null_node);
-        const extra_slice = if (node.outputs.len > 1) extra_outputs[0..@min(node.outputs.len - 1, 7)] else extra_outputs[0..0];
-        const parent_scope = ops.NameScope{ .map = converted };
+        const extra_count = node.outputs.len -| 1;
+        var inline_extras: [7]NodeId = undefined;
+        const extra_slice = if (extra_count <= inline_extras.len) inline_extras[0..extra_count] else try allocator.alloc(NodeId, extra_count);
+        defer if (extra_count > inline_extras.len) allocator.free(extra_slice);
+        @memset(extra_slice, null_node);
+        const Capture = struct {
+            model: *Model,
+            allocator: std.mem.Allocator,
+            builder: *Builder,
+            converted: *std.StringHashMapUnmanaged(NodeId),
+            names: *std.ArrayListUnmanaged([]const u8),
+            graph: *const GraphProto,
+
+            fn resolve(raw: *anyopaque, captured: []const u8) ops.ConvertError!NodeId {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                return ctx.model.recursiveConvert(ctx.allocator, ctx.builder, ctx.converted, ctx.names, ctx.graph, captured) catch |err| switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.MissingInput,
+                };
+            }
+        };
+        var capture: Capture = .{ .model = self, .allocator = allocator, .builder = builder, .converted = converted, .names = param_names, .graph = onnx_graph };
+        const parent_scope = ops.NameScope{ .map = converted, .capture = .{ .context = &capture, .resolve = Capture.resolve } };
         const result_id = ops.convertNodeWithScope(
             allocator,
             builder,
@@ -662,12 +701,13 @@ pub const Model = struct {
                 const extra_id = if (ei < extra_slice.len and extra_slice[ei] != null_node)
                     extra_slice[ei]
                 else
-                    result_id; // fallback to primary if not populated
+                    return error.UnsupportedOp;
                 try converted.put(allocator, out_name, extra_id);
             }
         }
 
-        return result_id;
+        // The recursive walk may have requested a secondary output first.
+        return converted.get(name) orelse error.OutputNotFound;
     }
 };
 
@@ -1904,4 +1944,31 @@ test "Model.convertToGraphWithInputShapes binds unnamed request dimensions" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "Model conversion returns secondary outputs requested before the primary" {
+    const a = std.testing.allocator;
+    var inputs = [_][]const u8{"x"};
+    var outputs = [_][]const u8{ "first", "second" };
+    var attributes = [_]proto.AttributeProto{.{ .name = "axis", .i = 0, .attr_type = .int }};
+    var nodes = [_]NodeProto{.{ .op_type = "Split", .inputs = &inputs, .outputs = &outputs, .attributes = &attributes }};
+    var x = [_]f32{ 1, 2, 3, 4 };
+    var dims = [_]i64{4};
+    var initializers = [_]TensorProto{.{ .name = "x", .data_type = .float32, .dims = &dims, .raw_data = std.mem.sliceAsBytes(&x) }};
+    var output_info = [_]ValueInfoProto{ .{ .name = "second" }, .{ .name = "first" } };
+    var model = try Model.init(a, .{ .graph = .{ .nodes = &nodes, .initializers = &initializers, .outputs = &output_info } });
+    defer {
+        model.output_to_node.deinit(a);
+        model.initializer_map.deinit(a);
+        model.input_set.deinit(a);
+    }
+    var converted = try model.convertToGraph(a);
+    defer converted.deinit(a);
+    try std.testing.expect(converted.output_ids[0] != converted.output_ids[1]);
+    const second = converted.graph.node(converted.output_ids[0]);
+    const first = converted.graph.node(converted.output_ids[1]);
+    try std.testing.expectEqual(@as(i64, 2), second.op.slice.starts[0]);
+    try std.testing.expectEqual(@as(i64, 0), first.op.slice.starts[0]);
+    nodes[0].op_type = "Identity";
+    try std.testing.expectError(error.UnsupportedOp, model.convertToGraph(a));
 }

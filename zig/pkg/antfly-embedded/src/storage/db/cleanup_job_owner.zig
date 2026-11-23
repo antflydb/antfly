@@ -32,6 +32,25 @@ pub const Port = struct {
     closing: ?*const std.atomic.Value(bool) = null,
     advance: *const fn (*anyopaque) anyerror!Advance,
     name: []const u8,
+    /// Classifies one of `advance`'s own errors as persistent (`true`)
+    /// rather than transient (`false`, the default for every error when
+    /// this is unset, preserving prior behavior for a caller that never
+    /// opts in). A persistent error gives up immediately -- see
+    /// `drain`'s own doc comment -- instead of spending this run's full
+    /// retry budget backing off on something that backing off cannot
+    /// fix.
+    persistent: ?*const fn (anyerror) bool = null,
+    /// Called at most once per `drain` run, the moment it gives up on a
+    /// run of failures from `advance` (persistent, by `persistent`'s own
+    /// classification, or merely exhausted its retry budget) instead of
+    /// resubmitting. `drain` itself knows nothing about what `advance`
+    /// is backed by, so recording this anywhere a status/maintenance
+    /// view can see it -- a counter, a log line beyond the ones `drain`
+    /// already emits, a "last error" field -- is entirely the owner's
+    /// own call. Always invoked after `port.state` has already been
+    /// released (see `drain`), so there is nothing here to coordinate
+    /// with a concurrent `schedule` about.
+    on_give_up: ?*const fn (*anyopaque, anyerror) void = null,
 };
 const Work = struct {
     port: Port,
@@ -69,6 +88,21 @@ fn yield(port: Port) void {
     // rediscover the durable marker. Never submit recursively on this stack.
     if (!port.lane.executesInline()) schedule(port);
 }
+/// `advance`'s own errors never loop forever here, no matter how
+/// persistent one turns out to be. Giving up (clearing `port.state` and
+/// returning the error, never calling `yield`/`schedule` again from
+/// this run) happens in exactly two cases: `port.persistent` classifies
+/// the error as persistent -- immediately, without spending the rest of
+/// this run's backoff budget on something backing off cannot fix -- or
+/// this run's retry budget (8 attempts) is exhausted regardless of
+/// classification. Before this, an unclassified-but-actually-persistent
+/// error (e.g. a storage invariant violation) still hit the 8-attempt
+/// cap, but `yield` resubmitted a *fresh* `drain` with its own retry
+/// counter back at zero -- forever, since nothing about the failure
+/// ever changes between resubmissions. `.busy`/`.idle` contention below
+/// is a different matter: that contention is expected to clear through
+/// someone else's progress, so it keeps its own existing yield-and-
+/// resubmit backoff unchanged.
 pub fn drain(port: Port) !void {
     var pages: usize = 0;
     var retries: usize = 0;
@@ -81,14 +115,15 @@ pub fn drain(port: Port) !void {
         const advance = port.advance(port.ptr) catch |err| {
             retries += 1;
             if (retries == 1 or std.math.isPowerOfTwo(retries)) std.log.warn("{s} cleanup retry attempt={} err={s}", .{ port.name, retries, @errorName(err) });
+            const give_up = retries >= 8 or (if (port.persistent) |classify| classify(err) else false);
+            if (give_up) {
+                port.state.store(0, .release);
+                if (port.on_give_up) |cb| cb(port.ptr, err);
+                return err;
+            }
             if (port.io) |io| pause(io, retries) else {
                 port.state.store(0, .release);
                 return err;
-            }
-            if (retries >= 8) {
-                yield(port);
-                if (port.lane.executesInline()) return err;
-                return;
             }
             continue;
         };
@@ -229,4 +264,94 @@ test "cleanup job owner yields queued slices and releases rejected admission" {
     schedule(f.port());
     try std.testing.expect(f.queued == null);
     try std.testing.expectEqual(@as(u8, 0), f.state.load(.acquire));
+}
+
+// The liveness bug this guards against: before this design, exhausting
+// the 8-attempt retry budget on a non-inline lane unconditionally
+// called `yield`, which resubmitted a *fresh* `drain` run -- its own
+// retry counter back at zero -- regardless of whether the error was
+// ever going to clear. A persistent `advance` failure (a storage
+// invariant violation, say) then looped forever: 8 failed attempts,
+// resubmit, 8 more, resubmit, ... A non-inline lane (this fixture's
+// `submit` queues rather than runs) is the case that actually exhibits
+// it -- an inline lane already returned the error instead of calling
+// `schedule` again (see `yield`'s own doc comment), so it never showed
+// this bug.
+test "cleanup job owner stops resubmitting after a persistent advance failure" {
+    const F = struct {
+        state: std.atomic.Value(u8) = .init(0),
+        queued: ?runtime.Job = null,
+        calls: usize = 0,
+        gave_up_err: ?anyerror = null,
+        gave_up_calls: usize = 0,
+        fn submit(ptr: *anyopaque, job: runtime.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.queued == null);
+            self.queued = job;
+        }
+        fn noop(_: *anyopaque, _: u64) void {}
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+        fn advance(ptr: *anyopaque) !Advance {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.InjectedPersistentCleanupFailure;
+        }
+        fn onGiveUp(ptr: *anyopaque, err: anyerror) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.gave_up_err = err;
+            self.gave_up_calls += 1;
+        }
+        fn port(self: *@This()) Port {
+            return .{
+                .ptr = self,
+                .state = &self.state,
+                .lane = .{ .ptr = self, .vtable = &.{ .submit = submit, .drain_owner = noop, .close_owner = noop, .poll = poll } },
+                .owner_id = 1,
+                .io = std.testing.io,
+                .advance = advance,
+                .name = "persistent-test",
+                .on_give_up = onGiveUp,
+            };
+        }
+        fn next(self: *@This()) void {
+            const job = self.queued.?;
+            self.queued = null;
+            // Mirrors the real `ThreadedDurableJobLane.runEntry`: a job's own
+            // returned error is logged and discarded there too, never
+            // propagated into the lane's worker loop.
+            defer job.deinit(job.ptr);
+            job.run(job.ptr) catch {};
+        }
+    };
+    var f: F = .{};
+    schedule(f.port());
+    try std.testing.expect(f.queued != null);
+    f.next(); // runs one `drain`: 8 failed `advance` attempts, then gives up
+    try std.testing.expectEqual(@as(usize, 8), f.calls);
+    try std.testing.expectEqual(@as(usize, 1), f.gave_up_calls);
+    try std.testing.expectEqual(error.InjectedPersistentCleanupFailure, f.gave_up_err.?);
+    try std.testing.expectEqual(@as(u8, 0), f.state.load(.acquire));
+    // Nothing resubmitted: this is the actual termination property --
+    // before the fix, `f.queued` would already hold a freshly requeued
+    // `Work` here, and repeating `f.next()` would never stop calling
+    // `advance` in groups of 8 forever.
+    try std.testing.expect(f.queued == null);
+
+    // A classified-persistent error gives up immediately, without
+    // spending the retry budget on backoff that cannot fix it.
+    f.calls = 0;
+    f.gave_up_calls = 0;
+    var classified = f.port();
+    classified.persistent = struct {
+        fn classify(err: anyerror) bool {
+            return err == error.InjectedPersistentCleanupFailure;
+        }
+    }.classify;
+    drain(classified) catch |err| try std.testing.expectEqual(error.InjectedPersistentCleanupFailure, err);
+    try std.testing.expectEqual(@as(usize, 1), f.calls);
+    try std.testing.expectEqual(@as(usize, 1), f.gave_up_calls);
+    try std.testing.expectEqual(@as(u8, 0), f.state.load(.acquire));
+    try std.testing.expect(f.queued == null);
 }

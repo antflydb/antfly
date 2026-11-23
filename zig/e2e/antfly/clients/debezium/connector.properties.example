@@ -1,0 +1,27 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+name=antfly-qualification
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+plugin.name=pgoutput
+database.hostname=host.docker.internal
+database.port=5432
+database.dbname=antfly
+database.user=antfly
+database.password=local-test-only
+database.sslmode=disable
+topic.prefix=qualification
+slot.name=qualification_slot
+slot.drop.on.stop=false
+publication.name=qualification_publication
+publication.autocreate.mode=disabled
+table.include.list=public.qualification_records
+snapshot.mode=initial
+offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore
+offset.storage.file.filename=/state/offsets.dat
+offset.flush.interval.ms=0
+record.processing.threads=1
+record.processing.order=ORDERED
+record.processing.with.serial.consumer=true
+converter.schemas.enable=false
+errors.max.retries=0
+provide.transaction.metadata=true

@@ -1084,7 +1084,6 @@ fn runCudaGradParity(
         var it = store.store.resident_weights.iterator();
         while (it.next()) |entry| {
             const owned_name = try allocator.dupe(u8, entry.key_ptr.*);
-            errdefer allocator.free(owned_name);
             try compute.insertWeightFromLoaded(owned_name, entry.value_ptr);
         }
         var cb = compute.computeBackend();
@@ -1339,7 +1338,6 @@ test "GLiNER2 CUDA compiled-device trainer updates resident LoRA weights" {
     var weight_it = store.store.resident_weights.iterator();
     while (weight_it.next()) |entry| {
         const owned_name = try allocator.dupe(u8, entry.key_ptr.*);
-        errdefer allocator.free(owned_name);
         try compute.insertWeightFromLoaded(owned_name, entry.value_ptr);
     }
     var cb = compute.computeBackend();
@@ -1551,7 +1549,6 @@ test "GLiNER2 CUDA checkpoint resume preserves resident AdamW trajectory" {
         var weight_it = store.store.resident_weights.iterator();
         while (weight_it.next()) |entry| {
             const owned_name = try allocator.dupe(u8, entry.key_ptr.*);
-            errdefer allocator.free(owned_name);
             try compute.insertWeightFromLoaded(owned_name, entry.value_ptr);
         }
         var cb = compute.computeBackend();
@@ -1601,7 +1598,6 @@ test "GLiNER2 CUDA checkpoint resume preserves resident AdamW trajectory" {
         var weight_it = store.store.resident_weights.iterator();
         while (weight_it.next()) |entry| {
             const owned_name = try allocator.dupe(u8, entry.key_ptr.*);
-            errdefer allocator.free(owned_name);
             try compute.insertWeightFromLoaded(owned_name, entry.value_ptr);
         }
         var cb = compute.computeBackend();

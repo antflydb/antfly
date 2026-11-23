@@ -2374,6 +2374,13 @@ fn inferModelTypeFromTasks(tasks: []const []const u8) ?ModelType {
 fn inferGlinerModelType(manifest: *const ModelManifest, model_dir_path: []const u8) ?[]const u8 {
     if (manifest.gliner_model_type.len > 0) return manifest.gliner_model_type;
 
+    // A declared span wrapper fixes its primary role in both full loading and
+    // discovery, independently of the directory name or optional vocabulary.
+    // This is a load candidate only; it grants no qualified task/head identity.
+    if (manifest.gliner_architecture == .span and manifest.gliner_span_declared and
+        manifest.gliner_classification_head == .none and
+        std.mem.eql(u8, manifest.config_model_arch, "extractor")) return "gliner2";
+
     const has_gliner_special_tokens = manifest.gliner_token_p != 0 and
         manifest.gliner_token_c != 0 and
         manifest.gliner_token_e != 0 and
@@ -5101,6 +5108,43 @@ test "explicit GLiNER label-marker decision head supports typed decisions" {
     try std.testing.expect(manifest.hasTask("decide"));
     try std.testing.expect(manifest.hasCapability("typed_decisions"));
     try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, manifest.gliner_classification_head);
+}
+
+test "raw declared span listing preserves extractor role without granting a decision head" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"extractor","architecture":"span","architecture_version":1,"architectures":["SpanExtractor"],"config_version":3,"span_head":{"span_mode":"markerV0"},"counting_layer":"count_lstm","token_pooling":"first"}
+    });
+    try tmp.dir.createDirPath(io, "encoder_config");
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data =
+        \\{"model_type":"modernbert","attention_bias":false,"mlp_bias":false,"norm_bias":false,"tie_word_embeddings":true,"hidden_size":1792,"intermediate_size":3840,"num_hidden_layers":28,"num_attention_heads":28,"vocab_size":50378,"max_position_embeddings":7999,"global_attn_every_n_layers":3,"local_attention":128,"norm_eps":0.00001,"pad_token_id":50283}
+    });
+    // This vocabulary must remain unread by candidate discovery. Its actual
+    // contents and markers are the loaded session's qualification obligation.
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "not a loaded vocabulary" });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    var listing = try loadListingFromDir(a, path);
+    defer listing.deinit();
+    try std.testing.expectEqual(ModelType.extractor, listing.model_type);
+    try std.testing.expectEqualStrings("gliner2", listing.gliner_model_type);
+    try std.testing.expect(listing.gliner_span_declared);
+    try std.testing.expectEqual(GlinerSpanEncoderFamily.modern_bert, listing.gliner_span_encoder_family);
+    try std.testing.expectEqual(GlinerClassificationHead.none, listing.gliner_classification_head);
+    try std.testing.expect(!listing.hasCapability("classification") and !listing.hasCapability("typed_decisions"));
+    try std.testing.expect(!listing.hasTask("decide"));
+    try std.testing.expectEqual(@as(i32, 0), listing.gliner_token_l);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[{\"id\":17,\"content\":\"[L]\"},{\"id\":18,\"content\":\"[SEP_STRUCT]\"}]}" });
+    var loaded = try loadFromDir(a, path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(listing.model_type, loaded.model_type);
+    try std.testing.expectEqualStrings(listing.gliner_model_type, loaded.gliner_model_type);
+    try std.testing.expectEqual(GlinerClassificationHead.none, loaded.gliner_classification_head);
+    try std.testing.expect(!loaded.hasCapability("classification") and !loaded.hasTask("decide"));
 }
 
 test "Decide listing reads small marker sidecar for declared classification head" {

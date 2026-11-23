@@ -189,7 +189,7 @@ fn jsonF32(value: std.json.Value) ?f32 {
     };
 }
 
-fn validateInputs(
+pub fn validateInputs(
     config: Config,
     input_ids: []const i64,
     attention_mask: []const i64,

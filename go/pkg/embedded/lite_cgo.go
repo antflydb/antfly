@@ -26,6 +26,7 @@ package embedded
 import "C"
 
 import (
+	"encoding/binary"
 	"fmt"
 	"runtime"
 	"strings"
@@ -143,6 +144,109 @@ type WriteIntent struct {
 	Key    string
 	Value  []byte
 	Delete bool
+}
+
+// SyncLevel names the durability/visibility level a batch admits at, matching
+// the "sync_level" strings accepted by the JSON batch API and the tag bytes
+// antfly_db_batch_wire decodes (see antfly.h).
+type SyncLevel string
+
+const (
+	SyncPropose     SyncLevel = "propose"
+	SyncWrite       SyncLevel = "write"
+	SyncFullText    SyncLevel = "full_text"
+	SyncEnrichments SyncLevel = "enrichments"
+	SyncFullIndex   SyncLevel = "full_index"
+)
+
+func (s SyncLevel) wireTag() (byte, error) {
+	switch s {
+	case SyncPropose:
+		return 0, nil
+	case SyncWrite:
+		return 1, nil
+	case SyncFullText:
+		return 2, nil
+	case SyncEnrichments:
+		return 3, nil
+	case SyncFullIndex:
+		return 4, nil
+	default:
+		return 0, fmt.Errorf("embedded: unknown sync level %q", string(s))
+	}
+}
+
+// EncodeBatchWire builds the binary payload BatchWire/antfly_db_batch_wire
+// decodes: writes and deletes (from WriteIntent.Delete) plus a sync level,
+// length-prefixed and little-endian, matching capi/batch_wire.zig exactly.
+// No JSON is produced or parsed, and the server-side decode is zero-copy.
+func EncodeBatchWire(writes []WriteIntent, syncLevel SyncLevel) ([]byte, error) {
+	tag, err := syncLevel.wireTag()
+	if err != nil {
+		return nil, err
+	}
+	var writeCount, deleteCount uint32
+	var writeSizer, deleteSizer batchWireSizer
+	sizer := batchWireSizer{size: 4 + 2 + 1 + 1 + 4 + 4} // magic, version, sync_level, reserved, write_count, delete_count
+	for _, w := range writes {
+		counter := &writeSizer
+		if w.Delete {
+			counter = &deleteSizer
+		}
+		if err := counter.addEntry(); err != nil {
+			return nil, err
+		}
+		if err := sizer.addLength(len(w.Key)); err != nil {
+			return nil, err
+		}
+		if !w.Delete {
+			if err := sizer.addLength(len(w.Value)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	writeCount, deleteCount = uint32(writeSizer.entries), uint32(deleteSizer.entries)
+
+	buf := make([]byte, sizer.size)
+	cursor := 0
+	putU32 := func(v uint32) {
+		binary.LittleEndian.PutUint32(buf[cursor:], v)
+		cursor += 4
+	}
+	putU16 := func(v uint16) {
+		binary.LittleEndian.PutUint16(buf[cursor:], v)
+		cursor += 2
+	}
+	putBytes := func(b []byte) {
+		copy(buf[cursor:], b)
+		cursor += len(b)
+	}
+
+	putU32(0x41464257) // "AFBW"
+	putU16(1)          // version
+	buf[cursor] = tag
+	cursor++
+	buf[cursor] = 0 // reserved
+	cursor++
+	putU32(writeCount)
+	putU32(deleteCount)
+	for _, w := range writes {
+		if w.Delete {
+			continue
+		}
+		putU32(uint32(len(w.Key)))
+		putBytes([]byte(w.Key))
+		putU32(uint32(len(w.Value)))
+		putBytes(w.Value)
+	}
+	for _, w := range writes {
+		if !w.Delete {
+			continue
+		}
+		putU32(uint32(len(w.Key)))
+		putBytes([]byte(w.Key))
+	}
+	return buf, nil
 }
 
 // DB is an embedded Antfly database handle.
@@ -649,6 +753,31 @@ func (db *DB) BatchJSON(request []byte) ([]byte, error) {
 
 	var out C.antfly_buffer
 	if err := checkOutcome(C.antfly_db_batch_json((*C.antfly_db)(handle), input, &out)); err != nil {
+		C.antfly_buffer_free(&out)
+		return nil, err
+	}
+	return takeBuffer(out), nil
+}
+
+// BatchWire applies a batch encoded in the binary wire format documented in
+// antfly.h (and capi/batch_wire.zig): writes, deletes and a sync level, with
+// no per-field JSON parsing. Build payload with EncodeBatchWire. Returns the
+// JSON batch result, same as BatchJSON. An OutcomeUnknown failure carries an
+// outcome receipt (see OutcomeReceiptOf).
+func (db *DB) BatchWire(payload []byte) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice(payload)
+	defer cleanup()
+
+	var out C.antfly_buffer
+	if err := checkOutcome(C.antfly_db_batch_wire((*C.antfly_db)(handle), input, &out)); err != nil {
 		C.antfly_buffer_free(&out)
 		return nil, err
 	}

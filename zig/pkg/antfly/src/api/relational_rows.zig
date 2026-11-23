@@ -96,7 +96,7 @@ pub fn prepareMutation(alloc: std.mem.Allocator, req: wire.RelationalRowMutation
         .sync_level = if (req.sync_level) |level| switch (level) {
             .propose => .propose,
             .write => .write,
-            .full_text => .full_text,
+            .query, .full_text => .full_text,
             .enrichments => .enrichments,
             .full_index => .full_index,
         } else .write,

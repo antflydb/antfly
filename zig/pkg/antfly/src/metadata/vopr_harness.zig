@@ -1222,12 +1222,17 @@ pub fn mirrorGroupBatchToActiveReplicas(
         if (cluster.node(i).status(group_id) != .active) continue;
         var response = try client.fetchGroupBatch(base_uri, group_id, table_name, body);
         defer response.deinit(client.alloc);
-        // This coarse fixture has no DataServer repair scheduler. Own the
-        // bounded initial-index materialization through the production repair
-        // endpoint before treating the mirrored replica as query-ready.
+        // This coarse fixture has no DataServer repair scheduler, so nothing
+        // else will ever wait out a scheduler-paced retry backoff on this
+        // repair's behalf; `force` tells the synchronous fallback that this
+        // call is the next attempt and must not stall behind that backoff
+        // (see `req.force`'s handling in repairIndexGenerationIssuesWithRequest).
+        // Own the bounded initial-index materialization through the
+        // production repair endpoint before treating the mirrored replica as
+        // query-ready.
         for (0..40) |_| {
             var repair = try client.fetchGroupArtifactRepairRun(base_uri, group_id, table_name,
-                \\{"target":"index","index_name":"full_text_index_v0","limit":16}
+                \\{"target":"index","index_name":"full_text_index_v0","limit":16,"force":true}
             );
             defer repair.deinit(client.alloc);
             var result = try std.json.parseFromSlice(struct { debt_remaining: bool, has_more: bool }, cluster.alloc, repair.body, .{ .ignore_unknown_fields = true });
@@ -3466,6 +3471,16 @@ const TestDescriptorFactory = struct {
                     .pre_vote = false,
                     .check_quorum = true,
                     .step_down_on_removal = true,
+                    // Deterministic per-node jitter, derived the same way as
+                    // the production metadata/data Raft runtimes
+                    // (metadata/runtime.zig, data/runtime.zig). Without it
+                    // every simulated node shares the same election_tick
+                    // countdown and, once in lockstep, candidates campaign
+                    // and collide on every tick under resource pressure
+                    // (split vote that never resolves). Seeding from the
+                    // sim's own (group_id, local_node_id) keeps exact replay
+                    // reproducible -- it must never come from host entropy.
+                    .random_seed = raft_host.stableRandomSeed(record.group_id, record.local_node_id),
                     .trace_logger = if (self.trace_group_id == record.group_id) self.trace_logger else null,
                 },
                 .storage = store.storage(),
@@ -6913,6 +6928,80 @@ pub const MetadataAdminVoprSource = struct {
             .native_memory_create,
             .lake_source_owner_read,
             .lake_index_lifecycle_read,
+            .sql_population_lineage,
+            .sql_snapshot_cohort,
+            .resolver_authority_mutate,
+            .scope_retirement_prepare,
+            .store_report_basis,
+            .sql_relation_boot_read,
+            .sql_relation_lifetime_page,
+            .sql_relation_boot_submit,
+            .scope_retirement_work,
+            .scope_retirement_manifest,
+            .scope_retirement_submit,
+            .scope_retirement_observation,
+            .table_retirement_prepare,
+            .table_retirement_submit,
+            .table_retirement_receipt,
+            .table_retirement_queue,
+            .table_retirement_effects,
+            .table_retirement_owner_work,
+            .relational_index_status,
+            .relational_index_prepare,
+            .relational_index_begin,
+            .relational_index_admission_status,
+            .relational_index_publish_decide,
+            .relational_index_publish_status,
+            .relational_index_cancel,
+            .relational_index_cancel_status,
+            .sql_index_annotations,
+            .sql_catalog_prepare,
+            .sql_catalog_mutate,
+            .sql_catalog_outcome,
+            .sql_native_index_prepare,
+            .sql_native_index_mutate,
+            .sql_native_index_outcome,
+            .relation_description_mutate,
+            .native_memory_create,
+            .schema_validation_discover,
+            .schema_validation_work,
+            .schema_validation_prepare,
+            .schema_validation_status,
+            .sql_view_mutate,
+            .sql_lock_read,
+            .sql_lock_mutate,
+            .sql_lock_outcome,
+            .sql_prepared_read,
+            .sql_prepared_mutate,
+            .sql_prepared_outcome,
+            .sql_authorization_read,
+            .sql_authorization_mutate,
+            .sql_authorization_outcome,
+            .sql_type_mutate,
+            .sql_type_snapshot,
+            .sql_type_bindings,
+            .sql_type_outcome,
+            .sql_cast_mutate,
+            .sql_cast_snapshot,
+            .sql_cast_outcome,
+            .sql_extension_snapshot,
+            .sql_extension_mutate,
+            .sql_extension_outcome,
+            .sql_routine_mutate,
+            .sql_graph_preparation_read,
+            .sql_graph_preparation_admit,
+            .sql_graph_preparation_outcome,
+            .sql_trigger_snapshot,
+            .sql_routine_snapshot,
+            .sql_routine_outcome,
+            .sql_sequence_admission_head,
+            .sql_sequence_snapshot,
+            .sql_column_sequence_handoffs,
+            .sql_sequence_mutate,
+            .sql_sequence_outcome,
+            .sql_sequence_counter_mutate,
+            .sql_sequence_prepare,
+            .sql_sequence_counter_outcome,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,
             .relation_replace,
@@ -6933,7 +7022,19 @@ pub const MetadataAdminVoprSource = struct {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
+            .relational_index_owner_decision,
+            .schema_validation_owner_read,
+            .schema_validation_receipt_read,
+            .schema_validation_submit,
+            .relational_index_owner_ack,
+            .relational_index_owner_ack_status,
+            .relational_index_source_accept,
+            .relational_index_source_complete,
+            .relational_index_source_accept_status,
             .fk_initial_create_prepare,
+            .query_population_prepare,
+            .constraint_name_prepare,
+            .constraint_name_check,
             .fk_initial_child_decision,
             .fk_initial_create_begin,
             .fk_initial_create_mutate,
@@ -8531,7 +8632,11 @@ pub const VoprPublicClusterFixture = struct {
             for (self.api_base_uris[0..self.uri_count], 0..) |base_uri, node_index| {
                 if (self.cluster.node(node_index).status(group_id) != .active) continue;
                 for ([_][]const u8{ graph_index_name, api_tables.default_full_text_index_name }) |index_name| {
-                    const body = try std.fmt.allocPrint(self.alloc, "{{\"target\":\"index\",\"index_name\":\"{s}\",\"limit\":16}}", .{index_name});
+                    // `force` tells the synchronous fallback this call is the
+                    // next attempt; this coarse fixture has no DataServer
+                    // scheduler to ever wait out a scheduler-paced retry
+                    // backoff on its behalf (see mirrorGroupBatchToActiveReplicas).
+                    const body = try std.fmt.allocPrint(self.alloc, "{{\"target\":\"index\",\"index_name\":\"{s}\",\"limit\":16,\"force\":true}}", .{index_name});
                     defer self.alloc.free(body);
                     for (0..40) |_| {
                         var response = try repair_client.fetchGroupArtifactRepairRun(base_uri, group_id, "docs", body);

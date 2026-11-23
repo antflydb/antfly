@@ -3,7 +3,8 @@ title: Move a database to Antfly Cloud
 description: Upload a consistent Lite snapshot, verify the managed copy, and export a copy to your own host
 prerequisites:
   - "An existing Lite database and its compatible Antfly runtime"
-  - "An Antfly Cloud organization with billing and Lite access"
+  - "An Antfly Cloud organization with billing, Lite access, and snapshot transfers enabled"
+  - "Permission to manage that organization"
 tags: [cloud, lite, migration]
 ---
 
@@ -16,11 +17,14 @@ create an empty database or load the documents again.
 
 Sign up at [Antfly Cloud](https://platform.antfly.io), verify your email, create
 an organization, and complete billing setup. Review the displayed price and any
-introductory terms. If Lite creation is unavailable for your organization,
-contact Antfly. See [Cloud getting started](/docs/cloud/getting-started).
+introductory terms. Import also requires snapshot transfers to be enabled for
+your organization and permission to manage the organization. If **Bring a Lite
+database** is missing, check your permissions with an organization administrator
+and contact Antfly about transfer availability. See
+[Cloud getting started](/docs/cloud/getting-started).
 
 Use the runtime that created your local file to snapshot it. The Quickstart uses
-[v0.3.1](https://github.com/antflydb/antfly/releases/tag/v0.3.1); Cloud uses its
+[v0.3.2](https://github.com/antflydb/antfly/releases/tag/v0.3.2); Cloud uses its
 own runtime, and import preflight must accept the snapshot. Models, credentials,
 and external media dependencies need separate configuration. The Quickstart's
 keyword-only database does not need a model.
@@ -84,12 +88,13 @@ Export from the instance page and download the snapshot to a new file. Keep
 that download untouched. Use a runtime compatible with the exported file and
 its managed runtime; a local CLI version alone does not establish compatibility.
 
-Stop any local server using port 8080, then serve a working copy:
+Stop any local server using port 8080, then serve a working copy in a new
+directory. This sequence stops if the directory already exists or copying fails:
 
 ```bash
-mkdir returned-lite
-cp downloaded.aflite returned-lite/database.aflite
-cd returned-lite
+mkdir returned-lite &&
+cp downloaded.aflite returned-lite/database.aflite &&
+cd returned-lite &&
 antfly standalone --storage-engine lite --storage-path "$PWD/database.aflite"
 ```
 

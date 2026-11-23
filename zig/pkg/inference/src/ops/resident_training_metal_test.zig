@@ -86,7 +86,14 @@ test "resident training strict primitives reject unqualified backends without fa
     try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, upload(&cb, &.{1}, &.{1}));
     const value = try cb.fromFloat32Shape(&.{1}, &.{1});
     defer cb.free(value);
-    try std.testing.expectError(error.UnsupportedResidentTrainingCapture, cb.snapshotTensorShape(value, &.{1}));
+    const snapshot = try cb.snapshotTensorShape(value, &.{1});
+    defer cb.free(snapshot);
+    const replacement = try cb.fromFloat32Shape(&.{9}, &.{1});
+    defer cb.free(replacement);
+    try std.testing.expect(try cb.copyRows2D(a, value, 0, replacement, 0, 1, 1));
+    const captured = try cb.toFloat32(snapshot, a);
+    defer a.free(captured);
+    try std.testing.expectEqualSlices(f32, &.{1}, captured);
     try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, cb.residentTrainingNorm(&.{.{ .tensor = value, .elem_count = 1 }}, .{}));
 }
 

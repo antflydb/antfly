@@ -427,7 +427,7 @@ pub const ClassificationPipeline = struct {
             break :blk &[_]Tensor{ input_ids_tensor, attention_mask_tensor, token_type_tensor.? };
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
-        var outputs = try run_permit.runWithControl(inputs, alloc, self.execution_control);
+        var outputs = try @import("../execution/tensor_dispatch.zig").runSerial(alloc, self.session, run_permit, inputs, self.execution_control);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);

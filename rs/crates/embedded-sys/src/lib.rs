@@ -598,6 +598,22 @@ unsafe extern "C" {
         out: *mut antfly_buffer,
         receipt_out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    /// `antfly_db_batch_json` for the length-prefixed binary batch format.
+    /// `request_buf` must stay valid for the call; key/value bytes are not
+    /// copied out of it.
+    pub fn antfly_db_batch_wire(
+        db: *mut antfly_db,
+        request_buf: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    /// `antfly_db_batch_wire` with the same-call receipt, as
+    /// `antfly_db_batch_json_with_receipt`.
+    pub fn antfly_db_batch_wire_with_receipt(
+        db: *mut antfly_db,
+        request_buf: antfly_slice,
+        out: *mut antfly_buffer,
+        receipt_out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_outcome_receipt_status(
         db: *mut antfly_db,
         receipt: antfly_slice,

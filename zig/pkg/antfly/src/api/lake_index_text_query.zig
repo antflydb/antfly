@@ -3694,7 +3694,7 @@ const Execution = struct {
         if (req.filter_query_json.len != 0) self.vector_include_provider = try resolver.openMembership(a, req.filter_query_json);
         if (req.exclusion_query_json.len != 0) self.vector_exclude_provider = try resolver.openMembership(a, req.exclusion_query_json);
     }
-    fn searchComponents(raw: ?*anyopaque, a: A, components: []const local.storage_db_query_search_exec.ComposedComponent) !local.storage_db_query_search_exec.ComposedComponentBatch {
+    fn searchComponents(raw: ?*anyopaque, a: A, components: []const local.storage_db_query_search_exec.ComposedComponent) !?local.storage_db_query_search_exec.ComposedComponentBatch {
         const self = from(raw);
         const scheduler = local.sql_parallel_scheduler;
         try self.resolveOverlayPhysical();

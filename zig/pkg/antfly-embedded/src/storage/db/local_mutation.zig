@@ -249,6 +249,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const ensureDurableReplicationStartupBarrier = commit.ensureDurableReplicationStartupBarrier;
         pub const failIfIdentityOrdinalExhaustedForNewUpserts = commit.failIfIdentityOrdinalExhaustedForNewUpserts;
         pub const finalizePendingRowPolicyReceiptLocked = commit.finalizePendingRowPolicyReceiptLocked;
+        pub const finalizePendingRowPolicySchemaPairLocked = commit.finalizePendingRowPolicySchemaPairLocked;
         pub const flushDurableReplicationOutboxes = commit.flushDurableReplicationOutboxes;
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
@@ -280,11 +281,15 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const notifyResolverReplayRuntimesForced = commit.notifyResolverReplayRuntimesForced;
         pub const pendingRowPolicyReceipt = commit.pendingRowPolicyReceipt;
         pub const preflightReplicationBatchSyncCommit = commit.preflightReplicationBatchSyncCommit;
+        pub const prepareLocalIntegrityDecision = commit.prepareLocalIntegrityDecision;
         pub const prepareMergeArtifactEffects = preparation.prepareMergeArtifactEffects;
         pub const projectedBatchLsmAdmissionBytes = preparation.projectedBatchLsmAdmissionBytes;
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
+        pub const resolveClosedLegacyTerminalInternal = commit.resolveClosedLegacyTerminalInternal;
+        pub const resolveExternalTransactionIntents = commit.resolveExternalTransactionIntents;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
+        pub const resolveTransactionIntentsInternalScoped = commit.resolveTransactionIntentsInternalScoped;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
         pub const shouldApplySplitReplicationLocked = commit.shouldApplySplitReplicationLocked;
@@ -391,6 +396,16 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const applyDerivedBatchTargetsProfiled = materialization.applyDerivedBatchTargetsProfiled;
         pub const applyDerivedBatchToIndexContext = materialization.applyDerivedBatchToIndexContext;
         pub const applyDerivedBatchToIndexContextProfiled = materialization.applyDerivedBatchToIndexContextProfiled;
+        pub const InlineTextPublication = materialization.InlineTextPublication;
+        pub const prepareInlineTextPublication = materialization.prepareInlineTextPublication;
+        pub const InlineGraphPublication = materialization.InlineGraphPublication;
+        pub const prepareInlineGraphPublication = materialization.prepareInlineGraphPublication;
+        pub const InlineSparsePublication = materialization.InlineSparsePublication;
+        pub const prepareInlineSparsePublication = materialization.prepareInlineSparsePublication;
+        pub const InlineDensePublication = materialization.InlineDensePublication;
+        pub const prepareInlineDensePublication = materialization.prepareInlineDensePublication;
+        pub const InlineAlgebraicPublication = materialization.InlineAlgebraicPublication;
+        pub const prepareInlineAlgebraicPublication = materialization.prepareInlineAlgebraicPublication;
         pub const applyGraphArtifactMutationPages = materialization.applyGraphArtifactMutationPages;
         pub const applyGraphDocClearsForIndex = materialization.applyGraphDocClearsForIndex;
         pub const applyPrecomputeAssetProducerOutput = materialization.applyPrecomputeAssetProducerOutput;
@@ -607,7 +622,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const loadSourceExtractionForResolution = materialization.loadSourceExtractionForResolution;
         pub const lockApply = commit.lockApply;
         pub const lockAtomicWithBackoff = commit.lockAtomicWithBackoff;
+        pub const lockAtomicWithBackoffIo = commit.lockAtomicWithBackoffIo;
         pub const lockAtomicWithBackoffProfiled = commit.lockAtomicWithBackoffProfiled;
+        pub const lockAtomicWithBackoffProfiledIo = commit.lockAtomicWithBackoffProfiledIo;
         pub const logSparseWriteProfileDelta = materialization.logSparseWriteProfileDelta;
         pub const makeChunkCacheKey = materialization.makeChunkCacheKey;
         pub const makeTimestampKey = preparation.makeTimestampKey;
@@ -829,6 +846,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
+            pub const finalizePendingRowPolicySchemaPairLocked = Implementation.finalizePendingRowPolicySchemaPairLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
@@ -846,7 +864,9 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const prepareMergeArtifactEffects = Implementation.prepareMergeArtifactEffects;
             pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
+            pub const resolveClosedLegacyTerminalInternal = Implementation.resolveClosedLegacyTerminalInternal;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsInternalScoped = Implementation.resolveTransactionIntentsInternalScoped;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
@@ -987,6 +1007,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
+            pub const finalizePendingRowPolicySchemaPairLocked = Implementation.finalizePendingRowPolicySchemaPairLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
@@ -1004,7 +1025,9 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const prepareMergeArtifactEffects = Implementation.prepareMergeArtifactEffects;
             pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
+            pub const resolveClosedLegacyTerminalInternal = Implementation.resolveClosedLegacyTerminalInternal;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsInternalScoped = Implementation.resolveTransactionIntentsInternalScoped;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
@@ -1021,7 +1044,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub fn scheduleDurableReplicationOutboxRecovery(_: *@This()) void {}
 
             pub fn resolveTransaction(self: *@This(), txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
-                try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .propose, .none, null, null);
+                try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .propose, .none, null, null, null, null);
             }
 
             pub fn waitForResolvedTransactionSyncWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: types.CancellationToken) !void {

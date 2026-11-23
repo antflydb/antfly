@@ -101,7 +101,7 @@ pub const Prepared = struct {
     shared: u64 = 0,
     new_bytes: u64 = 0,
 
-    pub fn apply(self: Prepared, txn: *store.DocStore.Txn) !void {
+    pub fn apply(self: Prepared, txn: anytype) !void {
         for (self.writes.items) |write| try txn.put(write.key, write.value);
         for (self.deletes.items) |name| try txn.delete(name);
     }

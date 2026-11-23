@@ -24,8 +24,15 @@ const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 const graph_exec = @import("graph_exec.zig");
 
 pub const VisibleHitEvaluator = struct {
+    worker_stop: ?*const std.atomic.Value(bool) = null,
     ctx: ?*anyopaque,
     filter_many_ctx: ?*anyopaque = null,
+    filter_many_controlled: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        hits: []const types.SearchHit,
+        stop: *const std.atomic.Value(bool),
+    ) anyerror![]bool = null,
     func: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -113,6 +120,7 @@ pub const SearchHitVisibilityEvaluator = struct {
 };
 
 pub const StoredPatternFilterExecutor = struct {
+    worker_stop: ?*const std.atomic.Value(bool) = null,
     ctx: ?*anyopaque,
     load_stored: *const fn (
         ctx: ?*anyopaque,
@@ -154,8 +162,15 @@ pub const StoredPatternFilterExecutor = struct {
 };
 
 pub const SearchResultPostprocessor = struct {
+    worker_stop: ?*const std.atomic.Value(bool) = null,
     ctx: ?*anyopaque,
     filter_visible_many_ctx: ?*anyopaque = null,
+    filter_visible_many_controlled: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        hits: []const types.SearchHit,
+        stop: *const std.atomic.Value(bool),
+    ) anyerror![]bool = null,
     is_visible: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -393,39 +408,74 @@ pub fn filterVisibleSearchResult(
     raw: types.SearchResult,
     evaluator: VisibleHitEvaluator,
 ) !types.SearchResult {
-    var kept = std.ArrayListUnmanaged(types.SearchHit).empty;
-    errdefer {
-        for (kept.items) |*hit| hit.deinit(alloc);
-        kept.deinit(alloc);
-    }
-
-    const source = raw;
-    const original_hits_len = raw.hits.len;
     var owned = raw;
     errdefer owned.deinit();
+    const control: @import("../../../search/query.zig").ExecutionControl = .{ .worker_stop = evaluator.worker_stop };
+    try control.check();
 
-    const keep_mask = if (evaluator.filter_many) |filter_many|
-        try filter_many(evaluator.filter_many_ctx orelse evaluator.ctx, alloc, owned.hits)
-    else
-        null;
-    defer if (keep_mask) |mask| alloc.free(mask);
-
-    for (owned.hits, 0..) |*hit, i| {
-        const keep = if (keep_mask) |mask|
-            mask[i]
-        else
-            try evaluator.func(evaluator.ctx, alloc, hit.*);
-        if (keep) {
-            try kept.append(alloc, hit.*);
-        } else {
-            hit.deinit(alloc);
+    const keep_mask = mask: {
+        const ctx = evaluator.filter_many_ctx orelse evaluator.ctx;
+        if (evaluator.worker_stop) |stop| {
+            if (evaluator.filter_many_controlled) |filter| break :mask try filter(ctx, alloc, owned.hits, stop);
         }
-    }
+        if (evaluator.filter_many) |filter| break :mask try filter(ctx, alloc, owned.hits);
+        const mask = try alloc.alloc(bool, owned.hits.len);
+        errdefer alloc.free(mask);
+        for (owned.hits, mask, 0..) |hit, *keep, i| {
+            if (i % 256 == 0) try control.check();
+            keep.* = try evaluator.func(evaluator.ctx, alloc, hit);
+        }
+        break :mask mask;
+    };
+    defer alloc.free(keep_mask);
+    try control.check();
 
+    const kept_len = std.mem.count(bool, keep_mask, &.{true});
+    if (kept_len == owned.hits.len) return owned;
+    const kept = try alloc.alloc(types.SearchHit, kept_len);
+    // All fallible work happens before moving any hit out of the input.
+    var output: usize = 0;
+    for (owned.hits, keep_mask) |*hit, keep| {
+        if (keep) {
+            kept[output] = hit.*;
+            output += 1;
+        } else hit.deinit(alloc);
+    }
     alloc.free(owned.hits);
-    owned.hits = try kept.toOwnedSlice(alloc);
-    rewriteLocalTotalAfterObservedDrop(&owned, source, original_hits_len, owned.hits.len);
+    owned.hits = kept;
+    rewriteLocalTotalAfterObservedDrop(&owned, raw, raw.hits.len, kept.len);
     return owned;
+}
+
+test "visible search filtering releases untouched candidate ownership on late error or worker stop" {
+    const alloc = std.testing.allocator;
+    const Evaluator = struct {
+        visited: usize = 0,
+        cancel: bool,
+        stop: std.atomic.Value(bool) = .init(false),
+
+        fn eval(raw: ?*anyopaque, _: Allocator, _: types.SearchHit) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.visited += 1;
+            if (self.visited == 2) {
+                if (!self.cancel) return error.TestVisibilityFailed;
+                self.stop.store(true, .release);
+            }
+            return true;
+        }
+    };
+
+    for ([_]bool{ false, true }) |cancel| {
+        var state: Evaluator = .{ .cancel = cancel };
+        const hits = try alloc.alloc(types.SearchHit, 300);
+        for (hits) |*hit| hit.* = .{ .id = try alloc.dupe(u8, "candidate"), .score = 1 };
+        try std.testing.expectError(if (cancel) error.Cancelled else error.TestVisibilityFailed, filterVisibleSearchResult(
+            alloc,
+            .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(hits.len) },
+            .{ .ctx = &state, .func = Evaluator.eval, .worker_stop = &state.stop },
+        ));
+        try std.testing.expectEqual(@as(usize, if (cancel) 256 else 2), state.visited);
+    }
 }
 
 pub fn isVisibleSearchHit(
@@ -1684,7 +1734,8 @@ pub fn applyStoredSearchPatternFilters(
     var ordinals: PatternOrdinalMemo = .{};
     defer ordinals.deinit(alloc);
 
-    const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns };
+    const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns, .worker_stop = executor.worker_stop };
+    try control.check();
     var include_keys: std.StringHashMapUnmanaged(void) = .empty;
     defer include_keys.deinit(alloc);
     var exclude_keys: std.StringHashMapUnmanaged(void) = .empty;
@@ -1885,6 +1936,7 @@ pub fn applyStoredSearchPatternFilters(
     var loaded_missing_index: usize = 0;
     var kept_len: usize = 0;
     for (result.hits, 0..) |hit, i| {
+        if (i % 256 == 0) try control.check();
         if (!keep_hits[i]) continue;
         _ = arena_state.reset(.retain_capacity);
         const hit_alloc = arena_state.allocator();
@@ -2010,7 +2062,9 @@ pub fn postprocessTextSearchResult(
     }
     var filtered = try filterVisibleSearchResult(alloc, raw, .{
         .ctx = processor.ctx,
+        .worker_stop = processor.worker_stop,
         .func = processor.is_visible,
+        .filter_many_controlled = processor.filter_visible_many_controlled,
         .filter_many = processor.filter_visible_many,
         .filter_many_ctx = processor.filter_visible_many_ctx,
     });
@@ -2018,6 +2072,7 @@ pub fn postprocessTextSearchResult(
     errdefer if (owns_filtered) filtered.deinit();
     filtered = try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
+        .worker_stop = processor.worker_stop,
         .load_stored = processor.load_stored,
         .load_many_stored = processor.load_many_stored,
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
@@ -2025,6 +2080,7 @@ pub fn postprocessTextSearchResult(
         .resolve_parent_id = if (chunk_backed) processor.resolve_parent_id else null,
         .load_parent_stored = if (chunk_backed) processor.load_parent_stored else null,
     });
+    try (@import("../../../search/query.zig").ExecutionControl{ .worker_stop = processor.worker_stop }).check();
     if (chunk_backed) {
         // Chunk members intentionally share their parent document ordinal.
         // Preserve distinct source chunks until hierarchy grouping while still

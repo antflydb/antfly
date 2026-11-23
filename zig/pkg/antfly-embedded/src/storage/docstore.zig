@@ -31,9 +31,17 @@ const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
+const replay_chunks = @import("db/derived/replay_chunks.zig");
+const apply_state = @import("db/derived/apply_state.zig");
+const replay_reference = @import("db/derived/replay_reference.zig");
 const internal_keys = @import("internal_keys.zig");
+const replay_journal_format = @import("replay_journal_format.zig");
 const retained_effects = @import("retained_effects.zig");
+const committed_history = @import("committed_history.zig");
 const artifact_payload = @import("artifact_payload.zig");
+const row_heap = @import("row_heap.zig");
+const row_heap_scope = @import("row_heap_scope.zig");
+const physical_table_catalog = @import("db/table_catalog.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
@@ -187,23 +195,270 @@ fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload
     }
 }
 
+/// WS5: journal credit ledger helpers shared by the append path
+/// (`writeReplayEntries`) and the retirement path (`retireReplaySlice`).
+fn loadJournalCreditLedger(txn: anytype) !internal_keys.JournalCreditLedger {
+    const raw = txn.get(internal_keys.journal_credit_ledger_key[0..]) catch |err| switch (err) {
+        error.NotFound => return internal_keys.JournalCreditLedger{},
+        else => return err,
+    };
+    return internal_keys.JournalCreditLedger.decode(raw) orelse return error.CorruptReplayMetadata;
+}
+
+fn storeJournalCreditLedger(txn: anytype, ledger: internal_keys.JournalCreditLedger) !void {
+    const raw = ledger.encode();
+    try txn.put(internal_keys.journal_credit_ledger_key[0..], raw[0..]);
+}
+
+/// The credit ledger a scan of every lane entry reproduces: what the base
+/// revision's journal is charged when it is upgraded in place.
+const ReplayCreditScan = struct {
+    ledger: internal_keys.JournalCreditLedger = .{},
+    heads: ReplayCreditLaneHeads = @splat(0),
+};
+
+fn scanReplayJournalCredits(txn: anytype) !ReplayCreditScan {
+    var scan: ReplayCreditScan = .{};
+    for (replay_credit_lanes, 0..) |kind, i| {
+        const head = replayCreditLaneHead(&scan.heads, i);
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        cursor.setLengthOnly();
+        const lower = internal_keys.replayRangeLower(kind, 0);
+        const upper = internal_keys.replayRangeUpper(kind);
+        cursor.setUpperBound(&upper);
+        var entry = try cursor.seekAtOrAfter(&lower);
+        while (entry) |current| : (entry = try cursor.next()) {
+            // Bounded by key as well: not every cursor honors the upper bound.
+            if (current.key.len < 2 or current.key[0] != internal_keys.replay_namespace or current.key[1] != kind) break;
+            const seq = internal_keys.parseReplayEntrySequence(current.key, kind) orelse continue;
+            if (std.mem.readInt(u64, head, .little) == 0) std.mem.writeInt(u64, head, seq + 1, .little);
+            scan.ledger = scan.ledger.charged(replay_journal_format.entryCharge(current.key.len, cursor.valueLen(current)), 1);
+        }
+    }
+    const next = try replayCreditNextSequence(txn);
+    for (0..replay_credit_lanes.len) |i| {
+        if (std.mem.readInt(u64, replayCreditLaneHead(&scan.heads, i), .little) == 0)
+            std.mem.writeInt(u64, replayCreditLaneFloor(&scan.heads, i), next, .little);
+    }
+    return scan;
+}
+
+/// Brings a journal the base revision initialized up to the current format
+/// in `txn`; see `replay_journal_format`.
+const replay_hint_ordinals = blk: {
+    var ordinals: [replay_hints.len]u8 = undefined;
+    for (replay_hints, 0..) |hint, i| ordinals[i] = replayHintOrdinal(hint);
+    break :blk ordinals;
+};
+
+const replay_credit_lanes = [_]u8{internal_keys.replay_all_kind} ++ replay_hint_ordinals;
+// The first key in each lane is enough to detect base retirement, which
+// only removes prefixes. A base append is detected separately by its head.
+// Keep the sequence at which an empty lane was observed. Its next seek
+// can start there, even if tombstones for the retired prefix still exist.
+const ReplayCreditLaneHeads = [replay_credit_lanes.len * 16]u8;
+
+fn replayCreditLaneHead(heads: *ReplayCreditLaneHeads, lane: usize) *[8]u8 {
+    return heads[lane * 16 ..][0..8];
+}
+
+fn replayCreditLaneFloor(heads: *ReplayCreditLaneHeads, lane: usize) *[8]u8 {
+    return heads[lane * 16 + 8 ..][0..8];
+}
+
+fn replayCreditBinding(heads: *const ReplayCreditLaneHeads, next: u64) u64 {
+    return std.hash.Wyhash.hash(next, heads);
+}
+
+fn storeProtectedReplayCredit(txn: anytype, ledger: internal_keys.JournalCreditLedger, heads: *const ReplayCreditLaneHeads, next: u64) !void {
+    const raw = ledger.encodeProtected(replayCreditBinding(heads, next));
+    try txn.put(&internal_keys.journal_credit_ledger_key, &raw);
+}
+
+fn stampProtectedReplayCreditFormat(txn: anytype) !void {
+    const version = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_protected_credit);
+    try txn.put(&internal_keys.replay_journal_format_version_key, &version);
+}
+
+fn installProtectedReplayCredit(txn: anytype, heads: *const ReplayCreditLaneHeads, ledger: internal_keys.JournalCreditLedger, next: u64) !void {
+    try storeProtectedReplayCredit(txn, ledger, heads, next);
+    try txn.put(&internal_keys.journal_credit_lane_heads_key, heads);
+    try stampProtectedReplayCreditFormat(txn);
+    _ = txn.get(&internal_keys.journal_credit_totals_witness_key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    try txn.delete(&internal_keys.journal_credit_totals_witness_key);
+}
+
+fn storeCompatibleReplayCredit(txn: anytype, ledger: internal_keys.JournalCreditLedger) !void {
+    try storeJournalCreditLedger(txn, ledger);
+    try txn.put(&internal_keys.journal_credit_totals_witness_key, &ledger.encode());
+}
+
+fn storeEmptyReplayCreditLaneHeads(txn: anytype, next: u64) !void {
+    var heads: ReplayCreditLaneHeads = @splat(0);
+    for (0..replay_credit_lanes.len) |lane| {
+        std.mem.writeInt(u64, replayCreditLaneFloor(&heads, lane), next, .little);
+    }
+    try txn.put(&internal_keys.journal_credit_lane_heads_key, &heads);
+    try storeCompatibleReplayCredit(txn, .{});
+}
+
+fn replayCreditLaneStart(heads: *const ReplayCreditLaneHeads, lane: usize) u64 {
+    const head = std.mem.readInt(u64, heads[lane * 16 ..][0..8], .little);
+    if (head != 0) return head - 1;
+    return std.mem.readInt(u64, heads[lane * 16 + 8 ..][0..8], .little);
+}
+
+fn replayCreditNextSequence(txn: anytype) !u64 {
+    const raw = replay_journal_format.getNextSequence(txn) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    return std.mem.readInt(u64, &raw, .little);
+}
+
+fn seekReplayCreditLaneHead(cursor: anytype, kind: u8, from: u64) !u64 {
+    const lower = internal_keys.replayRangeLower(kind, from);
+    const upper = internal_keys.replayRangeUpper(kind);
+    cursor.setUpperBound(&upper);
+    defer cursor.setUpperBound(null);
+    const entry = (try cursor.seekAtOrAfter(&lower)) orelse return 0;
+    const seq = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return 0;
+    return seq + 1;
+}
+
+fn storedReplayCreditLaneHeads(txn: anytype) !?ReplayCreditLaneHeads {
+    const raw = txn.get(&internal_keys.journal_credit_lane_heads_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (raw.len != @sizeOf(ReplayCreditLaneHeads)) return null;
+    return raw[0..@sizeOf(ReplayCreditLaneHeads)].*;
+}
+
+fn replayCreditsNeedRepair(txn: anytype) !bool {
+    if (try replay_journal_format.baseWroteSince(txn)) return true;
+    const stored = try storedReplayCreditLaneHeads(txn) orelse return true;
+    const ledger_raw = txn.get(&internal_keys.journal_credit_ledger_key) catch |err| switch (err) {
+        error.NotFound => return true,
+        else => return err,
+    };
+    if (try replay_journal_format.state(txn) == .protected_credit) {
+        const binding = internal_keys.JournalCreditLedger.protectedBinding(ledger_raw) orelse return true;
+        if (binding != replayCreditBinding(&stored, try replayCreditNextSequence(txn))) return true;
+    } else {
+        const ledger = internal_keys.JournalCreditLedger.decode(ledger_raw) orelse return true;
+        const expected = ledger.encode();
+        const witness = txn.get(&internal_keys.journal_credit_totals_witness_key) catch |err| switch (err) {
+            error.NotFound => return true,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, witness, &expected)) return true;
+    }
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
+    cursor.setKeysOnly();
+    for (replay_credit_lanes, 0..) |kind, i| {
+        const expected = std.mem.readInt(u64, stored[i * 16 ..][0..8], .little);
+        if (try seekReplayCreditLaneHead(&cursor, kind, replayCreditLaneStart(&stored, i)) != expected) return true;
+    }
+    return false;
+}
+
+fn upgradeLegacyReplayJournal(txn: anytype, keep_base_layout: bool) !void {
+    const scan = try scanReplayJournalCredits(txn);
+    try replay_journal_format.upgrade(txn, scan.ledger, &replay_hint_ordinals, keep_base_layout);
+    if (keep_base_layout) {
+        try txn.put(&internal_keys.journal_credit_lane_heads_key, &scan.heads);
+        try storeCompatibleReplayCredit(txn, scan.ledger);
+    }
+}
+
+/// Whether this store's appends keep the base revision's layout (every hint
+/// lane, the base `next_sequence` key): every backend whose readers use
+/// per-hint lanes. This selects the lane layout independently of the
+/// credit ledger encoding.
+fn keepsBaseReplayLayout(txn: anytype) bool {
+    const owner = txn.owner orelse return true;
+    return !owner.sharedReplayLane();
+}
+
 fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
     // DB writers reserve and commit under the apply lock. Failed reservations
     // may leave holes, but a late writer must never fill a hole below an
     // already published cut: replay consumers may have passed it. Consensus
     // duplicate detection happens before opening this mutation transaction.
     if (sequence == std.math.maxInt(u64)) return error.InvalidBatchRequest;
+    // A journal the base revision initialized is upgraded in this append's
+    // own transaction (open normally already did it), before its
+    // `next_sequence` is read from the current key; a fresh one is stamped.
+    const keep_base_layout = keepsBaseReplayLayout(txn);
+    const journal_state = try replay_journal_format.state(txn);
+    if (journal_state == .legacy) try upgradeLegacyReplayJournal(txn, keep_base_layout);
+    const already_initialized = journal_state != .absent;
+    if (!already_initialized) {
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_current);
+        try txn.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
+    }
     const previous = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
+    // Stashed as a fixed-size copy (not the borrowed slice -- several more
+    // `txn.get`/`txn.put` calls happen before it's used) so the `put` of
+    // this same key below can hand it to `artifact_inputs.touch` instead of
+    // that hook issuing its own second `txn.get` for the identical
+    // pre-write value. See `Capture.replay_meta_previous_hint`.
+    var previous_fixed: ?[8]u8 = null;
     if (previous) |raw| {
         if (raw.len != 8) return error.CorruptReplayMetadata;
-        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) return error.InvalidBatchRequest;
+        previous_fixed = raw[0..8].*;
+        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) {
+            std.log.warn("replay append below the committed cut: sequence={d} next_sequence={d}", .{ sequence, std.mem.readInt(u64, raw[0..8], .little) });
+            return error.InvalidBatchRequest;
+        }
     }
-    try txn.put(internal_keys.replay_meta_init_key[0..], "");
+
+    // WS5: this append is charged against the journal credit ledger in the
+    // same transaction that grows the journal. Admission is checked against
+    // an upper bound (every lane gets the full unfiltered payload) before any
+    // key is written, so a refused append leaves no partial state behind.
+    //
+    // Every hint the record carries gets an entry in its lane, whatever
+    // consumers are active (`replay_journal_format_v3`): where readers use
+    // hint lanes, the filtered payload copy the base revision writes, so its
+    // binary still finds every hinted record; on a shared-lane store, which
+    // filters the all-lane at read time, an empty index entry, so "a record
+    // for this hint in (a, b]" stays one seek.
+    const mask_all = change_journal_mod.encodedRecordHintMask(payload) catch 0;
+    const mask = if (keep_base_layout) mask_all else 0;
+    const lane_count: u64 = 1 + @popCount(mask);
+    const index_count: u64 = if (keep_base_layout) 0 else @popCount(mask_all);
+    const upper_bound_charge: u64 = lane_count * (internal_keys.replay_key_len + payload.len) + index_count * internal_keys.replay_key_len;
+    // Loaded once here for the admission check and reused below for the
+    // final charge instead of a second `txn.get` of the same key: nothing
+    // in between writes `journal_credit_ledger_key` (the puts above are to
+    // unrelated replay-journal keys), so the bytes read here are still
+    // exactly what a second read would return.
+    var reserved_ledger: ?internal_keys.JournalCreditLedger = null;
+    if (txn.owner) |owner| {
+        const ledger = try loadJournalCreditLedger(txn);
+        const admissible = owner.journal_credit_capacity_bytes -| owner.journal_credit_progress_reserve_bytes;
+        if (ledger.bytes + upper_bound_charge > admissible) return error.JournalCreditCapacityExceeded;
+        reserved_ledger = ledger;
+    }
+
+    // The init marker's value never changes once set; rewriting the same
+    // empty string every commit cost this record its own document_index
+    // leaf for no reason after the first append ever made.
+    if (!already_initialized) try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplayNextSequence(sequence + 1);
+    txn.artifact_inputs.replay_meta_previous_hint = previous_fixed;
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
+    if (keep_base_layout) try txn.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
     const latest_raw = encodeReplaySequence(sequence);
 
     const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
@@ -211,23 +466,67 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     const all_latest_key = internal_keys.replayLatestSequenceKey(internal_keys.replay_all_kind);
     try txn.put(all_latest_key[0..], latest_raw[0..]);
 
-    const mask = change_journal_mod.encodedRecordHintMask(payload) catch return;
-    if (mask == 0) return;
-
-    var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
-        try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
-        return;
+    var charged_bytes: u64 = internal_keys.replay_key_len + payload.len;
+    var charged_records: u64 = 1;
+    if (!keep_base_layout) for (replay_hints) |hint| {
+        if ((mask_all & change_journal_mod.singleHintMask(hint)) == 0) continue;
+        const index_key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+        try txn.put(index_key[0..], "");
+        charged_bytes += internal_keys.replay_key_len;
+        charged_records += 1;
     };
-    defer decoded.deinit();
 
-    for (replay_hints) |hint| {
-        if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
-        const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
-        defer alloc.free(lane_payload);
-        const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
-        try txn.put(key[0..], lane_payload);
-        const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
-        try txn.put(latest_key[0..], latest_raw[0..]);
+    write_hints: {
+        if (mask == 0) break :write_hints;
+
+        var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
+            try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
+            charged_bytes += @as(u64, @popCount(mask)) * (internal_keys.replay_key_len + payload.len);
+            charged_records += @popCount(mask);
+            break :write_hints;
+        };
+        defer decoded.deinit();
+
+        for (replay_hints) |hint| {
+            if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
+            const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
+            defer alloc.free(lane_payload);
+            const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+            try txn.put(key[0..], lane_payload);
+            const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+            try txn.put(latest_key[0..], latest_raw[0..]);
+            charged_bytes += internal_keys.replay_key_len + lane_payload.len;
+            charged_records += 1;
+        }
+    }
+
+    if (txn.owner != null) {
+        var ledger = reserved_ledger.?;
+        ledger = ledger.charged(charged_bytes, charged_records);
+        if (keep_base_layout) {
+            const stored = try storedReplayCreditLaneHeads(txn);
+            if (stored != null or !already_initialized) {
+                const previous_heads: ReplayCreditLaneHeads = stored orelse @splat(0);
+                var heads = previous_heads;
+                for (replay_credit_lanes, 0..) |kind, i| {
+                    if (i != 0 and (mask & (@as(u8, 1) << @intCast(kind))) == 0) continue;
+                    const slot = replayCreditLaneHead(&heads, i);
+                    if (std.mem.readInt(u64, slot, .little) == 0) {
+                        std.mem.writeInt(u64, slot, sequence + 1, .little);
+                        std.mem.writeInt(u64, replayCreditLaneFloor(&heads, i), 0, .little);
+                    }
+                }
+                if (!already_initialized) for (0..replay_credit_lanes.len) |i| {
+                    if (std.mem.readInt(u64, replayCreditLaneHead(&heads, i), .little) == 0)
+                        std.mem.writeInt(u64, replayCreditLaneFloor(&heads, i), sequence + 1, .little);
+                };
+                if (!std.mem.eql(u8, &heads, &previous_heads)) try txn.put(&internal_keys.journal_credit_lane_heads_key, &heads);
+                if (journal_state == .protected_credit)
+                    try storeProtectedReplayCredit(txn, ledger, &heads, sequence + 1)
+                else
+                    try storeCompatibleReplayCredit(txn, ledger);
+            } else try storeJournalCreditLedger(txn, ledger);
+        } else try storeJournalCreditLedger(txn, ledger);
     }
 }
 // ============================================================================
@@ -264,6 +563,8 @@ pub const ReplayIterationStats = struct {
     hint_filter_skips: usize = 0,
     scan_batches: usize = 0,
     fallback_used: bool = false,
+    /// See `backend_types.ReplayLaneIterationStats.scan_budget_exhausted`.
+    scan_budget_exhausted: bool = false,
 };
 
 // ============================================================================
@@ -459,10 +760,21 @@ fn updateGraphEndpointCleanupAdmission(txn: anytype, alloc: Allocator, key: []co
 }
 
 pub const DocStore = struct {
+    /// Actual native primary identity, installed by its DB owner. Transaction
+    /// adapters inherit this authority; request JSON never supplies it.
+    native_relation_pin: ?@import("../common/relation_persistence.zig").PhysicalPin = null,
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
     payload_migration_allowance: ?u64 = null,
     payload_policy_mutex: std.Io.Mutex = .init,
+    row_heap_active: std.atomic.Value(bool) = .init(false),
+    /// Scheduling hint only. The durable retirement counters, reader epochs
+    /// and primary transaction remain the authority for every deletion.
+    row_heap_collection_pending: std.atomic.Value(bool) = .init(false),
+    // Shares payload_policy_mutex with source/reader admission. Old current-tip
+    // probes protect immutable heap bodies; stable snapshots use backend MVCC.
+    row_heap_epochs: row_heap.Epochs = .{},
+    row_heap_collection_mutex: std.Io.Mutex = .init,
     payload_recovery_required: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
@@ -477,6 +789,7 @@ pub const DocStore = struct {
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
+    committed_history_cache: std.atomic.Value(u8) = .init(0),
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
     owned_lsm_backend: ?lsm_backend.BackendHandle,
@@ -485,6 +798,9 @@ pub const DocStore = struct {
     // Reservations are not visibility. Zero means the durable committed cut
     // has not yet been loaded; intentional persisted replay floors count.
     committed_replay_next_cached: AtomicU64 = .init(0),
+    /// The backend adoption epoch these caches were derived under; see
+    /// `revalidateAdoptedState`.
+    adopted_epoch: AtomicU64 = .init(0),
     // A failed portable-import rollback leaves a durable recovery marker. Once
     // fenced, this handle must not expose the partial generation or accept
     // writes that restart recovery would later erase. Reopening constructs a
@@ -499,6 +815,48 @@ pub const DocStore = struct {
     // transactions. Packing both into one atomic makes reader admission versus
     // publication closure a single indivisible transition.
     portable_import_reader_state: std.atomic.Value(usize) = .init(0),
+    // WS5: owner-queued journal retirement. `retirement_queue` is the
+    // foreground-raised watermark; `active_consumer_hint_mask` gates which
+    // hinted lanes an append writes (see replay_reference.zig); the credit
+    // policy bounds how large the unretired journal may grow before a
+    // producer append is refused.
+    retirement_queue: replay_chunks.RetirementQueue = .{},
+    active_consumer_hint_mask: std.atomic.Value(u8) = .init(replay_reference.all_hints_mask),
+    journal_credit_capacity_bytes: u64 = std.math.maxInt(u64),
+    journal_credit_progress_reserve_bytes: u64 = 0,
+    // WS5: the DB layer's last computed "every registered consumer has
+    // applied at least this sequence" watermark (`mutation_commit.zig`'s
+    // `truncateReplayJournalIfSafeContext`, the same catalog-derived walk
+    // that drives `active_consumer_hint_mask` above). `requestRetirement`
+    // only ever raises a *requested* ceiling -- a foreground caller's own
+    // just-applied sequence, not a cross-consumer minimum -- so nothing
+    // before `serviceRetirement` validates that ceiling against what every
+    // consumer has actually, durably applied. Default
+    // `maxInt(u64)` ("no constraint observed yet") preserves prior
+    // behavior for callers with no DB-layer consumer registry (native-only
+    // tests, backends with no managed indexes).
+    // WS5 (a): diagnostic only now -- `serviceRetirement` clamps against
+    // `apply_state.minAppliedSequenceAcrossAllConsumers` (a fresh scan of
+    // every progress-v2 record, done at drain time), not this field. Kept
+    // for `noteSafeRetirementWatermark` callers/tests that want to assert
+    // on the last value the DB layer's catalog walk computed.
+    known_safe_retirement_watermark: @import("antfly_platform").atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    // WS5 (a): consumer-generic clamp hook. `apply_state.
+    // minAppliedSequenceAcrossAllConsumers` only covers managed-index
+    // progress-v2 records; enrichment (`enrichment/enrichment_state.zig`)
+    // and resolution/promotion (`resolution_runtime.zig`) now also ride
+    // along (per perf/lwa-integration) but keep their own, differently-
+    // keyed progress records and import this very file, so `DocStore`
+    // cannot import them back without a cycle. The DB layer registers a
+    // callback here (`setExtraConsumerProgressProvider`) that reads those
+    // other kinds fresh and returns their minimum applied sequence;
+    // `serviceRetirement` clamps against it too, alongside the progress-v2
+    // scan. `null` (no DB-layer registration yet, or a native-only caller
+    // with no such consumers) contributes no additional constraint.
+    extra_consumer_progress_ctx: ?*anyopaque = null,
+    extra_consumer_progress_fn: ?ExtraConsumerProgressFn = null,
+
+    pub const ExtraConsumerProgressFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror!u64;
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
@@ -513,17 +871,20 @@ pub const DocStore = struct {
         .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
         .begin_batch = beginWriteBatch,
+        .begin_batch_with_options = beginWriteBatchWithOptions,
     });
 
     pub const Txn = struct {
         range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
+        history: committed_history.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
         mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
+        row_heap_probe_epoch: ?u64 = null,
         read: ?backend_erased.ReadTxn = null,
         probe: ?backend_erased.ProbeTxn = null,
         current_scan: ?backend_erased.CurrentScanTxn = null,
@@ -582,9 +943,11 @@ pub const DocStore = struct {
 
         pub fn abort(self: *Txn) void {
             self.retained.deinit(self.alloc);
+            self.history.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             const reader_owner = self.portable_import_reader_owner;
+            const heap_epoch = self.row_heap_probe_epoch;
             const payload_session = self.payload_session;
             defer if (payload_session) |session| session.release();
 
@@ -598,7 +961,10 @@ pub const DocStore = struct {
                 read.abort();
             }
             self.* = undefined;
-            if (reader_owner) |owner| owner.releasePortableImportReader();
+            if (reader_owner) |owner| {
+                if (heap_epoch) |epoch| owner.releaseRowHeapProbe(epoch);
+                owner.releasePortableImportReader();
+            }
         }
 
         pub fn commit(self: *Txn) !void {
@@ -615,7 +981,18 @@ pub const DocStore = struct {
                 try self.artifact_inputs.stage(self, self.retained.staged);
                 try self.artifact_footprint.stage(self);
                 try self.document_revisions.stage(self);
+                try self.history.stage(self.alloc, self);
             }
+            // NOT an `errdefer self.retained.deinit(...)` (and friends) here:
+            // every caller of `commit()` in this codebase already pairs it
+            // with its own `errdefer write.abort()` (see e.g.
+            // `artifact_footprint.zig`'s `initializeEmpty`/`invalidate`),
+            // and `abort()` deinits these same three. Adding a second deinit
+            // here double-frees them -- `HashMapUnmanaged.deinit` sets the
+            // map to `undefined`, so a caller's subsequent `abort()` would
+            // crash (caught by the crash sweep as an "incorrect alignment"
+            // panic inside `retained_effects.Capture.deinit`). Cleanup on a
+            // failed commit is the caller's `abort()`, by convention.
             const reader_owner = self.portable_import_reader_owner;
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;
@@ -635,6 +1012,7 @@ pub const DocStore = struct {
                 session.release();
             }
             self.retained.deinit(self.alloc);
+            self.history.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             self.* = undefined;
@@ -643,7 +1021,8 @@ pub const DocStore = struct {
         }
 
         pub fn get(self: *Txn, key: []const u8) ![]const u8 {
-            const value = try self.getPhysical(key);
+            const physical = try self.getPhysical(key);
+            const value = try self.resolveRowValue(key, physical);
             if (self.payload_session) |session| return try session.get(key, value);
             // A live probe admitted before migration may observe a later
             // reference. Retry with a new source lease; never leak its encoding
@@ -653,12 +1032,53 @@ pub const DocStore = struct {
             return value;
         }
 
+        fn rowHeapReader(self: *Txn) ?row_heap.Reader {
+            if (self.write) |*write| return row_heap.Reader.from(backend_erased.WriteTxn, write);
+            if (self.read) |*read| return row_heap.Reader.from(backend_erased.ReadTxn, read);
+            if (self.probe) |*probe| if (self.row_heap_probe_epoch != null) return row_heap.Reader.from(backend_erased.ProbeTxn, probe);
+            return null;
+        }
+        fn resolveRowValue(self: *Txn, key: []const u8, raw: []const u8) ![]const u8 {
+            if ((try row_heap.decode(key, raw)) == null) return raw;
+            const reader = self.rowHeapReader() orelse return error.StorageReadTemporarilyUnavailable;
+            return row_heap.resolve(reader, key, raw);
+        }
+        fn heapActive(self: *Txn) bool {
+            const owner = self.columnar_owner orelse self.portable_import_reader_owner orelse return false;
+            return owner.row_heap_active.load(.acquire);
+        }
+
+        /// Internal physical-maintenance primitive. A native rewrite admission
+        /// must fence logical writers before calling it; the job cursor belongs
+        /// in this SAME write transaction. This bypasses logical row hooks.
+        pub fn relocatePhysicalRow(self: *Txn, key: []const u8, generation: row_heap.Generation, ordinal: u64) !u64 {
+            const writer = if (self.write) |*write| write else return error.ReadOnly;
+            const owner = self.columnar_owner orelse return error.ReadOnly;
+            owner.lockPayloadPolicy();
+            owner.row_heap_active.store(true, .release);
+            owner.unlockPayloadPolicy();
+            // A deployed DB reader rejects ATBL8 before exposing any primary
+            // location. Capability and first physical row share this commit.
+            const raw_catalog = writer.get(physical_table_catalog.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            var facts = if (raw_catalog) |raw| try physical_table_catalog.Catalog.decode(raw) else physical_table_catalog.Catalog{};
+            if (facts.row_heap_format == 0) {
+                facts.row_heap_format = physical_table_catalog.maximum_row_heap_format;
+                const encoded = try facts.encodeDurable();
+                try writer.put(physical_table_catalog.key, encoded.slice());
+            }
+            return row_heap.relocate(self.alloc, writer, key, generation, ordinal);
+        }
+
         /// Exact key presence in this transaction's view. Physical references
         /// prove presence without resolving external source/artifact payloads.
         pub fn contains(self: *Txn, key: []const u8) !bool {
             if (self.write) |*write| return write.contains(key);
             if (self.probe) |*probe| return try probe.contains(key);
-            _ = self.getPhysical(key) catch |err| switch (err) {
+            if (self.current_scan != null) return error.Unsupported;
+            _ = self.read.?.get(key) catch |err| switch (err) {
                 error.NotFound => return false,
                 else => return err,
             };
@@ -690,7 +1110,8 @@ pub const DocStore = struct {
         /// Immutable LSM bytes may be pinned rather than copied.
         pub fn getLeased(self: *Txn, key: []const u8) ![]const u8 {
             if (self.probe) |*probe| {
-                const value = try probe.getLeased(key);
+                const physical = try probe.getLeased(key);
+                const value = try self.resolveRowValue(key, physical);
                 if (self.payload_session) |session| return try session.get(key, value);
                 if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(value))
                     return error.VectorMigrationReadEpochChanged;
@@ -702,9 +1123,9 @@ pub const DocStore = struct {
         /// Block-scoped values from this exact snapshot. Close scopes before
         /// aborting the transaction (which also owns the portable-import fence).
         pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {
-            if (self.read) |*read| return read.openReadScope(alloc);
-            if (self.write) |*write| return write.openReadScope(alloc);
-            return error.ReadOnly;
+            var physical = if (self.read) |*read| try read.openReadScope(alloc) else if (self.write) |*write| try write.openReadScope(alloc) else return error.ReadOnly;
+            errdefer physical.close();
+            return if (self.heapActive()) try row_heap_scope.wrap(alloc, physical) else physical;
         }
 
         /// Owned copies from one pinned generation, with read buffers released
@@ -724,7 +1145,8 @@ pub const DocStore = struct {
             defer alloc.free(physical);
             try scope.getManySorted(keys, physical);
             for (keys, physical, values) |key, raw, *value| {
-                const bytes = raw orelse continue;
+                const before = raw orelse continue;
+                const bytes = try row_heap.resolve(&scope, key, before);
                 if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(bytes)) {
                     const session = self.payload_session orelse return error.VectorMigrationReadEpochChanged;
                     // Read-only sessions have no prepared writes: resolving a
@@ -742,6 +1164,16 @@ pub const DocStore = struct {
 
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             try self.getManySortedPhysical(keys, values);
+            var refs = false;
+            for (keys, values) |key, value| if (value) |raw| {
+                if ((try row_heap.decode(key, raw)) != null) refs = true;
+            };
+            if (refs) {
+                const reader = self.rowHeapReader() orelse return error.StorageReadTemporarilyUnavailable;
+                // Reader carries the exact source view/probe epoch. The raw
+                // batch adapter retains its optimized physical-order read.
+                if (self.read) |*read| try row_heap.resolveMany(self.alloc, read, keys, values) else if (self.write) |*write| try row_heap.resolveMany(self.alloc, write, keys, values) else if (self.probe) |*probe| try row_heap.resolveMany(self.alloc, probe, keys, values) else _ = reader;
+            }
             if (self.payload_session) |session| {
                 for (keys, values) |key, *value| if (value.*) |raw| {
                     value.* = try session.get(key, raw);
@@ -750,6 +1182,13 @@ pub const DocStore = struct {
                 if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(raw))
                     return error.VectorMigrationReadEpochChanged;
             };
+        }
+
+        /// Release borrowed physical probe results once the caller has
+        /// consumed them. Unsupported backends keep them until abort.
+        pub fn releasePhysicalProbeResults(self: *Txn) !bool {
+            if (self.probe) |*probe| return probe.releaseResults();
+            return false;
         }
 
         pub fn getManySortedPhysical(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
@@ -778,6 +1217,17 @@ pub const DocStore = struct {
         pub fn getManySortedTransient(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (self.probe) |*probe| {
                 try probe.getManySortedWithBlockCacheAdmission(keys, values, .transient);
+                const Transient = struct {
+                    probe: *backend_erased.ProbeTxn,
+                    pub fn getManySorted(reader: *@This(), physical: []const []const u8, output: []?[]const u8) !void {
+                        return reader.probe.getManySortedWithBlockCacheAdmission(physical, output, .transient);
+                    }
+                };
+                for (keys, values) |key, value| if (value) |raw| {
+                    if ((try row_heap.decode(key, raw)) != null and self.row_heap_probe_epoch == null) return error.StorageReadTemporarilyUnavailable;
+                };
+                var transient: Transient = .{ .probe = probe };
+                try row_heap.resolveMany(self.alloc, &transient, keys, values);
                 if (self.payload_session) |session| {
                     for (keys, values) |key, *value| if (value.*) |raw| {
                         value.* = try session.get(key, raw);
@@ -809,6 +1259,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) anyerror!void {
+            if (self.heapActive()) try requireRowHeapCatalogFence(key, value);
             try updateGraphOwningTable(self, key, value);
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
             if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked) {
@@ -825,6 +1276,7 @@ pub const DocStore = struct {
             try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
+            try self.history.touch(self.alloc, self, key, value, if (self.columnar_owner) |owner| &owner.committed_history_cache else null);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
@@ -832,8 +1284,28 @@ pub const DocStore = struct {
             try self.invalidateColumns(key);
 
             const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-            try self.write.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+            const primary = if (self.payload_session) |session| session.primaryValue(value, stored) else stored;
+            if (self.heapActive()) try row_heap.put(&self.write.?, key, primary) else try self.write.?.put(key, primary);
             if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
+        }
+
+        /// Stages removal of the scope in this write's native commit.
+        pub fn deleteIndexCatalogScope(self: *Txn, scope: []const u8) !void {
+            if (self.write) |*write| return write.deleteIndexCatalogScope(scope);
+            return error.ReadOnly;
+        }
+
+        /// Stages index-catalog mutations into this write's native commit.
+        pub fn putIndexCatalogBatch(self: *Txn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+            if (self.write) |*write| return write.putIndexCatalogBatch(scope, mutations);
+            return error.ReadOnly;
+        }
+
+        /// One index-catalog record at this write's tip
+        /// (`backend_erased.WriteTxn.getIndexCatalogAlloc`).
+        pub fn getIndexCatalogAlloc(self: *Txn, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+            if (self.write) |*write| return write.getIndexCatalogAlloc(allocator, scope, namespace, key);
+            return error.ReadOnly;
         }
 
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
@@ -849,13 +1321,14 @@ pub const DocStore = struct {
             try self.document_revisions.touchValue(self.alloc, key, null);
             try self.artifact_footprint.touch(key, null);
             try self.range_mutation.touch(self, key);
+            try self.history.touch(self.alloc, self, key, null, if (self.columnar_owner) |owner| &owner.committed_history_cache else null);
             try self.artifact_inputs.touch(self.alloc, self, key, null);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, null);
             try self.invalidateColumns(key);
 
-            try self.write.?.delete(key);
+            if (self.heapActive()) try row_heap.remove(&self.write.?, key) else try self.write.?.delete(key);
             if (self.payload_session) |session| {
                 if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
                 try session.recordOwnership(&self.write.?, key, null);
@@ -884,9 +1357,9 @@ pub const DocStore = struct {
         }
 
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
-            var cursor_adapter = try self.openPhysicalCursorAdapter();
+            var cursor_adapter = try self.openBackendCursorAdapter();
             errdefer cursor_adapter.close();
-            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session, self.current_scan != null or self.probe != null);
+            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session, self.current_scan != null or self.probe != null or self.heapActive(), self.rowHeapReader());
         }
 
         pub fn hasPrefix(self: *Txn, prefix: []const u8) !bool {
@@ -897,6 +1370,12 @@ pub const DocStore = struct {
             return std.mem.startsWith(u8, row.key, prefix);
         }
 
+        pub fn countPrefix(self: *Txn, prefix: []const u8) !u64 {
+            var cursor = try self.openPhysicalCursorAdapter();
+            defer cursor.close();
+            return cursor.countPrefix(prefix);
+        }
+
         pub fn openPhysicalKeyCursorAdapter(self: *Txn) !CursorAdapter {
             var cursor = try self.openPhysicalCursorAdapter();
             cursor.setKeysOnly();
@@ -904,6 +1383,17 @@ pub const DocStore = struct {
         }
 
         pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
+            // "Physical" preserves external artifact references. Primary row
+            // locations are a DocStore implementation detail: range transfer,
+            // mutation retirement and portable export must still receive row
+            // bytes, not a location without its out-of-range private body.
+            // Backend snapshots/physical GC use runtime_store directly.
+            var cursor = try self.openBackendCursorAdapter();
+            errdefer cursor.close();
+            return wrapPayloadCursor(self.alloc, cursor, null, self.heapActive(), self.rowHeapReader());
+        }
+
+        fn openBackendCursorAdapter(self: *Txn) !CursorAdapter {
             if (self.write) |*write| return try write.openCursor();
             if (self.current_scan) |*current_scan| return try current_scan.openCursor();
             if (self.probe != null) return error.Unsupported;
@@ -922,6 +1412,7 @@ pub const DocStore = struct {
     pub const Batch = struct {
         range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
+        history: committed_history.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
@@ -934,14 +1425,46 @@ pub const DocStore = struct {
         graph_retirements_maybe: ?bool = null,
         unordered_bulk_append_puts: bool = false,
         runtime: ?backend_erased.Batch = null,
+        /// Set once this batch's `source_certificates.begin()` credit (if
+        /// any) has been released via `end()`. `commitStaged`'s own
+        /// `errdefer` and `StagedBatch.wait`'s `defer` are meant to be
+        /// mutually exclusive paths to exactly one release, but both
+        /// ultimately act on value-copied wrappers (`StagedBatch`,
+        /// `StagedDocBatch`, `backend_erased.Ticket`) around this
+        /// heap-resident `*Batch` -- a second release reached through any
+        /// copy of those wrappers (observed empirically: WS3 concurrent
+        /// capi writers, the first caller to ever make staged batches
+        /// genuinely overlap) must not double-decrement another writer's
+        /// in-flight count. See `releaseSourceCertificateOnce`.
+        source_certificate_released: bool = false,
 
         pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
             try self.artifact_inputs.attach(participant);
         }
 
+        /// The only path allowed to call `source_certificates.end()` for
+        /// this batch. `owner` is `source_owner`/`columnar_owner` as
+        /// captured at `commitStaged` time, not re-read from `self` here,
+        /// so a caller's own capture stays authoritative even if `self`
+        /// is reused before this runs. Idempotent: see
+        /// `source_certificate_released`'s doc comment.
+        fn releaseSourceCertificateOnce(self: *Batch, owner: ?*DocStore) void {
+            if (self.source_certificate_released) {
+                if (comptime @import("builtin").is_test) std.debug.print(
+                    "source_certificates: ignored a second release for batch {*} (owner {?*})\n",
+                    .{ self, owner },
+                );
+                return;
+            }
+            self.source_certificate_released = true;
+            if (owner) |o| o.source_certificates.end();
+        }
+
         pub const BatchTxn = struct {
             range_mutation: *@import("range_protection.zig").Mutation,
             retained: *retained_effects.Capture,
+            history: *committed_history.Capture,
+            history_cache: ?*std.atomic.Value(u8) = null,
             artifact_inputs: *@import("artifact_input_capture.zig").Capture,
             artifact_footprint: *@import("artifact_footprint.zig").Capture,
             document_revisions: *@import("document_mutation_revision.zig").Capture,
@@ -953,7 +1476,11 @@ pub const DocStore = struct {
             graph_directory_checked: *bool,
             graph_retirements_maybe: *?bool,
             unordered_bulk_append_puts: bool = false,
+            row_heap_active: bool = false,
             runtime: ?*backend_erased.Batch = null,
+            // WS5: lets `setReplayOpaque` -> `writeReplayEntries` reach the
+            // owning DocStore's consumer-hint mask and credit policy.
+            owner: ?*DocStore = null,
 
             pub fn consumeDenseManySorted(self: @This(), alloc: Allocator, keys: []const []const u8, values: []?[]const u8, dims: usize, sink: artifact_payload.DenseSink) !artifact_payload.DenseReadStats {
                 const session = self.payload_session orelse return error.Unsupported;
@@ -968,7 +1495,8 @@ pub const DocStore = struct {
             }
 
             pub fn get(self: @This(), key: []const u8) ![]const u8 {
-                const value = try self.runtime.?.get(key);
+                const physical = try self.runtime.?.get(key);
+                const value = try row_heap.resolve(self.runtime.?, key, physical);
                 if (self.payload_session) |session| return try session.get(key, value);
                 // A live probe admitted before migration may observe a later
                 // reference. Retry with a new source lease; never leak its encoding
@@ -983,6 +1511,7 @@ pub const DocStore = struct {
                 @memset(values, null);
 
                 try self.runtime.?.getManySorted(keys, values);
+                try row_heap.resolveMany(self.alloc, self.runtime.?, keys, values);
                 if (self.payload_session) |session| {
                     for (keys, values) |key, *value| if (value.*) |raw| {
                         value.* = try session.get(key, raw);
@@ -991,6 +1520,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) anyerror!void {
+                if (self.row_heap_active) try requireRowHeapCatalogFence(key, value);
                 try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
                 if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
@@ -1007,13 +1537,15 @@ pub const DocStore = struct {
                 try self.document_revisions.touchValueWithReader(self.alloc, self, key, value);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
+                try self.history.touch(self.alloc, self, key, value, self.history_cache);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
 
                 const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-                try self.runtime.?.put(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+                const primary = if (self.payload_session) |session| session.primaryValue(value, stored) else stored;
+                if (self.row_heap_active) try row_heap.put(self.runtime.?, key, primary) else try self.runtime.?.put(key, primary);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
@@ -1022,6 +1554,11 @@ pub const DocStore = struct {
             }
 
             fn appendPutChecked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
+                // Capturing historical values requires a read view. Leave the
+                // unordered append arena once, rather than draining it for
+                // every row while an outbound history consumer is active.
+                try self.history.touch(self.alloc, self, key, value, self.history_cache);
+                if (self.unordered_bulk_append_puts and self.history.enabled) return error.Unsupported;
                 if (std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix) and self.unordered_bulk_append_puts) return error.Unsupported;
                 try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
@@ -1063,7 +1600,11 @@ pub const DocStore = struct {
                 try self.invalidateColumns(key);
 
                 const stored = if (self.payload_session) |session| try session.put(key, value) else value;
-                try self.runtime.?.appendPut(key, if (self.payload_session) |session| session.primaryValue(value, stored) else stored);
+                const primary = if (self.payload_session) |session| session.primaryValue(value, stored) else stored;
+                if (self.row_heap_active) {
+                    if (self.unordered_bulk_append_puts) return error.RowHeapBulkAppendUnsupported;
+                    try row_heap.put(self.runtime.?, key, primary);
+                } else try self.runtime.?.appendPut(key, primary);
                 if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
@@ -1080,12 +1621,13 @@ pub const DocStore = struct {
                 try self.document_revisions.touchValue(self.alloc, key, null);
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
+                try self.history.touch(self.alloc, self, key, null, self.history_cache);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
 
-                try self.runtime.?.delete(key);
+                if (self.row_heap_active) try row_heap.remove(self.runtime.?, key) else try self.runtime.?.delete(key);
                 if (self.payload_session) |session| {
                     if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
                     try session.recordOwnership(self.runtime.?, key, null);
@@ -1114,13 +1656,32 @@ pub const DocStore = struct {
             }
 
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
-                var physical = try self.runtime.?.openCursor();
+                var physical = try self.openPhysicalCursorAdapter();
                 errdefer physical.close();
-                return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false);
+                return try wrapPayloadCursor(self.alloc, physical, self.payload_session, self.row_heap_active, row_heap.Reader.from(backend_erased.Batch, self.runtime.?));
+            }
+
+            fn openPhysicalCursorAdapter(self: @This()) !backend_erased.Cursor {
+                return self.runtime.?.openCursor();
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
                 try writeReplayEntries(self.alloc, self, sequence, payload);
+            }
+
+            /// WS4 phase 2: forwards to `backend_erased.Batch.putIndexCatalogBatch`
+            /// -- supported only on Lite (`error.Unsupported` elsewhere) --
+            /// so a `commit_participant.Participant` reached through this
+            /// `BatchTxn` (see `commit_participant.View.putIndexCatalog`)
+            /// can publish index-catalog records in the same native
+            /// transaction as this batch's own primary-keyspace writes.
+            pub fn putIndexCatalogBatch(self: @This(), scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+                try self.runtime.?.putIndexCatalogBatch(scope, mutations);
+            }
+
+            /// One index-catalog record at this batch's tip.
+            pub fn getIndexCatalogAlloc(self: @This(), allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) !?[]u8 {
+                return try self.runtime.?.getIndexCatalogAlloc(allocator, scope, namespace, key);
             }
         };
 
@@ -1141,6 +1702,7 @@ pub const DocStore = struct {
 
         pub fn abort(self: *Batch) void {
             self.retained.deinit(self.alloc);
+            self.history.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             const payload_session = self.payload_session;
@@ -1152,7 +1714,99 @@ pub const DocStore = struct {
             self.* = undefined;
         }
 
-        pub fn commit(self: *Batch) !void {
+        /// Returned by `commitStaged` (WS3). The batch's effects are applied
+        /// (and, for backends with a staged commit phase, enqueued into a
+        /// group some thread will drive to a shared fsync) by the time this
+        /// is returned; `wait` blocks only for that durability. A caller may
+        /// drop locks scoped to "a write is in flight" (the DB apply lock,
+        /// the capi connection gate) between `commitStaged` returning and
+        /// calling `wait`, instead of holding them across the fsync.
+        ///
+        /// `batch` must stay heap-resident until `wait` runs: it owns the
+        /// staging captures (`retained`/`artifact_inputs`/`document_revisions`)
+        /// that `source_certificates` and the payload session still reference
+        /// while the group is in flight, mirroring the bracket `commit` used
+        /// to hold open for its own duration.
+        pub const StagedBatch = struct {
+            alloc: Allocator,
+            batch: *Batch,
+            ticket: backend_erased.Ticket,
+            /// Captured eagerly in `commitStaged`, not read back through
+            /// `batch` here: success frees/invalidates `batch` before these
+            /// run, so a lazy `batch.columnar_owner` read would be undefined
+            /// memory by the time these fire.
+            source_owner: ?*DocStore,
+            payload_session: ?*artifact_payload.Session,
+            /// Only set when this batch actually touched columnar state;
+            /// bumped on successful durability, matching `commit`'s original
+            /// success-only `columnar_revision` bump.
+            bump_columnar_revision: ?*DocStore,
+
+            /// Does not free `batch`'s own memory: that allocation (if any
+            /// -- a plain `commit` caller's `batch` is typically a stack
+            /// local it owns itself) belongs to whoever created it, not to
+            /// this generic staged-commit path. The staged `put*` entry
+            /// points below, which heap-allocate it, free it themselves
+            /// after this returns.
+            pub fn wait(self: StagedBatch) !void {
+                _ = try self.waitSequence();
+            }
+
+            /// Like `wait`, also returning the commit sequence this batch's
+            /// own native group committed at (0 on a backend with no such
+            /// concept -- see `backend_erased.Ticket.waitSequence`).
+            /// Regression-B test hook.
+            pub fn waitSequence(self: StagedBatch) !u64 {
+                // `self.batch` (not yet freed: the caller -- `StagedDocBatch.
+                // wait`/`commit` -- only destroys it after this function has
+                // returned) owns the one-shot guard, so a second `wait()`
+                // reached through another copy of this value-type wrapper
+                // cannot double-release `source_owner`'s certificate credit.
+                defer self.batch.releaseSourceCertificateOnce(self.source_owner);
+                const sequence = self.ticket.waitSequence() catch |err| {
+                    self.batch.retained.poisoned = true;
+                    if (self.source_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
+                    // Deliberately not releasing `retained`/`artifact_inputs`/
+                    // `document_revisions` here even though `commitStaged`
+                    // already staged them: not every caller reaches `wait`
+                    // through `backend_erased.Batch.commitStaged`'s
+                    // inert-vtable swap (which makes a caller's later
+                    // `errdefer batch.abort()` a safe no-op once a ticket
+                    // exists). A caller that drives this inner `StagedBatch`
+                    // directly -- `db.zig`'s `saveIndexStatusSnapshots`, in
+                    // particular -- still wraps `commit()` (`commitStaged`
+                    // then `wait`) in its own `errdefer status_batch.abort()`
+                    // and expects `abort()` to be the one place these three
+                    // are released on any failure, including a failed
+                    // `wait`. Releasing them here too double-frees (caught as
+                    // an "incorrect alignment" panic inside
+                    // `retained_effects.Capture.deinit`'s `keyIterator` on
+                    // the now-`undefined` map). This path's leak when
+                    // nothing else aborts is real (see git history for the
+                    // attempted fix and why it was reverted) but needs a
+                    // change to the abort/release contract itself, not a
+                    // second release bolted on here.
+                    return err;
+                };
+                if (self.payload_session) |session| {
+                    session.committed = true;
+                    session.release();
+                }
+                self.batch.retained.deinit(self.batch.alloc);
+                self.batch.history.deinit(self.batch.alloc);
+                self.batch.artifact_inputs.deinit(self.batch.alloc);
+                self.batch.document_revisions.deinit(self.batch.alloc);
+                if (self.bump_columnar_revision) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+                self.batch.* = undefined;
+                return sequence;
+            }
+        };
+
+        /// Stage this batch's writes and return once they are applied and
+        /// enqueued for durability (WS3), instead of blocking for the fsync.
+        /// `commit` is this plus an immediate `wait`, for callers with no
+        /// locks of their own to drop in between.
+        pub fn commitStaged(self: *Batch) !StagedBatch {
             if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             errdefer if (self.columnar_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
@@ -1163,33 +1817,51 @@ pub const DocStore = struct {
                 try self.artifact_inputs.stage(self.asTxn(), self.retained.staged);
                 try self.artifact_footprint.stage(self.asTxn());
                 try self.document_revisions.stage(self.asTxn());
+                try self.history.stage(self.alloc, self.asTxn());
             }
-            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
+            // NOT an `errdefer` deinit of these three here, matching
+            // `Txn.commit`: `backend_erased.Batch.commitStaged` only swaps
+            // its own vtable to the inert `consumed_vtable` (making a
+            // caller's later `errdefer batch.abort()` a safe no-op) *after*
+            // this inner `commitStaged` has actually returned a
+            // `StagedBatch`. A failure before that point leaves this batch
+            // still abortable by convention, exactly like a failed
+            // `Txn.commit`; double-releasing here would crash the same way
+            // reverting `Txn.commit`'s own attempt at this did (see that
+            // comment). Only `StagedBatch.wait` -- reached after a ticket
+            // already exists, where that inert-vtable swap has already
+            // happened and nothing else will ever call `abort()` again --
+            // owns cleanup for a failure after staging.
+            const bump_columnar_revision = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;
-            if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
-            defer if (source_owner) |owner| owner.source_certificates.end();
             const payload_session = self.payload_session;
+            if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
+            errdefer self.releaseSourceCertificateOnce(source_owner);
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             if (payload_session) |session| try session.prepareCommit();
             if (payload_session) |session| session.primary_commit_attempted = true;
-            if (self.runtime) |*runtime| {
-                try runtime.commit();
-            }
-            if (payload_session) |session| {
-                session.committed = true;
-                session.release();
-            }
-            self.retained.deinit(self.alloc);
-            self.artifact_inputs.deinit(self.alloc);
-            self.document_revisions.deinit(self.alloc);
-            self.* = undefined;
-            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+            const ticket = if (self.runtime) |*runtime| try runtime.commitStaged() else backend_erased.Ticket.alreadyDurable();
+            return .{
+                .alloc = self.alloc,
+                .batch = self,
+                .ticket = ticket,
+                .source_owner = source_owner,
+                .payload_session = payload_session,
+                .bump_columnar_revision = bump_columnar_revision,
+            };
+        }
+
+        pub fn commit(self: *Batch) !void {
+            const staged = try self.commitStaged();
+            try staged.wait();
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
             return .{
                 .range_mutation = &self.range_mutation,
                 .retained = &self.retained,
+                .history = &self.history,
+                .history_cache = if (self.columnar_owner) |owner| &owner.committed_history_cache else null,
                 .artifact_inputs = &self.artifact_inputs,
                 .artifact_footprint = &self.artifact_footprint,
                 .document_revisions = &self.document_revisions,
@@ -1201,7 +1873,9 @@ pub const DocStore = struct {
                 .graph_directory_checked = &self.graph_directory_checked,
                 .graph_retirements_maybe = &self.graph_retirements_maybe,
                 .unordered_bulk_append_puts = self.unordered_bulk_append_puts,
+                .row_heap_active = if (self.columnar_owner) |owner| owner.row_heap_active.load(.acquire) else false,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
+                .owner = self.columnar_owner,
             };
         }
 
@@ -1238,6 +1912,12 @@ pub const DocStore = struct {
         }
     };
 
+    fn withWriteSerialization(store: backend_erased.Store) backend_erased.Store {
+        var serialized = store;
+        if (store.writeSerialization() == .gate) serialized.write_gate = store.writeSerialization().gate;
+        return serialized;
+    }
+
     pub fn open(alloc: Allocator, path: [*:0]const u8, opts: DocStoreOptions) !DocStore {
         var backend = try lsm_backend.BackendHandle.open(alloc, std.mem.span(path), .{
             .backend = .{
@@ -1247,27 +1927,134 @@ pub const DocStore = struct {
             .wal_enabled = !opts.read_only,
         });
         errdefer backend.close();
-        const runtime_store = try backend.backend.runtimeStore(alloc, .{});
-        return .{
+        var runtime_store = try backend.backend.runtimeStore(alloc, .{});
+        errdefer runtime_store.deinit();
+        var opened: DocStore = .{
             .alloc = alloc,
-            .runtime_store = runtime_store,
+            .runtime_store = withWriteSerialization(runtime_store),
+            .row_heap_active = .init(try rowHeapPresent(runtime_store)),
             .owns_runtime_store = true,
             .owned_lsm_backend = backend,
             .replay_index_state = .init(replay_index_unknown),
             .next_replay_sequence_cached = .init(0),
         };
+        if (!opts.read_only) try opened.upgradeLegacyReplayJournalAtOpen();
+        return opened;
     }
 
     pub fn openRuntime(alloc: Allocator, store: anytype) !DocStore {
-        const runtime_store = try initRuntimeStore(alloc, store);
-        return .{
+        var runtime_store = try initRuntimeStore(alloc, store);
+        // A store handed over by value stays the caller's to release when the
+        // open fails; only a wrapper made here is released here.
+        errdefer if (runtime_store.owned and @TypeOf(store) != backend_erased.Store) runtime_store.store.deinit();
+        var opened: DocStore = .{
             .alloc = alloc,
-            .runtime_store = runtime_store.store,
+            .runtime_store = withWriteSerialization(runtime_store.store),
+            .row_heap_active = .init(try rowHeapPresent(runtime_store.store)),
             .owns_runtime_store = runtime_store.owned,
             .owned_lsm_backend = null,
             .replay_index_state = .init(replay_index_unknown),
             .next_replay_sequence_cached = .init(0),
         };
+        try opened.upgradeLegacyReplayJournalAtOpen();
+        return opened;
+    }
+
+    /// Upgrades a journal the base revision initialized before this store
+    /// serves anything: its next append, and every reader of
+    /// `next_sequence`, expect the current layout. A read-only store cannot
+    /// upgrade and is left as it is. An unknown format fails the open.
+    fn upgradeLegacyReplayJournalAtOpen(self: *DocStore) !void {
+        const keep_base_layout = !self.sharedReplayLane();
+        const state = blk: {
+            var probe = try self.beginProbeTxn();
+            defer probe.abort();
+            break :blk try replay_journal_format.state(&probe);
+        };
+        if (state == .absent or (state.isCurrent() and !keep_base_layout)) return;
+        if (state.isCurrent()) {
+            var read = try self.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer read.abort();
+            if (!try replayCreditsNeedRepair(&read)) return;
+        }
+        var batch = self.beginWriteBatch() catch |err| switch (err) {
+            error.ReadOnly => return,
+            else => return err,
+        };
+        errdefer batch.abort();
+        const txn = batch.asTxn();
+        const write_state = try replay_journal_format.state(txn);
+        if (write_state.isCurrent()) {
+            if (!keep_base_layout or !try replayCreditsNeedRepair(txn)) {
+                batch.abort();
+                return;
+            }
+            if (write_state == .current and try replay_journal_format.baseWroteSince(txn)) {
+                try upgradeLegacyReplayJournal(txn, keep_base_layout);
+            } else {
+                // Bootstrapping the witness or reconciling a retirement
+                // changes accounting only. The remaining hint lanes retain
+                // their existing coverage.
+                const credits = try scanReplayJournalCredits(txn);
+                if (write_state == .protected_credit) {
+                    try installProtectedReplayCredit(txn, &credits.heads, credits.ledger, try replayCreditNextSequence(txn));
+                } else {
+                    try txn.put(&internal_keys.journal_credit_lane_heads_key, &credits.heads);
+                    try storeCompatibleReplayCredit(txn, credits.ledger);
+                }
+            }
+        } else {
+            try upgradeLegacyReplayJournal(txn, keep_base_layout);
+        }
+        batch.commit() catch |err| switch (err) {
+            error.ReadOnly => {
+                batch.abort();
+                return;
+            },
+            else => return err,
+        };
+    }
+
+    /// Explicitly upgrade a non-Lite journal to the
+    /// single-record credit encoding. Older binaries cannot write it.
+    pub fn enableProtectedReplayCredit(self: *DocStore) !void {
+        if (self.sharedReplayLane()) return error.Unsupported;
+        {
+            var probe = try self.beginProbeTxn();
+            defer probe.abort();
+            if (try replay_journal_format.state(&probe) == .protected_credit) return;
+        }
+        var batch = try self.beginWriteBatchWithOptions(.{ .block_cache_admission = .transient });
+        errdefer batch.abort();
+        const txn = batch.asTxn();
+        switch (try replay_journal_format.state(txn)) {
+            .absent => {
+                const next = encodeReplayNextSequence(1);
+                try txn.put(&internal_keys.replay_meta_init_key, "");
+                try txn.put(&internal_keys.replay_meta_next_sequence_key, &next);
+                try txn.put(&replay_journal_format.legacy_next_sequence_key, &next);
+                var heads: ReplayCreditLaneHeads = @splat(0);
+                for (0..replay_credit_lanes.len) |lane| {
+                    std.mem.writeInt(u64, replayCreditLaneFloor(&heads, lane), 1, .little);
+                }
+                try installProtectedReplayCredit(txn, &heads, .{}, 1);
+                try batch.commit();
+                self.markReplayIndexAvailable();
+                return;
+            },
+            .legacy => try upgradeLegacyReplayJournal(txn, true),
+            .current => if (try replay_journal_format.baseWroteSince(txn)) try upgradeLegacyReplayJournal(txn, true),
+            .protected_credit => {
+                batch.abort();
+                return;
+            },
+        }
+        const credits: ReplayCreditScan = if (try replayCreditsNeedRepair(txn))
+            try scanReplayJournalCredits(txn)
+        else
+            .{ .heads = (try storedReplayCreditLaneHeads(txn)).?, .ledger = try loadJournalCreditLedger(txn) };
+        try installProtectedReplayCredit(txn, &credits.heads, credits.ledger, try replayCreditNextSequence(txn));
+        try batch.commit();
     }
 
     pub fn close(self: *DocStore) void {
@@ -1279,6 +2066,11 @@ pub const DocStore = struct {
 
     fn backendCapabilities(self: *DocStore) backend_types.Capabilities {
         return self.runtime_store.capabilities();
+    }
+
+    /// See `backend_types.Capabilities.shared_replay_lane`.
+    pub fn sharedReplayLane(self: *DocStore) bool {
+        return self.backendCapabilities().shared_replay_lane;
     }
 
     /// Preserve transaction coordination when this document facade wraps an
@@ -1304,6 +2096,8 @@ pub const DocStore = struct {
     const PayloadCursor = struct {
         physical: backend_erased.Cursor,
         session: ?*artifact_payload.Session,
+        heap_reader: ?row_heap.Reader,
+        keys_only: bool = false,
         arena: std.heap.ArenaAllocator,
 
         pub fn close(self: *@This()) void {
@@ -1311,46 +2105,179 @@ pub const DocStore = struct {
             self.arena.deinit();
             if (self.session) |session| session.release();
         }
-        fn resolve(self: *@This(), entry: ?backend_erased.Entry) !?backend_erased.Entry {
+        fn resolve(self: *@This(), entry: ?backend_erased.Entry, reverse: bool) !?backend_erased.Entry {
             _ = self.arena.reset(.retain_capacity);
-            const value = entry orelse return null;
-            if (self.session) |session| return .{ .key = value.key, .value = try session.getAlloc(self.arena.allocator(), value.key, value.value) };
-            if (artifact_payload.isEmbeddingKey(value.key) and artifact_payload.isReference(value.value))
-                return error.VectorMigrationReadEpochChanged;
-            return value;
+            var current = entry;
+            while (current) |value| {
+                if (row_heap.isPhysicalKey(value.key) or row_heap.isPhysicalMetadata(value.key)) {
+                    current = if (reverse) try self.physical.prev() else try self.physical.next();
+                    continue;
+                }
+                if (self.keys_only) return value;
+                var body = value.value;
+                if ((try row_heap.decode(value.key, body)) != null) {
+                    const reader = self.heap_reader orelse return error.StorageReadTemporarilyUnavailable;
+                    body = try row_heap.resolve(reader, value.key, body);
+                }
+                if (self.session) |session| return .{ .key = value.key, .value = try session.getAlloc(self.arena.allocator(), value.key, body) };
+                if (artifact_payload.isEmbeddingKey(value.key) and artifact_payload.isReference(body)) return error.VectorMigrationReadEpochChanged;
+                return .{ .key = value.key, .value = body };
+            }
+            return null;
         }
         pub fn first(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.first());
+            return self.resolve(try self.physical.first(), false);
         }
         pub fn last(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.last());
+            return self.resolve(try self.physical.last(), true);
         }
         pub fn next(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.next());
+            return self.resolve(try self.physical.next(), false);
         }
         pub fn prev(self: *@This()) !?backend_erased.Entry {
-            return self.resolve(try self.physical.prev());
+            return self.resolve(try self.physical.prev(), true);
         }
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
-            return self.resolve(try self.physical.seekAtOrAfter(key));
+            return self.resolve(try self.physical.seekAtOrAfter(key), false);
         }
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_erased.Entry {
-            return self.resolve(try self.physical.seekAtOrBefore(key));
+            return self.resolve(try self.physical.seekAtOrBefore(key), true);
         }
         pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
             self.physical.setUpperBound(upper);
         }
+        pub fn setKeysOnly(self: *@This()) void {
+            self.keys_only = true;
+            self.physical.setKeysOnly();
+        }
     };
 
-    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session, live: bool) !backend_erased.Cursor {
+    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session, live: bool, heap_reader: ?row_heap.Reader) !backend_erased.Cursor {
         if (session == null and !live) return physical;
         if (session) |owner| owner.retain();
         errdefer if (session) |owner| owner.release();
         return try backend_erased.cursorFrom(alloc, PayloadCursor{
             .physical = physical,
             .session = session,
+            .heap_reader = heap_reader,
             .arena = std.heap.ArenaAllocator.init(alloc),
         });
+    }
+    fn requireRowHeapCatalogFence(key: []const u8, value: []const u8) !void {
+        if (!std.mem.eql(u8, key, physical_table_catalog.key)) return;
+        const facts = try physical_table_catalog.Catalog.decode(value);
+        if (facts.row_heap_format != physical_table_catalog.maximum_row_heap_format) return error.RowHeapCatalogDowngrade;
+    }
+    fn rowHeapPresent(runtime: backend_erased.Store) !bool {
+        var store = runtime;
+        var read = try store.beginProbe();
+        defer read.abort();
+        const marker = read.get(row_heap.enabled_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (marker) |raw| if (!std.mem.eql(u8, raw, row_heap.magic)) return error.CorruptRowHeapCatalog;
+        const raw_catalog = read.get(physical_table_catalog.key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        // Opaque low-level stores retain their old open contract. Interpret
+        // table facts here only when they declare this physical extension;
+        // ordinary schema/catalog validation remains the DB owner's boundary.
+        if (marker == null) {
+            const raw = raw_catalog orelse return false;
+            if (raw.len < 8 or !std.mem.eql(u8, raw[0..4], "ATBL") or std.mem.readInt(u32, raw[4..8], .little) != 8) return false;
+        }
+        const required = if (raw_catalog) |raw| (try physical_table_catalog.Catalog.decode(raw)).row_heap_format else 0;
+        if (marker != null and required == 0) return error.CorruptRowHeapCatalog;
+        return required != 0;
+    }
+
+    fn releaseRowHeapProbe(self: *DocStore, epoch: u64) void {
+        self.lockPayloadPolicy();
+        defer self.unlockPayloadPolicy();
+        self.row_heap_epochs.release(epoch);
+    }
+
+    pub const RowHeapCollection = struct { done: bool, waiting_for_readers: bool = false, rows: u32 = 0, bytes: u64 = 0 };
+
+    /// Leader/primary maintenance callers supply their existing write fence.
+    /// The callback-free collector changes physical records only. Its bounded
+    /// key page and retirement removals share a transaction with the debt count.
+    pub fn collectRowHeap(self: *DocStore, maximum_rows: u32) !RowHeapCollection {
+        if (maximum_rows == 0 or maximum_rows > 2048) return error.InvalidArgument;
+        if (!self.row_heap_collection_mutex.tryLock()) return .{ .done = false };
+        defer self.row_heap_collection_mutex.unlock(payloadPolicyIo());
+        if (!self.row_heap_active.load(.acquire)) return .{ .done = true };
+        try self.ensurePortableImportOperational();
+        var store = self.runtime_store;
+        const observed = observation: {
+            var probe = try store.beginProbe();
+            defer probe.abort();
+            break :observation .{ .clock = try row_heap.retirementClock(&probe), .bytes = try row_heap.retiredBytes(&probe) };
+        };
+        if (observed.bytes == 0) {
+            self.row_heap_collection_pending.store(false, .release);
+            self.lockPayloadPolicy();
+            defer self.unlockPayloadPolicy();
+            if (self.row_heap_epochs.collectible()) |fence| try self.row_heap_epochs.finish(fence);
+            return .{ .done = true };
+        }
+        if (observed.clock == 0) return error.CorruptRowHeapCatalog;
+        self.lockPayloadPolicy();
+        self.row_heap_epochs.mark(observed.clock) catch |err| {
+            self.unlockPayloadPolicy();
+            return err;
+        };
+        const fence = self.row_heap_epochs.collectible();
+        self.unlockPayloadPolicy();
+        const committed_fence = fence orelse {
+            // A retained probe may be long lived. Audit at the ordinary idle
+            // cadence instead of hot-polling the reader's release.
+            self.row_heap_collection_pending.store(false, .release);
+            return .{ .done = false, .waiting_for_readers = true };
+        };
+        var arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var writer = try store.beginWrite();
+        var committed = false;
+        defer if (!committed) writer.abort();
+        var selected: std.ArrayList([]const u8) = .empty;
+        var complete = false;
+        {
+            var cursor = try writer.openCursor();
+            defer cursor.close();
+            cursor.setKeysOnly();
+            var current = try cursor.seekAtOrAfter(row_heap.retirement_prefix);
+            while (current) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, row_heap.retirement_prefix)) break;
+                if (entry.key.len != row_heap.retirement_key_len) return error.CorruptRowHeapCatalog;
+                if (std.mem.readInt(u64, entry.key[row_heap.retirement_prefix.len..][0..8], .big) > committed_fence) break;
+                if (selected.items.len == maximum_rows) break;
+                try selected.append(a, try a.dupe(u8, entry.key));
+                current = try cursor.next();
+            }
+            complete = if (current) |entry| !std.mem.startsWith(u8, entry.key, row_heap.retirement_prefix) or
+                (entry.key.len == row_heap.retirement_key_len and std.mem.readInt(u64, entry.key[row_heap.retirement_prefix.len..][0..8], .big) > committed_fence) else true;
+        }
+        var bytes: u64 = 0;
+        for (selected.items) |key| bytes += try row_heap.collectRetired(&writer, key, committed_fence);
+        if (selected.items.len != 0) try writer.commit() else writer.abort();
+        committed = true;
+        if (complete) {
+            self.lockPayloadPolicy();
+            defer self.unlockPayloadPolicy();
+            try self.row_heap_epochs.finish(committed_fence);
+        }
+        var done = false;
+        if (complete) {
+            var check = try store.beginProbe();
+            defer check.abort();
+            done = try row_heap.retiredBytes(&check) == 0;
+        }
+        self.row_heap_collection_pending.store(!done, .release);
+        return .{ .done = done, .rows = @intCast(selected.items.len), .bytes = bytes };
     }
 
     fn lockPayloadPolicy(self: *DocStore) void {
@@ -1411,6 +2338,7 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        self.revalidateAdoptedState();
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
@@ -1466,14 +2394,18 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        self.revalidateAdoptedState();
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         self.lockPayloadPolicy();
         defer self.unlockPayloadPolicy();
+        const heap_epoch: ?u64 = if (self.row_heap_active.load(.acquire)) try self.row_heap_epochs.acquire() else null;
+        errdefer if (heap_epoch) |epoch| self.row_heap_epochs.release(epoch);
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = .{
             .payload_session = payload_session,
+            .row_heap_probe_epoch = heap_epoch,
             .alloc = self.alloc,
             .probe = try self.runtime_store.beginProbeWithBlockCacheAdmission(admission),
         };
@@ -2085,6 +3017,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteTxn(self: *DocStore) !Txn {
+        self.revalidateAdoptedState();
         try self.ensurePortableImportOperational();
         const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
@@ -2101,6 +3034,7 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
+        self.revalidateAdoptedState();
         try self.ensurePortableImportOperational();
         const payload_session = try self.createWritePayloadSession();
         errdefer if (payload_session) |session| session.release();
@@ -2108,6 +3042,7 @@ pub const DocStore = struct {
             .payload_session = payload_session,
             .alloc = self.alloc,
             .columnar_owner = self,
+            .history = .{ .capture_rows = options.capture_committed_rows },
             .runtime = try self.runtime_store.beginBatchWithOptions(options),
             .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
         };
@@ -2207,6 +3142,7 @@ pub const DocStore = struct {
     pub fn finishPortableImportPublication(self: *DocStore) void {
         self.source_certificates.end();
         self.retained_effects_cache.store(0, .release);
+        self.committed_history_cache.store(0, .release);
         std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
         self.portable_import_reader_state.store(0, .release);
     }
@@ -2372,17 +3308,22 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
     ) !void {
-        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null);
+        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null, 0);
     }
 
-    fn putBatchWithReplayOnceAndParticipant(
+    /// Shared preparation for `putBatchWithReplayOnceAndParticipant` and its
+    /// staged twin (WS3): builds and populates a `Batch`, stopping just
+    /// short of committing it so the caller can choose `commit` (wait
+    /// inline) or `commitStaged` (return a ticket instead).
+    fn prepareBatchWithReplayAndParticipant(
         self: *DocStore,
         writes: []const KVPair,
         deletes: []const []const u8,
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
-    ) !void {
+        history_commit_time_ns: i64,
+    ) !Batch {
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
             break :blk false;
@@ -2393,6 +3334,7 @@ pub const DocStore = struct {
         // so bulk ingestion never needs a foreground whole-store backfill.
         var batch = try self.beginWriteBatchWithOptions(options);
         errdefer batch.abort();
+        batch.history.history_commit_time_ns = history_commit_time_ns;
         if (participant) |observer| try batch.setCommitParticipant(observer);
         var txn = batch.asTxn();
         const graph_bulk = bulk_candidate and !try graphBulkIncomingNeedsDelete(self.alloc, txn, writes);
@@ -2426,7 +3368,158 @@ pub const DocStore = struct {
         if (replay) |entry| {
             try batch.setReplayOpaque(entry.sequence, entry.payload);
         }
+        return batch;
+    }
+
+    fn putBatchWithReplayOnceAndParticipant(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !void {
+        var batch = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns);
+        errdefer batch.abort();
         try batch.commit();
+    }
+
+    /// A pending `markReplayIndexAvailable`/`observeCommittedReplaySequence`
+    /// call, run from `StagedDocBatch.wait` only once the write is durable
+    /// (WS2 §3.2: visibility only after durability) rather than eagerly when
+    /// it is merely staged.
+    const StagedReplayObservation = struct {
+        store: *DocStore,
+        sequence: u64,
+    };
+
+    /// Returned by the staged `put*` entry points (WS3): the batch is
+    /// applied and enqueued for durability by the time this is returned.
+    /// `wait` blocks only for that durability; a caller (mutation_commit.zig's
+    /// `batchInternalPreparedOwned`) releases the DB apply lock and the capi
+    /// connection gate between getting this and calling `wait`.
+    pub const StagedDocBatch = struct {
+        inner: Batch.StagedBatch,
+        /// Owns `inner.batch`'s own heap allocation (the staged `put*` entry
+        /// points below heap-box it so it survives past their return; `wait`
+        /// is where it is finally freed, after `inner.wait` is done with it).
+        heap_batch: *Batch,
+        heap_alloc: Allocator,
+        replay_observation: ?StagedReplayObservation = null,
+
+        pub fn wait(self: StagedDocBatch) !void {
+            _ = try self.waitSequence();
+        }
+
+        /// Like `wait`, also returning the commit sequence this batch's own
+        /// native group committed at (0 on a backend with no such concept).
+        /// Regression-B test hook; see `backend_erased.Ticket.waitSequence`.
+        pub fn waitSequence(self: StagedDocBatch) !u64 {
+            // `inner.wait()` (`Batch.StagedBatch.wait`) deliberately does
+            // *not* release `heap_batch`'s retained/artifact_inputs/
+            // document_revisions captures on failure -- that contract
+            // (documented on `Batch.commitStaged`/`StagedBatch.wait`) leaves
+            // them owned by `heap_batch` so a caller's own `errdefer
+            // batch.abort()` is the one place that frees them, exactly
+            // once. But no caller of this `StagedDocBatch` ever holds such
+            // an `errdefer` on `heap_batch` -- `mutation_commit.zig`'s
+            // `batchInternalPreparedOwned`, in particular, only ever calls
+            // `wait()` itself (see its comment: "wait frees the ticket's
+            // owned heap state unconditionally the first time"). Unlike the
+            // success path below, a failure here used to fall straight
+            // through to the unconditional `defer destroy(heap_batch)`
+            // without ever calling `abort()` first, leaking those captures'
+            // underlying allocations (the hash maps' backing arrays) even
+            // though the struct that pointed to them was freed. This is
+            // the one and only place responsible for finishing that abort
+            // on this path, matching `backend_erased.zig`'s own `TicketBox`
+            // wait_fn wrapper, which does the same for its layer.
+            const sequence = self.inner.waitSequence() catch |err| {
+                self.heap_batch.abort();
+                self.heap_alloc.destroy(self.heap_batch);
+                return err;
+            };
+            self.heap_alloc.destroy(self.heap_batch);
+            if (self.replay_observation) |observation| {
+                observation.store.markReplayIndexAvailable();
+                observation.store.observeCommittedReplaySequence(observation.sequence);
+            }
+            return sequence;
+        }
+    };
+
+    fn putBatchWithReplayStagedOnceAndParticipant(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !StagedDocBatch {
+        const batch_box = try self.alloc.create(Batch);
+        errdefer self.alloc.destroy(batch_box);
+        batch_box.* = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns);
+        errdefer batch_box.abort();
+        const staged = try batch_box.commitStaged();
+        return .{
+            .inner = staged,
+            .heap_batch = batch_box,
+            .heap_alloc = self.alloc,
+            .replay_observation = if (replay) |entry| .{ .store = self, .sequence = entry.sequence } else null,
+        };
+    }
+
+    /// Stage a batch and return once it is applied and enqueued for
+    /// durability (WS3), instead of blocking for the fsync. Retries exactly
+    /// like `putBatchWithReplayAndParticipant` on `error.WriterLocked`;
+    /// unlike it, this never retries after staging succeeds, since there is
+    /// nothing left to retry once a ticket has been handed out.
+    pub fn putBatchWithReplayStagedAndParticipant(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+    ) !StagedDocBatch {
+        return self.putBatchWithHistoryTimeStaged(io, writes, deletes, replay, options, participant, 0);
+    }
+
+    pub fn putBatchWithHistoryTimeStaged(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !StagedDocBatch {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            return self.putBatchWithReplayStagedOnceAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns) catch |err| switch (err) {
+                error.WriterLocked => {
+                    if (attempt >= writer_locked_retry_count) return err;
+                    backoffWriterLockRetry(io);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    pub fn putBatchWithReplayStagedWithOptions(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+    ) !StagedDocBatch {
+        return self.putBatchWithReplayStagedAndParticipant(io, writes, deletes, replay, options, null);
     }
 
     fn putBatchWithReplayOnce(self: *DocStore, writes: []const KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
@@ -2453,9 +3546,24 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
+        return self.putBatchWithHistoryTime(io, writes, deletes, replay, options, participant, 0);
+    }
+
+    /// The caller supplies a native clock sample or a protocol-qualified
+    /// deterministic clock from the ordered entry.
+    pub fn putBatchWithHistoryTime(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        history_commit_time_ns: i64,
+    ) !void {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant) catch |err| switch (err) {
+            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant, history_commit_time_ns) catch |err| switch (err) {
                 error.WriterLocked => {
                     if (attempt >= writer_locked_retry_count) return err;
                     backoffWriterLockRetry(io);
@@ -2585,7 +3693,7 @@ pub const DocStore = struct {
     }
 
     pub fn lastReplaySequenceFromTxn(_: *DocStore, txn: *Txn, fallback_last: u64) !u64 {
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        const raw = replay_journal_format.getNextSequence(txn) catch |err| switch (err) {
             error.NotFound => return fallback_last,
             else => return err,
         };
@@ -2598,15 +3706,60 @@ pub const DocStore = struct {
         return try self.latestReplaySequenceForOrdinal(replayHintOrdinal(hint), fallback_last);
     }
 
+    /// Whether a record carrying `hint` lies in (`from_sequence`,
+    /// `through`], from one seek of the hint's lane: a current-format journal
+    /// gives every such record an entry there from the index floor on. Null
+    /// when the lane cannot say (an older layout, or a range below the floor).
+    pub fn replayHintRecordBetween(self: *DocStore, hint: change_journal_mod.TargetHint, from_sequence: u64, through: u64) !?bool {
+        if (from_sequence >= through) return false;
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        if (!(try replay_journal_format.state(&txn)).isCurrent()) return null;
+        if (try replay_journal_format.baseWroteSince(&txn)) return null;
+        const floor_raw = txn.get(internal_keys.replay_hint_index_floor_key[0..]) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (floor_raw) |raw| {
+            const floor = decodeReplaySequence(raw) orelse return error.CorruptReplayMetadata;
+            if (from_sequence +| 1 < floor) return null;
+        }
+        const ordinal = replayHintOrdinal(hint);
+        var cursor = try txn.openPhysicalKeyCursorAdapter();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(ordinal, from_sequence + 1);
+        const upper = internal_keys.replayRangeUpper(ordinal);
+        cursor.setUpperBound(&upper);
+        const entry = (cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        }) orelse return false;
+        if (entry.key.len != internal_keys.replay_key_len or entry.key[0] != internal_keys.replay_namespace or entry.key[1] != ordinal) return false;
+        return std.mem.readInt(u64, entry.key[2..10], .big) <= through;
+    }
+
     pub fn latestReplaySequenceForOrdinal(self: *DocStore, kind_ordinal: u8, fallback_last: u64) !u64 {
         if (!(try self.hasReplayEntries())) return fallback_last;
+        // A shared-lane journal's producer head is the only live answer: a
+        // per-hint marker there is a leftover of the layout before the
+        // upgrade, frozen at whatever it last held, and would report a
+        // target behind the hint's newer writes.
+        if (self.sharedReplayLane()) return @max(self.lastReplaySequence(fallback_last), fallback_last);
 
         var txn = try self.beginProbeTxn();
         defer txn.abort();
 
         const key = internal_keys.replayLatestSequenceKey(kind_ordinal);
         const raw = txn.get(key[0..]) catch |err| switch (err) {
-            error.NotFound => return fallback_last,
+            // Journal sharing: a per-hint latest-sequence marker is no
+            // longer written on every commit (see lite/docstore.zig's
+            // `writeReplayEntries`). Its absence just means this lane's
+            // progress now lives entirely in the single producer head
+            // sequence -- an upper bound on "how far could this hint
+            // possibly be behind," not an exact per-hint watermark. A
+            // backend that still maintains the per-hint marker (anything
+            // other than Lite, today) keeps its exact answer unchanged.
+            error.NotFound => return @max(self.lastReplaySequence(fallback_last), fallback_last),
             else => return err,
         };
         const latest = decodeReplaySequence(raw) orelse return error.CorruptReplayMetadata;
@@ -2617,7 +3770,36 @@ pub const DocStore = struct {
         return self.ensureReplayNextSequenceCached(fallback_next);
     }
 
+    /// Caches here are derived from durable state and advanced by this
+    /// store's own commits. When the backend adopts commits it did not make
+    /// through this store (another process, or a forwarded writer), drop
+    /// them so the next use reloads, and bump the query revisions so result
+    /// caches built on the old state are not reused.
+    fn revalidateAdoptedState(self: *DocStore) void {
+        const epoch = self.runtime_store.adoptionEpoch();
+        const seen = self.adopted_epoch.load(.acquire);
+        if (seen == epoch) return;
+        if (self.adopted_epoch.cmpxchgStrong(seen, epoch, .acq_rel, .acquire) != null) return;
+        // Raise, never lower: a writer of this store may hold a sequence it
+        // reserved from this counter and has not committed yet; reloading
+        // the committed cut beneath it would hand that sequence out again.
+        if (self.next_replay_sequence_cached.load(.acquire) != 0) {
+            const loaded = self.loadReplayNextSequenceFromStore(1);
+            while (true) {
+                const current = self.next_replay_sequence_cached.load(.acquire);
+                if (current >= loaded) break;
+                if (self.next_replay_sequence_cached.cmpxchgWeak(current, loaded, .acq_rel, .acquire) == null) break;
+            }
+        }
+        self.committed_replay_next_cached.store(0, .release);
+        if (self.replay_index_state.load(.monotonic) == replay_index_missing) self.replay_index_state.store(replay_index_unknown, .monotonic);
+        self.retained_effects_cache.store(0, .release);
+        _ = self.columnar_revision.fetchAdd(1, .acq_rel);
+        _ = self.query_generation_revision.fetchAdd(1, .acq_rel);
+    }
+
     pub fn reserveNextReplaySequence(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         while (true) {
             if (self.next_replay_sequence_cached.load(.acquire) != 0) {
                 return self.next_replay_sequence_cached.fetchAdd(1, .acq_rel);
@@ -2641,6 +3823,7 @@ pub const DocStore = struct {
     }
 
     pub fn hasReplayEntries(self: *DocStore) !bool {
+        self.revalidateAdoptedState();
         switch (self.replay_index_state.load(.monotonic)) {
             replay_index_available => return true,
             replay_index_missing => return false,
@@ -2665,9 +3848,25 @@ pub const DocStore = struct {
 
         var batch = try self.beginWriteBatch();
         errdefer batch.abort();
+        if (try replay_journal_format.state(batch.asTxn()) != .absent) {
+            batch.abort();
+            self.markReplayIndexAvailable();
+            return;
+        }
         try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        // WS5: this bootstrap path stamps the journal exactly like the first
+        // real append in writeReplayEntries does. Without it, a destination
+        // store seeded this way (e.g. a DB split destination, via
+        // ensureReplayFloor) looks "already initialized" with no version
+        // marker, and its first real append fails UnsupportedReplayJournalFormat.
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_current);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
         const next_raw = encodeReplayNextSequence(1);
         try batch.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
+        if (!self.sharedReplayLane()) {
+            try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+            try storeEmptyReplayCreditLaneHeads(batch.asTxn(), 1);
+        }
         try batch.commit();
         self.markReplayIndexAvailable();
         _ = self.next_replay_sequence_cached.cmpxchgStrong(0, 1, .acq_rel, .acquire);
@@ -2683,8 +3882,38 @@ pub const DocStore = struct {
 
         var batch = try self.beginWriteBatch();
         errdefer batch.abort();
+        // An older journal is upgraded first: stamping the current format
+        // over it would claim markers it never kept.
+        const keep_base_layout = !self.sharedReplayLane();
+        const journal_state = try replay_journal_format.state(batch.asTxn());
+        switch (journal_state) {
+            .absent => if (keep_base_layout) try storeEmptyReplayCreditLaneHeads(batch.asTxn(), desired_next),
+            .legacy => try upgradeLegacyReplayJournal(batch.asTxn(), keep_base_layout),
+            .current, .protected_credit => {},
+        }
+        const current_next = try replayCreditNextSequence(batch.asTxn());
+        if (journal_state != .absent and current_next >= desired_next) {
+            if (journal_state.isCurrent()) batch.abort() else try batch.commit();
+            self.markReplayIndexAvailable();
+            self.observeCommittedReplaySequence(current_next - 1);
+            return;
+        }
         try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        // See ensureReplayIndexInitialized: this must stamp the same version
+        // marker writeReplayEntries stamps on its own bootstrap path, or a
+        // store seeded only through this helper is rejected on its first
+        // real append.
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(if (journal_state == .protected_credit) internal_keys.replay_journal_format_protected_credit else internal_keys.replay_journal_format_current);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
         try batch.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
+        if (keep_base_layout) try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+        if (journal_state == .protected_credit) {
+            const txn = batch.asTxn();
+            if (try storedReplayCreditLaneHeads(txn)) |heads| {
+                const ledger = try loadJournalCreditLedger(txn);
+                try storeProtectedReplayCredit(txn, ledger, &heads, desired_next);
+            }
+        }
         try batch.commit();
 
         self.markReplayIndexAvailable();
@@ -2698,12 +3927,13 @@ pub const DocStore = struct {
     fn loadReplayNextSequenceFromStore(self: *DocStore, fallback_next: u64) u64 {
         var txn = self.beginProbeTxn() catch return fallback_next;
         defer txn.abort();
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch return fallback_next;
+        const raw = replay_journal_format.getNextSequence(&txn) catch return fallback_next;
         if (raw.len != 8) return fallback_next;
         return std.mem.readInt(u64, raw[0..8], .little);
     }
 
     fn ensureReplayNextSequenceCached(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         const cached = self.next_replay_sequence_cached.load(.acquire);
         if (cached != 0) return cached;
 
@@ -2729,13 +3959,14 @@ pub const DocStore = struct {
     }
 
     fn ensureCommittedReplayNextCached(self: *DocStore, fallback_next: u64) u64 {
+        self.revalidateAdoptedState();
         const cached = self.committed_replay_next_cached.load(.acquire);
         if (cached != 0) return cached;
         // A transient probe/read failure is not a durable empty cut. Leave
         // the cache unknown so the next observation retries recovery.
         var txn = self.beginProbeTxn() catch return fallback_next;
         defer txn.abort();
-        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+        const raw = replay_journal_format.getNextSequence(&txn) catch |err| switch (err) {
             error.NotFound => return fallback_next,
             else => return fallback_next,
         };
@@ -2806,6 +4037,7 @@ pub const DocStore = struct {
             .last_sequence = lane_stats.last_sequence,
             .scan_batches = lane_stats.scan_batches,
             .fallback_used = lane_stats.fallback_used,
+            .scan_budget_exhausted = lane_stats.scan_budget_exhausted,
         };
     }
 
@@ -2892,72 +4124,274 @@ pub const DocStore = struct {
         return try self.forEachReplayEntryFromHint(from_sequence, hint, ctx, callback);
     }
 
+    /// Back-compat full drain, used directly by low-level tests: loop bounded
+    /// chunks until retirement catches up to `up_to_sequence` (inclusive) or
+    /// there is nothing left to do.
     pub fn truncateReplayUpTo(self: *DocStore, alloc: Allocator, up_to_sequence: u64) !void {
-        try self.truncateReplayEntries(alloc, up_to_sequence);
+        while (true) {
+            const stats = try self.retireReplaySlice(alloc, up_to_sequence, default_retirement_budget);
+            if (stats.done) return;
+        }
     }
 
-    fn truncateReplayEntries(self: *DocStore, alloc: Allocator, up_to_sequence: u64) !void {
-        if (up_to_sequence == 0) return;
-        if (!(try self.hasReplayEntries())) return;
+    /// WS5: raise the foreground retirement watermark. Foreground/ack
+    /// callers only ever call this -- never `retireReplaySlice` directly --
+    /// so a write's acknowledgement never pays for a physical delete.
+    pub fn requestRetirement(self: *DocStore, min_progress: u64) void {
+        self.retirement_queue.request(min_progress);
+    }
 
-        var deletes = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (deletes.items) |key| alloc.free(key);
-            deletes.deinit(alloc);
+    /// WS5: gate which hinted lanes future appends write. Derived from the
+    /// DB layer's consumer catalog (see replay_reference.zig); callers that
+    /// never call this keep the safe all-hints default.
+    pub fn setActiveConsumerHintMask(self: *DocStore, mask: u8) void {
+        self.active_consumer_hint_mask.store(mask, .release);
+    }
+
+    /// WS5: the DB layer calls this every time it recomputes
+    /// `min_applied` (alongside `setActiveConsumerHintMask`, same call
+    /// site), so `serviceRetirement` below always clamps against a
+    /// reasonably fresh cross-consumer minimum instead of trusting
+    /// whatever ceiling a `requestRetirement` caller happened to pass.
+    pub fn noteSafeRetirementWatermark(self: *DocStore, min_consumer_progress: u64) void {
+        self.known_safe_retirement_watermark.store(min_consumer_progress, .release);
+    }
+
+    /// WS5 (a): register (or clear, with `null`) the consumer-generic
+    /// clamp callback `serviceRetirement` additionally consults. See
+    /// `extra_consumer_progress_fn`'s doc comment. Idempotent and cheap
+    /// (two pointer stores); safe to call on every retirement-adjacent
+    /// pass, not just once at open.
+    pub fn setExtraConsumerProgressProvider(self: *DocStore, ctx: ?*anyopaque, fn_: ?ExtraConsumerProgressFn) void {
+        self.extra_consumer_progress_ctx = ctx;
+        self.extra_consumer_progress_fn = fn_;
+    }
+
+    pub fn setJournalCreditPolicy(self: *DocStore, capacity_bytes: u64, progress_reserve_bytes: u64) void {
+        self.journal_credit_capacity_bytes = capacity_bytes;
+        self.journal_credit_progress_reserve_bytes = progress_reserve_bytes;
+    }
+
+    /// WS5 owner-only retirement entry point: one bounded, single-transaction
+    /// chunk, across every lane, draining the watermark `requestRetirement`
+    /// raised. The caller must already know it is the active owner (the Lite
+    /// path-lease holder or the Raft leader) -- `is_owner` is not derived
+    /// here, it is asserted, so a caller cannot mistake a skipped turn for a
+    /// completed one.
+    ///
+    /// `requestRetirement` callers (foreground acks, replay catch-up, a
+    /// caller's own just-applied sequence) raise a *requested* ceiling; they
+    /// are never required to prove it is safe. Per `clampRetireTarget`'s doc
+    /// comment, the owner must independently clamp to whatever every
+    /// registered consumer has actually applied before physically deleting
+    /// anything: `apply_state.minAppliedSequenceAcrossAllConsumers` (managed
+    /// indexes) and `extra_consumer_progress_fn` (every other journal
+    /// consumer kind: enrichments, resolvers/promotions, and anything else
+    /// the DB layer registers) are that clamp, both read fresh every call.
+    /// Their defaults (`maxInt(u64)`/no registration) preserve the
+    /// historical unclamped behavior for a store with no such consumers.
+    pub fn serviceRetirement(self: *DocStore, alloc: Allocator, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
+        if (!is_owner) return error.RetirementRequiresOwner;
+        const requested = self.retirement_queue.requested();
+        var safe_ceiling = try apply_state.minAppliedSequenceAcrossAllConsumers(alloc, self);
+        if (self.extra_consumer_progress_fn) |fn_| {
+            safe_ceiling = @min(safe_ceiling, try fn_(self.extra_consumer_progress_ctx.?, alloc));
         }
-        try deletes.ensureTotalCapacityPrecise(alloc, replay_truncate_batch_keys);
+        return try self.retireReplaySlice(alloc, replay_chunks.clampRetireTarget(requested, safe_ceiling), budget);
+    }
 
-        // Replay lanes are append-only. Capturing each lane independently is
-        // sufficient below an acknowledged retirement watermark, and avoids
-        // cloning/sorting unrelated document and artifact keys after every
-        // enrichment completion.
-        for (0..replay_hints.len + 1) |lane| {
-            const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
-            var from_sequence: u64 = 0;
-            while (true) {
-                var last_sequence = from_sequence;
-                {
-                    var txn = try self.beginReplayLaneScanTxn(ordinal, from_sequence);
-                    defer txn.abort();
-                    var cur = try txn.openCursor();
-                    defer cur.close();
-                    const lower = internal_keys.replayRangeLower(ordinal, from_sequence);
-                    const upper = internal_keys.replayRangeUpper(ordinal);
-                    cur.setUpperBound(&upper);
-                    var entry = try cur.seekAtOrAfter(&lower);
-                    while (entry) |kv| : (entry = try cur.next()) {
-                        if (std.mem.order(u8, kv.key, &upper) != .lt) break;
-                        const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
-                        if (sequence > up_to_sequence) break;
-                        const key = try alloc.dupe(u8, kv.key);
-                        errdefer alloc.free(key);
-                        try deletes.append(alloc, key);
-                        last_sequence = sequence;
-                        if (deletes.items.len == replay_truncate_batch_keys) break;
+    const ReplayRetirementPlan = struct {
+        stats: replay_chunks.RetirementStats = .{},
+        deletes: std.ArrayListUnmanaged([internal_keys.replay_key_len]u8) = .empty,
+        first_deleted: [replay_credit_lanes.len]?u64 = @splat(null),
+        deleted_through: [replay_credit_lanes.len]u64 = @splat(0),
+        heads: ?ReplayCreditLaneHeads = null,
+
+        fn reset(plan: *ReplayRetirementPlan) void {
+            plan.stats = .{};
+            plan.deletes.clearRetainingCapacity();
+            plan.first_deleted = @splat(null);
+            plan.deleted_through = @splat(0);
+            plan.heads = null;
+        }
+    };
+
+    fn planReplayRetirement(
+        txn: anytype,
+        plan: *ReplayRetirementPlan,
+        alloc: Allocator,
+        up_to_sequence: u64,
+        budget: replay_chunks.RetirementBudget,
+        initial_heads: ?ReplayCreditLaneHeads,
+        next: u64,
+    ) !void {
+        {
+            var cursor = try txn.openPhysicalCursorAdapter();
+            defer cursor.close();
+            cursor.boundPersistedRunBlockResidency();
+            cursor.setLengthOnly();
+            // Keep hinted lanes ahead of the all-record lane.
+            for (1..replay_credit_lanes.len + 1) |turn| {
+                const lane = turn % replay_credit_lanes.len;
+                const kind = replay_credit_lanes[lane];
+                const from = if (initial_heads) |heads| replayCreditLaneStart(&heads, lane) else 0;
+                if (from > up_to_sequence) continue;
+                const lower = internal_keys.replayRangeLower(kind, from);
+                const lane_end = internal_keys.replayRangeUpper(kind);
+                const cutoff = internal_keys.replayRangeLower(kind, up_to_sequence +| 1);
+                cursor.setUpperBound(if (up_to_sequence == std.math.maxInt(u64)) &lane_end else &cutoff);
+                defer cursor.setUpperBound(null);
+                var entry = try cursor.seekAtOrAfter(&lower);
+                while (entry) |kv| : (entry = try cursor.next()) {
+                    const sequence = internal_keys.parseReplayEntrySequence(kv.key, kind) orelse break;
+                    if (sequence > up_to_sequence) break;
+                    try plan.deletes.append(alloc, kv.key[0..internal_keys.replay_key_len].*);
+                    plan.stats.keys_deleted += 1;
+                    plan.stats.bytes_deleted += kv.key.len + cursor.valueLen(kv);
+                    plan.stats.retired_through = @max(plan.stats.retired_through, sequence);
+                    if (plan.first_deleted[lane] == null) plan.first_deleted[lane] = sequence;
+                    plan.deleted_through[lane] = sequence + 1;
+                    if (plan.stats.keys_deleted >= budget.max_keys or plan.stats.bytes_deleted >= budget.max_bytes) {
+                        plan.stats.done = false;
+                        break;
                     }
                 }
-                if (deletes.items.len == 0) break;
-                // Release the read generation before each bounded commit.
-                // Acknowledged rows are never replayed again; interruption
-                // leaves idempotent progress for the next maintenance pass.
-                var batch = try self.beginWriteBatch();
-                errdefer batch.abort();
-                for (deletes.items) |key| {
-                    batch.delete(key) catch |err| switch (err) {
-                        error.NotFound => {},
-                        else => return err,
-                    };
-                }
-                try batch.commit();
-                for (deletes.items) |key| alloc.free(key);
-                deletes.clearRetainingCapacity();
-                if (last_sequence >= up_to_sequence or last_sequence == std.math.maxInt(u64)) break;
-                from_sequence = last_sequence + 1;
+                if (!plan.stats.done) break;
             }
         }
+        if (plan.deletes.items.len == 0) return;
+        if (initial_heads) |old_heads| {
+            var heads = old_heads;
+
+            {
+                var cursor = try txn.openPhysicalCursorAdapter();
+                defer cursor.close();
+                cursor.setKeysOnly();
+                for (replay_credit_lanes, plan.deleted_through, 0..) |kind, from, i| {
+                    if (from == 0) continue;
+                    const head = try seekReplayCreditLaneHead(&cursor, kind, from);
+                    std.mem.writeInt(u64, replayCreditLaneHead(&heads, i), head, .little);
+                    std.mem.writeInt(u64, replayCreditLaneFloor(&heads, i), if (head == 0) @max(from, next) else 0, .little);
+                }
+            }
+            plan.heads = heads;
+        }
+    }
+
+    fn replayRetirementPrefixesUnchanged(txn: anytype, plan: *const ReplayRetirementPlan) !bool {
+        // Compatible writers can retire a lane without updating the
+        // witness. Verify the physical prefix while holding the gate.
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        for (replay_credit_lanes, plan.first_deleted) |kind, first| {
+            const sequence = first orelse continue;
+            if (try seekReplayCreditLaneHead(&cursor, kind, 0) != sequence + 1) return false;
+        }
+        return true;
+    }
+
+    /// Appends advance the sequence and retirement changes the first key
+    /// of each affected lane. Validate both before publishing a read plan.
+    /// If they changed, replan once under writer serialization.
+    fn retireReplaySlice(
+        self: *DocStore,
+        alloc: Allocator,
+        up_to_sequence: u64,
+        budget: replay_chunks.RetirementBudget,
+    ) !replay_chunks.RetirementStats {
+        if (up_to_sequence == 0 or !(try self.hasReplayEntries())) return .{};
+
+        var plan: ReplayRetirementPlan = .{};
+        defer plan.deletes.deinit(alloc);
+        try plan.deletes.ensureTotalCapacityPrecise(alloc, @min(budget.max_keys, replay_truncate_batch_keys));
+
+        const lanes_witnessed = !self.sharedReplayLane();
+        var observed_heads: ?ReplayCreditLaneHeads = null;
+        var observed_next: u64 = 0;
+        {
+            var read = try self.beginReadTxnWithBlockCacheAdmission(.transient);
+            defer read.abort();
+            if (lanes_witnessed) observed_heads = try storedReplayCreditLaneHeads(&read);
+            observed_next = try replayCreditNextSequence(&read);
+            try planReplayRetirement(&read, &plan, alloc, up_to_sequence, budget, observed_heads, observed_next);
+            if (plan.deletes.items.len == 0) return plan.stats;
+        }
+
+        var batch = try self.beginWriteBatchWithOptions(.{ .block_cache_admission = .transient });
+        var committed = false;
+        defer if (!committed) batch.abort();
+        const txn = batch.asTxn();
+        const initial_heads = if (lanes_witnessed) try storedReplayCreditLaneHeads(txn) else null;
+        const next = try replayCreditNextSequence(txn);
+        const append_preserves_range = observed_next == next or (next > observed_next and observed_next > up_to_sequence);
+        var reusable = false;
+        const protected_credit = lanes_witnessed and try replay_journal_format.state(txn) == .protected_credit;
+        if (!protected_credit and append_preserves_range and
+            (!lanes_witnessed or (observed_heads != null and initial_heads != null)))
+        {
+            reusable = try replayRetirementPrefixesUnchanged(txn, &plan);
+        }
+        if ((protected_credit or reusable) and observed_heads != null and initial_heads != null and append_preserves_range) {
+            const before = observed_heads.?;
+            const current = initial_heads.?;
+            reusable = true;
+            for (plan.deleted_through, 0..) |from, lane| {
+                if (from == 0) continue;
+                const start = lane * 16;
+                if (!std.mem.eql(u8, before[start..][0..16], current[start..][0..16])) {
+                    reusable = false;
+                    break;
+                }
+            }
+            if (reusable) {
+                const heads = &plan.heads.?;
+                var cursor: ?backend_erased.Cursor = null;
+                defer if (cursor) |*open_cursor| open_cursor.close();
+                for (replay_credit_lanes, plan.deleted_through, 0..) |kind, from, lane| {
+                    const start = lane * 16;
+                    if (from == 0) {
+                        heads[start..][0..16].* = current[start..][0..16].*;
+                    } else if (observed_next != next and std.mem.readInt(u64, replayCreditLaneHead(heads, lane), .little) == 0) {
+                        if (cursor == null) {
+                            cursor = try txn.openPhysicalCursorAdapter();
+                            cursor.?.setKeysOnly();
+                        }
+                        const head = try seekReplayCreditLaneHead(&cursor.?, kind, from);
+                        std.mem.writeInt(u64, replayCreditLaneHead(heads, lane), head, .little);
+                        std.mem.writeInt(u64, replayCreditLaneFloor(heads, lane), if (head == 0) @max(from, next) else 0, .little);
+                    }
+                }
+            }
+        }
+        if (!reusable) {
+            plan.reset();
+            try planReplayRetirement(txn, &plan, alloc, up_to_sequence, budget, initial_heads, next);
+            if (plan.deletes.items.len == 0) return plan.stats;
+        }
+
+        for (plan.deletes.items) |*key| try batch.delete(key);
+        plan.stats.no_op = false;
+        var ledger = try loadJournalCreditLedger(&batch);
+        ledger = ledger.released(plan.stats.bytes_deleted, plan.stats.keys_deleted);
+        if (plan.heads) |*heads| {
+            try txn.put(&internal_keys.journal_credit_lane_heads_key, heads);
+            if (try replay_journal_format.state(txn) == .protected_credit)
+                try storeProtectedReplayCredit(txn, ledger, heads, next)
+            else
+                try storeCompatibleReplayCredit(txn, ledger);
+        } else try storeJournalCreditLedger(&batch, ledger);
+
+        try batch.commit();
+        committed = true;
+        return plan.stats;
     }
 
     const replay_truncate_batch_keys: usize = 4096;
+    const default_retirement_budget = replay_chunks.RetirementBudget{
+        .max_keys = replay_truncate_batch_keys,
+        .max_bytes = replay_chunks.RetirementBudget.default_max_bytes,
+    };
 
     /// Scan all keys with the given prefix. Caller owns returned slices.
     pub fn scanPrefix(self: *DocStore, alloc: Allocator, prefix: []const u8) ![]OwnedKVPair {
@@ -3781,6 +5215,226 @@ fn cleanupTmp(path: [*:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
+test "docstore committed history captures initial and final images atomically across batches and rollback" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: committed_history.frame.Namespace = @splat(7);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+    const a = try internal_keys.documentKeyAlloc(alloc, "a");
+    defer alloc.free(a);
+    const b = try internal_keys.documentKeyAlloc(alloc, "b");
+    defer alloc.free(b);
+    try store.put(a, "original");
+    try store.put(internal_keys.public_schema_json_key, "schema-one");
+    var consumer: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        consumer = try committed_history.admit(&txn, namespace, @splat(1), committed_history.default_limit, 1000, 1);
+        try txn.commit();
+    }
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .capture_committed_rows = false });
+        errdefer batch.abort();
+        try batch.put(a, "copied");
+        try batch.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(a, "intermediate");
+        try txn.put(a, "replacement");
+        try txn.put(b, "inserted");
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        try txn.put(a, "aborted");
+        txn.abort();
+    }
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(internal_keys.public_schema_json_key, "schema-two");
+        try batch.put(a, "final");
+        try batch.delete(b);
+        batch.history.history_commit_time_ns = 123456789;
+        try batch.commit();
+    }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 2), (try committed_history.load(&txn)).?.latest);
+    for (1..3) |sequence| {
+        const descriptor_raw = try scratch.dupe(u8, try txn.get(&committed_history.recordKey(sequence)));
+        const descriptor = try committed_history.frame.Descriptor.decode(descriptor_raw, namespace, sequence);
+        var source = try committed_history.ChunkSource(DocStore.Txn).init(alloc, &txn, descriptor);
+        defer source.deinit();
+        var reader: committed_history.frame.Reader = .{ .descriptor = descriptor, .source = source.source() };
+        const header = try reader.header(scratch);
+        try std.testing.expectEqual(@as(i64, if (sequence == 1) 0 else 123456789), header.value.committed_at_ns);
+        try std.testing.expectEqual(committed_history.frame.TransactionScope.root_local, header.value.transaction_scope);
+        try std.testing.expectEqual(@as(u32, 2), header.count);
+        try std.testing.expectEqualStrings("schema-one", header.value.schema_before.?);
+        try std.testing.expectEqualStrings(if (sequence == 1) "schema-one" else "schema-two", header.value.schema_after.?);
+        const first = (try reader.next(scratch)).?;
+        try std.testing.expectEqualSlices(u8, a, first.key);
+        try std.testing.expectEqualStrings(if (sequence == 1) "copied" else "replacement", first.before.?);
+        try std.testing.expectEqualStrings(if (sequence == 1) "replacement" else "final", first.after.?);
+        const second = (try reader.next(scratch)).?;
+        try std.testing.expectEqualSlices(u8, b, second.key);
+        if (sequence == 1) {
+            try std.testing.expect(second.operation() == .insert);
+            try std.testing.expectEqualStrings("inserted", second.after.?);
+        } else {
+            try std.testing.expect(second.operation() == .delete);
+            try std.testing.expectEqualStrings("inserted", second.before.?);
+        }
+        try std.testing.expect((try reader.next(scratch)) == null);
+    }
+    try std.testing.expectEqual(@as(u64, 0), consumer.start);
+}
+
+test "docstore committed history reserves prepared effects before voting and releases with resolution" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: committed_history.frame.Namespace = @splat(8);
+    var consumer: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        consumer = try committed_history.admit(&txn, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+        try txn.commit();
+    }
+    const primary = try internal_keys.documentKeyAlloc(alloc, "row");
+    defer alloc.free(primary);
+    const intent = "\x00\x00__txn_intents__:" ++ "0123456789abcdef" ++ ":row";
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(intent, "\x00{\"id\":\"row\"}");
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        const state = (try committed_history.load(&txn)).?;
+        try std.testing.expect(state.reserved_bytes > 2 * 1024 * 1024);
+        try std.testing.expectEqual(@as(u64, 0), state.latest);
+    }
+    const filler = try alloc.alloc(u8, 2560 * 1024);
+    defer alloc.free(filler);
+    @memset(filler, 'x');
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(primary, filler);
+        try std.testing.expectError(error.HistoryFull, txn.commit());
+    }
+    try std.testing.expectError(error.NotFound, store.get(alloc, primary));
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(primary, "{\"id\":\"row\"}");
+        try txn.delete(intent);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const state = (try committed_history.load(&txn)).?;
+        try std.testing.expectEqual(@as(u64, 0), state.reserved_bytes);
+        try std.testing.expectEqual(@as(u64, 1), state.latest);
+        try std.testing.expect(try committed_history.reclaim(&txn, namespace));
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.reclaimed);
+        try committed_history.acknowledge(&txn, namespace, consumer.id, consumer.epoch, 0, 1);
+        try std.testing.expect(try committed_history.reclaim(&txn, namespace));
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.retained_bytes);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, committed_history.read(alloc, &txn, namespace, consumer.id, consumer.epoch, 0));
+        try txn.commit();
+    }
+}
+
+test "docstore committed history consumer epochs fence stale cursors and protect other consumers" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: committed_history.frame.Namespace = @splat(9);
+    const intent = "\x00\x00__txn_intents__:" ++ "0123456789abcdef" ++ ":row";
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+    try store.put(intent, "\x00before-enrollment");
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryPreparedTransactionsPresent, committed_history.admit(&txn, namespace, @splat(1), committed_history.default_limit, 1000, 1));
+    }
+    try store.delete(intent);
+    var first: committed_history.Consumer = undefined;
+    var second: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        first = try committed_history.admit(&txn, namespace, @splat(1), committed_history.default_limit, 1000, 1);
+        second = try committed_history.admit(&txn, namespace, @splat(2), committed_history.default_limit, 1000, 1);
+        try txn.commit();
+    }
+    const row = try internal_keys.documentKeyAlloc(alloc, "row");
+    defer alloc.free(row);
+    try store.put(row, "event");
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try committed_history.acknowledge(&txn, namespace, first.id, first.epoch, 0, 1);
+        try std.testing.expect(try committed_history.reclaim(&txn, namespace));
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.reclaimed);
+        try std.testing.expectError(error.HistoryCheckpointConflict, committed_history.acknowledge(&txn, namespace, first.id, first.epoch, 0, 1));
+        try committed_history.release(&txn, namespace, second.id, second.epoch);
+        try std.testing.expect(try committed_history.reclaim(&txn, namespace));
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.retained_bytes);
+        try committed_history.release(&txn, namespace, first.id, first.epoch);
+        const replacement = try committed_history.admit(&txn, namespace, first.id, committed_history.default_limit, 2000, 2);
+        try std.testing.expect(replacement.epoch > second.epoch);
+        try std.testing.expectEqual(@as(u64, 1), replacement.start);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, committed_history.read(alloc, &txn, namespace, first.id, first.epoch, 1));
+        try std.testing.expectError(error.HistoryResynchronizationRequired, committed_history.read(alloc, &txn, @splat(8), first.id, replacement.epoch, 1));
+        try committed_history.release(&txn, namespace, replacement.id, replacement.epoch);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(row, "must-roll-back");
+        try std.testing.expectError(error.HistoryMixedControl, committed_history.admit(&txn, namespace, first.id, committed_history.default_limit, 3000, 3));
+    }
+    const value = try store.get(alloc, row);
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("event", value);
+}
+
 test "docstore put/get/delete" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf);
@@ -3963,7 +5617,7 @@ test "docstore range tracking native LSM common prefix batch benchmark" {
 
 test "docstore range tracking survives native LSM reopen and rejects generation overflow atomically" {
     const range_protection = @import("range_protection.zig");
-    const index_records = @import("db/relational_index_records.zig");
+    const index_records = @import("db/relational/indexes/records.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4226,7 +5880,7 @@ test "docstore retained REF5 graph language persists exact value and tombstone a
 
 test "docstore retained integrity and row effects share an immutable atomic frame across reopen" {
     const alloc = std.testing.allocator;
-    const integrity = @import("db/relational_integrity_contract.zig");
+    const integrity = @import("db/relational/integrity/contract.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrity-tail", .{tmp.sub_path});
@@ -5152,6 +6806,40 @@ test "docstore backend runtime erases store handles" {
     }
 }
 
+test "docstore immutable presence retains its policy snapshot without copying large values" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const large = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'p');
+    try store.put("policy-program", large);
+    var historical = blk: {
+        var original = try store.beginReadTxn();
+        defer original.abort();
+        break :blk try original.forkRead();
+    };
+    defer historical.abort();
+    try store.putBatch(&.{.{ .key = "next-program", .value = large }}, &.{"policy-program"});
+    var current = try store.beginReadTxn();
+    defer current.abort();
+    const copies = backend.snapshotReadStats().point_value_copies;
+    for (0..8) |_| {
+        try std.testing.expect(try historical.contains("policy-program"));
+        try std.testing.expect(!try historical.contains("next-program"));
+        try std.testing.expect(!try historical.contains("missing"));
+        try std.testing.expect(!try current.contains("policy-program"));
+        try std.testing.expect(try current.contains("next-program"));
+    }
+    try std.testing.expectEqual(copies, backend.snapshotReadStats().point_value_copies);
+}
+
 test "ordered artifact inventory erased document snapshots retain their cut across fork and parent close" {
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});
@@ -5222,6 +6910,28 @@ test "ordered artifact inventory replay reservations do not publish a committed 
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 3), reopened.lastReplaySequence(0));
     try std.testing.expectEqual(@as(u64, 4), reopened.nextReplaySequence(1));
+}
+
+test "a store seeded only through ensureReplayNextSequenceAtLeast accepts its first real append" {
+    // db.zig's ensureReplayFloor (used to bootstrap a DB split destination)
+    // calls ensureReplayNextSequenceAtLeast before the destination ever takes
+    // a real write. That bootstrap must stamp the same journal-format marker
+    // writeReplayEntries stamps on its own first append: otherwise the store
+    // looks "already initialized" (replay_meta_init_key is set) with no
+    // version marker, and the first real append is rejected outright as an
+    // unsupported pre-ledger journal.
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.ensureReplayNextSequenceAtLeast(5);
+    try std.testing.expectEqual(@as(u64, 4), store.lastReplaySequence(0));
+    try store.appendReplayOpaque(alloc, 5, "payload");
+    try std.testing.expectEqual(@as(u64, 5), store.lastReplaySequence(0));
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
 }
 
 test "ordered artifact inventory ambiguous replay commit reloads durable cut without reusing reservation" {
@@ -5487,6 +7197,151 @@ test "docstore indexes replay rows by hint and truncates them" {
         alloc.free(after);
     }
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "WS5 DocStore serviceRetirement retires every lane in one commit and refuses non-owners" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{ .dense_vector, .full_text },
+    });
+    defer alloc.free(payload);
+    try store.putBatchWithReplay(null, &.{
+        .{ .key = "doc:a", .value = "A" },
+    }, &.{}, .{ .sequence = 1, .payload = payload });
+
+    // Non-owner callers never retire anything.
+    store.requestRetirement(1);
+    try std.testing.expectError(error.RetirementRequiresOwner, store.serviceRetirement(alloc, false, .{}));
+    try std.testing.expect(try store.hasReplayEntries());
+    const all_entries_before = try store.iterateReplayFrom(alloc, 1);
+    defer {
+        for (all_entries_before) |*entry| entry.deinit(alloc);
+        alloc.free(all_entries_before);
+    }
+    try std.testing.expectEqual(@as(usize, 1), all_entries_before.len);
+
+    // The owner drains the watermark in one bounded retirement turn.
+    const stats = try store.serviceRetirement(alloc, true, .{});
+    try std.testing.expect(!stats.no_op);
+    try std.testing.expect(stats.done);
+    try std.testing.expectEqual(@as(u64, 1), stats.retired_through);
+
+    const dense_after = try store.iterateReplayEntriesFromHint(alloc, 1, .dense_vector);
+    defer {
+        for (dense_after) |*entry| entry.deinit(alloc);
+        alloc.free(dense_after);
+    }
+    try std.testing.expectEqual(@as(usize, 0), dense_after.len);
+    const full_text_after = try store.iterateReplayEntriesFromHint(alloc, 1, .full_text);
+    defer {
+        for (full_text_after) |*entry| entry.deinit(alloc);
+        alloc.free(full_text_after);
+    }
+    try std.testing.expectEqual(@as(usize, 0), full_text_after.len);
+}
+
+test "docstore releases replay credit only once for overlapping retirement plans" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.appendReplayOpaque(alloc, 1, "first");
+        try store.appendReplayOpaque(alloc, 2, "second");
+        // Two views of the same backend must serialize their retirements.
+        var other = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer other.close();
+        const Retire = struct {
+            fn run(doc: *DocStore, result: *anyerror!replay_chunks.RetirementStats) void {
+                result.* = doc.retireReplaySlice(std.testing.allocator, 1, DocStore.default_retirement_budget);
+            }
+        };
+        var first: anyerror!replay_chunks.RetirementStats = undefined;
+        var second: anyerror!replay_chunks.RetirementStats = undefined;
+        var thread = try std.Thread.spawn(.{}, Retire.run, .{ &other, &second });
+        Retire.run(&store, &first);
+        thread.join();
+        try std.testing.expectEqual(@as(usize, 1), (try first).keys_deleted + (try second).keys_deleted);
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
+    const ledger = try loadJournalCreditLedger(&read);
+    try std.testing.expectEqual(@as(u64, 1), ledger.records);
+    try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "second".len), ledger.bytes);
+}
+
+test "compatible replay credit retirement detects an older writer changing the physical head" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.appendReplayOpaque(alloc, 1, "first");
+    try store.appendReplayOpaque(alloc, 2, "second");
+
+    var plan: DocStore.ReplayRetirementPlan = .{};
+    defer plan.deletes.deinit(alloc);
+    const heads = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const observed = (try storedReplayCreditLaneHeads(&read)).?;
+        try DocStore.planReplayRetirement(&read, &plan, alloc, 1, .{}, observed, 3);
+        break :blk observed;
+    };
+    var batch = try store.beginWriteBatch();
+    defer batch.abort();
+    const txn = batch.asTxn();
+    try std.testing.expect(try DocStore.replayRetirementPrefixesUnchanged(txn, &plan));
+    try batch.delete(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1));
+    try std.testing.expectEqual(heads, (try storedReplayCreditLaneHeads(txn)).?);
+    try std.testing.expect(!try DocStore.replayRetirementPrefixesUnchanged(txn, &plan));
+}
+
+test "WS5 DocStore journal credit ledger is charged on append and released on retirement" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    try store.putBatchWithReplay(null, &.{
+        .{ .key = "doc:a", .value = "A" },
+    }, &.{}, .{ .sequence = 1, .payload = "replay:1" });
+
+    const ledger_after_append = try store.get(alloc, internal_keys.journal_credit_ledger_key[0..]);
+    defer alloc.free(ledger_after_append);
+    const decoded_after_append = internal_keys.JournalCreditLedger.decode(ledger_after_append) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(decoded_after_append.bytes > 0);
+    try std.testing.expectEqual(@as(u64, 1), decoded_after_append.records);
+
+    store.requestRetirement(1);
+    _ = try store.serviceRetirement(alloc, true, .{});
+
+    const ledger_after_retire = try store.get(alloc, internal_keys.journal_credit_ledger_key[0..]);
+    defer alloc.free(ledger_after_retire);
+    const decoded_after_retire = internal_keys.JournalCreditLedger.decode(ledger_after_retire) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), decoded_after_retire.bytes);
+    try std.testing.expectEqual(@as(u64, 0), decoded_after_retire.records);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
+    const heads = (try storedReplayCreditLaneHeads(&read)).?;
+    try std.testing.expectEqual(@as(u64, 2), replayCreditLaneStart(&heads, 0));
 }
 
 test "docstore relational bulk appends retain direct ingest and atomic dirty tokens" {
@@ -6511,6 +8366,283 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
 }
 
+test "sequence catalog journal persists creation RESTART independently of declared START through cold retry" {
+    const sequence = @import("../system_catalog/sequences.zig");
+    const journal = @import("../system_catalog/sequence_journal.zig");
+    const Counter = journal.Store(DocStore.Txn);
+    const a = std.testing.allocator;
+    const record = try sequence.Record.create(.{ .start = 100, .restart = .{ .value = 7 }, .cache = 4 });
+    const key: journal.Key = .{ .group = 31, .sequence_id = 29 };
+    const request: journal.Request = .{ .expected = record.state, .request_id = @splat(9), .operation = .reserve };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            var invalid = record;
+            invalid.state.is_called = true;
+            try std.testing.expectError(error.InvalidSequenceDefinition, counter.initialize(a, invalid));
+            try counter.initialize(a, record);
+            try txn.commit();
+        }
+        var pinned = try store.beginReadTxn();
+        defer pinned.abort();
+        const reader: Counter = .{ .txn = &pinned, .key = key };
+        const prior = (try reader.load(a, record.definition)).?;
+        try std.testing.expectEqual(@as(i64, if (pass == 0) 7 else 10), prior.last_value);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            const receipt = try counter.execute(a, record.definition, request);
+            try std.testing.expectEqual(@as(i64, 7), receipt.lease.?.first);
+            try std.testing.expectEqual(@as(u64, 4), receipt.lease.?.count);
+            try std.testing.expectEqual(@as(i64, 10), receipt.state.last_value);
+            try std.testing.expectEqual(@as(u64, 2), receipt.state.revision);
+            try txn.commit();
+        }
+        try std.testing.expectEqualDeep(prior, (try reader.load(a, record.definition)).?);
+        try std.testing.expectEqual(@as(i64, 100), record.definition.start);
+    }
+}
+
+test "sequence catalog journal native LSM rollback cold retry and bounded retirement" {
+    const sequence = @import("../system_catalog/sequences.zig");
+    const journal = @import("../system_catalog/sequence_journal.zig");
+    const Counter = journal.Store(DocStore.Txn);
+    const ReadOnlyTxn = struct {
+        inner: *DocStore.Txn,
+        reads: usize = 0,
+        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
+            self.reads += 1;
+            return self.inner.get(name);
+        }
+    };
+    const FailingTxn = struct {
+        inner: *DocStore.Txn,
+        fail_at: usize,
+        writes: usize = 0,
+        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
+            return self.inner.get(name);
+        }
+        pub fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+            self.writes += 1;
+            if (self.writes == self.fail_at) return error.TestInjectedSequenceWriteFailure;
+            try self.inner.put(name, value);
+        }
+        pub fn delete(self: *@This(), name: []const u8) !void {
+            self.writes += 1;
+            if (self.writes == self.fail_at) return error.TestInjectedSequenceWriteFailure;
+            try self.inner.delete(name);
+        }
+    };
+    const a = std.testing.allocator;
+    const t = std.testing;
+    const key: journal.Key = .{ .group = 31, .sequence_id = 17 };
+    const initial_sequence = try sequence.Record.create(.{ .cache = 32 });
+    const definition = initial_sequence.definition;
+    const request: journal.Request = .{ .expected = initial_sequence.state, .request_id = @splat(1), .operation = .reserve };
+    // This test exercises a real atomic storage transaction, not Raft or public
+    // SQL activation. The catalog revision sentinel must never be rewritten by
+    // allocation, and a restart opens an independent durable LSM owner.
+    const catalog_key = "test.sequence.catalog-revision";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try counter.initialize(a, initial_sequence);
+                try t.expectError(error.SequenceCounterChanged, counter.initialize(a, initial_sequence));
+                try txn.put(catalog_key, "7");
+                try txn.commit();
+            }
+            var pinned = try store.beginReadTxn();
+            defer pinned.abort();
+            const reader: Counter = .{ .txn = &pinned, .key = key };
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            try t.expect((try reader.observe(a, definition, request)) == null);
+            try t.expectEqual(.ready, try reader.admission(a, definition, request));
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            for ([_]usize{ 1, 2 }) |fail_at| {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                var failing: FailingTxn = .{ .inner = &txn, .fail_at = fail_at };
+                const counter: journal.Store(FailingTxn) = .{ .txn = &failing, .key = key };
+                try t.expectError(error.TestInjectedSequenceWriteFailure, counter.execute(a, definition, request));
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                const entries = try DocStore.scanPrefixTxn(a, &txn, "\x00\x00__metadata__:sql_sequence_counters:v1:");
+                defer {
+                    for (entries) |entry| {
+                        a.free(entry.key);
+                        a.free(entry.value);
+                    }
+                    a.free(entries);
+                }
+                try t.expectEqual(@as(usize, 1), entries.len);
+                try txn.put(entries[0].key, "{\"format\":1,\"identity\":{\"group\":32,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1,\"is_called\":false}}");
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectError(error.InvalidSequenceState, counter.load(a, definition));
+                // Missing call/revision fields cannot acquire defaults that
+                // rewind an allocated counter during recovery.
+                for ([_][]const u8{
+                    "{\"format\":1,\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1}}",
+                    "{\"format\":1,\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"last_value\":1,\"is_called\":false}}",
+                    "{\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1,\"is_called\":false}}",
+                }) |malformed| {
+                    try txn.put(entries[0].key, malformed);
+                    try t.expectError(error.InvalidSequenceState, counter.load(a, definition));
+                }
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectEqual(@as(i64, 32), (try counter.execute(a, definition, request)).state.last_value);
+                // Abort after staging both the state and receipt.
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectEqual(@as(u64, 1), (try counter.load(a, definition)).?.revision);
+                const result = try counter.execute(a, definition, request);
+                try t.expectEqual(@as(i64, 1), result.lease.?.first);
+                try txn.commit();
+            }
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            // A pinned pre-allocation reader cannot observe the new receipt.
+            try t.expect((try reader.observe(a, definition, request)) == null);
+        } else {
+            {
+                var read_txn = try store.beginReadTxn();
+                defer read_txn.abort();
+                var readonly: ReadOnlyTxn = .{ .inner = &read_txn };
+                const reader: journal.Store(ReadOnlyTxn) = .{ .txn = &readonly, .key = key };
+                const observed = (try reader.observe(a, definition, request)).?;
+                try t.expectEqual(@as(i64, 1), observed.lease.?.first);
+                try t.expectEqual(@as(i64, 32), observed.state.last_value);
+                try t.expectEqual(@as(usize, 2), readonly.reads);
+                const Probe = struct {
+                    fn run(allocator: std.mem.Allocator, source: journal.Store(ReadOnlyTxn), def: sequence.Definition, original: journal.Request) !void {
+                        const result = (try source.observe(allocator, def, original)).?;
+                        try std.testing.expectEqual(@as(i64, 1), result.lease.?.first);
+                        try std.testing.expectEqual(@as(u64, 2), result.state.revision);
+                    }
+                };
+                try std.testing.checkAllAllocationFailures(a, Probe.run, .{ reader, definition, request });
+                var mismatch = request;
+                mismatch.request_id = @splat(2);
+                try t.expectError(error.SequenceCounterChanged, reader.observe(a, definition, mismatch));
+                try t.expectEqualDeep(observed.state, (try reader.load(a, definition)).?);
+            }
+            {
+                var damaged_txn = try store.beginWriteTxn();
+                defer damaged_txn.abort();
+                const entries = try DocStore.scanPrefixTxn(a, &damaged_txn, journal.allGroupsPrefix());
+                defer {
+                    for (entries) |entry| {
+                        a.free(entry.key);
+                        a.free(entry.value);
+                    }
+                    a.free(entries);
+                }
+                var checked = false;
+                for (entries) |entry| {
+                    if ((try journal.storedKey(entry.key)).?.revision != 2) continue;
+                    var receipt = try journal.receiptBytes(a, entry.value, definition);
+                    receipt.lease.?.first += 1;
+                    receipt.lease.?.count -= 1;
+                    const corrupted = try std.json.Stringify.valueAlloc(a, receipt, .{});
+                    defer a.free(corrupted);
+                    try damaged_txn.put(entry.key, corrupted);
+                    const damaged: Counter = .{ .txn = &damaged_txn, .key = key };
+                    try t.expectError(error.InvalidSequenceReceipt, damaged.observe(a, definition, request));
+                    try t.expectEqualDeep(receipt.state, (try damaged.load(a, definition)).?);
+                    checked = true;
+                }
+                try t.expect(checked);
+            }
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            const replay = try counter.execute(a, definition, request);
+            try t.expectEqual(@as(i64, 1), replay.lease.?.first);
+            try t.expectEqual(@as(u64, 2), (try counter.load(a, definition)).?.revision);
+            const wrong_group: Counter = .{ .txn = &txn, .key = .{ .group = 32, .sequence_id = 17 } };
+            try t.expect((try wrong_group.load(a, definition)) == null);
+            var state = replay.state;
+            for (0..130) |_| {
+                var next = request;
+                next.expected = state;
+                state = (try counter.execute(a, definition, next)).state;
+            }
+            // Missing old receipt is a conflict, never another allocation.
+            try t.expectError(error.SequenceCounterChanged, counter.execute(a, definition, request));
+            try t.expect((try counter.observe(a, definition, request)) == null);
+            try t.expectEqualDeep(state, (try counter.load(a, definition)).?);
+            const prefix = "\x00\x00__metadata__:sql_sequence_counters:v1:";
+            const entries = try DocStore.scanPrefixTxn(a, &txn, prefix);
+            defer {
+                for (entries) |entry| {
+                    a.free(entry.key);
+                    a.free(entry.value);
+                }
+                a.free(entries);
+            }
+            try t.expectEqual(@as(usize, journal.retained_receipts + 1), entries.len);
+            // Admission using an earlier counter must not overwrite a lease.
+            const stale: sequence.Record = .{ .definition = definition, .state = replay.state };
+            try t.expectError(error.SequenceCounterChanged, counter.alter(a, stale, .{ .restart = .{ .value = 1000 } }));
+            const prior: sequence.Record = .{ .definition = definition, .state = state };
+            try t.expectEqualDeep(prior, try counter.alter(a, prior, .{}));
+            const restarted = try counter.alter(a, prior, .{ .restart = .{ .value = 1000 } });
+            try t.expectError(error.SequenceCatalogChanged, counter.alter(a, prior, .{ .restart = .{ .value = 1000 } }));
+            try t.expectError(error.SequenceCatalogChanged, counter.execute(a, restarted.definition, request));
+            var fresh = request;
+            fresh.expected = restarted.state;
+            const first = try counter.execute(a, restarted.definition, fresh);
+            try t.expectEqual(@as(i64, 1000), first.lease.?.first);
+            fresh.expected = first.state;
+            fresh.operation = .{ .set = .{ .value = 77, .called = false } };
+            const reset = try counter.execute(a, restarted.definition, fresh);
+            try t.expect(reset.lease == null);
+            try t.expectEqualDeep(reset, try counter.execute(a, restarted.definition, fresh));
+            fresh.expected = reset.state;
+            fresh.operation = .reserve;
+            try t.expectEqual(@as(i64, 77), (try counter.execute(a, restarted.definition, fresh)).lease.?.first);
+            try counter.remove(a, restarted.definition);
+            try t.expect((try counter.load(a, restarted.definition)) == null);
+            const retired = try DocStore.scanPrefixTxn(a, &txn, prefix);
+            defer a.free(retired);
+            try t.expectEqual(@as(usize, 0), retired.len);
+            try txn.commit();
+        }
+        const revision = try store.get(a, catalog_key);
+        defer a.free(revision);
+        try t.expectEqualStrings("7", revision);
+    }
+}
+
 test "public graph metric borrowed wire content authority shares txn batch append abort and reopen boundaries" {
     const a = std.testing.allocator;
     const revision = @import("document_mutation_revision.zig");
@@ -6674,4 +8806,747 @@ test "docstore scoped owned batches pin one generation and release external payl
     try std.testing.expectEqual(@as(u64, 128), after.get_many_sorted_calls - before.get_many_sorted_calls);
     try std.testing.expectEqual(@as(u64, 384), after.get_many_sorted_keys - before.get_many_sorted_keys);
     try std.testing.expect(budget.live < baseline + 64 * 1024);
+}
+
+test "docstore committed history metadata grants fence late enrollment without per consumer tombstones" {
+    const control = @import("history_consumer.zig");
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    var open = true;
+    defer if (open) store.close();
+    const namespace: control.Namespace = @splat(7);
+    const incarnation: control.Digest = @splat(9);
+    const first: control.Grant = .{ .namespace = namespace, .authority = incarnation, .sequence = 1, .consumer = @splat(1), .definition = @splat(4), .expires_at_seconds = 1000, .policy_revision = 1 };
+    var second = first;
+    second.sequence = 2;
+    second.consumer = @splat(2);
+    var first_native: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        first_native = try control.enroll(&txn, first);
+        // Simulate a lost enrollment reply: the metadata owner will retire the
+        // original grant without knowing its allocated native consumer epoch.
+        _ = try control.enroll(&txn, second);
+        try txn.commit();
+    }
+    const row = try internal_keys.documentKeyAlloc(a, "retained");
+    defer a.free(row);
+    try store.put(row, "one committed frame");
+    var ref: control.Reference = .{ .namespace = namespace, .authority = incarnation, .consumer = first.consumer, .epoch = first_native.epoch, .grant = first.sequence, .definition = first.definition };
+    const closed_second: control.Retirement = .{ .namespace = namespace, .authority = incarnation, .consumer = second.consumer, .definition = second.definition, .grant = second.sequence, .sequence = 3 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try control.acknowledge(&txn, ref, 0, 1);
+        // Lost ACK response is idempotent; the other consumer still pins frame 1.
+        try control.acknowledge(&txn, ref, 0, 1);
+        _ = try committed_history.reclaim(&txn, namespace);
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.reclaimed);
+        try control.retire(&txn, closed_second);
+        try control.retire(&txn, closed_second);
+        _ = try committed_history.reclaim(&txn, namespace);
+        try std.testing.expectEqual(@as(u64, 1), (try committed_history.load(&txn)).?.reclaimed);
+        try control.renew(&txn, ref, 1000, 2000);
+        try control.renew(&txn, ref, 1000, 2000);
+        const retried = try control.enroll(&txn, first);
+        try std.testing.expectEqual(@as(u64, 2000), retried.expires_at_seconds);
+        try std.testing.expectEqual(first_native.epoch, retried.epoch);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, second));
+        var unknown = second;
+        unknown.consumer = @splat(3);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, unknown));
+        try std.testing.expectEqual(@as(u64, 3), (try control.load(&txn)).?.floor);
+        try std.testing.expectEqual(@as(u64, 2000), (try control.inspect(&txn, ref)).expires_at_seconds);
+    }
+    // An older surviving consumer is not invalidated by another feed's cleanup.
+    var refreshed = first;
+    refreshed.sequence = 4;
+    refreshed.expires_at_seconds = 2000;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const native = try control.enroll(&txn, refreshed);
+        try std.testing.expectEqual(first_native.epoch, native.epoch);
+        try std.testing.expectEqual(@as(u64, 0), native.start);
+        try std.testing.expectEqual(@as(u64, 1), native.acknowledged);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryConsumerConflict, control.inspect(&txn, ref));
+        var old_close = closed_second;
+        old_close.consumer = first.consumer;
+        old_close.grant = first.sequence;
+        old_close.sequence = 5;
+        try std.testing.expectError(error.HistoryConsumerConflict, control.retire(&txn, old_close));
+    }
+    ref.grant = refreshed.sequence;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try control.retire(&txn, .{ .namespace = namespace, .authority = incarnation, .consumer = ref.consumer, .definition = ref.definition, .grant = ref.grant, .sequence = 5 });
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 5), (try control.load(&txn)).?.floor);
+        try std.testing.expect(!(try committed_history.load(&txn)).?.active());
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, refreshed));
+    }
+}
+
+test "docstore committed history consumer retirement before enrollment and rollback preserve fencing" {
+    const control = @import("history_consumer.zig");
+    const a = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: control.Namespace = @splat(7);
+    const grant: control.Grant = .{ .namespace = namespace, .authority = @splat(9), .sequence = 1, .consumer = @splat(1), .definition = @splat(4), .expires_at_seconds = 1000, .policy_revision = 1 };
+    const closed: control.Retirement = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .grant = 1, .sequence = 2 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        _ = try control.enroll(&txn, grant);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(?control.State, null), try control.load(&txn));
+        try std.testing.expectEqual(@as(?committed_history.State, null), try committed_history.load(&txn));
+        try control.retire(&txn, closed);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, grant));
+        var newer = grant;
+        newer.sequence = 3;
+        newer.consumer = @splat(2);
+        _ = try control.enroll(&txn, newer);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const persisted = (try control.load(&txn)).?;
+        try std.testing.expectEqual(@as(u64, 2), persisted.floor);
+        try std.testing.expectEqual(@as(?committed_history.State, null), try committed_history.load(&txn));
+        var corrupt = persisted.encode();
+        corrupt[60] ^= 1;
+        try std.testing.expectError(error.HistoryCorrupt, control.State.decode(&corrupt));
+        var wrong = grant;
+        wrong.sequence = 3;
+        wrong.authority = @splat(8);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, wrong));
+        const row = try internal_keys.documentKeyAlloc(a, "must rollback");
+        defer a.free(row);
+        try txn.put(row, "value");
+        try std.testing.expectError(error.HistoryMixedControl, control.retire(&txn, closed));
+    }
+}
+
+test "docstore source artifact abort reopen and bounded reclamation preserve authority" {
+    const artifact = @import("source_plan_storage.zig");
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    var open = true;
+    defer if (open) store.close();
+    var root: artifact.Root = .{ .authority = .native, .namespace = @splat(0), .generation = 0, .fence = @splat(4) };
+    std.mem.writeInt(u64, root.namespace[0..8], 1, .big);
+    var frame: [128]u8 = @splat(0);
+    @memcpy(frame[0..4], "AFP1");
+    std.mem.writeInt(u32, frame[4..8], 1, .little);
+    std.mem.writeInt(u64, frame[8..16], 10, .little);
+    std.mem.writeInt(u64, frame[16..24], 11, .little);
+    std.mem.writeInt(u64, frame[24..32], 1, .little);
+    const digest = try artifact.frozenDigest(&frame);
+    @memcpy(frame[32..64], &digest);
+    var checksum: artifact.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&frame, &checksum, .{});
+    const hashes = [_]artifact.Digest{artifact.chunkDigest(0, &frame)};
+    var attempt: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, attempt[0..8], 1, .big);
+    const spec: artifact.Spec = .{ .namespace = artifact.namespaceFor(root, 1), .storage_epoch = 1, .binding = @splat(2), .domain = artifact.domainFor(@splat(2)), .attempt = attempt, .bytes = frame.len, .checksum = checksum, .plan_digest = digest, .chunk_hashes = &hashes };
+    var position: artifact.Digest = @splat(0);
+    std.mem.writeInt(u64, position[0..8], 1, .little);
+    position[31] = 2;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try artifact.stageBegin(a, &txn, root, spec);
+        try artifact.stageChunk(a, &txn, root, spec, 0, &frame);
+    }
+    var seal: artifact.Digest = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u16, 0), (try artifact.readQuota(&txn, root)).active);
+        try artifact.stageBegin(a, &txn, root, spec);
+        try artifact.stageChunk(a, &txn, root, spec, 0, &frame);
+        seal = try artifact.stageSeal(a, &txn, root, spec, position);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const bytes = try artifact.readSealedAlloc(a, &txn, root, spec, seal);
+        defer a.free(bytes);
+        try std.testing.expectEqualSlices(u8, &frame, bytes);
+        std.mem.writeInt(u64, position[0..8], 2, .little);
+        _ = try artifact.stageFence(a, &txn, root, spec, position);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectError(error.SourceReceiptExpired, artifact.stageBegin(a, &txn, root, spec));
+        try std.testing.expect(try artifact.stageReclaim(a, &txn, root, spec, 1));
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(try artifact.reclaimed(&txn, root, spec));
+        try std.testing.expectEqual(@as(u64, 0), (try artifact.readQuota(&txn, root)).reserved);
+        try std.testing.expectError(error.SourceReceiptExpired, artifact.stageBegin(a, &txn, root, spec));
+    }
+}
+
+fn writeLegacyReplayJournal(store: *DocStore) !void {
+    // The base revision's layout: no format marker, no credit ledger,
+    // `next_sequence` under its old key, and a per-hint lane copy.
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var next_raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &next_raw, 2, .little);
+    try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+    const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try batch.put(all_key[0..], "replay:1");
+    const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    try batch.put(lane_key[0..], "replay:1");
+    try batch.commit();
+}
+
+test "docstore upgrades a base-revision replay journal when it opens" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try writeLegacyReplayJournal(&store);
+    }
+
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(u64, 1), store.lastReplaySequence(0));
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        // A store whose readers use hint lanes keeps the base key, so a base
+        // binary rolled back onto it still reads where the journal is.
+        try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, (try txn.get(replay_journal_format.legacy_next_sequence_key[0..]))[0..8], .little));
+        // An older layout may have skipped a hint's appends: every marker
+        // starts at the head.
+        for (replay_hints) |hint| {
+            const marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+            try std.testing.expectEqual(@as(?u64, 1), decodeReplaySequence(try txn.get(marker[0..])));
+        }
+        const version = internal_keys.decodeReplayJournalFormatVersion(try txn.get(internal_keys.replay_journal_format_version_key[0..]));
+        try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_current), version);
+        const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 2), ledger.records);
+        try std.testing.expectEqual(@as(u64, 2 * (internal_keys.replay_key_len + "replay:1".len)), ledger.bytes);
+    }
+
+    // The next journal-producing mutation succeeds.
+    try store.putBatchWithReplay(null, &.{
+        .{ .key = "doc:a", .value = "A" },
+    }, &.{}, .{
+        .sequence = 2,
+        .payload = "replay:2",
+    });
+    try std.testing.expectEqual(@as(u64, 2), store.lastReplaySequence(0));
+}
+
+// A base binary rolled back onto an upgraded store appends in its own
+// layout: the base key only, no ledger charge. The next open notices and
+// reconciles.
+test "docstore reconciles appends a base binary made after the upgrade" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try writeLegacyReplayJournal(&store);
+    }
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        // The base binary's append of sequence 2.
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        var next_raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &next_raw, 3, .little);
+        try batch.put(replay_journal_format.legacy_next_sequence_key[0..], next_raw[0..]);
+        const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+        try batch.put(all_key[0..], "replay:2");
+        try batch.commit();
+        // Before any reconciliation (a read-only reopen never runs one), the
+        // head is read from both keys in one snapshot.
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 2), try store.lastReplaySequenceFromTxn(&txn, 0));
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(u64, 2), store.lastReplaySequence(0));
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, (try txn.get(internal_keys.replay_meta_next_sequence_key[0..]))[0..8], .little));
+    const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 3), ledger.records);
+    const marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(.enrichment));
+    try std.testing.expectEqual(@as(?u64, 2), decodeReplaySequence(try txn.get(marker[0..])));
+}
+
+// A base binary that only retires rows leaves both sequence keys agreeing;
+// the ledger still has to stop charging them.
+test "docstore reconciles rows a base binary retired after the upgrade" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try writeLegacyReplayJournal(&store);
+    }
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        const lane_key = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+        try batch.delete(lane_key[0..]);
+        try batch.commit();
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const ledger = internal_keys.JournalCreditLedger.decode(try txn.get(internal_keys.journal_credit_ledger_key[0..])) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), ledger.records);
+    try std.testing.expectEqual(@as(u64, internal_keys.replay_key_len + "replay:1".len), ledger.bytes);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
+}
+
+test "docstore enables protected credit before its first replay append" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+
+    try store.enableProtectedReplayCredit();
+    try store.appendReplayOpaque(alloc, 1, "fresh");
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(replay_journal_format.State.protected_credit, try replay_journal_format.state(&read));
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
+    try std.testing.expectError(error.NotFound, read.get(&internal_keys.journal_credit_totals_witness_key));
+}
+
+test "docstore reconciles missing, malformed, and undercounted ledgers with a matching lane witness" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var stale: [internal_keys.JournalCreditLedger.protected_len]u8 = undefined;
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.appendReplayOpaque(alloc, 1, "kept");
+        try store.enableProtectedReplayCredit();
+        const raw = try store.get(alloc, &internal_keys.journal_credit_ledger_key);
+        defer alloc.free(raw);
+        stale = raw[0..stale.len].*;
+        try store.appendReplayOpaque(alloc, 2, "kept");
+    }
+    for ([_]enum { missing, malformed, undercounted, stale_protected }{ .missing, .malformed, .undercounted, .stale_protected }) |damage| {
+        {
+            var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+            defer store.close();
+            var batch = try store.beginWriteBatch();
+            errdefer batch.abort();
+            switch (damage) {
+                .missing => try batch.delete(&internal_keys.journal_credit_ledger_key),
+                .malformed => try batch.put(&internal_keys.journal_credit_ledger_key, "invalid"),
+                .stale_protected => try batch.put(&internal_keys.journal_credit_ledger_key, &stale),
+                .undercounted => try storeJournalCreditLedger(&batch, .{ .records = 1, .bytes = internal_keys.replay_key_len }),
+            }
+            try batch.commit();
+        }
+        var reopened = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer reopened.close();
+        var read = try reopened.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&internal_keys.journal_credit_totals_witness_key));
+        const raw = try read.get(&internal_keys.journal_credit_ledger_key);
+        const ledger = internal_keys.JournalCreditLedger.decodeProtected(raw) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 2), ledger.records);
+        try std.testing.expectEqual(@as(u64, 2 * (internal_keys.replay_key_len + "kept".len)), ledger.bytes);
+    }
+}
+
+test "docstore installs a credit witness without advancing hint coverage" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.putBatchWithReplay(null, &.{}, &.{}, .{ .sequence = 1, .payload = "replay:1" });
+        // Simulate a current-format journal written before the witness was added.
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.delete(&internal_keys.journal_credit_lane_heads_key);
+        try batch.commit();
+    }
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try std.testing.expectEqual(@as(?bool, false), try store.replayHintRecordBetween(.enrichment, 0, 1));
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(!try replayCreditsNeedRepair(&read));
+}
+
+// Appends keep the base layout where readers use hint lanes: every hint the
+// record carries gets its lane and marker, whatever consumers are active,
+// and `next_sequence` stays under the base key too.
+test "docstore appends stay readable by the base layout" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    store.setActiveConsumerHintMask(0);
+    const payload = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = &.{"doc"}, .target_hints = &.{ .enrichment, .dense_vector } });
+    defer alloc.free(payload);
+    try store.putBatchWithReplay(null, &.{.{ .key = "doc", .value = "v" }}, &.{}, .{ .sequence = 1, .payload = payload });
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, (try txn.get(replay_journal_format.legacy_next_sequence_key[0..]))[0..8], .little));
+    for ([_]change_journal_mod.TargetHint{ .enrichment, .dense_vector }) |hint| {
+        const lane = internal_keys.replayEntryKey(replayHintOrdinal(hint), 1);
+        _ = try txn.get(lane[0..]);
+        const marker = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+        try std.testing.expectEqual(@as(?u64, 1), decodeReplaySequence(try txn.get(marker[0..])));
+    }
+    const full_text_lane = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    try std.testing.expectError(error.NotFound, txn.get(full_text_lane[0..]));
+    try std.testing.expectEqual(@as(?bool, true), try store.replayHintRecordBetween(.enrichment, 0, 1));
+    try std.testing.expectEqual(@as(?bool, false), try store.replayHintRecordBetween(.enrichment, 1, 5));
+    try std.testing.expectEqual(@as(?bool, false), try store.replayHintRecordBetween(.full_text, 0, 1));
+}
+
+// A read-only open never upgrades a base-revision journal; its sequence
+// readers must still find `next_sequence` under the legacy key rather than
+// report an empty journal.
+test "docstore reads a base-revision journal's watermark before it is upgraded" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try writeLegacyReplayJournal(&store);
+    try std.testing.expectEqual(@as(u64, 1), store.lastReplaySequence(0));
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(u64, 1), try store.lastReplaySequenceFromTxn(&txn, 0));
+}
+
+test "docstore refuses an unknown replay journal format when it opens" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    {
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(7);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
+        try batch.commit();
+    }
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    try std.testing.expectError(error.UnsupportedReplayJournalFormat, DocStore.openRuntime(alloc, &runtime));
+}
+
+test {
+    _ = row_heap;
+    _ = row_heap_scope;
+    _ = @import("row_heap_benchmark.zig");
+    _ = @import("row_heap_restore_test.zig");
+}
+
+test "docstore row heap placement preserves pinned rows batches logical cursors and bounded reader-safe collection" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const first = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(first);
+    const second = try internal_keys.documentKeyAlloc(a, "b");
+    defer a.free(second);
+    try store.put(first, "{\"status\":\"late\"}");
+    try store.put(second, "{\"status\":\"early\"}");
+    // The old current probe was admitted before the first format publication.
+    var before = try store.beginProbeTxn();
+    defer before.abort();
+    var snapshot = try store.beginReadTxn();
+    defer snapshot.abort();
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        _ = try write.relocatePhysicalRow(second, @splat(1), 0);
+        _ = try write.relocatePhysicalRow(first, @splat(1), 1);
+        try write.commit();
+    }
+    if (before.get(first)) |old| {
+        // Backends whose probe is already a stable snapshot retain old inline
+        // bytes. A current-tip probe must retry before following a new format.
+        try std.testing.expectEqualStrings("{\"status\":\"late\"}", old);
+    } else |err| try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, err);
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", try snapshot.get(first));
+    // New probes protect immutable payloads before reading their locations.
+    var pinned = try store.beginProbeTxn();
+    var pinned_open = true;
+    defer if (pinned_open) pinned.abort();
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", try pinned.get(first));
+    var stable = try store.beginReadTxn();
+    defer stable.abort();
+    {
+        var cursor = try stable.openCursor();
+        defer cursor.close();
+        var current = try cursor.first();
+        var seen: usize = 0;
+        while (current) |entry| {
+            try std.testing.expect(!row_heap.isPhysicalKey(entry.key));
+            try std.testing.expect(!row_heap.isPhysicalMetadata(entry.key));
+            if (internal_keys.isStoredDocumentRowKey(entry.key)) {
+                try std.testing.expect(!row_heap.isReference(entry.value));
+                seen += 1;
+            }
+            current = try cursor.next();
+        }
+        try std.testing.expectEqual(@as(usize, 2), seen);
+    }
+    {
+        var scope = try stable.openReadScope(a);
+        defer scope.close();
+        var projection: [1][]const u8 = undefined;
+        try scope.getRanges(first, &.{.{ .offset = 11, .length = 4 }}, &projection);
+        try std.testing.expectEqualStrings("late", projection[0]);
+    }
+    var values: [3]?[]const u8 = undefined;
+    try stable.getManySorted(&.{ first, second, second }, &values);
+    try std.testing.expectEqualStrings("{\"status\":\"early\"}", values[1].?);
+    try std.testing.expectEqualStrings(values[1].?, values[2].?);
+    var owned: [2]?[]u8 = undefined;
+    try stable.getManySortedOwnedScoped(a, &.{ first, second }, &owned);
+    defer for (owned) |value| if (value) |bytes| a.free(bytes);
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", owned[0].?);
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(first, "{\"status\":\"updated\"}");
+        try batch.delete(second);
+        try batch.commit();
+    }
+    // Existing stable snapshots still see the original rows through their own
+    // backend view; current probes can finish resolving retired locations.
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", try stable.get(first));
+    try std.testing.expectEqualStrings("{\"status\":\"early\"}", try stable.get(second));
+    const delayed = try store.collectRowHeap(1);
+    try std.testing.expect(delayed.waiting_for_readers);
+    try std.testing.expect(!store.row_heap_collection_pending.load(.acquire));
+    pinned.abort();
+    pinned_open = false;
+    var newer = try store.beginProbeTxn();
+    defer newer.abort();
+    const one = try store.collectRowHeap(1);
+    try std.testing.expectEqual(@as(u32, 1), one.rows);
+    try std.testing.expect(!one.done);
+    try std.testing.expect(store.row_heap_collection_pending.load(.acquire));
+    const two = try store.collectRowHeap(1);
+    try std.testing.expectEqual(@as(u32, 1), two.rows);
+    try std.testing.expect(two.done);
+    try std.testing.expect(!store.row_heap_collection_pending.load(.acquire));
+    // Collection did not wait for the post-mark probe, nor erase old MVCC data.
+    try std.testing.expectEqualStrings("{\"status\":\"late\"}", try stable.get(first));
+    try std.testing.expectEqualStrings("{\"status\":\"updated\"}", try newer.get(first));
+    try std.testing.expectError(error.NotFound, newer.get(second));
+    const ref = try row_heap.location(first, "{\"status\":\"late\"}", @splat(1), 1);
+    var raw = try store.runtime_store.beginRead();
+    defer raw.abort();
+    try std.testing.expectError(error.NotFound, raw.get(&ref.physicalKey()));
+}
+
+test "docstore row heap LSM restart keeps physical order atomic progress and logical revision" {
+    const a = std.testing.allocator;
+    const revision = @import("document_mutation_revision.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const first = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(first);
+    const second = try internal_keys.documentKeyAlloc(a, "b");
+    defer a.free(second);
+    const progress = "\x00\x00__metadata__:test_heap_progress";
+    var original: revision.Content = undefined;
+    for (0..3) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            try store.put(first, "{\"status\":\"zulu\"}");
+            try store.put(second, "{\"status\":\"alpha\"}");
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                original = (try revision.loadContent(&read, first)).?;
+            }
+            // Neither a location nor its progress may survive rollback.
+            {
+                var write = try store.beginWriteTxn();
+                defer write.abort();
+                _ = try write.relocatePhysicalRow(second, @splat(2), 0);
+                try write.put(progress, "aborted");
+            }
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.NotFound, read.get(progress));
+                try std.testing.expectEqualStrings("{\"status\":\"alpha\"}", try read.get(second));
+            }
+            {
+                var write = try store.beginWriteTxn();
+                errdefer write.abort();
+                _ = try write.relocatePhysicalRow(second, @splat(3), 0);
+                _ = try write.relocatePhysicalRow(first, @splat(3), 1);
+                try write.put(progress, "complete");
+                try write.commit();
+            }
+            try backend.flushBufferedWritesWithOptions(.{ .flush = true, .compact = true });
+        }
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualStrings("complete", try read.get(progress));
+            const content = (try revision.loadContent(&read, first)).?;
+            if (pass < 2) {
+                try std.testing.expectEqualDeep(original, content);
+                try std.testing.expectEqualStrings("{\"status\":\"zulu\"}", try read.get(first));
+                try std.testing.expectEqualStrings("{\"status\":\"alpha\"}", try read.get(second));
+                var transferred = try read.openPhysicalCursorAdapter();
+                defer transferred.close();
+                const entry = (try transferred.seekAtOrAfter(first)).?;
+                try std.testing.expectEqualStrings(first, entry.key);
+                try std.testing.expectEqualStrings("{\"status\":\"zulu\"}", entry.value);
+            } else {
+                try std.testing.expect(content.revision > original.revision);
+                try std.testing.expectEqualStrings("{\"status\":\"bravo\"}", try read.get(first));
+                try std.testing.expectError(error.NotFound, read.get(second));
+            }
+        }
+        if (pass < 2) {
+            // Inspect the durable physical plane, not the logical cursor's
+            // stable primary-key order. One compacted run orders bodies by
+            // the rewrite ordinal independently of the document key.
+            var raw = try store.runtime_store.beginRead();
+            defer raw.abort();
+            var cursor = try raw.openCursor();
+            defer cursor.close();
+            const early = (try cursor.seekAtOrAfter(row_heap.key_prefix)).?;
+            try std.testing.expectEqualStrings("{\"status\":\"alpha\"}", early.value);
+            const late = (try cursor.next()).?;
+            try std.testing.expectEqualStrings("{\"status\":\"zulu\"}", late.value);
+            const end = try cursor.next();
+            try std.testing.expect(end == null or !row_heap.isPhysicalKey(end.?.key));
+            const facts = try physical_table_catalog.Catalog.decode(try raw.get(physical_table_catalog.key));
+            try std.testing.expectEqual(@as(u8, 1), facts.row_heap_format);
+        }
+        if (pass == 1) {
+            // Opening a new process-equivalent store must register probes
+            // before they can observe a location, and recover retirement debt.
+            var probe = try store.beginProbeTxn();
+            try std.testing.expectEqualStrings("{\"status\":\"zulu\"}", try probe.get(first));
+            try store.put(first, "{\"status\":\"bravo\"}");
+            try store.delete(second);
+            try std.testing.expect((try store.collectRowHeap(1)).waiting_for_readers);
+            probe.abort();
+            // Leave the committed retirement records for a cold owner.
+        }
+        if (pass == 2) {
+            try std.testing.expectEqual(@as(u32, 1), (try store.collectRowHeap(1)).rows);
+            const last = try store.collectRowHeap(1);
+            try std.testing.expectEqual(@as(u32, 1), last.rows);
+            try std.testing.expect(last.done);
+            var raw = try store.runtime_store.beginRead();
+            defer raw.abort();
+            const retired = try row_heap.location(first, "{\"status\":\"zulu\"}", @splat(3), 1);
+            try std.testing.expectError(error.NotFound, raw.get(&retired.physicalKey()));
+        }
+        try store.sync(true);
+    }
 }

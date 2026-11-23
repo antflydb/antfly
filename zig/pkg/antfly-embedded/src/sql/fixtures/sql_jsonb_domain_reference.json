@@ -1,0 +1,149 @@
+{
+  "reference": "PostgreSQL 18.6 C/UTF8",
+  "scope": "JSONB scalar and array text/binary input admission, including non-rendered values",
+  "entries": [
+    {
+      "input": "1.20",
+      "kind": "number",
+      "length": 4,
+      "md5": "9dcc9bfbf9010d9b3df86f3f2ae7cb6f",
+      "text": "1.20"
+    },
+    {
+      "input": "-0.00",
+      "kind": "number",
+      "length": 4,
+      "md5": "f7ddd489ab0a82567b241b05971cbdb3",
+      "text": "0.00"
+    },
+    {
+      "input": "1e131071",
+      "kind": "number",
+      "length": 131072,
+      "md5": "dabc6d9326b11f73e87426f2d33eb575",
+      "text": null
+    },
+    {
+      "input": "1e131072",
+      "error": "22003"
+    },
+    {
+      "input": "0.1e131072",
+      "kind": "number",
+      "length": 131072,
+      "md5": "dabc6d9326b11f73e87426f2d33eb575",
+      "text": null
+    },
+    {
+      "input": "0.0001e131075",
+      "kind": "number",
+      "length": 131072,
+      "md5": "dabc6d9326b11f73e87426f2d33eb575",
+      "text": null
+    },
+    {
+      "input": "1e-16383",
+      "kind": "number",
+      "length": 16385,
+      "md5": "099a11a973a15eedc71a1c1145bc8bd7",
+      "text": null
+    },
+    {
+      "input": "1e-16384",
+      "error": "22003"
+    },
+    {
+      "input": "0e1073741823",
+      "kind": "number",
+      "length": 1,
+      "md5": "cfcd208495d565ef66e7dff9f98764da",
+      "text": "0"
+    },
+    {
+      "input": "0e1073741824",
+      "error": "22003"
+    },
+    {
+      "input": "0e-16384",
+      "error": "22003"
+    },
+    {
+      "input": "{\"k\":1.20,\"k\":2}",
+      "kind": "object",
+      "length": 8,
+      "md5": "565adc443f27e2f3bec574e324aad3f9",
+      "text": "{\"k\": 2}"
+    },
+    {
+      "input": "{\"k\":1,\"\\u006b\":1.20}",
+      "kind": "object",
+      "length": 11,
+      "md5": "45fa156fe1ef3835507a062ce7a4d270",
+      "text": "{\"k\": 1.20}"
+    },
+    {
+      "input": "{\"k\":1e131072,\"k\":2}",
+      "error": "22003"
+    },
+    {
+      "input": "{\"k\":\"\\u0000\",\"k\":2}",
+      "error": "22P05"
+    },
+    {
+      "input": "\"\\u0000\"",
+      "error": "22P05"
+    },
+    {
+      "input": "{\"\\u0000\":1}",
+      "error": "22P05"
+    },
+    {
+      "input": "\"\\ud800\"",
+      "error": "22P02"
+    },
+    {
+      "input": "\"\\ud83d\\ude00\"",
+      "kind": "string",
+      "length": 3,
+      "md5": "396165a5851036072d226002b6053e03",
+      "text": "\"😀\""
+    },
+    {
+      "input": "NaN",
+      "error": "22P02"
+    },
+    {
+      "input": "01",
+      "error": "22P02"
+    },
+    {
+      "input": "[null,true,1.20]",
+      "kind": "array",
+      "length": 18,
+      "md5": "0c9a2daaf36ace9437df295b549909df",
+      "text": "[null, true, 1.20]"
+    }
+  ],
+  "binary_errors": [
+    {
+      "binary": "",
+      "error": "08P01"
+    },
+    {
+      "binary": "026e756c6c",
+      "error": "XX000"
+    },
+    {
+      "binary": "01",
+      "error": "22P02"
+    },
+    {
+      "binary": "0122ff22",
+      "error": "22021"
+    },
+    {
+      "binary": "012261006222",
+      "error": "22021"
+    }
+  ]
+}

@@ -160,7 +160,7 @@ test "managed PJRT metadata batches physical headroom without exempting small al
     var failure = std.testing.FailingAllocator.init(a, .{});
     const budget = try Budget.create(failure.allocator(), &context);
     defer budget.destroy();
-    const controller = &budget.lifetime.domain.admission;
+    const controller = budget.lifetime.domain.admission;
     const capacity = controller.live_capacity_bytes;
     const pending = controller.live_pending_bytes;
     // An outstanding concurrent reservation prevents a new OS sample and

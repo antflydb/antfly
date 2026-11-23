@@ -61,71 +61,273 @@ const std = @import("std");
 /// and adopts every native namespace writer in the same durable transaction.
 /// Version 33 decodes name-sensitive table replacements carrying an exact
 /// relation-owner, logical-binding and metadata-incarnation mutation fence.
-/// Version 34 owns resolver corrections on destination namespaces, maintains
-/// their durable dependency index and applies bounded replay pages.
-/// Version 35 rejects incompatible resolver projection at admission and apply,
-/// and fences every namespace mutation against its validated consumer cut.
-/// Version 36 decodes curation provenance, cascade dispositions and proposal
-/// queues. Even an empty newly serialized namespace has fields v35 rejects.
-/// Version 37 fences proposal-owned source corrections at primary apply and
-/// understands durable queue identities on embedded resolver receipts.
-/// Version 38 preserves native service table ownership at every ingress and
-/// metadata peer, independently of resolver namespace/proposal support.
-/// Version 39 decodes native per-record resolver authority and its atomic heads.
-/// Version 40 carries compact physical namespace bindings and projection reads.
-/// Version 41 carries shared content-addressed namespace execution attachments.
-/// Version 43 maintains shared namespace-scoped consumer routes and readiness.
-/// Version 44 maintains content-addressed static resolver profile adjacency.
-/// Version 46 adds indexed static suppression, scoped binding deltas, and
-/// compact proposal lifecycle headers with separately retained evidence.
-/// Version 47 adds sparse profile witnesses and digest-fenced native replay.
-/// Version 48 carries batched query-policy reads and typed native mutation receipts.
-/// Version 49 maintains sparse pin branches and query dependency stamps.
-/// Version 50 adds bounded per-resolver consumer progress and head-only reads.
-/// Version 51 adds membership-only authority reads and backfilled v8 per-resolver progress rows.
-/// Version 52 adds indexed query declarations and revision-fenced ownership backfill.
-/// Version 53 maintains ordinary destination query proofs through v10 backfill.
-/// Version 54 accepts immutable query-profile references on policy pages.
-/// Version 55 returns complete bounded configured/native query paths.
-/// Version 57 projects configured negatives with qualified profile identities.
-/// Version 58 fences render and resolve with distinct execution dependency scopes.
-/// Version 59 combines replicated document jobs with resolver advancement tag 80.
-/// Version 60 backfills and maintains root-scoped resolver pin projections.
-/// Version 61 resumes bounded pin paths and backfills static root membership.
-/// Version 62 incrementally repairs graph-fenced pin membership from edit journals.
-/// Version 63 adds dependency-scoped pin repair and indexed invalidation proofs.
-/// Version 64 adds deletable dependency summaries and forward-only pin repair.
-/// Version 65 scopes native paths and adds paged fingerprint dependency summaries.
-/// Version 66 indexes routing sources for dependency-validated canonical proofs.
-/// Version 67 qualifies legacy resolver content before native cache admission.
-/// Version 68 tracks bounded edits during resumable resolver qualification.
-/// Version 69 retains consumer-owned SQL completion references.
-/// Version 70 qualifies routed SQL completion ownership across every peer.
-/// Version 71 retains managed completion producer retirement checkpoints.
-/// Version 72 requires pre-execution transaction proof handoff on all issuers.
-/// Version 73 prepares metadata-owned SQL completion consumers before admission.
-/// Version 74 retires unpublished completion subscriptions after issuer restart.
-/// Version 75 binds HTTP SQL handles to issuers and observes DDL submission.
-/// Version 76 requires attempt-aware commit proofs and joined connection refusals.
-/// Version 77 isolates issuer outboxes in shared transaction stores.
-/// Version 78 requires backend-wide coordination of shared session mutations.
-/// Version 79 admits privacy-owned consumer graphs and serving fences.
-/// Version 80 stores private range checkpoints as immutable, owner-fenced blobs.
-/// Version 81 accounts retained checkpoint bytes through final reclamation.
-/// Version 82 requires compact, authoritative privacy read bindings.
-/// Version 83 decodes independent durable query-artifact store ownership and
-/// its restartable cleanup frontier, including the global composed-cursor row.
-/// Version 84 adds graph definitions and transaction sessions.
-/// Version 85 admits publication-scoped immutable opening bundles.
-/// Version 86 admits authenticated demand locators in opening bundles.
-/// Version 87 admits bootstrap selectors in reader protocol 100 publications.
-/// Version 88 admits bounded inline map navigation in reader protocol 101.
-/// Version 90 admits table-scoped index aliases and durable retry receipts.
-/// Version 91 admits lifecycle-scoped alias deletion validators.
-/// Version 92 admits durable restore jobs with backup bindings.
-/// Version 93 separates immutable restore inputs from mutable checkpoints.
-/// Version 94 retains distributed restore admission ownership on ranges.
+/// Version 36 decodes constraint-membership reconciliation and immutable
+/// generated-name admission predicates for catalog, FK and rewrite workflows.
+/// Version 37 binds regular FK publication to owner-identical CHECK coverage.
+/// The explicit plan/command marker preserves predecessor log interpretation.
+/// Version 38 decodes private UNIQUE publication admission, including durable
+/// pending namespace sources and fixed-size owner progress. It does not imply
+/// native owner build/install capability or enable a public SQL producer.
+/// Version 39 decodes dedicated schema-reader store capabilities and their
+/// versioned sparse/baseline envelopes. This is decoder support, not an ACK
+/// that any particular schema has been installed on a data owner.
+/// Version 40 decodes the durable independent semantic/ASCH reader floor and
+/// enforces it on store registration and report-root publication. A schema
+/// publication producer must separately bind this floor to its mutation.
+/// Version 41 decodes definition-bound semantic/ASCH requirements in table
+/// records (storage extension v3), including nested FK/restore/catalog plans.
+/// This does not itself activate a floor or acknowledge an installed schema.
+/// Version 42 decodes AIPH v2 compact index-publication heads binding separate
+/// semantic/physical reader requirements to the admitted owner cohort.
+/// AIPO v3 retains accepted physical-proof commitments; bounded signed proof
+/// records and latest-stage re-attestation share this unreleased decoder gate.
+/// Admission and planless ACKs require durable activation of this decoder.
+/// Version 43 binds source-delivery and expected-inventory records to AIPO v4
+/// owner directories, persists compact complete-delivery provenance, and
+/// decodes ordered delivery acceptance. This does not enable native consumption.
+/// Version 44 decodes AIPH v3 completion counters, AIPO v5 source seals and
+/// final consumed-EOF acknowledgments. It does not imply index installation.
+/// Version 45 freezes target expectations from completed sources and decodes
+/// AIDA v3's fixed EOF-header prefix. This is not native validation capability.
+/// Version 46 decodes bounded physical-generation progress. It does not enable
+/// the authenticated native validation/install/release publication protocol.
+/// Version 47 decodes the AICV v3 bidirectional claim-inventory audit with an
+/// explicitly tagged native/Raft position. Earlier draft encodings are unsupported.
+/// This is physical progress, not authenticated native publication capability.
+/// Version 48 decodes bounded root-local audit progress on native validation
+/// replies. This still grants no authenticated publication/install capability.
+/// Version 49 decodes authenticated complete-audit witnesses. These are not
+/// logical validation ACKs and do not enable installation or publication.
+/// Version 50 decodes paired durable validation cuts and physical witnesses.
+/// It does not advertise the complete native install/release protocol.
+/// Version 51 requires retained physical evidence for native validation ACKs.
+/// Complete native install/release activation remains a separate barrier.
+/// Version 52 decodes metadata-revision hints on signed validation replies.
+/// This enables validation ACK scheduling, not full native install/release.
+/// Version 53 decodes the atomic index publication decision. It consumes the
+/// pending namespace source and installs the admitted metadata descriptor;
+/// native installation/release and public producer activation remain separate.
+/// Version 54 requires retained, paired physical witnesses for native installed
+/// ACKs and verifies them against the successor catalog and durable decision.
+/// Version 55 derives native release permission from the complete installed
+/// owner cohort and exact retained cut. This does not enable public DDL or
+/// authorize adoption of a different physical root.
+/// Version 56 adds incarnation/plan-bound SQL cancellation and its explicit
+/// command guard encoding. Earlier private cancellation bytes are not accepted.
+/// Version 57 decodes stored-view lifecycle commands and delegated read proofs
+/// separating caller, policy-selection, and credential-settings principals.
+/// Version 58 atomically publishes edits to enabled row-policy definitions,
+/// including empty default-deny epochs and implicit USING write checks.
+/// Version 60 carries purpose-bound SQL RLS read/normalization capabilities
+/// and per-mutation command provenance through private prepare/journal bytes.
+/// Version 61 admits a nullable column and its FK in one owner-fenced schema
+/// publication. Older validators permit only FK edits to an existing layout.
+/// Version 62 adds immutable column-transform IR to restore/rewrite intents.
+/// Version 63 includes main's curation provenance, cascade dispositions,
+/// proposal queues and proposal-owned source-correction fences. Main's v37
+/// resolver floor cannot be reused: this branch already assigned that profile
+/// to earlier SQL catalog support that does not decode these resolver fields.
+/// Version 69 includes main's native service ownership and complete resolver
+/// authority/projection decoder. Its published v38/v42 profiles overlap this
+/// branch's earlier SQL work, so require this combined decoder explicitly.
+/// Version 70 binds owned sequence defaults and table creation in one catalog transaction.
+/// Version 71 preserves exact SQL view temporal domains and dependency identities.
+/// Version 72 retains SQL DROP intent through native source/parent generation barriers.
+/// Version 73 combines durable document jobs and SQL index publication.
+/// Main owns command tag 79; the unreleased SQL index ACK moves to tag 89.
+/// Re-fence the complete index cohort so every admitted job can finish.
+/// Version 74 decodes query-population captures and sealed typed-row delivery.
+/// It does not authorize replaying a lost request-owned query evaluation.
+/// Private SQL capability floors are shifted above main's published v62 on
+/// integration. Historical versions 36–76 above describe development stages;
+/// their qualified floors are now 63–103. Main v62 must not admit SQL stages
+/// whose earlier development numbers happened to overlap its resolver protocol.
+/// Version 104 additionally combines main's indexed resolver replay and published
+/// tag 80; the private SQL delivery command uses the unallocated tag 90.
+/// Version 105 admits typed callable overloads and shared catalog outcomes.
+/// Version 107 decodes identity-fenced callable annotations on the retained
+/// catalog outcome lane without advancing executable generations.
+/// Version 108 decodes identity-bound operators and their derived dependency directory.
+/// Version 110 publishes database-owned casts and tags callable dependency owners.
+/// Version 111 decodes immutable namespace-owned named types.
+/// Version 112 combines main's resolver v63-v68: dependency-scoped repair,
+/// deletable summaries, scoped native paths, canonical routing proofs, legacy
+/// qualification, and bounded edits during resumable qualification. Earlier
+/// SQL readers must not admit these records using their overlapping numbers.
+/// Version 113 admits immutable SQL roles, provenance-preserving ACLs, and
+/// creator-bound table ACL initialization in the catalog transaction.
+/// Version 114 decodes identity-fenced named-type annotations on the shared
+/// outcome lane; presentation edits preserve executable type generations.
+/// Version 115 binds multi-table named-type epoch publications and their
+/// compact dependency reservations to the common schema validation ledger.
+/// Version 117 decodes builtin-based immutable domain definitions. Native
+/// dependent-column activation remains independently capability-gated.
+// CREATE copies native column annotations inside its guarded transaction.
+// Earlier creation-source readers must not silently discard these intents.
+// Main publishes completion capability floors 69, 71, and 78. The combined
+// unreleased SQL profile reserves floors above 78; historical notes above
+// describe its development sequence before this rebasing. Published transition
+// tag 81 remains SQL completion references; private SQL tags begin at 82.
+pub const sql_extension_version: u16 = 216;
+/// Main's published v83 owns durable query-artifact stores and their
+/// restartable cleanup frontier, including the composed-cursor row. This
+/// branch's earlier v83 and complete v178 SQL decoder do not decode that work.
+/// Require the unified v179 profile before admitting either ownership cut.
+/// The combined SQL and published graph cohort preserves main transition tag82,
+/// moves the unreleased index-completion tag, and admits both catalog families.
+/// This build combines the already-published pinned restore decoder with
+/// the independent SQL decoder lineage.
 pub const pinned_restore_job_version: u16 = 94;
+pub const restore_reservation_outcome_version: u16 = 232;
+pub const sql_security_labels_version: u16 = 233;
+pub const sql_collation_catalog_version: u16 = 234;
+pub const sql_document_view_indexes_version: u16 = 235;
+pub const sql_partition_membership_version: u16 = 236;
+pub const sql_replication_catalog_version: u16 = 237;
+pub const sql_publication_capture_version: u16 = 238;
+pub const sql_publication_terminal_version: u16 = 239;
+pub const sql_publication_decision_journal_version: u16 = 240;
+pub const sql_publication_abort_fence_version: u16 = 241;
+pub const sql_publication_collection_version: u16 = 242;
+pub const sql_publication_slot_version: u16 = 243;
+pub const sql_publication_slot_control_version: u16 = 244;
+pub const sql_subscription_apply_version: u16 = 245;
+pub const sql_catalog_completion_version: u16 = 246;
+pub const sql_catalog_reservation_version: u16 = 247;
+pub const sql_catalog_progress_version: u16 = 248;
+pub const sql_catalog_atomic_admission_version: u16 = 249;
+pub const sql_selinux_approval_version: u16 = 250;
+pub const sql_idle_session_reenrollment_version: u16 = 251;
+
+/// Immutable, pre-executed statement trigger receipts/results on SQL TRUNCATE.
+pub const sql_truncate_preparation_version: u16 = 215;
+/// Atomically acknowledged trigger-schema and active row-policy pairs.
+pub const coupled_schema_policy_version: u16 = 213;
+/// Native TEMP/UNLOGGED process ownership and authenticated boot recovery.
+pub const sql_relation_persistence_version: u16 = 211;
+/// Reserved until all table-trigger receiver and recovery paths qualify.
+pub const sql_table_triggers_version: u16 = 212;
+pub const sql_population_coordinator_version: u16 = 207;
+/// SQL GIN operator classes bind to typed algebraic sidecars under catalog custody.
+pub const sql_gin_index_version: u16 = 203;
+/// Immutable ancestor reservation custody and body-bound native outcomes.
+/// Scope reservations first appeared at 164. Child registrations extend their
+/// atomic membership and compact work feed; 167 additionally captures and fences
+/// external callable dependencies. Version 168 binds whole-type survivor
+/// evolution and column-specific view closure. Version 170 binds connection
+/// admission fences and independently verified native drainage receipts.
+/// Old decoders cannot participate.
+pub const sql_scope_retirement_version: u16 = 210;
+/// Database defaults and managed-role snapshots preserve credential policy,
+/// existing login baselines and definition identities.
+pub const sql_database_defaults_version: u16 = 201;
+/// Transaction-bound notification intents and visibility-gated ordered delivery.
+pub const sql_notifications_version: u16 = 200;
+/// Native SQL lock custody is part of the admitted 2PC manifest.
+pub const sql_native_lock_custody_version: u16 = 199;
+/// Ordinary catalog DDL binds a prepared command to a retained native outcome.
+pub const sql_catalog_journal_version: u16 = 196;
+pub const sql_prepared_lock_handoff_version: u16 = 198;
+/// The unreleased combined catalog profile also decodes trigger-return contracts.
+/// Keep new declarations above the older scalar-only routine capability floor.
+pub const sql_trigger_function_version: u16 = 189;
+/// SQL namespace ownership of native indexes and exact shared-journal outcomes.
+pub const sql_native_index_namespace_version: u16 = 189;
+/// Private session decisions and standalone ownership share native recovery.
+pub const sql_connection_transactions_version: u16 = 190;
+/// Native lock scopes bind command authority and external-decision admission.
+// Exact effects and command hashes bind the configured metadata group.
+pub const sql_lock_authority_version: u16 = 198;
+/// Guarded catalog/counter identities retain outcomes before checking command liveness.
+pub const sql_command_fence_version: u16 = 198;
+/// Public catalog-operation recovery binds an immutable logical target label.
+pub const table_retirement_public_version: u16 = 189;
+/// Exact whole-table publication after physical barriers with no survivors.
+pub const table_retirement_direct_version: u16 = 188;
+/// Root-bound all-survivor schema publication under the owning retirement.
+pub const table_retirement_survivors_version: u16 = 187;
+/// Root-bound source and parent plans with sparse, durable owner ACKs.
+pub const table_retirement_physical_version: u16 = 186;
+/// Durable table-retirement reservations, dependency leases and recovery proof.
+pub const table_retirement_version: u16 = 185;
+/// Transactional incoming-FK indexing and bounded complete-coverage adoption.
+pub const foreign_key_directory_version: u16 = 184;
+/// Hidden FK CREATE carries guarded LIKE inputs and immutable annotation effects.
+pub const initial_fk_creation_copy_version: u16 = 183;
+/// Hidden initial-FK plans reserve counter effects and publish them with the child.
+pub const initial_fk_column_sequences_version: u16 = 182;
+pub const sql_object_annotations_version: u16 = 181;
+pub const sql_attribute_handoffs_version: u16 = 180;
+/// Column allocation attests the complete persisted default binding, including mode.
+pub const sql_column_default_proof_version: u16 = 176;
+pub const sql_creation_sources_version: u16 = 175;
+pub const sql_prepared_transactions_version: u16 = 173;
+pub const sql_domain_epoch_version: u16 = 172;
+pub const sql_domain_version: u16 = 171;
+pub const sql_type_retirement_version: u16 = 170;
+pub const sql_type_epoch_version: u16 = 169;
+pub const sql_type_comment_version: u16 = 168;
+pub const sql_authorization_version: u16 = 167;
+pub const sql_type_version: u16 = 165;
+pub const sql_cast_version: u16 = 164;
+pub const sql_routine_version: u16 = 164;
+pub const sql_materialized_refresh_version: u16 = 157;
+pub const sql_materialized_view_version: u16 = 156;
+pub const sql_population_version: u16 = 155;
+pub const job_state_version: u16 = 158;
+pub const sql_drop_generation_version: u16 = 153;
+pub const sql_view_domains_version: u16 = 152;
+// Owned defaults include the atomic attribute-reference directory.
+pub const sql_column_sequences_version: u16 = 179;
+pub const sql_sequence_retirement_version: u16 = 179;
+pub const native_service_tables_version: u16 = 150;
+pub const resolver_records_version: u16 = 158;
+/// Stable database/namespace annotations, without physical schema publication.
+pub const sql_resource_comments_version: u16 = 149;
+pub const fk_historical_references_version: u16 = 147;
+/// Version 65 retains presentation metadata on stable column identities.
+pub const sql_column_comments_version: u16 = 146;
+/// Role-default patches share this branch's qualified SQL reader cohort.
+/// Earlier main readers reject empty/global role scopes; never admit one
+/// using only the original v12 setting-catalog floor.
+pub const sql_role_defaults_version: u16 = 144;
+/// Sequence records retain their original SQL reader cohort.
+pub const sql_sequence_catalog_version: u16 = 144;
+/// Version 64 binds validation-only publication to signed physical owner cuts,
+/// durable all-owner installation/publication/release barriers and recovery.
+pub const schema_validation_publication_version: u16 = 145;
+/// The same unreleased cohort decodes bounded native reporter retirement jobs.
+pub const native_reporter_restart_version: u16 = 145;
+/// AFNOWN1 is also used by standalone schema validation and reporter recovery.
+/// Its format does not imply the stronger complete index-delivery workflow.
+pub const native_owner_binding_version: u16 = 145;
+pub const sql_column_transform_version: u16 = 143;
+pub const fk_generation_column_addition_version: u16 = 142;
+pub const sql_row_policy_intent_version: u16 = 141;
+pub const sql_deferred_check_validation_version: u16 = 140;
+pub const initial_fk_checks_catalog_version: u16 = 140;
+pub const sql_row_policy_mutation_version: u16 = 139;
+pub const sql_view_catalog_version: u16 = 100;
+pub const index_publication_release_version: u16 = 154;
+// One coordinated floor for this unreleased protocol. A cohort capable only
+// of an earlier partial stage must not admit work that it cannot finish.
+pub const index_publication_installation_version: u16 = 154;
+pub const index_publication_decision_version: u16 = 154;
+pub const index_publication_head_version: u16 = 154;
+pub const index_delivery_version: u16 = 218;
+/// Metadata replicas must validate ASCH/reader profile 34 before admitting it.
+pub const clock_defaults_reader_version: u16 = 148;
+pub const schema_reader_publication_version: u16 = 84;
+pub const schema_reader_floor_version: u16 = 83;
+pub const schema_reader_capability_version: u16 = 82;
+pub const index_publication_admission_version: u16 = 154;
+pub const checks_catalog_identity_version: u16 = 80;
+/// Decoder floor for occupancy-capable reconciliation and name admission.
+pub const constraint_occupancy_version: u16 = 79;
+pub const resolver_namespaces_version: u16 = 166;
+/// Published SQL completion ownership from main; do not renumber these floors.
+pub const index_aliases_version: u16 = 90;
+pub const index_alias_lifecycle_version: u16 = 91;
 /// Catalog apply checks the physical identity captured by pgwire Bind.
 pub const bound_ddl_version: u16 = 95;
 /// Bound catalog and policy commands carry guards verified by every applying replica.
@@ -138,7 +340,6 @@ pub const guarded_generation_admission_version: u16 = 98;
 pub const bound_create_parent_version: u16 = 99;
 /// Every prospective metadata session owner can recover incarnation-bound staged work.
 pub const bound_session_version: u16 = 100;
-pub const current_version: u16 = bound_session_version;
 
 pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     const empty: [32]u8 = @splat(0);
@@ -148,8 +349,6 @@ pub fn restoreAdmissionDecoderVersion(ranges: anytype, fallback: u16) u16 {
     return fallback;
 }
 
-pub const index_aliases_version: u16 = 90;
-pub const index_alias_lifecycle_version: u16 = 91;
 pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {
     const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
     const required = if (envelope) try aliases.requiredEnvelopeStoreProtocol(a, bytes) else try aliases.requiredStoreProtocol(a, bytes);
@@ -158,17 +357,53 @@ pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelop
 pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
     return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
 }
+
+/// Version 101 adds source-control reservations and separate accepted/committed frontiers.
+/// Version 103 binds private provider continuations to outbound delivery/ACK cursors.
+/// Version 104 adds fenced logical-slot sessions and atomic LSN/feed confirmation.
+/// Version 105 retains fenced slot spool reservations and cleanup accounting.
+/// Version 106 persists slot spool cleanup checkpoints before capacity release.
+/// Version 107 freezes preflight wire identity and single-use spool build grants.
+/// Version 108 binds publication sets and atomically renews confirmed slot feedback.
+/// Version 109 retains exact pending root-control attempts and their receipts.
+/// Version 110 atomically settles accepted root controls with their metadata effects.
+/// Version 111 reconciles monotonic root effects without inventing command receipts.
+/// Version 112 records distinct retirement-fence attempts for unresolved controls.
+/// Version 113 reserves and seals quota for recoverable source-plan artifacts.
+/// Version 114 binds source checkpoint authority before reservation and retirement.
+/// Version 116 retains frozen source recovery manifests through reclamation.
+/// Version 117 persists the allocated initial position for logical slots.
+/// Version 118 atomically seals the feed cut and initializes its logical slot.
+/// Version 119 fences logical slot drop against an active stream lease.
+/// Version 120 advances empty slot projections without allocating LSNs.
+/// Version 121 coordinates durable PostgreSQL publication changes.
+/// Version 122 binds feed bootstrap completion to the acknowledged snapshot cut.
+/// Version 124 moves a qualified exported PostgreSQL slot to streaming.
+/// Version 125 coordinates catalog history and publication feeds.
+/// Version 126 persists physical owners in retained history plans.
+/// Version 127 plans distinct feed roots for ranges sharing a storage namespace.
+pub const compact_session_compare_version: u16 = 128;
+pub const spliced_session_record_version: u16 = 129;
+/// Version 130 certifies the initial scoped native PostgreSQL checkpoint.
+pub const iceberg_acceptance_status_version: u16 = 132;
+/// Version 135 persists bounded native history collection progress after ACK.
+/// Version 136 retires absent public feed roots with catalog authority.
+/// Version 137 transfers a qualified legacy checkpoint into fenced source control.
+/// Version 138 persists scoped PostgreSQL stream health within the actor revision.
+pub const current_version: u16 = sql_idle_session_reenrollment_version;
+pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
+pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
+pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
-pub const privacy_version: u16 = 82;
+
+/// Main's privacy v82 meaning is new relative to this branch's reader v82.
+/// The merged serving profile admits it only through coordinated floor176.
+pub const privacy_version: u16 = 214;
 pub fn usesPrivacy(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "\"_privacy\"") != null or std.mem.indexOf(u8, indexes_json, "_privacy_document") != null;
 }
-pub const job_state_version: u16 = 59;
-pub const resolver_records_version: u16 = 58;
-pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 68;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {
@@ -178,15 +413,16 @@ pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
-/// Version 84 adds graph definitions and transaction sessions alongside main's
-/// resolver namespace and document job formats, preserving command tags 0..80.
-pub const transaction_sessions_version: u16 = 84;
-pub const graph_definition_version: u16 = 84;
+/// The combined v180 decoder adds graph definitions and main's transaction
+/// sessions alongside SQL controls, preserving published main tags 0..82.
+pub const transaction_sessions_version: u16 = 218;
+pub const graph_definition_version: u16 = 218;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;
-pub const lake_index_catalog_version: u16 = 89;
+/// Unified main-v83 query-artifact ownership/cleanup plus complete SQL profile.
+pub const lake_index_catalog_version: u16 = 217;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
@@ -230,6 +466,7 @@ pub const max_create_definition_bytes: usize = 2 * 1024 * 1024;
 /// Defense in depth on the final encoded Raft command. This includes the
 /// definition, generated range records, and codec overhead.
 pub const max_transition_command_bytes: usize = 3 * 1024 * 1024;
+pub const max_native_snapshot_page_bytes: usize = max_transition_command_bytes - 128 * 1024;
 /// Multi-command catalog workflows emit legacy primitive entries as one
 /// locally atomic Raft batch. Encoded bytes, rather than an arbitrary entry
 /// count, are the resource and replication bound: compact removals for a valid
@@ -345,6 +582,9 @@ test "range membership is order independent and table scoped" {
     try std.testing.expect(!lhs.finish(7).eql(rhs.finish(7)));
 }
 
+/// One bound for producer admission, command framing and durable projection.
+pub const max_activation_bytes: usize = 1024;
+
 /// Replicated proof that this exact incarnation and membership can decode a
 /// protocol. Terms are deliberately excluded: elections do not undo activation.
 pub const Activation = struct {
@@ -365,3 +605,8 @@ pub const store_report_baseline_version: u16 = 10;
 
 /// Atomic, bounded acknowledgements for local schema migration readiness.
 pub const schema_progress_batch_version: u16 = 10;
+
+test "metadata table topology protocol keeps resolver qualification beyond named types" {
+    try std.testing.expect(resolver_namespaces_version > sql_type_version);
+    try std.testing.expect(current_version >= resolver_namespaces_version);
+}

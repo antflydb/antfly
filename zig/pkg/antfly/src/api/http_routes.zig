@@ -16,14 +16,19 @@
 const std = @import("std");
 
 pub const sql_max_request_body_bytes: usize = 4 << 20;
+pub const internal_lookup_control_max_body_bytes: usize = 16 << 20;
 
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    if (isInternalSourcePlanPath(path)) return 2 * 1024 * 1024;
+    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryBootstrapPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryArtifactPath(path) or isInternalHistoryOwnerPath(path) or isInternalHistoryDecisionPath(path)) return 4096;
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     if (privacyMutationBodyLimit(path)) |limit| return limit;
-    return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
+    if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) return sql_max_request_body_bytes;
+    if (Routes.matchGroupLookup(path) != null) return internal_lookup_control_max_body_bytes;
+    return null;
 }
 
 /// Metadata's ordinary listener cap is smaller than document admission. Keep
@@ -48,13 +53,28 @@ pub const DocumentReadRequest = struct {
     query: []const u8 = "",
     artifact_name: []const u8 = "",
 
+    pub fn requireShape(self: @This()) !void {
+        const limits = @import("antfly_public_limits");
+        if (self.query.len > limits.max_document_read_query_bytes) return error.InvalidArgument;
+        switch (self.operation) {
+            .lookup => if (self.artifact_name.len != 0) return error.InvalidArgument,
+            .manifest => if (self.query.len != 0) return error.InvalidArgument,
+            .manifests => if (self.query.len != 0 or self.artifact_name.len != 0) return error.InvalidArgument,
+        }
+    }
+
     pub fn encode(a: std.mem.Allocator, op: Operation, key: []const u8, query: []const u8, artifact: []const u8) ![]u8 {
-        if (key.len > @import("antfly_public_limits").max_internal_document_key_bytes) return error.InvalidArgument;
+        const limits = @import("antfly_public_limits");
+        if (key.len > limits.max_internal_document_key_bytes or query.len > limits.max_document_read_query_bytes) return error.InvalidArgument;
+        try (@This(){ .operation = op, .key_base64 = "", .query = query, .artifact_name = artifact }).requireShape();
         const encoder = std.base64.url_safe_no_pad.Encoder;
         const encoded = try a.alloc(u8, encoder.calcSize(key.len));
         defer a.free(encoded);
         _ = encoder.encode(encoded, key);
-        return std.json.Stringify.valueAlloc(a, @This(){ .operation = op, .key_base64 = encoded, .query = query, .artifact_name = artifact }, .{});
+        const body = try std.json.Stringify.valueAlloc(a, @This(){ .operation = op, .key_base64 = encoded, .query = query, .artifact_name = artifact }, .{});
+        errdefer a.free(body);
+        if (body.len > limits.max_document_read_body_bytes) return error.InvalidArgument;
+        return body;
     }
     pub fn decodeKey(self: @This(), a: std.mem.Allocator) ![]u8 {
         const maximum = @import("antfly_public_limits").max_internal_document_key_bytes;
@@ -68,6 +88,56 @@ pub const DocumentReadRequest = struct {
         return decoded;
     }
 };
+pub fn isInternalSourcePlanPath(path: []const u8) bool {
+    const prefix = "/internal/v1/groups/";
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    var pieces = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "tables")) return false;
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "source-plan")) return false;
+    const leaf = pieces.next() orelse return false;
+    return (std.mem.eql(u8, leaf, "control-v1") or std.mem.eql(u8, leaf, "observe-v1") or std.mem.eql(u8, leaf, "chunk-v1")) and pieces.next() == null;
+}
+
+pub fn isInternalHistoryControlPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "control-v1");
+}
+pub fn isInternalHistoryPagePath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "page-v1");
+}
+pub fn isInternalHistoryBootstrapPagePath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "bootstrap-page-v1");
+}
+pub fn isInternalHistoryResolutionPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "resolution-v1");
+}
+pub fn isInternalHistoryDecisionPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "decision-v1");
+}
+pub fn isInternalHistoryOwnerPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "owner-v1");
+}
+pub fn isInternalHistoryArtifactPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "artifact-v1");
+}
+pub fn isInternalHistoryPublicationPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "publication-v1");
+}
+pub fn isInternalHistoryGrantPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "grant-v1");
+}
+fn isInternalHistoryPath(path: []const u8, leaf: []const u8) bool {
+    const prefix = "/internal/v1/groups/";
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    var pieces = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "tables")) return false;
+    if ((pieces.next() orelse return false).len == 0) return false;
+    return std.mem.eql(u8, pieces.next() orelse return false, "history") and
+        std.mem.eql(u8, pieces.next() orelse return false, leaf) and pieces.next() == null;
+}
+
 pub fn isInternalDocumentReadPath(path: []const u8) bool {
     const prefix = "/internal/v1/groups/";
     if (!std.mem.startsWith(u8, path, prefix)) return false;
@@ -198,6 +268,28 @@ pub const Routes = struct {
     pub const internal_capabilities = "/internal/v1/capabilities";
     pub const batch_suffix = "/batch";
     pub const routed_batch_suffix = "/batch-routed-v1";
+    pub const source_plan_control_suffix = "/source-plan/control-v1";
+    pub const source_plan_observe_suffix = "/source-plan/observe-v1";
+    pub const source_scope_control_suffix = "/source-scope/control-v1";
+    pub const source_retirement_control_suffix = "/source-retirement/control-v1";
+    pub const source_scope_observe_suffix = "/source-scope/observe-v1";
+    pub const source_producer_closure_observe_suffix = "/source-producers/observe-v1";
+    pub const legacy_inventory_suffix = "/source-producers/legacy-inventory-v1";
+    pub const legacy_terminal_suffix = "/source-producers/legacy-terminal-v1";
+    pub const source_producer_close_suffix = "/source-producers/close-v1";
+    pub const source_checkpoint_observe_suffix = "/source-checkpoint/observe-v1";
+    pub const source_plan_chunk_suffix = "/source-plan/chunk-v1";
+    pub const history_control_suffix = "/history/control-v1";
+    pub const history_page_suffix = "/history/page-v1";
+    pub const history_bootstrap_page_suffix = "/history/bootstrap-page-v1";
+    pub const history_grant_suffix = "/history/grant-v1";
+    pub const history_resolution_suffix = "/history/resolution-v1";
+    pub const history_decision_suffix = "/history/decision-v1";
+    pub const history_owner_suffix = "/history/owner-v1";
+    pub const history_publication_suffix = "/history/publication-v1";
+    pub const history_split_cut_suffix = "/history/split-cut-v1";
+    pub const history_merge_cut_suffix = "/history/merge-cut-v1";
+    pub const history_artifact_suffix = "/history/artifact-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";
@@ -206,6 +298,9 @@ pub const Routes = struct {
     pub const fk_generation_parent_suffix = "/fk-generation-parent";
     pub const fk_generation_source_suffix = "/fk-generation-source";
     pub const fk_initial_child_suffix = "/fk-initial-child";
+    pub const relational_index_claims_suffix = "/relational-index-claims";
+    pub const relational_index_control_suffix = "/relational-index-control";
+    pub const schema_validation_prepare_suffix = "/schema-validation-prepare";
     pub const row_policy_install_suffix = "/row-policy-install";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
@@ -223,6 +318,7 @@ pub const Routes = struct {
     pub const graph_edges_suffix = "/graph-edges";
     pub const graph_edges_batch_suffix = "/graph-edges-batch";
     pub const resolver_operation_suffix = "/resolver-operation";
+    pub const sql_maintenance_suffix = "/sql-maintenance";
     pub const graph_metric_maintenance_suffix = "/graph-metric-maintenance";
     pub const vector_worker_suffix = "/vector-worker";
     pub const txn_begin_suffix = "/txn-begin";
@@ -1082,6 +1178,15 @@ pub const Routes = struct {
         return .{ .name = name };
     }
 
+    pub fn matchExtensionSqlControl(path: []const u8) ?ExtensionPackage {
+        const suffix = "/sql-control";
+        if (path.len <= extensions_v1_packages_prefix.len + suffix.len or
+            !std.mem.startsWith(u8, path, extensions_v1_packages_prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+        const name = path[extensions_v1_packages_prefix.len .. path.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .name = name };
+    }
+
     pub fn matchExtensionPackageVersion(path: []const u8) ?ExtensionPackageVersion {
         if (!std.mem.startsWith(u8, path, extensions_v1_packages_prefix)) return null;
         const rest = path[extensions_v1_packages_prefix.len..];
@@ -1728,6 +1833,11 @@ test "public api routes compile" {
     const extension_package = Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf").?;
     try std.testing.expectEqualStrings("memoryaf", extension_package.name);
     try std.testing.expect(Routes.matchExtensionPackage("/extensions/v1/packages/memoryaf/versions/1.0.0") == null);
+    const control = Routes.matchExtensionSqlControl("/extensions/v1/packages/memoryaf/sql-control").?;
+    try std.testing.expectEqualStrings("memoryaf", control.name);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages//sql-control") == null);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages/sql-control") == null);
+    try std.testing.expect(Routes.matchExtensionSqlControl("/extensions/v1/packages/memoryaf/versions/sql-control") == null);
     const extension_package_version = Routes.matchExtensionPackageVersion("/extensions/v1/packages/memoryaf/versions/1.0.0").?;
     try std.testing.expectEqualStrings("memoryaf", extension_package_version.name);
     try std.testing.expectEqualStrings("1.0.0", extension_package_version.version);
@@ -1853,4 +1963,26 @@ test "privacy internal key codec rejects malformed base64 before dispatch" {
         const request = DocumentReadRequest{ .operation = .lookup, .key_base64 = bad };
         try std.testing.expectError(error.InvalidArgument, request.decodeKey(a));
     }
+}
+
+test "privacy document read combined envelope preserves key controls and rejects mixed selectors" {
+    const a = std.testing.allocator;
+    const limits = @import("antfly_public_limits");
+    // Binary key plus percent-expanded control JSON travels in one body, not
+    // an oversized request line or a conflicting second POST body.
+    const query = "relational_integrity_jobs=%7B%22kind%22%3A%22observations%22%7D";
+    const body = try DocumentReadRequest.encode(a, .lookup, "a\x00b", query, "");
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(DocumentReadRequest, a, body, .{});
+    defer parsed.deinit();
+    try parsed.value.requireShape();
+    const key = try parsed.value.decodeKey(a);
+    defer a.free(key);
+    try std.testing.expectEqualStrings("a\x00b", key);
+    try std.testing.expectEqualStrings(query, parsed.value.query);
+    try std.testing.expectError(error.InvalidArgument, DocumentReadRequest.encode(a, .manifest, "a", query, "artifact"));
+    try std.testing.expectError(error.InvalidArgument, DocumentReadRequest.encode(a, .manifests, "a", "", "artifact"));
+    try std.testing.expectError(error.InvalidArgument, DocumentReadRequest.encode(a, .lookup, "a", "", "artifact"));
+    try std.testing.expect(limits.max_document_read_query_bytes >= 3 * @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes + 8192);
+    try std.testing.expect(limits.max_document_read_body_bytes >= std.base64.url_safe_no_pad.Encoder.calcSize(limits.max_internal_document_key_bytes) + 3 * @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes + 8192);
 }

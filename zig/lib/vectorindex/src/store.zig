@@ -21,6 +21,20 @@ pub const Entry = struct {
     value: []const u8,
 };
 
+/// One mutation a `NamespaceWriteTxn`/`NamespaceBatch` staged, harvested
+/// before any commit (lite-single-commit-write-path.md §3.3a's "stage,
+/// then install" mode: see `NamespaceWriteTxn.pendingMutations`). This is a
+/// library-local mirror of whatever mutation-record shape the concrete
+/// backend keeps internally (e.g. antfly-embedded's
+/// `native_catalog_backend.Mutation`); kept as a distinct type here only so
+/// this library never needs to depend on a host-specific module.
+pub const PendingMutation = struct {
+    namespace: ?[]const u8,
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+};
+
 pub const Namespace = enum {
     nodes,
     meta,
@@ -183,6 +197,11 @@ pub const NamespaceWriteTxn = struct {
         append_put: ?*const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque, Namespace) anyerror!Cursor = null,
+        /// Optional: this transaction's staged mutations so far, harvested
+        /// without committing (see `pendingMutations`). Absent for every
+        /// backend but one that can expose its own pending-mutation list
+        /// (today, antfly-embedded's `.native_catalog` Lite backend).
+        pending_mutations: ?*const fn (Allocator, *anyopaque) anyerror![]const PendingMutation = null,
     };
 
     pub fn abort(self: *NamespaceWriteTxn) void {
@@ -193,6 +212,20 @@ pub const NamespaceWriteTxn = struct {
     pub fn commit(self: *NamespaceWriteTxn) !void {
         try self.vtable.commit(self.allocator, self.ptr);
         self.* = undefined;
+    }
+
+    /// This transaction's staged mutations, to fold into an externally-
+    /// owned commit instead of calling `commit` on this transaction at all
+    /// (the caller must still `abort` this transaction once it has
+    /// harvested what it needs -- this never talks to the backend's
+    /// durable sink). `null` when the concrete backend has no such harvest
+    /// mechanism; the caller falls back to the ordinary committing API in
+    /// that case. The returned slice is freshly allocated (caller-owned),
+    /// but the byte slices inside are still borrowed from this
+    /// transaction's own storage and must be deep-copied before `abort`.
+    pub fn pendingMutations(self: *NamespaceWriteTxn) !?[]const PendingMutation {
+        const f = self.vtable.pending_mutations orelse return null;
+        return try f(self.allocator, self.ptr);
     }
 
     pub fn get(self: *NamespaceWriteTxn, namespace: Namespace, key: []const u8) ![]const u8 {
@@ -244,6 +277,8 @@ pub const NamespaceBatch = struct {
         append_put: ?*const fn (*anyopaque, Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
         staged_bytes: ?*const fn (*anyopaque) anyerror!?u64 = null,
+        /// See `NamespaceWriteTxn.VTable.pending_mutations`.
+        pending_mutations: ?*const fn (Allocator, *anyopaque) anyerror![]const PendingMutation = null,
     };
 
     /// Bytes staged for the backend's commit admission, or null when the
@@ -251,6 +286,12 @@ pub const NamespaceBatch = struct {
     pub fn stagedBytes(self: *NamespaceBatch) !?u64 {
         const staged = self.vtable.staged_bytes orelse return null;
         return try staged(self.ptr);
+    }
+
+    /// See `NamespaceWriteTxn.pendingMutations`.
+    pub fn pendingMutations(self: *NamespaceBatch) !?[]const PendingMutation {
+        const f = self.vtable.pending_mutations orelse return null;
+        return try f(self.allocator, self.ptr);
     }
 
     pub fn abort(self: *NamespaceBatch) void {
@@ -549,6 +590,13 @@ pub fn namespaceWriteTxnFrom(
         pub fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: Namespace) anyerror!Cursor {
             return try cursorFrom(alloc, try unbox(ptr).handle.openCursor(try mapNamespace(namespace)));
         }
+
+        pub fn pendingMutations(alloc: Allocator, ptr: *anyopaque) anyerror![]const PendingMutation {
+            const raw = (try unbox(ptr).handle.pendingMutations()) orelse &.{};
+            const out = try alloc.alloc(PendingMutation, raw.len);
+            for (raw, out) |m, *o| o.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+            return out;
+        }
     };
 
     return .{
@@ -563,6 +611,7 @@ pub fn namespaceWriteTxnFrom(
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
+            .pending_mutations = if (@hasDecl(Handle, "pendingMutations")) vt.pendingMutations else null,
         },
     };
 }
@@ -616,6 +665,13 @@ pub fn namespaceBatchFrom(
         pub fn stagedBytes(ptr: *anyopaque) anyerror!?u64 {
             return try unbox(ptr).handle.stagedBytes();
         }
+
+        pub fn pendingMutations(alloc: Allocator, ptr: *anyopaque) anyerror![]const PendingMutation {
+            const raw = (try unbox(ptr).handle.pendingMutations()) orelse &.{};
+            const out = try alloc.alloc(PendingMutation, raw.len);
+            for (raw, out) |m, *o| o.* = .{ .namespace = m.namespace, .key = m.key, .value = m.value, .is_delete = m.is_delete };
+            return out;
+        }
     };
 
     return .{
@@ -630,6 +686,7 @@ pub fn namespaceBatchFrom(
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
             .staged_bytes = if (@hasDecl(Handle, "stagedBytes")) vt.stagedBytes else null,
+            .pending_mutations = if (@hasDecl(Handle, "pendingMutations")) vt.pendingMutations else null,
         },
     };
 }
@@ -783,6 +840,84 @@ test "failed commit keeps vectorindex namespace batch handle abortable" {
 
     try std.testing.expectError(error.CommitFailed, batch.commit());
     try std.testing.expectEqual(@as(usize, 1), shared.commits);
+    batch.abort();
+    try std.testing.expect(shared.aborted);
+}
+
+test "namespace write handle with no pendingMutations declared reports unsupported" {
+    var shared = FailingCommitShared{};
+    var txn = try namespaceWriteTxnFrom(std.testing.allocator, FailingCommitHandle{ .shared = &shared }, Namespace, identityNamespace);
+    defer txn.abort();
+
+    try std.testing.expectEqual(@as(?[]const PendingMutation, null), try txn.pendingMutations());
+}
+
+const StagingHandle = struct {
+    shared: *FailingCommitShared,
+    pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
+
+    pub fn abort(self: *@This()) void {
+        self.shared.aborted = true;
+        self.pending.deinit(std.testing.allocator);
+    }
+    pub fn commit(self: *@This()) !void {
+        self.shared.commits += 1;
+    }
+    pub fn get(_: *@This(), _: Namespace, _: []const u8) ![]const u8 {
+        return error.NotFound;
+    }
+    pub fn put(self: *@This(), namespace: Namespace, key: []const u8, value: []const u8) !void {
+        _ = namespace;
+        try self.pending.append(std.testing.allocator, .{ .namespace = null, .key = key, .value = value });
+    }
+    pub fn delete(self: *@This(), namespace: Namespace, key: []const u8) !void {
+        _ = namespace;
+        try self.pending.append(std.testing.allocator, .{ .namespace = null, .key = key, .is_delete = true });
+    }
+    pub fn pendingMutations(self: *@This()) !?[]const PendingMutation {
+        return self.pending.items;
+    }
+};
+
+test "namespace write handle harvests pending mutations without committing" {
+    var shared = FailingCommitShared{};
+    // Passed by value, matching every other handle in this test file: the
+    // boxed copy inside the write handle (not this local variable) is what
+    // `put`/`delete`/`pendingMutations`/`abort` below actually mutate and
+    // free.
+    var txn = try namespaceWriteTxnFrom(std.testing.allocator, StagingHandle{ .shared = &shared }, Namespace, identityNamespace);
+
+    try txn.put(.meta, "k1", "v1");
+    try txn.delete(.meta, "k2");
+
+    const harvested = (try txn.pendingMutations()).?;
+    defer std.testing.allocator.free(harvested);
+    try std.testing.expectEqual(@as(usize, 2), harvested.len);
+    try std.testing.expectEqualStrings("k1", harvested[0].key);
+    try std.testing.expectEqualStrings("v1", harvested[0].value);
+    try std.testing.expect(!harvested[0].is_delete);
+    try std.testing.expectEqualStrings("k2", harvested[1].key);
+    try std.testing.expect(harvested[1].is_delete);
+
+    // The handle is still open: harvesting never committed or aborted it.
+    try std.testing.expectEqual(@as(usize, 0), shared.commits);
+    try std.testing.expect(!shared.aborted);
+    txn.abort();
+    try std.testing.expect(shared.aborted);
+    try std.testing.expectEqual(@as(usize, 0), shared.commits);
+}
+
+test "namespace batch harvests pending mutations without committing" {
+    var shared = FailingCommitShared{};
+    var batch = try namespaceBatchFrom(std.testing.allocator, StagingHandle{ .shared = &shared }, Namespace, identityNamespace);
+
+    try batch.put(.vecs, "k1", "v1");
+
+    const harvested = (try batch.pendingMutations()).?;
+    defer std.testing.allocator.free(harvested);
+    try std.testing.expectEqual(@as(usize, 1), harvested.len);
+    try std.testing.expectEqual(@as(usize, 0), shared.commits);
+
     batch.abort();
     try std.testing.expect(shared.aborted);
 }

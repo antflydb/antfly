@@ -240,6 +240,7 @@ pub const Reply = struct {
     token_evidence: ?TokenEvidence = null,
 };
 pub const Executor = struct {
+    require_all: bool = false,
     limits: Limits = .{},
     ptr: *anyopaque,
     invoke: *const fn (*anyopaque, Allocator, Invocation) anyerror!Reply,
@@ -387,6 +388,12 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
             size.* = std.math.cast(usize, counter.fullCount()) orelse return error.ConstrainedInputTooLarge;
         }
     }
+    if (executor.require_all) {
+        for (cost_failures, sizes, costs) |failure, size, cost| {
+            if (failure) |err| return err;
+            if (size > batch.max_input_bytes or !executor.limits.accepts(cost)) return error.ConstrainedInputTooLarge;
+        }
+    }
     if (mode == .auto or value_schema != .object) return error.InvalidConstrainedGenerationConfig;
     var validator = try schema_validator.CompiledSchema.init(a, value_schema);
     defer validator.deinit();
@@ -401,7 +408,8 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
     var begin: usize = 0;
     while (begin < inputs.len) {
         if (cost_failures[begin] != null or sizes[begin] > batch.max_input_bytes or !executor.limits.accepts(costs[begin])) {
-            result.failures[begin] = cost_failures[begin] orelse error.ConstrainedInputTooLarge;
+            const failure = cost_failures[begin] orelse error.ConstrainedInputTooLarge;
+            result.failures[begin] = failure;
             result.execution.rejected_items += 1;
             begin += 1;
             continue;
@@ -424,7 +432,7 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
         attempts: for (0..2) |attempt| {
             if (pending.items.len == 0) break;
             if (executor.checkpoint) |check| check(executor.ptr) catch |err| {
-                if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
+                if (executor.require_all or err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
                 for (result.values, result.failures) |value, *failure| if (value == null) {
                     failure.* = err;
                 };
@@ -450,7 +458,7 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
             }) catch |err| {
                 result.input_tokens +|= usage.input_tokens;
                 result.output_tokens +|= usage.output_tokens;
-                if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
+                if (executor.require_all or err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled) return err;
                 for (pending.items) |item| result.failures[item.id] = err;
                 if (err == error.Timeout) {
                     for (end..inputs.len) |id| result.failures[id] = err;
@@ -494,9 +502,10 @@ pub fn executeEvidence(a: Allocator, executor: Executor, mode: Output, value_sch
             var unanswered: std.ArrayList(Item) = .empty;
             for (pending.items) |item| if (result.values[item.id] == null) try unanswered.append(a, item);
             pending = unanswered;
-            if (attempt == 1) for (pending.items) |item| {
-                result.failures[item.id] = error.InvalidConstrainedOutput;
-            };
+            if (attempt == 1 and pending.items.len != 0) {
+                if (executor.require_all) return error.InvalidConstrainedOutput;
+                for (pending.items) |item| result.failures[item.id] = error.InvalidConstrainedOutput;
+            }
         }
         begin = end;
     }

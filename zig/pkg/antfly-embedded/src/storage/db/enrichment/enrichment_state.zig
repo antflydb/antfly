@@ -163,6 +163,10 @@ pub fn loadReplayCursorAtCut(alloc: Allocator, store: anytype, scope: []const u8
     return null;
 }
 
+// §3.2a's "Catch-up progress" ride-along entry: replay restarts from
+// durable progress and redoing the skipped preparation window is
+// idempotent, so a lost cursor write just means a slightly larger replay
+// window next time, not incorrect results.
 pub fn saveReplayCursor(store: anytype, scope: []const u8, cursor: ReplayCursor) !void {
     try saveReplayCursorAtCut(std.heap.page_allocator, store, null, scope, cursor, null);
 }
@@ -174,7 +178,7 @@ pub fn saveReplayCursorAtCut(alloc: Allocator, store: anytype, scope: ?[]const u
     defer alloc.free(raw);
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
+    var txn = try runtime.store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     if (scope) |checkpoint_scope| {
         const checkpoint = try loadProjectionCheckpointTxn(alloc, &txn, checkpoint_scope);
@@ -207,7 +211,7 @@ pub fn clearReplayCursor(store: anytype, scope: []const u8) !void {
     defer std.heap.page_allocator.free(key);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
+    var txn = try runtime.store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     txn.delete(key) catch |err| switch (err) {
         error.NotFound => {},
@@ -309,13 +313,19 @@ pub fn saveAppliedSequence(store: anytype, scope: []const u8, sequence: u64) !vo
     return try saveProjectionCheckpoint(store, scope, .{ .applied_sequence = sequence });
 }
 
+// §3.2a's "Catch-up progress" ride-along entry: replay restarts from
+// durable progress, and re-applying the backlog between the durable
+// watermark and the in-memory one is idempotent. Not yet a
+// commit_participant in the producer's own plan transaction (future
+// work -- see saveRuntimeStatus above for the same caveat); ride-along
+// already removes this call's own fsync.
 pub fn saveProjectionCheckpoint(store: anytype, scope: []const u8, checkpoint: ProjectionCheckpoint) !void {
     const key = try appliedSequenceKey(std.heap.page_allocator, scope);
     defer std.heap.page_allocator.free(key);
     var buf = encodeProjectionCheckpoint(checkpoint);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
+    var txn = try runtime.store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     try txn.put(key, &buf);
     try txn.commit();
@@ -681,10 +691,71 @@ fn encodeRuntimeAuxSidecar(runtime_status: []const u8, status: RuntimeStatus) [r
     return out;
 }
 
+var runtime_status_write_count: std.atomic.Value(u64) = .init(0);
+
+/// Count of `saveRuntimeStatus` calls that actually committed a write (as
+/// opposed to being skipped because every durable field was unchanged).
+/// Test-only instrumentation.
+pub fn runtimeStatusWriteCount() u64 {
+    return runtime_status_write_count.load(.monotonic);
+}
+
+pub fn resetRuntimeStatusWriteCountForTest() void {
+    runtime_status_write_count.store(0, .monotonic);
+}
+
+/// Durable, correctness-relevant fields: retry/terminal-failure state, the
+/// last error identity and the replay target. These gate crash-recovery
+/// backoff resumption and synchronous-barrier answers, so a write that only
+/// changes one of them must still commit. `error_count`/`retryable_error_
+/// count`/`fatal_error_count`/`skipped_source_count` are lifetime telemetry
+/// counters with no correctness role; they are deliberately excluded here so
+/// routine per-write accounting does not force a durable commit on every
+/// call (they still ride along for free whenever a durable field changes).
+fn durableRuntimeStatusFieldsUnchanged(current: RuntimeStatus, incoming: RuntimeStatus) bool {
+    return current.target_sequence == incoming.target_sequence and
+        current.consecutive_retry_count == incoming.consecutive_retry_count and
+        current.next_retry_at_ms == incoming.next_retry_at_ms and
+        current.retry_failure_fingerprint == incoming.retry_failure_fingerprint and
+        current.retry_failure_count == incoming.retry_failure_count and
+        current.admission_wait_count == incoming.admission_wait_count and
+        current.terminal_failure_min_sequence == incoming.terminal_failure_min_sequence and
+        current.terminal_failure_max_sequence == incoming.terminal_failure_max_sequence and
+        current.retrying == incoming.retrying and
+        current.worker_failed == incoming.worker_failed and
+        std.mem.eql(u8, current.last_error_code.slice(), incoming.last_error_code.slice());
+}
+
 pub fn saveRuntimeStatus(store: anytype, scope: []const u8, status: RuntimeStatus) !void {
+    // Status is saved on the indexing hot path, including once per mutation
+    // commit through `markAppliedThrough`'s no-pending-work fast path. The
+    // common case there is "nothing changed since the last durable write":
+    // skip the commit entirely rather than rewriting four keys whose values
+    // (outside the counters, which are not durability-critical) are
+    // identical to what is already on disk. Also skip the revision bump:
+    // a no-op save must not invalidate a reader's `observed_revision` from
+    // `saveRuntimeStatusAndProjection`'s optimistic-concurrency check.
+    if (durableRuntimeStatusFieldsUnchanged(
+        loadRuntimeStatus(std.heap.page_allocator, store, scope) catch |err| switch (err) {
+            error.InvalidEnrichmentState => RuntimeStatus{},
+            else => return err,
+        },
+        status,
+    )) return;
+    _ = runtime_status_write_count.fetchAdd(1, .monotonic);
     var runtime = try initRuntimeStore(std.heap.page_allocator, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
+    // §3.4: these are durable retry/terminal-failure fields, written only
+    // on change (the common case above commits nothing at all). The
+    // underlying failure/retry condition that caused the change persists
+    // until resolved, so a value lost here in a crash is re-observed and
+    // re-written identically by the producer's next attempt -- safe to
+    // lose, per §3.2a. Ride along instead of paying a dedicated fsync on
+    // the indexing hot path; ideally this would be a commit_participant
+    // inside the producer's own plan transaction, but that needs threading
+    // a View through every saveRuntimeStatus call site (future work) --
+    // ride-along already removes its own fsync today.
+    var txn = try runtime.store.beginBatchWithOptions(.{ .durability = .ride_along });
     errdefer txn.abort();
     const revision = try loadStatusRevisionTxn(std.heap.page_allocator, &txn, scope);
     _ = try putVersionedStatusTxn(std.heap.page_allocator, &txn, scope, status, revision);
@@ -1283,6 +1354,52 @@ test "admission wait budget survives disk close and WAL replay" {
         status.retrying = true;
         try saveRuntimeStatus(store, "admission-test", status);
     }
+}
+
+test "saveRuntimeStatus skips the durable write when nothing durable changed" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer store.deinit();
+
+    resetRuntimeStatusWriteCountForTest();
+    const status: RuntimeStatus = .{
+        .target_sequence = 9,
+        .consecutive_retry_count = 5,
+        .retry_failure_fingerprint = 77,
+        .retry_failure_count = 2,
+        .terminal_failure_min_sequence = 8,
+        .terminal_failure_max_sequence = 9,
+        .retrying = true,
+    };
+    try saveRuntimeStatus(store, "generated", status);
+    try std.testing.expectEqual(@as(u64, 1), runtimeStatusWriteCount());
+
+    // Repeating the identical durable fields, even with different lifetime
+    // counters, must not commit a second durable write.
+    var same_durable = status;
+    same_durable.error_count = 41;
+    same_durable.retryable_error_count = 7;
+    same_durable.fatal_error_count = 3;
+    same_durable.skipped_source_count = 2;
+    try saveRuntimeStatus(store, "generated", same_durable);
+    try std.testing.expectEqual(@as(u64, 1), runtimeStatusWriteCount());
+    // The skipped write's counters never made it to disk: that is the
+    // accepted tradeoff (telemetry counters are not durability-critical).
+    const unchanged = try loadRuntimeStatus(std.testing.allocator, store, "generated");
+    try std.testing.expectEqual(@as(u64, 0), unchanged.error_count);
+
+    // Changing any durable field commits again.
+    var changed = status;
+    changed.retry_failure_count = 3;
+    try saveRuntimeStatus(store, "generated", changed);
+    try std.testing.expectEqual(@as(u64, 2), runtimeStatusWriteCount());
+    const after = try loadRuntimeStatus(std.testing.allocator, store, "generated");
+    try std.testing.expectEqual(@as(u32, 3), after.retry_failure_count);
+
+    // A distinct scope is unaffected by another scope's cached comparison.
+    try saveRuntimeStatus(store, "other-scope", status);
+    try std.testing.expectEqual(@as(u64, 3), runtimeStatusWriteCount());
 }
 
 pub const scoped_retries = @import("scoped_retries.zig");

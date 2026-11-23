@@ -654,13 +654,26 @@ pub const Builder = struct {
         const decomposed = try self.mul(sum, scalar);
 
         const fused = try self.graph.addNode(.{
-            .op = .{ .fused_add_mul_scalar = {} },
+            .op = .{ .fused_add_mul_scalar = .{} },
             .output_shape = self.graph.node(decomposed).output_shape,
             .inputs = .{ a, b, scalar, null_node },
             .num_inputs = 3,
             .vjp_alternate = decomposed,
         });
         return fused;
+    }
+
+    /// Fused a * scalar[0] + b, retaining the correct differentiable alternate.
+    pub fn scaledAdd(self: *Builder, a: NodeId, b: NodeId, scalar: NodeId) !NodeId {
+        const scaled = try self.mul(a, scalar);
+        const decomposed = try self.add(scaled, b);
+        return self.graph.addNode(.{
+            .op = .{ .fused_add_mul_scalar = .{ .scale_before_add = true } },
+            .output_shape = self.graph.node(decomposed).output_shape,
+            .inputs = .{ a, b, scalar, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = decomposed,
+        });
     }
 
     /// Fused softmax: exp(x - max(x)) / sum(exp(x - max(x))) along last axis.

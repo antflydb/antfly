@@ -17,7 +17,7 @@ continue with the [optional AI steps](#optional-local-ai) on this page.
 
 ## Install Antfly
 
-Download [Antfly v0.3.1](https://github.com/antflydb/antfly/releases/tag/v0.3.1)
+Download [Antfly v0.3.2](https://github.com/antflydb/antfly/releases/tag/v0.3.2)
 for your OS and architecture, verify its published checksum, and extract the
 archive. Keep its supporting files beside the binary and add that directory to
 `PATH`. See [Downloads](/docs/downloads) for installation options.
@@ -26,7 +26,7 @@ archive. Keep its supporting files beside the binary and add that directory to
 antfly --version
 ```
 
-This walkthrough uses `0.3.1`. Check file compatibility before opening an existing
+This walkthrough uses `0.3.2`. Check file compatibility before opening an existing
 Lite database with another runtime version.
 
 ## Start Antfly
@@ -79,8 +79,8 @@ antfly load --table wikipedia \
 ```
 
 Wait for the load to finish successfully with 10,000 documents. The CLI batches
-the writes and waits for keyword-search visibility. Titles become stable IDs;
-loading again replaces documents with the same IDs.
+the writes; `--sync-level full_text` waits for keyword-search visibility. Titles
+become stable IDs; loading again replaces documents with the same IDs.
 
 ## Search
 

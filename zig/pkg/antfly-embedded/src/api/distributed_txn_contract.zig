@@ -41,6 +41,10 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
+    document_revision_scope: ?@import("../storage/document_revision_reservation.zig").Scope = null,
+    sql_locks: ?@import("../storage/pessimistic_lock/transaction.zig").Ref = null,
+    external_decision_owner: ?@import("../storage/transactions.zig").ExternalDecisionOwner = null,
+    source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
     route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
@@ -52,12 +56,41 @@ pub const PreDecisionContext = struct {
 /// Authenticated private recovery observation. A locator is never authority by
 /// itself: hidden owner handlers validate the exact plan and scope together.
 pub const TxnStatusRequest = struct {
+    route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
+    external_decision_owner: ?@import("../storage/transactions.zig").ExternalDecisionOwner = null,
     txn_id: db_types.TxnId,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,
 };
 
+/// Resolution retains its exact authority through routing and native callbacks.
+pub const TxnResolveRequest = struct {
+    route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    txn_id: db_types.TxnId,
+    status: db_types.TxnStatus,
+    commit_version: u64,
+    topology_epoch: u64 = 0,
+    sync_level: db_types.SyncLevel = .propose,
+    external_decision_owner: ?@import("../storage/transactions.zig").ExternalDecisionOwner = null,
+};
+
 pub const TableCommitRequest = struct {
+    document_revision_handoffs: []const @import("../storage/document_revision_reservation.zig").Handoff = &.{},
+    graph_preparation: ?@import("../storage/db/prepared_graph_effects.zig").Admission = null,
+    /// Immutable processed rows, retained by protected SQL/session staging.
+    /// Public ingress rejects this private preparation evidence.
+    trigger_receipts: []const @import("../sql/trigger_handoff.zig").Receipt = &.{},
+    /// Process-long API signer; never serialized into durable or public data.
+    trigger_minter: ?@import("../common/trigger_preparation_authority.zig").Minter = null,
+    /// Server-resolved physical owner epoch. Public JSON cannot enlist a
+    /// replacement native generation by supplying a table name alone.
+    relation_owner_minter: ?@import("../common/relation_owner_authority.zig").Minter = null,
+    sql_persistence: ?@import("../common/relation_persistence.zig").Descriptor = null,
+    /// Explicit trusted transaction origin. Older callers remain unlabelled.
+    source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
+    source_admission: ?@import("../storage/source_admission.zig").Command = null,
     bound_catalog_incarnation: ?[16]u8 = null,
     commit_requires: ?db_types.CommitRequires = null,
     /// Coordinator planning context, retained until cascade expansion finishes.
@@ -82,14 +115,38 @@ pub const TableCommitRequest = struct {
     graph_deletes: []const db_types.GraphEdgeDelete = &.{},
     predicates: []const db_types.TransactionVersionPredicate = &.{},
     integrity: []const db_types.TransactionIntegrityOperation = &.{},
-    integrity_commands: []const @import("../storage/db/relational_integrity_contract.zig").Command = &.{},
-    relational_activation: ?@import("../storage/db/relational_integrity_activation_contract.zig").Command = null,
-    relational_retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Command = null,
-    relational_index_maintenance: ?@import("../storage/db/relational_index_maintenance_contract.zig").Command = null,
+    integrity_commands: []const @import("../storage/db/relational/integrity/contract.zig").Command = &.{},
+    relational_activation: ?@import("../storage/db/relational/integrity/activation_contract.zig").Command = null,
+    relational_retirement: ?@import("../storage/db/relational/integrity/retirement_contract.zig").Command = null,
+    relational_index_maintenance: ?@import("../storage/db/relational/indexes/maintenance_contract.zig").Command = null,
+    pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (comptime nativeJsonSkipFieldComptime(field)) continue;
+            if (!self.nativeJsonSkipField(field)) {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+        }
+        try stream.endObject();
+    }
+    pub fn nativeJsonSkipFieldComptime(comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "relation_owner_minter") or std.mem.eql(u8, field, "trigger_minter");
+    }
     pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
-        return std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null;
+        return (std.mem.eql(u8, field, "bound_catalog_incarnation") and self.bound_catalog_incarnation == null) or ((comptime std.mem.eql(u8, field, "document_revision_handoffs")) and self.document_revision_handoffs.len == 0) or ((comptime std.mem.eql(u8, field, "graph_preparation")) and self.graph_preparation == null) or (comptime nativeJsonSkipFieldComptime(field)) or ((comptime std.mem.eql(u8, field, "sql_persistence")) and self.sql_persistence == null) or ((comptime std.mem.eql(u8, field, "graph_writes")) and self.graph_writes.len == 0) or ((comptime std.mem.eql(u8, field, "graph_deletes")) and self.graph_deletes.len == 0) or
+            (std.mem.eql(u8, field, "source_producer") and self.source_producer == .unlabelled);
     }
 };
+
+/// One transaction has one origin, including read-only and empty participants.
+/// Mixed/unknown authority cannot be filled in by routing or table identity.
+pub fn transactionProducer(tables: []const TableCommitRequest) !@FieldType(db_types.BatchRequest, "source_producer") {
+    const producer = if (tables.len == 0) .unlabelled else tables[0].source_producer;
+    if (producer == .scoped_source) return error.InvalidSourceAdmission;
+    for (tables) |table| if (table.source_producer != producer) return error.SourceTransactionIdentityConflict;
+    return producer;
+}
 
 pub const CommitConflict = struct {
     table_name: []const u8,

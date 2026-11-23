@@ -72,20 +72,7 @@ pub const Ledger = struct {
         try self.budget.reserve(bytes);
         errdefer self.budget.release(bytes);
         if (self.next_generation == std.math.maxInt(u64) or self.next_owner == std.math.maxInt(u64)) return error.CudaMemoryLimitExceeded;
-        if (owner.* == 0) {
-            var slot: ?*Owner = null;
-            for (self.owners.items) |*entry| if (entry.id == 0) {
-                slot = entry;
-                break;
-            };
-            if (slot == null) {
-                try self.owners.append(self.allocator, .{});
-                slot = &self.owners.items[self.owners.items.len - 1];
-            }
-            owner.* = self.next_owner;
-            self.next_owner += 1;
-            slot.?.* = .{ .id = owner.*, .primary = primary };
-        }
+        if (owner.* == 0) try self.prepareOwnerLocked(primary, owner);
         const index = if (self.free_head) |index| blk: {
             self.free_head = self.records.items[index].next_free;
             break :blk index;
@@ -97,6 +84,70 @@ pub const Ledger = struct {
         self.next_generation += 1;
         self.records.items[index] = .{ .live = true, .generation = generation, .primary = primary, .owner = owner.*, .bytes = bytes };
         return .{ .index = index, .generation = generation };
+    }
+
+    /// Prepare destination identity before any physical ownership publication.
+    /// No allocation or SDK call is performed by the subsequent token handoff.
+    pub fn prepareOwner(self: *Ledger, primary: usize, owner: *u64) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        try self.prepareOwnerLocked(primary, owner);
+    }
+    fn prepareOwnerLocked(self: *Ledger, primary: usize, owner: *u64) !void {
+        if (primary == 0) return error.InvalidCudaAllocationOwner;
+        if (owner.* != 0) {
+            for (self.owners.items) |entry| if (entry.id == owner.*) {
+                if (entry.primary != primary or entry.retained or entry.release_uncertain) return error.InvalidCudaAllocationOwner;
+                return;
+            };
+            return error.InvalidCudaAllocationOwner;
+        }
+        if (self.next_owner == std.math.maxInt(u64)) return error.CudaMemoryLimitExceeded;
+        var slot: ?*Owner = null;
+        for (self.owners.items) |*entry| if (entry.id == 0) {
+            slot = entry;
+            break;
+        };
+        if (slot == null) {
+            try self.owners.append(self.allocator, .{});
+            slot = &self.owners.items[self.owners.items.len - 1];
+        }
+        owner.* = self.next_owner;
+        self.next_owner += 1;
+        slot.?.* = .{ .id = owner.*, .primary = primary };
+    }
+    /// SAME exact live allocations, primary and byte credit. Validate the whole
+    /// finite token set before metadata-only transfer; no SDK/reserve/refund.
+    pub fn handoff(self: *Ledger, tokens: []const Token, source: u64, destination: u64, primary: usize) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        var target_valid = false;
+        for (self.owners.items) |entry| if (entry.id == destination and entry.primary == primary and !entry.retained and !entry.release_uncertain) {
+            target_valid = true;
+            break;
+        };
+        if (!target_valid or source == 0) return error.InvalidCudaAllocationOwner;
+        for (tokens, 0..) |token, i| {
+            if (token.index >= self.records.items.len) return error.InvalidCudaAllocationOwner;
+            const record = self.records.items[token.index];
+            if (!record.live or record.generation != token.generation or record.owner != source or record.primary != primary or record.retired or record.failed or record.ptr == 0) return error.InvalidCudaAllocationOwner;
+            for (tokens[0..i]) |previous| if (previous.index == token.index and previous.generation == token.generation) return error.InvalidCudaAllocationOwner;
+        }
+        for (tokens) |token| self.records.items[token.index].owner = destination;
+    }
+    /// A cold endpoint closes only after its allocations have moved or died.
+    /// It owns no quarantine retain/library and must never forgive live bytes.
+    pub fn forgetEmptyOwner(self: *Ledger, identity: u64) !void {
+        if (identity == 0) return;
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.hasOwnerAllocations(identity)) return error.InvalidCudaAllocationOwner;
+        for (self.owners.items) |*owner| if (owner.id == identity) {
+            if (owner.retained or owner.library != null or owner.release_uncertain) return error.InvalidCudaAllocationOwner;
+            owner.* = .{};
+            return;
+        };
+        return error.InvalidCudaAllocationOwner;
     }
 
     fn get(self: *Ledger, token: Token) *Record {
@@ -243,6 +294,16 @@ pub const Ledger = struct {
         }
     }
 
+    /// A Model's separate resident/domain charge must not close while this
+    /// managed wrapper still owns SDK allocations in the process backstop.
+    /// This observes the exact owner, never all contexts sharing its primary.
+    pub fn validateOwnerEmpty(self: *Ledger, owner: u64) !void {
+        if (owner == 0) return;
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.hasOwnerAllocations(owner)) return error.CudaAllocationOwnerStillLive;
+    }
+
     pub fn outstanding(self: *Ledger) usize {
         self.lock();
         defer self.mutex.unlock();
@@ -356,4 +417,61 @@ test "CUDA quarantine requires a continuous retain and releases it only after ev
     // This local mock owns no real CUDA retain/library; discard its metadata
     // to simulate exit without calling release a second time.
     for (ledger.owners.items) |*entry| entry.* = .{};
+}
+
+test "CUDA allocation ledger handoff is all-or-none and allocates nothing after destination preparation" {
+    var budget = accounting.Budget{ .limit = 64 };
+    var metadata = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var ledger = Ledger{ .allocator = metadata.allocator(), .budget = &budget };
+    defer ledger.deinit();
+    var source: u64 = 0;
+    var destination: u64 = 0;
+    const one = try ledger.reserve(7, &source, 24);
+    ledger.publish(one, 0x1000);
+    defer if (ledger.isLive(one)) ledger.release(one);
+    const two = try ledger.reserve(7, &source, 16);
+    ledger.publish(two, 0x2000);
+    defer if (ledger.isLive(two)) ledger.release(two);
+    try ledger.prepareOwner(7, &destination);
+    const allocations = metadata.alloc_index;
+    metadata.fail_index = allocations;
+    try std.testing.expectError(error.InvalidCudaAllocationOwner, ledger.handoff(&.{ one, one }, source, destination, 7));
+    try std.testing.expectError(error.InvalidCudaAllocationOwner, ledger.handoff(&.{ one, two }, source, destination, 8));
+    try std.testing.expectEqual(source, ledger.records.items[one.index].owner);
+    try std.testing.expectEqual(source, ledger.records.items[two.index].owner);
+    try ledger.handoff(&.{ one, two }, source, destination, 7);
+    try std.testing.expectEqual(allocations, metadata.alloc_index);
+    try std.testing.expectEqual(@as(usize, 40), budget.snapshot().live);
+    ledger.retire(source, true);
+    try ledger.forgetEmptyOwner(source);
+    try std.testing.expectError(error.InvalidCudaAllocationOwner, ledger.forgetEmptyOwner(destination));
+    try std.testing.expect(ledger.isLive(one) and ledger.isLive(two));
+    ledger.release(one);
+    ledger.release(two);
+    try ledger.forgetEmptyOwner(destination);
+    try std.testing.expectEqual(@as(usize, 0), budget.snapshot().live);
+}
+
+test "CUDA allocation hot reserve reuses metadata with many cold owners and failing allocator" {
+    var budget = accounting.Budget{ .limit = 64 };
+    var metadata = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var ledger = Ledger{ .allocator = metadata.allocator(), .budget = &budget };
+    defer ledger.deinit();
+    var owner: u64 = 0;
+    const initial = try ledger.reserve(7, &owner, 16);
+    ledger.publish(initial, 0x1000);
+    ledger.release(initial);
+    for (0..128) |_| {
+        var cold: u64 = 0;
+        try ledger.prepareOwner(7, &cold);
+    }
+    const allocations = metadata.alloc_index;
+    metadata.fail_index = allocations;
+    for (0..8) |_| {
+        const token = try ledger.reserve(7, &owner, 16);
+        ledger.publish(token, 0x1000);
+        ledger.release(token);
+    }
+    try std.testing.expectEqual(allocations, metadata.alloc_index);
+    try std.testing.expectEqual(@as(usize, 0), budget.snapshot().live);
 }

@@ -296,3 +296,16 @@ test('rename source is checked in the immutable merge-base tree', async () => {
   assert.deepEqual(f.treeReads, [f.comparison.merge_base_commit.sha, f.pr.head.sha]);
   assert.equal(f.approvals.length, 1);
 });
+
+
+test('large or unavailable change counts require human review without comparison or approval', async () => {
+  for (const count of [300, 649, 3000, 0, undefined, NaN]) {
+    const f = fixture(); f.pr.changed_files = count;
+    await f.run();
+    assert.equal(f.approvals.length, 0);
+    assert.equal(f.comparisons.length, 0);
+    assert.equal(f.treeReads.length, 0);
+    assert.equal(f.getReads(), 1);
+    assert.match(f.notices.at(-1), /Human review required/);
+  }
+});

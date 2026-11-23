@@ -69,6 +69,7 @@ pub const Context = struct {
     qualification_pjrt_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
     inference_linalg_mod: *std.Build.Module,
+    tile_mod: *std.Build.Module,
     antfly_platform_mod: *std.Build.Module,
     runtime_abi_mod: *std.Build.Module,
     document_runs_mod: *std.Build.Module,
@@ -278,6 +279,7 @@ pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Ste
             // Commands keep their declared imports even when their link-compatible
             // checks share an executable. A union of imports would mask missing
             // dependency declarations in standalone commands.
+            module.addImport("antfly_tile", ctx.tile_mod);
             module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);
             module.addImport("antfly_document_runs", ctx.document_runs_mod);
             for (command.imports) |dependency| {
@@ -364,6 +366,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
 }
 
 fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import, pjrt: ?*std.Build.Module) void {
+    module.addImport("antfly_tile", ctx.tile_mod);
     module.addImport("antfly_runtime_abi", ctx.runtime_abi_mod);
     module.addImport("antfly_document_runs", ctx.document_runs_mod);
     for (imports) |import| {
@@ -469,6 +472,7 @@ pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
         .qualification_pjrt_mod = ctx.graph.qualification_pjrt_mod,
         .protobuf_mod = ctx.graph.protobuf_mod,
         .inference_linalg_mod = ctx.graph.inference_linalg_mod,
+        .tile_mod = ctx.graph.tile_mod,
         .antfly_platform_mod = ctx.graph.platform_mod,
         .runtime_abi_mod = ctx.graph.runtime_abi_mod,
         .document_runs_mod = ctx.graph.document_runs_mod,

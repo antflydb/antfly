@@ -61,7 +61,9 @@ comptime {
     _ = @import("mc_tmpl_8.zig");
     _ = @import("mem.zig");
     _ = @import("msac.zig");
-    _ = @import("obu.zig");
+    // Header inspection imports the OBU grammar alone. Export its full decode
+    // entry point only with the reconstruction and reference-management code.
+    @export(&@import("obu.zig").antfly_av1_dav1d_parse_obus, .{ .name = "antfly_av1_dav1d_parse_obus" });
     _ = @import("pal.zig");
     _ = @import("picture.zig");
     _ = @import("qm.zig");

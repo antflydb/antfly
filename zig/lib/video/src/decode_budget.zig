@@ -22,6 +22,7 @@ pub const Budget = struct {
     live: usize = 0,
     peak: usize = 0,
     denied: bool = false,
+    reclaimer: ?@import("antfly_media").admission.Reclaimer = null,
     pub fn allocator(self: *Budget) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
@@ -38,10 +39,17 @@ pub const Budget = struct {
     }
     fn alloc(ctx: *anyopaque, len: usize, align_: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Budget = @ptrCast(@alignCast(ctx));
-        if (!self.admit(0, len)) return null;
-        const bytes = self.backing.rawAlloc(len, align_, ra) orelse return null;
+        const bytes = self.tryAlloc(len, align_, ra) orelse retry: {
+            if (!@import("antfly_media").admission.Reclaimer.reclaim(self.reclaimer)) return null;
+            self.denied = false;
+            break :retry self.tryAlloc(len, align_, ra) orelse return null;
+        };
         self.charge(0, len);
         return bytes;
+    }
+    fn tryAlloc(self: *Budget, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        if (!self.admit(0, len)) return null;
+        return self.backing.rawAlloc(len, alignment, ra);
     }
     fn resize(ctx: *anyopaque, bytes: []u8, align_: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *Budget = @ptrCast(@alignCast(ctx));

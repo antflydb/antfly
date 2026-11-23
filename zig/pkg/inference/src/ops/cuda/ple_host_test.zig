@@ -56,8 +56,8 @@ test "Gemma4 CUDA host PLE preserves prefill device tokens and captured fused de
     // Exercise malformed storage before any host owner exists, rather than
     // accidentally testing the duplicate-owner guard instead of validation.
     loaded.quantized_storage.?.raw_bytes = raw[0 .. raw.len - 1];
+    // Insertion consumes its owned key on both success and failure.
     const invalid_key = try a.dupe(u8, key);
-    defer a.free(invalid_key);
     try std.testing.expectError(error.InvalidShape, compute.insertWeightFromLoaded(invalid_key, &loaded));
     try std.testing.expect(compute.gemma4_ple_host.owner == null);
     try std.testing.expectEqual(physical_before, compute.ctx.device_allocations.snapshot().live);
@@ -137,10 +137,13 @@ test "Gemma4 CUDA host PLE preserves prefill device tokens and captured fused de
         defer a.free(expected_values);
         try std.testing.expectEqualSlices(f32, expected_values, values);
     }
-    // A second owner is rejected independently of storage validation.
-    const duplicate_key = try a.dupe(u8, key);
-    defer a.free(duplicate_key);
-    try std.testing.expectError(error.InvalidCudaState, compute.insertWeightFromLoaded(duplicate_key, &loaded));
+    // The shared insertion owner rejects duplicates before constructing a
+    // second host owner. Both rejected keys above are consumed by insertion.
+    const retained_owner = compute.gemma4_ple_host.owner;
+    const retained_address = tensorFromCt(host_weight).buffer.ptr;
+    try std.testing.expectError(error.DuplicateWeight, compute.insertWeightFromLoaded(try a.dupe(u8, key), &loaded));
+    try std.testing.expect(compute.gemma4_ple_host.owner == retained_owner);
+    try std.testing.expectEqual(retained_address, tensorFromCt(try cb.getWeight(key)).buffer.ptr);
 }
 
 test "Gemma4 CUDA host PLE failed physical free survives complete compute teardown" {

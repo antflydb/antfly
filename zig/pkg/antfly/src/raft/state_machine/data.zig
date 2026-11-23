@@ -61,6 +61,9 @@ pub const DataStateMachine = struct {
         read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *DataStateMachine = @ptrCast(@alignCast(ptr));
+        if (self.delegate == null and (snapshot != null or committed_entries.len != 0)) {
+            if (self.snapshot_builder) |builder| if (builder.requiresApplyDelegate()) return error.StorageKernelOwnerUnavailable;
+        }
         if (snapshot) |value| {
             if (self.snapshot_builder) |snapshot_builder| {
                 const installed = snapshot_builder.installSnapshot(

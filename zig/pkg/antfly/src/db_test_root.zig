@@ -14,6 +14,7 @@
 // limitations under the License.
 
 test {
+    _ = @import("antfly_local_sources").storage_db_relational_integrity_integration_test;
     _ = @import("antfly_local_sources").storage_db_authority_invalidation;
     _ = @import("antfly_local_sources").storage_db_schema_registry;
     _ = @import("antfly_local_sources").storage_db_row_policy_gate;
@@ -33,6 +34,7 @@ test {
     _ = @import("antfly_local_sources").storage_db_resolution_runtime;
     _ = @import("antfly_local_sources").storage_db_relational_index_catalog;
     _ = @import("antfly_local_sources").storage_db_relational_index_gc;
+    _ = @import("antfly_local_sources").storage_db_cleanup_job_owner;
 }
 
 pub const antfly_sources = struct {

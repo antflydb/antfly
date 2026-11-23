@@ -66,10 +66,20 @@ fn canonical(hash: *Hash, alloc: std.mem.Allocator, value: std.json.Value) anyer
     frame(hash, "end");
 }
 pub fn digest(alloc: std.mem.Allocator, indexes: []const u8, enrichments: []const u8, resolvers: []const u8) ![32]u8 {
+    return digestImpl(alloc, indexes, enrichments, resolvers, false);
+}
+
+/// Validate existing immutable commands without rewriting their signed proof
+/// material. New commands always use policy-independent semantic identity.
+pub fn legacyDigest(alloc: std.mem.Allocator, indexes: []const u8, enrichments: []const u8, resolvers: []const u8) ![32]u8 {
+    return digestImpl(alloc, indexes, enrichments, resolvers, true);
+}
+
+fn digestImpl(alloc: std.mem.Allocator, indexes: []const u8, enrichments: []const u8, resolvers: []const u8, legacy: bool) ![32]u8 {
     var hash = Hash.init(.{});
     frame(&hash, "antfly-row-derived-definitions-v1");
     if (indexes.len == 0) {
-        try producerDefinitions(&hash, alloc, enrichments, resolvers);
+        try producerDefinitions(&hash, alloc, enrichments, resolvers, legacy);
         return hash.finalResult();
     }
     if (indexes.len < 12 or !std.mem.eql(u8, indexes[0..4], "AIDX")) return error.InvalidArtifactCatalogCommand;
@@ -94,8 +104,9 @@ pub fn digest(alloc: std.mem.Allocator, indexes: []const u8, enrichments: []cons
         var definition = Hash.init(.{});
         frame(&definition, name);
         frame(&definition, &.{kind});
-        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, config, .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config, .{});
         defer parsed.deinit();
+        if (!legacy and parsed.value == .object) _ = parsed.value.object.swapRemove("execution");
         try canonical(&definition, alloc, parsed.value);
         entry.* = .{ .name = name, .digest = definition.finalResult() };
     }
@@ -109,11 +120,11 @@ pub fn digest(alloc: std.mem.Allocator, indexes: []const u8, enrichments: []cons
         if (i != 0 and std.mem.eql(u8, entries[i - 1].name, entry.name)) return error.InvalidArtifactCatalogCommand;
         frame(&hash, &entry.digest);
     }
-    try producerDefinitions(&hash, alloc, enrichments, resolvers);
+    try producerDefinitions(&hash, alloc, enrichments, resolvers, legacy);
     return hash.finalResult();
 }
 
-fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []const u8, resolvers: []const u8) !void {
+fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []const u8, resolvers: []const u8, legacy: bool) !void {
     for ([_][]const u8{ enrichments, resolvers }, [_][]const u8{ "enrichments", "resolvers" }) |raw, family| {
         if (raw.len == 0) continue;
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
@@ -136,6 +147,13 @@ fn producerDefinitions(hash: *Hash, alloc: std.mem.Allocator, enrichments: []con
         for (rows.array.items, entries) |raw_value, *entry| {
             if (raw_value != .object) return error.InvalidArtifactCatalogCommand;
             var value = raw_value;
+            if (!legacy and std.mem.eql(u8, family, "enrichments")) {
+                // Only declaration-level execution is operational. Never strip
+                // similarly named fields inside a provider recipe or schema.
+                value.object = try value.object.clone(projection_arena.allocator());
+                if (value.object.getPtr("execution_json")) |policy| policy.* = .{ .string = "" };
+                _ = value.object.swapRemove("execution");
+            }
             if (dictionary) |projections| if (value.object.get("projection_ref")) |reference| {
                 if (reference != .string or projections != .object) return error.InvalidArtifactCatalogCommand;
                 const projection = projections.object.get(reference.string) orelse return error.InvalidArtifactCatalogCommand;
@@ -221,4 +239,15 @@ test "resolver catalog native snapshot references preserve logical producer iden
     const left = try digest(a, "", "", expanded);
     const right = try digest(a, "", "", compact);
     try std.testing.expectEqualSlices(u8, &left, &right);
+}
+
+test "execution policy preserves ordered semantic identity but model changes do not" {
+    const a = std.testing.allocator;
+    const first = "[{\"name\":\"units\",\"producer_json\":\"reader-v1\",\"execution_json\":\"\"}]";
+    const larger = "[{\"name\":\"units\",\"producer_json\":\"reader-v1\",\"execution_json\":\"{\\\"max_output_tokens_per_item\\\":8192}\"}]";
+    const changed = "[{\"name\":\"units\",\"producer_json\":\"reader-v2\",\"execution_json\":\"\"}]";
+    try std.testing.expectEqualDeep(try digest(a, "", first, ""), try digest(a, "", larger, ""));
+    try std.testing.expectEqualDeep(try legacyDigest(a, "", first, ""), try digest(a, "", first, ""));
+    try std.testing.expect(!std.meta.eql(try digest(a, "", first, ""), try digest(a, "", changed, "")));
+    try std.testing.expect(!std.meta.eql(try legacyDigest(a, "", first, ""), try legacyDigest(a, "", larger, "")));
 }

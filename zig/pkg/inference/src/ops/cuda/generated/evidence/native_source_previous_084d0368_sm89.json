@@ -1,0 +1,47 @@
+{
+  "original_entries": 2,
+  "compared_entries": 2,
+  "retired": [],
+  "candidate_entries": 2,
+  "architectures": [
+    "sm_89"
+  ],
+  "added": [],
+  "changed_instructions": [],
+  "changed_resources": [],
+  "original_image_sha256": "0cc41e211289f4415649458aa8fd5322221f8b567e98b682212f02eedd77850d",
+  "candidate_image_sha256": "084d03682f0de388fccf4ce90fa3b12fc576777a5991ded8a10e6891747cdc1c",
+  "programs": [
+    {
+      "arch": "sm_89",
+      "function": "antfly_q4_0_down_q8_1_mmv_v1",
+      "original_instructions_sha256": "a237b97963d19e53b2eb3441abf73cece145702ca473e13268d7de1c1497a1a2",
+      "candidate_instructions_sha256": "a237b97963d19e53b2eb3441abf73cece145702ca473e13268d7de1c1497a1a2",
+      "original_resources_sha256": "2a7990a324b2c8630d7076621fd5a23b2c18ec5521a78eb54ca79ae43782ebe9",
+      "candidate_resources_sha256": "2a7990a324b2c8630d7076621fd5a23b2c18ec5521a78eb54ca79ae43782ebe9"
+    },
+    {
+      "arch": "sm_89",
+      "function": "antfly_q4_0_pair_activation_q8_1_mmv_v1",
+      "original_instructions_sha256": "23001ba965acd97439911492c01ecdd25df574c227d7f5cbb91f650b58801cde",
+      "candidate_instructions_sha256": "23001ba965acd97439911492c01ecdd25df574c227d7f5cbb91f650b58801cde",
+      "original_resources_sha256": "2cf7cf1c4724767d941e15904f8ed2d7e1375367004513e34e2056c5d25d01f2",
+      "candidate_resources_sha256": "2cf7cf1c4724767d941e15904f8ed2d7e1375367004513e34e2056c5d25d01f2"
+    }
+  ],
+  "previous_current_binding": {
+    "path": "src/ops/cuda/generated/evidence/native_source_previous_6af1a010_sm89.json",
+    "sha256": "fd8e7b04d3eefa4cc619b6be04044918a0b93bffa3125609602c453f0e310c93",
+    "candidate_image_sha256": "6af1a01081814fdfc7ad3971ee3e8bf6cc948143e72c453cb571ad216144918c",
+    "program_closure_equivalence": {
+      "path": "src/ops/cuda/generated/evidence/native_source_closure_previous_6af1a010_sm89.json",
+      "sha256": "5c86a4a89308e9fe26e817d94b272a77b60b589f76fb3d30494c56e16846f9c9",
+      "original_recorded_path": "src/ops/cuda/generated/evidence/native_source_closure_sm89.json"
+    }
+  },
+  "program_closure_equivalence": {
+    "path": "src/ops/cuda/generated/evidence/native_source_closure_sm89.json",
+    "sha256": "29ec4b58863fd12f97e333aad8be1b9802a2c51dc1e9867da321beada714f5ad"
+  },
+  "scope": "Original selectedSM89 target/revision/timing qualification remains historical. Exact code/owned constants/normalized metadata/global resource/closed-call payloads match canonical370/0adc baseline; full unchanged old current+closure bytes archived with explicit path override, preserving complete earlier chain. No new timing/GPU qualification."
+}

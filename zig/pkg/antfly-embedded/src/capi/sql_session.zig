@@ -87,7 +87,9 @@ pub const Session = struct {
         const before = self.entries.items.len;
         errdefer self.entries.items.len = before;
         const a = self.arena.allocator();
+        var domain_owner: ?*@import("../schema/domain_handoff.zig").Contract = null;
         for (mutations) |mutation| {
+            if (mutation.domain_admission != null and mutation.prepared_domain == null) return error.UnsupportedSqlExecution;
             // Reclaim the serialization builder's excess capacity, retaining
             // only the exact postimage shared by the overlay and commit path.
             const bytes = if (mutation.row) |row| try std.json.Stringify.valueAlloc(self.budget.allocator(), row, .{}) else "";
@@ -95,6 +97,17 @@ pub const Session = struct {
             self.bytes +|= bytes.len +| mutation.key.len +| 256;
             if (self.bytes > sql.runtime.resource_limits.default_memory_bytes or self.entries.items.len >= 4096) return error.SqlProgramLimitExceeded;
             var copy = mutation;
+            copy.domain_admission = null;
+            if (mutation.prepared_domain) |prepared| {
+                try prepared.validate();
+                if (domain_owner) |prior| {
+                    if (!prior.eql(prepared.*)) return error.CatalogGenerationChanged;
+                } else {
+                    domain_owner = try a.create(@import("../schema/domain_handoff.zig").Contract);
+                    domain_owner.?.* = prepared.*;
+                }
+                copy.prepared_domain = domain_owner;
+            }
             copy.key = try a.dupe(u8, mutation.key);
             const encoded = if (mutation.row != null) try a.dupe(u8, bytes) else null;
             copy.row = null;
@@ -141,6 +154,11 @@ pub const Session = struct {
                 };
                 if (original) |bytes| if (std.mem.eql(u8, bytes, write.value)) continue;
                 var mutation: catalog.Mutation = .{ .expected_version = 0, .key = try owned.dupe(u8, write.key), .row = null };
+                if (write.prepared_domain) |domain_descriptor| {
+                    const pointer = try owned.create(@import("../schema/domain_handoff.zig").Contract);
+                    pointer.* = domain_descriptor.*;
+                    mutation.prepared_domain = pointer;
+                }
                 mutation.json_null_fields = try owned.alloc([]const u8, write.json_null_fields.len);
                 for (write.json_null_fields, @constCast(mutation.json_null_fields)) |field, *out| out.* = try owned.dupe(u8, field);
                 for (request.predicates) |predicate| if (std.mem.eql(u8, predicate.key, write.key)) {
@@ -224,7 +242,7 @@ pub const Session = struct {
             if (entry.encoded_row != null or m.row != null) {
                 const json = if (entry.encoded_row) |bytes| try a.dupe(u8, bytes) else try std.json.Stringify.valueAlloc(a, m.row.?, .{});
                 errdefer a.free(json);
-                try group.writes.append(a, .{ .key = m.key, .value = json, .json_null_fields = m.json_null_fields });
+                try group.writes.append(a, .{ .key = m.key, .value = json, .json_null_fields = m.json_null_fields, .prepared_domain = m.prepared_domain });
             } else try group.deletes.append(a, m.key);
         }
         const requests = try a.alloc(d.api_distributed_txn_contract.TableCommitRequest, groups.items.len);
@@ -268,6 +286,25 @@ pub const Session = struct {
         const metadata = adapter.localCatalog(a, requests[0].schema_version.?) catch |err| return outcomes.notApplied(err);
         var prepared = d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
         defer prepared.deinit();
+        // A multi-statement session transaction that only ever touched one
+        // table on a Lite single-file store needs no cross-database
+        // two-phase decision, exactly like `sql.zig`'s `mutate` single-
+        // table fast path (lite-single-commit-write-path.md §3.3c): every
+        // table there already shares one physical commit domain. Fused
+        // (`allow_local_decision = true`) now that `commitCoordinatedLocal`
+        // gives an ambiguous outcome a resolvable `transaction_id` too (the
+        // retired outcome-receipt writer id, not a durable intent record --
+        // see its own comment).
+        if (self.handle.owned_lite_backend != null and prepared.tables.len == 1 and std.mem.eql(u8, prepared.tables[0].table_name, adapter.table_name)) {
+            const outcome = adapter.commitCoordinated(a, prepared.tables[0], true) catch |err| {
+                out_id.* = adapter.outcome_transaction_id;
+                self.failed = true;
+                return err;
+            };
+            out_id.* = adapter.outcome_transaction_id;
+            self.reset();
+            return outcome;
+        }
         const outcome = @import("sql_commit.zig").commit(self.handle, prepared.tables, out_id) catch |err| {
             self.failed = true;
             return err;

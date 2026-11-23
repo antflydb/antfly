@@ -891,6 +891,8 @@ then the executable image itself for a statically linked CLI, or a sibling `antf
 `PATH`. Library users do not need to ship
 a database server to use embedded inference.
 
+For embedded hosts that load `libantfly` dynamically, keep the library loaded for the life of the process. Descriptor recovery can outlive a database handle or an admission timeout. Close all database users before moving or renaming an `.aflite` file outside Lite, since the writer lease is keyed by path.
+
 #### Manual Maintenance
 
 Hosted/manual mode is important for environments such as WASM, mobile, plugins,

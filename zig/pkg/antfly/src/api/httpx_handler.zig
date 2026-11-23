@@ -22,7 +22,7 @@
 const std = @import("std");
 const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const ant_json = @import("antfly-json");
-const sql_execution = @import("sql_execution.zig");
+const sql_execution = @import("sql/execution/execution.zig");
 const sql_compiler = @import("antfly_local_sources").sql_compiler;
 const sql_runtime = @import("antfly_local_sources").sql_runtime;
 const sql_plan_cache = @import("../sql/plan_cache.zig");
@@ -363,6 +363,292 @@ fn requiresInternalServicePrincipal(path: []const u8) bool {
     return in_internal_namespace and !standby_exempt;
 }
 
+test "history grant ingress operation contracts" {
+    _ = @import("history_grant_operations.zig");
+    _ = @import("history_resolution_operations.zig");
+    _ = @import("history_publication_operations.zig");
+    _ = @import("history_owner_operations.zig");
+    _ = @import("history_decision_operations.zig");
+}
+
+test "history page ingress operation contracts" {
+    _ = @import("history_page_operations.zig");
+}
+
+test "history control ingress operation contracts" {
+    _ = @import("history_control_operations.zig");
+}
+
+test "history control ingress HTTP preserves recovery receipts and unknown failures" {
+    const a = std.testing.allocator;
+    const operations = @import("history_control_operations.zig");
+    const Fake = struct {
+        const Mode = enum { rejected, unknown, malformed, busy };
+        mode: Mode = .rejected,
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: []const u8, input: operations.wire.Request, _: @import("antfly_local_sources").api_operation.RequestContext) !operations.wire.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return switch (self.mode) {
+                .rejected => .{ .version = 1, .receipt = input.receipt orelse .{ .term = 2, .index = 3 }, .outcome = .{ .rejected = .checkpoint_conflict } },
+                .unknown => error.RaftBatchWriteOutcomeUnknown,
+                .malformed => .{ .version = 1, .outcome = .superseded },
+                .busy => error.StorageBusy,
+            };
+        }
+    };
+    var fake: Fake = .{};
+    var source: AuthStatusSource = .{};
+    const secret = "history-control-service-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true, .native_history_control = .{ .ptr = &fake, .execute_fn = Fake.run } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    const path = "/internal/v1/groups/17/tables/docs/history/control-v1";
+    try std.testing.expect(requiresInternalServicePrincipal(path));
+    try std.testing.expectEqual(@as(?usize, operations.wire.max_bytes), @import("http_routes.zig").publicPostBodyLimit(path));
+    try std.testing.expect(@import("http_routes.zig").publicPostBodyLimit(path ++ "/extra") == null);
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    const encoded_fence = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(encoded_fence);
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 17, .big);
+    std.mem.writeInt(u64, namespace[16..24], 19, .big);
+    const input: operations.wire.Request = .{ .version = 1, .operation = .recover, .receipt = .{ .term = 2, .index = 3 }, .command = .{ .collect = .{ .namespace = namespace, .authority = @splat(2) } } };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "17" }, .{ .name = "table_name", .value = "docs" } };
+    {
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalHistoryControl(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    for ([_]Fake.Mode{ .rejected, .unknown, .malformed, .busy }) |mode| {
+        fake.mode = mode;
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        try request.setHeader(metadata_api.catalog_route_fence_header, encoded_fence);
+        try request.setHeader(internal_service_auth.header_name, token);
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalHistoryControl(&context);
+        defer response.deinit();
+        const expected: u16 = switch (mode) {
+            .rejected, .unknown => 200,
+            .malformed => 500,
+            .busy => 503,
+        };
+        try std.testing.expectEqual(expected, response.status.code);
+        if (mode == .rejected) {
+            const decoded = try operations.wire.decodeResponse(a, response.body.?, input);
+            try std.testing.expect(decoded.confirmed());
+            try std.testing.expectEqual(.checkpoint_conflict, decoded.outcome.?.rejected);
+            try std.testing.expect(response.header(internal_batch_forwarding.outcome_header) == null);
+        } else {
+            try std.testing.expectEqualStrings(internal_batch_forwarding.outcome_unknown_v1, response.header(internal_batch_forwarding.outcome_header).?);
+            if (mode == .unknown) {
+                const decoded = try operations.wire.decodeResponse(a, response.body.?, input);
+                try std.testing.expectEqualDeep(input.receipt, decoded.receipt);
+                try std.testing.expect(!decoded.confirmed());
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
+test "source plan HTTP preserves authentication recovery and unknown outcomes" {
+    const a = std.testing.allocator;
+    const operations = @import("source_plan_operations.zig");
+    const Fake = struct {
+        const Mode = enum { rejected, unknown, malformed, busy };
+        mode: Mode = .rejected,
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, allocator: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: []const u8, input: operations.wire.ControlRequest, _: @import("antfly_local_sources").api_operation.RequestContext) !operations.wire.ControlReply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return switch (self.mode) {
+                .rejected => .{ .request_digest = try input.digest(allocator), .receipt = input.receipt orelse .{ .term = 2, .index = 3 }, .outcome = .{ .rejected = .conflict } },
+                .unknown => error.RaftBatchWriteOutcomeUnknown,
+                .malformed => .{ .request_digest = @splat(0), .outcome = .superseded },
+                .busy => error.StorageBusy,
+            };
+        }
+    };
+    var fake: Fake = .{};
+    var source: AuthStatusSource = .{};
+    const secret = "source-plan-service-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true, .native_source_plan_control = .{ .ptr = &fake, .execute_fn = Fake.run } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    const path = "/internal/v1/groups/17/tables/docs/source-plan/control-v1";
+    try std.testing.expect(requiresInternalServicePrincipal(path));
+    try std.testing.expectEqual(@as(?usize, operations.wire.max_bytes), @import("http_routes.zig").publicPostBodyLimit(path));
+    try std.testing.expect(@import("http_routes.zig").publicPostBodyLimit(path ++ "/extra") == null);
+    var fixture = try operations.wire.test_support.Fixture.init();
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = fixture.source_owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    const encoded_fence = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(encoded_fence);
+    var input = try fixture.begin();
+    input.operation = .recover;
+    input.receipt = .{ .term = 2, .index = 3 };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "17" }, .{ .name = "table_name", .value = "docs" } };
+    {
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalSourcePlanControl(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    for ([_]Fake.Mode{ .rejected, .unknown, .malformed, .busy }) |mode| {
+        fake.mode = mode;
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        try request.setHeader(metadata_api.catalog_route_fence_header, encoded_fence);
+        try request.setHeader(internal_service_auth.header_name, token);
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalSourcePlanControl(&context);
+        defer response.deinit();
+        const expected: u16 = switch (mode) {
+            .rejected, .unknown => 200,
+            .malformed, .busy => 503,
+        };
+        try std.testing.expectEqual(expected, response.status.code);
+        if (mode == .rejected) {
+            var parsed = try std.json.parseFromSlice(operations.wire.ControlReply, a, response.body.?, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            const decoded = parsed.value;
+            try decoded.validate(input, try input.digest(a));
+            try std.testing.expect(decoded.confirmed());
+            try std.testing.expectEqual(.conflict, decoded.outcome.?.rejected);
+            try std.testing.expect(response.header(internal_batch_forwarding.outcome_header) == null);
+        } else {
+            try std.testing.expectEqualStrings(internal_batch_forwarding.outcome_unknown_v1, response.header(internal_batch_forwarding.outcome_header).?);
+            if (mode == .unknown) {
+                var parsed = try std.json.parseFromSlice(operations.wire.ControlReply, a, response.body.?, .{ .ignore_unknown_fields = false });
+                defer parsed.deinit();
+                const decoded = parsed.value;
+                try decoded.validate(input, try input.digest(a));
+                try std.testing.expectEqualDeep(input.receipt, decoded.receipt);
+                try std.testing.expect(!decoded.confirmed());
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
+test "history control ingress mounted route rejects unsigned migration traffic" {
+    const a = std.testing.allocator;
+    var source: AuthStatusSource = .{};
+    const secret = "history-control-mounted-test-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api_server);
+    defer server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    for ([_][]const u8{ "control-v1", "page-v1", "bootstrap-page-v1", "grant-v1", "resolution-v1", "publication-v1" }) |leaf| {
+        const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/history/{s}", .{ base, leaf });
+        defer a.free(url);
+        var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+        defer unsigned.deinit();
+        try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
+        const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token } };
+        var authenticated = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
+        defer authenticated.deinit();
+        try std.testing.expectEqual(@as(u16, 400), authenticated.status.code);
+    }
+}
+
+test "history control ingress completion batches reject unsigned migration traffic" {
+    const a = std.testing.allocator;
+    var source: AuthStatusSource = .{};
+    const secret = "completion-batch-migration-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api_server);
+    defer server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/batch-routed-v1", .{base});
+    defer a.free(url);
+    const body = try batch_api.encodeBatchRequest(a, .{ .timestamp_ns = 1, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = @splat(3), .topology_epoch = 1, .completion_owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } } } });
+    defer a.free(body);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const unsigned_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_batch_forwarding.remaining_ms_header, "1000" }, .{ internal_batch_forwarding.forwards_remaining_header, "0" }, .{ internal_batch_forwarding.campaign_allowed_header, "false" } };
+    var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, body, &unsigned_headers, 20);
+    defer unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
+    const signed_headers = unsigned_headers ++ [_][2][]const u8{.{ internal_service_auth.header_name, token }};
+    var signed = try requestWithRetry(&client, client_io.io(), .POST, url, body, &signed_headers, 20);
+    defer signed.deinit();
+    // Reaches the configured writer boundary, which is deliberately absent.
+    try std.testing.expectEqual(@as(u16, 503), signed.status.code);
+    // The older endpoint also decodes canonical private batches. Completion
+    // commands cannot use its optional migration allowance to bypass auth.
+    const legacy_url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/batch", .{base});
+    defer a.free(legacy_url);
+    var legacy_unsigned = try requestWithRetry(&client, client_io.io(), .POST, legacy_url, body, &.{.{ "content-type", "application/json" }}, 20);
+    defer legacy_unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 401), legacy_unsigned.status.code);
+}
+
+test "internal capabilities advertise only the serving history apply profile" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .GET, "http://127.0.0.1/internal/v1/capabilities");
+    defer request.deinit();
+    var context = httpx.Context.init(a, std.testing.io, &request);
+    defer context.deinit();
+    // Capability serving does not depend on a particular hosted table/root.
+    var handler: AntflyApiHandler = undefined;
+    var response = try handler.internalCapabilities(&context);
+    defer response.deinit();
+    const Parsed = struct { data_raft_batch_protocol_version: u16, catalog_route_fence_protocol_version: u16 };
+    var parsed = try std.json.parseFromSlice(Parsed, a, response.body.?, .{});
+    defer parsed.deinit();
+    const protocol = @import("../common/data_raft_protocol.zig");
+    try std.testing.expectEqual(protocol.batch_protocol_version, protocol.maximumForHistoryApply(true));
+    try std.testing.expect(protocol.maximumForHistoryApply(false) < protocol.batch_history_control_protocol_version);
+    const expected = if (@import("storage_source_options").control_only) protocol.batch_protocol_version else protocol.batch_history_control_protocol_version - 1;
+    try std.testing.expectEqual(expected, parsed.value.data_raft_batch_protocol_version);
+    try std.testing.expectEqual(metadata_api.catalog_route_fence_protocol_current, parsed.value.catalog_route_fence_protocol_version);
+}
+
 test "internal namespace requires a service principal except hot standby" {
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/capabilities"));
@@ -385,6 +671,10 @@ fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []cons
 fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const jsonErrorResponse = AntflyApiHandler.jsonErrorResponse;
     return switch (err) {
+        error.Forbidden => jsonErrorResponse(ctx, 403, "schema declaration requires access to its referenced catalog objects"),
+        error.SqlNamedTypeNotFound => jsonErrorResponse(ctx, 400, "referenced SQL type does not exist"),
+        error.CatalogGenerationChanged => jsonErrorResponse(ctx, 409, "referenced catalog definitions changed; refresh and retry"),
+        error.MetadataCapabilityUnavailable => jsonErrorResponse(ctx, 503, "referenced schema capabilities are not active on this deployment"),
         error.InvalidExternalSourceInventory, error.InvalidExternalSourceSnapshot => jsonErrorResponse(ctx, 400, "invalid lake manifest: files require immutable identity, supported format, positive size, and valid inventory metadata"),
         error.ExternalSourceSnapshotTooLarge => jsonErrorResponse(ctx, 400, "lake manifest exceeds supported inventory limits"),
         error.UnsupportedExternalLakeSchemaType => jsonErrorResponse(ctx, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
@@ -934,6 +1224,8 @@ fn fetchAgentUrl(arena: std.mem.Allocator, request_context: managed_embedder.Req
     };
 }
 
+var coordinated_failure_diagnostic_once: std.atomic.Value(bool) = .init(false);
+
 pub const AntflyApiHandler = struct {
     api_server: *ApiHttpServer,
     /// Separate phase admission for H2 query bodies. Slow uploads must not
@@ -1015,17 +1307,23 @@ pub const AntflyApiHandler = struct {
         alloc: std.mem.Allocator,
         server: ?*http_server_mod.ApiHttpServer = null,
         value: @import("../pgwire/completion.zig").Completion = .{},
+        reports_existing_commit: bool = false,
+        reserve_on_prepare: bool = false,
+        control: operation_contract.RequestContext = .{},
         fn prepareTransaction(raw: *anyopaque, id: [16]u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try @import("sql_completion.zig").prepareTransaction(self.server orelse return error.DurabilityUnavailable, self.alloc, &self.value, id);
+            const server = self.server orelse return error.DurabilityUnavailable;
+            const protocol = @import("sql/session/completion.zig");
+            if (self.reserve_on_prepare) try protocol.reserveOnOwnerControlled(server, &self.value, self.control);
+            try protocol.prepareTransactionControlled(server, self.alloc, &self.value, id, self.control);
         }
         fn prepareMetadata(raw: *anyopaque, owner: operation_contract.SQLCompletionOwner) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try @import("sql_completion.zig").prepareMetadata(self.server orelse return error.DurabilityUnavailable, self.alloc, &self.value, owner);
+            try @import("sql/session/completion.zig").prepareMetadata(self.server orelse return error.DurabilityUnavailable, self.alloc, &self.value, owner);
         }
         fn rejectMetadata(raw: *anyopaque, owner: operation_contract.SQLCompletionOwner) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try @import("sql_completion.zig").rejectMetadata(self.server orelse return error.DurabilityUnavailable, self.alloc, &self.value, owner);
+            try @import("sql/session/completion.zig").rejectMetadata(self.server orelse return error.DurabilityUnavailable, self.alloc, &self.value, owner);
         }
         fn destroy(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1050,7 +1348,13 @@ pub const AntflyApiHandler = struct {
         const completion = try requestCompletion(ctx);
         const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
         owned.server = self.api_server;
-        @import("sql_completion.zig").reserveJoined(self.api_server, completion, 3, ctx.io) catch {
+        owned.control = operationContext(ctx, null);
+        if (routes.matchTransactionSessionCommit(path) != null) {
+            owned.reserve_on_prepare = true;
+            return null;
+        }
+        @import("sql/session/completion.zig").reserveJoinedControlled(self.api_server, completion, 3, ctx.io, owned.control) catch |err| {
+            if (err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled) return try sessionInspectionFailure(ctx, err);
             var response = try ctx.status(429).text("SQL completion capacity unavailable; retry after existing work completes");
             errdefer response.deinit();
             try attachSQLCompletion(&response, completion.*);
@@ -1063,7 +1367,9 @@ pub const AntflyApiHandler = struct {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
         try establishExecutionDeadlines(ctx);
-        if (try self.admitCompletion(ctx)) |response| return response;
+        if (!std.mem.eql(u8, http_server_mod.stripApiPrefix(ctx.request.uri.path), "/sql")) {
+            if (try self.admitCompletion(ctx)) |response| return response;
+        }
         var response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         errdefer response.deinit();
         try self.completeSQLResponse(ctx, &response);
@@ -1091,7 +1397,8 @@ pub const AntflyApiHandler = struct {
         // manufacture an unresolved durable owner. Ambiguous 409s stay fenced.
         const code = response.status.code;
         const rejected = code == 400 or code == 401 or code == 403 or code == 404 or code == 405 or code == 413 or code == 415 or code == 422 or code == 429;
-        if (!completion.execution_owned and !rejected and code != 204 and ctx.request.method != .GET) {
+        const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+        if (!owned.reports_existing_commit and !completion.execution_owned and !rejected and code != 204 and ctx.request.method != .GET) {
             if (response.body) |body| {
                 const Summary = struct { status: ?[]const u8 = null, transaction_id: ?[]const u8 = null, code: ?[]const u8 = null };
                 var parsed = std.json.parseFromSlice(Summary, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch null;
@@ -1104,7 +1411,7 @@ pub const AntflyApiHandler = struct {
                 } else completion.unknown = true;
             } else completion.unknown = true;
         }
-        @import("sql_completion.zig").pinJoined(self.api_server, ctx.allocator, completion, ctx.io);
+        @import("sql/session/completion.zig").pinJoinedControlled(self.api_server, ctx.allocator, completion, ctx.io, operationContext(ctx, null));
         try attachSQLCompletion(response, completion.*);
     }
 
@@ -1139,6 +1446,7 @@ pub const AntflyApiHandler = struct {
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
         establishInternalBackupDeadline(ctx);
+        establishInternalPublicationCaptureDeadline(ctx);
         establishInternalOnlineMergeDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
     }
@@ -1219,6 +1527,26 @@ pub const AntflyApiHandler = struct {
             return;
         }
         @import("../request_deadline.zig").tighten(ctx, budget_ms);
+    }
+
+    fn establishInternalPublicationCaptureDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_invalid) return;
+        const wire = @import("logical_replication_capture_worker.zig");
+        const path = ctx.request.uri.path;
+        const snapshot_route = @import("../metadata/replication_initialization_attestation.zig").route;
+        if (!std.mem.eql(u8, path, snapshot_route) and
+            (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
+                !(std.mem.endsWith(u8, path, wire.suffix) or std.mem.endsWith(u8, path, @import("replication_source_apply_attestation.zig").route_suffix)))) return;
+        const raw = ctx.header(wire.budget_header) orelse {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        const budget = std.fmt.parseUnsigned(u32, raw, 10) catch 0;
+        if (budget == 0 or budget > wire.max_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        @import("../request_deadline.zig").tighten(ctx, budget);
     }
 
     fn establishInternalOnlineMergeDeadline(ctx: *httpx.Context) void {
@@ -1546,6 +1874,13 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
+        try server.post("/db/v1/changefeeds", httpx.Handler.bind(self, createChangefeed));
+        try server.get("/db/v1/changefeeds/:feed_id", httpx.Handler.bind(self, inspectChangefeed));
+        try server.delete("/db/v1/changefeeds/:feed_id", httpx.Handler.bind(self, closeChangefeed));
+        try server.get("/db/v1/changefeeds/:feed_id/events", httpx.Handler.bind(self, pullChangefeed));
+        try server.post("/db/v1/changefeeds/:feed_id/ack", httpx.Handler.bind(self, acknowledgeChangefeed));
+        try server.post("/db/v1/changefeeds/:feed_id/renew", httpx.Handler.bind(self, renewChangefeed));
+
         const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1, routes.memory_mcp_v1_agent };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
@@ -1622,7 +1957,64 @@ pub const AntflyApiHandler = struct {
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+            try server.postWithBodyLimit(table_prefix ++ routes.source_retirement_control_suffix, @import("source_retirement_operations.zig").wire.max_request_bytes, httpx.Handler.bind(self, internalSourceRetirementControl))
+        else
+            try server.post(table_prefix ++ routes.source_retirement_control_suffix, httpx.Handler.bind(self, internalSourceRetirementControl));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+            try server.postWithBodyLimit(table_prefix ++ routes.source_scope_control_suffix, @import("source_scope_control_operations.zig").wire.max_request_bytes, httpx.Handler.bind(self, internalSourceScopeControl))
+        else
+            try server.post(table_prefix ++ routes.source_scope_control_suffix, httpx.Handler.bind(self, internalSourceScopeControl));
+        inline for (.{
+            .{ routes.source_plan_control_suffix, internalSourcePlanControl },
+            .{ routes.source_plan_observe_suffix, internalSourcePlanObserve },
+            .{ routes.source_scope_observe_suffix, internalSourceScopeObserve },
+            .{ routes.source_producer_closure_observe_suffix, internalSourceProducerClosureObserve },
+            .{ routes.source_producer_close_suffix, internalSourceProducerClose },
+            .{ routes.legacy_terminal_suffix, internalLegacyTerminal },
+            .{ routes.legacy_inventory_suffix, internalLegacyInventory },
+            .{ routes.source_checkpoint_observe_suffix, internalSourceCheckpointObserve },
+            .{ routes.source_plan_chunk_suffix, internalSourcePlanChunk },
+        }) |route| {
+            if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+                try server.postWithBodyLimit(table_prefix ++ route[0], @import("source_plan_operations.zig").wire.max_bytes, httpx.Handler.bind(self, route[1]))
+            else
+                try server.post(table_prefix ++ route[0], httpx.Handler.bind(self, route[1]));
+        }
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_control_suffix, @import("history_control_operations.zig").wire.max_bytes, httpx.Handler.bind(self, internalHistoryControl));
+        } else try server.post(table_prefix ++ routes.history_control_suffix, httpx.Handler.bind(self, internalHistoryControl));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_page_suffix, @import("history_page_operations.zig").max_request_bytes, httpx.Handler.bind(self, internalHistoryPage));
+        } else try server.post(table_prefix ++ routes.history_page_suffix, httpx.Handler.bind(self, internalHistoryPage));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_bootstrap_page_suffix, @import("history_page_operations.zig").max_bootstrap_request_bytes, httpx.Handler.bind(self, internalHistoryBootstrapPage));
+        } else try server.post(table_prefix ++ routes.history_bootstrap_page_suffix, httpx.Handler.bind(self, internalHistoryBootstrapPage));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_grant_suffix, @import("history_grant_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryGrant));
+        } else try server.post(table_prefix ++ routes.history_grant_suffix, httpx.Handler.bind(self, internalHistoryGrant));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_resolution_suffix, @import("history_resolution_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryResolution));
+        } else try server.post(table_prefix ++ routes.history_resolution_suffix, httpx.Handler.bind(self, internalHistoryResolution));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_decision_suffix, @import("history_decision_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryDecision));
+        } else try server.post(table_prefix ++ routes.history_decision_suffix, httpx.Handler.bind(self, internalHistoryDecision));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_owner_suffix, @import("history_owner_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryOwner));
+        } else try server.post(table_prefix ++ routes.history_owner_suffix, httpx.Handler.bind(self, internalHistoryOwner));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_artifact_suffix, @import("artifact_history_operations.zig").max_bytes, httpx.Handler.bind(self, internalArtifactHistory));
+        } else try server.post(table_prefix ++ routes.history_artifact_suffix, httpx.Handler.bind(self, internalArtifactHistory));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_split_cut_suffix, @import("topology_history_operations.zig").Split.max_bytes, httpx.Handler.bind(self, internalSplitHistoryCut));
+        } else try server.post(table_prefix ++ routes.history_split_cut_suffix, httpx.Handler.bind(self, internalSplitHistoryCut));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_merge_cut_suffix, @import("topology_history_operations.zig").Merge.max_bytes, httpx.Handler.bind(self, internalMergeHistoryCut));
+        } else try server.post(table_prefix ++ routes.history_merge_cut_suffix, httpx.Handler.bind(self, internalMergeHistoryCut));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_publication_suffix, @import("history_publication_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryPublication));
+        } else try server.post(table_prefix ++ routes.history_publication_suffix, httpx.Handler.bind(self, internalHistoryPublication));
         try self.registerInternalSqlRoutes(server);
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
@@ -1634,6 +2026,7 @@ pub const AntflyApiHandler = struct {
             try server.post(table_prefix ++ "/document-read", httpx.Handler.bind(self, internalDocumentRead));
         }
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
+        try server.post(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_suffix, httpx.Handler.bind(self, internalDocumentArtifactManifests));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key" ++ routes.artifacts_marker ++ ":artifact_name", httpx.Handler.bind(self, internalDocumentArtifactManifest));
         try server.get(internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix, httpx.Handler.bind(self, internalRepairCancelState));
@@ -1653,8 +2046,19 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.fk_generation_parent_suffix, httpx.Handler.bind(self, internalGroupFkGenerationParent));
         try server.post(table_prefix ++ routes.fk_generation_source_suffix, httpx.Handler.bind(self, internalGroupFkGenerationSource));
         try server.post(table_prefix ++ routes.fk_initial_child_suffix, httpx.Handler.bind(self, internalGroupFkInitialChild));
+        try server.post(table_prefix ++ routes.relational_index_claims_suffix, httpx.Handler.bind(self, internalGroupRelationalIndexClaims));
+        try server.post(table_prefix ++ routes.relational_index_control_suffix, httpx.Handler.bind(self, internalGroupRelationalIndexControl));
+        try server.post(table_prefix ++ routes.schema_validation_prepare_suffix, httpx.Handler.bind(self, internalGroupSchemaValidationPrepare));
         try server.post(table_prefix ++ routes.row_policy_install_suffix, httpx.Handler.bind(self, internalGroupRowPolicyInstall));
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
+        try server.post(table_prefix ++ @import("logical_replication_capture_worker.zig").suffix, httpx.Handler.bind(self, internalGroupPublicationCapture));
+        try server.post(table_prefix ++ @import("logical_replication_capture_worker.zig").capacity_suffix, httpx.Handler.bind(self, internalGroupPublicationCapacity));
+        try server.post(table_prefix ++ @import("logical_replication_capture_worker.zig").outbox_suffix, httpx.Handler.bind(self, internalGroupPublicationOutbox));
+        try server.post(table_prefix ++ @import("logical_replication_capture_worker.zig").terminal_suffix, httpx.Handler.bind(self, internalGroupPublicationTerminal));
+        try server.post(table_prefix ++ @import("logical_replication_capture_worker.zig").collection_suffix, httpx.Handler.bind(self, internalGroupPublicationCollection));
+        try server.post(table_prefix ++ @import("logical_replication_capture_worker.zig").outbox_page_suffix, httpx.Handler.bind(self, internalGroupPublicationOutboxPage));
+        try server.post(@import("../metadata/replication_initialization_attestation.zig").route, httpx.Handler.bind(self, internalReplicationSnapshotAttestation));
+        try server.post(table_prefix ++ @import("replication_source_apply_attestation.zig").route_suffix, httpx.Handler.bind(self, internalGroupReplicationReceipt));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ "/retained-read", httpx.Handler.bind(self, internalRetainedRead));
         try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
@@ -1664,6 +2068,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.graph_hydrate_suffix, httpx.Handler.bind(self, internalGraphHydrate));
         try server.post(table_prefix ++ routes.graph_edges_suffix, httpx.Handler.bind(self, internalGraphEdges));
         try server.post(table_prefix ++ routes.graph_edges_batch_suffix, httpx.Handler.bind(self, internalGraphEdges));
+        try server.post(table_prefix ++ routes.sql_maintenance_suffix, httpx.Handler.bind(self, internalSqlMaintenance));
         try server.post(table_prefix ++ routes.graph_metric_maintenance_suffix, httpx.Handler.bind(self, internalGraphMetricMaintenance));
         try server.post(table_prefix ++ routes.resolver_operation_suffix, httpx.Handler.bind(self, internalResolverOperation));
         try server.post(table_prefix ++ routes.text_stats_suffix, httpx.Handler.bind(self, internalTextStats));
@@ -1883,6 +2288,31 @@ pub const AntflyApiHandler = struct {
         txn_id: db_mod.types.TxnId,
         body: []const u8,
     ) !?httpx.Response {
+        if (ctx.request.method == .GET or ctx.header("X-Antfly-SQL-Fence") == null)
+            return self.forwardResolvedTransactionSession(ctx, txn_id, body, .lookup, null);
+        if (self.api_server.cfg.session_router == null or !self.api_server.hasSessionForwardTransport()) return null;
+        const owner = self.runDurableSQLRouting(ctx.io, ApiHttpServer.sessionRoutingOwner, .{ self.api_server, txn_id, operationContext(ctx, null) }) catch |err| switch (err) {
+            error.SqlWriteCapacityUnavailable => return try sqlRoutingOverloadedResponse(ctx),
+            error.DeadlineExceeded => return try sqlForwardDeadlineResponse(ctx),
+            else => return err,
+        };
+        return self.forwardResolvedTransactionSession(ctx, txn_id, body, .{ .resolved = owner }, null) catch |err| {
+            if ((try requestCompletion(ctx)).unknown) return try sqlForwardOutcomeUnknownResponse(ctx);
+            if (err == error.SqlWriteCapacityUnavailable) return try sqlRoutingOverloadedResponse(ctx);
+            if (err == error.SqlPeerUnavailable) return try sqlPeerUnavailableResponse(ctx);
+            if (err == error.DeadlineExceeded) return try sqlForwardDeadlineResponse(ctx);
+            return err;
+        };
+    }
+
+    fn forwardResolvedTransactionSession(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        txn_id: db_mod.types.TxnId,
+        body: []const u8,
+        owner: http_server_mod.ApiHttpServer.SessionForwardOwner,
+        preparation: ?*http_server_mod.RequestAdmission.Lease,
+    ) !?httpx.Response {
         const method: contextual_operations.Method = switch (ctx.request.method) {
             .GET => .get,
             .POST => .post,
@@ -1890,36 +2320,112 @@ pub const AntflyApiHandler = struct {
             .DELETE => .delete,
             else => return error.UnsupportedMethod,
         };
-        var response = (try self.api_server.forwardSessionOperation(txn_id, .{
+        const target = try ctx.request.uri.requestPath(ctx.allocator);
+        defer ctx.allocator.free(target);
+        var request: http_server_mod.ApiHttpServer.SessionForwardRequest = .{
             .method = method,
-            .target = ctx.request.uri.raw,
+            .target = target,
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
             .sql_fence = ctx.header("X-Antfly-SQL-Fence"),
+            .owner = owner,
             .content_type = ctx.header("content-type"),
             .body = body,
-        })) orelse return null;
+        };
+        var response = (if (owner == .resolved) routed: {
+            const router = self.api_server.cfg.session_router orelse return null;
+            if (!self.api_server.hasSessionForwardTransport()) return null;
+            const node = owner.resolved orelse if (self.api_server.txn_sessions.durableMissIsAuthoritative()) return null else transactions_api.sessionOwnerNodeId(txn_id);
+            if (node == 0 or node == router.localNodeId()) return null;
+            if (isSqlPeerHop(ctx)) return try sqlOwnerChangedResponse(ctx);
+            const cancellation = requestCancellation(ctx);
+            const deadline = @import("../request_deadline.zig").platformDeadline(ctx);
+            var state: http_server_mod.ApiHttpServer.SQLSessionForwardState = .{
+                .control = .{ .deadline_ns = deadline, .cancellation = &cancellation },
+                .propagate_execution_deadline = deadline != null and std.mem.startsWith(u8, http_server_mod.stripApiPrefix(ctx.request.uri.path), "/transactions/"),
+            };
+            const endpoint = try self.runDurableSQLRouting(ctx.io, ApiHttpServer.resolveSqlPeerEndpoint, .{ self.api_server, node, operationContext(ctx, null) });
+            defer if (endpoint) |uri| self.api_server.alloc.free(uri);
+            state.endpoint_resolved = true;
+            state.endpoint = endpoint;
+            request.sql = &state;
+            state.needs_adoption = endpoint == null;
+            const result: anyerror!?contextual_operations.OwnedResponse = if (endpoint == null) error.SqlPeerUnavailable else self.runSQLForwarding(ctx.io, preparation, &state.control, http_server_mod.ApiHttpServer.forwardSessionOperation, .{ self.api_server, txn_id, request });
+            if (state.needs_adoption and !cancellation.isCancelled()) {
+                const adopted = self.runDurableSQLRouting(ctx.io, http_server_mod.ApiHttpServer.adoptRoutedSQLSession, .{ self.api_server, txn_id, operationContext(ctx, null) }) catch |err| {
+                    if (state.attempted) {
+                        (try requestCompletion(ctx)).unknown = true;
+                        return if (result) |_| err else |transport_err| transport_err;
+                    }
+                    if (result) |_| {} else |transport_err| {
+                        if (transport_err == error.SqlPeerUnavailable) return transport_err;
+                    }
+                    return err;
+                };
+                if (adopted and !state.attempted) return null;
+            }
+            if (state.attempted) (try requestCompletion(ctx)).unknown = true;
+            break :routed try result;
+        } else try self.api_server.forwardSessionOperation(txn_id, request)) orelse return null;
         return try respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
     }
 
-    fn forwardSQLResource(self: *AntflyApiHandler, ctx: *httpx.Context, id: []const u8, kind: @import("sql_resource_routing.zig").Kind, body: []const u8) !?httpx.Response {
+    fn forwardSQLResource(self: *AntflyApiHandler, ctx: *httpx.Context, id: []const u8, kind: @import("sql/execution/resource_routing.zig").Kind, body: []const u8, resolved_owner: ?u64, preparation: ?*http_server_mod.RequestAdmission.Lease) !?httpx.Response {
+        const router = self.api_server.cfg.session_router orelse return null;
+        var owner = resolved_owner orelse try @import("sql/execution/resource_routing.zig").owner(id);
+        if (owner == 0 or owner == router.localNodeId()) return null;
+        if (resolved_owner == null and self.api_server.txn_sessions.durable != null) {
+            const index: usize = if (kind == .prepared) 0 else 1;
+            var handles: [3]?[]const u8 = @splat(null);
+            var owners: SQLRouteOwners = .{ .handles = @splat(null) };
+            handles[index] = id;
+            owners.handles[index] = owner;
+            owners = self.runDurableSQLRouting(ctx.io, resolveSqlRouteOwners, .{ self.api_server, handles, owners, operationContext(ctx, null) }) catch |err| switch (err) {
+                error.SqlWriteCapacityUnavailable => return try sqlRoutingOverloadedResponse(ctx),
+                error.DeadlineExceeded => return try sqlForwardDeadlineResponse(ctx),
+                else => return err,
+            };
+            owner = owners.handles[index].?;
+            if (owner == router.localNodeId()) return null;
+        }
+        if (isSqlPeerHop(ctx)) return try sqlOwnerChangedResponse(ctx);
         var headers: std.ArrayList(http_common.RequestHeader) = .empty;
         defer headers.deinit(ctx.allocator);
         const limits = @import("antfly_public_limits").Execution;
-        for ([_][]const u8{ http_server_mod.trusted_principal_header, "X-Antfly-SQL-Fence", "X-Antfly-SQL-Resource-Hop", "x-antfly-sql-connection-id", limits.timeout_header, limits.scan_rows_header, limits.memory_header, limits.spill_header }) |name| {
+        for ([_][]const u8{ http_server_mod.trusted_principal_header, "X-Antfly-SQL-Fence", ApiHttpServer.sql_peer_hop_header, "x-antfly-sql-connection-id", limits.timeout_header, limits.scan_rows_header, limits.memory_header, limits.spill_header }) |name| {
             if (ctx.header(name)) |value| try headers.append(ctx.allocator, .{ .name = name, .value = value });
         }
         const completion = try requestCompletion(ctx);
         var forwarded = false;
-        var response = self.api_server.forwardSQLResourceOperation(id, kind, .{ .method = switch (ctx.request.method) {
+        const target = try ctx.request.uri.requestPath(ctx.allocator);
+        defer ctx.allocator.free(target);
+        const request: http_common.HttpRequest = .{ .method = switch (ctx.request.method) {
             .GET => .GET,
             .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
             else => return error.UnsupportedMethod,
-        }, .uri = ctx.request.uri.raw, .headers = headers.items, .authorization = ctx.header("authorization"), .content_type = ctx.header("content-type"), .body = body }, &forwarded) catch |err| {
-            if (forwarded) completion.unknown = true;
-            if (err == error.SqlConnectionWrongOwner) return try rejectBeforeSQLExecution(ctx, try ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "08003", .message = "SQL resources must have the same issuing node" }));
+        }, .uri = target, .headers = headers.items, .authorization = ctx.header("authorization"), .content_type = ctx.header("content-type"), .body = body };
+        const cancellation = requestCancellation(ctx);
+        var control: http_server_mod.ApiHttpServer.SQLForwardControl = .{
+            .deadline_ns = @import("../request_deadline.zig").platformDeadline(ctx),
+            .cancellation = &cancellation,
+        };
+        const endpoint = (self.runDurableSQLRouting(ctx.io, ApiHttpServer.resolveSqlPeerEndpoint, .{ self.api_server, owner, operationContext(ctx, null) }) catch |err| switch (err) {
+            error.SqlWriteCapacityUnavailable => return try sqlRoutingOverloadedResponse(ctx),
+            error.DeadlineExceeded => return try sqlForwardDeadlineResponse(ctx),
+            else => return err,
+        }) orelse return try sqlPeerUnavailableResponse(ctx);
+        defer self.api_server.alloc.free(endpoint);
+        var response = self.runSQLForwarding(ctx.io, preparation, &control, ApiHttpServer.forwardSQLResourceToEndpoint, .{ self.api_server, endpoint, request, &forwarded, &control }) catch |err| {
+            if (forwarded) {
+                completion.unknown = true;
+                return try sqlForwardOutcomeUnknownResponse(ctx);
+            }
+            if (err == error.SqlWriteCapacityUnavailable) return try sqlRoutingOverloadedResponse(ctx);
+            if (err == error.SqlPeerUnavailable) return try sqlPeerUnavailableResponse(ctx);
+            if (err == error.DeadlineExceeded) return try sqlForwardDeadlineResponse(ctx);
+            if (err == error.SqlConnectionWrongOwner) return try sqlOwnerChangedResponse(ctx);
             return err;
         };
         if (response) |*owned| {
@@ -2623,6 +3129,11 @@ pub const AntflyApiHandler = struct {
             },
             .reject_unrouted_batch = self.api_server.cfg.routed_raft_batch_writer != null,
             .routed_raft_batch_writer = self.api_server.cfg.routed_raft_batch_writer,
+            .sql_lock_validator = .{ .ptr = self.api_server, .check = struct {
+                fn check(raw: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, group: u64, table: []const u8, command: @import("antfly_local_sources").storage_pessimistic_lock_control.Command) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
+                    return @import("sql/session/data_locks.zig").authorize(@ptrCast(@alignCast(raw)), a, context, group, table, command);
+                }
+            }.check },
             .txn_validator = .{
                 .ptr = self.api_server,
                 .validate_fn = struct {
@@ -2710,6 +3221,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (@import("external_transaction_errors.zig").classify(err)) |reason| return textResponse(ctx, 409, @errorName(reason));
         if (@import("relational_row_errors.zig").classify(err)) |reason| return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (err == error.RestoreStagingInProgress) return textResponse(ctx, 503, "RestoreStagingInProgress");
         if (@import("relational_integrity_errors.zig").classify(err)) |reason| return textResponse(ctx, 409, @errorName(reason));
@@ -2769,6 +3281,176 @@ pub const AntflyApiHandler = struct {
         return ctx.json(progress);
     }
 
+    fn internalReplicationSnapshotAttestation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const wire = @import("../metadata/replication_initialization_attestation.zig");
+        if (ctx.application_deadline_invalid or ctx.application_deadline_ns == null) return textResponse(ctx, 400, "invalid snapshot attestation deadline");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "snapshot attestation request required");
+        if (body.len > wire.max_request_bytes) return textResponse(ctx, 413, "snapshot attestation request too large");
+        const parsed = std.json.parseFromSlice(wire.Expected, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid snapshot attestation request");
+        defer parsed.deinit();
+        parsed.value.validate() catch return textResponse(ctx, 400, "invalid snapshot attestation request");
+        const driver = self.api_server.cfg.replication_snapshot_signer orelse return textResponse(ctx, 503, "snapshot attestation unavailable");
+        var context = operationContext(ctx, null);
+        context.setting_admin = true;
+        const proof = driver.sign(driver.ptr, ctx.allocator, parsed.value, context) catch |err| return switch (err) {
+            error.Forbidden => textResponse(ctx, 403, "snapshot attestation authority refused"),
+            error.CatalogGenerationChanged => textResponse(ctx, 409, "snapshot attestation realm changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "snapshot attestation canceled"),
+            error.DeadlineExceeded, error.Timeout => textResponse(ctx, 504, "snapshot attestation deadline exceeded"),
+            else => textResponse(ctx, 503, "snapshot attestation unavailable"),
+        };
+        return ctx.json(proof);
+    }
+
+    fn internalGroupReplicationReceipt(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const wire = @import("replication_source_apply_attestation.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "replication receipt request required");
+        if (body.len > wire.max_request_bytes) return textResponse(ctx, 413, "replication receipt request too large");
+        const parsed = std.json.parseFromSlice(wire.Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid replication receipt request");
+        defer parsed.deinit();
+        const request = parsed.value;
+        request.validate() catch return textResponse(ctx, 400, "invalid replication receipt request");
+        if (request.permit().owner_group_id != params.group_id) return textResponse(ctx, 409, "replication owner changed");
+        const driver = self.api_server.cfg.replication_receipt_driver orelse return textResponse(ctx, 503, "replication owner unavailable");
+        var context = operationContext(ctx, null);
+        context.setting_admin = true;
+        const result = driver.observe(driver.ptr, ctx.allocator, params.table_name, request, context) catch |err| return switch (err) {
+            error.Forbidden => textResponse(ctx, 403, "replication receipt authority refused"),
+            error.InvalidReplicationCutoverIntent => textResponse(ctx, 400, "invalid replication receipt request"),
+            error.ReplicationCutoverAuthorityLost, error.IdentityNamespaceMismatch => textResponse(ctx, 409, "replication owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "replication receipt canceled"),
+            error.DeadlineExceeded, error.Timeout => textResponse(ctx, 504, "replication receipt deadline exceeded"),
+            else => textResponse(ctx, 503, "replication receipt unavailable"),
+        };
+        return ctx.json(result);
+    }
+
+    fn internalGroupPublicationCapacity(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupPublicationReceipt(ctx, .capacity);
+    }
+
+    fn internalGroupPublicationOutbox(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupPublicationReceipt(ctx, .outbox);
+    }
+
+    fn internalGroupPublicationTerminal(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupPublicationReceipt(ctx, .terminal);
+    }
+
+    fn internalGroupPublicationReceipt(self: *AntflyApiHandler, ctx: *httpx.Context, comptime kind: enum { capacity, outbox, terminal }) !httpx.Response {
+        const capacity = kind == .capacity;
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const wire = @import("logical_replication_capture_worker.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "publication capacity request required");
+        if (body.len > (if (capacity) wire.max_capacity_request_bytes else wire.max_outbox_request_bytes)) return textResponse(ctx, 413, "publication receipt request too large");
+        const Input = if (capacity) wire.Capacity.Request else wire.Capacity.Observation;
+        const parsed = std.json.parseFromSlice(Input, ctx.allocator, body, .{ .parse_numbers = false }) catch return textResponse(ctx, 400, "invalid publication receipt request");
+        defer parsed.deinit();
+        const demand = if (capacity) parsed.value.demand else parsed.value;
+        if (demand.owner_group_id != params.group_id) return textResponse(ctx, 409, "publication capture owner changed");
+        const driver = self.api_server.cfg.publication_capture_driver orelse return textResponse(ctx, 503, "publication owner unavailable");
+        const observe = (switch (kind) {
+            .capacity => driver.observe_capacity,
+            .outbox => driver.observe_outbox,
+            .terminal => driver.observe_terminal,
+        }) orelse return textResponse(ctx, 503, "publication receipt unavailable");
+        var context = operationContext(ctx, null);
+        context.setting_admin = true;
+        const receipt = observe(driver.ptr, ctx.allocator, params.table_name, parsed.value, context) catch |err| return switch (err) {
+            error.Forbidden => textResponse(ctx, 403, "publication capture authority refused"),
+            error.InvalidLogicalCaptureControl => textResponse(ctx, 400, "invalid publication capacity request"),
+            error.LogicalCaptureControlChanged, error.IdentityNamespaceMismatch => textResponse(ctx, 409, "publication capture owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "publication capacity canceled"),
+            error.DeadlineExceeded, error.Timeout => textResponse(ctx, 504, "publication capacity deadline exceeded"),
+            else => textResponse(ctx, 503, "publication capacity pending"),
+        };
+        return ctx.json(receipt);
+    }
+
+    fn internalGroupPublicationCapture(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupPublicationOwnerControl(ctx, false);
+    }
+
+    fn internalGroupPublicationCollection(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupPublicationOwnerControl(ctx, true);
+    }
+
+    fn internalGroupPublicationOutboxPage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const wire = @import("logical_replication_capture_worker.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "outbox page request required");
+        if (body.len > wire.max_collection_request_bytes) return textResponse(ctx, 413, "outbox page request too large");
+        const parsed = std.json.parseFromSlice(wire.OutboxPageRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid outbox page request");
+        defer parsed.deinit();
+        if (parsed.value.access.reference.group_id != params.group_id) return textResponse(ctx, 409, "publication owner changed");
+        const driver = self.api_server.cfg.publication_capture_driver orelse return textResponse(ctx, 503, "publication owner unavailable");
+        const read = driver.read_page orelse return textResponse(ctx, 503, "publication outbox unavailable");
+        var context = operationContext(ctx, null);
+        context.setting_admin = true;
+        const bytes = read(driver.ptr, ctx.allocator, params.table_name, parsed.value, context) catch |err| return switch (err) {
+            error.Forbidden, error.ReplicationSlotNotFound, error.ReplicationSlotLeaseChanged => textResponse(ctx, 403, "outbox page authority refused"),
+            error.InvalidLogicalPublisher, error.InvalidLogicalOutbox => textResponse(ctx, 400, "invalid outbox page request"),
+            error.IdentityNamespaceMismatch => textResponse(ctx, 409, "publication owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "outbox page canceled"),
+            error.DeadlineExceeded, error.Timeout => textResponse(ctx, 504, "outbox page deadline exceeded"),
+            else => textResponse(ctx, 503, "outbox page unavailable"),
+        };
+        errdefer ctx.allocator.free(bytes);
+        try ctx.setHeader("content-type", "application/octet-stream");
+        _ = ctx.response.bodyOwned(ctx.allocator, bytes);
+        return ctx.response.build();
+    }
+
+    fn internalGroupPublicationOwnerControl(self: *AntflyApiHandler, ctx: *httpx.Context, comptime collection: bool) !httpx.Response {
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const wire = @import("logical_replication_capture_worker.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "publication capture request required");
+        if (body.len > (if (collection) wire.max_collection_request_bytes else wire.max_request_bytes)) return textResponse(ctx, 413, "publication capture request too large");
+        const Input = if (collection) wire.Publisher.GcPermission else wire.Capture.Request;
+        const parsed = std.json.parseFromSlice(Input, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid publication capture request");
+        defer parsed.deinit();
+        const group = if (collection) parsed.value.debt.reference.group_id else wire.ownerGroup(parsed.value) catch return textResponse(ctx, 400, "invalid publication capture scope");
+        if (group != params.group_id) return textResponse(ctx, 409, "publication capture owner changed");
+        const driver = self.api_server.cfg.publication_capture_driver orelse return textResponse(ctx, 503, "publication owner unavailable");
+        var context = operationContext(ctx, null);
+        context.setting_admin = true;
+        const execute = if (collection) driver.collect orelse return textResponse(ctx, 503, "publication collection unavailable") else driver.execute;
+        const result = execute(driver.ptr, ctx.allocator, params.table_name, parsed.value, context) catch |err| return switch (err) {
+            error.Forbidden => textResponse(ctx, 403, "publication capture authority refused"),
+            error.InvalidLogicalCaptureControl => textResponse(ctx, 400, "invalid publication capture request"),
+            error.LogicalCaptureControlChanged, error.IdentityNamespaceMismatch => textResponse(ctx, 409, "publication capture owner changed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "publication capture canceled"),
+            error.DeadlineExceeded, error.Timeout => textResponse(ctx, 504, "publication capture deadline exceeded"),
+            else => textResponse(ctx, 503, "publication capture outcome pending"),
+        };
+        return ctx.json(result);
+    }
+
     fn internalGroupOnlineMergeIo(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
@@ -2809,7 +3491,13 @@ pub const AntflyApiHandler = struct {
         const result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| {
             if (restore_owner_diagnostic_gate.admit(platform_time.monotonicNs()))
                 std.log.warn("restore owner failed action={s} group_id={d} class={s}", .{ @tagName(parsed.value.action), params.group_id, @errorName(err) });
-            if (@import("restore_source_errors.zig").permanent(err)) return textResponse(ctx, 422, "restore source integrity validation failed");
+            const source_errors = @import("restore_source_errors.zig");
+            if (parsed.value.scope.rewrite != null and source_errors.normalizeForTarget(err, .schema_rewrite) == error.ConstraintActivationFailed) {
+                const failure = try std.json.Stringify.valueAlloc(ctx.allocator, source_errors.OwnerFailure{ .protocol = "restore-owner-error-v1", .code = .constraint_validation_failed }, .{});
+                defer ctx.allocator.free(failure);
+                return jsonResponse(ctx, 422, failure);
+            }
+            if (source_errors.permanent(err)) return textResponse(ctx, 422, "restore source integrity validation failed");
             return switch (err) {
                 error.InvalidRestoreStagingCommand, error.RestoreSourceProofMissing, error.InvalidBackupArtifactPath => textResponse(ctx, 400, "invalid restore source proof"),
                 error.RestoreStagingScopeChanged, error.BackupArtifactIntegrityMismatch, error.BackupSealMismatch => textResponse(ctx, 409, "restore owner or artifact changed"),
@@ -2873,6 +3561,7 @@ pub const AntflyApiHandler = struct {
         const port = self.api_server.cfg.fk_generation_source orelse return textResponse(ctx, 503, "FK generation source unavailable");
         const receipt = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
             error.GenerationAdmissionChanged, error.IntegrityTopologyChanged, error.IdentityNamespaceMismatch, error.InvalidGenerationPublication => textResponse(ctx, 409, "FK generation source plan or owner changed"),
+            error.TransactionTopologyBusy => jsonResponse(ctx, 503, publication.source_draining_error_json),
             error.Canceled, error.Cancelled => textResponse(ctx, 408, "FK generation source canceled"),
             else => textResponse(ctx, 503, "FK generation source must be retried"),
         };
@@ -2895,6 +3584,118 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 503, "initial FK child must be retried"),
         };
         return ctx.json(receipt);
+    }
+
+    fn internalGroupRelationalIndexClaims(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupRelationalIndexOwner(ctx, true);
+    }
+
+    fn internalGroupRelationalIndexControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalGroupRelationalIndexOwner(ctx, false);
+    }
+
+    fn internalGroupRelationalIndexOwner(self: *AntflyApiHandler, ctx: *httpx.Context, comptime claims: bool) !httpx.Response {
+        // No tokenless migration exception for private index mutations.
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const execution = @import("relational_index/owner_execution.zig");
+        const budget_header = ctx.header(if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header) orelse return textResponse(ctx, 400, "private index operation budget required");
+        const budget_ms = std.fmt.parseUnsigned(u32, budget_header, 10) catch return textResponse(ctx, 400, "invalid private index operation budget");
+        if (budget_ms == 0 or budget_ms > execution.max_claim_budget_ms) return textResponse(ctx, 400, "invalid private index operation budget");
+        var context = operationContext(ctx, null).platformDeadline() catch return textResponse(ctx, 408, "private index operation deadline expired");
+        const deadline = platform_time.monotonicNs() +| @as(u64, budget_ms) * std.time.ns_per_ms;
+        context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        context.deadline_io = null;
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "private index operation required");
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        if (body.len > (if (claims) native.max_claim_wire_bytes else execution.max_control_request_bytes)) return textResponse(ctx, 413, "private index operation too large");
+        var parsed = std.json.parseFromSlice(if (claims) execution.ClaimRequest else execution.Request, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return switch (err) {
+            error.OutOfMemory => textResponse(ctx, 503, "private index operation decoder unavailable"),
+            else => textResponse(ctx, 400, "invalid private index operation"),
+        };
+        defer parsed.deinit();
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid private index operation scope");
+        const port = (if (claims) self.api_server.cfg.relational_index_claims else self.api_server.cfg.relational_index_control) orelse return textResponse(ctx, 503, "private index owner receiver unavailable");
+        var result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, context) catch |err| return switch (err) {
+            error.UnsupportedNativeIndexOwner => textResponse(ctx, 501, @errorName(err)),
+            error.UniqueConstraintViolation => textResponse(ctx, 409, @errorName(err)),
+            error.GenerationPublicationChanged, error.PrivateIndexOwnerJobChanged, error.PrivateIndexPublicationCanceled => textResponse(ctx, 409, @errorName(err)),
+            error.Canceled, error.Cancelled, error.DeadlineExceeded => textResponse(ctx, 408, @errorName(err)),
+            else => textResponse(ctx, 503, @errorName(err)),
+        };
+        defer result.deinit();
+        return ctx.json(if (claims) result.response() else try result.response());
+    }
+
+    fn internalGroupSchemaValidationPrepare(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+        defer service.deinit(self.api_server.alloc);
+        if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const preparation = @import("schema_validation/preparation.zig");
+        const budget_header = ctx.header(preparation.remaining_ms_header) orelse return textResponse(ctx, 400, "schema preparation budget required");
+        const budget_ms = std.fmt.parseUnsigned(u32, budget_header, 10) catch return textResponse(ctx, 400, "invalid schema preparation budget");
+        if (budget_ms == 0 or budget_ms > preparation.max_budget_ms) return textResponse(ctx, 400, "invalid schema preparation budget");
+        var context = operationContext(ctx, null).platformDeadline() catch return textResponse(ctx, 408, "schema preparation deadline expired");
+        const deadline = platform_time.monotonicNs() +| @as(u64, budget_ms) * std.time.ns_per_ms;
+        context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        context.deadline_io = null;
+        context.schema_validation_authority = true;
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "schema preparation required");
+        if (body.len == 0 or body.len > preparation.max_request_bytes) return textResponse(ctx, 413, "schema preparation too large");
+        var parsed = std.json.parseFromSlice(preparation.Request, ctx.allocator, body, .{ .ignore_unknown_fields = false }) catch |err| return switch (err) {
+            error.OutOfMemory => textResponse(ctx, 503, @errorName(err)),
+            else => self.internalGroupTableRetirementPrepare(ctx, params.group_id, params.table_name, body, context),
+        };
+        defer parsed.deinit();
+        parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid schema preparation scope");
+        const port = self.api_server.cfg.schema_validation_preparation orelse return textResponse(ctx, 503, "schema preparation unavailable");
+        const bytes = port.prepare(ctx.allocator, params.group_id, params.table_name, parsed.value, context) catch |err| return switch (err) {
+            error.Canceled, error.Cancelled, error.DeadlineExceeded => textResponse(ctx, 408, @errorName(err)),
+            error.Forbidden => textResponse(ctx, 403, @errorName(err)),
+            error.InvalidSchemaValidationJob, error.InvalidNullabilityProjection => textResponse(ctx, 400, @errorName(err)),
+            error.MetadataIncarnationMismatch, error.SchemaValidationJobChanged, error.IntegrityCatalogChanged, error.IntegrityTopologyBusy, error.IdentityNamespaceMismatch => textResponse(ctx, 409, @errorName(err)),
+            else => textResponse(ctx, 503, @errorName(err)),
+        };
+        errdefer ctx.allocator.free(bytes);
+        try ctx.setHeader("content-type", "application/octet-stream");
+        _ = ctx.response.bodyOwned(ctx.allocator, bytes);
+        return ctx.response.build();
+    }
+
+    fn internalGroupTableRetirementPrepare(self: *AntflyApiHandler, ctx: *httpx.Context, group: u64, table: []const u8, body: []const u8, authenticated: operation_contract.RequestContext) !httpx.Response {
+        const preparation = @import("table_retirement_preparation.zig");
+        if (!authenticated.schema_validation_authority) return textResponse(ctx, 403, "internal preparation authority required");
+        if (body.len > preparation.max_request_bytes) return textResponse(ctx, 413, "retirement preparation too large");
+        var parsed = std.json.parseFromSlice(struct { retirement: preparation.Request }, ctx.allocator, body, .{ .ignore_unknown_fields = false }) catch |err| return switch (err) {
+            error.OutOfMemory => textResponse(ctx, 503, @errorName(err)),
+            else => textResponse(ctx, 400, "invalid schema preparation"),
+        };
+        defer parsed.deinit();
+        parsed.value.retirement.validate(group) catch return textResponse(ctx, 400, "invalid retirement preparation scope");
+        // This alternative is reachable only after the existing preparation
+        // route authenticated an internal service and bounded its deadline.
+        var context = authenticated;
+        context.setting_admin = true;
+        context.schema_validation_authority = true;
+        context.fk_generation_publication_authority = true;
+        const bytes = self.api_server.prepareTableRetirementOwner(ctx.allocator, group, table, parsed.value.retirement, context) catch |err| return switch (err) {
+            error.Canceled, error.Cancelled, error.DeadlineExceeded => textResponse(ctx, 408, @errorName(err)),
+            error.Forbidden => textResponse(ctx, 403, @errorName(err)),
+            error.InvalidCatalogRecord, error.InvalidTableRetirementManifest, error.InvalidScopeRetirement => textResponse(ctx, 400, @errorName(err)),
+            error.MetadataIncarnationMismatch, error.CatalogGenerationChanged, error.GenerationRetirementChanged, error.IntegrityCatalogChanged, error.IntegrityTopologyBusy, error.IdentityNamespaceMismatch, error.SqlRelationOwnerChanged => textResponse(ctx, 409, @errorName(err)),
+            else => textResponse(ctx, 503, @errorName(err)),
+        };
+        errdefer ctx.allocator.free(bytes);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.bodyOwned(ctx.allocator, bytes);
+        return ctx.response.build();
     }
 
     fn internalGroupRowPolicyInstall(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3022,21 +3823,34 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing document read body");
         var input = std.json.parseFromSlice(@import("http_routes.zig").DocumentReadRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid document read body");
         defer input.deinit();
+        input.value.requireShape() catch return textResponse(ctx, 400, "invalid document read selectors");
         const key = input.value.decodeKey(ctx.allocator) catch |err| {
             if (err == error.OutOfMemory) return err;
             return textResponse(ctx, 400, "invalid document read key");
         };
         defer ctx.allocator.free(key);
-        if (input.value.query.len > @import("antfly_public_limits").max_request_body_bytes) return textResponse(ctx, 400, "document read exceeds byte limit");
+        if (input.value.query.len > @import("antfly_public_limits").max_document_read_query_bytes) return textResponse(ctx, 400, "document read exceeds byte limit");
+        // Lookup has its own selector/RLS admission below. Manifest reads
+        // must authenticate the same final-body owner grant before routing.
+        var manifest_context = operationContext(ctx, null);
+        if (input.value.operation != .lookup) {
+            if (input.value.query.len != 0) return textResponse(ctx, 400, "manifest query controls are not allowed");
+            if (manifest_context.catalog_route_fence_json.len != 0) {
+                const fence = try std.json.parseFromSliceLeaky(metadata_api.CatalogRouteFence, ctx.allocator, manifest_context.catalog_route_fence_json, .{});
+                if (fence.route.group_id != params.group_id) return textResponse(ctx, 400, "catalog route group mismatch");
+                const owned = try self.nativeRelationOwnerFence(ctx, fence, body, .read);
+                manifest_context.sql_relation_owner = owned.admission_sql_relation_owner;
+            }
+        }
         switch (input.value.operation) {
             .lookup => return self.internalGroupLookupKey(ctx, params.group_id, params.table_name, key, input.value.query),
             .manifest => {
-                var result = self.internalGroupOperations().documentArtifactManifest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, key, input.value.artifact_name) catch |err| return internalGroupErrorResponse(ctx, err);
+                var result = self.internalGroupOperations().documentArtifactManifest(ctx.allocator, manifest_context, params.group_id, params.table_name, key, input.value.artifact_name) catch |err| return internalGroupErrorResponse(ctx, err);
                 defer result.deinit(ctx.allocator);
                 return ctx.json(result);
             },
             .manifests => {
-                var result = self.internalGroupOperations().documentArtifactManifests(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, key) catch |err| return internalGroupErrorResponse(ctx, err);
+                var result = self.internalGroupOperations().documentArtifactManifests(ctx.allocator, manifest_context, params.group_id, params.table_name, key) catch |err| return internalGroupErrorResponse(ctx, err);
                 defer result.deinit(ctx.allocator);
                 return ctx.json(result);
             },
@@ -3056,7 +3870,46 @@ pub const AntflyApiHandler = struct {
     fn internalGroupLookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, group_id: u64, table_name: []const u8, key: []const u8, query: []const u8) !httpx.Response {
         var lookup_options = http_route_helpers.parseInternalLookupOptions(ctx.allocator, query) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
-        if (lookup_options.opts.privacy_original or std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
+        if (ctx.request.method == .POST and !@import("http_routes.zig").isInternalDocumentReadPath(ctx.request.uri.path)) {
+            const token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+            // Two spellings must not disagree about which control is routed.
+            if (lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_action or
+                lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0 or
+                lookup_options.opts.relational_index_status_json.len != 0 or (lookup_options.opts.sql_lock_query_json.len != 0 or lookup_options.opts.group_source_query_json.len != 0))
+                return textResponse(ctx, 400, "ambiguous lookup controls");
+            const body = (try ctx.body()) orelse return textResponse(ctx, 400, "lookup control body required");
+            if (body.len == 0 or body.len > @import("antfly_local_sources").storage_db_relational_integrity_contract.max_preparation_bytes)
+                return textResponse(ctx, 413, "lookup control body too large");
+            // Context owns these bytes through dispatch; OwnedLookupOptions
+            // only frees query buffers that it allocated itself.
+            lookup_options.opts.relational_integrity_jobs_json = body;
+        }
+        const policy_authority = @import("../usermgr/mod.zig").row_policy_authority;
+        const policy_token = ctx.header(policy_authority.principal_header);
+        const policy_database = ctx.header(policy_authority.database_header);
+        var decoded_policy_database: ?[]u8 = null;
+        defer if (decoded_policy_database) |value| ctx.allocator.free(value);
+        if (policy_token != null or policy_database != null) {
+            // A legacy unauthenticated internal route must not turn a user
+            // capability into an unfiltered integrity observation.
+            const service_token = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var service_identity = self.api_server.authenticateInternalServiceRequest(service_token) catch return unauthorizedResponse(ctx);
+            defer service_identity.deinit(self.api_server.alloc);
+            if (!service_identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+            const token = policy_token orelse return textResponse(ctx, 400, "missing policy principal");
+            const database = policy_database orelse return textResponse(ctx, 400, "missing policy database");
+            if (token.len == 0 or token.len > policy_authority.maximum_token_bytes or database.len == 0 or database.len > 3 * policy_authority.maximum_name_bytes or !db_mod.types.supportsIntegrityReadProof(lookup_options.opts.include_primary_digest, lookup_options.opts.relational_integrity_jobs_json))
+                return textResponse(ctx, 400, "invalid policy observation authority");
+            decoded_policy_database = (try decodePathParamOrBadRequest(ctx, database)) orelse return textResponse(ctx, 400, "invalid policy database");
+            if (decoded_policy_database.?.len == 0 or decoded_policy_database.?.len > policy_authority.maximum_name_bytes)
+                return textResponse(ctx, 400, "invalid policy database");
+            lookup_options.opts.row_policy_principal_proof = token;
+            lookup_options.opts.row_policy_database = decoded_policy_database.?;
+        }
+        if (lookup_options.opts.include_json_null_fields or lookup_options.opts.privacy_original or lookup_options.opts.privacy_policy_version != null or std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_install\"}") or
             std.mem.eql(u8, lookup_options.opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}"))
         {
             // A legacy unauthenticated internal peer must never gain the
@@ -3067,13 +3920,27 @@ pub const AntflyApiHandler = struct {
             defer identity.deinit(self.api_server.alloc);
             if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
         }
-        const control_lookup = lookup_options.opts.group_source_query_json.len != 0 or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
+        const control_lookup = (lookup_options.opts.sql_lock_query_json.len != 0 or lookup_options.opts.group_source_query_json.len != 0) or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
         const consistency = http_server_mod.parseLookupReadConsistency(query) catch
             return textResponse(ctx, 400, "invalid read consistency");
+        var request_context = operationContext(ctx, null);
+        if (lookup_options.opts.sql_lock_query_json.len != 0) try self.requireNativeNodeAuthority(ctx);
+        if (request_context.catalog_route_fence_json.len != 0) {
+            const fence = try std.json.parseFromSliceLeaky(metadata_api.CatalogRouteFence, ctx.allocator, request_context.catalog_route_fence_json, .{});
+            if (fence.route.execution == .native_local) {
+                try self.requireNativeNodeAuthority(ctx);
+                const private_lock = try @import("native_sql_lock_read.zig").isPrivateControl(ctx.allocator, logical_key, lookup_options.opts, fence);
+                if (!private_lock) {
+                    const body = if (ctx.request.method == .POST) (try ctx.body()) orelse "" else "";
+                    const owned = try self.nativeRelationOwnerFence(ctx, fence, body, .read);
+                    request_context.sql_relation_owner = owned.admission_sql_relation_owner;
+                }
+            }
+        }
         var result = self.internalGroupOperations().lookup(
             ctx.allocator,
-            operationContext(ctx, null),
+            request_context,
             .{
                 .group_id = group_id,
                 .table_name = table_name,
@@ -3090,6 +3957,21 @@ pub const AntflyApiHandler = struct {
         if (result.expected_content_digest) |digest| {
             const hex = std.fmt.bytesToHex(digest, .lower);
             try ctx.setHeader("X-Antfly-Primary-Digest", &hex);
+        }
+        if (lookup_options.opts.include_json_null_fields) {
+            const fields = try ctx.allocator.dupe([]const u8, result.json_null_fields);
+            defer ctx.allocator.free(fields);
+            std.mem.sort([]const u8, fields, {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.order(u8, left, right) == .lt;
+                }
+            }.less);
+            try http_client.TypedLookup.requireCanonical(result.json, fields);
+            try ctx.setHeader("X-Antfly-Typed-Nulls", "1");
+            var encoded = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .json = result.json, .json_null_fields = fields }, .{});
+            errdefer ctx.allocator.free(encoded);
+            if (encoded.len > http_client.TypedLookup.max_response_bytes) return error.InvalidResponse;
+            return ownedJsonResponse(ctx, 200, &encoded, ctx.allocator);
         }
         return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
     }
@@ -3577,6 +4459,12 @@ pub const AntflyApiHandler = struct {
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
+            error.TransitionOperationBusy,
+            error.TransactionTopologyBusy,
+            error.SplitSourceProjectionNotReady,
+            error.SplitSourceProjectionAdvanced,
+            error.DurableRootIncarnationUnavailable,
+            => textResponse(ctx, 503, @errorName(err)),
             error.Unsupported => textResponse(ctx, 405, "method not allowed"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
@@ -3629,8 +4517,7 @@ pub const AntflyApiHandler = struct {
     fn internalGroupBatch(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
-        if (self.api_server.cfg.routed_raft_batch_writer != null)
-            return textResponse(ctx, 404, "legacy raft batch forwarding unsupported");
+
         const forwarding = internal_batch_forwarding.parseValues(
             ctx.header(internal_batch_forwarding.remaining_ms_header),
             ctx.header(internal_batch_forwarding.forwards_remaining_header),
@@ -3639,22 +4526,43 @@ pub const AntflyApiHandler = struct {
         if (forwarding != null)
             return textResponse(ctx, 400, "raft batch forwarding headers require routed endpoint");
         const body = (try ctx.body()) orelse "";
-        var input = batch_api.parseInternalBatchRequest(ctx.allocator, body) catch |err| return switch (err) {
+        var native_route: ?metadata_api.CatalogRouteFence = null;
+        if (ctx.header(metadata_api.catalog_route_fence_header)) |encoded| {
+            const decoded = try std.json.parseFromSliceLeaky(metadata_api.CatalogRouteFence, ctx.allocator, encoded, .{});
+            if (decoded.route.execution == .native_local) {
+                native_route = try self.nativeRelationOwnerFence(ctx, decoded, body, .write);
+                native_route.?.admission_deadline_ns = operationContext(ctx, null).deadline_ns;
+                native_route.?.admission_deadline_io = operationContext(ctx, null).deadline_io;
+                native_route.?.admission_cancellation = operationContext(ctx, null).cancellation;
+                if (decoded.route.group_id != params.group_id) return error.TopologyChanged;
+            }
+        }
+        if (native_route == null and self.api_server.cfg.routed_raft_batch_writer != null)
+            return textResponse(ctx, 404, "legacy raft batch forwarding unsupported");
+        var input = (if (native_route != null) batch_api.parseOwnerBatchRequest(ctx.allocator, body) else batch_api.parseInternalBatchRequest(ctx.allocator, body)) catch |err| return switch (err) {
             error.InvalidBatchRequest => textResponse(ctx, 400, "invalid batch request"),
             error.ValueTooLong => textResponse(ctx, 413, "value too large"),
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer input.deinit(ctx.allocator);
+        if (batch_api.requiresCompletionProtocol(input.req)) {
+            const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        }
         if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
             return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
-        const result = self.internalGroupOperations().batch(
+        const result = (if (native_route) |fence| self.internalGroupOperations().nativeAtomicBatch(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input.req, fence) else self.internalGroupOperations().batch(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
             params.table_name,
             input.req,
-        ) catch |err| return switch (err) {
+        )) catch |err| return switch (err) {
+            error.SqlRelationOwnerChanged, error.SqlTemporaryRelationNotOwned, error.SqlRelationRecoveryIncomplete, error.InvalidSqlRelationPersistence => return textResponse(ctx, 409, @errorName(err)),
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
+            error.HistoryFull => historyPressureResponse(ctx),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.OnlineMergeArtifactCatalogUncoordinated => blk: {
@@ -3698,6 +4606,9 @@ pub const AntflyApiHandler = struct {
         // A Raft apply can reject validation after proposal. Preserve its typed
         // reason, without claiming the operation was never proposed. The
         // coordinator still has to establish an authoritative abort.
+        if (@import("external_transaction_errors.zig").classify(err)) |reason| return textResponse(ctx, 409, @errorName(reason));
+        if (@import("source_transaction_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, @import("source_transaction_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_row_errors.zig").classify(err)) |reason|
             return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_integrity_errors.zig").classify(err)) |reason|
@@ -3711,9 +4622,395 @@ pub const AntflyApiHandler = struct {
         return textResponse(ctx, 429, "RetainedEffectsFull");
     }
 
+    fn historyPressureResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return textResponse(ctx, 429, "HistoryFull");
+    }
+
+    fn internalHistoryDecision(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_decision_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyDecisionFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyDecisionFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyDecisionFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyDecisionFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history decision request exceeds byte limit");
+        var result = operations.execute(self.api_server.cfg.native_history_decision, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyDecisionFailure(ctx, err);
+        defer result.deinit();
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result.value);
+    }
+    fn historyDecisionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        try ctx.setHeader("Cache-Control", "no-store");
+        const failure = @import("history_decision_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryOwner(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_owner_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyOwnerFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyOwnerFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyOwnerFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyOwnerFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history owner request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_owner, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyOwnerFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyOwnerFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        try ctx.setHeader("Cache-Control", "no-store");
+        const failure = @import("history_owner_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalArtifactHistory(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("artifact_history_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "artifact history request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_artifact_history, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPublicationFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn internalSplitHistoryCut(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("topology_history_operations.zig").Split;
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "split history request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_split_cut, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPublicationFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn internalMergeHistoryCut(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("topology_history_operations.zig").Merge;
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "merge history request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_merge_cut, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPublicationFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn internalHistoryPublication(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_publication_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPublicationFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history publication request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_publication, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPublicationFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyPublicationFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        try ctx.setHeader("Cache-Control", "no-store");
+        const failure = @import("history_publication_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryResolution(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_resolution_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history resolution request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_resolution, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyResolutionFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyResolutionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const failure = @import("history_resolution_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryGrant(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_grant_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return historyGrantFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyGrantFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history grant request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_grant, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyGrantFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyGrantFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const failure = @import("history_grant_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryPage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalHistoryPageFor(ctx, false);
+    }
+
+    fn internalHistoryBootstrapPage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalHistoryPageFor(ctx, true);
+    }
+
+    fn internalHistoryPageFor(self: *AntflyApiHandler, ctx: *httpx.Context, comptime bootstrap: bool) !httpx.Response {
+        const operations = @import("history_page_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
+        if (body.len > (if (bootstrap) operations.max_bootstrap_request_bytes else operations.max_request_bytes)) return textResponse(ctx, 413, "history page request exceeds byte limit");
+        const context = operationContext(ctx, null);
+        const encoded = (if (bootstrap)
+            operations.Bootstrap.execute(self.api_server.cfg.native_history_bootstrap_page, ctx.allocator, params.group_id, params.table_name, body, context)
+        else
+            operations.execute(self.api_server.cfg.native_history_page, ctx.allocator, params.group_id, params.table_name, body, context)) catch |err| return historyPageFailure(ctx, err);
+        errdefer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/octet-stream");
+        try ctx.setHeader("Cache-Control", "no-store");
+        _ = ctx.response.bodyOwned(ctx.allocator, encoded);
+        return ctx.response.build();
+    }
+
+    fn historyPageFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const failure = @import("history_page_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
+    }
+
+    fn internalHistoryControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        // Retention mutations never accept unsigned rolling-upgrade traffic.
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid history control path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("history_control_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing history control request");
+        if (body.len > operations.wire.max_bytes) return textResponse(ctx, 413, "history control exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| {
+            if (err == error.InvalidHistoryControlResponse) {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+                return textResponse(ctx, 500, "invalid history control response");
+            }
+            const status: u16 = switch (err) {
+                error.ChangefeedCapabilityUnsupported => 501,
+                error.TopologyChanged, error.HistoryResynchronizationRequired, error.HistoryConsumerConflict, error.ConflictingOrderedApplyReceipt => 409,
+                error.GroupLeaderUnavailable, error.LeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.ResourceBudgetExceeded, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => 503,
+                error.InvalidCatalogRouteFence, error.InvalidHistoryControlWire, error.InvalidCatalogRouteFenceProtocol, error.UnsupportedCatalogRouteFence, error.MissingField, error.UnknownField, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.Overflow => 400,
+                else => 500,
+            };
+            // Callback errors cannot prove whether a proposal was accepted.
+            // Recovery always uses the original receipt, never an automatic retry.
+            try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+            return textResponse(ctx, status, "history control unavailable");
+        };
+        if (!result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        return ctx.json(result);
+    }
+
+    fn sourcePlanError(ctx: *httpx.Context, err: anyerror, mutation: bool) !httpx.Response {
+        if (mutation) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const status: u16 = switch (err) {
+            error.ChangefeedCapabilityUnsupported => 501,
+            error.TopologyChanged, error.HistoryResynchronizationRequired, error.SourceReceiptExpired, error.SourcePayloadConflict, error.SourceCheckpointConflict, error.SourceBindingConflict, error.ConflictingOrderedApplyReceipt => 409,
+            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.ResourceBudgetExceeded, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout, error.SourcePendingWork, error.SourceOutcomeUnresolved => 503,
+            error.InvalidCatalogRouteFence, error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.InvalidTxnRecord, error.InvalidCatalogRouteFenceProtocol, error.UnsupportedCatalogRouteFence, error.MissingField, error.UnknownField, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.Overflow => 400,
+            else => 500,
+        };
+        return textResponse(ctx, status, "source plan operation unavailable");
+    }
+    fn internalSourcePlanControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .control);
+    }
+    fn internalSourceScopeControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source scope path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_scope_control_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source scope request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "source scope request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        const mutation = input.operation == .submit;
+        const result = operations.execute(self.api_server.cfg.native_source_scope_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, mutation);
+        if (mutation and !result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalSourceRetirementControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source retirement path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_retirement_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source retirement request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "source retirement request exceeds byte limit");
+        var decoded = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        defer decoded.deinit();
+        const input = decoded.value;
+        const mutation = input.operation == .submit;
+        var result = operations.execute(self.api_server.cfg.native_source_retirement_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer result.deinit();
+        if (mutation and !result.value.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result.value) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalSourceProducerClose(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid producer close path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_producer_control_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing producer close request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "producer close request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        const result = operations.execute(self.api_server.cfg.native_source_producer_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+        if (result.outcome == null) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, true);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalLegacyInventory(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid legacy inventory path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_legacy_inventory_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing legacy inventory request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "legacy inventory request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        var result = operations.execute(self.api_server.cfg.native_legacy_inventory, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+        defer result.deinit(ctx.allocator);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, true);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalLegacyTerminal(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid legacy terminal path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_legacy_terminal_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing legacy terminal request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "legacy terminal request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        const result = operations.execute(self.api_server.cfg.native_legacy_terminal, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+        if (result.outcome == null) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, true);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalSourceProducerClosureObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .producer_closure);
+    }
+    fn internalSourceScopeObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .scope);
+    }
+    fn internalSourceCheckpointObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .checkpoint);
+    }
+    fn internalSourcePlanObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .observe);
+    }
+    fn internalSourcePlanChunk(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .chunk);
+    }
+    fn internalSourcePlan(self: *AntflyApiHandler, ctx: *httpx.Context, comptime kind: enum { control, observe, chunk, checkpoint, scope, producer_closure }) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source plan path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_plan_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source plan request");
+        const maximum = if (kind == .producer_closure) @import("source_producer_closure_operations.zig").wire.max_query_bytes else if (kind == .scope) @import("source_scope_operations.zig").wire.max_bytes else if (kind == .checkpoint) @import("source_checkpoint_operations.zig").wire.max_request_bytes else operations.wire.max_bytes;
+        if (body.len > maximum) return textResponse(ctx, 413, "source recovery request exceeds byte limit");
+        switch (kind) {
+            .control => {
+                const result = operations.executeControl(self.api_server.cfg.native_source_plan_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+                if (!result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+                return ctx.json(result);
+            },
+            .producer_closure => return ctx.json(@import("source_producer_closure_operations.zig").execute(self.api_server.cfg.native_source_producer_closure_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .scope => return ctx.json(@import("source_scope_operations.zig").execute(self.api_server.cfg.native_source_scope_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .checkpoint => return ctx.json(@import("source_checkpoint_operations.zig").execute(self.api_server.cfg.native_source_checkpoint_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .observe => return ctx.json(operations.executeObserve(self.api_server.cfg.native_source_plan_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .chunk => {
+                const result = operations.executeChunk(self.api_server.cfg.native_source_plan_chunk, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false);
+                defer ctx.allocator.free(result.chunk_base64);
+                return ctx.json(result);
+            },
+        }
+    }
+
     fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return ctx.json(.{
-            .data_raft_batch_protocol_version = internal_batch_forwarding.raft_batch_protocol_version,
+            .data_raft_batch_protocol_version = @import("../common/data_raft_protocol.zig").maximumForHistoryApply(@import("storage_source_options").control_only),
             .catalog_route_fence_protocol_version = metadata_api.catalog_route_fence_protocol_current,
         });
     }
@@ -3874,6 +5171,33 @@ pub const AntflyApiHandler = struct {
         return internalQueryResponse(ctx, &result);
     }
 
+    /// Node credentials do not delegate a SQL connection. Authenticate the
+    /// exact completed body and native generation before ordinary TEMP reads.
+    fn requireNativeNodeAuthority(self: *AntflyApiHandler, ctx: *httpx.Context) !void {
+        const node_token = ctx.header(internal_service_auth.header_name) orelse return error.Forbidden;
+        var node = try self.api_server.authenticateInternalServiceRequest(node_token);
+        defer node.deinit(self.api_server.alloc);
+        if (!node.is_internal_service) return error.Forbidden;
+    }
+
+    fn nativeRelationOwnerFence(self: *AntflyApiHandler, ctx: *httpx.Context, original: metadata_api.CatalogRouteFence, body: []const u8, purpose: @import("antfly_local_sources").common_relation_owner_authority.Purpose) !metadata_api.CatalogRouteFence {
+        var fence = original;
+        if (fence.route.execution != .native_local) return fence;
+        try self.requireNativeNodeAuthority(ctx);
+        if (fence.route.execution.native_local.kind != .temporary) return fence;
+        const authority = @import("antfly_local_sources").common_relation_owner_authority;
+        const proof = ctx.header(authority.header) orelse return error.SqlTemporaryRelationNotOwned;
+        const command_digest: ?[32]u8 = if (ctx.header(authority.command_digest_header)) |hex| digest: {
+            if (hex.len != 64) return error.Forbidden;
+            var value: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&value, hex) catch return error.Forbidden;
+            break :digest value;
+        } else null;
+        const key = try @import("sql/recovery/preparation_authority_keys.zig").configured(self.api_server.cfg);
+        fence.admission_sql_relation_owner = try authority.verify(ctx.allocator, key.secret, key.issuer, .{ .purpose = purpose, .table_id = fence.table_id, .group_id = fence.route.group_id, .descriptor_fingerprint = try fence.route.execution.native_local.fingerprint(), .body_digest = authority.bodyDigest(body), .command_fence_digest = command_digest }, fence.route.execution.native_local, @intCast(@divFloor(self.api_server.internalAuthRealtimeNs(), std.time.ns_per_s)), proof);
+        return fence;
+    }
+
     fn retainedReadContext(ctx: *httpx.Context) !operation_contract.RequestContext {
         // Retained owner capabilities use platform-clock deadlines. Ingress
         // deadlines use the transport's awake clock, whose epoch can differ.
@@ -3899,7 +5223,8 @@ pub const AntflyApiHandler = struct {
         const request = try retainedReadContext(ctx);
         var source = self.api_server.table_reads orelse return textResponse(ctx, 503, "retained read source unavailable");
         source.bindCatalogRouteFenceJson(ctx.allocator, request.catalog_route_fence_json, params.group_id, request.deadline_ns, request.cancellation) catch return textResponse(ctx, 400, "invalid catalog route fence");
-        const route = source.route_fence orelse return textResponse(ctx, 400, "catalog route fence required");
+        const route = self.nativeRelationOwnerFence(ctx, source.route_fence orelse return textResponse(ctx, 400, "catalog route fence required"), body, .read) catch |err| return textResponse(ctx, 403, @errorName(err));
+        source.route_fence = route;
         var principal: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(identity.credential_principal, &principal, .{});
         const runtime = self.api_server.retainedReadRuntime() catch return textResponse(ctx, 503, "retained read owner unavailable");
@@ -3910,7 +5235,11 @@ pub const AntflyApiHandler = struct {
             .group_id = route.route.group_id,
             .topology_revision = route.topology_epoch,
             .schema_version = parsed.value.schema_version,
-        }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| return textResponse(ctx, rpc.errorStatus(err), @errorName(err));
+        }, params.table_name, parsed.value, @import("retained_read_page.zig").formatForAccept(ctx.header("accept") orelse "")) catch |err| {
+            if (parsed.value.operation == .normalize or parsed.value.operation == .graph_page)
+                return textResponse(ctx, rpc.normalizationFailureHttpStatus(err), @errorName(err));
+            return textResponse(ctx, rpc.errorStatus(err), @errorName(err));
+        };
         defer ctx.allocator.free(encoded);
         try ctx.setHeader("content-type", if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").compact_magic)) @import("retained_read_page.zig").compact_media_type else if (std.mem.startsWith(u8, encoded, @import("retained_read_page.zig").magic)) @import("retained_read_page.zig").media_type else "application/json");
         try ctx.setHeader(metadata_api.catalog_route_fence_ack_header, metadata_api.catalog_route_fence_ack_value);
@@ -4040,6 +5369,33 @@ pub const AntflyApiHandler = struct {
         return try textResponse(ctx, 409, "GraphWireUpgradeRequired");
     }
 
+    fn internalSqlMaintenance(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        try operationContext(ctx, null).ensureActive();
+        const writes = self.api_server.table_writes orelse return textResponse(ctx, 404, "not found");
+        const body = (try ctx.body()) orelse "";
+        const routed: ?metadata_api.CatalogRouteFence = if (ctx.header(metadata_api.catalog_route_fence_header)) |encoded| admitted: {
+            var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").api_sql_maintenance_contract.Request, ctx.allocator, body, .{});
+            defer parsed.deinit();
+            try parsed.value.validate();
+            var fence = try self.nativeRelationOwnerFence(ctx, try std.json.parseFromSliceLeaky(metadata_api.CatalogRouteFence, ctx.allocator, encoded, .{}), body, if (parsed.value.operation == .statistics) .read else .write);
+            if (fence.route.group_id != params.group_id or fence.table_id != parsed.value.table_id) return error.TopologyChanged;
+            fence.admission_cancellation = operationContext(ctx, null).cancellation;
+            fence.admission_deadline_ns = operationContext(ctx, null).deadline_ns;
+            break :admitted fence;
+        } else null;
+        const json = ((if (routed) |fence| writes.sqlMaintenanceGroupLocalRouted(ctx.allocator, fence, params.group_id, params.table_name, body, operationContext(ctx, null).cancellation) else writes.sqlMaintenanceGroupLocal(ctx.allocator, params.group_id, params.table_name, body)) catch |err| switch (err) {
+            error.InvalidSqlParameters, error.UnknownSqlColumn, error.DuplicateSqlColumn, error.IdempotencyConflict => return textResponse(ctx, 400, @errorName(err)),
+            error.MaintenanceBusy => return textResponse(ctx, 503, @errorName(err)),
+            error.UnknownGroup, error.NotFound => return textResponse(ctx, 404, "not found"),
+            error.ReadOnly, error.StorageUnavailable => return textResponse(ctx, 503, @errorName(err)),
+            else => return internalGroupErrorResponse(ctx, err),
+        }) orelse return textResponse(ctx, 404, "not found");
+        defer ctx.allocator.free(json);
+        return jsonResponse(ctx, 200, json);
+    }
+
     fn internalGraphMetricMaintenance(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
@@ -4109,6 +5465,14 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer input.deinit(ctx.allocator);
+        if (batch_api.requiresCompletionProtocol(input.req)) {
+            // Completion v2 has no released unauthenticated transport. The
+            // legacy rolling-upgrade allowance must not grant this authority.
+            const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        }
         if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
             return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
         const result = self.internalGroupOperations().routedBatch(
@@ -4120,7 +5484,12 @@ pub const AntflyApiHandler = struct {
             forwarding_context,
         ) catch |err| return switch (err) {
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
+            error.HistoryFull => historyPressureResponse(ctx),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
+            error.DecisionNotProposed => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 409, "decision not proposed");
+            },
             error.TopologyChanged => blk: {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
                 break :blk textResponse(ctx, 409, "topology changed");
@@ -4181,6 +5550,9 @@ pub const AntflyApiHandler = struct {
         err: internal_group_operations.Error,
         phase: InternalTxnPhase,
     ) !httpx.Response {
+        if (@import("external_transaction_errors.zig").classify(err)) |reason| return textResponse(ctx, 409, @errorName(reason));
+        if (@import("source_transaction_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, @import("source_transaction_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_row_errors.zig").classify(err)) |reason|
             return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_integrity_errors.zig").classify(err)) |relational_error|
@@ -4190,6 +5562,7 @@ pub const AntflyApiHandler = struct {
         return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
             error.TransactionTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
+            error.DecisionNotProposed => textResponse(ctx, 409, "decision not proposed"),
             error.DecisionConflict => textResponse(ctx, 409, "decision conflict"),
             error.TransactionConflict => textResponse(ctx, 409, "transaction conflict"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
@@ -4206,6 +5579,7 @@ pub const AntflyApiHandler = struct {
             error.EnrichmentRetryInProgress,
             => textResponse(ctx, 202, "committed_visibility_pending"),
             error.EnrichmentWorkerFailed => textResponse(ctx, 202, "committed_repair_required"),
+            error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
             error.Unavailable => textResponse(ctx, 503, "transaction unavailable"),
             else => textResponse(ctx, 500, "internal server error"),
@@ -4226,8 +5600,19 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         var input = distributed_txn.parseTxnBeginRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnBeginRequest(ctx.allocator, &input);
-        self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+        if (input.route_fence) |fence| if (fence.route.execution == .native_local) {
+            input.route_fence = self.nativeRelationOwnerFence(ctx, fence, body, .prepare) catch |err| return textResponse(ctx, 403, @errorName(err));
+        };
+        var native_context = operationContext(ctx, null);
+        if (input.route_fence) |fence| native_context.sql_relation_owner = fence.admission_sql_relation_owner;
+        self.internalGroupOperations().txnBegin(ctx.allocator, native_context, params.group_id, params.table_name, input) catch |err| {
+            if (err == error.DecisionConflict and input.source_producer != .unlabelled) {
+                const proof = try distributed_txn.encodeProducerBeginConflict(ctx.allocator, input);
+                defer ctx.allocator.free(proof);
+                return textResponse(ctx, 409, proof);
+            }
             return internalTxnErrorResponse(ctx, err, .begin);
+        };
         return ctx.json(struct {}{});
     }
 
@@ -4241,7 +5626,21 @@ pub const AntflyApiHandler = struct {
             return textResponse(ctx, 400, "invalid transaction request");
         };
         defer distributed_txn.freeTxnPrepareRequest(ctx.allocator, &input);
-        self.internalGroupOperations().txnPrepare(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err| {
+        if (input.route_fence) |fence| if (fence.route.execution == .native_local) {
+            if (input.req.asBatch(input.txn_id, input.topology_epoch).externalActivationOwner() != null) {
+                self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
+            } else {
+                input.route_fence = self.nativeRelationOwnerFence(ctx, fence, body, .prepare) catch |err| return textResponse(ctx, 403, @errorName(err));
+            }
+        };
+        if (input.req.trigger_receipts.len != 0) {
+            const route = input.route_fence orelse return textResponse(ctx, 403, "trigger route authority required");
+            input.route_fence = @import("sql/triggers/authority.zig").admitHttp(self.api_server, ctx.allocator, route, input.req, body, ctx.header(@import("antfly_local_sources").common_trigger_preparation_authority.header), .prepare) catch |err|
+                return textResponse(ctx, 403, @errorName(err));
+        }
+        var native_context = operationContext(ctx, null);
+        if (input.route_fence) |fence| native_context.sql_relation_owner = fence.admission_sql_relation_owner;
+        self.internalGroupOperations().txnPrepare(ctx.allocator, native_context, params.group_id, params.table_name, input) catch |err| {
             if (err == error.InvalidArgument and txn_prepare_diagnostic_gate.admit(platform_time.monotonicNs()))
                 std.log.warn("transaction prepare rejected phase=owner group_id={d} scoped={} class={s}", .{ params.group_id, input.req.restore_staging_scope != null, @errorName(err) });
             return internalTxnErrorResponse(ctx, err, .prepare);
@@ -4254,6 +5653,10 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         const input = distributed_txn.parseTxnResolveRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        if (input.route_fence) |fence| if (fence.route.execution == .native_local) {
+            self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
+            if (input.external_decision_owner == null) return textResponse(ctx, 403, "external decision authority required");
+        };
         self.internalGroupOperations().txnResolve(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .resolve);
         return ctx.json(struct {}{});
@@ -4264,6 +5667,7 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         const input = distributed_txn.parseTxnStatusRequestWithScope(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        if (input.route_fence != null) self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
         const status = self.internalGroupOperations().txnStatusWithRequest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .status);
         return ctx.json(distributed_txn.TxnStatusResponse{ .status = status });
@@ -4275,6 +5679,7 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         var input = distributed_txn.parseTxnAcknowledgeRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnAcknowledgeRequest(ctx.allocator, &input);
+        if (input.route_fence != null) self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
         self.internalGroupOperations().txnAcknowledge(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .acknowledge);
         return ctx.json(struct {}{});
@@ -4286,6 +5691,7 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         var input = distributed_txn.parseTxnAcknowledgeManyRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnAcknowledgeManyRequest(ctx.allocator, &input);
+        if (input.route_fence != null) self.requireNativeNodeAuthority(ctx) catch |err| return textResponse(ctx, 403, @errorName(err));
         self.internalGroupOperations().txnAcknowledgeMany(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err| {
             if (err == error.RaftBatchWriteOutcomeUnknown) {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
@@ -4299,6 +5705,133 @@ pub const AntflyApiHandler = struct {
     // ---------------------------------------------------------------
     // Authentication helper
     // ---------------------------------------------------------------
+
+    fn createChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        const key = ctx.header("Idempotency-Key") orelse return jsonErrorResponse(ctx, 400, "missing changefeed idempotency key");
+        const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed definition");
+        if (bytes.len > 8192) return jsonErrorResponse(ctx, 400, "invalid changefeed definition");
+        const parsed = std.json.parseFromSlice(api.Create, ctx.allocator, bytes, .{ .parse_numbers = false }) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed definition");
+        defer parsed.deinit();
+        const result = api.create(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, key, parsed.value, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        _ = ctx.status(201);
+        return ctx.json(.{
+            .id = std.fmt.bytesToHex(result.id, .lower),
+            .cursor = std.fmt.bytesToHex(result.cursor, .lower),
+            .expires_at = result.expires_at,
+        });
+    }
+
+    fn inspectChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const id = feedId(ctx) orelse return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        const progress = @import("changefeed_public.zig").inspect(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, id, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        return ctx.json(progress);
+    }
+
+    fn feedId(ctx: *httpx.Context) ?@import("../metadata/changefeed_control.zig").Id {
+        var id: @import("../metadata/changefeed_control.zig").Id = undefined;
+        const raw = ctx.param("feed_id") orelse return null;
+        if (raw.len != id.len * 2) return null;
+        _ = std.fmt.hexToBytes(&id, raw) catch return null;
+        return id;
+    }
+
+    fn closeChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        const id = feedId(ctx) orelse return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        api.close(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, id, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        return ctx.status(204).text("");
+    }
+
+    fn pullChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const feed = @import("../metadata/changefeed_delivery.zig");
+        var limits: feed.Limits = .{};
+        if (ctx.query("limit")) |value| limits.events = std.fmt.parseInt(u32, value, 10) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed limit");
+        if (ctx.query("max_bytes")) |value| limits.bytes = std.fmt.parseInt(u32, value, 10) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed byte limit");
+        return self.changefeedRequest(ctx, ctx.query("after") orelse "", limits);
+    }
+
+    fn renewChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const id = feedId(ctx) orelse return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed lease");
+        if (bytes.len > 256) return jsonErrorResponse(ctx, 400, "invalid changefeed lease");
+        const parsed = std.json.parseFromSlice(struct { expires_at: u64 }, ctx.allocator, bytes, .{}) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed lease");
+        defer parsed.deinit();
+        const expires_at = @import("changefeed_public.zig").renew(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, id, parsed.value.expires_at, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        return ctx.json(.{ .expires_at = expires_at });
+    }
+
+    fn acknowledgeChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed checkpoint");
+        if (bytes.len > 256) return jsonErrorResponse(ctx, 400, "invalid changefeed checkpoint");
+        const parsed = std.json.parseFromSlice(struct { cursor: []const u8 }, ctx.allocator, bytes, .{}) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed checkpoint");
+        defer parsed.deinit();
+        return self.changefeedRequest(ctx, parsed.value.cursor, null);
+    }
+
+    fn changefeedRequest(self: *AntflyApiHandler, ctx: *httpx.Context, cursor: []const u8, limits: ?@import("../metadata/changefeed_delivery.zig").Limits) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        var selection: api.Selection = undefined;
+        const id = ctx.param("feed_id") orelse "";
+        if (id.len != selection.id.len * 2) return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        if (cursor.len != selection.after.len * 2) return jsonErrorResponse(ctx, 400, "invalid changefeed cursor");
+        _ = std.fmt.hexToBytes(&selection.id, id) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        _ = std.fmt.hexToBytes(&selection.after, cursor) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed cursor");
+        var result = api.execute(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, selection, limits, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        defer result.deinit();
+        try ctx.setHeader("cache-control", "no-store");
+        return switch (result) {
+            .page => |page| blk: {
+                const latest = std.fmt.bytesToHex(page.cursor, .lower);
+                try ctx.setHeader("Antfly-Changefeed-Cursor", &latest);
+                var body = try ctx.allocator.dupe(u8, page.body);
+                errdefer ctx.allocator.free(body);
+                break :blk try ownedJsonResponse(ctx, 200, &body, ctx.allocator);
+            },
+            .acknowledged => |checkpoint| ctx.json(.{ .cursor = std.fmt.bytesToHex(checkpoint, .lower) }),
+        };
+    }
+
+    fn changefeedError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        switch (err) {
+            error.Forbidden, error.Unauthorized, error.UserNotFound, error.ApiKeyExpired, error.ApiKeyNotFound => return jsonErrorResponse(ctx, 403, "changefeed access denied"),
+            error.InvalidChangefeed => return jsonErrorResponse(ctx, 400, "invalid changefeed request"),
+            error.ChangefeedResynchronizationRequired, error.ChangefeedCursorExpired, error.ChangefeedLeaseExpired, error.HistoryResynchronizationRequired, error.TopologyChanged, error.WalSnapshotExpired, error.WalRetentionRetired, error.LakeSnapshotRetired, error.LakeWalCoverageGap, error.LakeOverlayCoverageUnavailable => return jsonErrorResponse(ctx, 409, "changefeed_resynchronization_required"),
+            error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown, error.WalRetentionPositionRegressed => return jsonErrorResponse(ctx, 409, "changefeed_retry_required"),
+            error.ChangefeedEventTooLarge => return jsonErrorResponse(ctx, 409, "changefeed_event_too_large"),
+            error.ChangefeedBootstrapTooLarge => return jsonErrorResponse(ctx, 409, "changefeed_bootstrap_too_large"),
+            error.ChangefeedBackpressure, error.HistoryTooLarge, error.WalRetentionQuota => return jsonErrorResponse(ctx, 429, "changefeed_backpressure"),
+            error.ChangefeedCapabilityUnsupported => return jsonErrorResponse(ctx, 501, "changefeed_capability_unsupported"),
+            error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DeadlineExceeded, error.LakeSnapshotReadLeaseExpired, error.WalCommitContended, error.WalVisibilityUnavailable => return jsonErrorResponse(ctx, 503, "changefeed_unavailable"),
+            else => return err,
+        }
+    }
 
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
         if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null and
@@ -4491,6 +6024,10 @@ pub const AntflyApiHandler = struct {
             identity.* = cached.identity;
             cached.identity = null;
         } else {
+            // Time credential verification and identity resolution once, even when
+            // compressed-body middleware hands the verified identity to the route.
+            const timed = std.mem.eql(u8, ctx.header("X-Antfly-Server-Timing") orelse "", "1");
+            const start_ns = if (timed) platform_time.monotonicNs() else 0;
             identity.* = self.api_server.authenticateRequest(.{
                 .authorization = ctx.header("authorization"),
                 .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
@@ -4500,6 +6037,12 @@ pub const AntflyApiHandler = struct {
                 },
                 else => return err,
             };
+            if (timed) {
+                const elapsed_us = (platform_time.monotonicNs() -| start_ns) / std.time.ns_per_us;
+                var buf: [48]u8 = undefined;
+                const value = std.fmt.bufPrint(&buf, "auth;dur={d}.{d:0>3}", .{ elapsed_us / 1000, elapsed_us % 1000 }) catch unreachable;
+                try ctx.setHeader("Server-Timing", value);
+            }
         }
         const authenticated = identity.*.?;
         if (authenticated.is_internal_service and
@@ -5411,6 +6954,21 @@ pub const AntflyApiHandler = struct {
         commit_req: *transactions_api.OwnedTransactionCommitRequest,
         response_mode: CommitResponseMode,
     ) !httpx.Response {
+        return self.executeCommitRequestInner(ctx, borrowed_identity, commit_req, response_mode) catch |failure| {
+            // Stable test diagnostic only. Never dump row bodies, grants or
+            // allocator-heavy stacks at this public failure boundary.
+            if (@import("builtin").mode == .debug and !coordinated_failure_diagnostic_once.swap(true, .monotonic)) std.log.warn("public coordinated commit escaped phase={s} class={s}", .{ @tagName(response_mode), @errorName(failure) });
+            return failure;
+        };
+    }
+
+    fn executeCommitRequestInner(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        borrowed_identity: ?AuthenticatedIdentity,
+        commit_req: *transactions_api.OwnedTransactionCommitRequest,
+        response_mode: CommitResponseMode,
+    ) !httpx.Response {
         const alloc = ctx.allocator;
         var authenticated_identity = try http_server_mod.cloneCatalogIdentity(self.api_server.alloc, borrowed_identity);
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -5461,10 +7019,16 @@ pub const AntflyApiHandler = struct {
         var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
             return self.transactionPreparationError(ctx, err);
         defer prepared.deinit();
+        // Integrity/trigger expansion fixes the final physical participants.
+        // Sign those exact bodies under this request's authenticated principal,
+        // as the single-table and SQL-session commit paths already do.
+        const signed = self.api_server.signCurrentRowPolicyMutationParticipants(alloc, prepared.tables, commit_request) catch |err|
+            return self.transactionPreparationError(ctx, err);
         const outcome = ((switch (response_mode) {
-            .transaction => source.commitTransactionWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
-            .multi_batch => source.commitBatchWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
+            .transaction => source.commitTransactionWithCancellation(alloc, signed, commit_req.sync_level, commit_request.cancellation),
+            .multi_batch => source.commitBatchWithCancellation(alloc, signed, commit_req.sync_level, commit_request.cancellation),
         }) catch |err| switch (err) {
+            error.ChangefeedCapabilityUnsupported => return textResponse(ctx, 503, "transaction capability unavailable"),
             error.TransactionTooLarge => return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.InvalidBatchRequest,
             error.InvalidArgument,
@@ -5474,13 +7038,13 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
-            error.TopologyChanged => {
+            error.PreDispatchCatalogGenerationChanged, error.TopologyChanged => {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildCommitResponse(
                     arena_impl.allocator(),
                     "aborted",
-                    transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                    transactions_api.topologyChangedConflict(if (commit_req.tables.len == 1 and err == error.TopologyChanged) commit_req.tables[0].table_name else ""),
                     null,
                 );
                 _ = ctx.status(409);
@@ -5584,7 +7148,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(500);
                 return ctx.text("transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits");
             },
-            error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
+            error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => return self.transactionPreparationError(ctx, err),
+            error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .status = "aborted", .@"error" = "row_policy_denied", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+            error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Transaction admission or preparation unavailable.", .retryable = true }),
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
                 _ = ctx.status(503);
                 return ctx.text("transaction coordinator is temporarily unavailable");
             },
@@ -5721,12 +7288,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, "")) |response| return response;
-        if (!(try self.api_server.transactionSessionReadable(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
         const alloc = self.api_server.alloc;
-        var details = (self.api_server.txn_sessions.getDetails(alloc, txn_id) catch |err| switch (err) {
+        var details = (self.api_server.authorizedTransactionSessionDetails(txn_id, authenticated_identity, true) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5752,9 +7315,7 @@ pub const AntflyApiHandler = struct {
         // Principal binding remains authoritative after resource revocation.
         // This read returns no staged rows or catalog identities and must not
         // require participant permissions or a live execution owner.
-        if ((try self.api_server.txn_sessions.principalAccess(self.api_server.alloc, id, http_server_mod.transactionPrincipal(identity))) != .allowed)
-            return textResponse(ctx, 404, "not found");
-        const status = (try self.api_server.txn_sessions.getStatus(self.api_server.alloc, id)) orelse return textResponse(ctx, 404, "not found");
+        const status = (try self.api_server.txn_sessions.getStatusForPrincipal(self.api_server.alloc, id, http_server_mod.transactionPrincipal(identity))) orelse return textResponse(ctx, 404, "not found");
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         return ctx.openApiJson(try transactions_api.buildSessionStatusResponse(arena.allocator(), status));
@@ -5770,10 +7331,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var stage_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidTransactionCommitRequest => {
@@ -5789,7 +7350,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
         var validator: SessionStatementValidator = .{ .server = self.api_server, .context = tableMutationContext(ctx, &authenticated_identity) };
-        const session = (self.api_server.txn_sessions.stageValidated(alloc, txn_id, &stage_req, validator.port()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageValidated(alloc, guard, &stage_req, validator.port()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5799,7 +7360,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
             },
-            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
+            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.TemporalOverlapViolation, error.TemporalEmptyRange, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
             error.Forbidden => return jsonErrorResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge => return jsonErrorResponse(ctx, 413, "transaction statement exceeds preparation capacity"),
             else => return self.transactionPreparationError(ctx, err),
@@ -5823,10 +7384,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var read_req = transactions_api.parseStageReadPayload(alloc, body_data) catch {
             _ = ctx.status(400);
@@ -5843,7 +7404,7 @@ pub const AntflyApiHandler = struct {
         var stage_req = try transactions_api.ownedRequestFromStageReadRequest(alloc, read_req);
         defer stage_req.deinit(alloc);
         self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), &stage_req, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
-        var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshot(alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
+        var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshotForMutation(alloc, guard, read_req.table_name, read_req.key) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5897,7 +7458,7 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        const session = (self.api_server.txn_sessions.stageRead(alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageRead(alloc, guard, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5951,10 +7512,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var stage_req = switch (kind) {
             .write => transactions_api.parseStageWriteRequest(alloc, body_data) catch {
@@ -5973,7 +7534,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
         var validator: SessionStatementValidator = .{ .server = self.api_server, .context = tableMutationContext(ctx, &authenticated_identity) };
-        const session = (self.api_server.txn_sessions.stageValidated(alloc, txn_id, &stage_req, validator.port()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageValidated(alloc, guard, &stage_req, validator.port()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -5983,7 +7544,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
             },
-            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
+            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.TemporalOverlapViolation, error.TemporalEmptyRange, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
             error.Forbidden => return jsonErrorResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge => return jsonErrorResponse(ctx, 413, "transaction statement exceeds preparation capacity"),
             else => return self.transactionPreparationError(ctx, err),
@@ -6007,16 +7568,17 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, txn_id) catch |err| switch (err) {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
+        const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, guard) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -6050,16 +7612,17 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid savepoint id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, txn_id, parsed_savepoint_id) catch |err| switch (err) {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
+        const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, guard, parsed_savepoint_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -6079,12 +7642,15 @@ pub const AntflyApiHandler = struct {
     // separate from post-decision visibility/unknown-outcome handling below.
     fn transactionPreparationError(_: *AntflyApiHandler, ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
+            error.SessionWriteOutcomeUnknown => textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying"),
             error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "transaction preparation deadline exceeded before commit"),
-            error.Forbidden => textResponse(ctx, 403, "forbidden"),
+            error.Forbidden, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => textResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge, error.SessionRecordTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity"),
             error.ForeignKeyParentMissing,
             error.ForeignKeyReferenced,
             error.UniqueConstraintViolation,
+            error.TemporalOverlapViolation,
+            error.TemporalEmptyRange,
             error.ForeignKeyMatchFullViolation,
             error.ForeignKeyActionInProgress,
             error.ForeignKeyActionConflict,
@@ -6092,6 +7658,8 @@ pub const AntflyApiHandler = struct {
             error.VersionConflict,
             error.PreparedGenerationChanged,
             error.GenerationRetired,
+            error.RowPolicyCatalogChanged,
+            error.RowPolicyUnsupported,
             error.IntegrityCatalogChanged,
             error.SessionLeaseLost,
             error.TransactionCommitSealed,
@@ -6103,6 +7671,7 @@ pub const AntflyApiHandler = struct {
             error.RelationalCheckViolation,
             error.UnsupportedTransformOperation,
             => textResponse(ctx, 400, @errorName(err)),
+            error.RowPolicyAuthorityUnavailable,
             error.IntegrityCatalogUnavailable,
             error.ConstraintActivationInProgress,
             error.ConstraintActivationOwnerChanged,
@@ -6126,6 +7695,95 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn reserveFencedTransaction(context: operation_contract.RequestContext, server: *ApiHttpServer, completion: *@import("../pgwire/completion.zig").Completion) !void {
+        try context.ensureActive();
+        try @import("sql/session/completion.zig").reserveOnOwnerControlled(server, completion, context);
+    }
+
+    fn prepareFencedTransaction(context: operation_contract.RequestContext, txn_id: db_mod.types.TxnId) !void {
+        try context.ensureActive();
+        if (context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, txn_id);
+    }
+
+    fn sessionInspectionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.DeadlineExceeded => textResponse(ctx, 504, "transaction request deadline exceeded"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "transaction request canceled"),
+            error.SqlWriteCapacityUnavailable => sqlRoutingOverloadedResponse(ctx),
+            error.TransactionCommitRequestMismatch => textResponse(ctx, 409, "transaction commit retry body does not match the sealed request"),
+            error.SessionLeaseLost => textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
+            error.SessionWriteOutcomeUnknown => textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying"),
+            error.StorageReadTemporarilyUnavailable, error.ReadIndexUnavailable, error.ReadIndexTimeout, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.Timeout, error.ConcurrencyUnavailable => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk textResponse(ctx, 503, "transaction status unavailable; retry this transaction id");
+            },
+            else => err,
+        };
+    }
+
+    fn abortedSessionResponse(ctx: *httpx.Context, id: db_mod.types.TxnId) !httpx.Response {
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const response = try transactions_api.buildSessionCommitResponse(arena.allocator(), id, "aborted", null, null);
+        _ = ctx.status(409);
+        return ctx.openApiJson(response);
+    }
+
+    fn respondTerminalHttpCommit(self: *AntflyApiHandler, ctx: *httpx.Context, source: table_writes.TableWriteSource, guard: transactions_api.Mutation, terminal: transactions_api.TerminalCommit, commit_req: transactions_api.OwnedTransactionCommitRequest, identity: ?AuthenticatedIdentity, commit_request: operation_contract.RequestContext, execution_held: bool) !httpx.Response {
+        const alloc = self.api_server.alloc;
+        const txn_id = guard.id;
+        if (!(try self.api_server.transactionRequestAuthorizedControlled(identity, commit_req, commit_request))) return textResponse(ctx, 403, "forbidden");
+        var status = terminal.status;
+        // A complete terminal response is durable before the coordinator
+        // self-participant is released. Retrying that final ACK is safe;
+        // pending terminal states must instead replay phase two under the
+        // same transaction ID through session maintenance.
+        if (execution_held and status == .committed and !terminal.coordinator_acknowledged) {
+            if (terminal.coordinator_group_id) |coordinator_group_id| {
+                if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
+                defer self.releasePublicOperation("commitTransactionSession");
+                const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
+                const acknowledged = source.acknowledgeTransactionCommit(
+                    alloc,
+                    txn_id,
+                    coordinator_group_id,
+                    coordinator_table_name,
+                ) catch |err| blk: {
+                    std.log.warn("stable transaction coordinator acknowledgement retry deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    break :blk null;
+                };
+                if (acknowledged == null) {
+                    status = .committed_recovery_pending;
+                } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledgedForMutation(alloc, guard) catch |err| blk: {
+                    std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    break :blk null;
+                }) == null) {
+                    status = .committed_recovery_pending;
+                }
+            }
+        }
+        if (ctx.header("X-Antfly-SQL-Fence") != null) {
+            const completion = try requestCompletion(ctx);
+            const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+            owned.reports_existing_commit = true;
+            if (status != .committed or terminal.repair_required)
+                self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransactionControlled, .{ self.api_server, ctx.allocator, completion, txn_id, commit_request }) catch {
+                    completion.unknown = true;
+                };
+        }
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        const response = try transactions_api.buildSessionCommitResponse(
+            arena_impl.allocator(),
+            txn_id,
+            transactions_api.terminalCommitResponseStatus(status, terminal.repair_required),
+            null,
+            commit_req.tables,
+        );
+        _ = ctx.status(if (status == .committed and !terminal.repair_required) 200 else 202);
+        return ctx.openApiJson(response);
+    }
+
     pub fn commitTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         if (try self.admitCompletion(ctx)) |response| return response;
         var authenticated_identity: ?AuthenticatedIdentity = null;
@@ -6140,18 +7798,11 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const execution = try self.api_server.txn_sessions.acquireCommitExecution(txn_id, ctx.io);
-        defer execution.release();
+        if (self.forwardTransactionSession(ctx, txn_id, body_data) catch |err| return sessionInspectionFailure(ctx, err)) |response| return response;
+        const inspection_context = operationContext(ctx, authenticated_identity);
+        const observation = (self.api_server.authorizeHttpCommit(txn_id, authenticated_identity, inspection_context) catch |err|
+            return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
-        const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
         var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
         defer if (parsed_req) |*commit_req| commit_req.deinit(alloc);
         if (!transactions_api.isEmptySessionCommitBody(body_data)) {
@@ -6165,84 +7816,70 @@ pub const AntflyApiHandler = struct {
         }
         if (parsed_req) |*request| {
             self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), request, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
-            if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
+            if (!(try self.api_server.transactionRequestAuthorizedControlled(authenticated_identity, request.*, inspection_context))) return textResponse(ctx, 403, "forbidden");
         }
-        var commit_req = (self.api_server.txn_sessions.cloneCommitRequest(alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+        const commit_request = tableMutationContext(ctx, &authenticated_identity);
+        var terminal_on_cut: ?transactions_api.TerminalCommit = null;
+        defer if (terminal_on_cut) |*terminal| terminal.deinit(alloc);
+        const extra_request = if (parsed_req) |*value| value else null;
+        if (self.api_server.txn_sessions.inspectTerminalHttpCommit(alloc, observation, extra_request, &terminal_on_cut, commit_request, &self.api_server.query_admission) catch |err|
+            return sessionInspectionFailure(ctx, err)) |value|
+        {
+            var replay = value;
+            defer replay.deinit(alloc);
+            return self.respondTerminalHttpCommit(ctx, source, observation, terminal_on_cut.?, replay, authenticated_identity, commit_request, false);
+        }
+        const execution = self.api_server.txn_sessions.acquireCommitExecutionControlled(txn_id, ctx.io, commit_request) catch |err| return sessionInspectionFailure(ctx, err);
+        defer execution.release();
+        const owner = self.api_server.localSessionNodeId();
+        var guard = self.api_server.txn_sessions.mutationControlled(alloc, txn_id, owner, commit_request) catch |err| return sessionInspectionFailure(ctx, err);
+        guard.authorization = observation.authorization;
+        const session = (self.api_server.txn_sessions.readMutationInfoControlled(guard, commit_request) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        };
+        if (session.version.owner != owner) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+        if (session.terminal_abort) return abortedSessionResponse(ctx, txn_id);
+        // The first clone seals the body and prevents further staging.
+        // Reserve before that durable transition, but let terminal replays
+        // and already executing sessions reach their outcome first.
+        if (commit_request.sql_completion != null and !session.commit_execution_started and !session.terminal_commit) {
+            const completion = try requestCompletion(ctx);
+            self.runDurableSQLRouting(ctx.io, reserveFencedTransaction, .{ commit_request, self.api_server, completion }) catch |err| switch (err) {
+                error.SqlWriteCapacityUnavailable => return rejectBeforeSQLExecution(ctx, try textResponse(ctx, 429, "SQL completion capacity unavailable; retry after existing work completes")),
+                error.DeadlineExceeded => return sqlForwardDeadlineResponse(ctx),
+                else => return err,
+            };
+        }
+        var commit_req = (self.api_server.txn_sessions.inspectOrSealHttpCommit(alloc, guard, extra_request, &terminal_on_cut, commit_request) catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown, error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.TransactionCommitRequestMismatch => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit retry body does not match the sealed request");
             },
-            error.SessionLeaseLost => {
-                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(
-                    arena_impl.allocator(),
-                    txn_id,
-                    "aborted",
-                    transactions_api.sessionLeaseLostConflict(if (parsed_req) |value| if (value.tables.len > 0) value.tables[0].table_name else "" else ""),
-                    null,
-                );
-                _ = ctx.status(409);
-                return ctx.openApiJson(response);
-            },
+            error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
             else => return err,
         }) orelse {
             _ = ctx.status(400);
             return ctx.text("transaction has no staged writes");
         };
         defer commit_req.deinit(alloc);
-        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+        if (terminal_on_cut == null and !(try self.api_server.transactionRequestAuthorizedControlled(authenticated_identity, commit_req, commit_request))) {
             _ = ctx.status(403);
             return ctx.text("forbidden");
         }
 
-        if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
-            var terminal = terminal_value;
-            defer terminal.deinit(alloc);
-            var status = terminal.status;
-            // A complete terminal response is durable before the coordinator
-            // self-participant is released. Retrying that final ACK is safe;
-            // pending terminal states must instead replay phase two under the
-            // same transaction ID through session maintenance.
-            if (status == .committed and !terminal.coordinator_acknowledged) {
-                if (terminal.coordinator_group_id) |coordinator_group_id| {
-                    if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
-                    defer self.releasePublicOperation("commitTransactionSession");
-                    const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
-                    const acknowledged = source.acknowledgeTransactionCommit(
-                        alloc,
-                        txn_id,
-                        coordinator_group_id,
-                        coordinator_table_name,
-                    ) catch |err| blk: {
-                        std.log.warn("stable transaction coordinator acknowledgement retry deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        break :blk null;
-                    };
-                    if (acknowledged == null) {
-                        status = .committed_recovery_pending;
-                    } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch |err| blk: {
-                        std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        break :blk null;
-                    }) == null) {
-                        status = .committed_recovery_pending;
-                    }
-                }
-            }
-            var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-            defer arena_impl.deinit();
-            const response = try transactions_api.buildSessionCommitResponse(
-                arena_impl.allocator(),
-                txn_id,
-                transactions_api.terminalCommitResponseStatus(status, terminal.repair_required),
-                null,
-                commit_req.tables,
-            );
-            _ = ctx.status(if (status == .committed and !terminal.repair_required) 200 else 202);
-            return ctx.openApiJson(response);
-        }
+        if (terminal_on_cut) |terminal|
+            return self.respondTerminalHttpCommit(ctx, source, guard, terminal, commit_req, authenticated_identity, commit_request, true);
 
-        var execution_plan = try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id);
+        var execution_plan = self.api_server.txn_sessions.getExecutionPlanControlled(alloc, guard, commit_request) catch |err| switch (err) {
+            error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
+            error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
+            error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
+            else => return err,
+        };
         defer if (execution_plan) |*plan| plan.deinit();
         const distributed_tables_view = try commit_req.distributedTables(alloc);
         defer distributed_tables_view.deinit();
@@ -6265,9 +7902,19 @@ pub const AntflyApiHandler = struct {
                 error.Canceled, error.Cancelled => return textResponse(ctx, 408, "request canceled"),
                 else => return err,
             };
-            if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
-                if (!self.api_server.txn_sessions.removeBeforeExecution(alloc, txn_id)) {
-                    execution_plan = (try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id)) orelse
+            const read_conflict = self.api_server.validateCommitReadSetControlled(commit_req, commit_request) catch |err| return sessionInspectionFailure(ctx, err);
+            if (read_conflict) |conflict| {
+                const retired = self.api_server.txn_sessions.retireHttpCommitConflict(guard, commit_req.session_version.?, commit_request) catch |err| switch (err) {
+                    error.DeadlineExceeded, error.Canceled, error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
+                    else => false,
+                };
+                if (!retired) {
+                    execution_plan = (self.api_server.txn_sessions.getExecutionPlanControlled(alloc, guard, commit_request) catch |err| switch (err) {
+                        error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
+                        error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
+                        error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
+                        else => return err,
+                    }) orelse
                         return textResponse(ctx, 503, "transaction preflight changed; retry this transaction id");
                 } else {
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -6288,34 +7935,66 @@ pub const AntflyApiHandler = struct {
         if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
         defer self.releasePublicOperation("commitTransactionSession");
 
-        const commit_request = tableMutationContext(ctx, &authenticated_identity);
-        if (commit_request.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, txn_id);
+        if (commit_request.sql_completion != null) self.runDurableSQLRouting(ctx.io, prepareFencedTransaction, .{ commit_request, txn_id }) catch |err| {
+            if (err == error.SqlWriteCapacityUnavailable and execution_plan == null)
+                return rejectBeforeSQLExecution(ctx, try textResponse(ctx, 429, "SQL completion capacity unavailable; retry after existing work completes"));
+            if (err == error.SqlWriteCapacityUnavailable)
+                return textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying");
+            return err;
+        };
         if (execution_plan == null) {
             var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
                 return self.transactionPreparationError(ctx, err);
             defer prepared.deinit();
-            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, prepared.tables) catch |err|
-                return self.transactionPreparationError(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+            execution_plan = (self.api_server.txn_sessions.sealExecutionPlanControlled(alloc, guard, prepared.tables, commit_request) catch |err| switch (err) {
+                error.SessionWriteOutcomeUnknown, error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
+                error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
+                error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
+                else => return self.transactionPreparationError(ctx, err),
+            }) orelse return textResponse(ctx, 404, "not found");
         }
-        const outcome = (source.commitTransactionWithIdAndCancellation(
+        if (execution_plan.?.firstAttempt()) commit_request.ensureActive() catch
+            return textResponse(ctx, 503, "transaction admission requires reconciliation; retry this transaction id");
+        // A previously published plan can already own coordinator recovery.
+        // Carry the budget through its pre-decision checkpoints without
+        // revoking durable work once accepted.
+        const admission_token: operation_contract.CancellationToken = .{
+            .ptr = &commit_request,
+            .is_cancelled_fn = struct {
+                fn probe(ptr: *const anyopaque) bool {
+                    const request: *const operation_contract.RequestContext = @ptrCast(@alignCast(ptr));
+                    return request.isCancellationRequested();
+                }
+            }.probe,
+            .check_fn = struct {
+                fn check(ptr: *const anyopaque) !void {
+                    const request: *const operation_contract.RequestContext = @ptrCast(@alignCast(ptr));
+                    try request.ensureActive();
+                }
+            }.check,
+        };
+        const outcome = (source.commitTransactionAttempt(
             alloc,
             txn_id,
             session.begin_timestamp,
             execution_plan.?.value,
             session.sync_level,
-            commit_request.cancellation,
+            execution_plan.?.firstAttempt(),
+            admission_token,
         ) catch |err| rejected: {
-            const rejection = transactions_api.classifyCommitRejection(session, err);
+            if (err == error.ChangefeedCapabilityUnsupported) return textResponse(ctx, 503, "transaction capability unavailable; retry this transaction id");
+            const rejection = transactions_api.classifyCommitRejection(execution_plan.?.firstAttempt(), err);
             if (rejection == .ambiguous) return textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying");
-            if (rejection == .fresh) {
+            if (rejection == .fresh or rejection == .confirmed) {
                 // Publish the abort and settle consumers before attempting
                 // payload retirement or returning a safe rejection to callers.
-                const published = self.api_server.txn_sessions.recordTerminalAbort(alloc, txn_id) catch null;
-                if (published == null) return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
+                self.api_server.txn_sessions.publishAbortAndRetireForMutation(alloc, guard, if (rejection == .fresh) execution_plan.?.publication else null) catch return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
             }
             break :rejected switch (err) {
+                error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "row_policy_denied", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+                error.PreDispatchDecisionAdmissionUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Metadata decision admission unavailable.", .retryable = true }),
+                error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Commit preparation temporarily unavailable.", .retryable = true }),
                 error.TransactionTooLarge => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
                 },
                 error.InvalidBatchRequest,
@@ -6325,26 +8004,23 @@ pub const AntflyApiHandler = struct {
                 => {
                     // Participant validation terminally aborts this transaction
                     // ID, so retaining the session would only produce conflicts.
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(400);
                     return ctx.text("invalid transaction commit request");
                 },
-                error.TopologyChanged => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                error.PreDispatchCatalogGenerationChanged, error.TopologyChanged => {
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
                         arena_impl.allocator(),
                         txn_id,
                         "aborted",
-                        transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                        transactions_api.topologyChangedConflict(if (commit_req.tables.len == 1 and err == error.TopologyChanged) commit_req.tables[0].table_name else ""),
                         null,
                     );
                     _ = ctx.status(409);
                     return ctx.openApiJson(response);
                 },
                 error.DecisionConflict => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6358,7 +8034,6 @@ pub const AntflyApiHandler = struct {
                     return ctx.openApiJson(response);
                 },
                 error.DocIdentityNamespaceMismatch => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6372,17 +8047,14 @@ pub const AntflyApiHandler = struct {
                     return ctx.openApiJson(response);
                 },
                 error.UnsupportedOperation => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
                 },
                 error.TableNotFound => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(404);
                     return ctx.text("not found");
                 },
                 error.UnknownGroup => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6425,9 +8097,9 @@ pub const AntflyApiHandler = struct {
                     // throws this legacy outcome cannot return coordinator metadata
                     // in the same call, so maintenance replays the transaction at
                     // write durability solely to recover and release that handoff.
-                    _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(
+                    _ = (self.api_server.txn_sessions.recordTerminalCommitForMutation(
                         alloc,
-                        txn_id,
+                        guard,
                         .committed,
                         true,
                         null,
@@ -6460,7 +8132,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(503);
                     return ctx.text("transaction outcome is unknown; retry this transaction id");
                 },
-                error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
+                error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
                     _ = ctx.status(503);
                     return ctx.text("transaction coordinator is temporarily unavailable");
                 },
@@ -6479,9 +8151,9 @@ pub const AntflyApiHandler = struct {
                     committed.visibility_retry_pending,
                     committed.visibility_repair_required,
                 );
-                _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(
+                _ = (self.api_server.txn_sessions.recordTerminalCommitForMutation(
                     alloc,
-                    txn_id,
+                    guard,
                     status,
                     committed.visibility_repair_required,
                     committed.coordinator_group_id,
@@ -6509,7 +8181,7 @@ pub const AntflyApiHandler = struct {
                         };
                         if (acknowledged == null) {
                             status = .committed_recovery_pending;
-                        } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch |err| blk: {
+                        } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledgedForMutation(alloc, guard) catch |err| blk: {
                             std.log.warn("failed to persist stable transaction acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                             break :blk null;
                         }) == null) {
@@ -6530,7 +8202,8 @@ pub const AntflyApiHandler = struct {
                 return ctx.openApiJson(response);
             },
             .conflict => |conflict| {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                self.api_server.txn_sessions.publishAbortAndRetireForMutation(alloc, guard, execution_plan.?.publication) catch
+                    return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id");
                 const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req, conflict);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
@@ -6556,20 +8229,23 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        if (try self.api_server.txn_sessions.getTerminalCommit(self.api_server.alloc, txn_id)) |terminal_value| {
-            var terminal = terminal_value;
-            defer terminal.deinit(self.api_server.alloc);
-            _ = ctx.status(409);
-            return ctx.text("transaction is already committed");
-        }
-        if (!self.api_server.txn_sessions.remove(self.api_server.alloc, txn_id)) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
+        if (self.forwardTransactionSession(ctx, txn_id, body_data) catch |err| return sessionInspectionFailure(ctx, err)) |response| return response;
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err|
+            return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+        const registry = &self.api_server.txn_sessions;
+        const execution = try registry.acquireCommitExecution(txn_id, ctx.io);
+        defer execution.release();
+        const info = (registry.readMutationInfo(guard) catch |err| return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+        if (info.version.owner != self.api_server.localSessionNodeId())
+            return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+        const retired = info.terminal_abort or (registry.retireBeforeExecution(self.api_server.alloc, guard, info.version, false) catch false);
+        if (!retired) {
+            if (registry.getTerminalCommitForMutation(self.api_server.alloc, guard) catch |err| return sessionInspectionFailure(ctx, err)) |terminal_value| {
+                var terminal = terminal_value;
+                defer terminal.deinit(self.api_server.alloc);
+                return textResponse(ctx, 409, "transaction is already committed");
+            }
+            return textResponse(ctx, 503, "transaction changed; reconcile this transaction id");
         }
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -6677,7 +8353,12 @@ pub const AntflyApiHandler = struct {
         parameters: []const std.json.Value,
         limit: usize,
         execution_limits: sql_runtime.Limits = .{},
+        has_execution_budget: bool = false,
+        routed_commit_checked: bool = false,
         completion_io: std.Io,
+        completion: *@import("../pgwire/completion.zig").Completion,
+        completion_alloc: std.mem.Allocator,
+        observation_unavailable: bool = false,
         cache_io: std.Io,
         cache: *sql_plan_cache.Cache,
         done: std.Io.Event = .unset,
@@ -6688,14 +8369,34 @@ pub const AntflyApiHandler = struct {
         diagnostic_message_buffer: [256]u8 = undefined,
         compile_diagnostic_valid: bool = false,
         execution_entered: bool = false,
+        failure_published: bool = false,
         is_write: bool = false,
         preparation: *RequestAdmission.Lease,
         prepared_mode: SQLPreparedMode = .statement,
         prepared_id: ?[]const u8 = null,
         prepared_response: ?[]const u8 = null,
-        prepared_response_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 16 << 20 },
-        connection_owned: ?@import("sql_connections.zig").Owned = null,
+        prepared_response_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = http_server_mod.ApiHttpServer.max_sql_response_bytes },
+        connection_owned: ?@import("sql/session/connections.zig").Owned = null,
         connection_session_hex: [32]u8 = undefined,
+        statement_start_ns: u64 = 0,
+        notice_buffer: ?*@import("antfly_local_sources").sql_catalog.notices.Buffer = null,
+        fn reserveNotices(raw: *anyopaque, count: usize, bytes: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.notice_buffer == null) {
+                self.notice_buffer = try self.prepared_response_budget.allocator().create(@import("antfly_local_sources").sql_catalog.notices.Buffer);
+                self.notice_buffer.?.* = .{};
+            }
+            try self.notice_buffer.?.reserve(count, bytes);
+        }
+        fn emitNotice(raw: *anyopaque, notice: @import("antfly_local_sources").sql_catalog.notices.Notice) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const a = self.prepared_response_budget.allocator();
+            if (self.notice_buffer == null) {
+                self.notice_buffer = try a.create(@import("antfly_local_sources").sql_catalog.notices.Buffer);
+                self.notice_buffer.?.* = .{};
+            }
+            try self.notice_buffer.?.append(notice);
+        }
 
         fn deliverRead(raw: *anyopaque, alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream) anyerror!sql_runtime.Result {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -6726,19 +8427,43 @@ pub const AntflyApiHandler = struct {
                         if (column != 0) try writer.writer.writeByte(',');
                         const value = try page.values.cell(page.arena.allocator(), row, column);
                         if (cells % 8 == 0) try nulls.append(a, 0);
+                        if (value.temporal() != null or value.range() != null) try value.validateTemporal();
                         if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
                         cells += 1;
+                        if (!value.sql_null and ((definition.type == .bytea) != (value.bytes() != null))) return error.InvalidSqlBackendResponse;
                         if (value.sql_null) {
                             try writer.writer.writeAll("null");
+                        } else if (value.bytes()) |bytes| {
+                            try value.validateTemporal();
+                            if (definition.element_type != null) return error.InvalidSqlBackendResponse;
+                            try @import("antfly_local_sources").sql_scalar.Bytea.writeJson(&writer.writer, bytes, self.prepared_response_budget.limit);
+                        } else if (value.range()) |range| {
+                            const ranges = @import("antfly_local_sources").sql_range_value;
+                            if (ranges.kindFromType(definition.type) != range.kind) return error.InvalidSqlBackendResponse;
+                            var context: ranges.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit };
+                            try std.json.Stringify.value(try ranges.formatLeaky(&context, range.*), .{}, &writer.writer);
+                        } else if (value.temporal()) |temporal| {
+                            if (definition.type != .datetime or (definition.temporal_kind orelse .timestamp_tz) != temporal.kind()) return error.InvalidSqlBackendResponse;
+                            var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
+                            const exact = if (temporal.kind() == .timestamp_tz)
+                                try @import("antfly_local_sources").sql_scalar.formatTimestampResult(value, definition.type, &text)
+                            else
+                                try @import("antfly_local_sources").sql_temporal_text.format(temporal.*, &text);
+                            try std.json.Stringify.value(exact, .{}, &writer.writer);
+                        } else if (value.enumeration()) |atom| {
+                            try value.validateTemporal();
+                            if (definition.type != .enumeration) return error.InvalidSqlBackendResponse;
+                            const view = definition.enum_view orelse return error.InvalidSqlBackendResponse;
+                            try std.json.Stringify.value(try view.output(atom), .{}, &writer.writer);
                         } else if (value.array) |array| {
-                            if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;
                             try @import("antfly_local_sources").sql_array_wire.encode(array.*, &writer.writer, .{ .wire_bytes = self.prepared_response_budget.limit });
                         } else if (value.numeric) |number| {
-                            if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;
                             var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit };
                             const exact = try @import("antfly_local_sources").sql_numeric_value.format(&context, number.*);
                             try std.json.Stringify.value(exact, .{}, &writer.writer);
-                        } else if (value.patterns) |patterns| {
+                        } else if (value.patterns()) |patterns| {
                             try writer.writer.writeByte('[');
                             var offset: u64 = 0;
                             var first = true;
@@ -6782,6 +8507,8 @@ pub const AntflyApiHandler = struct {
         }
 
         fn run(self: *@This()) void {
+            self.adapter.notice_sink = .{ .ptr = self, .emit = emitNotice, .reserve = reserveNotices };
+            defer self.adapter.releaseExecutionOwners();
             // Wake on the executor that owns the request waiter, not the
             // backend executor running this worker.
             defer self.done.set(self.completion_io);
@@ -6789,21 +8516,97 @@ pub const AntflyApiHandler = struct {
             self.runChecked() catch |err| {
                 self.failure = err;
             };
+            if (!self.adapter.reports_existing_commit or self.adapter.context.sql_completion == null) return;
+            const pending = if (self.result) |result| result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required else false;
+            const uncertain = if (self.failure) |err| err == error.SqlTransactionOutcomeUnknown else false;
+            if (!pending and !uncertain) return;
+            const encoded = self.adapter.outcome_transaction_id orelse {
+                self.observation_unavailable = true;
+                return;
+            };
+            const id = distributed_txn.parseTxnIdHex(&encoded) catch {
+                self.observation_unavailable = true;
+                return;
+            };
+            @import("sql/session/completion.zig").observeTransactionControlled(self.adapter.server, self.completion_alloc, self.completion, id, self.adapter.context) catch {
+                self.observation_unavailable = true;
+            };
+        }
+
+        fn replayCommit(self: *@This(), store: *transactions_api.DurableSessionStore, encoded: []const u8, connection: ?[32]u8, principal: []const u8) !bool {
+            const txn_id = distributed_txn.parseTxnIdHex(encoded) catch return false;
+            const decision = (try store.sqlCommitDecisionStatus(std.heap.page_allocator, txn_id, connection, principal)) orelse return false;
+            return self.reportCommitDecision(txn_id, decision);
+        }
+
+        fn replayConnectionCommit(self: *@This(), store: *transactions_api.DurableSessionStore, encoded: []const u8, connection: [32]u8, principal: []const u8) !bool {
+            const id = distributed_txn.parseTxnIdHex(encoded) catch return false;
+            const probe = try store.probeSqlCommitDecision(std.heap.page_allocator, id, connection, principal);
+            if (probe.decision) |decision| return self.reportCommitDecision(id, decision);
+            if (probe.payload == .none) return false;
+            var read = try self.adapter.server.acquireSqlExecution(false);
+            defer read.release();
+            return self.replayCommit(store, encoded, connection, principal);
+        }
+
+        fn reportCommitDecision(self: *@This(), txn_id: [16]u8, decision: transactions_api.SqlStoredDecision) !bool {
+            self.reportsCommitResult(txn_id);
+            const disposition = decision.disposition;
+            if (disposition == .aborted) if (decision.abort_acknowledgement.diagnostic()) |err| return err;
+            self.result = try sql_runtime.Result.empty(std.heap.page_allocator, if (disposition == .aborted) "ROLLBACK" else "COMMIT");
+            self.result.?.output.mutation_outcome = switch (disposition) {
+                .committed => .committed,
+                .committed_pending => .committed_pending,
+                .committed_repair_required => .committed_repair_required,
+                .aborted => null,
+                .active, .prepared, .outcome_unknown => unreachable,
+            };
+            return true;
+        }
+
+        fn reportsCommitResult(self: *@This(), txn_id: db_mod.types.TxnId) void {
+            self.adapter.reports_existing_commit = true;
+            self.adapter.outcome_transaction_id = std.fmt.bytesToHex(txn_id, .lower);
         }
 
         fn runChecked(self: *@This()) !void {
             try self.adapter.context.ensureActive();
-            const prepared = @import("sql_prepared.zig");
+            const prepared = @import("sql/session/prepared.zig");
             var resource: ?prepared.Owned = null;
             defer if (resource) |*value| value.deinit();
             defer if (self.connection_owned) |*value| value.deinit();
             const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
             const resource_principal = http_server_mod.transactionPrincipal(self.adapter.identity.*) orelse "";
+            var connection_admission: ?@import("sql/session/connection_admission.zig").Lease = null;
+            defer if (connection_admission) |*lease| lease.release(self.adapter.server.sharedApiIo().?);
+            var command_scope: @import("sql/session/command_execution.zig").Request = .{};
+            const original_context = self.adapter.context;
+            defer {
+                self.adapter.releaseExecutionOwners();
+                if (self.failure) |failure| if (command_scope.failed(self.adapter.identity.*, failure) catch true) {
+                    self.failure_published = true;
+                    self.adapter.transaction_status = .failed;
+                };
+                command_scope.finish() catch |err| {
+                    if (self.failure == null) self.failure = if (self.execution_entered or self.prepared_response != null) error.SqlMutationOutcomeUnknown else err;
+                };
+                self.adapter.context = original_context;
+            }
+            errdefer if (command_scope.failed(self.adapter.identity.*, null) catch true) {
+                self.failure_published = true;
+                self.adapter.transaction_status = .failed;
+            };
             if (self.adapter.connection_id) |connection_id| {
+                const io = self.adapter.server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
+                connection_admission = try self.adapter.server.sql_connection_admission.acquire(self.adapter.server.alloc, io, .init(connection_id, resource_principal));
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
-                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms);
+                self.connection_owned = try @import("sql/session/connections.zig").loadReconciledWithAdmission(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms, &self.adapter.server.query_admission, if (self.has_execution_budget) .idle_only else .reconcile);
                 const connection = self.connection_owned.?.value;
-                if (connection.state == .beginning or connection.state == .uncertain) return error.SqlConnectionBusy;
+                try http_server_mod.requireSqlPrincipalInstance(self.adapter.server, self.adapter.identity.*, connection.principal_instance);
+                self.adapter.context = try self.adapter.context.platformDeadline();
+                self.adapter.context.deadline_ns = connection.statementDeadline(self.statement_start_ns, self.adapter.context.deadline_ns);
+                try self.adapter.context.ensureActive();
+                if (connection.state == .beginning) return error.SqlConnectionBusy;
                 if ((!self.adapter.inherit_session_database and !std.mem.eql(u8, self.adapter.database, connection.database)) or
                     (!self.adapter.inherit_session_namespace and !std.mem.eql(u8, self.adapter.namespace, connection.namespace))) return error.SqlConnectionChanged;
                 self.adapter.database = connection.database;
@@ -6814,15 +8617,50 @@ pub const AntflyApiHandler = struct {
                 self.adapter.inherit_session_namespace = false;
                 self.adapter.connection_generation = connection.generation;
                 self.adapter.connection_revision = connection.revision;
+                self.adapter.setting_baseline = connection.baseline;
+                self.adapter.setLookupPath(connection.lookup_path);
                 if (connection.active_txn) |active| {
                     self.connection_session_hex = std.fmt.bytesToHex(active, .lower);
-                    if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) return error.SqlTransactionNotActive;
+                    if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement) or
+                            !try self.replayConnectionCommit(store, supplied, connection_id, resource_principal)) return error.SqlTransactionNotActive;
+                        return;
+                    };
+                    if (connection.state == .uncertain) {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlConnectionBusy;
+                        self.adapter.reports_existing_commit = true;
+                        self.adapter.outcome_transaction_id = self.connection_session_hex;
+                        return error.SqlTransactionOutcomeUnknown;
+                    }
                     self.adapter.session_id = &self.connection_session_hex;
                     self.adapter.setting_overlay = &.{};
                 } else {
-                    if (self.adapter.session_id != null) return error.SqlTransactionNotActive;
+                    if (self.adapter.session_id) |supplied| {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlTransactionNotActive;
+                        if (!try self.replayConnectionCommit(store, supplied, connection_id, resource_principal))
+                            return error.SqlTransactionNotActive;
+                        return;
+                    }
                     self.adapter.setting_overlay = connection.overlay;
                 }
+            }
+            if (connection_admission) |*lease| {
+                const started = command_scope.start(self.adapter.server, self.adapter.context, self.adapter.identity.*, lease, .{ .mode = @tagName(self.prepared_mode), .statement = self.statement, .prepared_id = self.prepared_id, .parameters = self.parameters, .database = self.database, .namespace = self.namespace }) catch |err| {
+                    // Taking the next command can finish a previous native
+                    // lock scope. A lost reply there precedes SQL execution,
+                    // but still belongs to the existing durable transaction.
+                    if (std.mem.eql(u8, sql_execution.diagnostic(err).code, "40003") and self.adapter.outcome_transaction_id == null) {
+                        if (self.connection_owned) |owned| {
+                            if (owned.value.active_txn) |id|
+                                self.adapter.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
+                        }
+                    }
+                    return err;
+                };
+                if (started) self.adapter.context = command_scope.attach(self.adapter.context);
             }
             if (self.prepared_mode != .statement) {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;
@@ -6852,6 +8690,7 @@ pub const AntflyApiHandler = struct {
                     self.adapter.inherit_session_namespace = false;
                     self.adapter.prepared_bindings = value.bindings;
                     self.adapter.expected_setting_epoch = value.setting_epoch;
+                    self.adapter.setLookupPath(value.lookup_path);
                 }
             }
             if (self.prepared_mode == .statement) {
@@ -6861,22 +8700,25 @@ pub const AntflyApiHandler = struct {
                 var setting_arena = std.heap.ArenaAllocator.init(self.prepared_response_budget.allocator());
                 defer setting_arena.deinit();
                 const parsed_setting = try @import("../pgwire/session_commands.zig").settingCommand(setting_arena.allocator(), self.statement);
-                const setting: ?@import("sql_http_settings.zig").Command = if (parsed_setting) |value| switch (value) {
+                const setting: ?@import("sql/transport/http_settings.zig").Command = if (parsed_setting) |value| switch (value) {
                     .catalog => |catalog_setting| .{ .catalog = catalog_setting },
+                    .search_path => |path| .{ .search_path = path },
                     .reset_all => .reset_all,
                     .discard_all => .discard_all,
+                    .discard_sequences => .discard_sequences,
                     else => null,
                 } else null;
                 if (setting) |command| {
                     self.is_write = switch (command) {
                         .catalog => |catalog_setting| catalog_setting != .show,
-                        .reset_all, .discard_all => true,
+                        .search_path => |path| path != .show,
+                        .reset_all, .discard_all, .discard_sequences => true,
                     };
                     var execution = try self.adapter.server.acquireSqlExecution(self.is_write);
                     defer execution.release();
                     self.preparation.release();
                     self.execution_entered = true;
-                    self.result = try @import("sql_http_settings.zig").execute(std.heap.page_allocator, &self.adapter, command, self.parameters);
+                    self.result = try @import("sql/transport/http_settings.zig").execute(std.heap.page_allocator, &self.adapter, command, self.parameters);
                     return;
                 }
             }
@@ -6914,6 +8756,7 @@ pub const AntflyApiHandler = struct {
                 self.adapter.database = self.database;
                 self.adapter.namespace = self.namespace;
                 self.adapter.setting_overlay = state.setting_active.items;
+                self.adapter.setLookupPath(state.metadata.search_path_active);
             }
             var lease = self.cache.acquire(self.cache_io, .{
                 .statement = self.statement,
@@ -6927,10 +8770,13 @@ pub const AntflyApiHandler = struct {
             };
             defer lease.release(self.cache_io);
             const compiled = lease.compiled();
+            // COPY owns a wire streaming contract. Neither JSON execution nor
+            // JSON prepared resources may silently expose its SELECT body.
+            if ((compiled.statement == .copy_to or compiled.statement == .copy_from) and @import("sql/copy/server.zig").target(compiled.statement) == null) return error.UnsupportedSqlExecution;
             if (self.prepared_mode == .prepare) {
                 if (self.statement.len > prepared.max_statement_bytes) return error.SqlProgramLimitExceeded;
                 switch (compiled.statement) {
-                    .select, .insert, .update, .delete, .merge => {},
+                    .effect_block, .select, .insert, .update, .delete, .merge => {},
                     else => return error.UnsupportedSqlExecution,
                 }
                 var bindings: std.ArrayListUnmanaged(prepared.Binding) = .empty;
@@ -6943,7 +8789,7 @@ pub const AntflyApiHandler = struct {
                 defer description.deinit();
                 var bytes: [16]u8 = undefined;
                 try self.cache_io.randomSecure(&bytes);
-                const id = @import("sql_resource_routing.zig").encode(self.adapter.server.localSessionNodeId(), bytes);
+                const id = @import("sql/execution/resource_routing.zig").encode(self.adapter.server.localSessionNodeId(), bytes);
                 const expires = now_ms +| prepared.ttl_ms;
                 var owner_buffer: [20]u8 = undefined;
                 const encoded_owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{self.adapter.server.localSessionNodeId()});
@@ -6952,38 +8798,257 @@ pub const AntflyApiHandler = struct {
                     inline else => |tag| @field(sql_wire.SQLColumnType, @tagName(tag)),
                 } else .unknown;
                 const parameter_descriptors = try description.arena.allocator().alloc(sql_wire.SQLParameterDescriptor, parameter_types.len);
-                for (parameter_descriptors, parameter_types, description.binding.parameter_descriptors) |*output, kind, descriptor| output.* = .{ .type = kind, .nullable = descriptor.nullable, .element_type = if (descriptor.element_type) |element| switch (element) {
+                for (parameter_descriptors, parameter_types, description.binding.parameter_descriptors) |*output, kind, descriptor| output.* = .{ .type = kind, .nullable = descriptor.nullable, .named_type = if (descriptor.domainView()) |view| try @import("antfly_local_sources").sql_catalog.named_layouts.identityWireLeaky(std.meta.Child(@FieldType(sql_wire.SQLColumn, "named_type")), description.arena.allocator(), view.identity.?) else if (descriptor.enum_view) |view| try @import("antfly_local_sources").sql_catalog.named_layouts.identityWireLeaky(std.meta.Child(@FieldType(sql_wire.SQLColumn, "named_type")), description.arena.allocator(), view.record.identity) else null, .temporal_kind = if (descriptor.temporal_kind) |temporal_kind| switch (temporal_kind) {
+                    inline else => |tag| @field(sql_wire.SQLTemporalKind, @tagName(tag)),
+                } else null, .element_type = if (descriptor.element_type) |element| switch (element) {
                     inline else => |tag| @field(sql_wire.SQLArrayElementType, @tagName(tag)),
                 } else null };
                 const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .parameter_descriptors = parameter_descriptors, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 errdefer self.prepared_response_budget.allocator().free(response);
                 try self.adapter.context.ensureActive();
-                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .parameter_descriptors = description.binding.parameter_descriptors, .bindings = bindings.items }, now_ms);
+                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .lookup_path = if (self.adapter.ddl_search_path) |path| path.* else null, .parameter_types = description.binding.parameter_types, .parameter_descriptors = description.binding.parameter_descriptors, .bindings = bindings.items }, now_ms);
                 self.prepared_response = response;
                 return;
             }
-            self.is_write = switch (compiled.statement) {
-                .select, .explain => false,
-                .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
-            };
+            var legacy_replay: ?*transactions_api.DurableSessionStore = null;
+            if (!self.routed_commit_checked and compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
+                if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
+                    const id = distributed_txn.parseTxnIdHex(supplied) catch return error.SqlTransactionNotActive;
+                    const probe = try store.probeSqlCommitDecision(std.heap.page_allocator, id, null, resource_principal);
+                    if (probe.decision) |decision| {
+                        _ = try self.reportCommitDecision(id, decision);
+                        return;
+                    }
+                    if (probe.payload != .none) {
+                        if (self.adapter.server.query_admission.tryAcquireLease()) |read_lease| {
+                            var read = read_lease;
+                            defer read.release();
+                            if (try self.replayCommit(store, supplied, null, resource_principal)) return;
+                        } else if (probe.payload == .unknown) {
+                            legacy_replay = store;
+                        } else return error.SqlWriteCapacityUnavailable;
+                    }
+                };
+            }
+            self.is_write = compiled.requiresWriteAdmission();
             var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {
                 self.failure = err;
                 return;
             };
             defer execution.release();
+            if (legacy_replay) |store| {
+                if (try self.replayCommit(store, self.adapter.session_id.?, null, resource_principal)) return;
+            }
             self.preparation.release();
             self.execution_entered = true;
             self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
             var execution_backend = self.adapter.backend();
-            if (resource) |owned| execution_backend.parameter_descriptor_hints = owned.value.parameter_descriptors;
+            var parameter_region = std.heap.ArenaAllocator.init(self.prepared_response_budget.allocator());
+            defer parameter_region.deinit();
+            if (resource) |owned| execution_backend.parameter_descriptor_hints = @import("sql/catalog/type_schema.zig").parameterDescriptorsLeaky(self.adapter.server, parameter_region.allocator(), self.adapter.identity.*, self.adapter.context, owned.value.parameter_descriptors, &.{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
             var execution_limits = self.execution_limits;
             execution_limits.result_rows = self.limit;
             self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
+                sql_execution.diagnoseCatalogConflictTrace(err, @errorReturnTrace());
+                if ((err == error.SqlTransactionNotActive or (err == error.SqlTransactionOutcomeUnknown and self.adapter.reports_existing_commit)) and compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
+                    if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
+                        if (try self.replayCommit(store, supplied, null, resource_principal)) return;
+                    };
+                }
                 self.failure = err;
                 return;
             };
         }
     };
+
+    fn runDurableSQLRouting(self: *AntflyApiHandler, network: std.Io, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
+        const io = http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg) orelse return error.SqlWriteCapacityUnavailable;
+        return runSQLRoutingTask(io, network, task, args);
+    }
+
+    fn runSQLForwarding(self: *AntflyApiHandler, network: std.Io, preparation: ?*http_server_mod.RequestAdmission.Lease, control: *http_server_mod.ApiHttpServer.SQLForwardControl, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
+        _ = try control.timeoutMs();
+        if (self.api_server.cfg.imported_runtime_io) |views| {
+            const source = views.request_forward orelse return error.SqlWriteCapacityUnavailable;
+            const Call = struct {
+                server: *ApiHttpServer,
+                control: *http_server_mod.ApiHttpServer.SQLForwardControl,
+                args: @TypeOf(args),
+                network: std.Io,
+                preparation: ?*http_server_mod.RequestAdmission.Lease,
+                result: anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload = error.SqlWriteCapacityUnavailable,
+
+                fn invoke(raw: *anyopaque, borrow: *const @import("kernel_abi.zig").native_abi.IoBorrow) callconv(.c) void {
+                    const call: *@This() = @ptrCast(@alignCast(raw));
+                    var receiver = borrow.receive() catch return;
+                    call.control.executor = call.server.sqlPeerExecutor(borrow.*) catch |err| {
+                        call.result = err;
+                        return;
+                    };
+                    if (call.preparation) |held| held.release();
+                    call.result = runSQLRoutingTask(receiver.io(), call.network, task, call.args);
+                }
+            };
+            var call: Call = .{ .server = self.api_server, .control = control, .args = args, .network = network, .preparation = preparation };
+            if (!source.with_lane(source.context, &call, Call.invoke)) return error.SqlWriteCapacityUnavailable;
+            return call.result;
+        }
+        const runtime = self.api_server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+        var lease = runtime.acquireDedicatedRequestForwardLane() catch return error.SqlWriteCapacityUnavailable;
+        defer lease.release();
+        const io = lease.io();
+        control.executor = try self.api_server.sqlPeerExecutor(.init(&io));
+        if (preparation) |held| held.release();
+        return runSQLRoutingTask(io, network, task, args);
+    }
+
+    fn runSQLRoutingTask(io: std.Io, network: std.Io, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
+        const Result = @typeInfo(@TypeOf(task)).@"fn".return_type.?;
+        const Job = struct {
+            args: @TypeOf(args),
+            network: std.Io,
+            done: std.Io.Event = .unset,
+            result: Result = undefined,
+
+            fn run(job: *@This()) void {
+                defer job.done.set(job.network);
+                job.result = @call(.auto, task, job.args);
+            }
+        };
+        var job: Job = .{ .args = args, .network = network };
+        var future = io.concurrent(Job.run, .{&job}) catch return error.SqlWriteCapacityUnavailable;
+        job.done.waitUncancelable(network);
+        @import("protected_future.zig").wait(io, &future);
+        return job.result;
+    }
+
+    const SQLRouteOwners = struct {
+        handles: [3]?u64,
+        session: ?u64 = null,
+    };
+
+    fn resolveSqlRouteOwners(server: *http_server_mod.ApiHttpServer, handles: [3]?[]const u8, owners: SQLRouteOwners, context: operation_contract.RequestContext) !SQLRouteOwners {
+        try context.ensureActive();
+        const routing = @import("sql/execution/resource_routing.zig");
+        const local = server.localSessionNodeId();
+        var resolved = owners;
+        for (handles[0..2], 0..) |handle, i| {
+            const encoded = handle orelse continue;
+            if (resolved.handles[i].? == local) continue;
+            if (server.txn_sessions.durable) |store| {
+                const kind: routing.Kind = if (i == 0) .prepared else .connection;
+                if (try routing.ownsLocal(store, encoded, kind, local, &server.query_admission, context)) resolved.handles[i] = local;
+            }
+        }
+        if (handles[2]) |encoded| {
+            if (resolved.handles[2].? != local or (server.cfg.session_router != null and server.hasSessionForwardTransport())) {
+                const id = try distributed_txn.parseTxnIdHex(encoded);
+                resolved.session = try server.sessionRoutingOwner(id, context);
+                if (resolved.session) |node| resolved.handles[2] = node;
+            }
+        }
+        return resolved;
+    }
+
+    fn replaySharedCommit(self: *AntflyApiHandler, ctx: *httpx.Context, id: db_mod.types.TxnId, principal: []const u8, completion: *@import("../pgwire/completion.zig").Completion, owners: *SQLRouteOwners) !?httpx.Response {
+        const store = self.api_server.txn_sessions.durable orelse return null;
+        const probe = self.runDurableSQLRouting(ctx.io, transactions_api.DurableSessionStore.routedSqlCommitDecision, .{
+            store, std.heap.page_allocator, id, principal, &self.api_server.query_admission, operationContext(ctx, null),
+        }) catch |err| switch (err) {
+            error.SqlWriteCapacityUnavailable => return try sqlRoutingOverloadedResponse(ctx),
+            error.DeadlineExceeded => return try sqlForwardDeadlineResponse(ctx),
+            else => return err,
+        };
+        owners.session = probe.owner;
+        if (probe.owner) |node| owners.handles[2] = node;
+        const decision = probe.decision orelse return null;
+        const encoded = std.fmt.bytesToHex(id, .lower);
+        if (decision.disposition == .aborted) if (decision.abort_acknowledgement.diagnostic()) |err| {
+            var message: [256]u8 = undefined;
+            return try ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
+                .code = sql_execution.sqlState(err),
+                .message = sql_execution.diagnosticMessage(err, &message),
+                .transaction_id = &encoded,
+                .retryable = sql_execution.diagnostic(err).retryable,
+            });
+        };
+        const outcome: ?sql_wire.SQLMutationOutcome = switch (decision.disposition) {
+            .committed => .committed,
+            .committed_pending => .committed_pending,
+            .committed_repair_required => .committed_repair_required,
+            .aborted => null,
+            .active, .prepared, .outcome_unknown => unreachable,
+        };
+        if ((outcome == .committed_pending or outcome == .committed_repair_required) and ctx.header("X-Antfly-SQL-Fence") != null)
+            self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransactionControlled, .{ self.api_server, ctx.allocator, completion, id, operationContext(ctx, null) }) catch {
+                completion.unknown = true;
+            };
+        return try ctx.status(200).json(sql_wire.SQLResponse{
+            .columns = &.{},
+            .rows = &.{},
+            .rows_affected = 0,
+            .command_tag = if (outcome == null) "ROLLBACK" else "COMMIT",
+            .transaction_id = &encoded,
+            .transaction_status = .idle,
+            .mutation_outcome = outcome,
+        });
+    }
+
+    fn isSqlPeerHop(ctx: *const httpx.Context) bool {
+        const hop = ctx.header(ApiHttpServer.sql_peer_hop_header) orelse return false;
+        return std.mem.eql(u8, hop, ApiHttpServer.sql_peer_hop_value);
+    }
+
+    fn sqlOwnerChangedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return rejectBeforeSQLExecution(ctx, try ctx.status(503).json(sql_wire.SQLDiagnostic{
+            .code = "08003",
+            .message = "SQL resource ownership changed; retry through the current owner.",
+            .retryable = true,
+        }));
+    }
+
+    fn sqlForwardDeadlineResponse(ctx: *httpx.Context) !httpx.Response {
+        return rejectBeforeSQLExecution(ctx, try ctx.status(504).json(sql_wire.SQLDiagnostic{
+            .code = "57014",
+            .message = "Request deadline exceeded before forwarding to the SQL owner.",
+        }));
+    }
+
+    fn sqlPeerUnavailableResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return rejectBeforeSQLExecution(ctx, try ctx.status(503).json(sql_wire.SQLDiagnostic{
+            .code = "08006",
+            .message = "The request could not be sent to the SQL owner.",
+            .retryable = true,
+        }));
+    }
+
+    fn sqlSessionExecutionBudgetUnsupported(ctx: *httpx.Context) !httpx.Response {
+        return ctx.status(400).json(sql_wire.SQLDiagnostic{
+            .code = "0A000",
+            .message = "per-request execution budgets require a one-shot SQL statement",
+        });
+    }
+
+    fn sqlForwardOutcomeUnknownResponse(ctx: *httpx.Context) !httpx.Response {
+        var response = try ctx.status(409).json(sql_wire.SQLDiagnostic{
+            .code = "40003",
+            .message = "The peer may have executed the request; reconcile the transaction before retrying.",
+        });
+        errdefer response.deinit();
+        try attachSQLCompletion(&response, (try requestCompletion(ctx)).*);
+        return response;
+    }
+
+    fn sqlRoutingOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return rejectBeforeSQLExecution(ctx, try ctx.status(503).json(sql_wire.SQLDiagnostic{
+            .code = "53300",
+            .message = "SQL routing read capacity is temporarily exhausted.",
+            .retryable = true,
+        }));
+    }
 
     fn sqlOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("Retry-After", "1");
@@ -6997,6 +9062,61 @@ pub const AntflyApiHandler = struct {
 
     pub fn executeSQL(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.executeSQLMode(ctx, .statement, null);
+    }
+
+    const CatalogReceiptBuffers = struct { id: [20]u8 = undefined, generation: [20]u8 = undefined, revision: [20]u8 = undefined };
+
+    fn noticeWire(a: std.mem.Allocator, optional: ?*const @import("antfly_local_sources").sql_catalog.notices.Buffer) !?[]const sql_wire.SQLNotice {
+        const buffer = optional orelse return null;
+        const output = try a.alloc(sql_wire.SQLNotice, buffer.count);
+        for (output, 0..) |*notice, ordinal| {
+            const value = buffer.get(ordinal);
+            notice.* = .{ .code = value.code, .message = value.message };
+        }
+        return output;
+    }
+
+    fn catalogReceiptWire(value: @import("antfly_local_sources").sql_catalog.CatalogOperationReceipt, buffers: *CatalogReceiptBuffers) sql_wire.SQLCatalogOperationReceipt {
+        return .{
+            .kind = switch (value.kind) {
+                inline else => |kind| @field(sql_wire.SQLCatalogObjectKind, @tagName(kind)),
+            },
+            .operation = switch (value.operation) {
+                inline else => |operation| @field(sql_wire.SQLCatalogOperationKind, @tagName(operation)),
+            },
+            .database = value.database,
+            .namespace = value.namespace,
+            .name = value.name,
+            .state = switch (value.state) {
+                inline else => |state| @field(sql_wire.SQLCatalogOperationState, @tagName(state)),
+            },
+            .recovery_token = value.recovery_token,
+            .object_id = if (value.object_id) |id| std.fmt.bufPrint(&buffers.id, "{d}", .{id}) catch unreachable else null,
+            .generation = if (value.generation) |generation| std.fmt.bufPrint(&buffers.generation, "{d}", .{generation}) catch unreachable else null,
+            .catalog_revision = if (value.catalog_revision) |revision| std.fmt.bufPrint(&buffers.revision, "{d}", .{revision}) catch unreachable else null,
+            .diagnostic = if (value.diagnostic) |diagnostic| .{ .code = diagnostic.code, .message = diagnostic.message, .retryable = diagnostic.retryable } else null,
+        };
+    }
+
+    pub fn getSQLCatalogOperation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const recovery = @import("sql/recovery/catalog_recovery.zig");
+        const body = (try ctx.body()) orelse return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "catalog recovery request is required" });
+        if (body.len > recovery.max_token_bytes * 2) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "catalog recovery request is too large" });
+        var parsed = std.json.parseFromSlice(sql_wire.SQLCatalogRecoveryRequest, ctx.allocator, body, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid catalog recovery request" });
+        };
+        defer parsed.deinit();
+        const receipt = recovery.recover(self.api_server, identity, operationContext(ctx, identity), ctx.allocator, parsed.value.recovery_token) catch |err| {
+            var buffer: [512]u8 = undefined;
+            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer), .retryable = @import("antfly_local_sources").sql_errors.describe(err).retryable });
+        };
+        defer receipt.deinit(ctx.allocator);
+        var buffers: CatalogReceiptBuffers = .{};
+        return ctx.status(200).json(catalogReceiptWire(receipt, &buffers));
     }
 
     pub fn prepareSQL(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -7037,28 +9157,61 @@ pub const AntflyApiHandler = struct {
             return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL connection scope" });
         var random: [16]u8 = undefined;
         try self.api_server.sqlPlanCacheIo().randomSecure(&random);
-        const connection_id = @import("sql_resource_routing.zig").encode(self.api_server.localSessionNodeId(), random);
+        const connection_id = @import("sql/execution/resource_routing.zig").encode(self.api_server.localSessionNodeId(), random);
         const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
         const owner_node_id = self.api_server.localSessionNodeId();
         const principal = http_server_mod.transactionPrincipal(identity) orelse "";
-        @import("sql_connections.zig").reconcileExpired(store, &self.api_server.txn_sessions, self.api_server.alloc, now_ms) catch |err| {
-            var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
-        };
-        _ = @import("sql_connections.zig").mutate(store, .{ .create = .{
+        var login_defaults: ?@import("antfly_local_sources").sql_setting_catalog.Baseline = null;
+        defer if (login_defaults) |*baseline| baseline.deinit();
+        var login_timeout: ?u32 = null;
+        if (principal.len != 0) {
+            var setting_scratch = std.heap.ArenaAllocator.init(ctx.allocator);
+            defer setting_scratch.deinit();
+            var capture_adapter: sql_execution.Adapter = .{ .server = self.api_server, .identity = &identity, .context = operationContext(ctx, identity), .database = parsed.value.database, .namespace = parsed.value.namespace };
+            const capture = capture_adapter.settingCapture().?;
+            const raw = try capture.owner.load(capture.owner.ptr, setting_scratch.allocator(), capture.scope);
+            login_defaults = try @import("antfly_local_sources").sql_setting_catalog.Baseline.init(ctx.allocator, raw);
+            for (raw.definitions, login_defaults.?.entries) |definition, entry| {
+                if (!std.ascii.eqlIgnoreCase(definition.name, "statement_timeout")) continue;
+                if (entry.value != .integer or entry.value.integer < 0 or entry.value.integer > std.math.maxInt(i32)) return error.InvalidSettingCatalogSnapshot;
+                login_timeout = @intCast(entry.value.integer);
+            }
+        }
+        const connection: @import("sql/session/connection_record.zig").Record = .{
             .id = connection_id,
+            .wire_epoch = try self.api_server.sql_connection_admission.executionInstance(self.api_server.embedding_provider_runtime.io),
+            .durable_http = true,
             .principal = principal,
             .owner_node_id = owner_node_id,
-            .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms,
+            .expires_at_ms = now_ms +| @import("sql/session/connection_record.zig").ttl_ms,
             .database = parsed.value.database,
             .namespace = parsed.value.namespace,
-        } }, principal, owner_node_id, now_ms) catch |err| {
-            var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
+            .baseline = if (login_defaults) |baseline| baseline.entries else &.{},
+            .principal_instance = try http_server_mod.sqlPrincipalInstance(self.api_server, identity),
+            .statement_timeout_ms = login_timeout,
         };
+        self.runDurableSQLRouting(ctx.io, createLocalSQLConnection, .{ &self.api_server.txn_sessions, store, connection, now_ms, operationContext(ctx, identity) }) catch |err| return sqlConnectionError(ctx, err);
+        var native: @import("sql/session/command_execution.zig").Native = .{ .server = self.api_server, .context = operationContext(ctx, identity) };
+        var native_controller: ?@import("sql/session/command_execution.zig").Controller = null;
+        // Cover errors through response construction as well as enrollment.
+        // Ambiguous native admission retains a durable cleanup owner.
+        errdefer {
+            if (native_controller) |controller| controller.retire(ctx.allocator) catch {};
+            _ = @import("sql/session/connections.zig").mutate(store, .{ .close = connection_id }, principal, owner_node_id, now_ms) catch {};
+        }
+        if (self.api_server.source.vtable.supports_sql_command_ownership) {
+            native_controller = try native.controller(connection_id, identity);
+            try self.api_server.ensureSqlCommandUpkeep();
+            try native_controller.?.enroll(ctx.allocator, parsed.value.database);
+        }
         var owner_buffer: [20]u8 = undefined;
         const owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{owner_node_id});
-        return ctx.status(200).json(.{ .connection_id = &connection_id, .owner_node_id = owner, .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms, .database = parsed.value.database, .namespace = parsed.value.namespace });
+        return ctx.status(200).json(.{ .connection_id = &connection_id, .owner_node_id = owner, .expires_at_ms = now_ms +| @import("sql/session/connection_record.zig").ttl_ms, .database = parsed.value.database, .namespace = parsed.value.namespace });
+    }
+
+    fn createLocalSQLConnection(registry: *transactions_api.SessionRegistry, store: *transactions_api.DurableSessionStore, connection: @import("sql/session/connection_record.zig").Record, now_ms: u64, control: operation_contract.RequestContext) !void {
+        try control.ensureActive();
+        try @import("sql/session/connections.zig").create(store, registry, connection, now_ms);
     }
 
     pub fn closeSQLConnection(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id_raw: []const u8) !httpx.Response {
@@ -7073,20 +9226,103 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const decoded = distributed_txn.parseTxnIdHex(connection_id_raw) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid connection_id" });
         const connection_id = std.fmt.bytesToHex(decoded, .lower);
-        if (try self.forwardSQLResource(ctx, &connection_id, .connection, "{}")) |response| return response;
+        if (try self.forwardSQLResource(ctx, &connection_id, .connection, "{}", null, null)) |response| return response;
         const store = self.api_server.txn_sessions.durable orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "durable SQL connection storage unavailable" });
         const principal = http_server_mod.transactionPrincipal(identity) orelse "";
-        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
-        var connection = @import("sql_connections.zig").loadReconciled(store, &self.api_server.txn_sessions, self.api_server.alloc, connection_id, principal, self.api_server.localSessionNodeId(), now_ms) catch |err| {
+        const io = self.api_server.sharedApiIo() orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL connection execution unavailable" });
+        var admission = self.api_server.sql_connection_admission.acquire(self.api_server.alloc, io, .init(connection_id, principal)) catch |err| {
             var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
+            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer), .retryable = @import("antfly_local_sources").sql_errors.describe(err).retryable });
         };
-        connection.deinit();
-        _ = @import("sql_connections.zig").mutate(store, .{ .close = connection_id }, principal, self.api_server.localSessionNodeId(), now_ms) catch |err| {
-            var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
-        };
+        defer admission.release(io);
+        const control = operationContext(ctx, identity);
+        const enrolled = try self.runDurableSQLRouting(ctx.io, checkLocalSQLConnectionClose, .{ self.api_server, store, connection_id, principal, identity, control });
+        if (enrolled) {
+            var native: @import("sql/session/command_execution.zig").Native = .{ .server = self.api_server, .context = control };
+            const controller = try native.controller(connection_id, identity);
+            try native.awaitRetirement(self.api_server.alloc, controller);
+        }
+        try self.runDurableSQLRouting(ctx.io, closeLocalSQLConnection, .{ self.api_server, store, connection_id, principal, control });
         return ctx.status(200).json(struct {}{});
+    }
+
+    fn checkLocalSQLConnectionClose(server: *ApiHttpServer, store: *transactions_api.DurableSessionStore, connection_id: [32]u8, principal: []const u8, identity: ?AuthenticatedIdentity, control: operation_contract.RequestContext) !bool {
+        try control.ensureActive();
+        const connections = @import("sql/session/connections.zig");
+        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+        var connection = try connections.loadReconciledWithAdmission(store, &server.txn_sessions, server.alloc, connection_id, principal, server.localSessionNodeId(), now_ms, &server.query_admission, .reconcile);
+        defer connection.deinit();
+        try http_server_mod.requireSqlPrincipalInstance(server, identity, connection.value.principal_instance);
+        var enrolled = try @import("sql/session/command_producer.zig").load(store, server.alloc, connection_id);
+        defer if (enrolled) |*value| value.deinit();
+        return enrolled != null;
+    }
+
+    fn closeLocalSQLConnection(server: *ApiHttpServer, store: *transactions_api.DurableSessionStore, connection_id: [32]u8, principal: []const u8, control: operation_contract.RequestContext) !void {
+        try control.ensureActive();
+        const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+        _ = try @import("sql/session/connections.zig").mutate(store, .{ .close = connection_id }, principal, server.localSessionNodeId(), now_ms);
+    }
+
+    pub fn pollSQLNotifications(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id_raw: []const u8) !httpx.Response {
+        if (try self.admitCompletion(ctx)) |response| return response;
+        const response = self.pollSQLNotificationsOwned(ctx, connection_id_raw) catch |err| try sqlConnectionError(ctx, err);
+        return self.finishOwnedSQLResponse(ctx, response);
+    }
+    fn pollSQLNotificationsOwned(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id_raw: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const decoded = distributed_txn.parseTxnIdHex(connection_id_raw) catch return error.SqlInvalidParameterValue;
+        const connection_id = std.fmt.bytesToHex(decoded, .lower);
+        const body = (try ctx.body()) orelse "{}";
+        if (body.len > 4096) return error.SqlProgramLimitExceeded;
+        if (try self.forwardSQLResource(ctx, &connection_id, .connection, body, null, null)) |response| return response;
+        var parsed = try std.json.parseFromSlice(sql_wire.SQLNotificationPollRequest, ctx.allocator, body, .{});
+        defer parsed.deinit();
+        const limit = parsed.value.limit orelse 128;
+        if (limit < 1 or limit > 128) return error.SqlInvalidParameterValue;
+        const delivery = @import("sql/notifications/delivery.zig");
+        const acknowledgement = if (parsed.value.acknowledge) |token| try delivery.decodeCursor(token) else null;
+        const io = self.api_server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
+        const Job = struct {
+            owner: delivery.Owner,
+            acknowledgement: ?@import("antfly_local_sources").sql_ast.notifications.Cursor,
+            limit: u16,
+            network: std.Io,
+            done: std.Io.Event = .unset,
+            encoded: ?[]u8 = null,
+            failure: ?anyerror = null,
+            fn run(job: *@This()) void {
+                defer job.done.set(job.network);
+                job.runInner() catch |err| {
+                    job.failure = err;
+                };
+            }
+            fn runInner(job: *@This()) !void {
+                const server = job.owner.server;
+                const worker_io = server.sharedApiIo() orelse return error.SqlConnectionUnavailable;
+                var lease = try server.sql_connection_admission.acquire(server.alloc, worker_io, .init(job.owner.connection, http_server_mod.transactionPrincipal(job.owner.user) orelse ""));
+                defer lease.release(worker_io);
+                var budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 16 << 20 };
+                var arena = std.heap.ArenaAllocator.init(budget.allocator());
+                defer arena.deinit();
+                const a = arena.allocator();
+                const page = try job.owner.poll(a, job.acknowledgement, job.limit);
+                const events = try a.alloc(sql_wire.SQLNotification, page.events.len);
+                for (page.events, events) |event, *out| out.* = .{ .channel = event.channel, .payload = event.payload, .sender_pid = event.sender_pid };
+                const cursor = delivery.encodeCursor(page.cursor);
+                const output: sql_wire.SQLNotificationPage = .{ .notifications = events, .cursor = if (page.subscribed) &cursor else null, .pending = page.pending };
+                job.encoded = try std.json.Stringify.valueAlloc(server.alloc, output, .{ .emit_null_optional_fields = false });
+            }
+        };
+        var job: Job = .{ .owner = .{ .server = self.api_server, .user = identity, .context = operationContext(ctx, identity), .connection = connection_id }, .acknowledgement = acknowledgement, .limit = @intCast(limit), .network = ctx.io };
+        var future = try io.concurrent(Job.run, .{&job});
+        job.done.waitUncancelable(ctx.io);
+        @import("protected_future.zig").wait(io, &future);
+        defer if (job.encoded) |encoded| self.api_server.alloc.free(encoded);
+        if (job.failure) |err| return err;
+        return jsonResponse(ctx, 200, job.encoded orelse return error.InvalidSqlBackendResponse);
     }
 
     fn attachSQLCompletion(response: *httpx.Response, completion: @import("../pgwire/completion.zig").Completion) !void {
@@ -7099,7 +9335,9 @@ pub const AntflyApiHandler = struct {
         try response.headers.set("X-Antfly-SQL-Completion", encoded);
     }
     fn executeSQLMode(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8) !httpx.Response {
-        if (try self.admitCompletion(ctx)) |response| return response;
+        if (mode != .statement) {
+            if (try self.admitCompletion(ctx)) |response| return response;
+        }
         const completion = try requestCompletion(ctx);
         return self.finishOwnedSQLResponse(ctx, try self.executeSQLModeOwned(ctx, mode, resource_id, completion));
     }
@@ -7113,7 +9351,7 @@ pub const AntflyApiHandler = struct {
         const completion = try requestCompletion(ctx);
         // Forwarded execution already carries its owner's completion witness.
         if (response.headers.get("X-Antfly-SQL-Completion") == null) {
-            if (ctx.header("X-Antfly-SQL-Fence") != null) @import("sql_completion.zig").pinJoined(self.api_server, ctx.allocator, completion, ctx.io);
+            if (ctx.header("X-Antfly-SQL-Fence") != null) @import("sql/session/completion.zig").pinJoinedControlled(self.api_server, ctx.allocator, completion, ctx.io, operationContext(ctx, null));
             try attachSQLCompletion(&response, completion.*);
         }
         return response;
@@ -7132,18 +9370,26 @@ pub const AntflyApiHandler = struct {
         // a client statement. The gateway probes the exact socket it will use.
         if (ctx.header("X-Antfly-SQL-Probe")) |version| {
             if (!std.mem.eql(u8, version, "12")) return ctx.status(400).text("unsupported SQL completion probe");
-            if (!@import("sql_completion.zig").capableJoined(self.api_server, ctx.io)) return ctx.status(503).text("durable SQL completion unavailable");
+            if (!@import("sql/session/completion.zig").capableJoined(self.api_server, ctx.io)) return ctx.status(503).text("durable SQL completion unavailable");
             var response = try ctx.status(204).text("");
             try response.headers.set("X-Antfly-SQL-Capability", "12");
             return response;
         }
         if (ctx.header("X-Antfly-SQL-Settlement")) |action| {
-            if (!owner_mode and !std.mem.eql(u8, action, "12") and !std.mem.eql(u8, action, "ack-v12") and !std.mem.eql(u8, action, "11") and !std.mem.eql(u8, action, "ack-v11") and !std.mem.eql(u8, action, "10") and !std.mem.eql(u8, action, "ack-v10") and !std.mem.eql(u8, action, "9") and !std.mem.eql(u8, action, "ack-v9") and !std.mem.eql(u8, action, "8") and !std.mem.eql(u8, action, "ack-v8") and !std.mem.eql(u8, action, "7") and !std.mem.eql(u8, action, "ack-v7") and !std.mem.eql(u8, action, "6") and !std.mem.eql(u8, action, "ack-v6") and !std.mem.eql(u8, action, "5") and !std.mem.eql(u8, action, "ack-v5") and !std.mem.eql(u8, action, "4") and !std.mem.eql(u8, action, "ack-v4") and !std.mem.eql(u8, action, "3") and !std.mem.eql(u8, action, "ack-v3")) return ctx.status(400).text("unsupported SQL settlement");
+            const seal_shared_issuer = std.mem.eql(u8, action, "seal-shared-transaction-pin-issuer-v1");
+            const seal_legacy_pins = seal_shared_issuer or std.mem.eql(u8, action, "seal-legacy-transaction-pins-v1");
+            if (!seal_legacy_pins and !owner_mode and !std.mem.eql(u8, action, "12") and !std.mem.eql(u8, action, "ack-v12") and !std.mem.eql(u8, action, "11") and !std.mem.eql(u8, action, "ack-v11") and !std.mem.eql(u8, action, "10") and !std.mem.eql(u8, action, "ack-v10") and !std.mem.eql(u8, action, "9") and !std.mem.eql(u8, action, "ack-v9") and !std.mem.eql(u8, action, "8") and !std.mem.eql(u8, action, "ack-v8") and !std.mem.eql(u8, action, "7") and !std.mem.eql(u8, action, "ack-v7") and !std.mem.eql(u8, action, "6") and !std.mem.eql(u8, action, "ack-v6") and !std.mem.eql(u8, action, "5") and !std.mem.eql(u8, action, "ack-v5") and !std.mem.eql(u8, action, "4") and !std.mem.eql(u8, action, "ack-v4") and !std.mem.eql(u8, action, "3") and !std.mem.eql(u8, action, "ack-v3")) return ctx.status(400).text("unsupported SQL settlement");
             if (!owner_mode and (identity == null or !http_server_mod.permissionsAllow(identity.?.permissions, .@"*", "*", .admin))) return ctx.status(403).text("settlement requires management authority");
+            if (seal_shared_issuer and (self.api_server.txn_sessions.durable_scope != .cluster_shared or self.api_server.localSessionNodeId() == 0))
+                return ctx.status(409).text("SQL completion issuer fence requires a shared store and a routed issuer");
+            if (seal_legacy_pins and !seal_shared_issuer and (self.api_server.cfg.deployment_mode != .standalone or
+                self.api_server.txn_sessions.durable_scope != .node_local or self.api_server.hasSessionForwardTransport() or
+                self.api_server.cfg.hot_standby_mutation_policy_source != null or !self.api_server.mutationBackgroundExecutionPermitted()))
+                return ctx.status(409).text("SQL completion fence requires an exclusive standalone store");
             const encoded = (try ctx.body()) orelse return ctx.status(400).text("missing completion witness");
             if (encoded.len > 128 * 1024) return ctx.status(400).text("completion witness too large");
             const completion_mod = @import("../pgwire/completion.zig");
-            const owner_mod = @import("sql_completion.zig");
+            const owner_mod = @import("sql/session/completion.zig");
             var parsed_owner: ?std.json.Parsed(owner_mod.OwnerRequest) = if (owner_mode) try std.json.parseFromSlice(owner_mod.OwnerRequest, ctx.allocator, encoded, .{}) else null;
             defer if (parsed_owner) |*value| value.deinit();
             var parsed_completion = try std.json.parseFromSlice(completion_mod.Receipt, ctx.allocator, if (owner_mode) "{}" else encoded, .{});
@@ -7164,25 +9410,48 @@ pub const AntflyApiHandler = struct {
                 alloc: std.mem.Allocator,
                 receipt: completion_mod.Receipt,
                 network: std.Io,
+                context: operation_contract.RequestContext,
                 done: std.Io.Event = .unset,
                 remaining: ?completion_mod.Receipt = null,
                 acknowledge: bool = false,
                 acknowledged: bool = false,
+                seal_legacy_pins: bool = false,
+                shared_issuer: ?u64 = null,
+                seal_error: ?anyerror = null,
                 owner_request: ?owner_mod.OwnerRequest = null,
                 fn run(job: *@This()) void {
                     defer job.done.set(job.network);
-                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
-                    if (job.owner_request) |request| {
-                        job.acknowledged = owner_mod.ownerAction(job.server, job.alloc, request, false) catch false;
+                    const context = job.context;
+                    if (job.seal_legacy_pins) {
+                        const store = job.server.txn_sessions.durable orelse {
+                            job.seal_error = error.DurabilityUnavailable;
+                            return;
+                        };
+                        const sealed = if (job.shared_issuer) |issuer| store.sealSharedLegacySqlPinIssuer(issuer) else store.sealStandaloneLegacySqlPins();
+                        sealed catch |err| {
+                            job.seal_error = err;
+                        };
                         return;
                     }
-                    if (job.acknowledge) job.acknowledged = @import("sql_completion.zig").acknowledge(job.server, job.alloc, job.receipt, context) catch false else job.remaining = @import("sql_completion.zig").remaining(job.server, job.alloc, job.receipt, context) catch null;
+                    if (job.owner_request) |request| {
+                        job.acknowledged = owner_mod.ownerActionControlled(job.server, job.alloc, request, false, context) catch false;
+                        return;
+                    }
+                    if (job.acknowledge) job.acknowledged = @import("sql/session/completion.zig").acknowledge(job.server, job.alloc, job.receipt, context) catch false else job.remaining = @import("sql/session/completion.zig").remaining(job.server, job.alloc, job.receipt, context) catch null;
                 }
             };
-            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .owner_request = if (parsed_owner) |value| value.value else null };
+            const context = owner_mod.settlementContext(operationContext(ctx, identity)) catch |err| return sessionInspectionFailure(ctx, err);
+            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .context = context, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .seal_legacy_pins = seal_legacy_pins, .shared_issuer = if (seal_shared_issuer) self.api_server.localSessionNodeId() else null, .owner_request = if (parsed_owner) |value| value.value else null };
             var future = try io.concurrent(Probe.run, .{&job});
             job.done.waitUncancelable(ctx.io);
             @import("protected_future.zig").wait(io, &future);
+            if (seal_legacy_pins) {
+                if (job.seal_error) |err| switch (err) {
+                    error.CompletionIssuerNotDrained => return ctx.status(409).text("SQL completion issuer still has outstanding registrations"),
+                    else => return err,
+                };
+                return ctx.json(.{ .sealed = true });
+            }
             defer if (job.remaining) |value| ctx.allocator.free(value.outcomes);
             if (job.acknowledge or owner_mode) return ctx.json(.{ .complete = job.acknowledged });
             return ctx.json(.{ .complete = if (job.remaining) |value| !value.unknown and value.outcomes.len == 0 else false, .remaining = job.remaining });
@@ -7216,12 +9485,30 @@ pub const AntflyApiHandler = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        const budget_headers = @import("antfly_public_limits").Execution;
+        const has_execution_budget = ctx.header(budget_headers.timeout_header) != null or ctx.header(budget_headers.scan_rows_header) != null or
+            ctx.header(budget_headers.memory_header) != null or ctx.header(budget_headers.spill_header) != null;
+        if (request.session_id != null and has_execution_budget) return sqlSessionExecutionBudgetUnsupported(ctx);
+        if (mode == .statement) {
+            const no_parameters = if (request.parameters) |parameters| parameters.len == 0 else true;
+            const observe_retry = (request.session_id != null or request.connection_id != null) and no_parameters and
+                @import("../pgwire/session_commands.zig").isCommit(request.statement orelse "");
+            if (observe_retry and ctx.header("X-Antfly-SQL-Fence") != null and
+                ctx.header("X-Antfly-SQL-Probe") == null and ctx.header("X-Antfly-SQL-Settlement") == null)
+            {
+                const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+                owned.server = self.api_server;
+                owned.reserve_on_prepare = true;
+                owned.control = operationContext(ctx, null);
+            } else if (try self.admitCompletion(ctx)) |response| return response;
+        }
+
         const execution_limits = sqlExecutionLimits(ctx) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL execution budget" });
         const read_requirements = request.read_requirements orelse @import("antfly_local_sources").sql_read_requirements.Requirements{};
         read_requirements.validate(.sql) catch |err| return ctx.status(if (err == error.UnsupportedReadVisibility) @as(u16, 501) else @as(u16, 400)).json(sql_wire.SQLDiagnostic{ .code = if (err == error.UnsupportedReadVisibility) "0A000" else "22023", .message = "invalid or unsupported SQL read requirements" });
         if (mode == .prepare and request.read_requirements != null) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read requirements belong to execution, not preparation" });
         const statement = request.statement orelse "";
-        if (mode == .prepare and statement.len > @import("sql_prepared.zig").max_statement_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "prepared SQL statement exceeds 64 KiB" });
+        if (mode == .prepare and statement.len > @import("sql/session/prepared.zig").max_statement_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "prepared SQL statement exceeds 64 KiB" });
         if (mode == .statement or mode == .prepare) {
             if (statement.len == 0) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "statement is required" });
         } else if (request.statement != null or request.database != null or request.namespace != null) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "prepared executions use the stored statement and namespace" });
@@ -7229,50 +9516,70 @@ pub const AntflyApiHandler = struct {
         const prepared_id = if (mode == .execute or mode == .close) resource_id orelse return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "prepared_id is required" }) else null;
         if (prepared_id) |id| _ = distributed_txn.parseTxnIdHex(id) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid prepared_id" });
         if (request.parameters) |parameters| if (parameters.len > 1024) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL parameter count exceeds 1024" });
+        const limit = request.limit orelse 128;
+        if (limit < 1 or limit > 4096) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL result limit must be between 1 and 4096" });
         // Bind all node-owned handles before any transaction forwarding. A
         // conflicting set must never bounce between issuers or execute twice.
         const connection_handle = if (mode == .close) ctx.header("x-antfly-sql-connection-id") else request.connection_id;
-        var resource_owner: ?u64 = null;
-        for ([_]?[]const u8{ prepared_id, connection_handle, request.session_id }, 0..) |handle, index| if (handle) |encoded| {
-            var owner = @import("sql_resource_routing.zig").owner(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL handle" });
-            const local = self.api_server.localSessionNodeId();
-            if (owner != local) {
-                if (index < 2) {
-                    if (self.api_server.txn_sessions.durable) |store| if (try @import("sql_resource_routing.zig").ownsLocal(store, encoded, if (index == 0) .prepared else .connection, local)) {
-                        owner = local;
-                    };
-                } else {
-                    const id = try distributed_txn.parseTxnIdHex(encoded);
-                    owner = (try self.api_server.txn_sessions.getOwnerNodeId(self.api_server.alloc, id)) orelse owner;
-                }
+        const handles = [3]?[]const u8{ prepared_id, connection_handle, request.session_id };
+        var owners: SQLRouteOwners = .{ .handles = @splat(null) };
+        const local = self.api_server.localSessionNodeId();
+        var resolve = false;
+        var routed_commit_checked = false;
+        for (handles, 0..) |handle, i| if (handle) |encoded| {
+            const owner = @import("sql/execution/resource_routing.zig").owner(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL handle" });
+            owners.handles[i] = owner;
+            if (i == 2) {
+                resolve = resolve or owner != local or (self.api_server.cfg.session_router != null and self.api_server.hasSessionForwardTransport());
+            } else if (owner != local and self.api_server.txn_sessions.durable != null) resolve = true;
+        };
+        if (mode == .statement and prepared_id == null and connection_handle == null and
+            (request.parameters == null or request.parameters.?.len == 0) and
+            self.api_server.cfg.session_router != null and self.api_server.txn_sessions.durable != null and self.api_server.txn_sessions.durable_scope == .cluster_shared and
+            @import("../pgwire/session_commands.zig").isCommit(statement))
+        {
+            if (request.session_id) |encoded| {
+                const id = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL handle" });
+                if (try self.replaySharedCommit(ctx, id, http_server_mod.transactionPrincipal(identity) orelse "", completion, &owners)) |response| return response;
+                routed_commit_checked = true;
+                resolve = false;
             }
+        }
+        if (resolve) owners = self.runDurableSQLRouting(ctx.io, resolveSqlRouteOwners, .{ self.api_server, handles, owners, operationContext(ctx, null) }) catch |err| switch (err) {
+            error.SqlWriteCapacityUnavailable => return sqlRoutingOverloadedResponse(ctx),
+            error.DeadlineExceeded => return sqlForwardDeadlineResponse(ctx),
+            else => return err,
+        };
+        var resource_owner: ?u64 = null;
+        for (owners.handles) |owner| if (owner) |node| {
             if (resource_owner) |prior| {
-                if (owner != prior) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "08003", .message = "SQL resources must have the same issuing node" });
-            } else resource_owner = owner;
+                if (node != prior) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "08003", .message = "SQL resources must have the same issuing node" });
+            } else resource_owner = node;
         };
         if (prepared_id) |id| {
-            if (try self.forwardSQLResource(ctx, id, .prepared, body)) |response| return response;
+            if (try self.forwardSQLResource(ctx, id, .prepared, body, owners.handles[0], &preparation)) |response| return response;
         } else if (connection_handle) |id| {
-            if (try self.forwardSQLResource(ctx, id, .connection, body)) |response| return response;
+            if (try self.forwardSQLResource(ctx, id, .connection, body, owners.handles[1], &preparation)) |response| return response;
         }
         if (request.session_id) |encoded| {
-            if (ctx.header(@import("antfly_public_limits").Execution.timeout_header) != null or
-                ctx.header(@import("antfly_public_limits").Execution.scan_rows_header) != null or
-                ctx.header(@import("antfly_public_limits").Execution.memory_header) != null or
-                ctx.header(@import("antfly_public_limits").Execution.spill_header) != null)
-                return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "per-request execution budgets require a one-shot SQL statement" });
             const id = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL session_id must be a 32-character transaction id" });
-            if (try self.forwardTransactionSession(ctx, id, body)) |response| {
+            const forwarded = self.forwardResolvedTransactionSession(ctx, id, body, .{ .resolved = owners.session }, &preparation) catch |err| {
+                if (completion.unknown) return sqlForwardOutcomeUnknownResponse(ctx);
+                if (err == error.SqlWriteCapacityUnavailable) return sqlRoutingOverloadedResponse(ctx);
+                if (err == error.SqlPeerUnavailable) return sqlPeerUnavailableResponse(ctx);
+                if (err == error.DeadlineExceeded) return sqlForwardDeadlineResponse(ctx);
+                return err;
+            };
+            if (forwarded) |response| {
                 completion.unknown = true; // Fail closed if an older owner omits its witness.
                 return response;
             }
         }
+        if (!preparation.active) preparation = self.api_server.sql_preparation_admission.tryAcquireLease() orelse return sqlOverloadedResponse(ctx);
         const connection_id: ?[32]u8 = if (if (mode == .close) ctx.header("x-antfly-sql-connection-id") else request.connection_id) |encoded| blk: {
             const decoded = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL connection_id must be a 32-character hex id" });
             break :blk std.fmt.bytesToHex(decoded, .lower);
         } else null;
-        const limit = request.limit orelse 128;
-        if (limit < 1 or limit > 4096) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL result limit must be between 1 and 4096" });
         // Preparation has an independent bounded lane. The worker transfers
         // admission to exactly one execution class after classification.
         try self.api_server.reachRequestLifecycle(.admission_acquired, "executeSQL");
@@ -7294,12 +9601,13 @@ pub const AntflyApiHandler = struct {
             };
             defer compiled.deinit();
             return switch (compiled.statement) {
-                .select, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl => ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" }),
+                .select, .call, .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl => ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" }),
                 else => ctx.status(501).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "SQL statement is not supported by this endpoint" }),
             };
         };
         var job = SQLJob{
-            .adapter = .{ .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .statement_start_ns = platform_time.monotonicNs(),
+            .adapter = .{ .durable_http_session = true, .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -7309,11 +9617,16 @@ pub const AntflyApiHandler = struct {
             .parameters = request.parameters orelse &.{},
             .limit = @intCast(limit),
             .execution_limits = execution_limits,
+            .has_execution_budget = has_execution_budget,
+            .routed_commit_checked = routed_commit_checked,
             .completion_io = ctx.io,
+            .completion = completion,
+            .completion_alloc = ctx.allocator,
             .cache_io = self.api_server.sqlPlanCacheIo(),
             .cache = self.api_server.sqlPlanCache(),
             .preparation = &preparation,
         };
+        defer if (job.notice_buffer) |buffer| job.prepared_response_budget.allocator().destroy(buffer);
         completion.unknown = true;
         var future = runtime_io.concurrent(SQLJob.run, .{&job}) catch {
             completion.unknown = false; // The execution owner was never dispatched.
@@ -7326,40 +9639,47 @@ pub const AntflyApiHandler = struct {
         // hitting an already-canceled sleep and spinning until commit ends.
         job.done.waitUncancelable(ctx.io);
         @import("protected_future.zig").wait(runtime_io, &future);
-        completion.unknown = false;
+        // Finalization can fail after result production. Every joined outcome
+        // owns the same cleanup, including diagnostics and encoding failures.
+        defer if (job.result) |*owned| owned.deinit();
+        defer if (job.prepared_response) |encoded| job.prepared_response_budget.allocator().free(encoded);
+        defer if (job.encoded_read) |encoded| job.prepared_response_budget.allocator().free(encoded);
+        completion.unknown = job.observation_unavailable;
         if (job.failure) |err| {
+            if (err == error.SqlSessionExecutionBudgetUnsupported) return sqlSessionExecutionBudgetUnsupported(ctx);
+            const captured_notices = try noticeWire(ctx.allocator, job.notice_buffer);
+            defer if (captured_notices) |notices| ctx.allocator.free(notices);
+            if (job.adapter.reports_existing_commit) {
+                const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+                owned.reports_existing_commit = true;
+            }
             const diagnostic = sql_execution.diagnostic(err);
-            if (std.mem.eql(u8, diagnostic.code, "40003")) completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
+            if (!job.adapter.reports_existing_commit and std.mem.eql(u8, diagnostic.code, "40003"))
+                completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
             if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
                 .code = sql_execution.sqlState(err),
                 .message = if (job.compile_diagnostic_valid) job.diagnostic.message else sql_execution.diagnosticMessage(err, &job.diagnostic_message_buffer),
+                .notices = captured_notices,
                 .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
                 .retryable = diagnostic.retryable,
                 .position = if (job.compile_diagnostic_valid and mode != .execute) sql_execution.characterPosition(statement, job.diagnostic.start) else null,
-                .transaction_status = if (!job.execution_entered) null else switch (job.adapter.transaction_status) {
+                .transaction_status = if (!job.execution_entered and !job.failure_published) null else switch (job.adapter.transaction_status) {
                     .idle => .idle,
                     .in_transaction => .in_transaction,
                     .failed => .failed,
                 },
             });
         }
-        if (job.prepared_response) |encoded| {
-            defer job.prepared_response_budget.allocator().free(encoded);
-            return jsonResponse(ctx, 200, encoded);
-        }
-        var result = job.result.?;
-        defer result.deinit();
-        if (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready)) {
+        if (job.prepared_response) |encoded| return jsonResponse(ctx, 200, encoded);
+        const result = job.result.?;
+        if (!job.adapter.reports_existing_commit and (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready))) {
             const ddl = if (result.output.ddl_receipt) |value| try std.json.Stringify.valueAlloc(ctx.allocator, value, .{ .emit_null_optional_fields = false }) else null;
             defer if (ddl) |value| ctx.allocator.free(value);
             completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, ddl);
         }
-        if (job.encoded_read) |encoded| {
-            defer job.prepared_response_budget.allocator().free(encoded);
-            return jsonResponse(ctx, 200, encoded);
-        }
+        if (job.encoded_read) |encoded| return jsonResponse(ctx, 200, encoded);
         const columns = ctx.allocator.alloc(sql_wire.SQLColumn, result.output.columns.len) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             return err;
@@ -7367,15 +9687,27 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(columns);
         for (result.output.columns, columns) |column, *output| output.* = .{
             .name = column.name,
+            .named_type = if (column.domain_view) |view| try @import("antfly_local_sources").sql_catalog.named_layouts.identityWireLeaky(std.meta.Child(@FieldType(sql_wire.SQLColumn, "named_type")), ctx.allocator, view.identity.?) else if (column.enum_view) |view| try @import("antfly_local_sources").sql_catalog.named_layouts.identityWireLeaky(std.meta.Child(@FieldType(sql_wire.SQLColumn, "named_type")), ctx.allocator, view.record.identity) else null,
             .type = switch (column.type) {
                 inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
             },
-            .element_type = if (column.type == .array or column.element_type == .numeric) switch (column.element_type orelse return error.InvalidSqlBackendResponse) {
+            .element_type = if (column.element_type) |element| switch (element) {
                 inline else => |kind| @field(sql_wire.SQLArrayElementType, @tagName(kind)),
             } else null,
             .numeric_modifier = if (column.numeric_modifier) |modifier| .{ .precision = modifier.precision, .scale = modifier.scale } else null,
+            .temporal_kind = if (column.temporal_kind) |temporal_kind| switch (temporal_kind) {
+                inline else => |kind| @field(sql_wire.SQLTemporalKind, @tagName(kind)),
+            } else null,
         };
+        var catalog_receipt_buffers: CatalogReceiptBuffers = .{};
+        const captured_notices = if (job.adapter.result_ddl_notices.len != 0) blk: {
+            const notices = try ctx.allocator.alloc(sql_wire.SQLNotice, job.adapter.result_ddl_notices.len);
+            for (notices, job.adapter.result_ddl_notices) |*out, notice| out.* = .{ .code = notice.code, .message = notice.message };
+            break :blk @as(?[]const sql_wire.SQLNotice, notices);
+        } else try noticeWire(ctx.allocator, job.notice_buffer);
+        defer if (captured_notices) |notices| ctx.allocator.free(notices);
         const output: sql_wire.SQLResponse = .{
+            .notices = captured_notices,
             .columns = columns,
             .rows = result.output.rows,
             .sql_nulls = result.output.sql_nulls,
@@ -7400,20 +9732,24 @@ pub const AntflyApiHandler = struct {
                 .diagnostic = receipt.diagnostic,
                 .restore_job_id = receipt.restore_job_id,
                 .idempotency_key = receipt.idempotency_key,
+                .fk_generation_publication_id = receipt.fk_generation_publication_id,
+                .index_publication_token = receipt.index_publication_token,
+                .schema_validation_token = receipt.schema_validation_token,
             } else null,
             .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
+            .catalog_receipt = if (result.output.catalog_receipt) |receipt| catalogReceiptWire(receipt, &catalog_receipt_buffers) else null,
             .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
                 inline else => |kind| @field(sql_wire.SQLMutationOutcome, @tagName(kind)),
             } else null,
         };
-        var encoding_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 16 << 20 };
+        var encoding_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = ApiHttpServer.max_sql_response_bytes };
         const encoded = std.json.Stringify.valueAlloc(encoding_budget.allocator(), output, .{ .emit_null_optional_fields = false }) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             if (encoding_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL encoded result exceeds its 16 MiB memory budget" });
             return err;
         };
         defer encoding_budget.allocator().free(encoded);
-        const response_status: u16 = if (output.ddl_receipt) |receipt| sqlDdlReceiptHttpStatus(receipt.state) else 200;
+        const response_status: u16 = if (output.catalog_receipt) |receipt| if (receipt.state == .unknown or receipt.state == .rejected) 409 else if (receipt.state == .pending) 202 else 200 else if (output.ddl_receipt) |receipt| sqlDdlReceiptHttpStatus(receipt.state) else 200;
         return jsonResponse(ctx, response_status, encoded) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             return err;
@@ -7951,14 +10287,7 @@ pub const AntflyApiHandler = struct {
                 destination.name = parsed.value.name;
                 const resource = try system_catalog_routes.resourceNameAlloc(ctx.allocator, destination);
                 defer ctx.allocator.free(resource);
-                const kind: usermgr.ResourceType = switch (target.kind) {
-                    .query_source => .table,
-                    .graph => .graph,
-                    .database => .database,
-                    .namespace => .namespace,
-                    .table => .table,
-                    .tablespace => .tablespace,
-                };
+                const kind = system_catalog_routes.permissionKind(target.kind);
                 if (!http_server_mod.permissionsAllow(value.permissions, kind, resource, .admin)) return jsonErrorResponse(ctx, 403, "forbidden");
             }
             if (action == .set_tablespace and body.len > 0) {
@@ -7998,6 +10327,7 @@ pub const AntflyApiHandler = struct {
         const settings = @import("antfly_local_sources").system_catalog_settings;
         var parsed = std.json.parseFromSlice(settings.Request, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid setting mutation");
         defer parsed.deinit();
+        if (parsed.value != .put and parsed.value != .drop) return textResponse(ctx, 400, "use ALTER ROLE or ALTER DATABASE for scoped defaults");
         var context = operationContext(ctx, identity);
         context.setting_admin = true;
         const result = self.api_server.source.systemCatalog(ctx.allocator, context, .{ .setting_mutate = parsed.value }) catch |err|
@@ -8425,6 +10755,12 @@ pub const AntflyApiHandler = struct {
         return self.getIndex(ctx, table_name, index_name);
     }
 
+    pub fn getNamespaceTableIndexPublication(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.getIndexPublication(ctx, table_name, index_name);
+    }
+
     pub fn createNamespaceTableIndex(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
@@ -8611,7 +10947,9 @@ pub const AntflyApiHandler = struct {
             if (err == error.PrivacyManagedGraph) return jsonErrorResponse(ctx, 400, "privacy policies and managed producers must be configured through the table Privacy API");
             return err;
         };
-        var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
+        const bound_body = @import("sql/catalog/type_schema.zig").bindCreateBodyAlloc(self.api_server, alloc, authenticated_identity, operationContext(ctx, authenticated_identity), body_data) catch |err| return witnessDDLError(ctx, err);
+        defer if (bound_body) |bytes| alloc.free(bytes);
+        var create_req = table_contract.parseCreateTableRequest(alloc, bound_body orelse body_data) catch |err| {
             if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
                 std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
                 return err;
@@ -8624,7 +10962,7 @@ pub const AntflyApiHandler = struct {
         const create_route = try system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
         defer if (create_route) |value| value.deinit(alloc);
         const create_scope = if (create_route) |value| try value.target() else try system_catalog.Target.literal(logical_table_name);
-        const bound_schema = self.api_server.bindForeignKeySchema(alloc, create_scope, decoded_table_name, tables_api.effectiveSchemaJson(create_req.schema_json), "", authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| {
+        const bound_schema = self.api_server.bindResolvedForeignKeySchema(alloc, create_scope, decoded_table_name, tables_api.effectiveSchemaJson(create_req.schema_json), "", authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| {
             if (err == error.Forbidden) return jsonErrorResponse(ctx, 403, "foreign key declarations require admin permission on every referenced parent table");
             return witnessDDLError(ctx, err);
         };
@@ -8871,6 +11209,7 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("initial foreign key generations require coordinated parent-owner publication; create the table without foreign keys, then add them through a schema update");
                 },
                 error.ObjectTablePlacementUnsupported => return textResponse(ctx, 400, "object tables do not accept num_shards or replication sources"),
+                error.ExternalTableReplicationSourcesUnsupported => return textResponse(ctx, 400, tables_api.external_table_replication_sources_error_message),
                 error.HACatalogReplicationSourcesUnsupported => return respondJsonErrorBody(ctx, 400, ha_catalog_replication_sources_unsupported_body),
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
@@ -9379,26 +11718,59 @@ pub const AntflyApiHandler = struct {
             // an unexamined parent dependency between admission and commit.
             var snapshot = (try self.api_server.source.adminSnapshot()) orelse return jsonErrorResponse(ctx, 503, "schema authorization snapshot unavailable");
             defer self.api_server.source.freeAdminSnapshot(&snapshot);
-            const current = tables_api.findTableByName(&snapshot, decoded_table_name) orelse return jsonErrorResponse(ctx, 404, "not found");
-            const proposed = (if (mode == .merge_patch)
-                table_contract.mergeSchemaPatchRequest(alloc, current.schema_json, body_data)
-            else
-                table_contract.parseSchemaUpdateRequest(alloc, body_data)) catch |err| {
+            var current_record = (tables_api.findTableByName(&snapshot, decoded_table_name) orelse return jsonErrorResponse(ctx, 404, "not found")).*;
+            // SQL relation publication owns query definitions independently
+            // of the operational admin projection. Pin that same authority
+            // for REST schema admission, not a potentially older projection.
+            var definition_owner: ?std.json.Parsed(?system_catalog.QueryDefinition) = null;
+            defer if (definition_owner) |*owner| owner.deinit();
+            if (self.api_server.source.vtable.supports_query_definitions) {
+                const bytes = self.api_server.source.systemCatalog(alloc, operationContext(ctx, authenticated_identity), .{ .query_definition = decoded_table_name }) catch |err| return witnessDDLError(ctx, err);
+                defer alloc.free(bytes);
+                definition_owner = try std.json.parseFromSlice(?system_catalog.QueryDefinition, alloc, bytes, .{ .allocate = .alloc_always });
+                const definition = definition_owner.?.value orelse return jsonErrorResponse(ctx, 404, "not found");
+                if (definition.table_id != current_record.table_id) return jsonErrorResponse(ctx, 409, "table identity changed; refresh and retry");
+                current_record.schema_json = definition.schema_json;
+                current_record.read_schema_json = definition.read_schema_json;
+                current_record.indexes_json = definition.indexes_json;
+                current_record.lake_index_catalog_json = definition.lake_index_catalog_json;
+            }
+            const current = &current_record;
+            const proposed = @import("sql/catalog/type_schema.zig").bindUpdateAlloc(self.api_server, alloc, authenticated_identity, operationContext(ctx, authenticated_identity), current.schema_json, body_data, mode) catch |err| {
+                if (err == error.Forbidden or err == error.MetadataCapabilityUnavailable or err == error.SqlNamedTypeNotFound or err == error.CatalogGenerationChanged) return witnessDDLError(ctx, err);
                 if (err == error.OutOfMemory) return err;
                 _ = ctx.status(400);
                 return ctx.text(table_contract.schemaUpdateRequestErrorMessage(err, body_data));
             };
             defer alloc.free(proposed);
+            // A validation transition requires an unpublished historical
+            // scan regardless of current owner maintenance. Reject it before
+            // preparing FK/index support or entering a schema CAS; the inner
+            // authority repeats this guard against its committed predecessor.
+            if (!rewrite_requested) @import("antfly_local_sources").schema_relational_checks.validateSchemaUpdate(alloc, current.schema_json, proposed) catch |err| {
+                if (err == error.CheckConstraintValidationRequired) {
+                    _ = ctx.status(409);
+                    return ctx.text(@import("antfly_local_sources").schema_relational_checks.validation_required_message);
+                }
+                return witnessDDLError(ctx, err);
+            };
             const schema_route = try system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
             defer if (schema_route) |value| value.deinit(alloc);
             const logical_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return jsonErrorResponse(ctx, 400, "invalid table name");
             defer alloc.free(logical_name);
             const schema_scope = if (schema_route) |value| try value.target() else try system_catalog.Target.literal(logical_name);
-            const bound = self.api_server.bindForeignKeySchema(alloc, schema_scope, decoded_table_name, proposed, current.schema_json, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| {
+            const bound = self.api_server.bindResolvedForeignKeySchema(alloc, schema_scope, decoded_table_name, proposed, current.schema_json, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| {
                 if (err == error.Forbidden) return jsonErrorResponse(ctx, 403, "foreign key declarations require admin permission on every referenced parent table");
                 return witnessDDLError(ctx, err);
             };
             defer alloc.free(bound);
+            if (!rewrite_requested) @import("antfly_local_sources").schema_column_nullability.validateSchemaUpdate(alloc, current.schema_json, bound) catch |err| {
+                if (err == error.SchemaValidationPublicationRequired) {
+                    _ = ctx.status(409);
+                    return ctx.text(@import("antfly_local_sources").schema_column_nullability.validation_required_message);
+                }
+                return witnessDDLError(ctx, err);
+            };
             const version = try tables_api.schemaVersion(current.schema_json);
             expected_table_id = current.table_id;
             std.crypto.hash.Blake3.hash(current.schema_json, &expected_schema_digest, .{});
@@ -9420,6 +11792,14 @@ pub const AntflyApiHandler = struct {
             error.GeneratedColumnRewriteRequired => {
                 _ = ctx.status(409);
                 return ctx.text(@import("antfly_local_sources").schema_relational_expression_errors.rewrite_required_message);
+            },
+            error.SchemaValidationPublicationRequired => {
+                _ = ctx.status(409);
+                return ctx.text(@import("antfly_local_sources").schema_column_nullability.validation_required_message);
+            },
+            error.CheckConstraintValidationRequired => {
+                _ = ctx.status(409);
+                return ctx.text(@import("antfly_local_sources").schema_relational_checks.validation_required_message);
             },
             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => {
                 invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
@@ -9484,11 +11864,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(405);
                     return ctx.text("schema patch is unavailable on this deployment");
                 }
-                const schema_json = table_contract.parseSchemaUpdateRequest(alloc, body_data) catch |parse_err| {
-                    invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(parse_err, body_data);
-                    _ = ctx.status(400);
-                    return ctx.text(invalid_schema_message);
-                };
+                const schema_json = try alloc.dupe(u8, supported_schema orelse return error.InvalidSchemaUpdateRequest);
                 defer alloc.free(schema_json);
                 const table_writes_source = self.api_server.table_writes orelse {
                     _ = ctx.status(405);
@@ -9498,6 +11874,14 @@ pub const AntflyApiHandler = struct {
                     error.GeneratedColumnRewriteRequired => {
                         _ = ctx.status(409);
                         return ctx.text(@import("antfly_local_sources").schema_relational_expression_errors.rewrite_required_message);
+                    },
+                    error.SchemaValidationPublicationRequired => {
+                        _ = ctx.status(409);
+                        return ctx.text(@import("antfly_local_sources").schema_column_nullability.validation_required_message);
+                    },
+                    error.CheckConstraintValidationRequired => {
+                        _ = ctx.status(409);
+                        return ctx.text(@import("antfly_local_sources").schema_relational_checks.validation_required_message);
                     },
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
@@ -9638,7 +12022,7 @@ pub const AntflyApiHandler = struct {
         defer self.releasePublicOperation(operation_id);
         const request = operationContext(ctx, authenticated_identity);
         if (relational) if (binding.logical) |logical| {
-            var lake_adapter: @import("sql_execution.zig").Adapter = .{ .server = self.api_server, .identity = &authenticated_identity, .context = request };
+            var lake_adapter: @import("sql/execution/execution.zig").Adapter = .{ .server = self.api_server, .identity = &authenticated_identity, .context = request };
             const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| {
                 std.log.warn("external lake rows read failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
                 return switch (err) {
@@ -10458,6 +12842,66 @@ pub const AntflyApiHandler = struct {
         }
         var resp = try public_table_http.handleTableGetIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn getNamespaceSchemaValidationPublication(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.getSchemaValidationPublication(ctx, table_name);
+    }
+
+    pub fn getSchemaValidationPublication(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const alloc = ctx.allocator;
+        const decoded = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer alloc.free(decoded);
+        const route = system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path)) catch return jsonErrorResponse(ctx, 400, "invalid catalog target");
+        defer if (route) |value| value.deinit(alloc);
+        const target = (if (route) |value| value.target() else system_catalog.Target.literal(decoded)) catch return jsonErrorResponse(ctx, 400, "invalid catalog target");
+        const resource = try target.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        if (identity) |value| if (!http_server_mod.permissionsAllow(value.permissions, .table, resource, .admin)) return jsonErrorResponse(ctx, 403, "forbidden");
+        var context = operationContext(ctx, identity);
+        context.setting_admin = true;
+        context.schema_validation_authority = true;
+        const recovery = @import("schema_validation/recovery.zig");
+        const bytes = recovery.readTable(self.api_server.source, alloc, context, target, ctx.header("x-antfly-schema-validation-token") orelse "") catch |err| return jsonErrorResponse(ctx, recovery.httpStatus(err), @errorName(err));
+        defer alloc.free(bytes);
+        try ctx.setHeader("cache-control", "no-store");
+        return jsonResponse(ctx, 200, bytes);
+    }
+
+    pub fn getIndexPublication(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const alloc = ctx.allocator;
+        const decoded_table = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer alloc.free(decoded_table);
+        const decoded_index = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
+        defer alloc.free(decoded_index);
+        const route = system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path)) catch
+            return jsonErrorResponse(ctx, 400, "invalid catalog target");
+        defer if (route) |value| value.deinit(alloc);
+        const target = (if (route) |value| value.target() else system_catalog.Target.literal(decoded_table)) catch
+            return jsonErrorResponse(ctx, 400, "invalid catalog target");
+        const resource = try target.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        if (identity) |value| if (!http_server_mod.permissionsAllow(value.permissions, .table, resource, .admin))
+            return jsonErrorResponse(ctx, 403, "forbidden");
+        // These grants come only from authenticated ingress and current logical
+        // table authority, never the opaque token or a client-supplied owner.
+        var context = operationContext(ctx, identity);
+        context.setting_admin = true;
+        context.index_publication_authority = true;
+        const recovery = @import("index_publication_recovery.zig");
+        const bytes = recovery.readTable(self.api_server.source, alloc, context, target, decoded_index, ctx.header("x-antfly-index-publication-token") orelse "") catch |err|
+            return jsonErrorResponse(ctx, recovery.httpStatus(err), @errorName(err));
+        defer alloc.free(bytes);
+        try ctx.setHeader("cache-control", "no-store");
+        return jsonResponse(ctx, 200, bytes);
     }
 
     fn privacyCatalogMutationBlocked(self: *AntflyApiHandler, ctx: *httpx.Context, table: []const u8, name: []const u8) !?httpx.Response {
@@ -11957,6 +14401,131 @@ test "system catalog SQL setting publication requires cluster admin and forwards
     defer allowed.deinit();
     try std.testing.expectEqual(@as(u16, 200), allowed.status.code);
     try std.testing.expectEqual(@as(usize, 1), source.calls);
+    for ([_][]const u8{
+        "{\"database_default\":{\"name\":\"timezone\",\"database\":\"main\",\"value\":{\"string\":\"UTC\"}}}",
+        "{\"role_default\":{\"name\":\"app.mode\",\"principal\":\"settings_reader\",\"database\":\"\",\"value\":{\"string\":\"alpha\"}}}",
+    }) |private_body| {
+        var rejected = try requestWithRetry(&client, io.io(), .POST, url, private_body, &admin_headers, 20);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+    }
+}
+
+test "public index publication recovery requires table admin and preserves exact logical scope" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "*", .admin);
+    defer permission.deinit(alloc);
+    var admin = try auth.manager.createUser("index_admin", "secret", &.{permission});
+    defer admin.deinit(alloc);
+    var read_permission = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer read_permission.deinit(alloc);
+    var reader = try auth.manager.createUser("index_reader", "secret", &.{read_permission});
+    defer reader.deinit(alloc);
+    const Source = struct {
+        calls: usize = 0,
+        database: []const u8 = "default",
+        namespace: []const u8 = "public",
+        replaced: bool = false,
+        wrong_incarnation: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(context.setting_admin and context.index_publication_authority);
+            try std.testing.expect(!call.isMutation());
+            self.calls += 1;
+            switch (call) {
+                .resolve_many => |request| {
+                    try std.testing.expectEqual(@as(usize, 1), request.relations.len);
+                    try std.testing.expectEqualStrings(self.database, request.relations[0].database);
+                    try std.testing.expectEqualStrings(self.namespace, request.relations[0].namespace);
+                    try std.testing.expectEqualStrings("items/a", request.relations[0].name);
+                    const domain = @import("antfly_local_sources").system_catalog_domain;
+                    const id: u64 = if (self.replaced) 102 else 101;
+                    return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{
+                        .revision = 9,
+                        .tables = &.{},
+                        .relation_epoch = .{ .incarnation = @splat(0x11), .revision = 9 },
+                        .relations = &.{.{ .table = .{ .table_id = id, .name = "physical:101" }, .logical_table = "items/a", .owner = .{ .kind = .table, .table_id = id, .schema_version = 3, .schema_digest = @splat(4) } }},
+                    }, .{});
+                },
+                .relational_index_status => |request| {
+                    if (self.wrong_incarnation) return error.MetadataIncarnationMismatch;
+                    try std.testing.expectEqualStrings("by/email", request.index_name);
+                    try std.testing.expectEqualStrings("items/a", request.guard.logical_table);
+                    return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index/publication.zig").AdmissionStatus{ .metadata_incarnation = @splat('1') }, .{});
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        fn iface(self: *@This()) http_server_mod.StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog } };
+        }
+    };
+    var source: Source = .{};
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e: HttpxE2eServer = undefined;
+    try e2e.init(alloc, &api_server);
+    defer e2e.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(alloc, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try e2e.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/items%2Fa/indexes/by%2Femail/publication", .{base});
+    defer alloc.free(url);
+    const token = try @import("index_publication_recovery.zig").Token.encode(.{ .metadata_incarnation = @splat('1'), .table_id = 101, .id = @splat(2), .plan_digest = @splat(3) });
+    const reader_auth = try encodeBasicAuthorization(alloc, "index_reader", "secret");
+    defer alloc.free(reader_auth);
+    const admin_auth = try encodeBasicAuthorization(alloc, "index_admin", "secret");
+    defer alloc.free(admin_auth);
+    const reader_headers = [_][2][]const u8{ .{ "authorization", reader_auth }, .{ "X-Antfly-Index-Publication-Token", &token } };
+    var denied = try getWithRetry(&client, threaded.io(), url, &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    const missing_headers = [_][2][]const u8{.{ "authorization", admin_auth }};
+    var missing = try getWithRetry(&client, threaded.io(), url, &missing_headers, 20);
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(u16, 400), missing.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    const admin_headers = [_][2][]const u8{ .{ "authorization", admin_auth }, .{ "X-Antfly-Index-Publication-Token", &token } };
+    var allowed = try getWithRetry(&client, threaded.io(), url, &admin_headers, 20);
+    defer allowed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), allowed.status.code);
+    var result = try std.json.parseFromSlice(@import("antfly_indexes_openapi").types.IndexPublicationStatus, alloc, allowed.body.?, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings(&token, result.value.publication_token);
+    try std.testing.expectEqual(@import("antfly_indexes_openapi").types.IndexPublicationState.admission_unknown, result.value.state);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    source.database = "warehouse";
+    source.namespace = "sales";
+    const scoped_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/databases/warehouse/namespaces/sales/tables/items%2Fa/indexes/by%2Femail/publication", .{base});
+    defer alloc.free(scoped_url);
+    var scoped = try getWithRetry(&client, threaded.io(), scoped_url, &admin_headers, 20);
+    defer scoped.deinit();
+    try std.testing.expectEqual(@as(u16, 200), scoped.status.code);
+    try std.testing.expectEqual(@as(usize, 4), source.calls);
+    source.replaced = true;
+    var replaced = try getWithRetry(&client, threaded.io(), scoped_url, &admin_headers, 20);
+    defer replaced.deinit();
+    try std.testing.expectEqual(@as(u16, 409), replaced.status.code);
+    try std.testing.expectEqual(@as(usize, 5), source.calls);
+    source.replaced = false;
+    source.wrong_incarnation = true;
+    var foreign = try getWithRetry(&client, threaded.io(), scoped_url, &admin_headers, 20);
+    defer foreign.deinit();
+    try std.testing.expectEqual(@as(u16, 409), foreign.status.code);
+    try std.testing.expectEqual(@as(usize, 7), source.calls);
 }
 
 test "store-root enrollment requires cluster admin and forwards only valid possession proof" {
@@ -12412,7 +14981,7 @@ test "internal routed batch preserves typed validation across the HTTP forwardin
         .{ .name = "table_name", .value = "docs" },
     };
     const forwarding: internal_batch_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 1, .campaign_allowed = false };
-    for ([_]anyerror{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.PreparedReadSetChanged, error.RelationalExpressionOverflow }) |failure| {
+    for ([_]anyerror{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.PreparedReadSetChanged, error.RelationalExpressionOverflow, error.RowPolicyDenied, error.RowPolicyCatalogChanged, error.RowPolicyAuthenticationRequired }) |failure| {
         var writer = FailureWriter{ .failure = failure };
         var source = AuthStatusSource{};
         var api_server = ApiHttpServer.init(alloc, .{
@@ -12561,6 +15130,18 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
         var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.GroupLeaderUnavailable, phase);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+    }
+
+    {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/prepare");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.StorageReadTemporarilyUnavailable, .prepare);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expectEqualStrings("storage read temporarily unavailable", response.body.?);
         try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
     }
 
@@ -12820,6 +15401,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const FakeWrites = struct {
+        rejection: ?anyerror = null,
         batch_calls: usize = 0,
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
@@ -12835,6 +15417,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -12882,6 +15465,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.cancellation_transaction_calls += 1;
             try std.testing.expect(cancellation.ptr != null);
+            if (self.rejection) |err| return err;
             if (self.cancel_transaction_visibility_wait) return error.EnrichmentWaitCanceled;
             return commitTransaction(ptr, alloc_, tables, sync_level);
         }
@@ -12919,6 +15503,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.cancellation_batch_calls += 1;
             try std.testing.expect(cancellation.ptr != null);
+            if (self.rejection) |err| return err;
             if (self.cancel_batch_visibility_wait) return error.EnrichmentWaitCanceled;
             return commitBatch(ptr, alloc_, tables, sync_level);
         }
@@ -12949,12 +15534,14 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer alloc.free(transaction_url);
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
 
+    const batch_body = "{\"tables\":{\"users\":{\"inserts\":{\"user:1\":{\"name\":\"Alice\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}";
+    const transaction_body = "{\"read_set\":[],\"tables\":{\"users\":{\"inserts\":{\"user:3\":{\"name\":\"Carol\"}}}}}";
     var response = try requestWithRetry(
         &client,
         client_io.io(),
         .POST,
         batch_url,
-        "{\"tables\":{\"users\":{\"inserts\":{\"user:1\":{\"name\":\"Alice\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        batch_body,
         &headers,
         20,
     );
@@ -12993,7 +15580,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         client_io.io(),
         .POST,
         transaction_url,
-        "{\"read_set\":[],\"tables\":{\"users\":{\"inserts\":{\"user:3\":{\"name\":\"Carol\"}}}}}",
+        transaction_body,
         &headers,
         20,
     );
@@ -13089,6 +15676,21 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer canceled_transaction_parsed.deinit();
     try std.testing.expectEqualStrings("committed_visibility_pending", canceled_transaction_parsed.value.status);
     try std.testing.expectEqual(@as(usize, 2), writes.cancellation_transaction_calls);
+    for ([_]anyerror{ error.TransactionPrepareAbortedRowPolicyDenied, error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable }, [_]u16{ 403, 503, 503 }) |failure, status_code| {
+        writes.rejection = failure;
+        for ([_][]const u8{ batch_url, transaction_url }, [_][]const u8{ batch_body, transaction_body }) |url, body| {
+            var denied = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+            defer denied.deinit();
+            try std.testing.expectEqual(status_code, denied.status.code);
+            const Reply = struct { status: []const u8, code: []const u8, @"error": []const u8, retryable: bool };
+            var parsed_error = try std.json.parseFromSlice(Reply, alloc, denied.body.?, .{ .ignore_unknown_fields = true });
+            defer parsed_error.deinit();
+            try std.testing.expectEqualStrings("aborted", parsed_error.value.status);
+            try std.testing.expectEqualStrings(parsed_error.value.code, parsed_error.value.@"error");
+            try std.testing.expectEqual(status_code == 503, parsed_error.value.retryable);
+            try std.testing.expectEqualStrings(if (status_code == 503) "transaction_precommit_aborted" else "row_policy_denied", parsed_error.value.code);
+        }
+    }
 }
 
 test "httpx stable transaction commit durably hands off recovery before acknowledgement" {
@@ -13101,7 +15703,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
         next_commit_error: ?anyerror = error.EnrichmentWaitCanceled,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
-            return .{ .ptr = self, .vtable = &.{
+            return .{ .ptr = self, .supports_transaction_producers = true, .vtable = &.{
                 .batch = batch,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
@@ -15319,11 +17921,11 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var native = try storage.runtimeStore(alloc, .{ .name = "http-sql-connection-routes-test" });
     defer native.deinit();
     var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &native);
-    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable, .write_max_concurrent_requests = 1, .query_max_concurrent_requests = 1 }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const Route = struct {
-        const Kind = enum { open, sql, prepare, execute, close };
+        const Kind = enum { open, sql, fenced_sql, budget_sql, prepare, execute, close };
         const Reply = struct {
             status: u16,
             body: []u8,
@@ -15335,12 +17937,14 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             var request = try httpx.Request.init(allocator, if (kind == .close) .DELETE else .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             try request.headers.append("authorization", authorization);
+            if (kind == .fenced_sql) try request.headers.set("X-Antfly-SQL-Fence", "connection-test");
+            if (kind == .budget_sql) try request.headers.set(@import("antfly_public_limits").Execution.scan_rows_header, "100");
             request.body = body;
             var ctx = httpx.Context.init(allocator, std.testing.io, &request);
             defer ctx.deinit();
             var response = switch (kind) {
                 .open => try api.openSQLConnection(&ctx),
-                .sql => try api.executeSQL(&ctx),
+                .sql, .fenced_sql, .budget_sql => try api.executeSQL(&ctx),
                 .prepare => try api.prepareSQL(&ctx),
                 .execute => try api.executePreparedSQL(&ctx, id.?),
                 .close => try api.closeSQLConnection(&ctx, id.?),
@@ -15376,6 +17980,23 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         value: ?[]const u8 = null,
         code: ?[]const u8 = null,
     };
+    {
+        var began = try Route.statement(alloc, &handler, alice_auth, connection_id, "BEGIN ISOLATION LEVEL READ COMMITTED");
+        defer began.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), began.status);
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SHOW app.limit", .connection_id = connection_id }, .{});
+        defer alloc.free(body);
+        var invalid = try Route.call(alloc, &handler, alice_auth, .budget_sql, null, body);
+        defer invalid.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), invalid.status);
+        var error_body = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, invalid.body, .{});
+        defer error_body.deinit();
+        try std.testing.expectEqualStrings("0A000", error_body.value.code);
+        var rolled_back = try Route.statement(alloc, &handler, alice_auth, connection_id, "ROLLBACK");
+        defer rolled_back.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), rolled_back.status);
+    }
+
     for ([_]Step{
         .{ .sql = "SET app.limit = 5", .tag = "SET" },
         .{ .sql = "SHOW app.limit", .tag = "SHOW", .value = "5" },
@@ -15403,8 +18024,116 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             var result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, reply.body, .{});
             defer result.deinit();
             try std.testing.expectEqualStrings(step.tag.?, result.value.command_tag);
+            if (std.mem.eql(u8, step.sql, "COMMIT")) {
+                const committed_id = try distributed_txn.parseTxnIdHex(result.value.transaction_id.?);
+                const status = (try server.txn_sessions.getStatusForPrincipal(alloc, committed_id, "connection_alice")).?;
+                try std.testing.expectEqual(transactions_api.SessionDisposition.committed, status.disposition);
+                try std.testing.expect(!try durable.completionSettled(committed_id));
+                const retry_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .connection_id = connection_id, .session_id = result.value.transaction_id.? }, .{});
+                defer alloc.free(retry_body);
+                var retry = try Route.call(alloc, &handler, alice_auth, .fenced_sql, null, retry_body);
+                defer retry.deinit(alloc);
+                try std.testing.expectEqual(@as(u16, 200), retry.status);
+                var replayed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, retry.body, .{});
+                defer replayed.deinit();
+                try std.testing.expectEqualStrings(result.value.transaction_id.?, replayed.value.transaction_id.?);
+            }
             if (step.value) |value| try std.testing.expectEqualStrings(value, result.value.rows[0][0].string);
         }
+    }
+
+    {
+        var begun_failed = try Route.statement(alloc, &handler, alice_auth, connection_id, "BEGIN ISOLATION LEVEL READ COMMITTED");
+        defer begun_failed.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), begun_failed.status);
+        var begin_result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begun_failed.body, .{});
+        defer begin_result.deinit();
+        const failed_id = try distributed_txn.parseTxnIdHex(begin_result.value.session_id.?);
+        const failed_guard = try server.txn_sessions.mutation(alloc, failed_id, server.localSessionNodeId());
+        try server.txn_sessions.setSqlFailed(alloc, failed_guard, true);
+        var failed_commit = try Route.statement(alloc, &handler, alice_auth, connection_id, "COMMIT");
+        defer failed_commit.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), failed_commit.status);
+        var commit_result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, failed_commit.body, .{});
+        defer commit_result.deinit();
+        try std.testing.expectEqualStrings("ROLLBACK", commit_result.value.command_tag);
+        const status = (try server.txn_sessions.getStatusForPrincipal(alloc, failed_id, "connection_alice")).?;
+        try std.testing.expectEqual(transactions_api.SessionDisposition.aborted, status.disposition);
+        try std.testing.expect(!try durable.completionSettled(failed_id));
+    }
+
+    {
+        var begin = try Route.call(alloc, &handler, alice_auth, .sql, null, "{\"statement\":\"BEGIN ISOLATION LEVEL READ COMMITTED\"}");
+        defer begin.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), begin.status);
+        var begun = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begin.body, .{});
+        defer begun.deinit();
+        const encoded = begun.value.session_id.?;
+        const id = try distributed_txn.parseTxnIdHex(encoded);
+        var identity = try server.authenticateRequest(.{ .authorization = alice_auth });
+        defer identity.deinit(alloc);
+        try std.testing.expect((try server.authorizedTransactionMutation(id, identity)) == null);
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .session_id = encoded }, .{});
+        defer alloc.free(body);
+        for ([_]Route.Kind{ .sql, .fenced_sql }) |kind| {
+            var held: usize = 0;
+            if (kind == .fenced_sql) {
+                while (server.tryAcquireWrite()) held += 1;
+                try std.testing.expect(held != 0);
+            }
+            defer for (0..held) |_| server.releaseWrite();
+            var reply = try Route.call(alloc, &handler, alice_auth, kind, null, body);
+            defer reply.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 200), reply.status);
+            var committed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, reply.body, .{});
+            defer committed.deinit();
+            try std.testing.expectEqualStrings(encoded, committed.value.transaction_id.?);
+        }
+    }
+
+    for ([_]bool{ true, false }) |terminal_abort| {
+        const begun = try server.txn_sessions.beginForPrincipal(alloc, .{ .sql = .{
+            .database = "default",
+            .namespace = "public",
+            .isolation = .read_committed,
+            .mode = .read_write,
+        } }, 0, "connection_alice");
+        var terminal = (try durable.load(begun.txn_id)).?;
+        defer terminal.deinit(alloc);
+        terminal.terminal_abort = terminal_abort;
+        terminal.sql_abort_acknowledgement = .rollback;
+        terminal.commit_execution_started = terminal_abort;
+        try durable.saveForTest(terminal, null);
+        const encoded = std.fmt.bytesToHex(begun.txn_id, .lower);
+        const key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ @import("../metadata/transaction_session_record.zig").session_prefix, &encoded });
+        defer alloc.free(key);
+        {
+            var txn = try native.beginWrite();
+            errdefer txn.abort();
+            const packed_record = try txn.get(key);
+            const legacy = try std.mem.concat(alloc, u8, &.{ "{ ", packed_record[1..] });
+            defer alloc.free(legacy);
+            try txn.put(key, legacy);
+            try txn.commit();
+        }
+        var held: usize = 0;
+        if (terminal_abort) {
+            while (server.tryAcquireWrite()) held += 1;
+        } else {
+            while (server.tryAcquireQuery()) held += 1;
+        }
+        defer for (0..held) |_| {
+            if (terminal_abort) server.releaseWrite() else server.releaseQuery();
+        };
+        try std.testing.expect(held != 0);
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .session_id = &encoded }, .{});
+        defer alloc.free(body);
+        var replayed = try Route.call(alloc, &handler, alice_auth, .sql, null, body);
+        defer replayed.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), replayed.status);
+        var decision = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, replayed.body, .{});
+        defer decision.deinit();
+        try std.testing.expectEqualStrings(if (terminal_abort) "ROLLBACK" else "COMMIT", decision.value.command_tag);
     }
 
     const prepare_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT current_setting('app.limit')", .connection_id = connection_id }, .{});
@@ -15435,6 +18164,19 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var foreign_close = try Route.call(alloc, &handler, bob_auth, .close, connection_id, null);
     defer foreign_close.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), foreign_close.status);
+    {
+        server.cfg.imported_runtime_io = .{ .durable = std.Io.failing };
+        defer server.cfg.imported_runtime_io = null;
+        var blocked_open = try Route.call(alloc, &handler, alice_auth, .open, null, "{}");
+        defer blocked_open.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), blocked_open.status);
+        var overloaded = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
+        defer overloaded.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), overloaded.status);
+        var diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, overloaded.body, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("53300", diagnostic.value.code);
+    }
     var closed = try Route.call(alloc, &handler, alice_auth, .close, connection_id, null);
     defer closed.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), closed.status);
@@ -15442,9 +18184,233 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var after_close = try Route.statement(alloc, &handler, alice_auth, connection_id, "SHOW app.limit");
     defer after_close.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), after_close.status);
+
+    var second_open = try Route.call(alloc, &handler, alice_auth, .open, null, "{}");
+    defer second_open.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), second_open.status);
+    var second_connection = try std.json.parseFromSlice(sql_wire.SQLConnectionResponse, alloc, second_open.body, .{});
+    defer second_connection.deinit();
+    const uncertain_id = second_connection.value.connection_id;
+    const begin_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "BEGIN ISOLATION LEVEL READ COMMITTED", .connection_id = uncertain_id }, .{});
+    defer alloc.free(begin_body);
+    var begun = try Route.call(alloc, &handler, alice_auth, .fenced_sql, null, begin_body);
+    defer begun.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), begun.status);
+    const principal = "connection_alice";
+    const node = server.localSessionNodeId();
+    const connections = @import("sql/session/connections.zig");
+    const id = std.fmt.bytesToHex(try distributed_txn.parseTxnIdHex(uncertain_id), .lower);
+    const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+    var active = try connections.load(&durable, alloc, id, principal, node, now_ms);
+    defer active.deinit();
+    const txn_id = active.value.active_txn.?;
+    var stored = (try durable.load(txn_id)).?;
+    defer stored.deinit(alloc);
+    try std.testing.expect(stored.prepared_completion_only);
+    const guard = try server.txn_sessions.mutation(alloc, txn_id, node);
+    // The execution seal may have committed while the independent connection
+    // transition is still active. This retry only observes the sealed attempt.
+    var staged = try transactions_api.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{}}}}}");
+    defer staged.deinit(alloc);
+    _ = (try server.txn_sessions.stage(alloc, guard, &staged)).?;
+    {
+        const generic = try server.txn_sessions.beginForPrincipal(alloc, .{}, node, principal);
+        const generic_guard = try server.txn_sessions.mutation(alloc, generic.txn_id, node);
+        _ = (try server.txn_sessions.stage(alloc, generic_guard, &staged)).?;
+        const generic_hex = std.fmt.bytesToHex(generic.txn_id, .lower);
+        const url = try std.fmt.allocPrint(alloc, "http://localhost/db/v1/transactions/{s}/commit", .{&generic_hex});
+        defer alloc.free(url);
+        var request = try httpx.Request.init(alloc, .POST, url);
+        defer request.deinit();
+        try request.headers.set("Authorization", alice_auth);
+        try request.headers.set("X-Antfly-SQL-Fence", "capacity-fence");
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        const prior_source = server.table_writes;
+        server.table_writes = .{ .ptr = undefined, .vtable = undefined };
+        defer server.table_writes = prior_source;
+        const publication = try durable.createUnpublishedRegistration(@splat(17), .{ .transaction_id = &generic_hex }, false, .{});
+        try std.testing.expect(!try durable.claimAbandonedRegistration(publication, false, .{}));
+        try std.testing.expect(try durable.claimAbandonedRegistration(publication, true, .{}));
+        try std.testing.expect(!try durable.joinRegistration(publication));
+        try durable.removeRegistration(publication);
+        const published = try durable.createUnpublishedRegistration(@splat(17), .{ .transaction_id = &generic_hex }, false, .{});
+        try std.testing.expect(try durable.joinRegistration(published));
+        try std.testing.expect(!try durable.claimAbandonedRegistration(published, true, .{}));
+        try durable.removeRegistration(published);
+        const published_hex = std.fmt.bytesToHex(published, .lower);
+        const mixed = try @import("sql/session/completion.zig").remaining(&server, alloc, .{
+            .unknown = true,
+            .outcomes = &.{.{ .reference_id = &published_hex, .registration_node_id = server.localSessionNodeId() }},
+        }, .{});
+        defer alloc.free(mixed.outcomes);
+        try std.testing.expect(mixed.unknown);
+        try std.testing.expectEqual(@as(usize, 0), mixed.outcomes.len);
+        const capacity = @import("completion_outbox.zig").max_window;
+        try durable.reserveRegistrations(capacity);
+        defer durable.releaseRegistrations(capacity);
+        var rejected = try handler.commitTransactionSession(&ctx, &generic_hex);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
+        var persisted = (try durable.load(generic.txn_id)).?;
+        defer persisted.deinit(alloc);
+        try std.testing.expect(persisted.commit_body_digest == null);
+        _ = (try server.txn_sessions.stage(alloc, generic_guard, &staged)).?;
+        var sealed = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, generic_guard, null)).?;
+        defer sealed.deinit(alloc);
+        const participants = try sealed.distributedTables(alloc);
+        defer participants.deinit();
+        try std.testing.expectError(error.DeadlineExceeded, server.txn_sessions.sealExecutionPlanControlled(alloc, generic_guard, participants.tables, .{ .deadline_ns = 0 }));
+        try std.testing.expect((try server.txn_sessions.getExecutionPlan(alloc, generic_guard)) == null);
+        var execution = (try server.txn_sessions.sealExecutionPlan(alloc, generic_guard, participants.tables)).?;
+        defer execution.deinit();
+        _ = (try server.txn_sessions.recordTerminalCommitForMutation(alloc, generic_guard, .committed, false, null, null)).?;
+        durable.fail_writes_for_test = true;
+        defer durable.fail_writes_for_test = false;
+        const held_execution = server.txn_sessions.tryAcquireCommitExecution(generic.txn_id).?;
+        defer held_execution.release();
+        var replay_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer replay_ctx.deinit();
+        var replayed = try handler.commitTransactionSession(&replay_ctx, &generic_hex);
+        defer replayed.deinit();
+        try std.testing.expectEqual(@as(u16, 200), replayed.status.code);
+    }
+    var sealed_request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, null)).?;
+    defer sealed_request.deinit(alloc);
+    const tables = try sealed_request.distributedTables(alloc);
+    defer tables.deinit();
+    var plan = (try server.txn_sessions.sealExecutionPlan(alloc, guard, tables.tables)).?;
+    defer plan.deinit();
+    {
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .connection_id = uncertain_id }, .{});
+        defer alloc.free(body);
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        try request.headers.append("authorization", alice_auth);
+        try request.headers.set("X-Antfly-SQL-Fence", "commit-retry");
+        request.body = body;
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var observed = try handler.executeSQL(&ctx);
+        defer observed.deinit();
+        try std.testing.expectEqual(@as(u16, 409), observed.status.code);
+        const completion = try AntflyApiHandler.requestCompletion(&ctx);
+        try std.testing.expect(!completion.unknown);
+        try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+        {
+            var read = try server.acquireSqlExecution(false);
+            defer read.release();
+            var retry_completion: @import("../pgwire/completion.zig").Completion = .{};
+            defer retry_completion.deinit(alloc);
+            try @import("sql/session/completion.zig").observeTransaction(&server, alloc, &retry_completion, txn_id);
+            try std.testing.expectEqual(@as(usize, 1), retry_completion.outcomes.items.len);
+            try std.testing.expectEqualStrings(completion.outcomes.items[0].reference_id.?, retry_completion.outcomes.items[0].reference_id.?);
+        }
+        const max_window = @import("completion_outbox.zig").max_window;
+        try durable.reserveRegistrations(max_window);
+        defer durable.releaseRegistrations(max_window);
+        var retry_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer retry_ctx.deinit();
+        var retry_response = try handler.executeSQL(&retry_ctx);
+        defer retry_response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), retry_response.status.code);
+        const retried = try AntflyApiHandler.requestCompletion(&retry_ctx);
+        try std.testing.expectEqual(@as(usize, 1), retried.outcomes.items.len);
+        try std.testing.expectEqualStrings(completion.outcomes.items[0].reference_id.?, retried.outcomes.items[0].reference_id.?);
+    }
+    _ = try connections.mutate(&durable, .{ .uncertain = .{ .id = id, .guard = guard } }, principal, node, now_ms);
+    var blocked_read = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "SELECT 1");
+    defer blocked_read.deinit(alloc);
+    var busy = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, blocked_read.body, .{});
+    defer busy.deinit();
+    try std.testing.expectEqualStrings("25001", busy.value.code);
+    try std.testing.expect(busy.value.transaction_id == null);
+    var repeated = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "COMMIT");
+    defer repeated.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), repeated.status);
+    var diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, repeated.body, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings("40003", diagnostic.value.code);
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(txn_id, .lower), diagnostic.value.transaction_id.?);
+
+    const observations = try durable.observationRetirementPage(alloc, null, 8);
+    defer alloc.free(observations.entries);
+    defer if (observations.next_after) |key| alloc.free(key);
+    try std.testing.expectEqual(@as(usize, 1), observations.entries.len);
+    const reference = observations.entries[0].reference;
+    _ = (try server.txn_sessions.recordTerminalAbort(alloc, txn_id)).?;
+    var registration = (try durable.loadRegistration(alloc, reference)).?;
+    defer registration.deinit();
+    registration.value.phase = .acknowledging;
+    try durable.putRegistration(reference, registration.value);
+    try std.testing.expect(try durable.managedCompletion(txn_id, reference, true, try durable.registrationFloorFor(reference)));
+
+    // Put a settled observation with a damaged target directory before the
+    // valid row. It must remain retryable without blocking its neighbor.
+    const corrupt_id: [16]u8 = @splat(0);
+    _ = try server.txn_sessions.beginForPrincipalWithSettingsAndId(alloc, .{}, node, principal, &.{}, null, corrupt_id);
+    const corrupt_hex = std.fmt.bytesToHex(corrupt_id, .lower);
+    const corrupt_reference = try durable.createLocalObservedRegistration(@splat(3), .{ .transaction_id = &corrupt_hex }, corrupt_id);
+    const corrupt_guard = try server.txn_sessions.mutation(alloc, corrupt_id, node);
+    const corrupt_info = (try server.txn_sessions.readInfo(corrupt_id)).?;
+    try std.testing.expect(try server.txn_sessions.retireBeforeExecution(alloc, corrupt_guard, corrupt_info.version, false));
+    const directory = try std.fmt.allocPrint(alloc, "\x00\x00__api_completion_consumers__:{s}", .{&corrupt_hex});
+    defer alloc.free(directory);
+    {
+        var write = try native.beginWrite();
+        errdefer write.abort();
+        try write.put(directory, "invalid");
+        try write.commit();
+    }
+
+    const completions = @import("sql/session/completion.zig");
+    try completions.retireSettledObservations(&server, alloc, 8);
+    try std.testing.expect((try durable.loadRegistration(alloc, reference)) == null);
+    _ = try completions.reclaimLegacyObservationAcks(&server);
+    {
+        var read = try native.beginRead();
+        defer read.abort();
+        const proof_key = try std.fmt.allocPrint(alloc, "\x00\x00__api_completion_reference__:{s}:{s}", .{
+            &std.fmt.bytesToHex(txn_id, .lower),
+            &std.fmt.bytesToHex(reference, .lower),
+        });
+        defer alloc.free(proof_key);
+        const ack_key = try std.fmt.allocPrint(alloc, "\x00\x00__api_completion_retired__:{s}:ack:{s}", .{
+            &std.fmt.bytesToHex(reference[0..8].*, .lower),
+            &std.fmt.bytesToHex(reference[8..16].*, .lower),
+        });
+        defer alloc.free(ack_key);
+        try std.testing.expectError(error.NotFound, read.get(proof_key));
+        try std.testing.expectError(error.NotFound, read.get(ack_key));
+    }
+    var retained = (try durable.loadRegistration(alloc, corrupt_reference)).?;
+    defer retained.deinit();
+    const reference_hex = std.fmt.bytesToHex(reference, .lower);
+    const observed_outcome: @import("../pgwire/completion.zig").Outcome = .{
+        .reference_id = &reference_hex,
+        .registration_node_id = node,
+    };
+    try std.testing.expect(try completions.settled(&server, alloc, .{ .outcomes = &.{observed_outcome} }, .{}));
+    var foreign_reference = reference;
+    foreign_reference[0] ^= 1;
+    const foreign_hex = std.fmt.bytesToHex(foreign_reference, .lower);
+    var foreign_outcome = observed_outcome;
+    foreign_outcome.reference_id = &foreign_hex;
+    try std.testing.expectError(error.CompletionWrongOwner, completions.settled(&server, alloc, .{ .outcomes = &.{foreign_outcome} }, .{}));
+    const ordinary = try durable.createRegistration(@splat(2), .{ .transaction_id = &std.fmt.bytesToHex(txn_id, .lower) });
+    try durable.removeRegistration(ordinary);
+    const ordinary_hex = std.fmt.bytesToHex(ordinary, .lower);
+    const ordinary_outcome: @import("../pgwire/completion.zig").Outcome = .{ .reference_id = &ordinary_hex, .registration_node_id = node };
+    try std.testing.expect(!try completions.settled(&server, alloc, .{ .outcomes = &.{ordinary_outcome} }, .{}));
 }
 
 test "httpx SQL malformed catalog requests fail before publication" {
+    // Exact original default-subquery contracts, superseded by PostgreSQL's
+    // 0A000 prohibition rather than treated as implemented subquery defaults:
+    // sql-1109, sql-1110, sql-1111, sql-1112, sql-1113, sql-1114, sql-1115, sql-1116,
+    // sql-1117, sql-1118, sql-1119, sql-1120, sql-1121, sql-1122, sql-1123, sql-1124,
+    // sql-1125, sql-1126, sql-1127, sql-1128, sql-1129, sql-1130, sql-1131, sql-1132,
+    // sql-1133, sql-1134, sql-1135, sql-1136, sql-1137, sql-1138, sql-1139, sql-1140.
     const alloc = std.testing.allocator;
     const Source = struct {
         publications: usize = 0,
@@ -15478,6 +18444,8 @@ test "httpx SQL malformed catalog requests fail before publication" {
             const diagnostic = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
             defer diagnostic.deinit();
             try std.testing.expectEqualStrings(code, diagnostic.value.object.get("code").?.string);
+            if (std.mem.indexOf(u8, sql, "DEFAULT (SELECT") != null)
+                try std.testing.expectEqualStrings("subqueries are not allowed in schema defaults", diagnostic.value.object.get("message").?.string);
         }
     };
     for ([_][]const u8{ "CREATE TABLE broken (", "CREATE TABLE broken (n bigint", "CREATE TABLE broken (n bigint CONSTRAINT only_name" }) |sql|
@@ -15505,6 +18473,152 @@ test "httpx SQL document campaign verifies exact native mutation and storage out
     // sql-1085, sql-1086, sql-1087, sql-1089, sql-1090, sql-1092.
     // sql-1093, sql-1094, sql-1095, sql-1096, sql-1098, sql-1099.
     // sql-1100.
+    try documentMutationCampaign(@import("antfly_local_sources").sql_parity_fixtures.document_reference);
+}
+
+test "httpx SQL original document assignments enforce readonly versions and JSONB types" {
+    const ids = [_][]const u8{ "sql-0912", "sql-0915", "sql-0916", "sql-0921", "sql-0943", "sql-1083" };
+    const bytes = @import("antfly_local_sources").sql_parity_fixtures.document_boundary_reference;
+    var parsed = try std.json.parseFromSlice(struct { entries: []const struct { id: []const u8 } }, std.testing.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(ids.len, parsed.value.entries.len);
+    for (ids, parsed.value.entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    try documentMutationCampaign(bytes);
+}
+
+test "httpx SQL original floating document MOD rejects signatures without changing primary bytes" {
+    const ids = [_][]const u8{ "sql-0970", "sql-0971", "sql-0972", "sql-0973" };
+    const bytes = @import("antfly_local_sources").sql_parity_fixtures.document_numeric_rejection_reference;
+    var parsed = try std.json.parseFromSlice(struct { entries: []const struct { id: []const u8, sqlstate: []const u8 } }, std.testing.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(ids.len, parsed.value.entries.len);
+    for (ids, parsed.value.entries) |id, entry| {
+        try std.testing.expectEqualStrings(id, entry.id);
+        try std.testing.expectEqualStrings("42883", entry.sqlstate);
+    }
+    try documentMutationCampaign(bytes);
+}
+
+test "httpx SQL document expression mutations do not trust historical index annotations" {
+    const ids = [_][]const u8{
+        "sql-0891",
+        "sql-0911",
+        "sql-0913",
+        "sql-0918",
+        "sql-0922",
+        "sql-0928",
+        "sql-0929",
+        "sql-0930",
+        "sql-0932",
+        "sql-0933",
+        "sql-0934",
+        "sql-0938",
+        "sql-0946",
+        "sql-0956",
+        "sql-0957",
+        "sql-0958",
+        "sql-0959",
+        "sql-0960",
+        "sql-0961",
+        "sql-0962",
+        "sql-0963",
+        "sql-0964",
+        "sql-0965",
+        "sql-0966",
+        "sql-0967",
+        "sql-0968",
+        "sql-0969",
+        "sql-0974",
+        "sql-0975",
+        "sql-0976",
+        "sql-0977",
+        "sql-0978",
+        "sql-0979",
+        "sql-0980",
+        "sql-0982",
+        "sql-0983",
+        "sql-0984",
+        "sql-0985",
+        "sql-0987",
+        "sql-0988",
+        "sql-0989",
+        "sql-0990",
+        "sql-0991",
+        "sql-0992",
+        "sql-0993",
+        "sql-0994",
+        "sql-0996",
+        "sql-0997",
+        "sql-0998",
+        "sql-0999",
+        "sql-1001",
+        "sql-1002",
+        "sql-1003",
+        "sql-1004",
+        "sql-1005",
+        "sql-1006",
+        "sql-1007",
+        "sql-1009",
+        "sql-1010",
+        "sql-1011",
+        "sql-1012",
+        "sql-1014",
+        "sql-1015",
+        "sql-1016",
+        "sql-1017",
+        "sql-1018",
+        "sql-1019",
+        "sql-1020",
+        "sql-1021",
+        "sql-1022",
+        "sql-1023",
+        "sql-1024",
+        "sql-1025",
+        "sql-1026",
+        "sql-1027",
+        "sql-1028",
+        "sql-1030",
+        "sql-1031",
+        "sql-1032",
+        "sql-1033",
+        "sql-1034",
+        "sql-1035",
+        "sql-1036",
+        "sql-1037",
+        "sql-1038",
+        "sql-1039",
+        "sql-1040",
+        "sql-1041",
+        "sql-1042",
+        "sql-1043",
+        "sql-1044",
+        "sql-1045",
+        "sql-1046",
+        "sql-1047",
+        "sql-1048",
+        "sql-1049",
+        "sql-1050",
+        "sql-1051",
+        "sql-1052",
+        "sql-1053",
+        "sql-1058",
+        "sql-1065",
+        "sql-1066",
+        "sql-1067",
+        "sql-1069",
+        "sql-1075",
+        "sql-1091",
+        "sql-1097",
+    };
+    const bytes = @import("antfly_local_sources").sql_parity_fixtures.document_projection_reference;
+    const manifest = try std.json.parseFromSlice(struct { entries: []const struct { id: []const u8 } }, std.testing.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer manifest.deinit();
+    try std.testing.expectEqual(ids.len, manifest.value.entries.len);
+    for (ids, manifest.value.entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    try documentMutationCampaign(bytes);
+}
+
+fn documentMutationCampaign(reference_bytes: []const u8) !void {
     const alloc = std.testing.allocator;
     const Source = struct {
         schema: []const u8 = "",
@@ -15551,8 +18665,8 @@ test "httpx SQL document campaign verifies exact native mutation and storage out
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, reads.source(), writes.source());
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const parity = @import("sql_parity_reference.zig");
-    const reference = try std.json.parseFromSlice(parity.DocumentReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.document_reference, .{ .ignore_unknown_fields = true });
+    const parity = @import("sql/testing/parity_reference.zig");
+    const reference = try std.json.parseFromSlice(parity.DocumentReference, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
     defer reference.deinit();
     try parity.runDocuments(alloc, &handler, &db, &source, reference.value);
 }
@@ -15681,7 +18795,7 @@ test "httpx SQL LATERAL original campaign executes captured native table relatio
     const ids = try alloc.alloc([]const u8, parsed.value.entries.len);
     defer alloc.free(ids);
     for (parsed.value.entries, ids) |entry, *id| id.* = entry.id;
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, ids, reference_bytes);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(alloc, &handler, ids, reference_bytes);
     try std.testing.expectEqual(ids.len, source.captures);
     var corpus = try @import("antfly_local_sources").sql_parity_fixtures.Corpus.init(alloc);
     defer corpus.deinit();
@@ -15726,7 +18840,7 @@ test "httpx SQL PostgreSQL original set reads preserve cross table bags and null
         parsed.value.profile.additional_tables[0],
         parsed.value.profile.additional_tables[1],
     };
-    const Source = @import("sql_parity_sources.zig").Tables(3);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(3);
     var source: Source = undefined;
     source.captures = 0;
     var databases: [3]db_mod.DB = undefined;
@@ -15760,7 +18874,7 @@ test "httpx SQL PostgreSQL original set reads preserve cross table bags and null
         "sql-0543", "sql-0544", "sql-0547", "sql-0548",
         "sql-0553",
     };
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
     try std.testing.expectEqual(ids.len, source.captures);
 }
 
@@ -15785,7 +18899,7 @@ test "httpx SQL PostgreSQL original aggregate reads preserve filters captures an
     const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
     for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
     try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -15799,22 +18913,533 @@ test "httpx SQL PostgreSQL original aggregate reads preserve filters captures an
         "sql-1225", "sql-1232", "sql-1242", "sql-1243", "sql-1244", "sql-1245",
         "sql-1246", "sql-1247", "sql-1248", "sql-1250", "sql-1251", "sql-1252",
     };
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
     // Single-table aggregates use the retained native scan, not the separate
     // multi-table capture hook exercised by the set-operation fixture above.
     try std.testing.expectEqual(@as(usize, 0), source.captures);
 }
 
-test "httpx SQL PostgreSQL original stored array reads preserve typed column semantics" {
+fn postgresNativeSingleTableReads(reference_bytes: []const u8, table_name: []const u8, ids: []const []const u8, codes: ?[]const []const u8) !void {
     const alloc = std.testing.allocator;
-    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.typed_array_read_reference;
+    const profile = try std.json.parseFromSlice(struct {
+        profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
+        entries: []const struct { id: []const u8, sqlstate: ?[]const u8 = null },
+    }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+    defer profile.deinit();
+    try std.testing.expectEqual(ids.len, profile.value.entries.len);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-single-table-originals");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.Stringify.valueAlloc(a, profile.value.profile.schema, .{});
+    try db.setSchemaJson(alloc, schema);
+    const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
+    for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+    try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = table_name, .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init(table_name, 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for (ids, profile.value.entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
+    if (codes) |expected_codes| {
+        try std.testing.expectEqual(ids.len, expected_codes.len);
+        for (ids, expected_codes, profile.value.entries) |id, code, entry| {
+            try std.testing.expectEqualStrings(code, entry.sqlstate orelse return error.MissingRejectionContract);
+            try @import("sql/testing/parity_reference.zig").expectRejection(alloc, &handler, id, code);
+        }
+        try std.testing.expectEqual(@as(usize, 0), source.captures);
+        try std.testing.expectEqual(@as(usize, 0), source.native_reads.load(.monotonic));
+    } else try @import("sql/testing/parity_reference.zig").runReferenceDescribedTransportStrict(alloc, &handler, ids, reference_bytes);
+}
+
+test "httpx SQL PostgreSQL original users alias read preserves the bounded matching frontier" {
+    const ids = [_][]const u8{"sql-0171"};
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.users_read_reference, "users", &ids, null);
+}
+
+test "httpx SQL PostgreSQL original binding rejections resolve signatures before native row access" {
+    const ids = [_][]const u8{ "sql-0215", "sql-0259", "sql-0261", "sql-0262", "sql-0263", "sql-0267", "sql-0268", "sql-0269", "sql-0270", "sql-0552", "sql-1370", "sql-1501" };
+    const codes = [_][]const u8{ "42883", "42883", "42883", "42883", "42883", "42883", "42883", "42883", "42883", "42804", "42P20", "42601" };
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.binding_rejection_reference, "usage_records", &ids, &codes);
+}
+
+test "httpx SQL PostgreSQL original extended reads preserve scoped arrays aggregates and ordered windows" {
+    const ids = [_][]const u8{
+        "sql-0203", "sql-0204", "sql-1224", "sql-1229", "sql-1266", "sql-1302", "sql-1378", "sql-1379", "sql-1380", "sql-1381",
+    };
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.extended_read_reference, "usage_records", &ids, null);
+}
+
+test "httpx SQL PostgreSQL original remaining reads preserve distinct frontiers and typed aggregates" {
+    const ids = [_][]const u8{ "sql-0292", "sql-0641", "sql-0642", "sql-1231", "sql-1237", "sql-1253" };
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.remaining_read_reference, "usage_records", &ids, null);
+}
+
+test "httpx SQL PostgreSQL original stored array reads preserve typed column semantics" {
+    const ids = [_][]const u8{
+        "sql-0167", "sql-0168", "sql-0185", "sql-0186", "sql-0187", "sql-0190", "sql-0194",
+        "sql-0200", "sql-0211", "sql-0212", "sql-0213", "sql-0280", "sql-0283", "sql-0285",
+        "sql-0286", "sql-0287", "sql-0288", "sql-0289", "sql-0290", "sql-0291", "sql-0293",
+        "sql-0294", "sql-0295", "sql-0296", "sql-0298", "sql-0299",
+    };
+    try postgresNativeSingleTableReads(@import("antfly_local_sources").sql_parity_fixtures.typed_array_read_reference, "usage_records", &ids, null);
+}
+
+test "httpx SQL catalog JSON generated rows preserve public DDL and restart semantics" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-json-generated");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var create = try local.sql_compiler.compile(alloc, "CREATE TABLE payloads (id text, j jsonb DEFAULT 'null'::jsonb, kind text GENERATED ALWAYS AS (jsonb_typeof(j)) STORED, n text GENERATED ALWAYS AS (jsonb_extract_path_text(j, 'n')) STORED)", .{});
+    defer create.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, create.statement.create_table);
+    {
+        var seed = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer seed.close();
+        try seed.setSchemaJson(alloc, schema);
+        try seed.batch(.{ .timestamp_ns = 42, .writes = &.{
+            .{ .key = "a", .value = "{\"id\":\"a\"}" },
+            .{ .key = "b", .value = "{\"id\":\"b\",\"j\":{\"n\":1.20}}" },
+            .{ .key = "c", .value = "{\"id\":\"c\",\"j\":null}" },
+        } });
+    }
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "payloads", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("payloads", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = "{\"statement\":\"SELECT id, j, kind, n, jsonb_typeof(j) AS observed FROM payloads ORDER BY id\"}";
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.executeSQL(&context);
+    defer response.deinit();
+    if (response.status.code != 200) std.debug.print("JSON generated read rejected: {s}\n", .{response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{ .parse_numbers = false });
+    try std.testing.expectEqual(@as(usize, 3), result.value.rows.len);
+    try std.testing.expectEqual(sql_wire.SQLColumnType.json, result.value.columns[1].type);
+    for (result.value.rows, result.value.sql_nulls.?, 0..) |row, flags, i| {
+        try std.testing.expectEqual(i == 2, flags[1]);
+        try std.testing.expectEqual(i == 2, flags[2]);
+        try std.testing.expectEqual(i != 1, flags[3]);
+        try std.testing.expectEqual(i == 2, flags[4]);
+        if (i == 0) {
+            try std.testing.expectEqual(std.json.Value.null, row[1]);
+            try std.testing.expectEqualStrings("null", row[2].string);
+            try std.testing.expectEqualStrings("null", row[4].string);
+        } else if (i == 1) {
+            try std.testing.expectEqualStrings("1.20", row[1].object.get("n").?.number_string);
+            try std.testing.expectEqualStrings("object", row[2].string);
+            try std.testing.expectEqualStrings("1.20", row[3].string);
+            try std.testing.expectEqualStrings("object", row[4].string);
+        }
+    }
+}
+
+test "httpx SQL catalog original multi column generated rows match PostgreSQL after restart" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const Input = struct { id: []const u8, status: ?[]const u8, amount: []const u8, fee: []const u8, metadata_json: []const u8 };
+    const fixture = try std.json.parseFromSlice(struct { id: []const u8, inputs: []const Input, rows: []const [4]?[]const u8 }, alloc, local.sql_parity_fixtures.generated_original_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var corpus = try local.sql_parity_fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    const original = try corpus.get(fixture.value.id);
+    var create = try local.sql_compiler.compile(alloc, original.sql, .{});
+    defer create.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-original-generated");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, create.statement.create_table);
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var seed = try db_mod.DB.open(alloc, directory.path(), options);
+        defer seed.close();
+        try seed.setSchemaJson(alloc, schema);
+        const writes = try a.alloc(db_mod.types.TransactionWrite, fixture.value.inputs.len);
+        for (fixture.value.inputs, writes) |input, *write| {
+            var row: std.json.Value = .{ .object = .empty };
+            try row.object.put(a, "id", .{ .string = input.id });
+            try row.object.put(a, "status", if (input.status) |status| .{ .string = status } else .null);
+            try row.object.put(a, "amount", .{ .string = input.amount });
+            try row.object.put(a, "fee", .{ .string = input.fee });
+            try row.object.put(a, "metadata", try std.json.parseFromSliceLeaky(std.json.Value, a, input.metadata_json, .{ .parse_numbers = false }));
+            write.* = .{ .key = input.id, .value = try std.json.Stringify.valueAlloc(a, row, .{}) };
+        }
+        var seed_reads = table_reads.BoundTableReadSource.init("generated_expr_records", 8, &seed, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var coordinated = try local.api_relational_integrity_commit.prepare(alloc, seed_reads.source(), &.{.{ .table_id = 7, .name = "generated_expr_records", .schema_json = schema }}, &.{.{ .table_name = "generated_expr_records", .writes = writes }});
+        defer coordinated.deinit();
+        try std.testing.expectEqual(@as(usize, 1), coordinated.tables.len);
+        const prepared = coordinated.tables[0];
+        try std.testing.expect(prepared.integrity_commands.len != 0);
+        try std.testing.expectEqual(@as(usize, 0), prepared.range_guards.len);
+        const txn = try seed.beginTransactionWithId(@splat(42), 42);
+        try seed.writeTransaction(txn, .{ .writes = prepared.writes, .deletes = prepared.deletes, .transforms = prepared.transforms, .predicates = prepared.predicates, .schema_version = prepared.schema_version, .integrity = prepared.integrity, .integrity_commands = prepared.integrity_commands, .relational_schema_version = prepared.relational_schema_version, .relational_integrity_generation_set = prepared.relational_integrity_generation_set });
+        try seed.commitTransaction(txn, 43);
+    }
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    defer db.close();
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "generated_expr_records", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("generated_expr_records", 8, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = "{\"statement\":\"SELECT id, status_slug, CAST(amount_cents AS text) AS cents, source_key FROM generated_expr_records ORDER BY id\"}";
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.executeSQL(&context);
+    defer response.deinit();
+    if (response.status.code != 200) std.debug.print("original generated read rejected: {s}\n", .{response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{});
+    try std.testing.expectEqual(fixture.value.rows.len, result.value.rows.len);
+    for (result.value.rows, result.value.sql_nulls.?, fixture.value.rows) |row, flags, expected| {
+        try std.testing.expectEqual(@as(usize, 4), row.len);
+        for (row, flags, expected) |value, sql_null, golden| {
+            try std.testing.expectEqual(golden == null, sql_null);
+            if (golden) |text| try std.testing.expectEqualStrings(text, value.string);
+        }
+    }
+}
+
+test "httpx SQL generated immutable planning preserves PostgreSQL stored rows after restart" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        inputs: []const struct { s: ?[]const u8, n: ?i64 },
+        entries: []const struct { sql: []const u8, type: []const u8, sqlstate: ?[]const u8, rows: []const ?[]const u8 = &.{} },
+    }, alloc, local.sql_generated_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var admitted: usize = 0;
+    for (fixture.value.entries) |entry| {
+        if (entry.sqlstate != null) continue;
+        admitted += 1;
+        var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-generated-immutable");
+        defer directory.cleanup();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var compiled = try local.sql_compiler.compile(alloc, entry.sql, .{});
+        defer compiled.deinit();
+        const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+        {
+            var seed = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer seed.close();
+            try seed.setSchemaJson(alloc, schema);
+            const writes = try a.alloc(db_mod.types.BatchWrite, fixture.value.inputs.len);
+            for (fixture.value.inputs, writes, 0..) |input, *write, i| write.* = .{
+                .key = try std.fmt.allocPrint(a, "r{d}", .{i}),
+                .value = try std.json.Stringify.valueAlloc(a, .{ .s = input.s, .n = input.n, .t = "2026-01-01T00:00:00Z" }, .{}),
+            };
+            try seed.batch(.{ .writes = writes, .timestamp_ns = 42 });
+        }
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const Source = @import("sql/testing/parity_sources.zig").Tables(1);
+        var source: Source = .{
+            .records = .{.{ .table_id = 7, .name = "generated_probe", .schema_json = schema }},
+            .reads = .{table_reads.BoundTableReadSource.init("generated_probe", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+        };
+        var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+        defer server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &server };
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = "{\"statement\":\"SELECT s, n, g, CAST(g AS text) AS generated_value FROM generated_probe ORDER BY n NULLS FIRST\"}";
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("generated row read rejected: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{});
+        try std.testing.expectEqual(entry.rows.len, result.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 4), result.value.columns.len);
+        const expected_type: sql_wire.SQLColumnType = if (std.mem.eql(u8, entry.type, "text")) .string else if (std.mem.eql(u8, entry.type, "int")) .integer else .boolean;
+        try std.testing.expectEqual(expected_type, result.value.columns[2].type);
+        for (result.value.rows, result.value.sql_nulls.?, entry.rows, fixture.value.inputs) |row, flags, expected, input| {
+            try std.testing.expectEqual(input.s == null, flags[0]);
+            if (input.s) |text| try std.testing.expectEqualStrings(text, row[0].string);
+            try std.testing.expectEqual(input.n == null, flags[1]);
+            if (input.n) |number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, row[1].string, 10));
+            try std.testing.expectEqual(expected == null, flags[2]);
+            try std.testing.expectEqual(expected == null, flags[3]);
+            if (expected) |text| try std.testing.expectEqualStrings(text, row[3].string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 27), admitted);
+}
+
+test "httpx SQL generated immutable planning preserves PostgreSQL rejection diagnostics" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, alloc, local.sql_generated_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-generated-rejections");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, schema);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "generated_input", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("generated_input", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var rejected: usize = 0;
+    for (fixture.value.entries) |entry| {
+        const expected = entry.sqlstate orelse continue;
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = entry.sql }, .{});
+        defer alloc.free(body);
+        request.body = body;
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 400) std.debug.print("generated rejection diagnostic: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(expected, diagnostic.value.code);
+        rejected += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 15), rejected);
+    try std.testing.expectEqual(@as(usize, 0), source.captures);
+}
+
+test "httpx SQL immutable index planning preserves PostgreSQL rejection diagnostics" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        base_sql: []const u8,
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, alloc, local.sql_index_planning_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-index-rejections");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var base = try local.sql_compiler.compile(alloc, fixture.value.base_sql, .{});
+    defer base.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(alloc, base.statement.create_table);
+    defer alloc.free(schema);
+    try db.setSchemaJson(alloc, schema);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "index_probe", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("index_probe", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    const Catalog = struct {
+        fn run(raw: *anyopaque, a: std.mem.Allocator, control: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *Source = @ptrCast(@alignCast(raw));
+            if (call != .resolve_many or call.resolve_many.relations.len == 0)
+                return Source.systemCatalog(raw, a, control, call);
+            try control.ensureActive();
+            // Test-only immutable relation cut, not production publication
+            // authority. Mutation callbacks remain deliberately unavailable.
+            const domain = local.system_catalog_domain;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const relations = try arena.allocator().alloc(?domain.ResolvedRelation, call.resolve_many.relations.len);
+            @memset(relations, null);
+            const table = self.records[0];
+            var parsed_schema = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+            defer parsed_schema.deinit(a);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(table.schema_json, &digest, .{});
+            for (call.resolve_many.relations, relations) |target, *resolved| {
+                if (!std.mem.eql(u8, target.database, "default") or !std.mem.eql(u8, target.namespace, "public") or !std.mem.eql(u8, target.name, table.name)) continue;
+                var value = domain.ResolvedTable.fromTable(table);
+                value.query_definition = domain.QueryDefinition.fromTable(table);
+                resolved.* = .{ .table = value, .logical_table = table.name, .owner = .{ .table_id = table.table_id, .schema_version = parsed_schema.version, .schema_digest = digest, .kind = .table } };
+            }
+            return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{ .revision = 7, .tables = &.{}, .relations = relations, .relation_epoch = .{ .revision = 7, .incarnation = @splat(7) } }, .{});
+        }
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Catalog.run, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var rejected: usize = 0;
+    for (fixture.value.entries) |entry| {
+        const expected = entry.sqlstate orelse continue;
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = entry.sql }, .{});
+        defer alloc.free(body);
+        request.body = body;
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 400) std.debug.print("index rejection diagnostic: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(expected, diagnostic.value.code);
+        rejected += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), rejected);
+    try std.testing.expectEqual(@as(usize, 0), source.captures);
+}
+
+test "httpx SQL transaction timestamp results retain typed values through public streaming" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-transaction-time");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, schema);
+    try db.batch(.{ .writes = &.{.{ .key = "u1", .value = "{\"id\":\"u1\"}" }}, .timestamp_ns = 42 });
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var corpus = try local.sql_parity_fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    const clock_contracts = try std.json.parseFromSlice(struct {
+        clock_contracts: []const struct { id: []const u8, columns: []const []const u8, column_oids: []const u32, semantics: []const u8 },
+        uuid_contract: struct { id: []const u8, columns: []const []const u8, column_oids: []const u32, version: u8, variant: []const u8 },
+    }, alloc, local.sql_parity_fixtures.remaining_read_reference, .{ .ignore_unknown_fields = true });
+    defer clock_contracts.deinit();
+    try std.testing.expectEqual(@as(usize, 3), clock_contracts.value.clock_contracts.len);
+    for (clock_contracts.value.clock_contracts, [_][]const u8{ "sql-0174", "sql-0175", "sql-0176" }) |entry, id| {
+        try std.testing.expectEqualStrings(id, entry.id);
+        try std.testing.expectEqualStrings("planned_at_ns", entry.columns[0]);
+        try std.testing.expectEqual(@as(u32, 1184), entry.column_oids[0]);
+        try std.testing.expectEqualStrings("transaction_start_microseconds", entry.semantics);
+    }
+    for ([_][]const u8{
+        (try corpus.get("sql-0174")).sql,
+        (try corpus.get("sql-0175")).sql,
+        (try corpus.get("sql-0176")).sql,
+        "SELECT now() AS planned_at_ns, transaction_timestamp() AS txn, CURRENT_TIMESTAMP(6) AS rounded FROM usage_records WHERE id=$1",
+        "SELECT now() AS planned_at_ns FROM usage_records WHERE id=$1 ORDER BY id",
+    }) |sql| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .statement = sql, .parameters = .{"u1"} }, .{});
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        const before = std.Io.Clock.now(.real, std.testing.io).nanoseconds;
+        var response = try handler.executeSQL(&context);
+        const after = std.Io.Clock.now(.real, std.testing.io).nanoseconds;
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("transaction timestamp rejected: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, arena.allocator(), response.body.?, .{});
+        try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+        try std.testing.expectEqualStrings("planned_at_ns", result.value.columns[0].name);
+        for (result.value.columns, result.value.rows[0], result.value.sql_nulls.?[0]) |column_, value, is_null| {
+            try std.testing.expectEqual(.datetime, column_.type);
+            try std.testing.expect(!is_null);
+            try std.testing.expectEqualStrings(result.value.rows[0][0].string, value.string);
+            const parsed = try local.sql_temporal_text.parseCanonical(.timestamp_tz, value.string);
+            try std.testing.expect(parsed.timestamp_tz.micros != std.math.minInt(i64) and parsed.timestamp_tz.micros != std.math.maxInt(i64));
+            const ns = parsed.timestamp_tz.unixNanoseconds().?;
+            try std.testing.expect(ns >= @divFloor(before, 1000) * 1000 and ns <= after);
+        }
+    }
+    const uuid_contract = clock_contracts.value.uuid_contract;
+    try std.testing.expectEqualStrings("sql-0177", uuid_contract.id);
+    try std.testing.expectEqualStrings("request_id", uuid_contract.columns[0]);
+    try std.testing.expectEqual(@as(u32, 2950), uuid_contract.column_oids[0]);
+    try std.testing.expectEqual(@as(u8, 4), uuid_contract.version);
+    try std.testing.expectEqualStrings("RFC4122", uuid_contract.variant);
+    const original = try corpus.get(uuid_contract.id);
+    var seen: [32][16]u8 = undefined;
+    for (&seen, 0..) |*next, count| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .statement = original.sql, .parameters = .{"u1"} }, .{});
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("UUID original rejected: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, arena.allocator(), response.body.?, .{});
+        try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.value.columns.len);
+        try std.testing.expect(@import("sql/testing/parity_reference.zig").postgresColumnMatches(result.value.columns[0], 2950));
+        try std.testing.expectEqualStrings(uuid_contract.columns[0], result.value.columns[0].name);
+        try std.testing.expect(!result.value.sql_nulls.?[0][0]);
+        next.* = try local.common_uuid.parse(result.value.rows[0][0].string);
+        try std.testing.expectEqual(@as(u8, 4), next[6] >> 4);
+        try std.testing.expectEqual(@as(u8, 2), next[8] >> 6);
+        for (seen[0..count]) |previous| try std.testing.expect(!std.mem.eql(u8, &previous, next));
+    }
+}
+
+test "httpx SQL PostgreSQL original digest read preserves case nulls and duplicate results" {
+    const alloc = std.testing.allocator;
+    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.digest_read_reference;
     const profile = try std.json.parseFromSlice(struct {
         profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
         entries: []const struct { id: []const u8 },
     }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
     defer profile.deinit();
-    try std.testing.expectEqual(@as(usize, 14), profile.value.entries.len);
-    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-typed-array-originals");
+    try std.testing.expectEqual(@as(usize, 1), profile.value.entries.len);
+    try std.testing.expectEqualStrings("sql-0257", profile.value.entries[0].id);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-digest-original");
     defer directory.cleanup();
     var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
@@ -15826,7 +19451,7 @@ test "httpx SQL PostgreSQL original stored array reads preserve typed column sem
     const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
     for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
     try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{
         .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
         .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
@@ -15836,11 +19461,7 @@ test "httpx SQL PostgreSQL original stored array reads preserve typed column sem
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
-    const ids = [_][]const u8{
-        "sql-0167", "sql-0168", "sql-0185", "sql-0186", "sql-0187", "sql-0200", "sql-0288",
-        "sql-0289", "sql-0290", "sql-0291", "sql-0293", "sql-0294", "sql-0298", "sql-0299",
-    };
-    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    try @import("sql/testing/parity_reference.zig").runReferenceStrict(alloc, &handler, &.{"sql-0257"}, reference_bytes);
 }
 
 test "httpx SQL joined source RETURNING preserves native array storage and PostgreSQL images" {
@@ -15860,7 +19481,7 @@ test "httpx SQL joined source RETURNING preserves native array storage and Postg
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const Source = @import("sql_parity_sources.zig").Tables(2);
+        const Source = @import("sql/testing/parity_sources.zig").Tables(2);
         var source: Source = .{ .records = undefined, .reads = undefined };
         var databases: [2]db_mod.DB = undefined;
         var opened: usize = 0;
@@ -16120,6 +19741,11 @@ test "httpx SQL PostgreSQL regex mutations preserve complete native postimages" 
     try postgresNativeMutationCampaigns(&.{ "sql-1443", "sql-1471", "sql-1473", "sql-1474", "sql-1475" });
 }
 
+test "httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read" {
+    // Exact original sources: sql-1432 (INSERT SELECT), sql-1462 (VALUES).
+    try postgresNativeMutationCampaigns(&.{ "sql-1432", "sql-1462" });
+}
+
 test "httpx SQL PostgreSQL named conflict targets preserve complete native postimages" {
     try postgresNativeMutationCampaigns(&.{"sql-1463"});
 }
@@ -16159,24 +19785,35 @@ test "httpx SQL PostgreSQL partial and expression arbiters preserve complete nat
 const PostgresMutationOwner = enum { constraint, index, expression };
 
 test "httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages" {
-    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1509", "sql-1514" }, true, .index, true);
-    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1510", "sql-1515" }, true, .expression, true);
+    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1509", "sql-1514" }, true, .index, true, false);
+    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1510", "sql-1515" }, true, .expression, true, false);
+}
+
+test "httpx SQL PostgreSQL original mutation rejections preserve every native primary and owner" {
+    const ids = [_][]const u8{
+        "sql-1396", "sql-1397", "sql-1401", "sql-1404", "sql-1405",
+        "sql-1433", "sql-1434", "sql-1441", "sql-1446", "sql-1448",
+        "sql-1449", "sql-1450", "sql-1451", "sql-1466", "sql-1485",
+        "sql-1486", "sql-1435", "sql-1472",
+    };
+    try postgresNativeMutationCampaignsWithReadPolicy(&ids, true, .constraint, false, true);
 }
 
 fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner) !void {
-    try postgresNativeMutationCampaignsWithReadPolicy(selected, unique, index_owned, false);
+    try postgresNativeMutationCampaignsWithReadPolicy(selected, unique, index_owned, false, false);
 }
 
-fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner, comptime indexed_selectors: bool) !void {
+fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner, comptime indexed_selectors: bool, comptime rejections: bool) !void {
     // Retain checked ownership for the full campaign without allocator-stack
     // unwinding on every native relation and HTTP allocation.
     var fixture_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
     defer fixture_allocator.deinit();
     const alloc = fixture_allocator.allocator();
-    const parity = @import("sql_parity_reference.zig");
-    const Source = @import("sql_parity_sources.zig").Tables(3);
+    const parity = @import("sql/testing/parity_reference.zig");
+    const Source = @import("sql/testing/parity_sources.zig").Tables(3);
     var completed_campaigns: usize = 0;
-    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false, expression: bool = false }{
+    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false, expression: bool = false, rejections: bool = false }{
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mutation_rejection_reference, .ids = &.{}, .unique = true, .rejections = true },
         .{
             .bytes = @import("antfly_local_sources").sql_parity_fixtures.mutation_postgres_reference,
             .ids = &.{
@@ -16198,6 +19835,7 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mixed_mutation_postgres_reference, .ids = &.{"sql-1460"}, .unique = true, .expression = true },
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.upper_mutation_postgres_reference, .ids = &.{"sql-1461"}, .unique = true, .expression = true },
     }) |campaign| {
+        if (campaign.rejections != rejections) continue;
         if (campaign.unique != unique) continue;
         if (campaign.expression != (index_owned == .expression)) continue;
         if (campaign.expression) {
@@ -16310,8 +19948,16 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
             reference.profile.admission_probes = probes;
         }
         try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, reference, if (selected.len != 0) selected else campaign.ids);
+        if (comptime selected.len == 2 and std.mem.eql(u8, selected[0], "sql-1432") and std.mem.eql(u8, selected[1], "sql-1462")) {
+            // A single-owner source uses one retained native range view, not
+            // the multi-relation statement-capture callback. VALUES conflict
+            // resolution must not add a full source/table read.
+            try std.testing.expectEqual(@as(usize, 0), source.captures);
+            try std.testing.expectEqual(@as(usize, 1), source.unbounded_reads.load(.monotonic));
+            try std.testing.expect(source.lookup_calls.load(.monotonic) > 0);
+        }
         completed_campaigns += 1;
-        if (unique) {
+        if (unique and !rejections) {
             // Logical UNIQUE ownership must resolve through native point
             // reads, not table-size-dependent statement capture or scans.
             try std.testing.expect(source.lookup_calls.load(.monotonic) > 0);
@@ -16355,6 +20001,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
+            // Login captures an authenticated settings cut even when this
+            // relational fixture declares no role or database defaults.
+            if (input == .setting_snapshot) {
+                if (!std.mem.eql(u8, context.setting_read_principal orelse "", input.setting_snapshot.principal)) return error.Forbidden;
+                return std.json.Stringify.valueAlloc(a, @import("antfly_local_sources").sql_setting_catalog.RawSnapshot{ .scope = input.setting_snapshot, .epoch = 7, .definitions = &.{} }, .{});
+            }
             // This fixture has no row-policy publication. The production
             // admission path treats that absence as an unprotected table.
             if (input == .policy_publication_status) return a.dupe(u8, "null");
@@ -16413,7 +20065,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var compiled_receipt = try @import("antfly_local_sources").sql_compiler.compile(alloc, statement, .{});
         defer compiled_receipt.deinit();
         var receipt_identity: ?@import("http_server.zig").AuthenticatedIdentity = null;
-        var receipt_adapter: @import("sql_execution.zig").Adapter = .{ .server = &server, .identity = &receipt_identity, .context = .{}, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 999, .object_generation = 9, .wal_lsn = 999999 }, .wait_ms = 0 } };
+        var receipt_adapter: @import("sql/execution/execution.zig").Adapter = .{ .server = &server, .identity = &receipt_identity, .context = .{}, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 999, .object_generation = 9, .wal_lsn = 999999 }, .wait_ms = 0 } };
         try std.testing.expectError(error.ReadReceiptGenerationMismatch, receipt_adapter.execute(alloc, &compiled_receipt, &.{}, .{}, null));
         try std.testing.expectError(error.ReadReceiptGenerationMismatch, @import("antfly_local_sources").sql_read_stream.Stream.open(alloc, receipt_adapter.backend(), &compiled_receipt, &.{}, .{}));
         var receipt_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
@@ -16454,9 +20106,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         "sql-1375", "sql-1377", "sql-1382", "sql-1383", "sql-1384", "sql-1385", "sql-1386",
         "sql-1387",
     };
-    try @import("sql_parity_reference.zig").runArrayExpressions(alloc, &handler);
-    try @import("sql_parity_reference.zig").runJsonExistenceExpressions(alloc, &handler);
-    try @import("sql_parity_reference.zig").runInternalArrayQueries(alloc, &handler);
+    try @import("sql/testing/parity_reference.zig").runUuidExpressions(alloc, &handler);
+    try @import("sql/testing/parity_reference.zig").runArrayExpressions(alloc, &handler);
+    try @import("sql/testing/parity_reference.zig").runJsonExistenceExpressions(alloc, &handler);
+    try @import("sql/testing/parity_reference.zig").runInternalArrayQueries(alloc, &handler);
     // SQL integer transport is lossless text, whereas a JSON numeric value
     // remains a number even when its physical cell also uses an i64 tag.
     for ([_]struct { sql: []const u8, integer: i64 }{
@@ -16481,10 +20134,11 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     }
     // These historical SQLite-positive originals are invalid in PostgreSQL:
     // an output alias is not an input variable inside ORDER BY arithmetic.
-    for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, "42703");
-    try @import("sql_parity_reference.zig").run(alloc, &handler, &reference_cases);
+    for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql/testing/parity_reference.zig").expectRejection(alloc, &handler, id, "42703");
+    try @import("sql/testing/parity_reference.zig").run(alloc, &handler, &reference_cases);
+    try @import("sql/testing/parity_reference.zig").runScalarKernels(alloc, &handler);
     {
-        const parity = @import("sql_parity_reference.zig");
+        const parity = @import("sql/testing/parity_reference.zig");
         const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.read_campaign_reference;
         try parity.runNumberWireContracts(alloc);
         try parity.runArrayWireContracts(alloc);
@@ -16525,7 +20179,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
         try parity.runReferenceStrict(alloc, &campaign_handler, ids, reference_bytes);
     }
-    try @import("sql_parity_reference.zig").runNativeContracts(alloc, &handler, &.{ "sql-0208", "sql-1369" });
+    try @import("sql/testing/parity_reference.zig").runNativeContracts(alloc, &handler, &.{ "sql-0208", "sql-1369" });
     for ([_][]const u8{
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}",
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE _id = $1\",\"parameters\":[\"a\"]}",
@@ -16825,7 +20479,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try std.testing.expectEqualStrings("9007199254740993", prepared_response.value.owner_node_id);
         const id = prepared_response.value.prepared_id;
         const params = [_]httpx.RouteParam{.{ .name = "prepared_id", .value = id }};
-        var resource = try @import("sql_prepared.zig").load(&prepared_durable, alloc, id, "", server.localSessionNodeId(), platform_time.realtimeNs() / std.time.ns_per_ms);
+        var resource = try @import("sql/session/prepared.zig").load(&prepared_durable, alloc, id, "", server.localSessionNodeId(), platform_time.realtimeNs() / std.time.ns_per_ms);
         defer resource.deinit();
         try std.testing.expectEqual(@as(usize, 1), resource.value.bindings.len);
         var transaction_id: [32]u8 = undefined;
@@ -16962,7 +20616,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             if (std.mem.eql(u8, case_id, "sql-0065")) {
                 const parsed = try std.json.parseFromSlice(std.json.Value, alloc, plan, .{});
                 defer parsed.deinit();
-                try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("plan_version").?.integer);
+                try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("plan_version").?.integer);
             } else try std.testing.expect(std.mem.indexOf(u8, plan, "Select") != null);
             try std.testing.expect(source.calls > 0);
         }
@@ -17558,7 +21212,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer result.deinit();
             try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
             try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
-            try std.testing.expectEqualStrings("2025-01-01T00:00:00.000000000Z", result.value.rows[0][0].string);
+            try std.testing.expectEqualStrings("2025-01-01 00:00:00+00", result.value.rows[0][0].string);
         }
     }
     {
@@ -17576,13 +21230,13 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var mutation_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &mutation_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, mutation_reads.source(), mutation_writes.source());
         defer mutation_server.deinit();
         var mutation_handler = AntflyApiHandler{ .api_server = &mutation_server };
-        try @import("sql_parity_reference.zig").runPointMutations(alloc, &mutation_handler, &mutation_db, &.{
+        try @import("sql/testing/parity_reference.zig").runPointMutations(alloc, &mutation_handler, &mutation_db, &.{
             "sql-1497", "sql-1498", "sql-1504", "sql-1505", "sql-1506", "sql-1507",
             "sql-1513", "sql-1518", "sql-1519", "sql-1520", "sql-1521", "sql-1522",
         });
     }
     {
-        const parity = @import("sql_parity_reference.zig");
+        const parity = @import("sql/testing/parity_reference.zig");
         const reference = try std.json.parseFromSlice(parity.MutationReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.mutation_reference, .{ .ignore_unknown_fields = true });
         defer reference.deinit();
         const mutation_schema = try std.json.Stringify.valueAlloc(alloc, reference.value.schema, .{});
@@ -17618,7 +21272,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer user.deinit(alloc);
         var pg_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .user_manager = &manager }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
         defer pg_server.deinit();
-        var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &pg_server };
+        var pg_adapter: @import("sql/transport/pgwire.zig").Adapter = .{ .server = &pg_server };
         const wire_backend = pg_adapter.backend();
         const credential = try wire_backend.vtable.authenticate(wire_backend.context, alloc, "cursor_reader", "secret");
         defer credential.release(credential.context, alloc);
@@ -17682,7 +21336,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer source_array.deinit();
             var encoded: std.Io.Writer.Allocating = .init(alloc);
             defer encoded.deinit();
-            if (format == 0) try sources.sql_array_text.encode(source_array.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(source_array.value, &encoded.writer, .{});
+            if (format == 0) try sources.sql_array_text.encode(alloc, source_array.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(alloc, source_array.value, &encoded.writer, .{});
             var array_request = request;
             array_request.statement = "SELECT $1::bigint[] a,cardinality($1) n FROM usage_records LIMIT 1";
             array_request.parameter_types = if (declared) &.{.array} else &.{};
@@ -17844,7 +21498,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer user.deinit(alloc);
         var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .user_manager = &manager }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
         defer text_server.deinit();
-        var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &text_server };
+        var pg_adapter: @import("sql/transport/pgwire.zig").Adapter = .{ .server = &text_server };
         const Wire = struct {
             fn frame(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
                 try out.writeByte(tag);
@@ -17947,6 +21601,12 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
                 pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
                     return null;
                 }
+                pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
+                    return null;
+                }
+                pub fn prev(_: *@This()) !?Entry {
+                    return null;
+                }
                 pub fn next(_: *@This()) !?Entry {
                     return null;
                 }
@@ -18034,7 +21694,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
             self.owner_attempts += 1;
             if (!self.default_conflict) {
                 var empty: EmptyOwner = .{};
-                var effects = try owner.prepare(a, &empty, tables[0].integrity_commands);
+                var effects = try owner.prepare(a, &empty, tables[0].integrity_commands, null);
                 defer effects.deinit();
             }
             self.primary_apply_attempts += 1;
@@ -18619,6 +22279,48 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
     try std.testing.expectEqualStrings("alpha", parsed.value.title);
 }
 
+test "httpx schema validation pins authoritative SQL definitions over stale admin projection" {
+    const alloc = std.testing.allocator;
+    const schema =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gte","value":0,"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const Fake = struct {
+        fn catalog(_: *anyopaque, a: std.mem.Allocator, _: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            return switch (call) {
+                .resolve => std.json.Stringify.valueAlloc(a, system_catalog.ResolvedTable{ .table_id = 7, .name = "docs" }, .{}),
+                .query_definition => std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .table_id = 7, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" }, .{}),
+                else => error.TestUnexpectedCatalogMutation,
+            };
+        }
+    };
+    // The operational projection intentionally has no CHECK declaration.
+    var source = SchemaUpdateStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{
+        .status = SchemaUpdateStatusSource.status,
+        .admin_snapshot = SchemaUpdateStatusSource.adminSnapshot,
+        .free_admin_snapshot = SchemaUpdateStatusSource.freeAdminSnapshot,
+        .system_catalog = Fake.catalog,
+        .supports_query_definitions = true,
+    } }, null, null);
+    defer api_server.deinit();
+    var next = try std.json.parseFromSlice(std.json.Value, alloc, schema, .{});
+    defer next.deinit();
+    _ = next.value.object.orderedRemove("version");
+    try next.value.object.getPtr("checks").?.array.items[0].object.put(next.arena.allocator(), "not_valid", .{ .bool = false });
+    const body = try std.json.Stringify.valueAlloc(next.arena.allocator(), next.value, .{});
+    var request = try httpx.Request.init(alloc, .PUT, "http://127.0.0.1/db/v1/tables/docs/schema");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    var response = try handler.updateSchema(&ctx, "docs", .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rewrite=true") != null);
+    try std.testing.expect(source.schema_json == null);
+}
+
 test "httpx antfly schema update returns full table status after projection" {
     const alloc = std.testing.allocator;
 
@@ -18752,6 +22454,46 @@ test "httpx retained read refuses unsigned migration requests and requires catal
     try std.testing.expect(api_server.retained_read_runtime == null);
 }
 
+test "httpx temporal probes require service authority unambiguous controls and bounded bodies" {
+    const a = std.testing.allocator;
+    const body_limits = @import("http_routes.zig");
+    var source = AuthStatusSource{};
+    const secret = "temporal-probe-test-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "httpx-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const too_large = try a.alloc(u8, body_limits.internal_lookup_control_max_body_bytes + 1);
+    defer a.free(too_large);
+    @memset(too_large, ' ');
+    const Case = struct { signed: bool = true, query: []const u8 = "", body: ?[]const u8 = null, status: u16 };
+    for ([_]Case{
+        .{ .signed = false, .body = "{}", .status = 401 },
+        .{ .query = "?_relational_integrity_catalog=true", .body = "{}", .status = 400 },
+        .{ .query = "?_relational_integrity_jobs=%7B%7D", .body = "{}", .status = 400 },
+        .{ .status = 400 },
+        .{ .body = "", .status = 413 },
+        .{ .body = too_large, .status = 413 },
+    }) |case| {
+        const url = try std.fmt.allocPrint(a, "http://127.0.0.1/internal/v1/groups/7/tables/docs/documents/group{s}", .{case.query});
+        defer a.free(url);
+        var request = try httpx.Request.init(a, .POST, url);
+        defer request.deinit();
+        request.body = case.body;
+        if (case.signed) try request.setHeader(internal_service_auth.header_name, token);
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" }, .{ .name = "key", .value = "group" } };
+        ctx.params = &params;
+        var response = try handler.internalGroupLookup(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+    }
+    try std.testing.expectEqual(@as(?usize, body_limits.internal_lookup_control_max_body_bytes), body_limits.publicPostBodyLimit("/internal/v1/groups/7/tables/docs/documents/group"));
+    try std.testing.expectEqual(@as(?usize, body_limits.sql_max_request_body_bytes), body_limits.publicPostBodyLimit("/db/v1/sql"));
+}
+
 test "httpx hidden handoff receipt rejects public caller even in legacy internal mode" {
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
@@ -18778,6 +22520,488 @@ test "httpx hidden handoff receipt rejects public caller even in legacy internal
         var response = try handler.internalGroupLookup(&ctx);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 401), response.status.code);
+    }
+}
+
+test "httpx SQL policy observation rejects public capabilities even in legacy internal mode" {
+    const a = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{
+        .internal_service_secret = "private-policy-observation-test-secret",
+        .internal_service_issuer = "httpx-test",
+        .internal_service_accept_legacy_unauthenticated = true,
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    const authority = @import("../usermgr/mod.zig").row_policy_authority;
+    for ([_][]const u8{
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/documents/a?read_consistency=read_index&_primary_digest=true",
+        "http://127.0.0.1/internal/v1/groups/7/tables/docs/documents/a?read_consistency=read_index&_relational_integrity_jobs=%7B%22kind%22%3A%22observations%22%7D",
+    }) |uri| {
+        for ([_]bool{ false, true }) |with_database| {
+            var request = try httpx.Request.init(a, .GET, uri);
+            defer request.deinit();
+            try request.setHeader(authority.principal_header, "opaque.signed-capability");
+            if (with_database) try request.setHeader(authority.database_header, "default");
+            var ctx = httpx.Context.init(a, undefined, &request);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{
+                .{ .name = "group_id", .value = "7" },
+                .{ .name = "table_name", .value = "docs" },
+                .{ .name = "key", .value = "a" },
+            };
+            ctx.params = &params;
+            var response = try handler.internalGroupLookup(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source scope control refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-scope/control-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceScopeControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx private index claims require explicit service authentication and bounded identity-only payloads" {
+    const alloc = std.testing.allocator;
+    const execution = @import("relational_index/owner_execution.zig");
+    const Fixture = struct {
+        batches: usize = 0,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, value: execution.ClaimRequest, context: operation_contract.RequestContext) !execution.ClaimResult {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(@as(usize, 1), value.claims.len);
+            try std.testing.expectEqualStrings("tuple\x00\xff\x80", value.claims[0].tuple);
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
+            self.batches += 1;
+            // Transport fixture only, not a real completed build or ACK.
+            return .acknowledged;
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "private-index-test-secret-0123456789";
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = "httpx-test",
+        .internal_service_accept_legacy_unauthenticated = true,
+        .relational_index_claims = .{ .ptr = &fixture, .execute_fn = Fixture.execute },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/relational-index-claims");
+    defer request.deinit();
+    const value: execution.ClaimRequest = .{
+        .table_id = 1,
+        .group_id = 7,
+        .id = @splat(3),
+        .claims = &.{.{ .tuple = "tuple\x00\xff\x80", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }},
+    };
+    const body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(body);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body));
+    try request.setBody(body);
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+    }
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    try request.headers.append(internal_service_auth.header_name, token);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+    try request.headers.append(execution.claim_remaining_ms_header, "1000");
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        ctx.application_deadline_ns = 0;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 408), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.batches);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    }
+    var wrong = value;
+    wrong.group_id += 1;
+    const wrong_body = try std.json.Stringify.valueAlloc(alloc, wrong, .{});
+    defer alloc.free(wrong_body);
+    try request.setBody(wrong_body);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.batches);
+    var many: [129]@typeInfo(@FieldType(execution.ClaimRequest, "claims")).pointer.child = @splat(value.claims[0]);
+    wrong = value;
+    wrong.claims = &many;
+    const many_body = try std.json.Stringify.valueAlloc(alloc, wrong, .{});
+    defer alloc.free(many_body);
+    try request.setBody(many_body);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.batches);
+    var mounted: HttpxE2eServer = undefined;
+    try mounted.init(alloc, &api_server);
+    defer mounted.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try mounted.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/relational-index-claims", .{base});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token }, .{ execution.claim_remaining_ms_header, "1000" } };
+    var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 2), fixture.batches);
+}
+
+test "httpx private schema preparation requires service authority a bounded budget and exact routing scope" {
+    const a = std.testing.allocator;
+    const preparation = @import("schema_validation/preparation.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, _: preparation.Request, context: operation_contract.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(context.schema_validation_authority);
+            try context.ensureActive();
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqualStrings("docs", table);
+            self.calls += 1;
+            // Transport authorization only; actual signed binary success and
+            // scope checks run through the compiled storage-owner fixture.
+            return error.CatalogPublicationProofPending;
+        }
+        fn expectStatus(handler: *AntflyApiHandler, req: *httpx.Request, expected: u16, deadline: ?u64) !void {
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, req);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+            ctx.params = &params;
+            ctx.application_deadline_ns = deadline;
+            var response = try handler.internalGroupSchemaValidationPrepare(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(expected, response.status.code);
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "schema-preparation-secret-0123456789";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "httpx-test", .internal_service_accept_legacy_unauthenticated = true, .schema_validation_preparation = .{ .ptr = &fixture, .prepare_fn = Fixture.prepare } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var req = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/groups/7/tables/docs/schema-validation-prepare");
+    defer req.deinit();
+    var value: preparation.Request = .{ .group_id = 7, .metadata_incarnation = @splat('1'), .id = @splat(2), .provisional_plan = @splat(3), .transition_id = 4, .namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .before_schema = "{}", .after_schema = "{}", .selection = .{ .not_null = &.{"n"} } };
+    const body = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(body);
+    try req.setBody(body);
+    try Fixture.expectStatus(&handler, &req, 401, null);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    try req.headers.append(internal_service_auth.header_name, token);
+    try Fixture.expectStatus(&handler, &req, 400, null);
+    try req.headers.append(preparation.remaining_ms_header, "1000");
+    try Fixture.expectStatus(&handler, &req, 408, 0);
+    const invented = try std.fmt.allocPrint(a, "{s},\"source_position\":1}}", .{body[0 .. body.len - 1]});
+    defer a.free(invented);
+    try req.setBody(invented);
+    try Fixture.expectStatus(&handler, &req, 400, null);
+    value.group_id = 8;
+    const foreign = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(foreign);
+    try req.setBody(foreign);
+    try Fixture.expectStatus(&handler, &req, 400, null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try req.setBody(body);
+    try Fixture.expectStatus(&handler, &req, 503, null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "httpx private index control requires explicit service authority and mounts bounded fence reserve requests" {
+    const alloc = std.testing.allocator;
+    const execution = @import("relational_index/owner_execution.zig");
+    const Fixture = struct {
+        effects: usize = 0,
+        operation: @FieldType(execution.Request, "operation") = .fence,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, value: execution.Request, context: operation_contract.RequestContext) !execution.Result {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(self.operation, value.operation);
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
+            self.effects += 1;
+            // An authenticated transport fixture, not proof of a real build.
+            return .acknowledged;
+        }
+        fn expectStatus(handler: *AntflyApiHandler, request: *httpx.Request, expected: u16, deadline: ?u64) !void {
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, request);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+            ctx.params = &params;
+            ctx.application_deadline_ns = deadline;
+            var response = try handler.internalGroupRelationalIndexControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(expected, response.status.code);
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "private-control-test-secret-0123456789";
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = "httpx-test",
+        .internal_service_accept_legacy_unauthenticated = true,
+        .relational_index_control = .{ .ptr = &fixture, .execute_fn = Fixture.execute },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/relational-index-control");
+    defer request.deinit();
+    var value: execution.Request = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .operation = .fence };
+    const body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(body);
+    try request.setBody(body);
+    try Fixture.expectStatus(&handler, &request, 401, null);
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    try request.headers.append(internal_service_auth.header_name, token);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    try request.headers.append(execution.control_remaining_ms_header, "1000");
+    try Fixture.expectStatus(&handler, &request, 408, 0);
+    const unknown = try std.fmt.allocPrint(alloc, "{s},\"authority\":true}}", .{body[0 .. body.len - 1]});
+    defer alloc.free(unknown);
+    try request.setBody(unknown);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    try request.setBody(body);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "30001");
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "0");
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    _ = request.headers.remove(execution.control_remaining_ms_header);
+    try request.headers.append(execution.control_remaining_ms_header, "1000");
+    value.group_id = 8;
+    const foreign = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(foreign);
+    try request.setBody(foreign);
+    try Fixture.expectStatus(&handler, &request, 400, null);
+    const oversized = try alloc.alloc(u8, execution.max_control_request_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, ' ');
+    try request.setBody(oversized);
+    try Fixture.expectStatus(&handler, &request, 413, null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.effects);
+    value.group_id = 7;
+    inline for (.{ .fence, .reserve, .cancel, .cancel_complete, .cancel_release }) |action| {
+        value.operation = action;
+        fixture.operation = action;
+        const action_body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(action_body);
+        try request.setBody(action_body);
+        try Fixture.expectStatus(&handler, &request, 200, null);
+    }
+    try std.testing.expectEqual(@as(usize, 5), fixture.effects);
+    fixture.operation = .fence;
+    var mounted: HttpxE2eServer = undefined;
+    try mounted.init(alloc, &api_server);
+    defer mounted.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try mounted.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/relational-index-control", .{base});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token }, .{ execution.control_remaining_ms_header, "1000" } };
+    var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(usize, 6), fixture.effects);
+}
+
+test "httpx source producer closure observe refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/observe-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceProducerClosureObserve(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source producer control refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/close-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceProducerClose(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source legacy terminal refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/legacy-terminal-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalLegacyTerminal(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source legacy inventory refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/legacy-inventory-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalLegacyInventory(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx changefeed create requires an idempotency key and authenticated credential" {
+    const a = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    for ([_]?[]const u8{ null, "request-1" }, [_]u16{ 400, 403 }) |key, expected| {
+        var request = try httpx.Request.init(a, .POST, "http://node/db/v1/changefeeds");
+        defer request.deinit();
+        if (key) |value| try request.setHeader("Idempotency-Key", value);
+        request.body = "{\"tables\":[\"docs\"]}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.createChangefeed(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(expected, response.status.code);
+    }
+}
+
+test "httpx changefeed pull rejects short cursors and requires authentication for valid cursors" {
+    const a = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    for ([_][]const u8{ "ab", "abababababababababababababababababababababababababababababababab" }, [_]u16{ 400, 403 }) |cursor, expected| {
+        const url = try std.fmt.allocPrint(a, "http://node/db/v1/changefeeds/{s}/events?after={s}", .{ "01010101010101010101010101010101", cursor });
+        defer a.free(url);
+        var request = try httpx.Request.init(a, .GET, url);
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        const params = [_]httpx.RouteParam{.{ .name = "feed_id", .value = "01010101010101010101010101010101" }};
+        ctx.params = &params;
+        var response = try handler.pullChangefeed(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(expected, response.status.code);
+    }
+}
+
+test "httpx source scope control reports phase conflict and unresolved results conservatively" {
+    inline for (.{ .{ error.SourceBindingConflict, @as(u16, 409) }, .{ error.SourcePendingWork, @as(u16, 503) }, .{ error.SourceOutcomeUnresolved, @as(u16, 503) } }) |case| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/internal/v1/groups/7/tables/rows/source-scope/control-v1");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.sourcePlanError(&ctx, case[0], true);
+        defer response.deinit();
+        try std.testing.expectEqual(case[1], response.status.code);
+        try std.testing.expectEqualStrings(internal_batch_forwarding.outcome_unknown_v1, response.headers.get(internal_batch_forwarding.outcome_header).?);
     }
 }
 
@@ -18993,6 +23217,35 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
             _ = self.creates.fetchAdd(1, .monotonic);
             return a.dupe(u8, value);
         }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const owner: *SchemaUpdateStatusSource = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            const table: system_catalog.ResolvedTable = .{ .table_id = 7, .name = "docs" };
+            switch (call) {
+                .resolve => |target| return std.json.Stringify.valueAlloc(a, @as(?system_catalog.ResolvedTable, if (std.mem.eql(u8, target.table, "docs")) table else null), .{}),
+                .query_definition => return std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .table_id = 7, .schema_json = owner.schema_json.?, .read_schema_json = "", .indexes_json = tables_api.default_indexes_json }, .{}),
+                .policy_publication_status => return a.dupe(u8, "null"),
+                .sql_column_sequence_handoffs => |request| {
+                    try std.testing.expect(context.setting_admin);
+                    for (request.targets) |target| try std.testing.expectEqual(@as(usize, 0), target.sequence_handoffs.len);
+                    return std.json.Stringify.valueAlloc(a, request.targets, .{});
+                },
+                .resolve_many => |request| {
+                    if (request.expected_revision) |revision| try std.testing.expectEqual(@as(u64, 1), revision);
+                    const resolved = try a.alloc(?system_catalog.ResolvedTable, request.targets.len);
+                    defer a.free(resolved);
+                    for (request.targets, resolved) |target, *slot| slot.* = if (std.mem.eql(u8, target.table, "docs")) table else null;
+                    const names = try a.alloc(?[]const u8, request.storage_names.len);
+                    defer a.free(names);
+                    for (request.storage_names, names) |name, *slot| slot.* = name;
+                    return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 1, .tables = resolved, .logical_names = names }, .{});
+                },
+                else => {
+                    std.debug.print("schema rewrite fixture unexpected catalog call: {s}\n", .{@tagName(call)});
+                    return error.UnexpectedCatalogCall;
+                },
+            }
+        }
         fn load(_: *anyopaque, a: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {
             return a.alloc(restore_jobs.ReplicatedPersistence.OwnedRow, 0);
         }
@@ -19016,7 +23269,9 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
     var source = SchemaUpdateStatusSource{ .schema_json = source_schema };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
-    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.readFacts } }, source.iface(), null, writes.iface());
+    var status_vtable = source.iface().vtable.*;
+    status_vtable.system_catalog = Fixture.catalog;
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.readFacts } }, .{ .ptr = &source, .vtable = &status_vtable }, null, writes.iface());
     defer api_server.deinit();
     api_server.restore_job_store.deinit();
     api_server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
@@ -19106,6 +23361,9 @@ test "httpx schema rewrite authorizes incoming dependencies before source admiss
     try std.testing.expectEqual(@as(u32, 0), writes.reconcile_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
     try api_server.requireSchemaRewriteAuthority("basic:rewriter", &.{"docs"});
+    try api_server.requireTransformRewriteAuthority("basic:rewriter", &.{"docs"});
+    try auth.manager.setRowFilter("rewriter", "docs", "{\"term\":{\"tenant\":\"one\"}}");
+    try std.testing.expectError(error.StoredDestinationAuthorizationRevoked, api_server.requireTransformRewriteAuthority("basic:rewriter", &.{"docs"}));
     try std.testing.expectError(error.StoredDestinationAuthorizationRevoked, api_server.requireSchemaRewriteAuthority("basic:rewriter", &.{ "docs", "dependent" }));
     try auth.manager.deleteUser("rewriter");
     try std.testing.expectError(error.StoredDestinationAuthorizationRevoked, api_server.requireSchemaRewriteAuthority("basic:rewriter", &.{"docs"}));
@@ -19506,7 +23764,7 @@ test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NU
     defer db.close();
     try db.setSchemaJson(alloc, schema);
     try db.batch(.{ .writes = &.{.{ .key = "1", .value = "{\"id\":1}" }} });
-    const Source = @import("sql_parity_sources.zig").Tables(1);
+    const Source = @import("sql/testing/parity_sources.zig").Tables(1);
     var source: Source = .{ .records = .{.{ .table_id = 7, .name = "docs", .schema_json = schema }}, .reads = .{table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())} };
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
@@ -22616,7 +26874,7 @@ test "SQL pgwire native capability requires durable transactions and metadata re
     // Outboxes stay node-owned even when transaction storage is shared.
     for ([_]@import("transactions.zig").SessionStoreScope{ .node_local, .cluster_shared }) |scope| {
         api.txn_sessions.durable_scope = scope;
-        try std.testing.expect(!@import("sql_completion.zig").capableJoined(&api, std.testing.io));
+        try std.testing.expect(!@import("sql/session/completion.zig").capableJoined(&api, std.testing.io));
     }
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }
@@ -22637,7 +26895,7 @@ test "SQL pgwire native owner RPC requires internal service authority and reject
     defer a.free(token);
     var handler: AntflyApiHandler = .{ .api_server = &api };
     const foreign = @import("transactions.zig").newSessionTxnId(2);
-    const body = try std.json.Stringify.valueAlloc(a, @import("sql_completion.zig").OwnerRequest{ .transaction_id = foreign, .reference_id = @splat(1), .action = .acknowledge }, .{});
+    const body = try std.json.Stringify.valueAlloc(a, @import("sql/session/completion.zig").OwnerRequest{ .transaction_id = foreign, .reference_id = @splat(1), .action = .acknowledge }, .{});
     defer a.free(body);
     for ([_]?[]const u8{ null, "invalid", token }, 0..) |credential, index| {
         var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql");
@@ -22656,7 +26914,7 @@ test "SQL pgwire native owner RPC requires internal service authority and reject
         const held = if (consumer) &api.sql_completion_owner_active else &api.sql_completion_consumer_active;
         held.store(true, .release);
         defer held.store(false, .release);
-        const rpc = try std.json.Stringify.valueAlloc(a, @import("sql_completion.zig").OwnerRequest{ .transaction_id = foreign, .reference_id = @splat(1), .action = .status, .consumer_node_id = if (consumer) 0 else null }, .{});
+        const rpc = try std.json.Stringify.valueAlloc(a, @import("sql/session/completion.zig").OwnerRequest{ .transaction_id = foreign, .reference_id = @splat(1), .action = .status, .consumer_node_id = if (consumer) 0 else null }, .{});
         defer a.free(rpc);
         var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql");
         defer request.deinit();
@@ -22742,6 +27000,18 @@ test "SQL pgwire native gzip capacity refusal proves no execution" {
     try std.testing.expect(response.headers.get("X-Antfly-SQL-Completion") != null);
 }
 
+fn testRequestForwardSource(io: *std.Io) @import("kernel_abi.zig").RequestForwardLaneSource {
+    const abi = @import("kernel_abi.zig");
+    return .{ .context = io, .with_lane = struct {
+        fn withLane(raw: *anyopaque, context: *anyopaque, callback: abi.RequestForwardLaneSource.Callback) callconv(.c) bool {
+            const owner_io: *std.Io = @ptrCast(@alignCast(raw));
+            const borrow: abi.native_abi.IoBorrow = .init(owner_io);
+            callback(context, &borrow);
+            return true;
+        }
+    }.withLane };
+}
+
 test "SQL pgwire native HTTP connection capacity proves no execution and failed forwarding stays unknown" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -22751,10 +27021,11 @@ test "SQL pgwire native HTTP connection capacity proves no execution and failed 
     var storage = try @import("antfly_local_sources").storage_docstore.DocStore.open(a, path, .{});
     defer storage.close();
     var durable = transactions_api.DurableSessionStore.init(a, &storage);
+    var transport_io = std.testing.io;
     var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
     defer api.deinit();
     var handler: AntflyApiHandler = .{ .api_server = &api };
-    for (0..@import("sql_connections.zig").max_connections + 1) |index| {
+    for (0..@import("sql/session/connections.zig").max_connections + 1) |index| {
         var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql/connections");
         defer request.deinit();
         try request.setBody("{}");
@@ -22764,7 +27035,7 @@ test "SQL pgwire native HTTP connection capacity proves no execution and failed 
         var response = try handler.openSQLConnection(&ctx);
         defer response.deinit();
         try handler.completeSQLResponse(&ctx, &response);
-        try std.testing.expectEqual(@as(u16, if (index < @import("sql_connections.zig").max_connections) 200 else 503), response.status.code);
+        try std.testing.expectEqual(@as(u16, if (index < @import("sql/session/connections.zig").max_connections) 200 else 503), response.status.code);
         const completion = try AntflyApiHandler.requestCompletion(&ctx);
         try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 0);
         try std.testing.expect(response.headers.get("X-Antfly-SQL-Completion") != null);
@@ -22782,12 +27053,22 @@ test "SQL pgwire native HTTP connection capacity proves no execution and failed 
     };
     api.cfg.session_router = .{ .ptr = undefined, .vtable = &.{ .local_node_id = Remote.node, .local_status = undefined, .node_base_uri = Remote.uri } };
     api.cfg.session_executor = .{ .ptr = undefined, .vtable = &.{ .execute = Remote.execute } };
-    const remote = @import("sql_resource_routing.zig").encode(1, @splat(1));
+    api.cfg.admitted_sql_peer_executor = api.cfg.session_executor;
+    const remote = @import("sql/execution/resource_routing.zig").encode(1, @splat(1));
     const uri = try std.fmt.allocPrint(a, "http://localhost/db/v1/sql/connections/{s}", .{remote});
     defer a.free(uri);
     var request = try httpx.Request.init(a, .DELETE, uri);
     defer request.deinit();
     try request.headers.set("X-Antfly-SQL-Fence", "remote-test");
+    {
+        var rejected_ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer rejected_ctx.deinit();
+        var rejected = try handler.closeSQLConnection(&rejected_ctx, &remote);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 503), rejected.status.code);
+        try std.testing.expect(!(try AntflyApiHandler.requestCompletion(&rejected_ctx)).unknown);
+    }
+    api.cfg.imported_runtime_io.?.request_forward = testRequestForwardSource(&transport_io);
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
     var response = try handler.closeSQLConnection(&ctx, &remote);
@@ -22807,25 +27088,30 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     defer storage.close();
     var durable = transactions_api.DurableSessionStore.init(a, &storage);
     const Source = struct {
+        calls: usize = 0,
+        failure: anyerror = error.TableNotFound,
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
             return error.TestUnexpectedResult;
         }
-        fn commit(_: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
-            return error.TableNotFound;
+        fn commit(ptr: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.failure;
         }
     };
-    var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = undefined, .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit } });
+    var source: Source = .{};
+    var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = &source, .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit } });
     defer api.deinit();
     var handler: AntflyApiHandler = .{ .api_server = &api };
     const session = try api.txn_sessions.begin(a, .{}, 0);
     var staged = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
     defer staged.deinit(a);
-    _ = (try api.txn_sessions.stage(a, session.txn_id, &staged)).?;
+    _ = (try api.txn_sessions.stage(a, try api.txn_sessions.mutation(a, session.txn_id, api.localSessionNodeId()), &staged)).?;
     var committed = (try api.txn_sessions.cloneCommitRequest(a, session.txn_id, null)).?;
     defer committed.deinit(a);
     const tables = try committed.distributedTables(a);
     defer tables.deinit();
-    var sealed = (try api.txn_sessions.sealExecutionPlan(a, session.txn_id, tables.tables)).?;
+    var sealed = (try api.txn_sessions.sealExecutionPlan(a, try api.txn_sessions.mutation(a, session.txn_id, api.localSessionNodeId()), tables.tables)).?;
     defer sealed.deinit();
     const id = std.fmt.bytesToHex(session.txn_id, .lower);
     const uri = try std.fmt.allocPrint(a, "http://localhost/db/v1/transactions/{s}/commit", .{id});
@@ -22846,7 +27132,50 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     try std.testing.expect(retained.commit_execution_started and !retained.terminal_abort);
     const completion = try AntflyApiHandler.requestCompletion(&ctx);
     try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 1);
-    try std.testing.expect(!try @import("sql_completion.zig").settled(&api, a, .{ .outcomes = completion.outcomes.items }, .{}));
+    try std.testing.expect(!try @import("sql/session/completion.zig").settled(&api, a, .{ .outcomes = completion.outcomes.items }, .{}));
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    // The process can lose the response between publishing abort and retiring the session.
+    _ = (try api.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
+    var retry = httpx.Context.init(a, std.testing.io, &request);
+    defer retry.deinit();
+    var aborted = try handler.commitTransactionSession(&retry, &id);
+    defer aborted.deinit();
+    try std.testing.expectEqual(@as(u16, 409), aborted.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    for ([_]anyerror{ error.TransactionPrepareAbortedRowPolicyDenied, error.TransactionPrepareAbortedUnavailable }, [_]u16{ 403, 503 }) |failure, expected| {
+        source.failure = failure;
+        const another = try api.txn_sessions.begin(a, .{}, 0);
+        _ = (try api.txn_sessions.stage(a, try api.txn_sessions.mutation(a, another.txn_id, api.localSessionNodeId()), &staged)).?;
+        var bound = (try api.txn_sessions.cloneCommitRequest(a, another.txn_id, null)).?;
+        defer bound.deinit(a);
+        var plan = (try api.txn_sessions.sealExecutionPlan(a, try api.txn_sessions.mutation(a, another.txn_id, api.localSessionNodeId()), tables.tables)).?;
+        defer plan.deinit();
+        var req = try httpx.Request.init(a, .POST, "/");
+        defer req.deinit();
+        try req.setBody("{}");
+        var attempt = httpx.Context.init(a, std.testing.io, &req);
+        defer attempt.deinit();
+        var rejected = try handler.commitTransactionSession(&attempt, &std.fmt.bytesToHex(another.txn_id, .lower));
+        defer rejected.deinit();
+        try std.testing.expectEqual(expected, rejected.status.code);
+        try std.testing.expect((try durable.load(another.txn_id)) == null);
+    }
+}
+
+test "SQL native graph public row policy rejection preserves forbidden without outcome claims" {
+    for ([_]anyerror{ error.RowPolicyDenied, error.RowPolicyAuthenticationRequired }) |failure| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/db/v1/batch");
+        defer request.deinit();
+        var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer context.deinit();
+        var handler: AntflyApiHandler = .{ .api_server = undefined };
+        var response = try handler.transactionPreparationError(&context, failure);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+        try std.testing.expectEqualStrings("forbidden", response.body.?);
+        try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+        try std.testing.expect(response.headers.get("Retry-After") == null);
+    }
 }
 
 test "distributed SQL API worker RPC requires signed service authority even during legacy migration" {
@@ -22955,4 +27284,521 @@ test "distributed SQL API control routes authenticate cancellation and share ter
     var response = try server.router.find(.POST, transport.result_path, &params).?.handler.invoke(&ctx);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 409), response.status.code);
+}
+
+test "httpx SQL connection routes preserve settings and retire prepared resources: adoption preserves ambiguous forwarding" {
+    const a = std.testing.allocator;
+    var storage = @import("antfly_local_sources").storage_mem_backend.Backend.init(a, .{});
+    defer storage.close();
+    var store = try storage.runtimeStore(a, .{ .name = "sql-forward-adoption" });
+    defer store.deinit();
+    var durable = transactions_api.DurableSessionStore.initRuntime(a, &store);
+    var pool = std.Io.Threaded.init(a, .{});
+    defer pool.deinit();
+    var transport_io = pool.io();
+    const Peer = struct {
+        server: *ApiHttpServer = undefined,
+        id: db_mod.types.TxnId = undefined,
+        expiry: u64 = undefined,
+        reached_peer: bool = true,
+        fn local(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, _: u64) !?[]u8 {
+            return try alloc.dupe(u8, "http://owner");
+        }
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const peer: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings(ApiHttpServer.sql_peer_hop_value, req.header(ApiHttpServer.sql_peer_hop_header).?);
+            const budget = req.header(@import("antfly_public_limits").Execution.timeout_header).?;
+            try std.testing.expectEqual(req.timeout_ms.?, try std.fmt.parseUnsigned(u32, budget, 10));
+            try std.testing.expect(req.timeout_ms.? <= 5000);
+            if (!peer.reached_peer) {
+                req.delivery_tracker.?.markNotSent();
+                return error.ConnectionRefused;
+            }
+            req.delivery_tracker.?.markMayHaveBeenSent();
+            try std.testing.expect(try peer.server.txn_sessions.adoptIfLeaseExpired(std.testing.allocator, peer.id, 2, peer.expiry));
+            return error.ConnectionReset;
+        }
+    };
+    var peer: Peer = .{};
+    var server = ApiHttpServer.init(a, .{
+        .session_store = &durable,
+        .session_owner_lease_ttl_ns = std.time.ns_per_s,
+        .session_store_scope = .cluster_shared,
+        .imported_runtime_io = .{ .durable = std.testing.io, .request_forward = testRequestForwardSource(&transport_io) },
+        .session_router = .{ .ptr = &peer, .vtable = &.{ .local_node_id = Peer.local, .local_status = undefined, .node_base_uri = Peer.uri } },
+        .session_executor = .{ .ptr = &peer, .vtable = &.{ .execute = Peer.execute } },
+        .admitted_sql_peer_executor = .{ .ptr = &peer, .vtable = &.{ .execute = Peer.execute } },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const session = try server.txn_sessions.begin(a, .{}, 7);
+    peer.server = &server;
+    peer.id = session.txn_id;
+    peer.expiry = session.begin_timestamp + 2 * std.time.ns_per_s;
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/transactions/test/commit");
+    defer request.deinit();
+    try request.headers.set("X-Antfly-SQL-Fence", "forwarding-test");
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    @import("../request_deadline.zig").tightenPlatform(&ctx, platform_time.monotonicNs() + 5 * std.time.ns_per_s);
+    var response = (try handler.forwardTransactionSession(&ctx, session.txn_id, "{}")).?;
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    try std.testing.expect(response.headers.get("X-Antfly-SQL-Completion") != null);
+    try std.testing.expect((try AntflyApiHandler.requestCompletion(&ctx)).unknown);
+    try std.testing.expectEqual(@as(?u64, 2), try server.txn_sessions.getOwnerNodeId(a, session.txn_id));
+    peer.reached_peer = false;
+    const unsent = try server.txn_sessions.begin(a, .{}, 7);
+    var unsent_ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer unsent_ctx.deinit();
+    @import("../request_deadline.zig").tightenPlatform(&unsent_ctx, platform_time.monotonicNs() + 5 * std.time.ns_per_s);
+    var unavailable = (try handler.forwardTransactionSession(&unsent_ctx, unsent.txn_id, "{}")).?;
+    defer unavailable.deinit();
+    try std.testing.expectEqual(@as(u16, 503), unavailable.status.code);
+    try std.testing.expect(unavailable.headers.get("X-Antfly-SQL-Completion") != null);
+    try std.testing.expect(!(try AntflyApiHandler.requestCompletion(&unsent_ctx)).unknown);
+
+    const remote = try server.txn_sessions.begin(a, .{ .sql = .{
+        .database = "default",
+        .namespace = "public",
+        .isolation = .read_committed,
+        .mode = .read_write,
+    } }, 7);
+    var terminal = (try durable.load(remote.txn_id)).?;
+    defer terminal.deinit(a);
+    terminal.terminal_abort = true;
+    terminal.commit_execution_started = true;
+    terminal.sql_abort_acknowledgement = .rollback;
+    try durable.saveForTest(terminal, null);
+    const encoded = std.fmt.bytesToHex(remote.txn_id, .lower);
+    const body = try std.json.Stringify.valueAlloc(a, .{ .statement = "COMMIT", .session_id = &encoded }, .{});
+    defer a.free(body);
+    var replay_request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql");
+    defer replay_request.deinit();
+    replay_request.body = body;
+    {
+        const invalid_body = try std.json.Stringify.valueAlloc(a, .{ .statement = "COMMIT", .session_id = &encoded, .limit = 4097 }, .{});
+        defer a.free(invalid_body);
+        replay_request.body = invalid_body;
+        defer replay_request.body = body;
+        var invalid_ctx = httpx.Context.init(a, std.testing.io, &replay_request);
+        defer invalid_ctx.deinit();
+        var rejected = try handler.executeSQL(&invalid_ctx);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+    }
+    var replay_ctx = httpx.Context.init(a, std.testing.io, &replay_request);
+    defer replay_ctx.deinit();
+    var replayed = try handler.executeSQL(&replay_ctx);
+    defer replayed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), replayed.status.code);
+    var decision = try std.json.parseFromSlice(sql_wire.SQLResponse, a, replayed.body.?, .{});
+    defer decision.deinit();
+    try std.testing.expectEqualStrings("ROLLBACK", decision.value.command_tag);
+    try std.testing.expectEqualStrings(&encoded, decision.value.transaction_id.?);
+}
+
+test "httpx SQL connection routes preserve settings and retire prepared resources: routed commit preserves the owner receipt" {
+    const alloc = std.testing.allocator;
+    const erased = @import("antfly_local_sources").storage_backend_erased;
+    const Fixture = struct {
+        owner_reads: usize = 0,
+        forwards: usize = 0,
+        prefix: [128]u8 = @splat(0),
+        durable_io: std.Io,
+        api: *ApiHttpServer = undefined,
+
+        fn local(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn nodeUri(_: *anyopaque, a: std.mem.Allocator, node: u64) !?[]u8 {
+            try std.testing.expectEqual(@as(u64, 7), node);
+            return try a.dupe(u8, "http://owner");
+        }
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const fixture: *@This() = @ptrCast(@alignCast(raw));
+            fixture.forwards += 1;
+            try std.testing.expectEqualStrings("http://owner/db/v1/sql?trace=route%2Ftest", req.uri);
+            try std.testing.expectEqualStrings("route-test", req.header("X-Antfly-SQL-Fence").?);
+            try std.testing.expectEqualStrings(ApiHttpServer.sql_peer_hop_value, req.header(ApiHttpServer.sql_peer_hop_header).?);
+            try std.testing.expect(req.timeout_ms.? > 0 and req.timeout_ms.? <= 5000);
+            try std.testing.expect(req.cancellation != null);
+            try std.testing.expectEqual(@as(usize, 0), fixture.api.sql_preparation_admission.stats().in_flight);
+            // This pool has one slot. The transport must leave it available.
+            var future = try fixture.durable_io.concurrent(noop, .{});
+            future.await(fixture.durable_io);
+            const headers = try a.alloc(http_common.Header, 1);
+            errdefer a.free(headers);
+            headers[0].name = try a.dupe(u8, "X-Antfly-SQL-Completion");
+            errdefer a.free(headers[0].name);
+            headers[0].value = try a.dupe(u8, "owner-receipt");
+            errdefer a.free(headers[0].value);
+            return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "{}") };
+        }
+        fn noop() void {}
+        fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+        fn capabilities(_: *anyopaque) @import("antfly_local_sources").storage_backend_types.Capabilities {
+            return .{};
+        }
+        fn fullRead(_: *anyopaque, key: []const u8) ![]const u8 {
+            if (std.mem.startsWith(u8, key, "\x00\x00__api_sql_abort_receipt__:")) return error.NotFound;
+            return error.TestUnexpectedFullRead;
+        }
+        fn openCursor(_: std.mem.Allocator, _: *anyopaque) !erased.Cursor {
+            return error.TestUnexpectedFullRead;
+        }
+        fn readScope(a: std.mem.Allocator, ptr: *anyopaque) !erased.ReadScope {
+            const Parent = @This();
+            const Scope = struct {
+                fixture: *Parent,
+                pub fn probePrefix(self: *@This(), _: []const u8, length: usize) ![]const u8 {
+                    return self.fixture.prefix[0..length];
+                }
+                pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+                    return error.TestUnexpectedFullRead;
+                }
+                pub fn close(_: *@This()) void {}
+            };
+            return erased.readScopeFrom(a, Scope{ .fixture = @ptrCast(@alignCast(ptr)) });
+        }
+        fn beginRead(a: std.mem.Allocator, ptr: *anyopaque) !erased.ReadTxn {
+            const fixture: *@This() = @ptrCast(@alignCast(ptr));
+            fixture.owner_reads += 1;
+            return .{ .allocator = a, .ptr = ptr, .vtable = &.{
+                .abort = deinit,
+                .get = fullRead,
+                .open_cursor = openCursor,
+                .open_read_scope = readScope,
+            } };
+        }
+        fn beginWrite(_: std.mem.Allocator, _: *anyopaque) !erased.WriteTxn {
+            return error.TestUnexpectedWrite;
+        }
+        fn beginBatch(_: std.mem.Allocator, _: *anyopaque) !erased.Batch {
+            return error.TestUnexpectedWrite;
+        }
+    };
+
+    var durable_pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
+    defer durable_pool.deinit();
+    var transport_pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
+    defer transport_pool.deinit();
+    var transport_io = transport_pool.io();
+    var fixture: Fixture = .{ .durable_io = durable_pool.io() };
+    var payload: [65]u8 = @splat(0);
+    std.mem.writeInt(u64, payload[1..9], 7, .little);
+    var encoded: [std.base64.standard.Encoder.calcSize(payload.len)]u8 = undefined;
+    _ = try std.fmt.bufPrint(&fixture.prefix, "{{\"s1\":\"{s}\",", .{std.base64.standard.Encoder.encode(&encoded, &payload)});
+
+    var store: erased.Store = .{ .allocator = alloc, .ptr = &fixture, .write_serialization = .intrinsic, .vtable = &.{
+        .deinit = Fixture.deinit,
+        .capabilities = Fixture.capabilities,
+        .begin_read = Fixture.beginRead,
+        .begin_write = Fixture.beginWrite,
+        .begin_batch = Fixture.beginBatch,
+    } };
+    var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &store);
+    var api = ApiHttpServer.init(alloc, .{
+        .session_store = &durable,
+        .session_store_scope = .cluster_shared,
+        .imported_runtime_io = .{ .durable = durable_pool.io(), .request_forward = testRequestForwardSource(&transport_io) },
+        .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.nodeUri } },
+        .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+        .admitted_sql_peer_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    fixture.api = &api;
+    fixture.owner_reads = 0;
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    const body = try std.fmt.allocPrint(alloc, "{{\"statement\":\"COMMIT\",\"session_id\":\"{s}\"}}", .{@import("sql/execution/resource_routing.zig").encode(1, @splat(3))});
+    defer alloc.free(body);
+    var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/sql?trace=route%2Ftest");
+    defer request.deinit();
+    try request.headers.set("X-Antfly-SQL-Fence", "route-test");
+    request.body = body;
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    @import("../request_deadline.zig").tightenPlatform(&ctx, platform_time.monotonicNs() + 5 * std.time.ns_per_s);
+    var response = try handler.executeSQL(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings("owner-receipt", response.headers.get("X-Antfly-SQL-Completion").?);
+    try std.testing.expectEqual(@as(usize, 1), fixture.owner_reads);
+    try std.testing.expectEqual(@as(usize, 1), fixture.forwards);
+    try request.headers.set(ApiHttpServer.sql_peer_hop_header, ApiHttpServer.sql_peer_hop_value);
+    {
+        var peer_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer peer_ctx.deinit();
+        var refused = try handler.executeSQL(&peer_ctx);
+        defer refused.deinit();
+        try std.testing.expectEqual(@as(u16, 503), refused.status.code);
+        try std.testing.expect(refused.headers.get("X-Antfly-SQL-Completion") != null);
+        try std.testing.expectEqual(@as(usize, 1), fixture.forwards);
+    }
+    const previous_reads = fixture.owner_reads;
+    try request.headers.set(@import("antfly_public_limits").Execution.scan_rows_header, "100");
+    var invalid_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer invalid_ctx.deinit();
+    var invalid = try handler.executeSQL(&invalid_ctx);
+    defer invalid.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid.status.code);
+    try std.testing.expectEqual(previous_reads, fixture.owner_reads);
+    try std.testing.expectEqual(@as(usize, 1), fixture.forwards);
+
+    _ = request.headers.remove(@import("antfly_public_limits").Execution.scan_rows_header);
+    _ = request.headers.remove(ApiHttpServer.sql_peer_hop_header);
+    var expired_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer expired_ctx.deinit();
+    @import("../request_deadline.zig").tightenPlatform(&expired_ctx, platform_time.monotonicNs() -| 1);
+    var expired = try handler.executeSQL(&expired_ctx);
+    defer expired.deinit();
+    try std.testing.expectEqual(@as(u16, 504), expired.status.code);
+    try std.testing.expect(expired.headers.get("X-Antfly-SQL-Completion") != null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.forwards);
+}
+
+test "httpx private schema preparation retirement alternative binds service authority scope and budget" {
+    const a = std.testing.allocator;
+    const preparation = @import("table_retirement_preparation.zig");
+    const schema_preparation = @import("schema_validation/preparation.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        fn prepare(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: preparation.Request, context: operation_contract.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(context.setting_admin and context.schema_validation_authority and context.fk_generation_publication_authority);
+            try context.ensureActive();
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(@as(u64, 72), request.namespace.shard_id);
+            try std.testing.expectEqualStrings("docs", table);
+            self.calls += 1;
+            // Transport authorization only, no physical owner receipt claim.
+            return alloc.dupe(u8, "{}");
+        }
+        fn status(handler: *AntflyApiHandler, req: *httpx.Request, expected: u16, deadline: ?u64) !void {
+            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, req);
+            defer ctx.deinit();
+            const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+            ctx.params = &params;
+            ctx.application_deadline_ns = deadline;
+            var response = try handler.internalGroupSchemaValidationPrepare(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(expected, response.status.code);
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "retirement-preparation-secret-0123456789";
+    var server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "httpx-test", .internal_service_accept_legacy_unauthenticated = true, .table_retirement_preparation = .{ .ptr = &fixture, .prepare_fn = Fixture.prepare } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var req = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/groups/7/tables/docs/schema-validation-prepare");
+    defer req.deinit();
+    var value: preparation.Request = .{ .lookup = .{ .group = 2188, .table = 3, .id = @splat(1) }, .expected_revision = 1, .effects = .{ .digest = @splat(2), .root_table = 3, .survivors = 0, .counters = 0, .views = 0 }, .metadata_incarnation = "11111111111111111111111111111111".*, .table_id = 3, .owner_group_id = 7, .namespace = .{ .table_id = 3, .shard_id = 72, .range_id = 172 } };
+    const body = try std.json.Stringify.valueAlloc(a, .{ .retirement = value }, .{});
+    defer a.free(body);
+    try req.setBody(body);
+    try Fixture.status(&handler, &req, 401, null);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    try req.headers.append(internal_service_auth.header_name, token);
+    try Fixture.status(&handler, &req, 400, null);
+    try req.headers.append(schema_preparation.remaining_ms_header, "1000");
+    try Fixture.status(&handler, &req, 408, 0);
+    const mixed = try std.fmt.allocPrint(a, "{s},\"before_schema\":\"{{}}\"}}", .{body[0 .. body.len - 1]});
+    defer a.free(mixed);
+    try req.setBody(mixed);
+    try Fixture.status(&handler, &req, 400, null);
+    value.owner_group_id = 72;
+    const foreign = try std.json.Stringify.valueAlloc(a, .{ .retirement = value }, .{});
+    defer a.free(foreign);
+    try req.setBody(foreign);
+    try Fixture.status(&handler, &req, 400, null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try req.setBody(body);
+    try Fixture.status(&handler, &req, 200, null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    const legacy = try std.json.Stringify.valueAlloc(a, schema_preparation.Request{ .group_id = 7, .metadata_incarnation = @splat('1'), .id = @splat(2), .provisional_plan = @splat(3), .transition_id = 4, .namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .before_schema = "{}", .after_schema = "{}", .selection = .{ .not_null = &.{"n"} } }, .{});
+    defer a.free(legacy);
+    try req.setBody(legacy);
+    try Fixture.status(&handler, &req, 503, null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "subscription receipt RPC snapshot attestation requires service authentication and a bounded request" {
+    const a = std.testing.allocator;
+    const wire = @import("../metadata/replication_initialization_attestation.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        fn sign(raw: *anyopaque, _: std.mem.Allocator, expected: wire.Expected, context: operation_contract.RequestContext) !wire.Proof {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(context.setting_admin and context.deadline_ns != null);
+            try std.testing.expectEqual(@as(u64, 7), expected.metadata_group_id);
+            self.calls += 1;
+            return error.CatalogGenerationChanged;
+        }
+    };
+    var fixture: Fixture = .{};
+    const secret = "0123456789abcdef0123456789abcdef";
+    const issuer = "replication-rpc";
+    var api = ApiHttpServer.init(a, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = issuer,
+        .replication_snapshot_signer = .{ .ptr = &fixture, .sign = Fixture.sign },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = issuer }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const body = try std.json.Stringify.valueAlloc(a, wire.Expected{
+        .metadata_group_id = 7,
+        .metadata_incarnation = @splat(49),
+        .source_digest = @splat(2),
+        .expected_generation = 1,
+        .txn_id = @splat(3),
+        .request_digest = @splat(4),
+        .retained_digest = @splat(5),
+    }, .{});
+    defer a.free(body);
+    for ([_]u16{ 401, 400, 409 }, 0..) |status, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost" ++ wire.route);
+        defer request.deinit();
+        if (index != 0) try request.headers.set(internal_service_auth.header_name, token);
+        if (index != 1) try request.headers.set(@import("logical_replication_capture_worker.zig").budget_header, "500");
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        AntflyApiHandler.establishInternalPublicationCaptureDeadline(&ctx);
+        var response = try handler.internalReplicationSnapshotAttestation(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "subscription receipt RPC binds internal service, group and deadline before owner observation" {
+    const a = std.testing.allocator;
+    const wire = @import("replication_source_apply_attestation.zig");
+    const permit = @import("antfly_local_sources").storage_db_replication_source_apply_store.fixturePreparation().permit;
+    const Fixture = struct {
+        calls: usize = 0,
+        remote_calls: usize = 0,
+        fn localNode(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn localStatus(_: *anyopaque, _: u64) @import("../raft/host.zig").HostedReplicaStatus {
+            return .absent;
+        }
+        fn leader(_: *anyopaque, group: u64) ?u64 {
+            return if (group == 9) 2 else null;
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, node: u64) !?[]u8 {
+            if (node != 2) return null;
+            return try alloc.dupe(u8, "http://remote");
+        }
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(.POST, request.method);
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/groups/9/tables/items" ++ wire.route_suffix));
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            try std.testing.expectEqualStrings("5000", request.header(@import("logical_replication_capture_worker.zig").budget_header).?);
+            const parsed = try std.json.parseFromSlice(wire.Request, alloc, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(.activated, parsed.value.stage.stage);
+            self.remote_calls += 1;
+            return .{ .status = 200, .body = try alloc.dupe(u8, "null") };
+        }
+
+        fn observe(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, request: wire.Request, context: operation_contract.RequestContext) !?wire.Observation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(context.setting_admin and context.deadline_ns != null);
+            try std.testing.expectEqualStrings("items", table);
+            try std.testing.expectEqual(.activated, request.stage.stage);
+            try std.testing.expectEqualDeep(@import("antfly_local_sources").storage_db_replication_source_apply_store.fixturePreparation().permit, request.permit());
+            self.calls += 1;
+            return null;
+        }
+    };
+    var fixture: Fixture = .{};
+    const secret = "0123456789abcdef0123456789abcdef";
+    var api = ApiHttpServer.init(a, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = "replication-rpc",
+        .session_router = .{ .ptr = &fixture, .vtable = &.{
+            .local_node_id = Fixture.localNode,
+            .local_status = Fixture.localStatus,
+            .group_leader_node_id = Fixture.leader,
+            .node_base_uri = Fixture.uri,
+        } },
+        .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+        .admitted_sql_peer_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+        .replication_receipt_driver = .{ .ptr = &fixture, .observe = Fixture.observe },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "replication-rpc" }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const control: wire.Request = .{ .stage = .{ .permit = permit, .stage = .activated } };
+    try std.testing.expectError(error.Forbidden, api.routedReplicationReceipt(a, "items", undefined, control, .{}));
+    try std.testing.expectError(error.Forbidden, @import("replication_subscription_apply.zig").step(&api, a, undefined, .{}));
+    const body = try std.json.Stringify.valueAlloc(a, control, .{});
+    defer a.free(body);
+    for ([_]u16{ 401, 409, 200 }, 0..) |status, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/groups/9/tables/items" ++ wire.route_suffix);
+        defer request.deinit();
+        if (index != 0) try request.headers.set(internal_service_auth.header_name, token);
+        try request.headers.set(@import("logical_replication_capture_worker.zig").budget_header, "500");
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        const group = if (index == 1) "8" else "9";
+        const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = group }, .{ .name = "table_name", .value = "items" } };
+        ctx.params = &params;
+        AntflyApiHandler.establishInternalPublicationCaptureDeadline(&ctx);
+        try std.testing.expect(!ctx.application_deadline_invalid and ctx.application_deadline_ns != null);
+        var response = try handler.internalGroupReplicationReceipt(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status.code);
+        if (index == 2) try std.testing.expectEqualStrings("null", response.body.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var fence: metadata_api.CatalogRouteFence = .{
+        .metadata_group_id = permit.semantic.metadata_group,
+        .metadata_incarnation = permit.semantic.metadata_incarnation,
+        .catalog_revision = 1,
+        .table_id = permit.namespace.table_id,
+        .topology_epoch = permit.topology_epoch,
+        .route = .{
+            .group_id = permit.owner_group_id,
+            .range_id = permit.namespace.range_id,
+            .identity_namespace = .{ .table_id = permit.namespace.table_id, .shard_id = permit.namespace.shard_id, .range_id = permit.namespace.range_id },
+        },
+    };
+    try std.testing.expect((try api.routedReplicationReceipt(a, "items", fence, control, .{ .setting_admin = true })) == null);
+    fence.topology_epoch += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, api.routedReplicationReceipt(a, "items", fence, control, .{ .setting_admin = true }));
+    try std.testing.expectEqual(@as(usize, 1), fixture.remote_calls);
+}
+
+test "httpx source scope retirement control refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-retirement/control-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceRetirementControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
 }

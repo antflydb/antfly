@@ -70,6 +70,12 @@ pub const CodedSession = struct {
         var handle: ?*anyopaque = null;
         const status = av_decoder_create_coded(@backingInt(codec), config.ptr, config.len, width, height, @backingInt(format), @intFromBool(require_hardware), callback, context, &handle);
         if (status == -108) return error.OutOfMemory; // memFullErr
+        if (codec == .vp9 or codec == .av1) switch (status) {
+            -12906, // kVTCouldNotFindVideoDecoderErr
+            -12910, // kVTVideoDecoderUnsupportedDataFormatErr
+            => return error.UnsupportedVideoProfile,
+            else => {},
+        };
         if (status != 0) return error.VideoDecoderUnavailable;
         return .{ .handle = handle.? };
     }
@@ -309,18 +315,9 @@ pub const Continuation = struct {
         if (!supported or indexes.len == 0 or indexes.len > self.slots.len) return error.InvalidPacketIndex;
         try control.check();
         var planning_reader = self.capture.reader.*;
-        const PlanningControl = struct {
-            original: media.source.Control,
-            current: media.source.Control,
-            fn check(raw: ?*const anyopaque) !void {
-                const checks: *const @This() = @ptrCast(@alignCast(raw.?));
-                try checks.original.check();
-                try checks.current.check();
-            }
-        };
-        var checks = PlanningControl{ .original = planning_reader.input.control, .current = control };
-        var planning_source = planning_reader.input.*;
-        planning_source.control = .{ .context = &checks, .check_fn = PlanningControl.check };
+        const input = planning_reader.input;
+        const checks = media.source.ReadControl{ .source = input.control, .worker = control };
+        var planning_source = input.view(input.allocator, input.admission_pool, checks.control());
         planning_reader.input = &planning_source;
         var unique: [32]usize = undefined;
         var count: usize = 0;
@@ -362,18 +359,9 @@ pub const Continuation = struct {
     }
     fn decodeRun(self: *Continuation, indexes: []const usize, sink: Sink, control: media.source.Control) !usize {
         var reader_view = self.capture.reader.*;
-        const Controls = struct {
-            original: media.source.Control,
-            current: media.source.Control,
-            fn check(raw: ?*const anyopaque) !void {
-                const checks: *const @This() = @ptrCast(@alignCast(raw.?));
-                try checks.original.check();
-                try checks.current.check();
-            }
-        };
-        var controls = Controls{ .original = reader_view.input.control, .current = control };
-        var source = reader_view.input.*;
-        source.control = .{ .context = &controls, .check_fn = Controls.check };
+        const input = reader_view.input;
+        const controls = media.source.ReadControl{ .source = input.control, .worker = control };
+        var source = input.view(input.allocator, input.admission_pool, controls.control());
         reader_view.input = &source;
         const previous = self.capture.control;
         self.capture.control = source.control;

@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -29,7 +34,7 @@
 //
 // Supported contracts are deliberately narrow:
 //   * SM89, batch=1, query heads=8, KV heads=1 (E2B) or 2 (E4B);
-//   * E2B q512/q3 buckets; E4B q2..8192 chunks through 32768 KV tokens;
+//   * E2B q512/q3 buckets; two-KV-head q2..8192 chunks through 128K on qualified SM12, 32K on SM89;
 //   * HD256 with sliding_window=512, or HD512 with global attention;
 //   * contiguous F32 Q and paged F16 K/V, F32 output;
 //   * 16-token pages, either null/identity or explicit page tables.
@@ -39,15 +44,17 @@
 
 #include <cuda_fp16.h>
 #include <mma.h>
+#ifndef __CUDACC_RTC__
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#endif
 
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
 #endif
-#ifndef ANTFLY_FLASH_KERNEL
-#error "ANTFLY_FLASH_KERNEL must name the exported production entry point"
+#if !defined(ANTFLY_FLASH_KERNEL) && !defined(ANTFLY_FLASH_REFERENCE_KERNEL)
+#error "Flash template requires a production or reference entry point"
 #endif
 #ifndef ANTFLY_FLASH_HEAD_DIM
 #error "ANTFLY_FLASH_HEAD_DIM must be 256 or 512"
@@ -56,24 +63,41 @@
 #error "ANTFLY_FLASH_SLIDING_WINDOW must be 512 for HD256 or 0 for HD512"
 #endif
 
-namespace ANTFLY_FLASH_NAMESPACE {
+// antfly-flash:begin common
+#include <cuda_fp16.h>
+#include <mma.h>
+#ifndef __CUDACC_RTC__
+#include <stdint.h>
+#include <stddef.h>
+#include <math.h>
+#endif
+#ifndef ANTFLY_FLASH_COMMON_DEFINED
+#define ANTFLY_FLASH_COMMON_DEFINED
+namespace antfly_flash_common {
 
 using namespace nvcuda;
 
-constexpr unsigned kHeads = 8u;
-#ifdef ANTFLY_FLASH_KV_HEADS
-constexpr unsigned kKvHeads = ANTFLY_FLASH_KV_HEADS;
-#else
-constexpr unsigned kKvHeads = 1u;
-#endif
+// One source owner, with compile-time geometry per instantiation. A bundle
+// may contain both E2B and E4B; the first wrapper must not fix all later layouts.
+template <unsigned KvHeads>
+struct Geometry {
+static constexpr unsigned kHeads = 8u;
+static constexpr unsigned kKvHeads = KvHeads;
 static_assert(kKvHeads == 1u || kKvHeads == 2u, "Only Gemma E2B/E4B geometries are supported");
-constexpr unsigned kPageTokens = 16u;
-constexpr unsigned kQueryTile = kKvHeads == 2u ? 64u : 16u;
-constexpr unsigned kKeyTile = 16u;
-constexpr unsigned kThreads = 256u;
-constexpr unsigned kWarps = kThreads / 32u;
-constexpr unsigned kInvalidToken = 0xffffffffu;
-constexpr float kNegativeInfinity = -3.402823466e+38F;
+static constexpr unsigned kPageTokens = 16u;
+static constexpr unsigned kQueryTile = kKvHeads == 2u ? 64u : 16u;
+static constexpr unsigned kKeyTile = 16u;
+static constexpr unsigned kThreads = 256u;
+static constexpr unsigned kWarps = kThreads / 32u;
+// The shared ABI retains the existing L4 envelope. Host dispatch further
+// restricts the expanded SM12 image to the physically qualified GB10 target.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300
+static constexpr unsigned kMaxKvTokens = kKvHeads == 2u ? 131072u : 4096u;
+#else
+static constexpr unsigned kMaxKvTokens = kKvHeads == 2u ? 32768u : 4096u;
+#endif
+static constexpr unsigned kInvalidToken = 0xffffffffu;
+static constexpr float kNegativeInfinity = -3.402823466e+38F;
 
 enum PrototypeStatus : unsigned {
     kStatusOk = 0u,
@@ -89,15 +113,23 @@ enum PrototypeStatus : unsigned {
     kStatusAddressOverflow = 10u,
 };
 
-__device__ __forceinline__ bool pointer_aligned(const void* ptr, uintptr_t alignment) {
-    return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1u)) == 0u;
+// Runtime compilation supplies pointer-sized builtins without host C headers.
+#ifdef __CUDACC_RTC__
+using PointerBits = unsigned long long;
+#else
+using PointerBits = uintptr_t;
+#endif
+static_assert(sizeof(PointerBits) == sizeof(void*), "pointer alignment integer width");
+
+static __device__ __forceinline__ bool pointer_aligned(const void* ptr, PointerBits alignment) {
+    return (reinterpret_cast<PointerBits>(ptr) & (alignment - 1u)) == 0u;
 }
 
-__device__ __forceinline__ unsigned ceil_div_u32(unsigned value, unsigned divisor) {
+static __device__ __forceinline__ unsigned ceil_div_u32(unsigned value, unsigned divisor) {
     return value / divisor + (value % divisor != 0u ? 1u : 0u);
 }
 
-__device__ __forceinline__ unsigned physical_token(
+static __device__ __forceinline__ unsigned physical_token(
     unsigned logical_token,
     const unsigned* block_table,
     unsigned block_count,
@@ -125,7 +157,7 @@ struct VisibleRange {
     unsigned end;
 };
 
-__device__ __forceinline__ VisibleRange visible_range(
+static __device__ __forceinline__ VisibleRange visible_range(
     unsigned query_pos,
     unsigned kv_seq_len,
     unsigned kv_position_offset,
@@ -133,22 +165,12 @@ __device__ __forceinline__ VisibleRange visible_range(
 ) {
     VisibleRange result{0u, 0u};
     if (query_pos < kv_position_offset) return result;
-    const unsigned visible = query_pos - kv_position_offset + 1u;
-    result.end = visible < kv_seq_len ? visible : kv_seq_len;
-    if (sliding_window != 0u) {
-        const unsigned window_start_abs = query_pos + 1u > sliding_window
-            ? query_pos + 1u - sliding_window
-            : 0u;
-        if (window_start_abs > kv_position_offset) {
-            result.begin = window_start_abs - kv_position_offset;
-            if (result.begin > result.end) result.begin = result.end;
-        }
-    }
+    ANTFLY_CAUSAL_KEY_WINDOW(const unsigned, query_pos, kv_seq_len, kv_position_offset, sliding_window, result.begin, result.end)
     return result;
 }
 
 template <int HeadDim, int SlidingWindow, bool Flash>
-__device__ bool validate_launch(
+static __device__ bool validate_launch(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -199,11 +221,11 @@ __device__ bool validate_launch(
                 head_dim != static_cast<unsigned>(HeadDim) ||
                 (kKvHeads == 1u ? (q_seq_len != 512u && q_seq_len != 3u)
                                   : (q_seq_len < 2u || q_seq_len > 8192u)) ||
-                kv_seq_len == 0u || kv_seq_len > (kKvHeads == 1u ? 4096u : 32768u)) {
+                kv_seq_len == 0u || kv_seq_len > kMaxKvTokens) {
                 error = kStatusUnsupportedShape;
             } else {
                 const bool supported_prefix = kKvHeads == 2u ?
-                    (query_position_offset <= 32768u - q_seq_len) : q_seq_len == 512u
+                    (query_position_offset <= kMaxKvTokens - q_seq_len) : q_seq_len == 512u
                     ? (query_position_offset == 0u || query_position_offset == 512u ||
                           query_position_offset == 1024u || query_position_offset == 1536u)
                     : query_position_offset == 2048u;
@@ -278,26 +300,9 @@ __device__ bool validate_launch(
     return true;
 }
 
-template <int HeadDim>
-__device__ __forceinline__ size_t flash_shared_bytes() {
-    // Keep this layout mirrored by the typed renderer and qualification harness.
-    if constexpr (kKvHeads == 2u) {
-        return (kQueryTile + 2u * kKeyTile) * HeadDim * sizeof(half) + 3u * kQueryTile * sizeof(float) +
-            kQueryTile * kKeyTile * sizeof(half) +
-            (kKeyTile + 1u) * sizeof(unsigned);
-    }
-    return
-        2u * kQueryTile * HeadDim * sizeof(half) + // Q tile + K/V tile
-        kQueryTile * kKeyTile * sizeof(float) +   // scores
-        kQueryTile * kKeyTile * sizeof(half) +    // probabilities
-        kWarps * kQueryTile * 16u * sizeof(float) + // per-warp WMMA scratch
-        3u * kQueryTile * sizeof(unsigned) +       // physical, begin, end
-        4u * kQueryTile * sizeof(float) +          // max, denom, alpha, beta
-        sizeof(unsigned);                          // shared error
-}
 
 template <int HeadDim, int SlidingWindow>
-__device__ void flash_prefill_body(
+static __device__ void flash_prefill_body(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -804,7 +809,7 @@ __device__ void flash_prefill_body(
 }
 
 template <int HeadDim, int SlidingWindow>
-__device__ void reference_prefill_body(
+static __device__ void reference_prefill_body(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -924,7 +929,16 @@ __device__ void reference_prefill_body(
         : 0.0f;
 }
 
-} // namespace ANTFLY_FLASH_NAMESPACE
+}; // Geometry
+
+} // namespace antfly_flash_common
+#endif
+// antfly-flash:end common
+
+#ifndef ANTFLY_FLASH_KV_HEADS
+#define ANTFLY_FLASH_KV_HEADS 1
+#endif
+using ANTFLY_FLASH_NAMESPACE = antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEADS>;
 
 #define ANTFLY_FLASH_ARGUMENTS \
     float* dst, \
@@ -963,6 +977,7 @@ __device__ void reference_prefill_body(
     key_row_bytes, base_key_row_bytes, value_row_bytes, block_count, \
     page_size_tokens, format, value_format, physical_token_capacity, decode_scalars
 
+#ifdef ANTFLY_FLASH_KERNEL
 extern "C" __global__ void
 ANTFLY_FLASH_KERNEL(
     ANTFLY_FLASH_ARGUMENTS
@@ -974,6 +989,8 @@ ANTFLY_FLASH_KERNEL(
         ANTFLY_FLASH_HEAD_DIM,
         ANTFLY_FLASH_SLIDING_WINDOW>(ANTFLY_FORWARD_ARGUMENTS, storage);
 }
+
+#endif
 
 #ifdef ANTFLY_FLASH_REFERENCE_KERNEL
 extern "C" __global__ void

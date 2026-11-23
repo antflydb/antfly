@@ -1,0 +1,1278 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL",
+  "create": "CREATE TABLE usage_records(id TEXT PRIMARY KEY,tenant_id TEXT,status TEXT)",
+  "seed": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('a','tenant-a','active'),('b','tenant-a','ready'),('c','tenant-b','active'),('d','tenant-b','blocked'),('e',NULL,'active'),('f','tenant-a',NULL),('g','tenant-b','ACTIVE')",
+  "read": "SELECT id,tenant_id,status FROM usage_records ORDER BY id",
+  "cases": [
+    {
+      "id": "sql-0321",
+      "command_tag": "ALTER TABLE",
+      "setup": [
+        "CREATE POLICY fixture_policy ON usage_records USING (tenant_id = 'tenant-a')"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        }
+      ]
+    },
+    {
+      "id": "sql-0322",
+      "command_tag": "ALTER TABLE",
+      "setup": [
+        "CREATE POLICY fixture_policy ON usage_records USING (tenant_id = 'tenant-a')",
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "r",
+              "tenant-b",
+              "active"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0323",
+      "command_tag": "CREATE POLICY",
+      "setup": [
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        }
+      ]
+    },
+    {
+      "id": "sql-0324",
+      "command_tag": "CREATE POLICY",
+      "setup": [
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        }
+      ]
+    },
+    {
+      "id": "sql-0325",
+      "command_tag": "CREATE POLICY",
+      "setup": [
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "r",
+              "tenant-b",
+              "active"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0326",
+      "command_tag": "CREATE POLICY",
+      "setup": [
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        }
+      ]
+    },
+    {
+      "id": "sql-0327",
+      "command_tag": "CREATE POLICY",
+      "setup": [
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        }
+      ]
+    },
+    {
+      "id": "sql-0328",
+      "command_tag": "CREATE POLICY",
+      "setup": [
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "r",
+              "tenant-b",
+              "active"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0329",
+      "command_tag": "ALTER POLICY",
+      "setup": [
+        "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = 'tenant-b')",
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        }
+      ]
+    },
+    {
+      "id": "sql-0330",
+      "command_tag": "CREATE POLICY",
+      "setup": [
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ]
+      ],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ]
+      ],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": null,
+          "rows": [
+            [
+              "p",
+              "tenant-a",
+              "active"
+            ]
+          ]
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        }
+      ]
+    },
+    {
+      "id": "sql-0331",
+      "command_tag": "DROP POLICY",
+      "setup": [
+        "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = 'tenant-b')",
+        "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY"
+      ],
+      "rows": [],
+      "all_rows": [
+        [
+          "a",
+          "tenant-a",
+          "active"
+        ],
+        [
+          "b",
+          "tenant-a",
+          "ready"
+        ],
+        [
+          "c",
+          "tenant-b",
+          "active"
+        ],
+        [
+          "d",
+          "tenant-b",
+          "blocked"
+        ],
+        [
+          "e",
+          null,
+          "active"
+        ],
+        [
+          "f",
+          "tenant-a",
+          null
+        ],
+        [
+          "g",
+          "tenant-b",
+          "ACTIVE"
+        ]
+      ],
+      "filtered_rows": [],
+      "probes": [
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('q','tenant-b','blocked')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active')",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'blocked' WHERE id = 'a'",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "UPDATE usage_records SET tenant_id = 'tenant-b',status = 'active' WHERE id = 'a'",
+          "sqlstate": null,
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('p','tenant-a','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        },
+        {
+          "statement": "INSERT INTO usage_records(id,tenant_id,status) VALUES ('r','tenant-b','active') RETURNING id,tenant_id,status",
+          "sqlstate": "42501",
+          "rows": null
+        }
+      ]
+    }
+  ]
+}

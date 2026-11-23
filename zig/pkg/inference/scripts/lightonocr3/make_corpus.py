@@ -20,6 +20,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -31,12 +32,18 @@ def main():
         type=Path,
         default=Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
     )
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--dense", action="store_true", help="Add a high-resolution small-print table"
+    )
     args = parser.parse_args()
-    root = Path(__file__).resolve().parent / "corpus"
-    root.mkdir(exist_ok=True)
+    default_root = Path(__file__).resolve().parent / "corpus"
+    root = args.output_dir or default_root
+    root.mkdir(parents=True, exist_ok=True)
     cases = [
         {
             "name": "receipt",
+            "min_grounding_boxes": 3,
             "size": [864, 640],
             "font_size": 34,
             "lines": [
@@ -105,7 +112,10 @@ def main():
     manifest = [
         {
             "name": "invoice",
-            "image": "../../../src/models/testdata/lightonocr3/invoice.png",
+            "image": os.path.relpath(
+                default_root / "../../../src/models/testdata/lightonocr3/invoice.png",
+                root,
+            ),
             "expected": "Antfly local OCR\n\nInvoice 12345\n\nTotal USD 42.00",
             "required": ["Antfly", "12345", "42.00"],
             "max_new_tokens": 128,
@@ -131,12 +141,47 @@ def main():
                 "expected": "\n".join(case["lines"]),
                 "required": case["required"],
                 "max_new_tokens": 256,
+                **(
+                    {"min_grounding_boxes": case["min_grounding_boxes"]}
+                    if "min_grounding_boxes" in case
+                    else {}
+                ),
+            }
+        )
+    if args.dense:
+        rows = [("Item", "Reference", "Quantity", "Unit price")]
+        rows += [
+            (
+                f"Replacement part {i:02}",
+                f"SKU-{1200 + i}",
+                str(i % 5 + 1),
+                f"USD {10 + i}.25",
+            )
+            for i in range(1, 33)
+        ]
+        image = Image.new("RGB", (1800, 2400), "white")
+        draw = ImageDraw.Draw(image)
+        font = ImageFont.truetype(str(args.font), 24)
+        for row_index, row in enumerate(rows):
+            y = 120 + row_index * 58
+            draw.line((80, y, 1690, y), fill="gray", width=1)
+            for x, field in zip((100, 640, 1100, 1400), row):
+                draw.text((x, y + 14), field, fill="black", font=font)
+        image.save(root / "dense-table.png")
+        manifest.append(
+            {
+                "name": "dense-table",
+                "image": "dense-table.png",
+                "expected": "\n".join(" ".join(row) for row in rows),
+                "required": ["SKU-1201", "SKU-1216", "SKU-1232", "USD 42.25"],
+                "max_new_tokens": 3072,
+                "expected_table_rows": rows,
             }
         )
     (root / "cases.json").write_text(
         json.dumps(
             {
-                "description": "Four synthetic OCR smoke pages; not a representative accuracy corpus.",
+                "description": f"{len(manifest)} synthetic OCR smoke pages; not a representative accuracy corpus.",
                 "license": "Apache-2.0",
                 "font": args.font.name,
                 "cases": manifest,

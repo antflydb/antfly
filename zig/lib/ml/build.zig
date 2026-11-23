@@ -19,11 +19,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    _ = b.addModule("ml", .{
+    const platform = b.dependency("antfly_platform", .{ .target = target, .optimize = optimize }).module("antfly_platform");
+    const ml = b.addModule("ml", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    ml.addImport("antfly_platform", platform);
 
     // Tests
     const test_step = b.step("test", "Run unit tests");
@@ -45,6 +48,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        t.root_module.addImport("antfly_platform", platform);
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 }

@@ -22,14 +22,14 @@ const A = std.mem.Allocator;
 pub const Column = struct {
     name: []const u8,
     type: @import("ast.zig").ColumnType,
-    element_type: ?@import("array_value.zig").ElementType = null,
+    element_type: ?@import("array/value.zig").ElementType = null,
     pub fn datum(self: Column, a: A, raw: Datum) !Datum {
         if (raw.sql_null) return .{};
         if (self.type == .number and self.element_type == .numeric) {
             if (raw.numeric != null) return raw;
-            var ctx: @import("numeric_value.zig").Context = .{ .alloc = a };
-            const number = try @import("numeric_storage.zig").fromJson(&ctx, raw.value);
-            const value = try a.create(@import("numeric_value.zig").Value);
+            var ctx: @import("numeric/value.zig").Context = .{ .alloc = a };
+            const number = try @import("numeric/storage.zig").fromJson(&ctx, raw.value);
+            const value = try a.create(@import("numeric/value.zig").Value);
             value.* = number.value;
             return Datum.typedNumeric(value);
         }

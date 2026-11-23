@@ -54,7 +54,7 @@ See: [SQL design](https://github.com/antflydb/antfly/blob/main/docs/design/sql/e
 
 ### sync_level
 
-How long a batch write waits before returning: `propose` (Raft proposal accepted, the default), `write` (durably applied to the local store), `full_text` (full-text index WAL written), `enrichments` (enrichments precomputed before commit; a synchronous producer failure rejects the write), or `full_index` (all index writes complete).
+How long a batch write waits before returning: `propose` (Raft proposal accepted, the default), `write` (durably applied to the local store), `query` (durable document write visible to full-text queries, with `full_text` accepted as an alias), `enrichments` (enrichments precomputed before commit; a synchronous producer failure rejects the write), or `full_index` (all index writes complete).
 
 ### Templates
 

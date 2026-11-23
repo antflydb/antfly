@@ -1853,6 +1853,38 @@ test "optional scalar: partially set" {
     try testing.expectEqual(@as(?u64, null), decoded.id64);
 }
 
+const AllocationFailureChild = struct {
+    values: []u32 = &.{},
+    extra: []u32 = &.{},
+    pub const _pb_field_map = [_]FieldDesc{
+        .{ .field_num = 1, .name = "values", .encoding = .repeated_varint },
+        .{ .field_num = 2, .name = "extra", .encoding = .repeated_varint },
+    };
+};
+const AllocationFailureParent = struct {
+    children: []AllocationFailureChild = &.{},
+    tail: []u32 = &.{},
+    pub const _pb_field_map = [_]FieldDesc{
+        .{ .field_num = 1, .name = "children", .encoding = .repeated_submessage },
+        .{ .field_num = 2, .name = "tail", .encoding = .repeated_varint },
+    };
+};
+fn nestedRepeatedAllocationFailureCase(allocator: Allocator) !void {
+    // Two owned children precede another repeated field. Failures exercise
+    // uncommitted children as well as partially finalized list ownership.
+    const bytes = [_]u8{ 10, 6, 8, 1, 8, 2, 16, 3, 10, 6, 8, 4, 8, 5, 16, 6, 16, 7, 16, 8 };
+    var value = try decode(AllocationFailureParent, allocator, &bytes);
+    defer deinit(AllocationFailureParent, allocator, &value);
+    try testing.expectEqual(@as(usize, 2), value.children.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, value.children[0].values);
+    try testing.expectEqualSlices(u32, &.{6}, value.children[1].extra);
+    try testing.expectEqualSlices(u32, &.{ 7, 8 }, value.tail);
+}
+test "nested repeated messages retire every owned child across all allocation failures" {
+    try nestedRepeatedAllocationFailureCase(testing.allocator);
+    try testing.checkAllAllocationFailures(testing.allocator, nestedRepeatedAllocationFailureCase, .{});
+}
+
 const AllocationChild = struct {
     values: []i64 = &.{},
     pub const _pb_field_map = [_]FieldDesc{

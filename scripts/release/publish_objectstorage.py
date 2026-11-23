@@ -372,7 +372,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--channel",
-        choices=("stable", "next", "nightly"),
+        choices=tuple(load_policy()["channels"]),
         help="also publish the policy-defined mutable channel projection",
     )
     parser.add_argument(

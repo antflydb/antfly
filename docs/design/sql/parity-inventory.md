@@ -1,6 +1,6 @@
 # Original SQL extraction parity inventory
 
-Status: release gate blocking. Run
+For the current ledger status, run
 `python3 scripts/check_sql_parity_inventory.py --report` for current
 dispositions and per-family blocking counts; this document does not restate
 them. The checker reads only the JSON fixtures below, never this page.
@@ -12,7 +12,8 @@ Original plan fingerprints, endpoint behavior, authorization, diagnostics and
 deliberate rejections must be distinguished. Blocking dispositions describe
 missing case-by-case evidence, not missing implementations.
 
-The SQL design is in [SQL extraction](extraction.md); regex qualification is in
+The SQL design is in [SQL extraction](extraction.md); native callable ownership
+and recovery are in [SQL routines](routines.md). Regex qualification is in
 [the regex parity design](regex-parity.md). Batch-by-batch campaign narratives,
 per-case evidence prose and component measurements are in
 [history](history/parity-inventory-batches.md).
@@ -120,10 +121,62 @@ expression-index cases run against those declared owners (with duplicate
 `23505`, named-index-alias `42704` and wrong-inference-target `42P10` probes),
 not against an unconstrained baseline.
 
-The restructuring plan excludes graph and lake SQL integration. Any corpus cases
-belonging to those integrations still need explicit scope review. Deferred cases
-continue to block this strict original-corpus gate; a publication scope exception
-must be reviewed as a change to gate policy, not hidden as a passing test.
+The historical restructuring plan excluded graph and lake SQL integration. That
+exclusion does not waive their original corpus contracts. Deferred cases continue
+to block this strict original-corpus gate; a publication scope exception must be
+reviewed as a change to gate policy, not hidden as a passing test.
+
+### Integration scope confirmed 2026-10-19
+
+The remaining-case implementation includes SQL publications and subscriptions,
+outbound publication of Antfly changes, PostgreSQL-style management of WASM
+extensions, and qualification of existing tablespace SQL behavior. These are
+implementation obligations, not completed capabilities or inventory waivers.
+
+- Subscriptions must reuse existing PostgreSQL CDC ingestion, backfill,
+  checkpoints and ordinary mutation enforcement. SQL subscription objects need
+  durable database-scoped ownership and publication membership; an upstream
+  publication created by a replication source is not an Antfly SQL publication.
+- Publications must publish committed Antfly changes through shared durable
+  mutation/replication machinery. Consistent snapshot-to-stream handoff,
+  transaction ordering, consumer acknowledgements, bounded retention and
+  owner-failover recovery require end-to-end evidence. A catalog entry or parser
+  node alone does not activate outbound logical replication.
+- Extension DDL must adapt the existing package/lifecycle catalog and WASM
+  runtime, with database-scoped installation, schema-qualified typed exports,
+  ownership, dependencies and durable recovery. PostgreSQL SQL compatibility
+  does not imply loading PostgreSQL C extensions. Compatibility-name no-ops do
+  not establish that an extension or its functions are installed.
+- Tablespaces already have shared catalog and SQL lowering. Qualify lifecycle,
+  inherited placement and the actual placement/rebalance consumer rather than
+  creating a second tablespace subsystem or claiming relocation from metadata
+  assignment alone.
+
+Each integration retains the same PostgreSQL oracle, native public execution,
+complete-postimage and recovery requirements as other cohorts. Unsupported
+responses and successful metadata-only operations do not close positive runtime
+contracts. This scope confirmation does not change the pinned corpus, its
+checksums or any case disposition.
+
+### Graph statement cuts
+
+Standalone canonical `MATCH` can reuse the existing native graph query cut and
+return typed binding keys, depth and distance directly to SQL. SQL still owns
+projection, ordering and limit; a truncated native binding set is an error,
+not a sortable SQL prefix. Table lock admission and native credential filters
+remain shared. This does not activate delegated-view or SQL-only grant/RLS graph
+reads; those require a principal bridge into graph anchor and node reads.
+
+Joined and CTE graph sources additionally require one retained graph/row cut.
+Capture the primary transaction, an index publication lifetime lease and the
+outgoing/reverse edge contexts under the same short owner fence. Attest applied
+watermarks, identity generation, graph generations and ownership fingerprints
+before returning a cursor. Extend retained-read handles with paged graph
+expansion and hydration using those captured contexts. Calling ordinary `/query`
+while holding that fence can deadlock on the read-index apply it blocks and does
+not prove a shared cut. Transactional graph reads also need range/source proofs.
+Concurrent mutation, index drop/rebuild, topology moves, cancellation and cold
+restore must exercise that common provider before mixed-source cases close.
 
 ## Commands and acceptance policy
 
@@ -150,6 +203,22 @@ evidence from cases without recorded evidence and identify original rejection
 contracts; neither category is an inferred count of missing features.
 Zig 0.17 gates use repeatable `-Dtest-filter=...` compile options. Filters for the
 same owner/build options share one build without broadening other selected gates.
+
+The SELinux evidence gate for `sql-0153` requires enforcing Linux. Set
+`ANTFLY_TEST_SELINUX_ALLOW_CONTEXT` and `ANTFLY_TEST_SELINUX_DENY_CONTEXT` to two
+valid object contexts. The test process needs permission to read the active
+policy, relabel from the initial unlabeled table context, and relabel to only
+the allowed context. The gate verifies the original statement, denial, and
+allowed relabel through the Unix pgwire listener and metadata Raft. On a
+different build host, use `antfly-api-sql-selinux-live-build` to produce the
+test executable for transfer to the enforcing host.
+
+Standalone startup enrolls the signer on first use. To rotate the signer or
+policy, set `ANTFLY_PGWIRE_SELINUX_ROTATE_EPOCH` to the currently enrolled epoch
+and start with the replacement signing seed and policy. To withdraw trust,
+remove the SELinux socket and seed configuration and set
+`ANTFLY_PGWIRE_SELINUX_WITHDRAW_EPOCH` to the current epoch. Startup checks the
+durable result, and an epoch mismatch leaves the existing verifier intact.
 `--gate` requires `--evidence`; it cannot narrow the release gate. A family report
 used with `--release` still checks every original ID.
 Release checking fails while any case is unresolved or deferred. Once all cases
@@ -250,40 +319,29 @@ from current SQL extraction is not repaired by naming this inventory check a ful
 | window | 22 |
 
 
-## Remaining activation caveats
+## Evidence scope
 
-- `sql-1412` declares a NOT VALID CHECK in its original setup; PostgreSQL still
-  enforces that CHECK on new writes. Success against a baseline without the
-  CHECK does not establish parity.
-- The unique-selector cases `sql-1509`, `sql-1510`, `sql-1512`, `sql-1514`,
-  `sql-1515` and `sql-1517` need their ordinary/partial/expression-predicate
-  index owners and bounded native access evidence. Their original setup uses
-  VALIDATE CONSTRAINT on index names, which is not a PostgreSQL constraint
-  operation. `sql-1509`, `sql-1510`, `sql-1514` and `sql-1515` have PostgreSQL
-  DML results and mounted native execution against ready unique-index owners
-  (exact equality index spans, primary content digests, no full-table capture),
-  but remain unresolved until that setup and public catalog activation are
-  adjudicated. `sql-1512` and `sql-1517` still need their own owner profiles.
-  A table scan against the baseline is not a substitute for unique-owner
-  activation.
-- Unique-owner provenance is an OpenAPI-generated `constraint`/`index` identity.
-  Table-bound DROP/VALIDATE CONSTRAINT reject index owners; index retirement
-  removes its paired uniqueness rule. Unqualified PostgreSQL DROP INDEX still
-  needs catalog owner resolution (see
-  [namespace relation ownership](../../../zig/SYSTEM_CATALOG.md#namespace-relation-ownership)).
-- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`) maps to the durable
-  empty-generation barrier; SQL-owned sequence counters remain outside the
-  current catalog model, and the promoted-standby and asynchronous-artifact
-  online-transfer fault matrices are not established.
-- Prepared CTE/recursive/MERGE cases (`sql-0005`, `sql-0008`–`sql-0010`) have
-  hosted single-owner evidence but stay unresolved pending multi-owner and
-  distributed fault evidence.
-- Joined/source UPDATE and DELETE, MERGE, lateral and recursive source cases
-  require explicit current-engine mapping beyond ordinary DML component tests.
-- DDL's 384 entries include session commands, prepared statements, cursors,
-  maintenance, locks, and constraints. Review actual original admission/runtime
-  behavior before treating all of these as implemented or all as future scope.
-- Existing scalar/aggregate/join/window, document DML, DDL, session and protocol
-  tests should be mapped to exact IDs. Current passing component suites do not
-  automatically resolve source corpus entries. No cases are automatically
-  waived by family or by keyword.
+- `sql-1412` verifies that PostgreSQL and Antfly enforce a NOT VALID CHECK on
+  new writes. The mounted gate checks SQLSTATE 23514, unchanged postimages,
+  historical-invalid-row readability, and enforcement after cold owner restart.
+- The six unique-selector cases (`sql-1509`, `sql-1510`, `sql-1512`,
+  `sql-1514`, `sql-1515`, and `sql-1517`) use public CREATE UNIQUE INDEX
+  activation, full and partial index witnesses, and a PostgreSQL DML reference.
+  The native gate verifies RETURNING, postimages, uniqueness on future writes,
+  and cold owner recovery. The original setups treated index names as
+  constraints, so the gate uses the corresponding public index operation.
+- TRUNCATE (`sql-0160`–`sql-0165`, `sql-1101`, `sql-1103`) uses durable
+  empty-generation publication. The document RESTART IDENTITY gate checks
+  authenticated admission, completion, future writes, cold recovery, and
+  preservation of unrelated counters. Owned sequence reset and the
+  promoted-standby and asynchronous-artifact fault matrices require their own
+  qualification.
+- The prepared CTE, recursive, and MERGE cases (`sql-0005`,
+  `sql-0008`–`sql-0010`) have authenticated native pgwire and PostgreSQL
+  evidence for their recorded owner profiles. Consult each ledger entry for
+  its topology and restart coverage. Multi-node failover, distributed
+  cancellation, and transaction-spanning snapshot behavior have separate
+  evidence requirements.
+- Pure compiler and storage gates qualify the contracts they exercise.
+  The ledger records which mounted, provider, or distributed checks qualify
+  each case. Release readiness requires executing the referenced gates.

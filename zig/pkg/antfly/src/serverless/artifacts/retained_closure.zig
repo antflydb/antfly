@@ -181,6 +181,8 @@ pub fn remember(fs: *Fs, id: []const u8, witnesses: []const api.RetentionWitness
     defer fs.alloc.free(path);
     var threaded = std.Io.Threaded.init(fs.alloc, .{});
     defer threaded.deinit();
+    var scope_fence = if (try api.uploadScopeFromArtifactId(id)) |scope| try fs.scopeWriteGuard(threaded.io(), scope, token) else null;
+    defer if (scope_fence) |*guard| guard.deinit();
     try fs.durable_dirs.ensure(fs.alloc, threaded.io(), std.fs.path.dirname(path).?);
     const bytes = try std.json.Stringify.valueAlloc(fs.alloc, Certificate{ .root = id, .witnesses = witnesses }, .{});
     defer fs.alloc.free(bytes);

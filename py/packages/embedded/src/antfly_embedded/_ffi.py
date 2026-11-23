@@ -303,6 +303,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
         _ERR,
     ),
     ("antfly_db_batch_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_batch_wire", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_last_error_outcome_receipt", [_BUF_P], _ERR),
     ("antfly_db_outcome_receipt_status", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_uint8)], _ERR),
     ("antfly_db_outcome_receipt_forget", [_VOID_P, AntflySlice], _ERR),
@@ -423,16 +424,23 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ),
 ]
 
+# Additive exports within one ABI version. A library predating them still
+# loads; the methods that need them raise UnsupportedError.
+_OPTIONAL_FUNCTIONS = frozenset(
+    {
+        "antfly_db_graph_catalog_json",
+        "antfly_db_cypher_json",
+        "antfly_db_graph_write_status_json",
+        "antfly_db_batch_wire",
+    }
+)
+
 _lib: ctypes.CDLL | None = None
 
 
 def _configure(lib: ctypes.CDLL) -> None:
     for name, argtypes, restype in _FUNCTIONS:
-        if name in {
-            "antfly_db_graph_catalog_json",
-            "antfly_db_cypher_json",
-            "antfly_db_graph_write_status_json",
-        } and not hasattr(lib, name):
+        if name in _OPTIONAL_FUNCTIONS and not hasattr(lib, name):
             continue
         func = getattr(lib, name)
         func.argtypes = argtypes

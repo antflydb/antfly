@@ -27,7 +27,7 @@ pub const PhysicalColumn = struct {
     /// Contiguous borrowed coordinates need no per-lane identity array.
     range: ?struct { begin: usize = 0, count: usize } = null,
     kind: @import("ast.zig").ColumnType,
-    element: ?@import("array_value.zig").ElementType = null,
+    element: ?@import("array/value.zig").ElementType = null,
     pub fn len(self: @This()) usize {
         return if (self.range) |span| span.count else self.selection.len;
     }
@@ -68,7 +68,7 @@ pub const PhysicalColumn = struct {
     /// Normalize only selected lanes; excluded payloads remain lazy. Narrow
     /// integers are checked without copying, and REAL values round once into
     /// a compact native vector using the scalar width/underflow contract.
-    pub fn coerce(self: @This(), a: A, kind_: @import("ast.zig").ColumnType, element_: ?@import("array_value.zig").ElementType) !?@This() {
+    pub fn coerce(self: @This(), a: A, kind_: @import("ast.zig").ColumnType, element_: ?@import("array/value.zig").ElementType) !?@This() {
         if (self.kind != kind_) return null;
         const compatible = switch (kind_) {
             .integer => element_ == null or element_ == .int16 or element_ == .int32 or element_ == .int64,
@@ -188,13 +188,13 @@ pub const DecimalColumn = struct {
         if (scale > 38) return error.InvalidDecimal128;
         return scale;
     }
-    pub fn cell(self: @This(), index: usize, fixed: *@import("numeric_value.zig").ScaledInteger, value: *@import("numeric_value.zig").Value) !scalar.Datum {
+    pub fn cell(self: @This(), index: usize, fixed: *@import("numeric/value.zig").ScaledInteger, value: *@import("numeric/value.zig").Value) !scalar.Datum {
         const row = self.physical.rowAt(index);
         if (self.physical.vector.nulls.isNull(row)) return .{};
         const decimal = self.physical.vector.values.decimal128;
         const scale = try self.scaleAt(index);
         try @import("../common/decimal128.zig").validateCoefficient(decimal.values[row], decimal.precision, scale);
-        fixed.* = try @import("numeric_value.zig").ScaledInteger.init(decimal.values[row], scale);
+        fixed.* = try @import("numeric/value.zig").ScaledInteger.init(decimal.values[row], scale);
         value.* = fixed.view();
         return scalar.Datum.typedNumeric(value);
     }
@@ -203,8 +203,8 @@ pub const DecimalColumn = struct {
 /// Escaping keys are copied by the existing typed group/join stores.
 pub const NumericScratch = struct {
     views: []?DecimalColumn,
-    fixed: []@import("numeric_value.zig").ScaledInteger,
-    numbers: []@import("numeric_value.zig").Value,
+    fixed: []@import("numeric/value.zig").ScaledInteger,
+    numbers: []@import("numeric/value.zig").Value,
     pub fn init(a: A, columns: []const Batch) !NumericScratch {
         var present = false;
         for (columns) |column| if (try column.decimalColumnSelected(a, 0, null) != null) {
@@ -214,9 +214,9 @@ pub const NumericScratch = struct {
         if (!present) return .{ .views = &.{}, .fixed = &.{}, .numbers = &.{} };
         const views = try a.alloc(?DecimalColumn, columns.len);
         errdefer a.free(views);
-        const fixed = try a.alloc(@import("numeric_value.zig").ScaledInteger, columns.len);
+        const fixed = try a.alloc(@import("numeric/value.zig").ScaledInteger, columns.len);
         errdefer a.free(fixed);
-        const numbers = try a.alloc(@import("numeric_value.zig").Value, columns.len);
+        const numbers = try a.alloc(@import("numeric/value.zig").Value, columns.len);
         errdefer a.free(numbers);
         for (columns, views) |column, *view| view.* = try column.decimalColumnSelected(a, 0, null);
         return .{ .views = views, .fixed = fixed, .numbers = numbers };
@@ -490,7 +490,7 @@ pub const Batch = union(enum) {
             fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 if (self.nulls[row_index] != 0) return .{};
-                const number = @import("numeric_value.zig");
+                const number = @import("numeric/value.zig");
                 var context: number.Context = .{ .alloc = alloc };
                 var value = try number.fromScaledInteger(&context, self.values[row_index], if (self.scales.len == 0) self.scale else self.scales[row_index]);
                 errdefer value.deinit();
@@ -733,12 +733,13 @@ pub const Batch = union(enum) {
                 const value = try v.source.cell(a, v.selection[index], v.ordinals[column]);
                 if (column >= v.types.len) return error.InvalidSqlBackendResponse;
                 const type_ = v.types[column];
-                break :blk try @import("describe.zig").coerceDatum(a, value, type_.kind orelse return error.InvalidSqlBackendResponse, type_.element_type);
+                if (type_.kind == null) return error.InvalidSqlBackendResponse;
+                break :blk try @import("describe.zig").coerceDatumTyped(a, value, type_);
             },
             .columns => |v| blk: {
                 const definition = v.definitions[column];
                 const value = try v.page.typedCell(a, index, definition.name, definition.element_type == .numeric);
-                break :blk try @import("describe.zig").coerceDatum(a, value, definition.type, definition.element_type);
+                break :blk try @import("describe.zig").coerceDatumTyped(a, value, scalar.columnType(definition));
             },
         };
     }
@@ -809,8 +810,8 @@ fn selectedDictionaryScenario(a: A) !void {
     for (0..mapped.len()) |row| try std.testing.expectEqualDeep(try mapped.cell(a, row, 0), try reordered.cell(a, row, 0));
 }
 test "SQL NUMERIC batch mappings borrow exact cells without placeholder coercion" {
-    var context: @import("numeric_value.zig").Context = .{ .alloc = std.testing.allocator };
-    var number = try @import("numeric_value.zig").parse(&context, "9007199254740993.1200");
+    var context: @import("numeric/value.zig").Context = .{ .alloc = std.testing.allocator };
+    var number = try @import("numeric/value.zig").parse(&context, "9007199254740993.1200");
     defer number.deinit();
     const source: Batch = .{ .rows = &.{ &.{scalar.Datum.typedNumeric(&number.value)}, &.{.{}} } };
     var mapping: Batch = .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .types = &.{.{ .kind = .number, .element_type = .numeric }}, .selection = &.{ 0, 1 } } };
@@ -835,8 +836,8 @@ test "external lake mapped batches retain exact NUMERIC declarations before coer
     const mapped: Batch = .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .types = &.{.{ .kind = .number, .element_type = .numeric }}, .selection = &.{ 0, 1, 2 } } };
     for ([_][]const u8{ "9007199254740993", "9007199254740993.125" }, 0..) |text, row| {
         const value = try mapped.cell(a, row, 0);
-        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
-        try std.testing.expectEqualStrings(text, try @import("numeric_value.zig").format(&context, value.numeric.?.*));
+        var context: @import("numeric/value.zig").Context = .{ .alloc = a };
+        try std.testing.expectEqualStrings(text, try @import("numeric/value.zig").format(&context, value.numeric.?.*));
     }
     try std.testing.expect((try mapped.cell(a, 2, 0)).sql_null);
 }
@@ -995,4 +996,42 @@ test "SQL scalar row descriptors reuse bounded storage without retiring expressi
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL mutation temporal batches preserve exact borrowed domains through selection and projection" {
+    const temporal = @import("temporal/value.zig");
+    const values = [_]temporal.Value{
+        .{ .date = .{ .days = 0 } },
+        .{ .time = .{ .micros = 12345 } },
+        .{ .time_tz = .{ .time = .{ .micros = 12345 }, .seconds_west = 5400 } },
+        .{ .timestamp = .{ .micros = 0 } },
+        .{ .timestamp_tz = .{ .micros = 0 } },
+        .{ .interval = .{ .months = 1, .days = 2, .micros = 3 } },
+    };
+    var none: std.heap.FixedBufferAllocator = .init(&.{});
+    for (&values) |*value| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const source: Batch = .{ .rows = &.{ &.{scalar.Datum.typedTemporal(value)}, &.{.{}}, &.{scalar.Datum.json(.{ .string = "invalid-unselected" })} } };
+        var mapped: Batch = .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .types = &.{.{ .kind = .datetime, .temporal_kind = value.kind() }}, .selection = &.{ 0, 1 } } };
+        var columns: Batch = .{ .columns = .{ .page = .{ .native = .{ .values = &source, .names = &.{"v"} }, .selection = &.{ 0, 1 } }, .definitions = &.{.{ .name = "v", .type = .datetime, .temporal_kind = value.kind() }} } };
+        for ([_]*const Batch{ &mapped, &columns }) |batch| {
+            // Coercion borrows both typed payloads and SQL NULLs without a
+            // heap, and never decodes the invalid unselected source row.
+            try std.testing.expect((try batch.cell(none.allocator(), 0, 0)).temporal() == value);
+            try std.testing.expect((try batch.cell(none.allocator(), 1, 0)).sql_null);
+            const selected = try batch.select(arena.allocator(), &.{ 1, 0, 0 });
+            const projected = try selected.project(arena.allocator(), 0);
+            try std.testing.expect((try projected.cell(none.allocator(), 0, 0)).sql_null);
+            try std.testing.expect((try projected.cell(none.allocator(), 1, 0)).temporal() == value);
+            try std.testing.expect((try projected.cell(none.allocator(), 2, 0)).temporal() == value);
+        }
+        for (std.enums.values(temporal.Kind)) |wrong| {
+            if (wrong == value.kind()) continue;
+            mapped.mapped.types = &.{.{ .kind = .datetime, .temporal_kind = wrong }};
+            columns.columns.definitions = &.{.{ .name = "v", .type = .datetime, .temporal_kind = wrong }};
+            try std.testing.expectError(error.SqlTypeMismatch, mapped.cell(none.allocator(), 0, 0));
+            try std.testing.expectError(error.SqlTypeMismatch, columns.cell(none.allocator(), 0, 0));
+        }
+    }
 }

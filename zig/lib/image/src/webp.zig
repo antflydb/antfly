@@ -343,6 +343,41 @@ pub fn probe(webp_bytes: []const u8) !Info {
     return (try parseChunks(webp_bytes)).info;
 }
 
+/// Inspect dimensions from the container prefix. The full decoder verifies
+/// chunk ordering, declared lengths, and agreement with the image bitstream.
+pub fn probeDimensionsPrefix(bytes: []const u8) !Info {
+    if (!hasSignature(bytes)) return error.WebpDecodeFailed;
+    const riff_end = @as(u64, try readU32Le(bytes, 4)) + 8;
+    const end: usize = @intCast(@min(riff_end, bytes.len));
+    var cursor: usize = riff_header_len;
+    while (cursor < end) {
+        if (end - cursor < chunk_header_len) return error.WebpDecodeFailed;
+        const kind = bytes[cursor..][0..4];
+        const size: usize = try readU32Le(bytes, cursor + 4);
+        const start = cursor + chunk_header_len;
+        if (size > riff_end - start) return error.WebpDecodeFailed;
+        const payload = bytes[start..][0..@min(size, end - start)];
+        if (std.mem.eql(u8, kind, "VP8X")) {
+            var info: Info = .{};
+            if (size != 10) return error.WebpDecodeFailed;
+            try parseVp8x(payload, &info);
+            return info;
+        }
+        if (std.mem.eql(u8, kind, "VP8 ")) {
+            const dimensions = try parseVp8Dimensions(payload);
+            return .{ .width = dimensions.width, .height = dimensions.height };
+        }
+        if (std.mem.eql(u8, kind, "VP8L")) {
+            const dimensions = try parseVp8lHeader(payload);
+            return .{ .width = dimensions.width, .height = dimensions.height };
+        }
+        if (size > end - start) return error.WebpDecodeFailed;
+        cursor = start + size;
+        if (cursor < end and size % 2 != 0) cursor += 1;
+    }
+    return error.WebpDecodeFailed;
+}
+
 fn parseChunks(webp_bytes: []const u8) !ParsedChunks {
     if (!hasSignature(webp_bytes)) return error.WebpDecodeFailed;
 

@@ -323,6 +323,22 @@ pub const Prepared = struct {
     fn stage(ptr: *anyopaque, view: commit_hooks.View, encoded: []const u8) !void {
         const self: *Prepared = @ptrCast(@alignCast(ptr));
         if (self.other) |other| try other.stage(other.ptr, view, encoded);
+        // `init` above only ever appends to `self.records`/`self.documents`
+        // inside its own `if (try publication.authority(&txn)) |authority|`
+        // block: with no online-source replication authority configured
+        // (the ordinary case for every standalone-Lite write, direct
+        // enrichments included), both stay empty and this participant has
+        // nothing to stage. Decoding `encoded` unconditionally below, before
+        // this check existed, meant that whenever the host transaction had
+        // no document/artifact revision of its OWN to stamp (and so handed
+        // every attached participant's `stage` empty position bytes --
+        // see `artifact_input_capture.zig`'s `Capture.stage`), this
+        // function crashed on `publication.Position.decode(&.{})` with
+        // `error.InvalidControlReceiptPosition` even though it was about to
+        // do nothing with the decoded position anyway (every use below is
+        // inside the `for (self.records)` loop, which such a decode would
+        // only ever precede empty).
+        if (self.records.len == 0) return;
         const position = try publication.Position.decode(encoded);
         const a = self.arena.allocator();
         // Source images are interned by document. Compare the complete bytes

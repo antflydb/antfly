@@ -88,7 +88,7 @@ test "native moondream matches the upstream float32 reference" {
     defer parsed.deinit();
     const ref = parsed.value;
 
-    var pipeline = try moondream.Pipeline.load(a, model_dir);
+    var pipeline = try moondream.Pipeline.loadWithOptions(a, model_dir, null, null, .{ .observe_allocations = true });
     defer pipeline.deinit();
     const config = pipeline.config;
 
@@ -177,5 +177,10 @@ test "native moondream matches the upstream float32 reference" {
         }
         try std.testing.expectEqualSlices(i32, want, got);
         try std.testing.expectEqualStrings(ref.answer, result.text);
+        const observed = pipeline.executionDiagnostics() orelse return error.MissingMoondreamObservation;
+        try std.testing.expect(observed.outcome == .success);
+        try std.testing.expect(observed.operation == .prefill or observed.operation == .decode_step);
+        try std.testing.expect(observed.context_runtime_scope == .borrowed_execution_backend_context);
+        try std.testing.expect(observed.runtime.native_allocations.?.model.?.coverage == .from_owner_creation);
     }
 }

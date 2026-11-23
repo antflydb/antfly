@@ -19,7 +19,7 @@ const runtime_build = @import("runtime.zig");
 
 pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile {
     const b = ctx.b;
-    const exe = runtime_build.addStandaloneExecutable(b, ctx.graph, ctx.target, ctx.optimize, ctx.paths.inference_root, ctx.backend.link_libc, .{ .strip = ctx.strip, .has_accelerator = ctx.hasAccelerator() });
+    const exe = runtime_build.addStandaloneExecutable(b, ctx.graph, ctx.target, ctx.optimize, ctx.paths.inference_root, ctx.backend.link_libc, .{ .strip = ctx.strip, .enable_metal = ctx.backend.enable_metal, .enable_cuda = ctx.backend.enable_cuda, .enable_pjrt = ctx.backend.enable_pjrt });
     const install_exe = b.addInstallArtifact(exe, .{
         .dest_sub_path = "antfly-inference-dev",
     });
@@ -38,12 +38,21 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const finetune_step = ctx.step("finetune", "Run Antfly inference finetune");
     finetune_step.dependOn(&run_finetune.step);
 
+    const measured_cuda_pjrt = runtime_build.measuredCudaPjrtCompileMemory(b.graph.host, ctx.target, ctx.optimize, .{
+        .strip = ctx.strip,
+        .enable_cuda = ctx.backend.enable_cuda,
+        .enable_pjrt = ctx.backend.enable_pjrt,
+        .enable_metal = ctx.backend.enable_metal,
+    });
+    const previous_bench_memory_mb = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 24 else if (ctx.backend.enable_cuda) 26 else 12) * 1024;
+    const bench_memory_mb = if (measured_cuda_pjrt) |profile| profile.bench_server_mib orelse previous_bench_memory_mb else previous_bench_memory_mb;
     const bench_server = b.addExecutable(.{
         .name = "antfly-inference-bench-server",
-        // Retain video codec compiler headroom and main's larger Darwin Metal
-        // allowance for the production prepared-pipeline benchmark.
+        // Whole-model server builds measured 22.44 GiB on Darwin/Metal and
+        // 24.3 GiB on Linux/CUDA. Reserve headroom for scheduling, while
+        // retaining the explicit override for smaller configurations.
         .max_rss = std.math.mul(usize, b.option(usize, "bench-server-compile-memory-mb", "Declared HTTP benchmark server compiler memory bound in MiB") orelse
-            (@as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 12) * 1024), 1024 * 1024) catch @panic("benchmark server compiler memory bound overflows"),
+            bench_memory_mb, 1024 * 1024) catch @panic("benchmark server compiler memory bound overflows"),
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/benchmark_server.zig"),
             .target = ctx.target,

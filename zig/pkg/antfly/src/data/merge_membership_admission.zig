@@ -94,13 +94,19 @@ fn acquires(alloc: std.mem.Allocator, payload: []const u8) !bool {
     // of these ASCII identifier characters in a valid JSON object key.
     if (std.mem.indexOf(u8, payload, "\"_merge_checkpoint\"") == null and
         std.mem.indexOf(u8, payload, "\\u") == null) return false;
-    var decoded = try batch.decode(alloc, payload);
+    // The escape might be inside a native control's payload, rather than
+    // in a merge key. Use the same envelope dispatch as ordered apply.
+    var decoded = try batch.decodeForApply(alloc, payload);
     defer decoded.deinit(alloc);
-    if (decoded.protocol_barrier_version != null) return false;
-    if (decoded.batch.req.online_source) |command| {
+    const rows = switch (decoded) {
+        .batch => |rows| rows,
+        else => return false,
+    };
+    if (rows.protocol_barrier_version != null) return false;
+    if (rows.batch.req.online_source) |command| {
         if (command == .admit and command.scope().fence.role == .merge_source) return true;
     }
-    if (decoded.batch.req.merge_checkpoint) |checkpoint| {
+    if (rows.batch.req.merge_checkpoint) |checkpoint| {
         // Fence accept too: it precedes begin_copy, and membership must remain
         // stable while the donor's immutable source certificate is installed.
         if (checkpoint.kind == .accept or checkpoint.kind == .begin_copy) return true;
