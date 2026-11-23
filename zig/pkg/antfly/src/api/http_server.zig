@@ -15777,6 +15777,18 @@ pub const ApiHttpServer = struct {
         return guard;
     }
 
+    pub fn authorizeHttpCommit(self: *ApiHttpServer, id: db_mod.types.TxnId, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) !?transactions_api.Mutation {
+        const principal = transactionPrincipal(identity);
+        var details = (try self.txn_sessions.getAuthorizationDetailsControlled(self.alloc, id, principal, context)) orelse return null;
+        defer details.deinit(self.alloc);
+        try context.ensureActive();
+        if (!directTransactionRouteEligible(details, false) or !try self.transactionSessionDetailsAuthorizedControlled(identity, details, context)) return null;
+        try context.ensureActive();
+        var observation: transactions_api.Mutation = .{ .id = id, .owner = self.localSessionNodeId(), .tenure = null };
+        observation.bindPublicSession(details.status.begin_timestamp, principal);
+        return observation;
+    }
+
     pub fn transactionSessionAccessible(
         self: *ApiHttpServer,
         txn_id: db_mod.types.TxnId,
@@ -15838,7 +15850,7 @@ pub const ApiHttpServer = struct {
     /// Public labels identify the original statement, not its current authority.
     /// Resolve pinned storage identities once under a revision fence, including
     /// read-only sessions and tables that do not need FK coordination.
-    fn currentTransactionResources(self: *ApiHttpServer, alloc: std.mem.Allocator, bindings: []const transactions_api.CatalogBinding) !std.StringHashMapUnmanaged([]const u8) {
+    fn currentTransactionResources(self: *ApiHttpServer, alloc: std.mem.Allocator, bindings: []const transactions_api.CatalogBinding, context: api_operation.RequestContext) !std.StringHashMapUnmanaged([]const u8) {
         var result: std.StringHashMapUnmanaged([]const u8) = .empty;
         if (self.source.vtable.system_catalog == null) return result;
         var names: std.ArrayList([]const u8) = .empty;
@@ -15853,8 +15865,9 @@ pub const ApiHttpServer = struct {
         var revision: ?u64 = null;
         var start: usize = 0;
         while (start < names.items.len) {
+            try context.ensureActive();
             const end = @min(names.items.len, start + 256);
-            const bytes = try self.source.systemCatalog(alloc, .{}, .{ .resolve_many = .{ .storage_names = names.items[start..end], .expected_revision = revision } });
+            const bytes = try self.source.systemCatalog(alloc, context, .{ .resolve_many = .{ .storage_names = names.items[start..end], .expected_revision = revision } });
             const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{});
             if (resolved.logical_names.len != end - start) return error.CatalogRoutingUnavailable;
             revision = resolved.revision;
@@ -15870,6 +15883,10 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         details: transactions_api.SessionDetails,
     ) !bool {
+        return self.transactionSessionDetailsAuthorizedControlled(authenticated_identity, details, .{});
+    }
+
+    fn transactionSessionDetailsAuthorizedControlled(self: *ApiHttpServer, authenticated_identity: ?AuthenticatedIdentity, details: transactions_api.SessionDetails, context: api_operation.RequestContext) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -15878,7 +15895,7 @@ pub const ApiHttpServer = struct {
             for (details.tables, entries) |table, *entry| entry.* = .{ .logical = table.table_name, .physical = table.storage_name orelse table.table_name };
             break :legacy entries;
         } else details.catalog_bindings;
-        const resources = try self.currentTransactionResources(a, bindings);
+        const resources = try self.currentTransactionResources(a, bindings, context);
         for (details.tables) |table| {
             const resource = resources.get(table.table_name) orelse table.table_name;
             if (resource.len == 0) return false;
@@ -15907,20 +15924,30 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request: transactions_api.OwnedTransactionCommitRequest,
     ) !bool {
+        return self.transactionRequestAuthorizedControlled(authenticated_identity, request, .{});
+    }
+
+    pub fn transactionRequestAuthorizedControlled(self: *ApiHttpServer, authenticated_identity: ?AuthenticatedIdentity, request: transactions_api.OwnedTransactionCommitRequest, context: api_operation.RequestContext) !bool {
+        try context.ensureActive();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        var sql_scope = @import("sql/execution/authorization_runtime.zig").TransactionScope.init(self, authenticated_identity, .{}, arena.allocator(), request) catch |err| switch (err) {
+        var sql_scope = @import("sql/execution/authorization_runtime.zig").TransactionScope.init(self, authenticated_identity, context, arena.allocator(), request) catch |err| switch (err) {
             error.Forbidden => return false,
             else => return err,
         };
-        return self.transactionRequestAuthorizedWithSql(authenticated_identity, request, if (sql_scope) |*scope| scope else null);
+        return self.transactionRequestAuthorizedWithSqlControlled(authenticated_identity, request, if (sql_scope) |*scope| scope else null, context);
     }
 
     pub fn transactionRequestAuthorizedWithSql(self: *ApiHttpServer, authenticated_identity: ?AuthenticatedIdentity, request: transactions_api.OwnedTransactionCommitRequest, sql_scope: ?*const @import("sql/execution/authorization_runtime.zig").TransactionScope) !bool {
+        return self.transactionRequestAuthorizedWithSqlControlled(authenticated_identity, request, sql_scope, .{});
+    }
+
+    fn transactionRequestAuthorizedWithSqlControlled(self: *ApiHttpServer, authenticated_identity: ?AuthenticatedIdentity, request: transactions_api.OwnedTransactionCommitRequest, sql_scope: ?*const @import("sql/execution/authorization_runtime.zig").TransactionScope, context: api_operation.RequestContext) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const resources = try self.currentTransactionResources(arena.allocator(), request.catalog_bindings.items);
+        const resources = try self.currentTransactionResources(arena.allocator(), request.catalog_bindings.items, context);
         for (request.read_set) |read| {
+            try context.ensureActive();
             const resource = resources.get(read.table_name) orelse read.table_name;
             if (resource.len == 0) return false;
             if (!(try self.transactionReadKeyAuthorized(
@@ -15928,6 +15955,7 @@ pub const ApiHttpServer = struct {
                 resource,
                 read.key,
                 request.physicalName(read.table_name),
+                context,
             ))) return false;
         }
         for (request.tables) |table| {
@@ -15951,13 +15979,14 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         key: []const u8,
         physical_table_name: []const u8,
+        context: api_operation.RequestContext,
     ) !bool {
         if (!admittedTablePermissionAllowed(authenticated_identity, table_name, .read)) return false;
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const filter = row_filter_json orelse return true;
         const source = self.table_reads orelse return false;
-        var lookup = (try source.lookup(self.alloc, physical_table_name, key, .{}, .read_index)) orelse return true;
+        var lookup = (try source.lookup(self.alloc, physical_table_name, key, context, .read_index)) orelse return true;
         defer lookup.deinit(self.alloc);
         return try self.docJsonMatchesRowFilter(key, lookup.json, filter);
     }

@@ -1410,7 +1410,7 @@ pub const AntflyApiHandler = struct {
                 } else completion.unknown = true;
             } else completion.unknown = true;
         }
-        @import("sql/session/completion.zig").pinJoined(self.api_server, ctx.allocator, completion, ctx.io);
+        @import("sql/session/completion.zig").pinJoinedControlled(self.api_server, ctx.allocator, completion, ctx.io, operationContext(ctx, null));
         try attachSQLCompletion(response, completion.*);
     }
 
@@ -7707,6 +7707,8 @@ pub const AntflyApiHandler = struct {
     fn sessionInspectionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
             error.DeadlineExceeded => textResponse(ctx, 504, "transaction request deadline exceeded"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "transaction request canceled"),
+            error.SqlWriteCapacityUnavailable => sqlRoutingOverloadedResponse(ctx),
             error.TransactionCommitRequestMismatch => textResponse(ctx, 409, "transaction commit retry body does not match the sealed request"),
             error.SessionLeaseLost => textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
             error.SessionWriteOutcomeUnknown => textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying"),
@@ -7729,7 +7731,7 @@ pub const AntflyApiHandler = struct {
     fn respondTerminalHttpCommit(self: *AntflyApiHandler, ctx: *httpx.Context, source: table_writes.TableWriteSource, guard: transactions_api.Mutation, terminal: transactions_api.TerminalCommit, commit_req: transactions_api.OwnedTransactionCommitRequest, identity: ?AuthenticatedIdentity, commit_request: operation_contract.RequestContext, execution_held: bool) !httpx.Response {
         const alloc = self.api_server.alloc;
         const txn_id = guard.id;
-        if (!(try self.api_server.transactionRequestAuthorized(identity, commit_req))) return textResponse(ctx, 403, "forbidden");
+        if (!(try self.api_server.transactionRequestAuthorizedControlled(identity, commit_req, commit_request))) return textResponse(ctx, 403, "forbidden");
         var status = terminal.status;
         // A complete terminal response is durable before the coordinator
         // self-participant is released. Retrying that final ACK is safe;
@@ -7796,7 +7798,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (self.forwardTransactionSession(ctx, txn_id, body_data) catch |err| return sessionInspectionFailure(ctx, err)) |response| return response;
-        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err|
+        const inspection_context = operationContext(ctx, authenticated_identity);
+        const observation = (self.api_server.authorizeHttpCommit(txn_id, authenticated_identity, inspection_context) catch |err|
             return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
@@ -7812,22 +7815,24 @@ pub const AntflyApiHandler = struct {
         }
         if (parsed_req) |*request| {
             self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), request, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
-            if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
+            if (!(try self.api_server.transactionRequestAuthorizedControlled(authenticated_identity, request.*, inspection_context))) return textResponse(ctx, 403, "forbidden");
         }
         const commit_request = tableMutationContext(ctx, &authenticated_identity);
         var terminal_on_cut: ?transactions_api.TerminalCommit = null;
         defer if (terminal_on_cut) |*terminal| terminal.deinit(alloc);
         const extra_request = if (parsed_req) |*value| value else null;
-        if (self.api_server.txn_sessions.inspectTerminalHttpCommit(alloc, guard, extra_request, &terminal_on_cut, commit_request) catch |err|
+        if (self.api_server.txn_sessions.inspectTerminalHttpCommit(alloc, observation, extra_request, &terminal_on_cut, commit_request, &self.api_server.query_admission) catch |err|
             return sessionInspectionFailure(ctx, err)) |value|
         {
             var replay = value;
             defer replay.deinit(alloc);
-            return self.respondTerminalHttpCommit(ctx, source, guard, terminal_on_cut.?, replay, authenticated_identity, commit_request, false);
+            return self.respondTerminalHttpCommit(ctx, source, observation, terminal_on_cut.?, replay, authenticated_identity, commit_request, false);
         }
         const execution = self.api_server.txn_sessions.acquireCommitExecutionControlled(txn_id, ctx.io, commit_request) catch |err| return sessionInspectionFailure(ctx, err);
         defer execution.release();
         const owner = self.api_server.localSessionNodeId();
+        var guard = self.api_server.txn_sessions.mutationControlled(alloc, txn_id, owner, commit_request) catch |err| return sessionInspectionFailure(ctx, err);
+        guard.authorization = observation.authorization;
         const session = (self.api_server.txn_sessions.readMutationInfoControlled(guard, commit_request) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -7860,7 +7865,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("transaction has no staged writes");
         };
         defer commit_req.deinit(alloc);
-        if (terminal_on_cut == null and !(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+        if (terminal_on_cut == null and !(try self.api_server.transactionRequestAuthorizedControlled(authenticated_identity, commit_req, commit_request))) {
             _ = ctx.status(403);
             return ctx.text("forbidden");
         }
@@ -7868,7 +7873,8 @@ pub const AntflyApiHandler = struct {
         if (terminal_on_cut) |terminal|
             return self.respondTerminalHttpCommit(ctx, source, guard, terminal, commit_req, authenticated_identity, commit_request, true);
 
-        var execution_plan = self.api_server.txn_sessions.getExecutionPlan(alloc, guard) catch |err| switch (err) {
+        var execution_plan = self.api_server.txn_sessions.getExecutionPlanControlled(alloc, guard, commit_request) catch |err| switch (err) {
+            error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
             error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
             else => return err,
@@ -7897,7 +7903,8 @@ pub const AntflyApiHandler = struct {
             };
             if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
                 if (!(self.api_server.txn_sessions.retireBeforeExecution(alloc, guard, commit_req.session_version.?, false) catch false)) {
-                    execution_plan = (self.api_server.txn_sessions.getExecutionPlan(alloc, guard) catch |err| switch (err) {
+                    execution_plan = (self.api_server.txn_sessions.getExecutionPlanControlled(alloc, guard, commit_request) catch |err| switch (err) {
+                        error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
                         error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
                         error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
                         else => return err,
@@ -7933,12 +7940,33 @@ pub const AntflyApiHandler = struct {
             var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
                 return self.transactionPreparationError(ctx, err);
             defer prepared.deinit();
-            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, guard, prepared.tables) catch |err| switch (err) {
+            execution_plan = (self.api_server.txn_sessions.sealExecutionPlanControlled(alloc, guard, prepared.tables, commit_request) catch |err| switch (err) {
+                error.SessionWriteOutcomeUnknown, error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
                 error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
                 error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
                 else => return self.transactionPreparationError(ctx, err),
             }) orelse return textResponse(ctx, 404, "not found");
         }
+        if (execution_plan.?.firstAttempt()) commit_request.ensureActive() catch
+            return textResponse(ctx, 503, "transaction admission requires reconciliation; retry this transaction id");
+        // A previously published plan can already own coordinator recovery.
+        // Carry the budget through its pre-decision checkpoints without
+        // revoking durable work once accepted.
+        const admission_token: operation_contract.CancellationToken = .{
+            .ptr = &commit_request,
+            .is_cancelled_fn = struct {
+                fn probe(ptr: *const anyopaque) bool {
+                    const request: *const operation_contract.RequestContext = @ptrCast(@alignCast(ptr));
+                    return request.isCancellationRequested();
+                }
+            }.probe,
+            .check_fn = struct {
+                fn check(ptr: *const anyopaque) !void {
+                    const request: *const operation_contract.RequestContext = @ptrCast(@alignCast(ptr));
+                    try request.ensureActive();
+                }
+            }.check,
+        };
         const outcome = (source.commitTransactionAttempt(
             alloc,
             txn_id,
@@ -7946,7 +7974,7 @@ pub const AntflyApiHandler = struct {
             execution_plan.?.value,
             session.sync_level,
             execution_plan.?.firstAttempt(),
-            commit_request.cancellation,
+            admission_token,
         ) catch |err| rejected: {
             if (err == error.ChangefeedCapabilityUnsupported) return textResponse(ctx, 503, "transaction capability unavailable; retry this transaction id");
             const rejection = transactions_api.classifyCommitRejection(execution_plan.?.firstAttempt(), err);
@@ -9317,7 +9345,7 @@ pub const AntflyApiHandler = struct {
         const completion = try requestCompletion(ctx);
         // Forwarded execution already carries its owner's completion witness.
         if (response.headers.get("X-Antfly-SQL-Completion") == null) {
-            if (ctx.header("X-Antfly-SQL-Fence") != null) @import("sql/session/completion.zig").pinJoined(self.api_server, ctx.allocator, completion, ctx.io);
+            if (ctx.header("X-Antfly-SQL-Fence") != null) @import("sql/session/completion.zig").pinJoinedControlled(self.api_server, ctx.allocator, completion, ctx.io, operationContext(ctx, null));
             try attachSQLCompletion(&response, completion.*);
         }
         return response;
@@ -9376,6 +9404,7 @@ pub const AntflyApiHandler = struct {
                 alloc: std.mem.Allocator,
                 receipt: completion_mod.Receipt,
                 network: std.Io,
+                context: operation_contract.RequestContext,
                 done: std.Io.Event = .unset,
                 remaining: ?completion_mod.Receipt = null,
                 acknowledge: bool = false,
@@ -9386,7 +9415,7 @@ pub const AntflyApiHandler = struct {
                 owner_request: ?owner_mod.OwnerRequest = null,
                 fn run(job: *@This()) void {
                     defer job.done.set(job.network);
-                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
+                    const context = job.context;
                     if (job.seal_legacy_pins) {
                         const store = job.server.txn_sessions.durable orelse {
                             job.seal_error = error.DurabilityUnavailable;
@@ -9399,13 +9428,14 @@ pub const AntflyApiHandler = struct {
                         return;
                     }
                     if (job.owner_request) |request| {
-                        job.acknowledged = owner_mod.ownerAction(job.server, job.alloc, request, false) catch false;
+                        job.acknowledged = owner_mod.ownerActionControlled(job.server, job.alloc, request, false, context) catch false;
                         return;
                     }
                     if (job.acknowledge) job.acknowledged = @import("sql/session/completion.zig").acknowledge(job.server, job.alloc, job.receipt, context) catch false else job.remaining = @import("sql/session/completion.zig").remaining(job.server, job.alloc, job.receipt, context) catch null;
                 }
             };
-            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .seal_legacy_pins = seal_legacy_pins, .shared_issuer = if (seal_shared_issuer) self.api_server.localSessionNodeId() else null, .owner_request = if (parsed_owner) |value| value.value else null };
+            const context = owner_mod.settlementContext(operationContext(ctx, identity)) catch |err| return sessionInspectionFailure(ctx, err);
+            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .context = context, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .seal_legacy_pins = seal_legacy_pins, .shared_issuer = if (seal_shared_issuer) self.api_server.localSessionNodeId() else null, .owner_request = if (parsed_owner) |value| value.value else null };
             var future = try io.concurrent(Probe.run, .{&job});
             job.done.waitUncancelable(ctx.io);
             @import("protected_future.zig").wait(io, &future);
@@ -18207,6 +18237,8 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         defer sealed.deinit(alloc);
         const participants = try sealed.distributedTables(alloc);
         defer participants.deinit();
+        try std.testing.expectError(error.DeadlineExceeded, server.txn_sessions.sealExecutionPlanControlled(alloc, generic_guard, participants.tables, .{ .deadline_ns = 0 }));
+        try std.testing.expect((try server.txn_sessions.getExecutionPlan(alloc, generic_guard)) == null);
         var execution = (try server.txn_sessions.sealExecutionPlan(alloc, generic_guard, participants.tables)).?;
         defer execution.deinit();
         _ = (try server.txn_sessions.recordTerminalCommitForMutation(alloc, generic_guard, .committed, false, null, null)).?;

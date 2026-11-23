@@ -299,18 +299,19 @@ fn discardOutcome(completion: *wire.Completion, alloc: std.mem.Allocator, index:
     if (removed.transaction_id) |value| alloc.free(value);
     if (removed.ddl_receipt_json) |value| alloc.free(value);
 }
-fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion) !void {
-    const store = try registrationStore(server);
+fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, context: operation.RequestContext) !void {
+    const store = try registrationStoreControlled(server, context);
     var index = completion.join_begin orelse return;
     const local = if (server.cfg.session_router) |router| router.localNodeId() else 0;
     while (index < completion.outcomes.items.len) {
+        try context.ensureActive();
         const outcome = completion.outcomes.items[index];
         if (outcome.registration_node_id == null or outcome.registration_node_id.? != local or outcome.reference_id == null) {
             index += 1;
             continue;
         }
         const reference = try parseId(outcome.reference_id.?);
-        var record = (try store.loadRegistration(alloc, reference)) orelse {
+        var record = (try store.loadRegistrationControlled(alloc, reference, context)) orelse {
             if (!@import("../../completion_outbox.zig").isObservation(reference)) return error.CompletionUnavailable;
             discardOutcome(completion, alloc, index);
             continue;
@@ -322,27 +323,27 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
         }
         const id = if (record.value.outcome.transaction_id) |encoded| try parseId(encoded) else null;
         const local_proof = @import("../../completion_outbox.zig").isObservation(reference) or server.txn_sessions.durable_scope == .cluster_shared or
-            (if (id) |txn_id| (try server.txn_sessions.getOwnerNodeId(alloc, txn_id)) orelse @import("../../transactions.zig").sessionOwnerNodeId(txn_id) else local) == local;
+            (if (id) |txn_id| (try server.txn_sessions.probeOwnerNodeId(txn_id, &server.query_admission, context)) orelse @import("../../transactions.zig").sessionOwnerNodeId(txn_id) else local) == local;
         // These references have never escaped the execution owner. Retire a
         // successful local proof and its intent in one atomic batch rather than
         // accumulating every autocommit in the connection's bounded manifest.
-        if (id != null and record.value.execution_admitted and local_proof and try store.completionReferenceSettled(id.?, reference)) {
-            if (store.retireLocalPreparedRegistration(reference, id.?)) |_| {
+        if (id != null and record.value.execution_admitted and local_proof and try store.completionReferenceSettledControlled(id.?, reference, context)) {
+            if (store.retireLocalPreparedRegistrationControlled(reference, id.?, context)) |_| {
                 discardOutcome(completion, alloc, index);
                 continue;
             } else |_| {}
         }
-        if (!try store.joinRegistration(reference)) {
+        if (!try store.joinRegistrationControlled(reference, context)) {
             if (!@import("../../completion_outbox.zig").isObservation(reference)) return error.CompletionUnavailable;
             discardOutcome(completion, alloc, index);
             continue;
         }
         const request: OwnerRequest = .{ .reference_id = reference, .consumer_node_id = outcome.registration_node_id, .action = .status };
-        const complete = consumerAction(server, alloc, request, true) catch false;
+        const complete = consumerActionControlled(server, alloc, request, true, context) catch false;
         if (complete) {
             var ack = request;
             ack.action = .acknowledge;
-            if (consumerAction(server, alloc, ack, true) catch false) {
+            if (consumerActionControlled(server, alloc, ack, true, context) catch false) {
                 discardOutcome(completion, alloc, index);
                 continue;
             }
@@ -352,12 +353,20 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
     completion.join_begin = null;
 }
 pub fn pinJoined(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, network: std.Io) void {
+    pinJoinedControlled(server, alloc, completion, network, .{});
+}
+
+pub fn pinJoinedControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, network: std.Io, request: operation.RequestContext) void {
     if (completion.unknown or completion.outcomes.items.len == 0) return;
     const fresh = for (completion.outcomes.items) |outcome| {
         if (outcome.registration_node_id == null) break true;
     } else false;
     const has_prepared = completion.join_begin != null;
     if (!fresh and !has_prepared) return;
+    const context = settlementContext(request) catch {
+        completion.unknown = true;
+        return;
+    };
     const io = server_mod.ApiHttpServer.configuredDurableIo(server.cfg) orelse {
         completion.unknown = true;
         return;
@@ -367,14 +376,15 @@ pub fn pinJoined(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, co
         alloc: std.mem.Allocator,
         completion: *wire.Completion,
         network: std.Io,
+        context: operation.RequestContext,
         done: std.Io.Event = .unset,
         fn run(job: *@This()) void {
             defer job.done.set(job.network);
-            const store = registrationStore(job.server) catch {
+            const store = registrationStoreControlled(job.server, job.context) catch {
                 job.completion.unknown = true;
                 return;
             };
-            joinPrepared(job.server, job.alloc, job.completion) catch {
+            joinPrepared(job.server, job.alloc, job.completion, job.context) catch {
                 job.completion.unknown = true;
                 return;
             };
@@ -394,7 +404,7 @@ pub fn pinJoined(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, co
                         return;
                     };
                     const reserved = job.completion.capacity.remaining > 0;
-                    const reference = (if (reserved) store.createReservedRegistration(seed, outcome.*) else store.createRegistration(seed, outcome.*)) catch {
+                    const reference = (if (reserved) store.createReservedRegistrationControlled(seed, outcome.*, job.context) else store.createRegistrationControlled(seed, outcome.*, job.context)) catch {
                         job.alloc.free(encoded);
                         job.completion.unknown = true;
                         return;
@@ -408,7 +418,7 @@ pub fn pinJoined(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, co
                     job.completion.unknown = true;
                     return;
                 };
-                _ = consumerAction(job.server, job.alloc, .{ .reference_id = reference, .consumer_node_id = outcome.registration_node_id, .action = .pin }, true) catch {
+                _ = consumerActionControlled(job.server, job.alloc, .{ .reference_id = reference, .consumer_node_id = outcome.registration_node_id, .action = .pin }, true, job.context) catch {
                     outcome.registration_pending = true;
                     continue;
                 };
@@ -416,7 +426,7 @@ pub fn pinJoined(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, co
             }
         }
     };
-    var job = Job{ .server = server, .alloc = alloc, .completion = completion, .network = network };
+    var job = Job{ .server = server, .alloc = alloc, .completion = completion, .network = network, .context = context };
     var future = io.concurrent(Job.run, .{&job}) catch {
         completion.unknown = true;
         return;
@@ -424,13 +434,13 @@ pub fn pinJoined(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, co
     job.done.waitUncancelable(network);
     @import("../../protected_future.zig").wait(io, &future);
 }
-fn pin(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, outcome: wire.Outcome, reference: [16]u8, retired_through: u64) !void {
+fn pin(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, outcome: wire.Outcome, reference: [16]u8, retired_through: u64, context: operation.RequestContext) !void {
     if (outcome.ddl_receipt_json) |encoded| {
         var parsed = try std.json.parseFromSlice(catalog.DdlReceipt, alloc, encoded, .{});
         defer parsed.deinit();
-        try change(server, alloc, reference, try owner(parsed.value), .pin, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s }, true, retired_through);
+        try change(server, alloc, reference, try owner(parsed.value), .pin, context, true, retired_through);
     } else if (outcome.transaction_id) |encoded| {
-        if (!try ownerAction(server, alloc, .{ .transaction_id = try parseId(encoded), .reference_id = reference, .action = .pin, .managed = true, .retired_through = retired_through }, true)) return error.CompletionUnavailable;
+        if (!try ownerActionControlled(server, alloc, .{ .transaction_id = try parseId(encoded), .reference_id = reference, .action = .pin, .managed = true, .retired_through = retired_through }, true, context)) return error.CompletionUnavailable;
     } else return error.InvalidArgument;
 }
 pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, receipt: wire.Receipt, context: operation.RequestContext) !bool {
@@ -439,7 +449,7 @@ pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, rece
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
         if (outcome.registration_node_id) |node| {
-            if (!try consumerAction(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .status }, true)) return false;
+            if (!try consumerActionControlled(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .status }, true, context)) return false;
             continue;
         }
         if (outcome.ddl_receipt_json) |encoded| {
@@ -468,7 +478,7 @@ pub fn settled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, rece
             if (coverage.value.schema_version < target.schema_version or coverage.value.retirement != null or !(std.mem.eql(u8, coverage.value.state, "enforced") or std.mem.eql(u8, coverage.value.state, "invalid"))) return false;
             try change(server, alloc, reference, target, .complete, context, false, 0);
         } else if (outcome.transaction_id) |encoded| {
-            if (!try ownerAction(server, alloc, .{ .transaction_id = try parseId(encoded), .reference_id = reference, .action = .status }, true)) return false;
+            if (!try ownerActionControlled(server, alloc, .{ .transaction_id = try parseId(encoded), .reference_id = reference, .action = .status }, true, context)) return false;
         } else return false;
     }
     return true;
@@ -479,7 +489,7 @@ pub fn acknowledge(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
         try context.ensureActive();
         const reference = try parseId(outcome.reference_id orelse return false);
         if (outcome.registration_node_id) |node| {
-            if (!try consumerAction(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .acknowledge }, true)) return false;
+            if (!try consumerActionControlled(server, alloc, .{ .reference_id = reference, .consumer_node_id = node, .action = .acknowledge }, true, context)) return false;
             continue;
         }
         if (outcome.ddl_receipt_json) |encoded| {
@@ -487,7 +497,7 @@ pub fn acknowledge(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
             defer parsed.deinit();
             try change(server, alloc, reference, try owner(parsed.value), .acknowledge, context, false, 0);
         } else if (outcome.transaction_id) |encoded| {
-            if (!try ownerAction(server, alloc, .{ .transaction_id = try parseId(encoded), .reference_id = reference, .action = .acknowledge }, true)) return false;
+            if (!try ownerActionControlled(server, alloc, .{ .transaction_id = try parseId(encoded), .reference_id = reference, .action = .acknowledge }, true, context)) return false;
         } else return false;
     }
     return true;
@@ -513,20 +523,25 @@ pub const OwnerRequest = struct { transaction_id: [16]u8 = @splat(0), reference_
 // Remote stores retain compact retirement checkpoints, so delayed retries cannot
 // recreate acknowledged proofs, including across process restarts.
 fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, forward: bool) anyerror!bool {
+    return consumerActionControlled(server, alloc, request, forward, .{});
+}
+
+fn consumerActionControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, forward: bool, parent: operation.RequestContext) anyerror!bool {
+    const context = try settlementContext(parent);
     if (request.action != .pin and request.action != .status and request.action != .acknowledge) return error.InvalidArgument;
     const local = if (server.cfg.session_router) |router| router.localNodeId() else 0;
     const node = request.consumer_node_id orelse return error.InvalidArgument;
-    if (node != local) return forwardOwner(server, alloc, request, node, forward);
-    const store = try registrationStore(server);
-    const lock = store.lockRegistration(request.reference_id);
+    if (node != local) return forwardOwnerControlled(server, alloc, request, node, forward, context);
+    const store = try registrationStoreControlled(server, context);
+    const lock = try store.lockRegistrationControlled(request.reference_id, context);
     defer lock.unlock();
     // Observation records are removed only after terminal settlement.
     // Ordinary issued sequences can also denote unpublished discards.
-    var record = (try store.loadRegistration(alloc, request.reference_id)) orelse
+    var record = (try store.loadRegistrationControlled(alloc, request.reference_id, context)) orelse
         return request.action == .acknowledge or (request.action == .status and @import("../../completion_outbox.zig").isObservation(request.reference_id));
     defer record.deinit();
     const observation = @import("../../completion_outbox.zig").isObservation(request.reference_id);
-    const floor = if (observation) 0 else try store.registrationFloor();
+    const floor = if (observation) 0 else try store.registrationFloorControlled(request.reference_id, context);
     var outcome = record.value.outcome;
     const hex = std.fmt.bytesToHex(request.reference_id, .lower);
     outcome.reference_id = &hex;
@@ -540,41 +555,39 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
         if (record.value.outcome.ddl_receipt_json) |json| {
             var parsed = try std.json.parseFromSlice(catalog.DdlReceipt, alloc, json, .{});
             defer parsed.deinit();
-            try change(server, alloc, request.reference_id, try owner(parsed.value), .abandon, .{}, true, floor);
-            try change(server, alloc, request.reference_id, try owner(parsed.value), .acknowledge, .{}, true, floor);
+            try change(server, alloc, request.reference_id, try owner(parsed.value), .abandon, context, true, floor);
+            try change(server, alloc, request.reference_id, try owner(parsed.value), .acknowledge, context, true, floor);
         } else {
             const target_id = try parseId(record.value.outcome.transaction_id.?);
-            _ = try ownerAction(server, alloc, .{ .transaction_id = target_id, .reference_id = request.reference_id, .action = .abandon, .managed = true, .retired_through = floor }, true);
-            _ = try ownerAction(server, alloc, .{ .transaction_id = target_id, .reference_id = request.reference_id, .action = .acknowledge, .managed = true, .retired_through = floor }, true);
+            _ = try ownerActionControlled(server, alloc, .{ .transaction_id = target_id, .reference_id = request.reference_id, .action = .abandon, .managed = true, .retired_through = floor }, true, context);
+            _ = try ownerActionControlled(server, alloc, .{ .transaction_id = target_id, .reference_id = request.reference_id, .action = .acknowledge, .managed = true, .retired_through = floor }, true, context);
         }
-        try store.removeRegistration(request.reference_id);
+        try store.removeRegistrationControlled(request.reference_id, context);
         return true;
     }
     if (record.value.prepared and !(record.value.observation orelse false) and record.value.outcome.transaction_id != null and record.value.phase != .acknowledging) {
-        _ = try ownerAction(server, alloc, .{ .transaction_id = try parseId(record.value.outcome.transaction_id.?), .reference_id = request.reference_id, .action = .quiesce, .managed = true, .retired_through = floor }, true);
+        _ = try ownerActionControlled(server, alloc, .{ .transaction_id = try parseId(record.value.outcome.transaction_id.?), .reference_id = request.reference_id, .action = .quiesce, .managed = true, .retired_through = floor }, true, context);
     }
     if (record.value.phase == .registering) {
-        pin(server, alloc, outcome, request.reference_id, floor) catch |err| {
-            const probe_context: operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
-            if (!(settled(server, alloc, .{ .outcomes = &.{outcome} }, probe_context) catch false)) return err;
+        pin(server, alloc, outcome, request.reference_id, floor, context) catch |err| {
+            if (!(settled(server, alloc, .{ .outcomes = &.{outcome} }, context) catch false)) return err;
         };
         record.value.phase = .registered;
-        try store.putRegistration(request.reference_id, record.value);
+        try store.putRegistrationControlled(request.reference_id, record.value, context);
     }
     if (request.action == .pin) return record.value.phase != .acknowledging;
-    const context: operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
     if (request.action == .status) {
         if (record.value.phase == .acknowledging) return true;
         if (observation) {
             const id = try parseId(outcome.transaction_id orelse return error.InvalidTransactionSessionRecord);
-            return store.completionReferenceSettled(id, request.reference_id);
+            return store.completionReferenceSettledControlled(id, request.reference_id, context);
         }
         return settled(server, alloc, .{ .outcomes = &.{outcome} }, context);
     }
     if (observation) {
         const id = try parseId(outcome.transaction_id orelse return error.InvalidTransactionSessionRecord);
-        if (record.value.phase != .acknowledging and !try store.completionReferenceSettled(id, request.reference_id)) return false;
-        try store.retireLocalPreparedRegistration(request.reference_id, id);
+        if (record.value.phase != .acknowledging and !try store.completionReferenceSettledControlled(id, request.reference_id, context)) return false;
+        try store.retireLocalPreparedRegistrationControlled(request.reference_id, id, context);
         return true;
     }
     if (record.value.phase != .acknowledging) {
@@ -582,19 +595,26 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
         // a live consumer. Once terminal proof is observed it remains terminal.
         if (!try settled(server, alloc, .{ .outcomes = &.{outcome} }, context)) return false;
         record.value.phase = .acknowledging;
-        try store.putRegistration(request.reference_id, record.value);
+        try store.putRegistrationControlled(request.reference_id, record.value, context);
     }
     const complete = if (outcome.ddl_receipt_json) |encoded| blk: {
         var parsed = try std.json.parseFromSlice(catalog.DdlReceipt, alloc, encoded, .{});
         defer parsed.deinit();
         try change(server, alloc, request.reference_id, try owner(parsed.value), .acknowledge, context, true, floor);
         break :blk true;
-    } else try ownerAction(server, alloc, .{ .transaction_id = try parseId(outcome.transaction_id.?), .reference_id = request.reference_id, .action = .acknowledge, .managed = true, .retired_through = floor }, true);
-    if (complete) try store.removeRegistration(request.reference_id);
+    } else try ownerActionControlled(server, alloc, .{ .transaction_id = try parseId(outcome.transaction_id.?), .reference_id = request.reference_id, .action = .acknowledge, .managed = true, .retired_through = floor }, true, context);
+    if (complete) try store.removeRegistrationControlled(request.reference_id, context);
     return complete;
 }
 fn forwardOwner(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, node: u64, forward: bool) !bool {
     return forwardOwnerControlled(server, alloc, request, node, forward, .{});
+}
+
+pub fn settlementContext(request: operation.RequestContext) !operation.RequestContext {
+    var context = try request.platformDeadline();
+    const limit = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s;
+    context.deadline_ns = @min(context.deadline_ns orelse limit, limit);
+    return context;
 }
 
 fn forwardOwnerControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, node: u64, forward: bool, context: operation.RequestContext) !bool {
@@ -615,7 +635,9 @@ fn forwardOwnerControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
     try budget.ensureActive();
     const timeout = if (budget.deadline_ns) |deadline| @min(1500, @max(1, (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms)) else 1500;
     const cancellation: http_common.RequestCancellation = .{ .borrowed_token = budget.cancellation };
-    var response = try executor.execute(alloc, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = @intCast(timeout), .cancellation = &cancellation, .headers = &.{ .{ .name = auth.header_name, .value = token }, .{ .name = "X-Antfly-SQL-Settlement", .value = "owner-v12" } } });
+    var timeout_buf: [16]u8 = undefined;
+    const timeout_text = try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout});
+    var response = try executor.execute(alloc, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = @intCast(timeout), .cancellation = &cancellation, .headers = &.{ .{ .name = auth.header_name, .value = token }, .{ .name = "X-Antfly-SQL-Settlement", .value = "owner-v12" }, .{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = timeout_text } } });
     defer response.deinit(alloc);
     if (response.status != 200) return error.CompletionOwnerUnavailable;
     var result = try std.json.parseFromSlice(struct { complete: bool }, alloc, response.body, .{});
@@ -625,36 +647,41 @@ fn forwardOwnerControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allo
 // Node-local records and their proofs retain the original node identity after
 // payload expiry. Shared stores remain directly authoritative on every replica.
 pub fn ownerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, forward: bool) !bool {
-    if (request.consumer_node_id != null) return consumerAction(server, alloc, request, forward);
+    return ownerActionControlled(server, alloc, request, forward, .{});
+}
+
+pub fn ownerActionControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, forward: bool, context: operation.RequestContext) anyerror!bool {
+    try context.ensureActive();
+    if (request.consumer_node_id != null) return consumerActionControlled(server, alloc, request, forward, context);
     const txn = @import("../../transactions.zig");
     // Observation proofs can only be created and retired atomically with the
     // local outbox record. Standalone owner actions cannot mutate them.
     if (@import("../../completion_outbox.zig").isObservation(request.reference_id) and request.action != .status)
         return error.InvalidArgument;
     if (server.txn_sessions.durable_scope != .cluster_shared) {
-        const node = (try server.txn_sessions.getOwnerNodeId(alloc, request.transaction_id)) orelse txn.sessionOwnerNodeId(request.transaction_id);
+        const node = (try server.txn_sessions.probeOwnerNodeId(request.transaction_id, &server.query_admission, context)) orelse txn.sessionOwnerNodeId(request.transaction_id);
         const local = if (server.cfg.session_router) |router| router.localNodeId() else 0;
-        if (node != local) return forwardOwner(server, alloc, request, node, forward);
+        if (node != local) return forwardOwnerControlled(server, alloc, request, node, forward, context);
     }
     const store = server.txn_sessions.durable orelse return error.DurabilityUnavailable;
     if (server.txn_sessions.durable_scope == .cluster_shared and !store.supportsSharedMutations())
         return error.CompletionOwnerUnavailable;
+    const floor = if (request.managed) request.retired_through else null;
     return switch (request.action) {
-        .forget => try store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, .forget),
-        .quiesce => if (try store.completionReferenceSettled(request.transaction_id, request.reference_id)) true else store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, .quiesce),
-        .prepare, .observe, .abandon => store.changeCompletionReference(request.transaction_id, request.reference_id, false, if (request.managed) request.retired_through else null, switch (request.action) {
-            .prepare => .prepare,
-            .observe => .observe,
-            .quiesce => .quiesce,
-            .abandon => .abandon,
-            else => unreachable,
-        }),
+        .status => store.completionReferenceSettledControlled(request.transaction_id, request.reference_id, context),
+        .quiesce => if (try store.completionReferenceSettledControlled(request.transaction_id, request.reference_id, context)) true else store.changeCompletionReferenceControlled(request.transaction_id, request.reference_id, false, floor, .quiesce, context),
         .pin => blk: {
-            if (request.managed) _ = try store.managedCompletion(request.transaction_id, request.reference_id, false, request.retired_through) else try store.pinCompletion(request.transaction_id, request.reference_id);
+            _ = try store.changeCompletionReferenceControlled(request.transaction_id, request.reference_id, false, floor, .pin, context);
             break :blk true;
         },
-        .status => store.completionReferenceSettled(request.transaction_id, request.reference_id),
-        .acknowledge => if (request.managed) store.managedCompletion(request.transaction_id, request.reference_id, true, request.retired_through) else store.acknowledgeCompletion(request.transaction_id, request.reference_id),
+        .acknowledge, .prepare, .observe, .abandon, .forget => store.changeCompletionReferenceControlled(request.transaction_id, request.reference_id, request.action == .acknowledge, floor, switch (request.action) {
+            .pin, .acknowledge => .pin,
+            .prepare => .prepare,
+            .observe => .observe,
+            .abandon => .abandon,
+            .forget => .forget,
+            else => unreachable,
+        }, context),
     };
 }
 pub fn reclaimLegacyObservationAcks(server: *server_mod.ApiHttpServer) !bool {
