@@ -3851,18 +3851,7 @@ pub const CudaCompute = struct {
             std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
             if (owner.head.ptr == 0 or self.compute.execution_scope == null)
                 return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
-            const scope = self.compute.execution_scope.?;
-            scope.output_ptr = owner.head.ptr;
-            scope.output_bytes = owner.head.len;
-            scope.output_active = true;
-            scope.output_taken = false;
-            defer scope.output_active = false;
-            const output = try cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
-            if (!scope.output_taken) {
-                cb.free(output);
-                return error.InvalidExecutionPlan;
-            }
-            return output;
+            return linearNoBiasWithDestination(self.compute, input_ct, weight, owner.rows, owner.hidden, owner.vocab, false, owner.head);
         }
         pub fn setInput(self: *@This(), input_ct: CT) !void {
             const owner = &self.compute.bounded_decode_graph;
@@ -17854,11 +17843,6 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
     if (self.execution_scope) |scope| {
-        if (scope.output_active and scope.output_ptr != 0 and len == scope.output_bytes) {
-            if (scope.output_taken) return error.InvalidExecutionPlan;
-            scope.output_taken = true;
-            return .{ .ptr = scope.output_ptr, .len = len, .borrowed = true };
-        }
         if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
     }
     var result = try allocDeviceBufferOrdinary(self, len);
@@ -18131,10 +18115,6 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
 fn releaseDeviceBufferUsing(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer, comptime checked: bool) !void {
     if (buffer.ptr == 0) return;
     if (self.execution_scope) |scope| {
-        if (buffer.borrowed and buffer.ptr == scope.output_ptr) {
-            buffer.* = .{};
-            return;
-        }
         if (scope.base == 0) scope.release(buffer.ptr) else if (scope.owns(buffer.ptr)) {
             scope.release(buffer.ptr);
             buffer.* = .{};
@@ -21208,10 +21188,17 @@ const OwnedF32Output = struct {
         return fromOwnedShapeBytes(compute, shape, count, count * @sizeOf(f32));
     }
     inline fn fromOwnedShapeBytes(compute: *CudaCompute, shape: []i64, count: usize, bytes: usize) !@This() {
+        return fromOwnedShapeDestination(compute, shape, count, bytes, null);
+    }
+    inline fn fromOwnedShapeDestination(compute: *CudaCompute, shape: []i64, count: usize, bytes: usize, destination: ?buffer_mod.DeviceBuffer) !@This() {
         errdefer compute.allocator.free(shape);
         const header = try compute.allocator.create(CudaTensor);
         errdefer compute.allocator.destroy(header);
-        return .{ .compute = compute, .shape = shape, .buffer = try allocDeviceBuffer(compute, bytes), .count = count, .header = header };
+        const buffer: buffer_mod.DeviceBuffer = if (destination) |assigned| blk: {
+            if (assigned.ptr == 0 or assigned.len != bytes) return error.InvalidExecutionPlan;
+            break :blk .{ .ptr = assigned.ptr, .len = assigned.len, .borrowed = true };
+        } else try allocDeviceBuffer(compute, bytes);
+        return .{ .compute = compute, .shape = shape, .buffer = buffer, .count = count, .header = header };
     }
     inline fn deinit(output: *@This()) void {
         if (output.shape) |shape| {
@@ -25322,15 +25309,21 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
 
 fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, primitive_training: bool) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    return linearNoBiasWithDestination(self, input, weight, rows, in_dim, out_dim, primitive_training, null);
+}
+
+fn linearNoBiasWithDestination(self: *CudaCompute, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, primitive_training: bool, destination: ?buffer_mod.DeviceBuffer) !CT {
     try validateProjectionOperands(tensorFromCt(input), tensorFromCt(weight), null, rows, in_dim, out_dim);
     const out_count = try checkedMul(rows, out_dim);
     const output_bytes = try lightOnLinearOutputBytes(self, tensorFromCt(weight), rows, out_dim);
-    var output = try OwnedF32Output.fromOwnedShapeBytes(self, try allocShape2(self.allocator, rows, out_dim), out_count, output_bytes);
+    var output = try OwnedF32Output.fromOwnedShapeDestination(self, try allocShape2(self.allocator, rows, out_dim), out_count, output_bytes, destination);
     defer output.deinit();
     errdefer if (strictSeq2seqMatmul(self) or isF16Weight(tensorFromCt(weight))) self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
     const device = output.buffer;
     try linearNoBiasInto(self, device, tensorFromCt(input), tensorFromCt(weight), rows, in_dim, out_dim, primitive_training);
-    return output.intoTensor();
+    const result = output.intoTensor();
+    if (destination != null) tensorFromCt(result).owns_buffer = false;
+    return result;
 }
 
 /// One target schedule for allocating and physically planned projections.
@@ -28246,7 +28239,6 @@ fn reducedAddLayerNormSum(ctx: *anyopaque, a_ct: CT, b_ct: CT, gamma_ct: CT, bet
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile != .transformer_seq2seq or !self.runtime_policy.seq2seq.residual_sum or self.kernels.add_layer_norm_sum_f32 == null) return null;
     if (dim == 0 or !std.math.isFinite(eps) or eps < 0) return null;
-    if (self.execution_scope) |scope| if (scope.output_active) return null;
     const a = tensorFromCt(a_ct);
     const b = tensorFromCt(b_ct);
     const gamma = tensorFromCt(gamma_ct);
@@ -45027,22 +45019,14 @@ test "LightOnOCR3 CUDA wide graph head has independent admission and never enter
     const head_pointer = owner.head.ptr;
     const cached = compute.temp_buffers.buffers.items.len;
     for ([_]usize{ 0, 0x1000 }) |base| {
-        var scope = @import("../../execution/stream_workspace.zig").Scope{
-            .plan = owner.plan.?,
-            .base = base,
-            .output_ptr = owner.head.ptr,
-            .output_bytes = owner.head.len,
-            .output_active = true,
-        };
+        var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = owner.plan.?, .base = base };
         compute.execution_scope = &scope;
         defer compute.execution_scope = null;
-        var output = try allocDeviceBuffer(&compute, head_bytes);
-        try std.testing.expect(output.borrowed and scope.output_taken);
-        try std.testing.expectEqual(head_pointer, output.ptr);
-        try std.testing.expectError(error.InvalidExecutionPlan, allocDeviceBuffer(&compute, head_bytes));
-        scope.output_active = false;
-        releaseDeviceBuffer(&compute, &output);
-        try std.testing.expectEqual(@as(usize, 0), output.ptr);
+        var output = try OwnedF32Output.fromOwnedShapeDestination(&compute, try allocShape2(compute.allocator, 8, 128), 8 * 128, head_bytes, owner.head);
+        defer output.deinit();
+        try std.testing.expect(output.buffer.borrowed);
+        try std.testing.expectEqual(head_pointer, output.buffer.ptr);
+        try std.testing.expectError(error.InvalidExecutionPlan, OwnedF32Output.fromOwnedShapeDestination(&compute, try allocShape2(compute.allocator, 8, 128), 8 * 128, head_bytes - 4, owner.head));
         try std.testing.expectEqual(head_pointer, owner.head.ptr);
         try std.testing.expectEqual(cached, compute.temp_buffers.buffers.items.len);
         try std.testing.expectEqual(@as(usize, 0), owner.plan.?.event_count);
@@ -60106,12 +60090,11 @@ test "source linear bank metadata reuses only its audio owner or exact captured 
     plan.allocate(layout.bytes, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000 };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
     var captured = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x10000000), captured.bank.ptr);
-    try std.testing.expect(!scope.output_taken);
     captured.deinit(&compute);
     try std.testing.expect(scope.valid and scope.cursor == plan.event_count);
 }
@@ -60411,12 +60394,12 @@ test "source local relative temporary follows the actual learned and captured ba
     plan.allocate(layout.bytes, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = layout.bytes };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000 };
     compute.source_linear_scratch = .{};
     compute.execution_scope = &scope;
     var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, layout.bytes, layout.bytes, false);
     temporary.deinit(&compute);
-    try std.testing.expect(scope.valid and scope.cursor == plan.event_count and !scope.output_taken);
+    try std.testing.expect(scope.valid and scope.cursor == plan.event_count);
 }
 
 test "actual source capture without a planned arena rejects before allocation or SDK use" {
@@ -60477,7 +60460,7 @@ test "source local relative actual external capture rejects before module or out
     plan.allocate(256, 0x1000);
     plan.release(0x1000);
     try std.testing.expect(plan.finishNoOutput());
-    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000, .output_active = true, .output_ptr = 0x20000000, .output_bytes = 256 };
+    var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 0x10000000 };
     compute.execution_scope = &scope;
     compute.source_linear_scratch = .{};
     compute.embedding_gemma2 = null;
@@ -60488,7 +60471,7 @@ test "source local relative actual external capture rejects before module or out
     var temporary = try SourceLinearTemporary.acquireKnownCapture(&compute, 256, 256, capture);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x10000000), temporary.bank.ptr);
     temporary.deinit(&compute);
-    try std.testing.expect(scope.valid and scope.cursor == plan.event_count and !scope.output_taken);
+    try std.testing.expect(scope.valid and scope.cursor == plan.event_count);
     try std.testing.expectEqual(@as(u64, 0), compute.stats.device_alloc_calls);
     try std.testing.expectEqual(@as(usize, 6), Fake.queries);
     // Invalid public geometry must still fail without even querying the driver.

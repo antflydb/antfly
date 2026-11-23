@@ -121,13 +121,6 @@ pub const Scope = struct {
     base: DevicePointer = 0,
     cursor: usize = 0,
     valid: bool = true,
-    // A caller-owned output can outlive individual arena allocations without
-    // joining the ordinary temporary cache. Only its explicit producer may
-    // borrow it; release remains valid through this complete stream scope.
-    output_ptr: DevicePointer = 0,
-    output_bytes: usize = 0,
-    output_active: bool = false,
-    output_taken: bool = false,
     published_ptr: DevicePointer = 0,
     bound_start: DevicePointer = 0,
     bound_end: DevicePointer = 0,
