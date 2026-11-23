@@ -20691,13 +20691,13 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const replay = arena.graph != null and arena.preferReplay();
     // Establish scratch and input custody before allocating the result or
     // submitting profiling events and copies.
-    var execution_scope = if (replay) null else try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
-    if (execution_scope) |*scope| {
-        if (capture) try SourceLinearTemporary.validateArenaCapture(self, scope);
-        if (!capture) for (inputs, spans) |ct, span| {
-            if (span.bytes != 0 and !scope.disjointBacking(tensorFromCt(ct).buffer.ptr, span.bytes)) return null;
-        };
+    for (inputs, spans) |ct, span| {
+        if (span.bytes == 0) continue;
+        const source: buffer_mod.DeviceBuffer = .{ .ptr = tensorFromCt(ct).buffer.ptr, .len = span.bytes };
+        if (source.ptr == 0 or CudaCompute.stageBufferOverlap(source, arena.buffers[0])) return null;
     }
+    var execution_scope = if (replay) null else try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
+    if (capture) try SourceLinearTemporary.validateArenaCapture(self, &execution_scope.?);
     const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
@@ -60231,11 +60231,9 @@ test "public source audio linear recreates input bank through actual learning ca
         const expected: [4]f32 = @splat(@floatFromInt(value));
         try std.testing.expectEqualSlices(f32, &expected, held_values);
     }
-    // An eager call with a source in the arena backing must decline before
-    // the callback, leaving the already published results untouched.
+    // Both dispatch routes must decline an arena alias before submitting work.
     for (&compute.embedding_gemma2_execution.arenas) |*arena| {
         if (arena.kind != .audio or arena.graph == null) continue;
-        arena.replay_samples = 2;
         arena.eager_samples = 0;
         arena.timing_replay = null;
         var alias: CudaTensor = .{
@@ -60246,7 +60244,14 @@ test "public source audio linear recreates input bank through actual learning ca
             .owns_buffer = false,
             .owns_shape = false,
         };
-        try std.testing.expect(try cb.audioExecution(0x303, &.{ &alias, identity }, &run, Run.call) == null);
+        const copies_before = compute.stats.d2d_bytes;
+        const replays_before = compute.audio_graph_replays;
+        for ([_]u8{ 2, 0 }) |replay_samples| {
+            arena.replay_samples = replay_samples;
+            try std.testing.expect(try cb.audioExecution(0x303, &.{ &alias, identity }, &run, Run.call) == null);
+        }
+        try std.testing.expectEqual(copies_before, compute.stats.d2d_bytes);
+        try std.testing.expectEqual(replays_before, compute.audio_graph_replays);
         break;
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 5), run.calls);
