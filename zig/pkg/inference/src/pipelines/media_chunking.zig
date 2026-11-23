@@ -1123,6 +1123,7 @@ pub const Runner = struct {
                 }
                 break :observed_track if (err == error.OutOfMemory and observed.memory.denied != null) error.AudioTooLarge else err;
             };
+            observed.builder.compactResolved();
             break :observed_track Track.initObservedWebm(self.allocator, input, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission, observed.builder, observed.memory.live, owner.flight != null);
         } else Track.initCached(self.allocator, input, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission);
         if (owner.flight) |lease| lease.deinit();
@@ -1293,6 +1294,7 @@ pub const Runner = struct {
                 defer reader.deinit();
                 if (required_audio and builder.failure == null) {
                     builder.resolve(source) catch |err| builder.fail(err);
+                    if (builder.failure == null) builder.compactResolved();
                 }
                 if (builder.failure) |err| {
                     if (err == error.OutOfMemory) {

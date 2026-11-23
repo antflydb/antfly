@@ -712,6 +712,12 @@ pub const DirectoryBuilder = struct {
         self.deferred.clearAndFree(self.allocator);
     }
 
+    pub fn compactResolved(self: *DirectoryBuilder) void {
+        std.debug.assert(self.failure == null and self.deferred.items.len == 0);
+        self.packets.shrinkAndFree(self.allocator, self.packets.items.len);
+        self.padding.shrinkAndFree(self.allocator, self.padding.items.len);
+    }
+
     fn collectBlock(self: *DirectoryBuilder, input: *Source, elem: Webm.Element, discard: ?Webm.ObservedDiscard, prefix: []const u8, ticks: u64, scale: u64, resident_only: bool) !void {
         const track = self.track orelse return error.UnsupportedAudioFormat;
         var scan = Webm.Scan{ .input = input, .limits = self.limits };
@@ -913,6 +919,19 @@ fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track:
         packets.appendAssumeCapacity(packet);
         offset += size;
     }
+}
+
+test "WebM sealed directory releases unused packet and padding capacity" {
+    const a = std.testing.allocator;
+    var builder = DirectoryBuilder{ .allocator = a, .limits = .{} };
+    defer builder.deinit();
+    try builder.packets.ensureTotalCapacityPrecise(a, 16);
+    builder.packets.appendAssumeCapacity(.{ .offset = 1, .size = 8, .time_ns = 0 });
+    try builder.padding.ensureTotalCapacityPrecise(a, 8);
+    builder.compactResolved();
+    try std.testing.expectEqual(@as(usize, 1), builder.packets.capacity);
+    try std.testing.expectEqual(@as(usize, 0), builder.padding.capacity);
+    try std.testing.expectEqual(@as(u64, 1), builder.packets.items[0].offset);
 }
 
 test "WebM borrowed and range indexes preserve signed block padding" {
