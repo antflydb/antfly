@@ -768,7 +768,7 @@ pub const Session = struct {
         const stamp = description.stamp orelse return .recheck;
         if (!self.source.vtable.guarded_select_stream or self.status != .idle or
             !description.is_select or description.copy_out != null or description.copy_in != null or
-            !stamp.reusable or stamp.catalog == null or description.binding_guard == null or description.setting_epoch == null) return .recheck;
+            !stamp.reusable or stamp.catalog == null or description.binding_guard == null) return .recheck;
         self.openPortalStream(portal, description.columns) catch |err| switch (err) {
             error.CachedPlanResultTypeChanged => return self.cachedPlanChanged(),
             error.CatalogGenerationChanged, error.SettingCatalogChanged => {

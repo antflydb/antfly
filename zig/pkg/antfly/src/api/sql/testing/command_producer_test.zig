@@ -1701,6 +1701,43 @@ test "SQL command producer native cold restart reenrolls an idle durable HTTP co
         .port = .{ .ptr = &hooks, .call = IngressRuntime.call },
         .runtime = hooks.runtime(),
     };
+    try native.until(&source, .retired, hooks.now_ms);
+    const FaultPort = struct {
+        native: *Native,
+        backend: @FieldType(authority.scopes.Registration, "replaces"),
+        mode: enum { expired, rejected },
+        fn call(raw: *anyopaque, alloc: A, input: Call) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode == .rejected and input == .sql_lock_outcome)
+                return std.json.Stringify.valueAlloc(alloc, authority.outcomes.Outcome{ .rejected = .CatalogGenerationChanged }, .{});
+            const bytes = try Native.call(self.native, alloc, input);
+            if (self.mode != .expired or input != .sql_lock_read or !std.meta.eql(input.sql_lock_read.backend, self.backend)) return bytes;
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(authority.Snapshot, alloc, bytes, .{});
+            defer parsed.deinit();
+            parsed.value.head += authority.outcomes.retained;
+            return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        }
+    };
+    for ([_]@FieldType(FaultPort, "mode"){ .expired, .rejected }, 0..) |mode, ordinal| {
+        var retired = (try producer.load(&source, a, connection)).?;
+        defer retired.deinit();
+        var registration = original.value.registration;
+        registration.replaces = retired.value.retiredNativeBackend();
+        registration.lease.backend.id = id(800 + ordinal);
+        registration.lease.expires_at_ms = hooks.now_ms + producer.execution_lease_ms;
+        registration.nonce = native.nonce();
+        try producer.create(&source, "alice", registration, actor, owner.instance, try native.head(), native.nonce(), hooks.now_ms, retired.value.revision);
+        var pending = (try producer.load(&source, a, connection)).?;
+        defer pending.deinit();
+        var fault: FaultPort = .{ .native = &native, .backend = registration.lease.backend, .mode = mode };
+        try producer.advance(&source, a, "alice", pending.value, owner.instance, hooks.now_ms, native.nonce(), .{ .ptr = &fault, .call = FaultPort.call });
+        var failed = (try producer.load(&source, a, connection)).?;
+        defer failed.deinit();
+        try std.testing.expectEqual(.retired, failed.value.phase);
+        try std.testing.expect(failed.value.registration_absent);
+        try std.testing.expect(failed.value.retiredNativeBackend().?.eql(original.value.registration.lease.backend));
+    }
     try owner.enroll(a, native.database);
     var successor = (try producer.load(&source, a, connection)).?;
     defer successor.deinit();

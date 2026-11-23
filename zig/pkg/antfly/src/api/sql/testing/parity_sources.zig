@@ -33,6 +33,9 @@ pub fn Tables(comptime count: usize) type {
         records: [count]local.common_topology_records.TableRecord,
         reads: [count]table_reads.BoundTableReadSource,
         captures: usize = 0,
+        catalog_revision: u64 = 7,
+        catalog_epoch: ?local.system_catalog_relation_reconciliation.Epoch = null,
+        catalog_stamp_reads: std.atomic.Value(usize) = .init(0),
         native_reads: std.atomic.Value(usize) = .init(0),
         lookup_calls: std.atomic.Value(usize) = .init(0),
         unbounded_reads: std.atomic.Value(usize) = .init(0),
@@ -58,10 +61,22 @@ pub fn Tables(comptime count: usize) type {
         pub fn systemCatalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, input: @import("../../../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
+            if (input == .setting_snapshot and self.catalog_epoch != null)
+                return std.json.Stringify.valueAlloc(a, local.sql_setting_catalog.RawSnapshot.init(input.setting_snapshot, 1, &.{}), .{});
             if (input == .policy_publication_status) return a.dupe(u8, "null");
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = (try self.record(input.write_validation)).schema_json }, .{});
             if (input != .resolve_many) return error.UnexpectedCatalogCall;
-            if (input.resolve_many.expected_revision) |revision| if (revision != 7) return error.CatalogGenerationChanged;
+            if (input.resolve_many.expected_revision) |revision| if (revision != self.catalog_revision) return error.CatalogGenerationChanged;
+            if (self.catalog_epoch != null and input.resolve_many.cursor_bindings.len != 0)
+                return std.json.Stringify.valueAlloc(a, catalog.ResolvedMany{
+                    .revision = self.catalog_revision,
+                    .tables = &.{},
+                    .source_epoch = self.catalog_epoch,
+                    .cursor_policies = .{ .digest = @splat(0), .protected = false },
+                }, .{});
+            if (self.catalog_epoch != null and input.resolve_many.include_source_epoch and
+                input.resolve_many.targets.len == 0 and input.resolve_many.storage_names.len == 0)
+                _ = self.catalog_stamp_reads.fetchAdd(1, .monotonic);
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -71,14 +86,14 @@ pub fn Tables(comptime count: usize) type {
                     _ = try self.record(name);
                     logical.* = try (catalog.Target{ .table = name }).resourceNameAlloc(scratch);
                 }
-                return std.json.Stringify.valueAlloc(a, catalog.ResolvedMany{ .revision = 7, .tables = &.{}, .logical_names = names }, .{});
+                return std.json.Stringify.valueAlloc(a, catalog.ResolvedMany{ .revision = self.catalog_revision, .tables = &.{}, .logical_names = names, .source_epoch = self.catalog_epoch }, .{});
             }
             const tables = try scratch.alloc(?catalog.ResolvedTable, input.resolve_many.targets.len);
             for (input.resolve_many.targets, tables) |target, *table| {
                 const value = try self.record(target.table);
                 table.* = .{ .table_id = value.table_id, .name = value.name, .query_definition = if (input.resolve_many.include_query_definitions) .{ .table_id = value.table_id, .schema_json = value.schema_json, .read_schema_json = value.read_schema_json, .indexes_json = value.indexes_json } else null };
             }
-            return std.json.Stringify.valueAlloc(a, catalog.ResolvedMany{ .revision = 7, .tables = tables }, .{});
+            return std.json.Stringify.valueAlloc(a, catalog.ResolvedMany{ .revision = self.catalog_revision, .tables = tables, .source_epoch = self.catalog_epoch }, .{});
         }
         pub fn snapshot(ptr: *anyopaque) !metadata.AdminSnapshot {
             const self: *Self = @ptrCast(@alignCast(ptr));

@@ -17,8 +17,11 @@ import contextlib
 import copy
 import io
 import json
+import os
+import select
 import signal
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -52,6 +55,41 @@ class ParityInventoryTest(unittest.TestCase):
         spawn.assert_called_once_with(command, cwd=Path("."), start_new_session=True)
         kill_group.assert_called_once_with(123, signal.SIGKILL)
         self.assertEqual(child.wait.call_count, 2)
+
+    def test_sigterm_reaps_gate_with_live_grandchild(self):
+        gate = (
+            "import os, subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print(os.getpid(), flush=True); "
+            "__import__('time').sleep(60)"
+        )
+        runner = (
+            "from check_sql_parity_inventory import run_gate; "
+            "from pathlib import Path; import sys; "
+            "run_gate([sys.executable, '-c', sys.argv[1]], cwd=Path.cwd(), timeout=60)"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", runner, gate],
+            cwd=Path(__file__).resolve().parent,
+            stdout=subprocess.PIPE,
+        ) as supervisor:
+            group = None
+            try:
+                readable, _, _ = select.select([supervisor.stdout], [], [], 10)
+                self.assertTrue(readable, "gate did not report startup")
+                group = int(supervisor.stdout.readline())
+                supervisor.terminate()
+                # Both descendants inherit the write end, so EOF proves
+                # the entire group stopped, even after the supervisor exited.
+                supervisor.communicate(timeout=10)
+                self.assertEqual(supervisor.returncode, 128 + signal.SIGTERM)
+                group = None
+            finally:
+                if group is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(group, signal.SIGKILL)
+                if supervisor.poll() is None:
+                    supervisor.kill()
 
     @classmethod
     def setUpClass(cls):

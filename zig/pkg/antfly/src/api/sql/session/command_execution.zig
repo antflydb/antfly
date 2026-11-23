@@ -110,7 +110,7 @@ pub const Controller = struct {
                 cut.scope != null or cut.owner != null or cut.next_work != null or cut.receipt != null or cut.wait_resource != null) return error.InvalidSqlBackendResponse;
             if (predecessor != null and cut.idle_session_reenrollment != true) return error.SqlConnectionUnavailable;
             try self.check();
-            const registration: authority.scopes.Registration = .{ .group = cut.group, .connection = self.connection, .nonce = try self.nonce(), .standalone = self.standalone, .replaces = if (predecessor) |prior| prior.registration.lease.backend else null, .lease = .{
+            const registration: authority.scopes.Registration = .{ .group = cut.group, .connection = self.connection, .nonce = try self.nonce(), .standalone = self.standalone, .replaces = if (predecessor) |prior| prior.retiredNativeBackend() else null, .lease = .{
                 .backend = .{ .incarnation = cut.incarnation, .id = try self.nonce(), .fence = 1 },
                 .database = cut.database_id.?,
                 .node = self.node,

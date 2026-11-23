@@ -5854,6 +5854,101 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     try std.testing.expect(!(try http.tablePermissionCurrentlyAllowed(replacement_identity, "docs", .read)));
 }
 
+test "SQL pgwire native prepared streams validate catalog changes without a redundant warm probe" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const db_mod = local.storage_db_selected_root.db;
+    const raft = @import("../../../raft/mod.zig");
+    const reads = @import("antfly_source_root").antfly_sources.table_reads;
+    const Source = @import("../testing/parity_sources.zig").Tables(1);
+    var declaration = try compiler.compile(a, "CREATE TABLE usage_records(id TEXT,status TEXT)", .{});
+    defer declaration.deinit();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, declaration.statement.create_table);
+    defer a.free(schema);
+    var directory = try local.common_test_directory.TestDirectory.init("sql-prepared-admission-native");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
+    defer db.close();
+    try db.setSchemaJson(a, schema);
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"id\":\"row\",\"status\":\"open\"}" }} });
+    var ranges = [_]local.common_topology_records.RangeRecord{.{ .table_id = 7, .group_id = 7, .range_id = 1, .start_key = "", .doc_identity_shard_id = 1, .doc_identity_range_id = 1 }};
+    var source: Source = .{ .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }}, .reads = .{reads.BoundTableReadSource.init("usage_records", 7, &db, raft.read_gate.alreadyReadSafeBarrier())}, .ranges = &ranges };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var policies = @import("antfly_casbin").MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var permission = try usermgr.Permission.initOwned(a, .table, "usage_records", .read);
+    defer permission.deinit(a);
+    var user = try manager.createUser("copy-reader", "secret", &.{permission});
+    defer user.deinit(a);
+    var server = http.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr(), .auth_enabled = true, .user_manager = &manager }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var adapter: Adapter = .{ .server = &server };
+    // Run extended protocol through the native adapter. Only Parse and Bind
+    // sample the catalog stamp on a warm execution. A new revision after
+    // Bind re-enters the compatibility path before delivering any rows.
+    source.catalog_epoch = .{ .incarnation = @splat(1), .revision = 1 };
+    const Frames = struct {
+        fn write(out: *std.Io.Writer, tag: u8, payload: []const u8) !void {
+            try out.writeByte(tag);
+            try out.writeInt(u32, @intCast(payload.len + 4), .big);
+            try out.writeAll(payload);
+        }
+        fn bindThenChange(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, description: wire.Description) !bool {
+            const valid = try Adapter.descriptionCurrent(raw, alloc, identity, request, description);
+            const owner: *Adapter = @ptrCast(@alignCast(raw));
+            const fixture: *Source = @ptrCast(@alignCast(owner.server.source.ptr));
+            if (valid) fixture.catalog_revision += 1;
+            return valid;
+        }
+    };
+    for ([_]bool{ false, true }) |change| {
+        source.catalog_stamp_reads.store(0, .monotonic);
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        const startup = "user\x00copy-reader\x00database\x00default\x00\x00";
+        try input.writer.writeInt(u32, startup.len + 8, .big);
+        try input.writer.writeInt(u32, 196608, .big);
+        try input.writer.writeAll(startup);
+        try Frames.write(&input.writer, 'p', "secret\x00");
+        try Frames.write(&input.writer, 'P', "plan\x00SELECT id FROM usage_records\x00\x00\x00");
+        try Frames.write(&input.writer, 'B', "portal\x00plan\x00\x00\x00\x00\x00\x00\x00");
+        try Frames.write(&input.writer, 'E', "portal\x00\x00\x00\x00\x00");
+        try Frames.write(&input.writer, 'S', "");
+        try Frames.write(&input.writer, 'X', "");
+        var reader = std.Io.Reader.fixed(input.written());
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        const Protocol = @import("../../../pgwire/protocol.zig");
+        var backend = adapter.backend();
+        var vtable = backend.vtable.*;
+        if (change) vtable.description_current = Frames.bindThenChange;
+        backend.vtable = &vtable;
+        var session: Protocol.Session = .{ .alloc = a, .io = std.testing.io, .source = backend, .reader = &reader, .writer = &output.writer };
+        defer session.deinit();
+        try session.run();
+        var frames: Protocol.Cursor = .{ .bytes = output.written() };
+        var rows: usize = 0;
+        while (frames.offset < frames.bytes.len) {
+            const tag = try frames.int(u8);
+            const bytes = try frames.take((try frames.int(u32)) - 4);
+            if (tag == 'E') {
+                std.debug.print("prepared protocol error: {s}\n", .{bytes});
+                return error.UnexpectedPreparedQueryError;
+            }
+            if (tag == 'D') rows += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), rows);
+        try std.testing.expectEqual(@as(usize, if (change) 4 else 2), source.catalog_stamp_reads.load(.monotonic));
+    }
+    source.catalog_epoch = null;
+    source.catalog_revision = 7;
+}
+
 test "SQL pgwire native COPY originals stream PostgreSQL byte contracts over durable rows" {
     const a = std.testing.allocator;
     const local = @import("antfly_local_sources");

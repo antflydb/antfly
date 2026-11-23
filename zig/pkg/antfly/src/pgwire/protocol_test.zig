@@ -2107,7 +2107,6 @@ test "pgwire guarded select validates its opened shape without a second catalog 
     for ([_]bool{ true, false }) |compatible| {
         var mock: Mock = .{
             .guarded_select_stream = true,
-            .describe_setting_epoch = 17,
             .stream_rows = 2,
             .stream_definitions = if (compatible) null else &.{.{ .name = "renamed", .type = .integer }},
         };

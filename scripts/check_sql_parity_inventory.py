@@ -322,18 +322,39 @@ def evidence_runs(gate_ids, gates):
 
 
 def run_gate(command, *, cwd, timeout):
-    with subprocess.Popen(command, cwd=cwd, start_new_session=True) as child:
-        try:
-            status = child.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+    waiting = False
+    terminated = False
+
+    def terminate(signum, _frame):
+        nonlocal terminated
+        terminated = True
+        if waiting:
+            raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        with subprocess.Popen(command, cwd=cwd, start_new_session=True) as child:
             try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait()
-            raise
+                waiting = True
+                if terminated:
+                    raise SystemExit(128 + signal.SIGTERM)
+                status = child.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt, SystemExit):
+                waiting = False
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+                raise
+            finally:
+                waiting = False
+        if terminated:
+            raise SystemExit(128 + signal.SIGTERM)
         if status:
             raise subprocess.CalledProcessError(status, command)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def run_evidence(gate_ids, gates, root=ROOT):
