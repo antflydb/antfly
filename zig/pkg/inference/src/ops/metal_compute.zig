@@ -55952,6 +55952,53 @@ const PreparedDenseRegionFixture = struct {
                 defer a.free(actual);
                 for (actual, wants) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
             }
+            if (mixed_fusion) {
+                // The private decoder Frame has a single provider, while the
+                // general partitioned executable also owns a fallback backend.
+                var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, graph, &.{&cb}, .{}, false);
+                defer layout.deinit();
+                const private_pool = (try layout.createPool(a, graph, &.{&cb}, null)) orelse return error.MissingPhysicalPool;
+                defer private_pool.deinit();
+                private_pool.coverage_graph = graph;
+                private_pool.coverage_reachable = analysis.reachable;
+                private_pool.coverage_backend = cb;
+                private_pool.metal_frame_dispatch = true;
+                try private_pool.configureRoutes(bindings[1..parameter_count]);
+                const private = (try private_pool.prepareRoutes(&.{activation})) orelse return error.MissingPreparedRoutes;
+                defer private.release();
+                try std.testing.expectEqual(@as(usize, 1), private.pool.regions.len);
+                var private_claims = switch (try private.claimRegions(a, null, &.{activation})) {
+                    .ready => |owned| owned,
+                    else => return error.MissingPreparedRegionClaims,
+                };
+                defer private_claims.releaseUnsubmitted();
+                const operation = @import("../execution/backend_operation.zig");
+                var scope: operation.Scope = .{};
+                defer scope.deinitChecked() catch unreachable;
+                try operation.enterInto(&cb, graph, null, .managed, &scope);
+                const cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = scope.token() };
+                const frame = (try private.pool.acquirePreparedWithRegionsAndOperation(null, null, &private_claims, graph, scope.token())) orelse return error.MissingPhysicalPool;
+                defer _ = frame.finishWithCleanup(cleanup) catch unreachable;
+                try frame.beginWithCleanup(cleanup);
+                try frame.beginProgramPreparation();
+                const bound_values = try a.alloc(?CT, graph.nodeCount());
+                defer a.free(bound_values);
+                @memset(bound_values, null);
+                for (inputs[0..parameter_count]) |input| bound_values[input.node_id] = input.value;
+                try frame.prepareProgramViews(&cb, graph, bound_values, cleanup);
+                try frame.sealProgramStorage();
+                const installed = &private.pool.regions[0];
+                for (0..2) |_| {
+                    const projected = try frame.executeProgramRegion(installed, bound_values);
+                    for (projected, installed.outputs) |output, slot| try std.testing.expectEqual(bound_values[slot.slot.node].?, output.tensor);
+                    _ = try frame.executePreparedProgram(&cb, bound_values, graph.outputs.items[0], null, &.{ .total_sequence_len = 0, .query_sequence_len = 0, .kv_sequence_len = 0 });
+                }
+                for (graph.outputs.items, expected) |node, wants| {
+                    const actual = try cb.toFloat32(bound_values[node].?, a);
+                    defer a.free(actual);
+                    for (actual, wants) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
+                }
+            }
             return;
         }
         var profile = (try @import("../execution/region_execution_profile.zig").acquire(cb, graph)) orelse return error.MissingMetalRegionProfile;

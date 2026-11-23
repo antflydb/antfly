@@ -1935,6 +1935,7 @@ pub const Frame = struct {
     /// Device scratch/auxiliary headers are materialized once during cold
     /// preparation, never by an entered numerical program.
     program_resources: []ProgramResources = &.{},
+    program_regions: []?@import("region_binding.zig").Bound = &.{},
     program_completion_pending: bool = false,
     prepared_program: bool = false,
 
@@ -2298,8 +2299,10 @@ pub const Frame = struct {
         self.prepared_program = true;
     }
     pub fn sealProgramStorage(self: *Frame) !void {
-        if (self.native_program_views.len == 0 or self.pool.backends.len != 1 or !@import("dense_decoder_backend.zig").available(&self.pool.backends[0]) or self.stats.dispatches != 0 or self.pool.regions.len != 0 or self.pool.replay_backend != null) return error.InvalidNativeProgramPreparation;
+        if (self.native_program_views.len == 0 or self.pool.backends.len != 1 or !@import("dense_decoder_backend.zig").available(&self.pool.backends[0]) or self.stats.dispatches != 0 or self.program_regions.len != self.pool.regions.len or self.pool.replay_backend != null) return error.InvalidNativeProgramPreparation;
+        for (self.program_regions) |bound| if (bound == null) return error.UnpreparedNativeProgramStorage;
         for (self.pool.kernels, 0..) |maybe, index| if (maybe) |kernel| {
+            if (self.pool.regionForNode(@intCast(index)) != null) continue;
             if (self.storages[kernel.output_allocation] == null) return error.UnpreparedNativeProgramStorage;
             const resource: ?*const ProgramResources = if (self.program_resources.len == self.pool.kernels.len) &self.program_resources[index] else null;
             if (kernel.workspace_bytes != 0 and (resource == null or resource.?.workspace == null)) return error.UnpreparedNativeProgramStorage;
@@ -2326,7 +2329,7 @@ pub const Frame = struct {
         return self.finishProgramPreparation();
     }
     pub fn finishProgramPreparation(self: *Frame) !void {
-        if (self.retired or self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.scope_backends != 1 or !@import("dense_decoder_backend.zig").available(&self.pool.backends[0]) or self.stats.dispatches != 0 or self.pool.regions.len != 0 or self.pool.replay_backend != null) return error.InvalidNativeProgramPreparation;
+        if (self.retired or self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.scope_backends != 1 or !@import("dense_decoder_backend.zig").available(&self.pool.backends[0]) or self.stats.dispatches != 0 or self.program_regions.len != self.pool.regions.len or self.pool.replay_backend != null) return error.InvalidNativeProgramPreparation;
         // Constructor uploads may still read host staging. End that one cold
         // lifetime before its construction owner leaves, without a kernel fence.
         try self.recordProgramCompletion();
@@ -2353,7 +2356,7 @@ pub const Frame = struct {
         return self.rebindProgramHostInputs(inputs);
     }
     pub fn rebindProgramHostInputs(self: *Frame, inputs: []const host_ingress.Input) ![]const interpreter.RuntimeInput {
-        if (self.retired or self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.scope_backends != 1 or !@import("dense_decoder_backend.zig").available(&self.pool.backends[0]) or self.pool.regions.len != 0 or self.pool.replay_backend != null) return error.InvalidNativeProgramRebind;
+        if (self.retired or self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.scope_backends != 1 or !@import("dense_decoder_backend.zig").available(&self.pool.backends[0]) or self.program_regions.len != self.pool.regions.len or self.pool.replay_backend != null) return error.InvalidNativeProgramRebind;
         try self.beforeProgramHostInputReuse();
         try self.pool.validateHostInputs(inputs);
         if (self.host_input_generation == std.math.maxInt(u64)) return error.HostInputGenerationExhausted;
@@ -3009,24 +3012,71 @@ pub const Frame = struct {
 
     /// Every selected region consumes its already-admitted, exact Frame resources.
     /// No runtime pattern selection or numerical fallback occurs on this path.
-    pub fn executeRegion(self: *Frame, installed: *const @import("region_binding.zig").Installed, facts: []const route.Binding, inputs: []const CT) !@import("region_binding.zig").Bound {
-        const region = @import("region_route.zig");
+    fn regionDispatchPolicy(self: *const Frame, installed: *const @import("region_binding.zig").Installed) !u64 {
+        const backend = self.pool.backends[installed.backend_index];
+        if (backend.kind() == .metal and self.pool.region_execution_profile == .unknown and self.pool.requiresManagedExecution()) {
+            const current = self.scope_cleanup.operation orelse return error.RegionExecutionProfileChanged;
+            if (current.mode != .managed) return error.RegionExecutionProfileChanged;
+            return installed.owner.policy_key;
+        }
+        return self.pool.currentRegionPolicy(installed.backend_index);
+    }
+
+    /// Prepare stable output and scratch headers for a caller that borrows
+    /// every publication until the private program is destroyed.
+    fn prepareProgramRegion(self: *Frame, installed: *const @import("region_binding.zig").Installed, facts: []const route.Binding) !*@import("region_binding.zig").Bound {
+        if (!self.prepared_program or self.native_program_storage_sealed or self.scope_backends != 1 or
+            installed.owner.requirements.payload_claim_required or installed.owner.vtable.prepare_assigned != null) return error.InvalidNativeProgramPreparation;
         const index = try self.regionIndex(installed);
+        if (self.program_regions.len == 0) {
+            self.program_regions = try self.pool.allocator.alloc(?@import("region_binding.zig").Bound, self.pool.regions.len);
+            @memset(self.program_regions, null);
+        }
+        if (self.program_regions[index] != null) return error.InvalidNativeProgramPreparation;
+        const backend = self.pool.backends[installed.backend_index];
+        self.program_regions[index] = try self.acquireRegionOutputs(&backend, installed, facts, try self.regionDispatchPolicy(installed));
+        return &self.program_regions[index].?;
+    }
+
+    pub fn executeProgramRegion(self: *Frame, installed: *const @import("region_binding.zig").Installed, values: []const ?CT) ![]const @import("region_route.zig").Assigned {
+        const node = installed.owner.entry_node;
+        if (self.pool.regionAtEntry(node) != installed) return error.PreparedRegionOwnerChanged;
+        const index = self.pool.region_by_node[node];
+        if (!self.native_program_storage_sealed or self.retired or self.scope_backends != 1 or index >= self.program_regions.len) return error.UnpreparedNativeProgramViews;
+        const bound = if (self.program_regions[index]) |*owner| owner else return error.UnpreparedNativeProgramViews;
+        const selected = if (self.pool.selection) |*value| value else return error.MissingPreparedKernelRoute;
+        const count = installed.owner.input_nodes.len;
+        const max_inputs = @import("region_binding.zig").max_inputs;
+        if (count > max_inputs) return error.PreparedRegionBindingChanged;
+        var facts: [max_inputs]route.Binding = undefined;
+        var inputs: [max_inputs]CT = undefined;
+        try self.pool.regionFacts(installed.owner, selected.inputs.entries, facts[0..count]);
+        for (installed.owner.input_nodes, facts[0..count], inputs[0..count]) |input, fact, *actual| {
+            if (input >= values.len) return error.PreparedRegionBindingChanged;
+            actual.* = if (fact == .tensor) fact.tensor.value else values[input] orelse return error.MissingValue;
+        }
+        try self.dispatchBoundRegion(installed, index, facts[0..count], inputs[0..count], try self.regionDispatchPolicy(installed), bound);
+        return bound.outputs[0..bound.output_count];
+    }
+
+    pub fn executeRegion(self: *Frame, installed: *const @import("region_binding.zig").Installed, facts: []const route.Binding, inputs: []const CT) !@import("region_binding.zig").Bound {
+        const index = try self.regionIndex(installed);
+        if (!self.in_use or self.claimed or index >= self.region_claims.len) return error.InvalidPreparedRegionClaim;
+        if (installed.owner.requirements.payload_claim_required and self.region_claims[index] == null) return error.PreparedRegionClaimRequired;
+        const policy = try self.regionDispatchPolicy(installed);
+        const backend = self.pool.backends[installed.backend_index];
+        var bound = try self.acquireRegionOutputs(&backend, installed, facts, policy);
+        errdefer bound.deinit();
+        try self.dispatchBoundRegion(installed, index, facts, inputs, policy, &bound);
+        return bound;
+    }
+
+    fn dispatchBoundRegion(self: *Frame, installed: *const @import("region_binding.zig").Installed, index: usize, facts: []const route.Binding, inputs: []const CT, policy: u64, bound: *const @import("region_binding.zig").Bound) !void {
+        const region = @import("region_route.zig");
         const backend = self.pool.backends[installed.backend_index];
         if (!self.in_use or self.claimed or index >= self.region_claims.len) return error.InvalidPreparedRegionClaim;
         const claim: ?*const region.PayloadClaim = if (self.region_claims[index]) |*value| value else null;
         if (installed.owner.requirements.payload_claim_required and claim == null) return error.PreparedRegionClaimRequired;
-        const managed_metal = backend.kind() == .metal and self.pool.region_execution_profile == .unknown and self.pool.requiresManagedExecution();
-        const policy = policy: {
-            if (managed_metal) {
-                const current = self.scope_cleanup.operation orelse return error.RegionExecutionProfileChanged;
-                if (current.mode != .managed) return error.RegionExecutionProfileChanged;
-                break :policy installed.owner.policy_key;
-            }
-            break :policy try self.pool.currentRegionPolicy(installed.backend_index);
-        };
-        var bound = try self.acquireRegionOutputs(&backend, installed, facts, policy);
-        errdefer bound.deinit();
         var invocation = bound.invocation(.{ .context = backend.ptr, .table = backend.vtable }, policy, facts, inputs);
         invocation.validation.payload_claim = claim;
         invocation.validation.operation = self.scope_cleanup.operation;
@@ -3051,7 +3101,6 @@ pub const Frame = struct {
             try owned.transferToSubmission(.{ .context = backend.ptr, .table = backend.vtable }, .completed_or_enqueued, null);
             self.region_claims[index] = null;
         }
-        return bound;
     }
 
     /// Successful encoding already handed its roots to real completion tickets.
@@ -3227,8 +3276,24 @@ pub const Frame = struct {
             self.program_resources = try self.pool.allocator.alloc(ProgramResources, graph.nodeCount());
             for (self.program_resources) |*resource| resource.* = .{};
         }
+        for (self.pool.regions) |*installed| {
+            var facts: [@import("region_binding.zig").max_inputs]route.Binding = undefined;
+            const count = installed.owner.input_nodes.len;
+            if (count > facts.len) return error.PreparedRegionBindingChanged;
+            try self.pool.regionExecutionFacts(installed.owner, facts[0..count]);
+            const bound = try self.prepareProgramRegion(installed, facts[0..count]);
+            for (installed.outputs, 0..) |output, index| {
+                const node = output.slot.node;
+                if (node >= values.len or values[node] != null) return error.PreparedRegionOutputMismatch;
+                const view = try bound.take(index);
+                self.native_program_view_pins[output.slot.allocation] += 1;
+                self.native_program_views[node] = view;
+                values[node] = view;
+            }
+            if (bound.workspace != null) self.native_program_view_pins[installed.workspace_allocation] += 1;
+        }
         for (graph.nodes.items, 0..) |node, index| {
-            if (values[index] != null) continue;
+            if (values[index] != null or self.pool.regionForNode(@intCast(index)) != null) continue;
             const slot = self.pool.plan.slotForNode(@intCast(index)) orelse continue;
             if (slot.allocation == buffers.invalid_allocation or slot.allocation >= self.storages.len or slot.backend != cb.kind() or node.output_shape.dtype != .f32) return error.IncompleteNativeProgram;
             const view = if (node.op == .constant)
@@ -3262,7 +3327,7 @@ pub const Frame = struct {
         // Cold assignment only. Inputs are stable physical headers, not values
         // read by any numerical operation during this preparation.
         for (self.pool.kernels, 0..) |maybe, index| if (maybe) |*kernel| {
-            if (self.pool.plan.slotForNode(@intCast(index)) == null) continue;
+            if (self.pool.plan.slotForNode(@intCast(index)) == null or self.pool.regionForNode(@intCast(index)) != null) continue;
             const selected = self.pool.preparedKernelRoute(@intCast(index)) orelse return error.MissingPreparedKernelRoute;
             var inputs: [3]CT = undefined;
             for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |node, i| inputs[i] = values[node] orelse return error.MissingValue;
@@ -3307,6 +3372,9 @@ pub const Frame = struct {
         };
     }
     fn clearNativeProgramViews(self: *Frame, cleanup: @import("cleanup_context.zig").Context) void {
+        for (self.program_regions) |*maybe| if (maybe.*) |*bound| bound.deinitWithCleanup(cleanup);
+        self.pool.allocator.free(self.program_regions);
+        self.program_regions = &.{};
         for (self.program_resources) |resource| {
             for (resource.auxiliaries[0..resource.auxiliary_count]) |auxiliary| self.pool.backends[0].freeWithCleanup(auxiliary.tensor, cleanup);
             if (resource.workspace) |workspace| self.pool.backends[0].freeWithCleanup(workspace, cleanup);

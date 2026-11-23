@@ -914,6 +914,17 @@ pub const Schedule = struct {
                 if (self.graph.node(source).op != .parameter or self.values[source] != value) return error.PreparedKernelBindingChanged;
             }
         }
+        if (self.selected.pool.regionAtEntry(members[0])) |installed| {
+            const frame = self.frame orelse return error.DenseScheduleNotEntered;
+            if (!std.mem.eql(ml.graph.NodeId, installed.owner.covered_nodes, members) or installed.outputs.len != members.len)
+                return error.DenseScheduleOrderChanged;
+            for (installed.outputs, members) |output, member| if (output.slot.node != member) return error.DenseScheduleOrderChanged;
+            self.values[activation] = inputs[0][0];
+            const outputs = try frame.executeProgramRegion(installed, self.values);
+            self.cursor += members.len;
+            if (self.cursor == self.steps.len) try frame.recordProgramCompletion();
+            return .{ .first = outputs[0].tensor, .second = outputs[1].tensor, .third = outputs[2].tensor };
+        }
         return .{
             .first = try self.executeStep(self.graph.node(members[0]), inputs[0], null),
             .second = try self.executeStep(self.graph.node(members[1]), inputs[1], null),

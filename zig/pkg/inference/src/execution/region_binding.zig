@@ -61,8 +61,11 @@ pub const Bound = struct {
         return self.outputs[index].tensor;
     }
     pub fn deinit(self: *Bound) void {
-        for (self.outputs[0..self.output_count], self.owned[0..self.output_count]) |output, owned| if (owned) self.backend.free(output.tensor);
-        if (self.workspace) |workspace| self.backend.free(workspace);
+        self.deinitWithCleanup(.{});
+    }
+    pub fn deinitWithCleanup(self: *Bound, cleanup: @import("cleanup_context.zig").Context) void {
+        for (self.outputs[0..self.output_count], self.owned[0..self.output_count]) |output, owned| if (owned) self.backend.freeWithCleanup(output.tensor, cleanup);
+        if (self.workspace) |workspace| self.backend.freeWithCleanup(workspace, cleanup);
         self.* = undefined;
     }
 };
