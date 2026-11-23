@@ -59,10 +59,6 @@ pub const EncoderOutputs = union(enum) {
 /// reference once. Merged-cache decoders have a separate stateful contract.
 const PlacementReason = @import("diagnostics.zig").StagePlacement.Reason;
 
-pub fn supportsResidentPair(encoder: backends.Session, decoder: backends.Session, controlled: bool) bool {
-    return residentPairPlacement(encoder, decoder, controlled) == .resident_pair;
-}
-
 pub fn residentPairPlacement(encoder: backends.Session, decoder: backends.Session, controlled: bool) PlacementReason {
     const source = encoder.shared_compute_context orelse return .no_source_context;
     if (decoder.shared_compute_context != source) return .foreign_context;
@@ -415,7 +411,7 @@ test "encoder decoder resident stages retain hidden state and materialize only t
         defer decoder.close();
         encoder.run_admission = .{ .controller = &controller, .backend_class = if (kind == .native) .cpu else .gpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
         const control = Control{ .native_call_policy = .in_process };
-        try std.testing.expect(supportsResidentPair(encoder, decoder, true));
+        try std.testing.expectEqual(PlacementReason.resident_pair, residentPairPlacement(encoder, decoder, true));
         const Mismatched = struct {
             fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
                 return &.{

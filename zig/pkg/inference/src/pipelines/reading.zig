@@ -3242,8 +3242,8 @@ test "reading default imported stages keep encoder resident and preserve host re
         defer shared_decoder.close();
         const reference_decoder = try imported.createSessionWithOptions(a, decoder_path, kind, .{ .graph_runtime_strategy = .compiled_preferred });
         defer reference_decoder.close();
-        try std.testing.expect(stage_runtime.supportsResidentPair(encoder, shared_decoder, true));
-        try std.testing.expect(!stage_runtime.supportsResidentPair(encoder, reference_decoder, true));
+        try std.testing.expect(stage_runtime.residentPairPlacement(encoder, shared_decoder, true) == .resident_pair);
+        try std.testing.expect(stage_runtime.residentPairPlacement(encoder, reference_decoder, true) != .resident_pair);
         const config = ReadConfig{ .image_size = 1, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .max_length = 2, .decoder_start_token_id = 0, .eos_token_id = 1 };
         var candidate = ReadingPipeline.init(a, encoder, shared_decoder, tokenizer, config, null);
         var reference = ReadingPipeline.init(a, encoder, reference_decoder, tokenizer, config, null);
