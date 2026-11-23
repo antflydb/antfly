@@ -41341,6 +41341,16 @@ fn consumerTests() type {
                     return try snapshot(raw);
                 }
                 fn freeAdmin(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn routingSnapshot(raw: *anyopaque, _: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    const current = try snapshot(raw);
+                    return .{
+                        .metadata_group_id = group,
+                        .metadata_incarnation = incarnation,
+                        .catalog_revision = current.status.metadata_epoch,
+                        .tables = current.tables,
+                        .ranges = current.ranges,
+                    };
+                }
                 fn boot(raw: *anyopaque, alloc: std.mem.Allocator, query: boots.Query, _: ?u64) !boots.Observation {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     const bytes = try self.store.sqlRelationBootJson(alloc, group, query);
@@ -41350,7 +41360,15 @@ fn consumerTests() type {
                     return parsed.value;
                 }
                 fn catalog(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
-                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = freeAdmin, .catalog_identity = identity, .sql_relation_boot = boot } };
+                    return .{ .ptr = self, .vtable = &.{
+                        .admin_snapshot = snapshot,
+                        .free_admin_snapshot = freeAdmin,
+                        .catalog_identity = identity,
+                        .routing_snapshot = routingSnapshot,
+                        .linearizable_routing_snapshot = routingSnapshot,
+                        .free_routing_snapshot = freeRoutingSnapshot,
+                        .sql_relation_boot = boot,
+                    } };
                 }
                 fn system(raw: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
                     const self: *@This() = @ptrCast(@alignCast(raw));
@@ -41379,7 +41397,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     return self.store.loadRestoreStagingProgress(alloc, group, id);
                 }
-                fn generation(raw: *anyopaque, _: ?u64, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+                fn generation(raw: *anyopaque, _: antfly.public_api.table_catalog.RoutingBudget, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
                     try std.testing.expect(authoritative);
                     const current = try snapshot(raw);
                     return antfly.public_api.table_catalog.RoutingGeneration.create(std.testing.allocator, .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .catalog_revision = current.status.metadata_epoch, .tables = current.tables, .ranges = current.ranges }, .{});
@@ -41444,12 +41462,14 @@ fn consumerTests() type {
                 if (!constrained) {
                     // This is actual native-primary user data, committed only
                     // after the durable initialized-image proof was published.
-                    var row_owner = try owner.leaseTransitionOwner(42, "rows", old_descriptor);
-                    defer row_owner.deinit();
-                    var written = try row_owner.lease.entry.owner.batchJson("rows", "{\"inserts\":{\"old-row\":{\"id\":1}},\"sync_level\":\"write\"}");
-                    written.deinit();
-                    const populated = try row_owner.lease.entry.owner.nativeRelationBinding(scratch, "rows");
-                    try std.testing.expect(populated.has_user_data);
+                    const route = try antfly.public_api.table_catalog.routedGroupSnapshot(scratch, provider.catalog(), "rows", "old-row");
+                    const fence = route.fence() orelse return error.TestUnexpectedResult;
+                    _ = (try owner.writeSource().batchGroupLocalRouted(scratch, 42, "rows", .{
+                        .writes = &.{.{ .key = "old-row", .value = "{\"id\":1}" }},
+                        .sync_level = .write,
+                    }, fence)) orelse return error.TestUnexpectedResult;
+                    const populated = try owner.inspectUnpublishedNativeImage(scratch, 42, persistence);
+                    try std.testing.expectEqual(@as(?bool, true), populated.has_user_data);
                 }
                 // Withhold the actual shutdown transport before deinit: an
                 // orderly native flush is not itself a metadata clean receipt.
@@ -41527,16 +41547,25 @@ fn consumerTests() type {
             forbidden.scope.plan_digest[0] ^= 1;
             try std.testing.expectError(error.RestoreStagingScopeChanged, DataServer.restoreOwnerControl(&restarted, scratch, "rows", 43, forbidden, .{}));
             {
-                var captured = try DataServer.recoverRestoreDescriptor(&restarted, scratch, 43, "rows", scope.digest(), plan.id, .read, .{});
-                defer captured.deinit(scratch);
-                var row_owner = try owner.leaseTransitionOwner(43, "rows", captured.descriptor);
-                defer row_owner.deinit();
                 // The owned status projection is not a user-row read grant.
-                try std.testing.expectError(error.RestoreStagingInProgress, row_owner.lease.entry.owner.lookupJson("rows", "{\"key\":\"old-row\"}"));
+                const reads = owner.readSource();
+                if (reads.lookupGroupLocal(scratch, 43, "rows", "old-row", .{}, .stale)) |row| {
+                    if (row) |value| {
+                        var unexpected = value;
+                        unexpected.deinit(scratch);
+                        return error.TestUnexpectedResult;
+                    }
+                } else |err| switch (err) {
+                    error.GroupNotFound, error.TableNotFound, error.StorageKernelOwnerUnavailable, error.RestoreStagingInProgress => {},
+                    else => return err,
+                }
                 // Imported scope is still mutable; it cannot attest finalized
                 // emptiness before the real validation/installation sequence.
-                const finalization_lookup = try antfly.public_api.table_reads.encodeStorageKernelLookupRequest(scratch, "", .{ .relational_topology_json = "{\"mode\":\"native_empty_finalization\"}", .restore_staging_scope = scope.digest(), .restore_staging_plan_id = plan.id });
-                try std.testing.expectError(error.RestoreValidationPending, row_owner.lease.entry.owner.lookupJson("rows", finalization_lookup));
+                try std.testing.expectError(error.RestoreValidationPending, reads.lookupGroupLocal(scratch, 43, "rows", "", .{
+                    .relational_topology_json = "{\"mode\":\"native_empty_finalization\"}",
+                    .restore_staging_scope = scope.digest(),
+                    .restore_staging_plan_id = plan.id,
+                }, .read_index));
             }
             // Empty-generation BEGIN actually completed import. Preserve its
             // phase-specific physical receipt before validation changes it.
@@ -41594,11 +41623,8 @@ fn consumerTests() type {
             try std.testing.expectEqual(.recovering, (try Provider.boot(&provider, scratch, .{ .node = 9 }, null)).record.?.phase);
             try std.testing.expectEqualDeep(before, (try Provider.boot(&provider, scratch, .{ .node = 9, .binding_table = 7 }, null)).initialized.?);
             if (constrained) {
-                var hidden = try DataServer.recoverRestoreDescriptor(&restarted, scratch, 43, "rows", scope.digest(), plan.id, .resolve, .{});
-                defer hidden.deinit(scratch);
-                var retained = try owner.leaseTransitionOwner(43, "rows", hidden.descriptor);
-                defer retained.deinit();
-                try std.testing.expect((try retained.lease.entry.owner.nativeRelationBinding(scratch, "rows")).has_transaction_state);
+                const retained = try owner.inspectUnpublishedNativeImage(scratch, 43, successor);
+                try std.testing.expectEqual(@as(?bool, true), retained.has_transaction_state);
             }
             // Publish the actual acceptance, then finish the physical owner.
             // PK validation leaves a real, resolved ordinary coordinator in
@@ -41620,13 +41646,10 @@ fn consumerTests() type {
             const ready_boot = try ready.requireReady();
             try owner.admitRelationHost(.{ .node_id = 9, .store_id = 11, .execution_instance = instance, .generation_instance = instance, .data_generation = 2 }, ready_boot.boot());
             _ = try owner.reconcileServingCatalogAtRoot(43, "rows", .{ .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_s });
-            const public_descriptor: kernel_owner_descriptor.Descriptor = .{ .lsm_root_generation = restarted.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(43), .identity = .{ .table_id = 8, .shard_id = 43, .range_id = 43 }, .schema_json = schema, .indexes_json = "{}", .table_storage = target_table.storage, .sql_persistence = successor };
-            var public_owner = try owner.leaseTransitionOwner(43, "rows", public_descriptor);
-            defer public_owner.deinit();
-            const reopened = try public_owner.lease.entry.owner.nativeRelationBinding(scratch, "rows");
-            try std.testing.expect(reopened.descriptor.eql(successor));
-            try std.testing.expectEqual(initialized.binding.physical_root_incarnation, reopened.physical_root_incarnation);
-            try std.testing.expect(!reopened.has_user_data);
+            const reopened = try owner.inspectUnpublishedNativeImage(scratch, 43, successor);
+            try std.testing.expect(reopened.descriptor.?.eql(successor));
+            try std.testing.expectEqual(@as(?u128, initialized.binding.physical_root_incarnation), reopened.physical_root_incarnation);
+            try std.testing.expectEqual(@as(?bool, false), reopened.has_user_data);
         }
 
         test "data runtime native restore phase two rejoins activating descriptor authority" {
@@ -44864,14 +44887,14 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.reported_identity;
                 }
-                fn acquire(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*catalog_mod.RoutingGeneration {
+                fn acquire(ptr: *anyopaque, budget: catalog_mod.RoutingBudget, authoritative: bool) !*catalog_mod.RoutingGeneration {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(!authoritative);
                     // Catalogs without an I/O clock use platform monotonic.
                     // Passing the worker's raw Threaded awake deadline here
                     // expires immediately on Darwin despite a live quantum.
-                    try std.testing.expect(deadline_ns != null);
-                    try (catalog_mod.RoutingBudget{ .deadline_ns = deadline_ns }).checkpoint();
+                    try std.testing.expect(budget.deadline_ns != null);
+                    try budget.checkpoint();
                     self.captures += 1;
                     self.generation.retain();
                     return self.generation;
@@ -57521,6 +57544,7 @@ fn consumerTests() type {
             var original_live = true;
             defer if (original_live) original.deinitOwned(a);
             try original.validate();
+            var original_controls = [_]controls.PackageControl{original};
             var owned = try cloneAdminSnapshotOwned(a, .{
                 .status = .{ .metadata_group_id = 9, .metrics = .{} },
                 .tables = &.{},
@@ -57529,7 +57553,7 @@ fn consumerTests() type {
                 .placement_intents = &.{},
                 .split_transitions = &.{},
                 .merge_transitions = &.{},
-                .sql_extension_controls = @constCast(&.{original}),
+                .sql_extension_controls = &original_controls,
             });
             defer freeAdminSnapshotOwned(a, &owned);
             try std.testing.expect(owned.sql_extension_controls[0].name.ptr != original.name.ptr);
