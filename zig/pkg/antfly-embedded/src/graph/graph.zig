@@ -8206,7 +8206,37 @@ pub const GraphIndex = struct {
     /// this API's narrow scope (see the section doc comment above); the
     /// caller falls back to `applyMutationPage` (via `addEdge`/the public
     /// batch-apply entry points) in that case.
+    pub const InlineWriterView = struct {
+        forward: native_catalog_backend.Backend,
+        reverse: native_catalog_backend.Backend,
+
+        pub fn close(self: *InlineWriterView) void {
+            self.reverse.close();
+            self.forward.close();
+        }
+
+        pub fn advance(self: *InlineWriterView, publication: *const InlineEdgePublication) !void {
+            errdefer {
+                self.forward.invalidateMirror();
+                self.reverse.invalidateMirror();
+            }
+            try self.forward.applyExternallyCommittedMutations(publication.forward_mutations);
+            try self.reverse.applyExternallyCommittedMutations(publication.reverse_mutations);
+        }
+    };
+
+    pub fn forkInlineWriter(self: *GraphIndex) !InlineWriterView {
+        if (self.outgoing_owner != .native_catalog or self.reverse_owner != .native_catalog) return error.InlineEdgePublicationUnsupported;
+        var forward = try self.outgoing_owner.native_catalog.forkWriterView();
+        errdefer forward.close();
+        return .{ .forward = forward, .reverse = try self.reverse_owner.native_catalog.forkWriterView() };
+    }
+
     pub fn prepareInlineEdgePublication(self: *GraphIndex, write: BatchWrite) !InlineEdgePublication {
+        return self.prepareInlineEdgePublicationFrom(null, write);
+    }
+
+    pub fn prepareInlineEdgePublicationFrom(self: *GraphIndex, writer: ?*InlineWriterView, write: BatchWrite) !InlineEdgePublication {
         if (std.meta.activeTag(self.outgoing_owner) != .native_catalog or std.meta.activeTag(self.reverse_owner) != .native_catalog) {
             wal_trace.recordOp(.graph_inline_prepare_backend_mismatch);
             return error.InlineEdgePublicationUnsupported;
@@ -8228,8 +8258,8 @@ pub const GraphIndex = struct {
         try edge_type_mod.validateStored(write.edge_type);
         try edge_weight.validateStored(write.weight);
 
-        const forward_backend = self.outgoing_owner.native_catalog;
-        const reverse_backend = self.reverse_owner.native_catalog;
+        const forward_backend = if (writer) |view| &view.forward else self.outgoing_owner.native_catalog;
+        const reverse_backend = if (writer) |view| &view.reverse else self.reverse_owner.native_catalog;
 
         var forward_txn = try forward_backend.boundWrite(.{});
         defer forward_txn.abort();
@@ -21900,6 +21930,36 @@ test "graph native_catalog backend: reverse index stays consistent with forward 
         try std.testing.expectEqual(@as(usize, 1), in_edges.len);
         try std.testing.expectEqualStrings(node, in_edges[0].source);
     }
+}
+
+test "graph private writer view advances both catalogs without serving queued edges" {
+    const alloc = std.testing.allocator;
+    var buffer: [256]u8 = undefined;
+    const path = tmpPath(&buffer, "inline-edge-writer-view");
+    defer cleanupTmp(path);
+    var backing = NativeCatalogTestSink{ .allocator = alloc };
+    defer backing.deinit();
+    var graph = try GraphIndex.open(alloc, @as(?*anyopaque, null), path, "g", .{
+        .reverse_backend = .native_catalog,
+        .native_catalog_sink = backing.sink(),
+    });
+    defer graph.close();
+    const submits = backing.submit_calls;
+    var writer = try graph.forkInlineWriter();
+    defer writer.close();
+
+    const edge: BatchWrite = .{ .source = "a", .target = "b", .edge_type = "rel" };
+    var first = try graph.prepareInlineEdgePublicationFrom(&writer, edge);
+    defer first.abort();
+    try writer.advance(&first);
+    var overwrite = try graph.prepareInlineEdgePublicationFrom(&writer, edge);
+    defer overwrite.abort();
+    try std.testing.expectEqual(first.counters, overwrite.counters);
+    try writer.advance(&overwrite);
+    try std.testing.expectEqual(submits, backing.submit_calls);
+    const served = try graph.getEdges(alloc, "a", "rel", .out);
+    defer GraphIndex.freeEdges(alloc, served);
+    try std.testing.expectEqual(@as(usize, 0), served.len);
 }
 
 test "graph inline edge publication stages mutations without touching the sink, then installs durably via an external fold-in" {
