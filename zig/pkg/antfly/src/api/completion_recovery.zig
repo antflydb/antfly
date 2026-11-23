@@ -1170,6 +1170,20 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expect(!fake.resolved[0] and fake.resolved[1] and fake.state.acknowledgments_pending);
     try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
     try std.testing.expect(fake.resolved[0] and !fake.state.acknowledgments_pending);
+    // The follower can leave the catalog after its cleanup was acknowledged.
+    var final_ranges = [_]tables.RangeRecord{changed_ranges[1]};
+    final_ranges[0].start_key = "";
+    const final_routes = try catalog_api.RoutingGeneration.create(a, .{
+        .metadata_group_id = 1,
+        .metadata_incarnation = owners[0].metadata_incarnation,
+        .catalog_revision = 12,
+        .tables = &records,
+        .ranges = &final_ranges,
+    }, .{});
+    defer final_routes.release();
+    fake.generation = final_routes;
+    changed_fence.topology_epoch = (try final_routes.indexed.tableRoutingView("docs", .{})).topology_epoch;
+    changed_fence.catalog_revision = 12;
     fake.expect_coordinator_release = true;
     const acknowledgments_before_release = fake.acknowledgments;
     try std.testing.expect(try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));

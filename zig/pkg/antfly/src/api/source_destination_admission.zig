@@ -319,6 +319,18 @@ pub const Admission = struct {
 
         const admission = decision.admission.admission;
         const coordinator = try admission.coordinatorMember();
+        if (decision.record.status == .aborted) {
+            if (!decision.record.intents_resolved) return error.SourcePendingWork;
+            if (!decision.record.acknowledgments_pending) {
+                _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, source.epoch_attempt_retirement_protocol_version);
+                // The decision read excludes the deliberately retained coordinator
+                // acknowledgment. The ordered fence requires every member settled.
+                var routed = manifest.owner;
+                routed.topology_epoch = fence.topology_epoch;
+                try recovery.participants.acknowledgeRetainedCoordinator(a, routed, fence, coordinator.locator, manifest.transaction_id, context);
+                return true;
+            }
+        }
         const catalog = @import("table_catalog.zig");
         var budget = recovery.catalog.budget(null);
         budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
@@ -352,16 +364,6 @@ pub const Admission = struct {
             try recovery.participants.abortDisplacedSource(a, request.binding(), observed.value, fence, timestamp, context);
             return error.SourcePendingWork;
         }
-        if (!decision.record.intents_resolved) return error.SourcePendingWork;
-        if (!decision.record.acknowledgments_pending) {
-            // The decision read excludes the deliberately retained coordinator
-            // acknowledgment. The ordered fence requires every member settled.
-            var routed = manifest.owner;
-            routed.topology_epoch = fence.topology_epoch;
-            try recovery.participants.acknowledgeRetainedCoordinator(a, routed, fence, coordinator.locator, manifest.transaction_id, context);
-            return true;
-        }
-
         // Retirement proves both the enlisted and never-enlisted cases at
         // each follower before the coordinator may acknowledge its cleanup.
         for (admission.participants, routes) |member, route| {
