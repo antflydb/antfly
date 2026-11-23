@@ -1362,7 +1362,8 @@ fn embeddingGemma2ImageConfig() Config {
     };
 }
 
-const AudioCacheRecipe = @import("../execution/audio_schedule.zig").AudioRecipe;
+const audio_schedule = @import("../execution/audio_schedule.zig");
+const AudioCacheRecipe = audio_schedule.AudioRecipe;
 fn audioCacheConfig(cfg: AudioConfig) AudioCacheRecipe {
     return .{
         .count = 0,
@@ -2141,19 +2142,6 @@ fn encodeAudioFeaturesResident(cb: *const ComputeBackend, allocator: std.mem.All
     return encodeAudioFeatureCohortResident(cb, allocator, store, cfg, &.{features}, null);
 }
 
-/// Rowwise conformer projections/FFNs run once over all clips. Only temporal
-/// attention and convolution split at clip boundaries; padding cannot leak.
-const AudioFramePlan = struct { layers: usize = 1, in_flight: usize = 1 };
-fn audioFramePlan(rows: usize, hidden: usize, intermediate: usize) AudioFramePlan {
-    if (rows == 0 or hidden == 0 or intermediate == 0) return .{};
-    const floats = std.math.add(usize, std.math.mul(usize, hidden, 12) catch return .{}, std.math.mul(usize, intermediate, 4) catch return .{}) catch return .{};
-    const bytes = std.math.mul(usize, std.math.mul(usize, rows, floats) catch return .{}, 4) catch return .{};
-    // At most one submitted group and one encoding group. Views and activation
-    // buffers for both fit inside the existing 768-MiB audio reservation.
-    const group = @min(@as(usize, 4), (384 * 1024 * 1024) / (std.math.mul(usize, bytes, 2) catch return .{}));
-    return if (group == 0) .{} else .{ .layers = group, .in_flight = 2 };
-}
-
 fn encodeAudioFeatureCohortResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, declared_cfg: AudioConfig, features_list: []const *AudioFeatures, lengths: ?[]usize) !ResidentEncodedAudio {
     const cfg = try audioConfigForBackend(cb, declared_cfg);
     if (features_list.len == 0 or features_list.len > 4 or (lengths != null and lengths.?.len != features_list.len)) return error.InvalidInputShape;
@@ -2212,7 +2200,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
     const grouped_frames = cohort and cb.kind() == .metal and store.huggingface and cfg.exclude_farthest_key and
         !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame() and !profile_enabled and std.meta.eql(audioHostOps(), AudioHostOps{}) and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
         !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO");
-    const frame_plan = if (grouped_frames) audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else AudioFramePlan{};
+    const frame_plan = if (grouped_frames) audio_schedule.audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else audio_schedule.AudioFramePlan{};
     const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
     var pending_frame = false;
     // Drain before layer inputs, hidden outputs, and cached weights leave scope.
@@ -9458,15 +9446,6 @@ test "embeddinggemma2 CUDA audio preparation accepts model-valid clips beyond th
     @memset(bytes[24..28], 0);
     try std.testing.expectError(error.UnsupportedAudioFormat, embeddingGemma2EncodedAudioSequenceBound(bytes));
     @memcpy(bytes[24..28], &rate);
-}
-
-test "embeddinggemma2 Metal audio frame groups bound two live groups and avoid overflow" {
-    try std.testing.expectEqual(AudioFramePlan{ .layers = 4, .in_flight = 2 }, audioFramePlan(64, 1024, 4096));
-    for ([_]usize{ 64, 256, 512, 1024, 2048, 8192 }) |rows| {
-        const plan = audioFramePlan(rows, 1024, 4096);
-        if (plan.in_flight == 2) try std.testing.expect(rows * (1024 * 12 + 4096 * 4) * 4 * plan.layers * 2 <= 384 * 1024 * 1024);
-    }
-    try std.testing.expectEqual(AudioFramePlan{}, audioFramePlan(std.math.maxInt(usize), 1024, 4096));
 }
 
 test "embeddinggemma2 audio QKV packing uses an overflow-safe activation budget" {
