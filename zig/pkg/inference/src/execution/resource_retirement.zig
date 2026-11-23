@@ -560,6 +560,26 @@ pub const Charge = struct {
             charge.release();
         }
     };
+    /// Transfer the creator reference to cache settlement after its owner
+    /// and views have been destroyed. No allocation or supplier runs here.
+    pub fn deferCacheCreatorDrop(self: *Charge) !void {
+        const backing = switch (self.quota) {
+            .cache_component => |parts| parts[0] orelse return error.NotCacheComponentCharge,
+            else => return error.NotCacheComponentCharge,
+        };
+        const holder = self.prepared_boundary orelse return error.PreparedBoundaryAlreadyUsed;
+        holder.* = .{
+            .node = .{ .context = holder, .release_fn = DeferredRoot.release },
+            .charge = self,
+            .allocator = self.metadata,
+        };
+        self.prepared_boundary = null;
+        backing.deferCreatorDrop(&holder.node) catch |err| {
+            self.prepared_boundary = holder;
+            return err;
+        };
+    }
+
     /// Register before any SDK allocation/submission or physical retirement.
     /// The caller's existing root remains held on every registration error.
     /// This extra root prevents quota callbacks under the numerical gate even

@@ -13745,6 +13745,36 @@ pub const StagedExecution = struct {
         return .{ .ptr = self, .close_fn = closeFrontendCache };
     }
 
+    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, key: u64, inputs: []const ops.CT) anyerror!void {
+        if (comptime !build_options.enable_metal) return;
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        if (!self.active or self.cb.ptr != cb.ptr or self.cb.vtable != cb.vtable or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return;
+        const model = self.model_retention orelse return;
+        const pin = if (model.admission_domain) |*value| value else return;
+        const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+        const request = (try Metal.pendingAudioScratch(cb, key, inputs)) orelse return;
+        try pause(self);
+
+        var bank = Metal.fundAudioScratch(cb, request, pin) catch |err| {
+            try acquire(self);
+            switch (err) {
+                error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable, error.OutOfMemory, error.MetalBufferAllocFailed, error.PreparedCacheGrowthChanged, error.MissingCacheRetirementDomain => return,
+                else => return err,
+            }
+        };
+        // A cold cache candidate must not starve the original stage permit.
+        // Retire it outside the gates before retrying the original execution.
+        self.enter(self.control, true) catch {
+            const settlement = bank.discardOutsideExecution();
+            try acquire(self);
+            try settlement;
+            return;
+        };
+        var published = false;
+        defer if (!published) bank.discardAfterResume();
+        published = try Metal.publishAudioScratch(cb, request, &bank);
+    }
+
     fn audioCache(raw: *anyopaque, cb: *const ops.ComputeBackend, request: @import("audio_schedule.zig").AudioRecipe, live_inputs: []const *ops.CT) anyerror!ops.EmbeddingCacheScope {
         if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
@@ -13924,7 +13954,7 @@ pub const StagedExecution = struct {
         // optional cooperative-scheduling policy. Disabled scheduling keeps
         // every former scheduling callback inert while cache preparation works.
         if (!schedule and (self.cb.kind() != .cuda or self.gate == null)) return;
-        self.hook = .{ .ptr = self, .pause_fn = if (schedule) pause else noScheduledYield, .resume_fn = if (schedule) acquire else noScheduledYield, .yield_ready_fn = if (schedule) yieldReady else noScheduledYield, .cleanup_fn = if (schedule) cleanup else noScheduledCleanup, .workspace_fn = if (schedule and self.video_phases) workspace else null, .copy_fn = if (schedule and self.timings != null) copied else null, .image_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) imageCache else null else null, .vision_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) visionCache else null else null, .cache_inputs_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheInputs else null else null, .cache_handoff_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheHandoff else null else null, .audio_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) audioCache else null else null, .video_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoCache else null else null, .video_consumer_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoConsumer else null else null };
+        self.hook = .{ .ptr = self, .pause_fn = if (schedule) pause else noScheduledYield, .resume_fn = if (schedule) acquire else noScheduledYield, .yield_ready_fn = if (schedule) yieldReady else noScheduledYield, .cleanup_fn = if (schedule) cleanup else noScheduledCleanup, .workspace_fn = if (schedule and self.video_phases) workspace else null, .copy_fn = if (schedule and self.timings != null) copied else null, .image_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) imageCache else null else null, .vision_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) visionCache else null else null, .cache_inputs_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheInputs else null else null, .cache_handoff_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheHandoff else null else null, .audio_scratch_fn = if (comptime build_options.enable_metal) if (schedule and self.session.backend() == .metal) metalAudioScratch else null else null, .audio_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) audioCache else null else null, .video_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoCache else null else null, .video_consumer_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoConsumer else null else null };
         self.cb.embedding_stage = &self.hook;
     }
     fn nativeWeightCache(raw: *anyopaque, cb: *const ComputeBackend, request: ops.NativeWeightCachePreparation) !ops.EmbeddingCacheScope {

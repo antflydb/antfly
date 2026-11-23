@@ -466,8 +466,12 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             .host_bytes = plan.storage.host_bytes,
             .backend_bytes = plan.storage.backend_bytes,
         };
+        const scratch_bytes = plan.input_workspace_bytes;
         entry.* = null;
         plan.deinit();
+        if (self.embeddinggemma2_cache_admission) |cache| {
+            plan.retireFundedScratchLocked(cache, scratch_bytes);
+        } else std.debug.assert(plan.input_workspace_charge == null);
         std.heap.c_allocator.destroy(plan);
         if (self.embeddinggemma2_cache_admission) |cache| charges.refundLocked(cache);
         return charges.host_bytes + charges.backend_bytes;

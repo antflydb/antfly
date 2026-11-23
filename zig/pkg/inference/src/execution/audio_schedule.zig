@@ -191,6 +191,7 @@ pub const Plan = struct {
     input_workspace_bytes: usize = 0,
     arena_recipe: ArenaLayout = .{},
     input_workspace_bank: ?CT = null,
+    input_workspace_charge: ?*@import("resource_retirement.zig").Charge = null,
     prepared: bool = false,
     linear_only: bool = false,
     nodes: []Node = &.{},
@@ -230,6 +231,16 @@ pub const Plan = struct {
         self.metadata_views = views;
         self.metadata_bytes = metadata_bytes;
         self.storage.host_bytes = host_bytes;
+    }
+
+    /// Caller owns residency exclusion and has destroyed all published views.
+    /// The logical cache slot can retire while the SDK retains the charge.
+    pub fn retireFundedScratchLocked(self: *Plan, cache: *@import("../runtime/tier/cache.zig").SharedCache, logical_bytes: usize) void {
+        const charge = self.input_workspace_charge orelse return;
+        std.debug.assert(self.input_workspace_bank == null);
+        self.input_workspace_charge = null;
+        cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, logical_bytes);
+        charge.deferCacheCreatorDrop() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
 
     pub fn deinit(self: *Plan) void {
@@ -384,6 +395,23 @@ pub const Plan = struct {
             };
         }
     };
+
+    /// A value-only request may cross the provider boundary. The receiver
+    /// revalidates it against the current learned plan after admission.
+    pub const ScratchUpgrade = struct {
+        key: u64,
+        stamp: u64,
+        bytes: usize,
+        views: usize,
+    };
+
+    pub fn scratchUpgrade(self: *const Plan, clock: u64, bank_limit: usize) !?ScratchUpgrade {
+        if (!self.prepared or self.disabled or clock < self.retry_after or self.input_workspace_bytes != 0) return null;
+        const bytes = self.arena_recipe.workspaceBytes(self.workspaces.len, self.count, bank_limit);
+        if (bytes == 0) return null;
+        const counts = try self.arenaViewCounts(self.arena_recipe, false, .separate);
+        return .{ .key = self.key, .stamp = self.stamp, .bytes = bytes, .views = counts.workspaces };
+    }
 
     pub const ArenaViewCounts = struct {
         outputs: usize = 0,
