@@ -134,17 +134,7 @@ pub const State = struct {
             }
         }
 
-        pub fn captureHidden(self: *@This(), value: *const decoder_forward.ForwardHiddenDevice, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
-            if (resident) {
-                self.next_device = (try self.target.copyTargetHiddenRowFromHiddenToBackend(value, row, source, self.draft.context.cb)) orelse return error.UnsupportedBackend;
-                if (sync) self.draft.context.cb.evalTensor(self.next_device.?) catch {};
-            } else {
-                var target = self.target;
-                target.context.allocator = self.owner.allocator;
-                self.next_host = try target.dupeTargetHiddenRowFromHiddenDevice(value, row, source);
-            }
-        }
-        pub fn captureAllDevice(self: *@This(), value: *const decoder_forward.ForwardAllWithHiddenDevice, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
+        pub fn captureDevice(self: *@This(), value: decoder_forward.DeviceHiddenRows, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
             if (resident) {
                 self.next_device = (try self.target.copyTargetHiddenRowToBackend(value, row, source, self.draft.context.cb)) orelse return error.UnsupportedBackend;
                 if (sync) self.draft.context.cb.evalTensor(self.next_device.?) catch {};
@@ -329,7 +319,7 @@ pub const State = struct {
 
         const row = seq_len - 1;
         if (use_resident_draft) {
-            if (try target.copyTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, draft_cb)) |activation| {
+            if (try target.copyTargetHiddenRowToBackend(target_hidden.hiddenRows(), row, hidden_source, draft_cb)) |activation| {
                 self.replaceDevice(activation);
                 return;
             }
@@ -357,7 +347,7 @@ pub const State = struct {
         };
         const row = rows - 1;
         if (use_resident_draft) {
-            if (try target.copyTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, draft_cb)) |activation| {
+            if (try target.copyTargetHiddenRowToBackend(target_hidden.hiddenRows(), row, hidden_source, draft_cb)) |activation| {
                 self.replaceDevice(activation);
                 return true;
             }
@@ -371,7 +361,7 @@ pub const State = struct {
         // Host activations belong to this owner, even when its allocator is
         // different from the source runtime's temporary allocation domain.
         target.context.allocator = self.allocator;
-        return target.dupeTargetHiddenRowFromHiddenDevice(hidden, row, source);
+        return target.dupeTargetHiddenRowFromDevice(hidden.hiddenRows(), row, source);
     }
 
     pub const CacheEvent = struct {

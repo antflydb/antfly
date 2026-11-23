@@ -7054,7 +7054,7 @@ pub const NativeGenerationPipeline = struct {
                             !verify_result.had_bonus)
                         {
                             const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                            try draft_round.captureHidden(&canonical_hidden, 0, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
+                            try draft_round.captureDevice(canonical_hidden.hiddenRows(), 0, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
                             if (mtp_profile.enabled) {
                                 mtp_profile.activation_copies += 1;
                                 mtp_profile.accepted_hidden_reuse_rows += 1;
@@ -7143,7 +7143,7 @@ pub const NativeGenerationPipeline = struct {
                     {
                         const row = logit_base_row + verify_result.accepted - 1;
                         const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                        try draft_round.captureHidden(&target_hidden, row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
+                        try draft_round.captureDevice(target_hidden.hiddenRows(), row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
                         if (mtp_profile.enabled) {
                             mtp_profile.activation_copies += 1;
                             mtp_profile.accepted_hidden_reuse_rows += 1;
@@ -7212,7 +7212,7 @@ pub const NativeGenerationPipeline = struct {
                         {
                             const row = logit_base_row + verify_result.accepted - 1;
                             const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                            try draft_round.captureHidden(&target_hidden, row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
+                            try draft_round.captureDevice(target_hidden.hiddenRows(), row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
                             if (mtp_profile.enabled) {
                                 mtp_profile.activation_copies += 1;
                                 mtp_profile.accepted_hidden_reuse_rows += 1;
@@ -7266,7 +7266,7 @@ pub const NativeGenerationPipeline = struct {
                         {
                             const row = logit_base_row + verify_result.accepted - 1;
                             const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                            try draft_round.captureHidden(&target_hidden, row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
+                            try draft_round.captureDevice(target_hidden.hiddenRows(), row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
                             if (mtp_profile.enabled) {
                                 mtp_profile.activation_copies += 1;
                                 mtp_profile.accepted_hidden_reuse_rows += 1;
@@ -7292,7 +7292,7 @@ pub const NativeGenerationPipeline = struct {
                     ) orelse return error.InvalidTensorShape;
                     if (row >= target_hidden.rows) return error.InvalidTensorShape;
                     const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                    try draft_round.captureHidden(&target_hidden, row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
+                    try draft_round.captureDevice(target_hidden.hiddenRows(), row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
                     if (mtp_profile.enabled) {
                         mtp_profile.activation_copies += 1;
                         mtp_profile.accepted_hidden_reuse_rows += 1;
@@ -7344,7 +7344,7 @@ pub const NativeGenerationPipeline = struct {
                 {
                     const row = verify_result.accepted - 1;
                     const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
-                    try draft_round.captureAllDevice(&target_result, row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
+                    try draft_round.captureDevice(target_result.hiddenRows(), row, hidden_source, use_resident_draft, mtp_profile.sync_enabled);
                     if (mtp_profile.enabled) {
                         mtp_profile.activation_copies += 1;
                         mtp_profile.accepted_hidden_reuse_rows += 1;

@@ -43,12 +43,25 @@ pub const ForwardAllWithHiddenHost = struct {
     }
 };
 
+/// Borrowed result rows. The forward result keeps both tensors alive
+/// until the caller publishes its independent host or backend value.
+pub const DeviceHiddenRows = struct {
+    backend: *const ComputeBackend,
+    hidden: ops.CT,
+    pre_norm_hidden: ?ops.CT,
+    rows: usize,
+};
+
 pub const ForwardAllWithHiddenDevice = struct {
     cb: *const ComputeBackend,
     logits: ops.CT,
     hidden: ops.CT,
     pre_norm_hidden: ops.CT,
     rows: usize,
+
+    pub fn hiddenRows(self: *const ForwardAllWithHiddenDevice) DeviceHiddenRows {
+        return .{ .backend = self.cb, .hidden = self.hidden, .pre_norm_hidden = self.pre_norm_hidden, .rows = self.rows };
+    }
 
     pub fn deinit(self: *ForwardAllWithHiddenDevice) void {
         self.cb.free(self.logits);
@@ -66,6 +79,10 @@ pub const ForwardHiddenDevice = struct {
     greedy_token_id: ?u32 = null,
     prepared_tail_choices: ?[]u32 = null,
     choices_allocator: ?std.mem.Allocator = null,
+
+    pub fn hiddenRows(self: *const ForwardHiddenDevice) DeviceHiddenRows {
+        return .{ .backend = self.cb, .hidden = self.hidden, .pre_norm_hidden = self.pre_norm_hidden, .rows = self.rows };
+    }
 
     pub fn deinit(self: *ForwardHiddenDevice) void {
         self.cb.free(self.hidden);
@@ -799,7 +816,7 @@ pub const Runtime = struct {
         )) |active_result| {
             var result = active_result;
             defer result.deinit();
-            const activation = try self.dupeTargetHiddenRowFromHiddenDevice(&result, 0, hidden_source);
+            const activation = try self.dupeTargetHiddenRowFromDevice(result.hiddenRows(), 0, hidden_source);
             errdefer self.context.allocator.free(activation);
             return .{
                 .activation = activation,
@@ -825,7 +842,7 @@ pub const Runtime = struct {
                     hidden_source,
                 );
             defer result.deinit();
-            const activation = try self.dupeTargetHiddenRowFromHiddenDevice(&result, 0, hidden_source);
+            const activation = try self.dupeTargetHiddenRowFromDevice(result.hiddenRows(), 0, hidden_source);
             errdefer self.context.allocator.free(activation);
             return .{
                 .activation = activation,
@@ -839,7 +856,7 @@ pub const Runtime = struct {
             &decode_context,
         );
         defer result.deinit();
-        const activation = try self.dupeTargetHiddenRowFromDevice(&result, 0, hidden_source);
+        const activation = try self.dupeTargetHiddenRowFromDevice(result.hiddenRows(), 0, hidden_source);
         errdefer self.context.allocator.free(activation);
         return .{
             .activation = activation,
@@ -880,7 +897,7 @@ pub const Runtime = struct {
         )) |active_result| {
             var result = active_result;
             defer result.deinit();
-            const activation = try self.copyTargetHiddenRowFromHiddenToBackend(&result, 0, hidden_source, dst_cb);
+            const activation = try self.copyTargetHiddenRowToBackend(result.hiddenRows(), 0, hidden_source, dst_cb);
             errdefer if (activation) |tensor| dst_cb.free(tensor);
             return .{
                 .activation = activation,
@@ -906,7 +923,7 @@ pub const Runtime = struct {
                     hidden_source,
                 );
             defer result.deinit();
-            const activation = try self.copyTargetHiddenRowFromHiddenToBackend(&result, 0, hidden_source, dst_cb);
+            const activation = try self.copyTargetHiddenRowToBackend(result.hiddenRows(), 0, hidden_source, dst_cb);
             errdefer if (activation) |tensor| dst_cb.free(tensor);
             return .{
                 .activation = activation,
@@ -920,7 +937,7 @@ pub const Runtime = struct {
             &decode_context,
         );
         defer result.deinit();
-        const activation = try self.copyTargetHiddenRowToBackend(&result, 0, hidden_source, dst_cb);
+        const activation = try self.copyTargetHiddenRowToBackend(result.hiddenRows(), 0, hidden_source, dst_cb);
         errdefer if (activation) |tensor| dst_cb.free(tensor);
         return .{
             .activation = activation,
@@ -1791,9 +1808,19 @@ pub const Runtime = struct {
         return try self.context.allocator.dupe(f32, hidden[row * hidden_size ..][0..hidden_size]);
     }
 
+    fn targetHiddenRow(self: *Runtime, result: DeviceHiddenRows, row: usize, source: HiddenSource) !ops.CT {
+        if (result.backend.ptr != self.context.cb.ptr or result.backend.vtable != self.context.cb.vtable) return error.ForeignPreparedRows;
+        if (row >= result.rows) return error.InvalidTensorShape;
+        const hidden = switch (source) {
+            .final => result.hidden,
+            .pre_norm => result.pre_norm_hidden orelse return error.MissingMaterializedHiddenState,
+        };
+        return self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, self.context.gpt_config.hidden_size);
+    }
+
     pub fn dupeTargetHiddenRowFromDevice(
         self: *Runtime,
-        result: *const ForwardAllWithHiddenDevice,
+        result: DeviceHiddenRows,
         row: usize,
         source: HiddenSource,
     ) ![]f32 {
@@ -1802,56 +1829,21 @@ pub const Runtime = struct {
 
     fn dupeTargetHiddenRowFromDeviceUnobserved(
         self: *Runtime,
-        result: *const ForwardAllWithHiddenDevice,
+        result: DeviceHiddenRows,
         row: usize,
         source: HiddenSource,
     ) ![]f32 {
-        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden,
-        };
-        const row_ct = try self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, hidden_size);
+        const row_ct = try self.targetHiddenRow(result, row, source);
         defer self.context.cb.free(row_ct);
         const row_host = try self.context.cb.toFloat32(row_ct, self.context.allocator);
         errdefer self.context.allocator.free(row_host);
-        if (row_host.len != hidden_size) return error.InvalidTensorShape;
-        return row_host;
-    }
-
-    pub fn dupeTargetHiddenRowFromHiddenDevice(
-        self: *Runtime,
-        result: *const ForwardHiddenDevice,
-        row: usize,
-        source: HiddenSource,
-    ) ![]f32 {
-        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().dupeTargetHiddenRowFromHiddenDeviceUnobserved, .{ self, result, row, source });
-    }
-
-    fn dupeTargetHiddenRowFromHiddenDeviceUnobserved(
-        self: *Runtime,
-        result: *const ForwardHiddenDevice,
-        row: usize,
-        source: HiddenSource,
-    ) ![]f32 {
-        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden orelse return error.MissingMaterializedHiddenState,
-        };
-        const row_ct = try self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, hidden_size);
-        defer self.context.cb.free(row_ct);
-        const row_host = try self.context.cb.toFloat32(row_ct, self.context.allocator);
-        errdefer self.context.allocator.free(row_host);
-        if (row_host.len != hidden_size) return error.InvalidTensorShape;
+        if (row_host.len != self.context.gpt_config.hidden_size) return error.InvalidTensorShape;
         return row_host;
     }
 
     pub fn copyTargetHiddenRowToBackend(
         self: *Runtime,
-        result: *const ForwardAllWithHiddenDevice,
+        result: DeviceHiddenRows,
         row: usize,
         source: HiddenSource,
         dst_cb: *const ComputeBackend,
@@ -1861,48 +1853,14 @@ pub const Runtime = struct {
 
     fn copyTargetHiddenRowToBackendUnobserved(
         self: *Runtime,
-        result: *const ForwardAllWithHiddenDevice,
+        result: DeviceHiddenRows,
         row: usize,
         source: HiddenSource,
         dst_cb: *const ComputeBackend,
     ) !?ops.CT {
-        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden,
-        };
-        const row_ct = try self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, hidden_size);
+        const row_ct = try self.targetHiddenRow(result, row, source);
         defer self.context.cb.free(row_ct);
-        return try dst_cb.copyTensorFromBackend(self.context.cb, row_ct);
-    }
-
-    pub fn copyTargetHiddenRowFromHiddenToBackend(
-        self: *Runtime,
-        result: *const ForwardHiddenDevice,
-        row: usize,
-        source: HiddenSource,
-        dst_cb: *const ComputeBackend,
-    ) !?ops.CT {
-        return @import("invocation_observation.zig").callContextOperation(&self.context, .forward, @This().copyTargetHiddenRowFromHiddenToBackendUnobserved, .{ self, result, row, source, dst_cb });
-    }
-
-    fn copyTargetHiddenRowFromHiddenToBackendUnobserved(
-        self: *Runtime,
-        result: *const ForwardHiddenDevice,
-        row: usize,
-        source: HiddenSource,
-        dst_cb: *const ComputeBackend,
-    ) !?ops.CT {
-        const hidden_size: usize = @intCast(self.context.gpt_config.*.hidden_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const hidden = switch (source) {
-            .final => result.hidden,
-            .pre_norm => result.pre_norm_hidden orelse return error.MissingMaterializedHiddenState,
-        };
-        const row_ct = try self.context.cb.sliceRows2D(self.context.allocator, hidden, row, 1, hidden_size);
-        defer self.context.cb.free(row_ct);
-        return try dst_cb.copyTensorFromBackend(self.context.cb, row_ct);
+        return dst_cb.copyTensorFromBackend(self.context.cb, row_ct);
     }
 
     pub fn graphForward(
@@ -2412,6 +2370,16 @@ fn checkPhysicalLogitRowSelection(backend_value: ops.ComputeBackend, _: ops.Comp
     defer backend.free(logits);
     var numerical = Runtime{ .context = .{ .allocator = a, .cb = backend, .gpt_config = &config } };
     const rows = ForwardAllWithHiddenDevice{ .cb = backend, .logits = logits, .hidden = logits, .pre_norm_hidden = logits, .rows = 3 };
+    const pre_norm = try numerical.dupeTargetHiddenRowFromDevice(rows.hiddenRows(), 1, .pre_norm);
+    defer a.free(pre_norm);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 5, 4, 0 }, pre_norm);
+    const hidden_only = ForwardHiddenDevice{ .cb = backend, .hidden = logits, .pre_norm_hidden = null, .rows = 3 };
+    try std.testing.expectError(error.MissingMaterializedHiddenState, numerical.dupeTargetHiddenRowFromDevice(hidden_only.hiddenRows(), 1, .pre_norm));
+    var foreign_backend = backend_value;
+    foreign_backend.ptr = @ptrFromInt(8);
+    var foreign_rows = hidden_only.hiddenRows();
+    foreign_rows.backend = &foreign_backend;
+    try std.testing.expectError(error.ForeignPreparedRows, numerical.dupeTargetHiddenRowFromDevice(foreign_rows, 1, .final));
     const choices = (try numerical.greedyLogitRows(logits, 1, 2)) orelse return error.MissingLogitChoices;
     defer a.free(choices);
     try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, choices);
