@@ -4107,6 +4107,10 @@ test "model aware media builds WebM audio independently and budgets optional spe
         .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = webm.len } },
     };
     const Speaker = struct {
+        fn unexpectedOutput(_: *anyopaque, _: std.mem.Allocator, _: Payload, _: planning.Descriptor, _: ?EmbeddingContext, _: ?Output, _: ?anyerror, _: bool) ![]const output_types.Result {
+            return error.UnexpectedOutput;
+        }
+
         fn prepare(_: *anyopaque, _: std.mem.Allocator, _: @import("media_chunking_audio.zig").Provider, _: usize, _: [32]u8, _: []const u8, _: bool) !void {
             return error.OptionalAudioBudgetExceeded;
         }
@@ -4123,6 +4127,7 @@ test "model aware media builds WebM audio independently and budgets optional spe
             .allow_partial = partial,
             .outputs = .{ .boundary_model = "boundary", .targets = &targets },
             .audio_output_targets = 0b110,
+            .output_executor = .{ .context = &provider, .execute = Speaker.unexpectedOutput },
             .speaker_analysis = .{ .context = &provider, .prepare = Speaker.prepare },
         }, result.executor(), .{}, .{ .context = &result, .accept = Qualification.accept });
         var owner = Runner.VideoAudio{ .source = &source, .range_webm = true };
