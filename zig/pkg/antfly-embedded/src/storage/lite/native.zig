@@ -11419,11 +11419,13 @@ pub const NativeFile = struct {
         const last = @max(scan.last_sequence orelse 0, floor, covered);
         redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redoOffset(), capacity, scan.valid_bytes, if (last == 0) null else last);
         redo.writer.last_record_start = if (scan_ctx.last_record_offset) |offset| start_offset + offset else null;
-        if (scan.valid_count != 0) {
-            redo.shared.noteApplied(last);
+        if (scan.valid_count != 0) redo.shared.noteApplied(last);
+        // Rebuilding a cursor can rescan the already-visible prefix. Only
+        // advancing the visible sequence invalidates logical runtime state.
+        if (last > redo.durable_sequence) {
+            redo.durable_sequence = last;
             _ = self.adoption_epoch.fetchAdd(1, .acq_rel);
         }
-        if (last > redo.durable_sequence) redo.durable_sequence = last;
         if (self.writer_lock_file != null or redo.sidecar_epoch != null) redo.frontier_cache = persisted;
         // Provisional bump, as `refreshCrossProcessRedoOverlay` does: an
         // adopted on-disk checkpoint names only its fold boundary.
