@@ -218,7 +218,7 @@ pub fn catalogMarkers(bytes: []const u8) ?CatalogMarkers {
     var scanner = std.json.Scanner.initCompleteInput(alloc, bytes);
     defer scanner.deinit();
     if ((scanner.peekNextTokenType() catch return null) != .object_begin) return null;
-    var result: CatalogMarkers = .initEmpty();
+    var result: CatalogMarkers = .empty;
     walkCatalogMarkers(&scanner, alloc, 0, &result) catch return null;
     if ((scanner.next() catch return null) != .end_of_document) return null;
     return result;

@@ -1,0 +1,112 @@
+{
+  "runtime_source": "0275381f8420ba5f1455108c4f0fba80f4e295e9",
+  "benchmark_sha256": "6192b3d83cda5b9b43cee878e2d44fd86b2b0a74caf1b0b7dfa13a78e2e31cc6",
+  "gpu": "NVIDIA GB10 (SM121)",
+  "reference_receipt": "e4b-qat-gb10-projector-native-plan-20261121.json",
+  "base_profile_sha256": "a27eec3038607e700c03c0796f49b39bbe0cec59e112d9bfd3c2b0d4865cc916",
+  "environment_override": {
+    "ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_RESIDUAL_TERMS": "3"
+  },
+  "first_step_logit_rows_byte_identical": 8,
+  "timed_prompt_and_output_token_rows_identical": 24,
+  "quality_cases_sha256": "56f30c327be60714cd1ab46f6ae9aae3118fe23b60e98db6cab0fe9645ba501e",
+  "timed_cases_sha256": "c87937fc89df20edfbdb2458af4cc8f63504744c1578f0e31dff36def818316c",
+  "cases": [
+    {
+      "id": "text_short_256",
+      "first_logits_sha256": "b9db2064e5c57c0de9f577c2abc7ca18b02c8c86e25327d49c38c9465555f149",
+      "prompt_tokens": 32,
+      "samples_ms": [
+        4072.498251,
+        4054.641956,
+        4057.28322
+      ],
+      "median_ms": 4057.28322,
+      "reference_median_ms": 7596.061739
+    },
+    {
+      "id": "page_summary_128",
+      "first_logits_sha256": "e2af0d3a2646ac2fc4003a90d706ccf0de7ee652750c66e6e39516cc424ea0fd",
+      "prompt_tokens": 419,
+      "samples_ms": [
+        2100.798283,
+        2097.3104,
+        2091.42004
+      ],
+      "median_ms": 2097.3104,
+      "reference_median_ms": 3920.866969
+    },
+    {
+      "id": "long2k_summary_64",
+      "first_logits_sha256": "7a9c4800dd5002dde4c357116bdc8f849082256f8acf656ddb97a0eae1b05d95",
+      "prompt_tokens": 1775,
+      "samples_ms": [
+        1292.830525,
+        1274.683233,
+        1278.446216
+      ],
+      "median_ms": 1278.446216,
+      "reference_median_ms": 1272.88787
+    },
+    {
+      "id": "image_64",
+      "first_logits_sha256": "aa76c305e1a8ef1adc638ecd6dfddab8e59c4b979056341871c3b7aaac17041b",
+      "prompt_tokens": 284,
+      "samples_ms": [
+        1233.234227,
+        1222.945622,
+        1218.668767
+      ],
+      "median_ms": 1222.945622,
+      "reference_median_ms": 2716.807069
+    },
+    {
+      "id": "audio_1s_64",
+      "first_logits_sha256": "e9eb905c92d85e206f92aef2df691a8a03210372a947d101fcba00e02917701b",
+      "prompt_tokens": 42,
+      "samples_ms": [
+        1090.616019,
+        1088.43287,
+        1080.36887
+      ],
+      "median_ms": 1088.43287,
+      "reference_median_ms": 1062.416306
+    },
+    {
+      "id": "audio_12s_64",
+      "first_logits_sha256": "2735567e37b1a8416b5f5930bb25a1a25453337842d7d5e53cb4ea4196382201",
+      "prompt_tokens": 317,
+      "samples_ms": [
+        1141.434681,
+        1130.673742,
+        1130.114478
+      ],
+      "median_ms": 1130.673742,
+      "reference_median_ms": 2317.205325
+    },
+    {
+      "id": "audio_30s_64",
+      "first_logits_sha256": "0a2cb3d3933d594212f58fc741ec11a9d2326c6bbf640c618c72e24d5e6205af",
+      "prompt_tokens": 767,
+      "samples_ms": [
+        1258.827078,
+        1598.124976,
+        1584.578891
+      ],
+      "median_ms": 1584.578891,
+      "reference_median_ms": 1757.305567
+    },
+    {
+      "id": "video_6s_64",
+      "first_logits_sha256": "af1d663429a8b4e68f9ec537aa91940026620c6850f016f568426193bcf21992",
+      "prompt_tokens": 465,
+      "samples_ms": [
+        1277.305277,
+        1260.684606,
+        1262.829689
+      ],
+      "median_ms": 1262.829689,
+      "reference_median_ms": 2785.378116
+    }
+  ]
+}

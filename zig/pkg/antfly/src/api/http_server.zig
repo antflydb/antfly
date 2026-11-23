@@ -224,6 +224,10 @@ test "direct public transaction routes exclude connection-owned sessions" {
     attached.connection_id = @splat('a');
     try std.testing.expect(!ApiHttpServer.directTransactionRouteEligible(attached, false));
     try std.testing.expect(ApiHttpServer.directTransactionRouteEligible(attached, true));
+    var graph = empty;
+    graph.graph_receipt = true;
+    try std.testing.expect(ApiHttpServer.directTransactionRouteEligible(graph, true));
+    try std.testing.expect(!ApiHttpServer.directTransactionRouteEligible(graph, false));
 }
 
 test "global query requires a non-empty table name" {
@@ -4260,6 +4264,7 @@ pub const ApiHttpServer = struct {
     sql_settlement_active: std.atomic.Value(bool) = .init(false),
     sql_completion_owner_active: std.atomic.Value(bool) = .init(false),
     sql_completion_recovery_after: u64 = 0,
+    sql_observation_retirement_after: ?[]u8 = null,
     sql_completion_consumer_active: std.atomic.Value(bool) = .init(false),
     write_admission: RequestAdmission,
     inference_admission: RequestAdmission,
@@ -4274,6 +4279,7 @@ pub const ApiHttpServer = struct {
     sql_connection_admission: @import("sql/session/connection_admission.zig").Pool = .{},
     sql_sequence_sessions: @import("sql/execution/sequence_cache.zig").Pool = .{},
     txn_sessions: transactions_api.SessionRegistry = .{},
+    last_sql_abort_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_cleanup_ns: std.atomic.Value(u64) = .init(0),
     last_session_lease_renew_ns: std.atomic.Value(u64) = .init(0),
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
@@ -5326,6 +5332,7 @@ pub const ApiHttpServer = struct {
         self.a2a_tasks.deinit(self.owner_alloc);
         self.sql_connection_admission.deinit(self.alloc);
         self.sql_sequence_sessions.deinit(self.alloc);
+        if (self.sql_observation_retirement_after) |key| self.alloc.free(key);
         self.txn_sessions.deinit(self.alloc);
         self.memory_work_cursors.deinit(self.alloc);
         if (self.opened_session_store) |opened| {
@@ -6057,8 +6064,20 @@ pub const ApiHttpServer = struct {
         @import("sql/session/completion.zig").recoverUnpublished(self, self.alloc, 32) catch |err| {
             std.log.warn("unpublished SQL completion cleanup deferred err={s}", .{@errorName(err)});
         };
+        @import("sql/session/completion.zig").retireSettledObservations(self, self.alloc, 64) catch |err| {
+            std.log.warn("SQL completion observation retirement deferred err={s}", .{@errorName(err)});
+        };
         self.retryPendingTransactionRecovery(32) catch |err| {
             std.log.warn("failed to advance stable transaction recovery err={s}", .{@errorName(err)});
+        };
+        if (self.txn_sessions.durable) |store| {
+            const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+            @import("sql/session/connections.zig").reconcileExpired(store, &self.txn_sessions, self.alloc, now_ms) catch |err| {
+                std.log.warn("expired SQL connection cleanup deferred err={s}", .{@errorName(err)});
+            };
+        }
+        self.maybeCleanupExpiredSqlAbortReceipts() catch |err| {
+            std.log.warn("SQL abort receipt cleanup deferred err={s}", .{@errorName(err)});
         };
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
@@ -7506,13 +7525,6 @@ pub const ApiHttpServer = struct {
                     }) orelse continue;
                 },
                 .commit => |*commit| {
-                    const distributed_view = commit.request.distributedTables(self.alloc) catch |err| {
-                        std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
-                        continue;
-                    };
-                    defer distributed_view.deinit();
-                    const distributed_tables = distributed_view.tables;
                     var execution_plan = if (commit.execution_plan) |bytes| transactions_api.parseExecutionPlan(self.alloc, bytes) catch |err| {
                         // A damaged durable plan is not permission to re-plan
                         // or discard a potentially committed transaction.
@@ -7520,11 +7532,16 @@ pub const ApiHttpServer = struct {
                         continue;
                     } else null;
                     defer if (execution_plan) |*plan| plan.deinit();
+                    var legacy_view = if (execution_plan == null) commit.request.?.distributedTables(self.alloc) catch |err| {
+                        std.log.err("invalid legacy stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                        continue;
+                    } else null;
+                    defer if (legacy_view) |*view| view.deinit();
                     const outcome = (source.commitTransactionWithId(
                         self.alloc,
                         txn_id,
                         commit.begin_timestamp,
-                        if (execution_plan) |plan| plan.value else distributed_tables,
+                        if (execution_plan) |plan| plan.value else legacy_view.?.tables,
                         // Proposal-only delivery is insufficient for recovery:
                         // a new leader may discard it before apply. Upgrade
                         // only the weakest level, preserving stronger caller
@@ -7534,6 +7551,12 @@ pub const ApiHttpServer = struct {
                         else
                             commit.sync_level,
                     ) catch |err| switch (err) {
+                        error.TransactionPrepareAbortedRowPolicyDenied, error.TransactionPrepareAbortedUnavailable => {
+                            self.txn_sessions.publishAbortAndRetire(self.alloc, txn_id, null) catch |persist_err| {
+                                std.log.warn("stable transaction abort persistence deferred txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
+                            };
+                            continue;
+                        },
                         error.EnrichmentWorkerFailed => {
                             // Older records and third-party sources may expose a
                             // committed terminal repair only as an error. Persist
@@ -7568,8 +7591,7 @@ pub const ApiHttpServer = struct {
                         .conflict => {
                             // A replayed transaction ID can only conflict when
                             // the coordinator durably chose abort.
-                            _ = (self.txn_sessions.recordTerminalAbort(self.alloc, txn_id) catch continue) orelse continue;
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
+                            self.txn_sessions.publishAbortAndRetire(self.alloc, txn_id, null) catch continue;
                         },
                         .committed => |committed| {
                             const repair_required = commit.repair_required or committed.visibility_repair_required;
@@ -11229,14 +11251,41 @@ pub const ApiHttpServer = struct {
         return router.localNodeId();
     }
 
-    fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
-        const ttl_ns = self.cfg.session_ttl_ns orelse return;
+    fn maybeCleanupExpiredSqlAbortReceipts(self: *ApiHttpServer) !void {
+        if (self.txn_sessions.durable == null) return;
         const now_ns = platform_time.realtimeNs();
-        const interval_ns = self.cfg.session_cleanup_interval_ns orelse ttl_ns;
+        const previous_ns = self.last_sql_abort_cleanup_ns.load(.acquire);
+        const periodic = previous_ns == 0 or now_ns -| previous_ns >= std.time.ns_per_min;
+        if (periodic and self.last_sql_abort_cleanup_ns.cmpxchgStrong(previous_ns, now_ns, .acq_rel, .acquire) != null) return;
+        const retention_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
+        if (periodic or self.txn_sessions.durable_scope == .cluster_shared) self.txn_sessions.migrateLegacySqlAbortReceipts(self.alloc) catch |err| {
+            std.log.warn("legacy SQL abort receipt migration deferred err={s}", .{@errorName(err)});
+        };
+        if (!periodic and !self.txn_sessions.hasSqlReceiptCleanupBacklog()) return;
+        _ = try self.txn_sessions.cleanupExpiredSqlAbortReceipts(self.alloc, now_ns -| retention_ns);
+        if (!periodic) return;
+        if (self.cfg.deployment_mode == .standalone and self.txn_sessions.durable_scope == .node_local and
+            self.cfg.session_executor == null and self.cfg.hot_standby_mutation_policy_source == null and self.mutationBackgroundExecutionPermitted())
+        {
+            const store = self.txn_sessions.durable.?;
+            _ = try store.reclaimStandaloneSqlAbortProofs();
+        }
+    }
+
+    fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
+        const tagged_sql_only = self.cfg.session_ttl_ns == null;
+        if (tagged_sql_only and self.txn_sessions.durable_scope != .cluster_shared) return;
+        const ttl_ns = self.cfg.session_ttl_ns orelse std.time.ns_per_hour;
+        const now_ns = platform_time.realtimeNs();
+        const interval_ns = self.cfg.session_cleanup_interval_ns orelse if (tagged_sql_only) std.time.ns_per_min else ttl_ns;
         const previous_ns = self.last_session_cleanup_ns.load(.acquire);
-        if (previous_ns != 0 and now_ns -| previous_ns < interval_ns) return;
-        self.last_session_cleanup_ns.store(now_ns, .release);
-        _ = try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
+        const periodic = previous_ns == 0 or now_ns -| previous_ns >= interval_ns;
+        if (!periodic and !(tagged_sql_only and self.txn_sessions.hasTaggedSqlCleanupBacklog())) return;
+        if (periodic) self.last_session_cleanup_ns.store(now_ns, .release);
+        _ = if (tagged_sql_only)
+            try self.txn_sessions.cleanupExpiredTaggedSqlDecisions(self.alloc, now_ns -| ttl_ns)
+        else
+            try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
     }
 
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
@@ -15285,7 +15334,7 @@ pub const ApiHttpServer = struct {
         // Lease expirations are durable and compared across processes, so they
         // must use the Unix realtime epoch. Monotonic time is only valid for
         // deciding when this process should run another renewal pass.
-        _ = self.txn_sessions.renewOwnedLeases(self.alloc, owner_node_id, platform_time.realtimeNs()) catch |err| switch (err) {
+        _ = self.txn_sessions.renewOwnedLeases(owner_node_id, platform_time.realtimeNs()) catch |err| switch (err) {
             error.SessionLeaseLost => return,
             else => return err,
         };
@@ -15467,6 +15516,15 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn authorizedTransactionMutation(self: *ApiHttpServer, id: db_mod.types.TxnId, identity: ?AuthenticatedIdentity) !?transactions_api.Mutation {
+        var details = (try self.txn_sessions.getAuthorizationDetailsForPrincipal(self.alloc, id, transactionPrincipal(identity))) orelse return null;
+        defer details.deinit(self.alloc);
+        if (!directTransactionRouteEligible(details, false) or !try self.transactionSessionDetailsAuthorized(identity, details)) return null;
+        var guard = try self.txn_sessions.mutation(self.alloc, id, self.localSessionNodeId());
+        guard.bindPublicSession(details.status.begin_timestamp, transactionPrincipal(identity));
+        return guard;
+    }
+
     pub fn transactionSessionAccessible(
         self: *ApiHttpServer,
         txn_id: db_mod.types.TxnId,
@@ -15489,38 +15547,38 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         read_only: bool,
     ) !bool {
-        if ((try self.txn_sessions.principalAccess(
-            self.alloc,
-            txn_id,
-            transactionPrincipal(authenticated_identity),
-        )) != .allowed) return false;
-        var details = (try self.txn_sessions.getDetails(self.alloc, txn_id)) orelse return false;
+        var details = (try self.authorizedTransactionSessionDetails(txn_id, authenticated_identity, read_only)) orelse return false;
         defer details.deinit(self.alloc);
-        // Direct transaction routes cannot present or verify the idle HTTP
-        // connection owner. SQL requests use the separate exact-ID adapter;
-        // principal equality alone must not bypass its active fence.
-        if (!directTransactionRouteEligible(details, read_only)) return false;
-        return try self.transactionSessionDetailsAuthorized(authenticated_identity, details);
+        return true;
+    }
+
+    pub fn authorizedTransactionSessionDetails(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, identity: ?AuthenticatedIdentity, read_only: bool) !?transactions_api.SessionDetails {
+        var details = (try self.txn_sessions.getDetailsForPrincipal(self.alloc, txn_id, transactionPrincipal(identity))) orelse return null;
+        errdefer details.deinit(self.alloc);
+        if (!directTransactionRouteEligible(details, read_only) or !try self.transactionSessionDetailsAuthorized(identity, details)) {
+            details.deinit(self.alloc);
+            return null;
+        }
+        return details;
     }
 
     fn directTransactionRouteEligible(details: transactions_api.SessionDetails, read_only: bool) bool {
-        return read_only or details.connection_id == null;
+        return read_only or (details.connection_id == null and !details.graph_receipt and !details.prepared_completion_only);
     }
 
     pub fn listAuthorizedTransactionSessions(
         self: *ApiHttpServer,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]transactions_api.SessionStatus {
-        const candidates = try self.txn_sessions.listStatusesForPrincipal(
-            self.alloc,
-            transactionPrincipal(authenticated_identity),
-        );
+        const candidates = try self.txn_sessions.listSessionIds(self.alloc, transactionPrincipal(authenticated_identity));
         defer self.alloc.free(candidates);
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
         errdefer authorized.deinit(self.alloc);
-        for (candidates) |status| {
-            if (try self.transactionSessionReadable(status.txn_id, authenticated_identity))
-                try authorized.append(self.alloc, status);
+        for (candidates) |id| {
+            var details = (try self.txn_sessions.getListingDetailsForPrincipal(self.alloc, id, transactionPrincipal(authenticated_identity))) orelse continue;
+            defer details.deinit(self.alloc);
+            if (!try self.transactionSessionDetailsAuthorized(authenticated_identity, details)) continue;
+            try authorized.append(self.alloc, details.status);
         }
         return try authorized.toOwnedSlice(self.alloc);
     }
@@ -15562,13 +15620,19 @@ pub const ApiHttpServer = struct {
     ) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        const resources = try self.currentTransactionResources(arena.allocator(), details.catalog_bindings);
+        const a = arena.allocator();
+        const bindings = if (details.graph_receipt and details.catalog_bindings.len == 0) legacy: {
+            const entries = try a.alloc(transactions_api.CatalogBinding, details.tables.len);
+            for (details.tables, entries) |table, *entry| entry.* = .{ .logical = table.table_name, .physical = table.storage_name orelse table.table_name };
+            break :legacy entries;
+        } else details.catalog_bindings;
+        const resources = try self.currentTransactionResources(a, bindings);
         for (details.tables) |table| {
             const resource = resources.get(table.table_name) orelse table.table_name;
             if (resource.len == 0) return false;
             // Private integrity predicates are not user reads or mutations.
             // Explicit reads still require read access (and row filtering).
-            if (table.staged_read_count > 0 and
+            if ((table.staged_read_count > 0 or table.has_range_reads) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
             if ((table.staged_write_count > 0 or table.staged_delete_count > 0) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
@@ -15865,6 +15929,7 @@ pub const ApiHttpServer = struct {
         const incoming = if (raw) |owner| owner.tables else tables;
         if (raw) |owner| preparation_request = owner.context;
         const selected = (self.selectIntegritySnapshot(alloc, incoming, request) catch |err| return raw_api.captureFailure(.select_integrity, err)) orelse {
+            if (hasRowPolicyWritePrincipal(request)) return error.RowPolicyCatalogChanged;
             var prepared: integrity.Prepared = .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = incoming };
             errdefer prepared.deinit();
             raw_api.finishPreparation(&raw, &prepared) catch |err| return raw_api.captureFailure(.finish, err);
@@ -15887,17 +15952,19 @@ pub const ApiHttpServer = struct {
                 self.source.freeAdminSnapshot(&snapshot);
                 snapshot = authoritative;
                 if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables))
-                    return .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = tables };
+                    break :blk integrity.Prepared{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = incoming };
                 break :blk try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, incoming, preparation_request);
             };
             errdefer prepared.deinit();
             self.authorizeIntegrityMutations(request, prepared.tables) catch |err| return raw_api.captureFailure(.authorize_integrity, err);
             raw_api.finishPreparation(&raw, &prepared) catch |err| return raw_api.captureFailure(.finish, err);
+            prepared.tables = try self.signRowPolicyMutationParticipants(prepared.arena.allocator(), prepared.tables, snapshot.tables, request);
             return prepared;
         }
         var prepared: integrity.Prepared = .{ .arena = std.heap.ArenaAllocator.init(alloc), .tables = incoming };
         errdefer prepared.deinit();
         raw_api.finishPreparation(&raw, &prepared) catch |err| return raw_api.captureFailure(.finish, err);
+        prepared.tables = try self.signRowPolicyMutationParticipants(prepared.arena.allocator(), prepared.tables, snapshot.tables, request);
         return prepared;
     }
 
@@ -15921,39 +15988,62 @@ pub const ApiHttpServer = struct {
         const owners = try lifetimes.attachOwnerMinters(self, alloc, request, bound);
         const captured = try @import("sql/triggers/authority.zig").attachMinters(self, alloc, request, owners);
         if (!hasRowPolicyWritePrincipal(request)) return captured;
-        const a = alloc;
-        const signed = try a.dupe(distributed_txn.TableCommitRequest, captured);
-        var indices: std.ArrayList(usize) = .empty;
-        var names: std.ArrayList([]const u8) = .empty;
-        for (tables, 0..) |table, index| {
-            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and table.graph_writes.len == 0 and table.graph_deletes.len == 0 and table.predicates.len == 0 and table.range_guards.len == 0 and table.integrity_commands.len == 0) continue;
-            try indices.append(a, index);
-            try names.append(a, table.table_name);
+        const tables_to_sign = captured;
+        const Participant = struct {
+            table_id: ?u64 = null,
+            schema_version: ?u32 = null,
+            proof: []const u8 = "",
+            database: []const u8 = "",
+            admitted_at: i64 = 0,
+            sql_intent: bool = false,
+        };
+        var participants: std.StringArrayHashMapUnmanaged(Participant) = .empty;
+        for (tables_to_sign) |table| {
+            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and table.graph_writes.len == 0 and table.graph_deletes.len == 0 and table.predicates.len == 0 and table.range_guards.len == 0 and table.integrity_commands.len == 0 and table.integrity.len == 0) continue;
+            const slot = try participants.getOrPut(alloc, table.table_name);
+            if (!slot.found_existing) slot.value_ptr.* = .{};
+            for (table.predicates) |predicate| {
+                slot.value_ptr.sql_intent = slot.value_ptr.sql_intent or predicate.row_policy_requirement != .native;
+            }
+            if (table.relational_schema_version) |version| {
+                if (slot.value_ptr.schema_version) |prior| if (version != prior) return error.PreparedGenerationChanged;
+                slot.value_ptr.schema_version = version;
+            }
+        }
+        if (participants.count() == 0) return captured;
+        for (catalog_tables) |record| {
+            if (participants.getPtr(record.name)) |participant| {
+                if (participant.table_id != null) return error.RowPolicyCatalogChanged;
+                participant.table_id = record.table_id;
+            }
         }
         var revision: ?u64 = null;
         var start: usize = 0;
-        while (start < names.items.len) {
-            const end = @min(names.items.len, start + 256);
-            const chunk = names.items[start..end];
-            const bytes = try self.source.systemCatalog(a, request, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision } });
-            const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
-            if (resolved.logical_names.len != chunk.len) return error.RowPolicyCatalogChanged;
+        while (start < participants.count()) {
+            const end = @min(participants.count(), start + 256);
+            const names = participants.keys()[start..end];
+            const bytes = try self.source.systemCatalog(alloc, request, .{ .resolve_many = .{ .storage_names = names, .expected_revision = revision } });
+            const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{});
+            if (resolved.logical_names.len != names.len) return error.RowPolicyCatalogChanged;
             revision = resolved.revision;
-            for (chunk, resolved.logical_names, indices.items[start..end]) |physical, logical, index| {
-                const table = for (catalog_tables) |record| {
-                    if (std.mem.eql(u8, record.name, physical)) break record;
-                } else return error.RowPolicyCatalogChanged;
+            for (names, resolved.logical_names, participants.values()[start..end]) |physical, logical, *participant| {
+                const id = participant.table_id orelse return error.RowPolicyCatalogChanged;
                 const target = try system_catalog.Target.parse(logical orelse return error.RowPolicyCatalogChanged);
-                const sql_intent = for (signed[index].predicates) |predicate| {
-                    if (predicate.row_policy_requirement != .native) break true;
-                } else false;
-                if (try self.rowPolicyWriteProofForPurpose(a, request, table.table_id, physical, target.database, signed[index].relational_schema_version, if (sql_intent) .sql_write else .ordinary)) |proof| {
-                    signed[index].row_policy_principal_proof = proof;
-                    signed[index].row_policy_database = target.database;
-                    signed[index].row_policy_admitted_at_seconds = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
+                if (try self.rowPolicyWriteProofForPurpose(alloc, request, id, physical, target.database, participant.schema_version, if (participant.sql_intent) .sql_write else .ordinary)) |proof| {
+                    participant.proof = proof;
+                    participant.database = target.database;
+                    participant.admitted_at = @intCast(@divFloor(self.internalAuthRealtimeNs(), std.time.ns_per_s));
                 }
             }
             start = end;
+        }
+        // All fragments routed to the same owner must carry one identical admission.
+        const signed = try alloc.dupe(distributed_txn.TableCommitRequest, captured);
+        for (signed) |*table| {
+            const participant = participants.getPtr(table.table_name) orelse continue;
+            table.row_policy_principal_proof = participant.proof;
+            table.row_policy_database = participant.database;
+            table.row_policy_admitted_at_seconds = participant.admitted_at;
         }
         return signed;
     }
@@ -16331,7 +16421,8 @@ pub const ApiHttpServer = struct {
             // This marker exists only after every contacted participant has
             // a durable abort. Unlike generic 503, the batch cannot later
             // commit, so callers may safely retry with a new attempt.
-            error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
+            error.TransactionPrepareAbortedRowPolicyDenied => return error.TransactionPrepareAbortedRowPolicyDenied,
+            error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
             error.PreDecisionReadUnavailable => return error.WritePrecommitReadUnavailable,
             // Coverage is checked before coordinator admission. Preserve that
             // definite result instead of the generic unknown-write 503.
@@ -27102,6 +27193,7 @@ pub const ApiHttpServer = struct {
         const req = db_mod.types.DocumentArtifactTableReprocessRequest{
             .from_key = if (shard_resumes.len > 0) "" else (running_state.next_key orelse running_state.from_key),
             .to_key = running_state.to_key,
+            .selection = running_state.selection,
             .limit = running_state.limit,
             .shard_cursors = shard_resumes,
         };
@@ -40287,6 +40379,64 @@ test "ordinary reads and writes distinguish absent policy from unavailable autho
     }
 }
 
+test "distributed txn public commit preparation signs physical participants and rechecks revoked grants" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        table: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs" }},
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.table, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            switch (call) {
+                .resolve_many => |request| {
+                    try std.testing.expectEqual(@as(usize, 1), request.storage_names.len);
+                    try std.testing.expectEqualStrings("docs", request.storage_names[0]);
+                    return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 4, .tables = &.{}, .logical_names = &.{"docs"} }, .{});
+                },
+                .policy_publication_status => |table_id| {
+                    try std.testing.expect(context.row_policy_install_authority);
+                    return std.json.Stringify.valueAlloc(alloc, @import("antfly_local_sources").system_catalog_policies.PublicationStamp{ .table_id = table_id, .schema_version = 1, .generation = 2, .catalog_epoch = 3, .phase = .active }, .{});
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+    const secret = "0123456789abcdef0123456789abcdef";
+    const issuer = "test";
+    var fixture = Fixture{};
+    var server = ApiHttpServer.init(a, .{ .trusted_principal_secret = secret, .trusted_principal_issuer = issuer }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .system_catalog = Fixture.catalog } }, null, null);
+    defer server.deinit();
+    var auth = try initTestAuthManager(a);
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var grant = try usermgr.Permission.initOwned(a, .table, "docs", .write);
+    defer grant.deinit(a);
+    var user = try auth.manager.createUser("writer", "secret", &.{grant});
+    defer user.deinit(a);
+    var permissions = [_]usermgr.Permission{grant};
+    const identity: ?AuthenticatedIdentity = .{ .username = @constCast("writer"), .credential_principal = @constCast("basic:writer"), .permissions = &permissions, .live_user_manager = &auth.manager };
+    const context: api_operation.RequestContext = .{ .row_policy_credential = &identity };
+    const tables = [_]distributed_txn.TableCommitRequest{
+        .{ .table_name = "docs", .writes = &.{.{ .key = "row", .value = "{}" }} },
+        .{ .table_name = "docs", .deletes = &.{"other"} },
+    };
+    var prepared = try server.preparePublicCommitWithIntegrity(a, &tables, context);
+    defer prepared.deinit();
+    const signed = prepared.tables[0];
+    try std.testing.expectEqualStrings(signed.row_policy_principal_proof, prepared.tables[1].row_policy_principal_proof);
+    var verified = try usermgr.row_policy_authority.verify(a, secret, issuer, .{ .access = .write, .table_id = 7, .table = "docs", .database = system_catalog.default_database_name, .policy_generation = 2, .catalog_epoch = 3 }, @intCast(signed.row_policy_admitted_at_seconds), signed.row_policy_principal_proof);
+    defer verified.deinit();
+    try std.testing.expectEqualStrings("writer", verified.value.principal);
+    try auth.manager.removePermissionFromUser("writer", "docs", .table);
+    try std.testing.expectError(error.Forbidden, server.preparePublicCommitWithIntegrity(a, &tables, context));
+}
+
 test "api http server authenticates trusted principal" {
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -45648,7 +45798,7 @@ test "api http server stale no-FK catalog cannot take uncoordinated batch path" 
         .isolation = .read_committed,
         .mode = .read_write,
     } }, server.localSessionNodeId());
-    _ = try server.txn_sessions.stageSql(alloc, begun.txn_id, &statement);
+    _ = try server.txn_sessions.stageSql(alloc, try server.txn_sessions.mutation(alloc, begun.txn_id, begun.version.owner), &statement);
     const timing = @import("sql/session/constraint_timing.zig").set(
         &server,
         alloc,
@@ -45816,16 +45966,23 @@ test "api http server routes table batches through the batch commit hook" {
         try std.testing.expectEqual(calls_before + 1, writes.batch_commit_calls);
     }
 
-    writes.commit_error = error.TransactionPrepareAbortedUnavailable;
-    var aborted_resp = try executeHttpxTestRequest(&server, .{
-        .method = .POST,
-        .uri = "/tables/docs/batch",
-        .content_type = "application/json",
-        .body = batch_body,
-    });
-    defer aborted_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 503), aborted_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, aborted_resp.body, "transaction_precommit_aborted") != null);
+    const abort_causes = [_]anyerror{ error.TransactionPrepareAbortedUnavailable, error.TransactionPrepareAbortedRowPolicyDenied };
+    for (abort_causes, [_]u16{ 503, 403 }) |failure, expected_status| {
+        writes.commit_error = failure;
+        var aborted = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer aborted.deinit(std.testing.allocator);
+        try std.testing.expectEqual(expected_status, aborted.status);
+        const result = try std.json.parseFromSlice(struct { status: []const u8, code: []const u8, retryable: bool }, std.testing.allocator, aborted.body, .{ .ignore_unknown_fields = true });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("aborted", result.value.status);
+        try std.testing.expectEqualStrings(if (expected_status == 403) "row_policy_denied" else "transaction_precommit_aborted", result.value.code);
+        try std.testing.expectEqual(expected_status == 503, result.value.retryable);
+    }
 
     for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress }) |wait_err| {
         writes.commit_error = wait_err;
@@ -45901,7 +46058,7 @@ test "api http server routes table batches through the batch commit hook" {
     defer legacy_pending_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
-    try std.testing.expectEqual(@as(usize, 12) + descriptor_pressures.len, writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 11) + abort_causes.len + descriptor_pressures.len, writes.batch_commit_calls);
     for ([_]anyerror{ error.StorageBusy, error.GenerationTransitionActive }) |unavailable| {
         writes.commit_error = unavailable;
         const calls_before = writes.batch_commit_calls;
@@ -47671,6 +47828,50 @@ test "api http server retries stable terminal commits without replaying writes" 
     var abort = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = abort_uri, .content_type = "application/json", .body = "" });
     defer abort.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), abort.status);
+
+    // Fail only the durable read under commit execution. Earlier routing and
+    // authorization reads must succeed so both handlers reach that inspection.
+    const Fault = struct {
+        registry: *transactions_api.SessionRegistry,
+        id: db_mod.types.TxnId,
+        native: *backend_erased.Store,
+        failures: usize = 0,
+        fn read(_: std.mem.Allocator, ptr: *anyopaque) !backend_erased.ReadTxn {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.registry.tryAcquireCommitExecution(self.id)) |lease| {
+                lease.release();
+                return self.native.beginRead();
+            }
+            self.failures += 1;
+            return error.StorageReadTemporarilyUnavailable;
+        }
+    };
+    var memory = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
+    defer memory.close();
+    var native = try memory.runtimeStore(alloc, .{ .name = "receipt-inspection" });
+    defer native.deinit();
+    var backing = transactions_api.DurableSessionStore.initRuntime(alloc, &native);
+    const id = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
+    try backing.saveForTest(server.txn_sessions.sessions.get(id).?, null);
+    var fault = Fault{ .registry = &server.txn_sessions, .id = id, .native = &native };
+    var callbacks = native.vtable.*;
+    callbacks.begin_read = Fault.read;
+    var failing: backend_erased.Store = .{ .allocator = alloc, .ptr = &fault, .vtable = &callbacks };
+    var shared = transactions_api.DurableSessionStore.initRuntime(alloc, &failing);
+    const previous = server.txn_sessions.durable;
+    const scope = server.txn_sessions.durable_scope;
+    server.txn_sessions.durable = &shared;
+    server.txn_sessions.durable_scope = .cluster_shared;
+    defer {
+        server.txn_sessions.durable_scope = scope;
+        server.txn_sessions.durable = previous;
+    }
+    for ([_][]const u8{ commit_uri, abort_uri }) |uri| {
+        var response = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = "" });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fault.failures);
 }
 
 test "api session maintenance recovers crash window after durable 2pc commit" {
@@ -64926,7 +65127,7 @@ test "SQL pgwire native ordinary rollback leaves no permanent completion proofs"
     for (&ids) |*id| {
         const session = try registry.begin(a, .{}, 0);
         id.* = session.txn_id;
-        try std.testing.expect(registry.removeBeforeExecution(a, session.txn_id));
+        try std.testing.expect(try registry.retireBeforeExecution(a, try registry.mutation(a, session.txn_id, session.version.owner), session.version, false));
     }
     try std.testing.expectEqual(@as(usize, 0), registry.sessions.count());
     for (ids) |id| {

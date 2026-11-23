@@ -28,7 +28,7 @@ const tuples = @import("keys.zig");
 const mapper = @import("../../document_mapper.zig");
 const rows = @import("../../algebraic/relational_row_codec.zig");
 const covering = @import("cover.zig");
-const partial = @import("predicate.zig");
+const partial = @import("partial_predicate.zig");
 const Allocator = std.mem.Allocator;
 
 /// Already selected by the catalog for key and covering-value preparation.

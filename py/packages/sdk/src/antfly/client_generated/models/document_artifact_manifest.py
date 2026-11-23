@@ -54,7 +54,8 @@ class DocumentArtifactManifest:
             last_error_message (None | str | Unset): Human-readable last extraction or materialization error summary, when
                 available.
             manifest_json (str | Unset): Opaque JSON manifest for the artifact units and provenance. Present only for raw
-                detail responses.
+                detail responses. Newly produced document-extraction generations include the declared execution policy under
+                execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it.
             state_json (None | str | Unset): Optional opaque JSON state for incremental processing. Present only for raw
                 detail responses.
     """

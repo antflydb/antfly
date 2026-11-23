@@ -449,7 +449,8 @@ fn rangesOverlap(a: [2]usize, b: [2]usize) bool {
     return a[0] < a[1] and b[0] < b[1] and a[0] < b[1] and b[0] < a[1];
 }
 fn validateAuxiliary(cb: *const ops.ComputeBackend, prepared_call: *const Prepared) !void {
-    if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl) return error.UnsupportedPreparedTrunkCache;
+    if (comptime !@import("build_options").enable_native) return error.UnsupportedPreparedTrunkCache;
+    if (!@import("../ops/native_compute.zig").isCanonicalVTable(cb.vtable)) return error.UnsupportedPreparedTrunkCache;
     const context = cb.call_context orelse return error.MissingCurrentCleanupEpoch;
     const loan = context.native_weights orelse return error.ForeignNativeWeightModel;
     if (prepared_call.workspace_declined) {
@@ -735,7 +736,7 @@ fn trunkTensor(cb: *const ops.ComputeBackend, a: std.mem.Allocator, entry: *cons
 }
 
 fn trunkTensorBorrowed(cb: *const ops.ComputeBackend, entry: *const trunk_cache.Entry, layer: usize, which: usize, values: []f32) !ops.CT {
-    if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl or cb.vtable.fromBorrowedFloat32Shape == null or entry.device != null)
+    if (!@import("../ops/native_compute.zig").isCanonicalVTable(cb.vtable) or cb.vtable.fromBorrowedFloat32Shape == null or entry.device != null)
         return error.UnsupportedPreparedTrunkCache;
     const width = try std.math.mul(usize, entry.tokens, entry.hidden);
     const offset = try std.math.mul(usize, 2 * layer + which, width);

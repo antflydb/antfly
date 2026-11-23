@@ -197,7 +197,10 @@ pub const sql_catalog_reservation_version: u16 = 209;
 pub const sql_catalog_progress_version: u16 = 210;
 pub const sql_catalog_atomic_admission_version: u16 = 211;
 pub const sql_selinux_approval_version: u16 = 212;
-pub const current_version: u16 = sql_selinux_approval_version;
+// The SQL branch already allocated 101 and 102 to different commands.
+pub const compact_session_compare_version: u16 = 213;
+pub const spliced_session_record_version: u16 = 214;
+pub const current_version: u16 = spliced_session_record_version;
 /// Immutable, pre-executed statement trigger receipts/results on SQL TRUNCATE.
 pub const sql_truncate_preparation_version: u16 = 177;
 /// Atomically acknowledged trigger-schema and active row-policy pairs.

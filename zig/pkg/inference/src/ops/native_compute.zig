@@ -970,6 +970,7 @@ const DenseStorage = struct {
     allocator: std.mem.Allocator,
     data: []f32,
     data_alignment: std.mem.Alignment = .of(f32),
+    immutable: bool = false,
 
     fn create(allocator: std.mem.Allocator, data: []f32) !*DenseStorage {
         const owner = try allocator.create(DenseStorage);
@@ -6887,7 +6888,7 @@ pub const NativeCompute = struct {
         var owned_tensor = tensor;
         defer owned_tensor.deinit();
         const converted = try convertTensorToOwnedF32(self.allocator, &owned_tensor);
-        return self.importDenseTensor(owned_tensor.name, owned_tensor.dtype, owned_tensor.shape, converted);
+        return self.importOwnedStaticDenseTensor(owned_tensor.name, owned_tensor.dtype, owned_tensor.shape, .{ .values = converted, .allocator = self.allocator });
     }
 
     pub const OwnedFloat32 = struct { values: []f32, allocator: std.mem.Allocator };
@@ -6905,6 +6906,14 @@ pub const NativeCompute = struct {
         buf.owned = true;
         buf.declared_dtype = dtype;
         buf.name = name;
+        return tensor;
+    }
+
+    /// Mark the backing, since independently owned reshape wrappers can
+    /// share it and have no retained parent or named-weight metadata.
+    pub fn importOwnedStaticDenseTensor(self: *NativeCompute, name: []const u8, dtype: tensor_mod.DType, shape: []const i64, payload: OwnedFloat32) !CT {
+        const tensor = try self.importOwnedDenseTensor(name, dtype, shape, payload);
+        toBuf(tensor).dense_storage.?.immutable = true;
         return tensor;
     }
 
@@ -7853,6 +7862,8 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .copyPhysicalInput = &copyPhysicalInputOp,
     .readFloat32Into = &readFloat32IntoOp,
     .retainImmutableTensor = &retainImmutableTensorOp,
+    .standaloneOutputBytes = &standaloneOutputBytesOp,
+    .pooledOutputStorage = &pooledOutputStorageOp,
 };
 
 const native_cold_cleanup_services: ops.ColdCleanupServices = .{
@@ -7865,6 +7876,11 @@ const native_cold_cleanup_services: ops.ColdCleanupServices = .{
     .linear_pair_prepared = linearPairDenseWithCleanup,
 };
 fn acceptsColdCleanupImplementation(table: *const ComputeBackend.VTable) bool {
+    return table == &vtable_impl;
+}
+
+pub fn isCanonicalVTable(table: *const ComputeBackend.VTable) bool {
+    if (comptime !build_options.enable_native) return false;
     return table == &vtable_impl;
 }
 
@@ -34444,14 +34460,6 @@ fn packedExpertRowBlockBase(
 
 const decodeFp16Le = quant_codec.decodeFp16Le;
 
-fn decodeF32Le(b0: u8, b1: u8, b2: u8, b3: u8) f32 {
-    const bits: u32 = @as(u32, b0) |
-        (@as(u32, b1) << 8) |
-        (@as(u32, b2) << 16) |
-        (@as(u32, b3) << 24);
-    return @bitCast(bits);
-}
-
 fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     var owned_output = try OwnedDenseOutput.copy(self, getData(input));
@@ -37200,7 +37208,26 @@ fn divideOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 }
 
 fn negateOp(ctx: *anyopaque, input: CT) anyerror!CT {
+    if (integerSource(input)) |source| {
+        const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+        const output = try copyDenseSourceTensorWithShape(self, source, tensorStoredShape(input) orelse source.shape);
+        errdefer freeTensor(self, output);
+        const bytes = toBuf(output).owned_source_tensor.?.data;
+        switch (source.dtype) {
+            .i8 => negateIntegers(i8, bytes),
+            .i16 => negateIntegers(i16, bytes),
+            .i32 => negateIntegers(i32, bytes),
+            .i64 => negateIntegers(i64, bytes),
+            else => return error.UnsupportedTensorType,
+        }
+        return output;
+    }
     return primUnaryOp(.negate, ctx, input);
+}
+
+fn negateIntegers(comptime T: type, bytes: []u8) void {
+    const values = std.mem.bytesAsSlice(T, bytes);
+    for (values) |*value| value.* = -%value.*;
 }
 
 /// Allocating, consuming and planned primitives share one vector/scalar loop.
@@ -38060,21 +38087,63 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
 }
 
 fn denseDotInto(lhs: []const f32, rhs: []const f32, output: []f32, plan: ops.kernel_descriptor.Dot) void {
-    // Preserve NativeCompute's f64 accumulator and batch/row/column traversal.
+    // Vectorize independent output columns when the RHS rows are contiguous.
+    // Each lane keeps the same f64 accumulator and order over K.
+    const lanes = 8;
     for (0..plan.batch_count) |batch| {
         const lhs_base = batch * plan.m * plan.k;
         const rhs_base = batch * plan.n * plan.k;
         const output_base = batch * plan.m * plan.n;
-        for (0..plan.m) |row| for (0..plan.n) |column| {
-            var acc: f64 = 0;
-            for (0..plan.k) |inner| {
-                const li = lhs_base + (if (plan.lhs_contract_last) row * plan.k + inner else inner * plan.m + row);
-                const ri = rhs_base + (if (plan.rhs_contract_last) column * plan.k + inner else inner * plan.n + column);
-                acc += @as(f64, lhs[li]) * @as(f64, rhs[ri]);
+        for (0..plan.m) |row| {
+            const lhs_start = lhs_base + if (plan.lhs_contract_last) row * plan.k else row;
+            const lhs_stride = if (plan.lhs_contract_last) 1 else plan.m;
+            const destination = output[output_base + row * plan.n ..][0..plan.n];
+            var column: usize = 0;
+            if (!plan.rhs_contract_last) {
+                while (column + lanes <= plan.n) : (column += lanes) {
+                    var acc: @Vector(lanes, f64) = @splat(0);
+                    for (0..plan.k) |inner| {
+                        const value: @Vector(lanes, f64) = @splat(lhs[lhs_start + inner * lhs_stride]);
+                        const weights: @Vector(lanes, f32) = rhs[rhs_base + inner * plan.n + column ..][0..lanes].*;
+                        acc += value * @as(@Vector(lanes, f64), @floatCast(weights));
+                    }
+                    destination[column..][0..lanes].* = @as(@Vector(lanes, f32), @floatCast(acc));
+                }
             }
-            output[output_base + row * plan.n + column] = @floatCast(acc);
-        };
+            while (column < plan.n) : (column += 1) {
+                var acc: f64 = 0;
+                for (0..plan.k) |inner| {
+                    const ri = rhs_base + if (plan.rhs_contract_last) column * plan.k + inner else inner * plan.n + column;
+                    acc += @as(f64, lhs[lhs_start + inner * lhs_stride]) * @as(f64, rhs[ri]);
+                }
+                destination[column] = @floatCast(acc);
+            }
+        }
     }
+}
+
+test "dense dot assigned output preserves layouts and scalar tails" {
+    const batches = 2;
+    const m = 3;
+    const n = 11;
+    const k = 7;
+    var a: [batches * m * k]f32 = undefined;
+    var b: [batches * n * k]f32 = undefined;
+    for (&a, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 9)) / 7.0 - 1;
+    for (&b, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 13)) / 11.0 - 1;
+    for ([_]bool{ false, true }) |lhs_last| for ([_]bool{ false, true }) |rhs_last| {
+        var result: [batches * m * n]f32 = undefined;
+        denseDotInto(&a, &b, &result, .{ .batch_count = batches, .m = m, .n = n, .k = k, .lhs_contract_last = lhs_last, .rhs_contract_last = rhs_last });
+        for (0..batches) |batch| for (0..m) |row| for (0..n) |column| {
+            var reference: f64 = 0;
+            for (0..k) |inner| {
+                const ai = batch * m * k + if (lhs_last) row * k + inner else inner * m + row;
+                const bi = batch * n * k + if (rhs_last) column * k + inner else inner * n + column;
+                reference += @as(f64, a[ai]) * @as(f64, b[bi]);
+            }
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(reference)), result[(batch * m + row) * n + column], 1e-7);
+        };
+    };
 }
 
 fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
@@ -40066,8 +40135,16 @@ fn convertDTypeOp(ctx: *anyopaque, input: CT, target: ops.GraphDType) anyerror!?
                 bytes[i] = @intFromBool(f != 0);
                 continue;
             }
-            if (!std.math.isFinite(f) or f < -9223372036854775808.0 or f >= 9223372036854775808.0) return error.InvalidIntegerCast;
-            value = @intFromFloat(f);
+            // ONNX Cast allows out-of-range float-to-integer values. Match
+            // constant folding so masked-off NaN/Inf lanes cannot abort a graph.
+            value = switch (target) {
+                .i8 => std.math.lossyCast(i8, f),
+                .i16 => std.math.lossyCast(i16, f),
+                .i32 => std.math.lossyCast(i32, f),
+                .i64 => std.math.lossyCast(i64, f),
+                .u8 => std.math.lossyCast(u8, f),
+                else => unreachable,
+            };
         }
         switch (target) {
             .i8, .u8 => bytes[i] = @truncate(@as(u64, @bitCast(value))),
@@ -40277,6 +40354,37 @@ test "embeddinggemma2 CPU segment attention output transfer frees data on alloca
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+fn cacheOutputBacking(value: CT) ?*const Buf {
+    const view = toBuf(value);
+    if (view.tensor_refs.load(.acquire) != 1 or isCachedWeightBuf(view)) return null;
+    var owner: *const Buf = view;
+    while (true) {
+        if (owner.view_strides != null or owner.view_base_offset != 0 or owner.source_tensor != null or
+            owner.quantized_storage != null or owner.temporary_preparation != null or owner.reservation != null or
+            (owner.declared_dtype != null and owner.declared_dtype != .f32) or
+            owner.data.ptr != view.data.ptr or owner.data.len != view.data.len) return null;
+        if (owner.physical_lease != null) return owner;
+        owner = toBuf(owner.retained_parent orelse return owner);
+    }
+}
+
+fn standaloneOutputBytesOp(_: *anyopaque, value: CT) ?usize {
+    const owner = cacheOutputBacking(value) orelse return null;
+    if (!owner.owned or owner.physical_lease != null or owner.tensor_refs.load(.acquire) != 1) return null;
+    if (owner.dense_storage) |storage| {
+        if (storage.data.ptr != owner.data.ptr or storage.data.len != owner.data.len or storage.references.load(.acquire) != 1) return null;
+    }
+    return std.math.mul(usize, owner.data.len, @sizeOf(f32)) catch null;
+}
+
+fn pooledOutputStorageOp(ctx: *anyopaque, value: CT) ?*const ops.physical_storage.Lease {
+    const owner = cacheOutputBacking(value) orelse return null;
+    if (owner.owned) return null;
+    const lease = owner.physical_lease orelse return null;
+    if (lease.backend.ptr != ctx or owner.data.ptr != toBuf(lease.tensor).data.ptr) return null;
+    return lease;
 }
 
 fn retainImmutableTensorOp(ctx: *anyopaque, tensor: CT) anyerror!?CT {
@@ -40677,6 +40785,19 @@ fn tensorDTypeOp(ctx: *anyopaque, tensor: CT) anyerror!tensor_mod.DType {
     if (buf.declared_dtype) |dtype| return dtype;
     if (buf.data.len > 0) return .f32;
     if (buf.quantized_storage != null) return .f32;
+    // Native can publish a dense F32 tensor whose logical extent is empty.
+    // Zero backing bytes do not erase its dtype or turn a lazy weight into
+    // a materialized activation.
+    if (buf.lazy_entry == null and !buf.cached_weight and weightOrigin(buf) == null) {
+        if (buf.logical_shape) |shape| {
+            var empty = false;
+            for (shape) |dimension| {
+                if (dimension < 0) return error.UnsupportedTensorType;
+                empty = empty or dimension == 0;
+            }
+            if (empty) return .f32;
+        }
+    }
     return error.UnsupportedTensorType;
 }
 
@@ -52854,7 +52975,7 @@ fn denseStorageOwnership(comptime capture: bool, tensor: CT, view: *const Buf, r
         .domain = .host,
         .requested_bytes = if (owned) bytes else null,
         .backing_bytes = if (owned) bytes else null,
-        .access = if (lease) |physical| (if (physical.accounting_class == .constant) .read_only else .writable) else (if (isCachedWeightBuf(root)) .read_only else if (owned) .writable else .unknown),
+        .access = if (lease) |physical| (if (physical.accounting_class == .constant) .read_only else .writable) else (if (nativeTensorReadOnly(root)) .read_only else if (owned) .writable else .unknown),
         .ownership = if (owned) .allocation else if (isCachedWeightBuf(root)) .borrowed_model else .unknown,
     };
     if (lease) |physical| if (physical.admission) |reserved| {
@@ -55515,6 +55636,28 @@ test "native shared dense views preserve their original allocator across compute
     try std.testing.expect(!second.wrong_owner_free);
 }
 
+test "reshaped static initializer backing cannot be consumed in place" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const weight = try compute.importOwnedStaticDenseTensor("", .f32, &.{3}, .{ .values = try a.dupe(f32, &.{ 2, 3, 5 }), .allocator = a });
+    defer cb.free(weight);
+    const view = try cb.primReshape(weight, &.{ 1, 1, 3 });
+    defer cb.free(view);
+    try std.testing.expectEqual(toBuf(weight).dense_storage, toBuf(view).dense_storage);
+    const activations = try cb.fromFloat32Shape(&.{ 7, 11, 13 }, &.{ 1, 1, 3 });
+    defer cb.free(activations);
+    try std.testing.expectEqual(@as(?CT, null), try cb.multiplyConsumeRight(activations, view));
+    const result = try cb.multiply(activations, view);
+    defer cb.free(result);
+    const values = try cb.toFloat32(result, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 14, 33, 65 }, values);
+}
+
 test "native owned static imports preserve the caller allocation owner" {
     var first = ProvenanceAllocator{ .backing = std.testing.allocator };
     defer first.deinit();
@@ -55953,6 +56096,7 @@ fn nativeTensorReadOnly(buf: *const Buf) bool {
     var current = buf;
     while (true) {
         if (current.physical_lease) |lease| if (lease.isReadOnly()) return true;
+        if (current.dense_storage) |storage| if (storage.immutable) return true;
         if (current.cached_weight or current.weight_handle != null) return true;
         current = toBuf(current.retained_parent orelse return false);
     }
@@ -57732,7 +57876,7 @@ test "Native transpose broadcast and full slice retain lazy alias schedules" {
 /// Physical banks guarantee the alignment of every qualified logical view.
 /// DenseStorage records the original allocation contract for its final free;
 /// ordinary/adopted F32 buffers continue to use their original alignment.
-const physical_storage_policy: ops.physical_storage.Policy = .{ .allocate = allocatePhysicalRequest };
+const physical_storage_policy: ops.physical_storage.Policy = .{ .minimum_alignment = 8, .allocate = allocatePhysicalRequest };
 fn allocatePhysicalRequest(ctx: *anyopaque, request: ops.physical_storage.Request) anyerror!?CT {
     // Existing Native/CUDA input banks have the same storage representation.
     return allocateNativePhysicalStorageOp(ctx, request.byte_size);

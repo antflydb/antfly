@@ -1181,6 +1181,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{
             .ptr = self,
             .prepares_rows_atomically = true,
+            .validates_local_decision_route = true,
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
@@ -1194,6 +1195,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_request = txnResolveGroupLocalWithRequest,
+                .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
@@ -10385,7 +10387,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
     ) !void {
-        return self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, req, .{});
+        return self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, req, .{}, 0);
     }
 
     /// Existing private restore 2PC ingress; never a public native decision route.
@@ -10401,11 +10403,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
         context: request_operation.RequestContext,
+        decision_epoch: u64,
     ) !void {
-        return self.applyTransactionGroupLocalRouted(alloc, group_id, table_name, req, context, null);
+        return self.applyTransactionGroupLocalAdmitted(alloc, group_id, table_name, req, context, null, decision_epoch);
     }
 
     fn applyTransactionGroupLocalRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: request_operation.RequestContext, route: ?metadata_api.CatalogRouteFence) !void {
+        return self.applyTransactionGroupLocalAdmitted(alloc, group_id, table_name, req, context, route, 0);
+    }
+
+    fn applyTransactionGroupLocalAdmitted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: request_operation.RequestContext, route: ?metadata_api.CatalogRouteFence, decision_epoch: u64) !void {
         try @import("sql/execution/graph_vote.zig").require(alloc, self.catalog, table_name, req, context.deadline_ns);
         var admitted_route = route;
         var native_admission: ?NativeControlAdmission = null;
@@ -10421,8 +10428,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
-        var lease = try self.acquireTransactionOwner(alloc, group_id, table_name, req, context, admitted_route, native_admission);
+        var lease = if (decision_epoch != 0) try self.acquireWithControls(group_id, table_name, .{ .cancellation = context.cancellation, .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io }) else try self.acquireTransactionOwner(alloc, group_id, table_name, req, context, admitted_route, native_admission);
         defer lease.deinit();
+        if (decision_epoch != 0) {
+            const decision_route = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, decision_epoch, group_id, context.cancellation);
+            const expected = decision_route.route.identity_namespace;
+            const actual = lease.entry.identity;
+            if (actual.table_id != expected.table_id or actual.shard_id != expected.shard_id or actual.range_id != expected.range_id) return error.DecisionNotProposed;
+        }
         try context.ensureActive();
         try self.applyCapturedTransactionOwner(alloc, &lease, table_name, req, context, route, native_admission, request_json);
     }
@@ -10654,29 +10667,45 @@ pub const ProvisionedKernelOwnerSource = struct {
         txn_id: db_types.TxnId,
         status: db_types.TxnStatus,
         commit_version: u64,
-        _: u64,
+        topology_epoch: u64,
         sync_level: db_types.SyncLevel,
     ) !?void {
+        return txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
+    }
+
+    fn txnResolveGroupLocalWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        status: db_types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_types.SyncLevel,
+        cancellation: db_types.CancellationToken,
+    ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
+        try self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, .{
             .sync_level = sync_level,
             .transaction = .{ .resolve = .{
                 .txn_id = txn_id,
                 .status = status,
                 .commit_version = commit_version,
             } },
-        });
+        }, .{ .cancellation = cancellation }, topology_epoch);
         return {};
     }
 
     fn txnResolveGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: @import("antfly_local_sources").api_distributed_txn_contract.TxnResolveRequest, cancellation: db_types.CancellationToken) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        try self.applyTransactionGroupLocalRouted(alloc, group, table, .{
+        const decision_epoch = if (request.external_decision_owner == null and request.restore_staging_scope == null) request.topology_epoch else 0;
+        try self.applyTransactionGroupLocalAdmitted(alloc, group, table, .{
             .restore_staging_scope = request.restore_staging_scope,
             .restore_staging_plan_id = request.restore_staging_plan_id,
             .sync_level = request.sync_level,
             .transaction = .{ .resolve = .{ .txn_id = request.txn_id, .status = request.status, .commit_version = request.commit_version, .external_decision_owner = request.external_decision_owner } },
-        }, .{ .cancellation = cancellation }, request.route_fence);
+        }, .{ .cancellation = cancellation }, request.route_fence, decision_epoch);
         return {};
     }
 
@@ -14069,7 +14098,7 @@ test "SQL relation lifetime terminal ordinary sessions release actual compiled o
         sealed.deinit(a);
         const tables = try request.distributedTables(a);
         defer tables.deinit();
-        var plan = (try registry.sealExecutionPlan(a, info.txn_id, tables.tables)) orelse return error.TestExpectedCommitPlan;
+        var plan = (try registry.sealExecutionPlan(a, try registry.mutation(a, info.txn_id, info.version.owner), tables.tables)) orelse return error.TestExpectedCommitPlan;
         plan.deinit();
         const context: request_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s };
         try std.testing.expectEqual(@as(usize, 1), entry.active_users);
@@ -14103,7 +14132,7 @@ test "SQL relation lifetime terminal ordinary sessions release actual compiled o
         try std.testing.expectEqual(@as(usize, 1), held.closes);
         try std.testing.expect(held.outside_locks);
         try std.testing.expectEqual(@as(usize, 0), entry.active_users);
-        var retained = (try registry.getExecutionPlan(a, info.txn_id)) orelse return error.TestExpectedCommitPlan;
+        var retained = (try registry.getExecutionPlan(a, try registry.mutation(a, info.txn_id, info.version.owner))) orelse return error.TestExpectedCommitPlan;
         defer retained.deinit();
         try std.testing.expectEqualStrings("docs", retained.value[0].table_name);
         if (!abort) {

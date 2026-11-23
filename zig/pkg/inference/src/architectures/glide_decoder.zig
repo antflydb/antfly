@@ -337,7 +337,7 @@ const Forward = struct {
         defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
         // Debug: append the first row's readout hidden state after every layer
         // (raw f32) for layer-by-layer comparison against the reference.
-        const dump_file: ?*std.c.FILE = if (platform.env.getenvZ("ANTFLY_GLIDE_DECODER_DUMP")) |path| std.c.fopen(path, "ab") else null;
+        const dump_file: ?*std.c.FILE = if (comptime !@import("builtin").link_libc) null else if (platform.env.getenvZ("ANTFLY_GLIDE_DECODER_DUMP")) |path| std.c.fopen(path, "ab") else null;
         defer if (dump_file) |file| {
             _ = std.c.fclose(file);
         };

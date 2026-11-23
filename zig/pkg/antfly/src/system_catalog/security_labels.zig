@@ -330,11 +330,11 @@ pub const Admitted = struct {
     upserts: [1]domain.Resource,
     outcome: catalog.Outcome,
 
-    fn delta(self: *const Admitted) domain.Delta {
+    fn delta(self: *Admitted) domain.Delta {
         return .{ .upserts = &self.upserts, .removes = &.{}, .next_id = self.meta.next_id };
     }
 
-    pub fn apply(self: *const Admitted, a: A, txn: *local.storage_docstore.DocStore.Txn, group: u64, command: Command) !catalog.Outcome {
+    pub fn apply(self: *Admitted, a: A, txn: *local.storage_docstore.DocStore.Txn, group: u64, command: Command) !catalog.Outcome {
         try storage.applyDelta(a, txn, group, self.delta(), self.meta, try catalog.canonicalDigest("antfly:security-label-command:v1", command));
         return self.outcome;
     }
@@ -356,7 +356,7 @@ pub fn admitTxn(a: A, txn: *local.storage_docstore.DocStore.Txn, group: u64, com
         if (!std.mem.eql(u8, provider.name, prepared.provider_name) or !std.mem.eql(u8, &provider.digest, &prepared.provider_digest)) return error.CatalogGenerationChanged;
         break :native try relabel(a, found.resource, provider, prepared);
     };
-    const admitted: Admitted = .{
+    var admitted: Admitted = .{
         .meta = meta,
         .upserts = .{updated},
         .outcome = .{ .success = .{

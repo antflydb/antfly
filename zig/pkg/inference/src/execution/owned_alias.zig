@@ -32,10 +32,37 @@ pub fn fullSpanActivation(pool: *const physical.Pool, slot: buffers.LogicalSlot,
     if (slot.kind != .view or slot.backend != target.kind() or slot.node_id >= graph.nodeCount() or slot.node_id >= reachable.len or !reachable[slot.node_id]) return false;
     const node = graph.node(slot.node_id);
     if (node.num_inputs != 1 or node.inputs[0] >= reachable.len or !reachable[node.inputs[0]]) return false;
-    const root = metadata.activationRoot(&pool.plan, slot.node_id, slot.backend) orelse return false;
+    const root = metadata.fullSpanRoot(&pool.plan, slot.node_id, slot.backend) orelse return false;
     if (root.node_id >= selected.planes_witnessed.len or !selected.planes_witnessed[root.node_id]) return false;
-    const allocating = pool.plan.allocationById(root.allocation) orelse return false;
-    if (allocating.backend != slot.backend or allocating.kind != .tensor) return false;
+    const backing_bytes = backing: {
+        const allocation_id, const expected_kind = switch (root.kind) {
+            .allocation => .{ root.allocation, buffers.AllocationKind.tensor },
+            .constant => literal: {
+                if (target.kind() != .cuda or root.desc.shape.dtype != .f32 or slot.roles.graph_output) return false;
+                const store = pool.literal_store orelse return false;
+                const index = store.node_indices[root.node_id];
+                if (index == ml.graph.null_node or !pool.literalEnabled(index)) return false;
+                break :literal .{ store.literals[index].allocation, buffers.AllocationKind.constant_binding };
+            },
+            .runtime_input => ingress: {
+                if (target.kind() != .cuda or slot.roles.graph_output or root.desc.shape.dtype != .f32) return false;
+                for (pool.device_input_plans) |input| {
+                    if (input.node == root.node_id and input.epoch == selected.epoch and input.shape.eq(root.desc.shape))
+                        break :ingress .{ input.allocation, buffers.AllocationKind.input_binding };
+                }
+                const immutable = pool.immutable_bindings orelse return false;
+                const binding = immutable.find(root.node_id) orelse return false;
+                if (selected.inputs.find(root.node_id) != null or binding != .tensor or selected.plane_counts[root.node_id] != 1) return false;
+                const plane = selected.planes[root.node_id][0];
+                if (plane.backing == null or !plane.descriptor.shape.eq(root.desc.shape)) return false;
+                break :backing plane.readable_bytes;
+            },
+            else => return false,
+        };
+        const allocating = pool.plan.allocationById(allocation_id) orelse return false;
+        if (allocating.backend != slot.backend or allocating.kind != expected_kind) return false;
+        break :backing allocating.byte_size;
+    };
     var current = slot;
     var depth: usize = 0;
     while (current.kind == .view) : (depth += 1) {
@@ -66,7 +93,7 @@ pub fn fullSpanActivation(pool: *const physical.Pool, slot: buffers.LogicalSlot,
             else => unreachable,
         };
         if (!std.meta.eql(plane.backing, planned.backing) or plane.byte_offset != planned.byte_offset) return false;
-        if (plane.role != .primary or plane.descriptor.current_backend != target.kind() or plane.descriptor.storage != storage or plane.descriptor.quant_format != null or plane.descriptor.attention_storage != null or plane.descriptor.attention_kv_format != null or !plane.descriptor.shape.eq(current.desc.shape) or plane.descriptor.view_source != parent.node_id or !metadata.dense(current.desc.shape, plane.descriptor.strides) or plane.logical_bytes != bytes or plane.readable_bytes != bytes or plane.writable != null or plane.layout_key != null or plane.storage_epoch != selected.epoch or allocating.byte_size < bytes) return false;
+        if (plane.role != .primary or plane.descriptor.current_backend != target.kind() or plane.descriptor.storage != storage or plane.descriptor.quant_format != null or plane.descriptor.attention_storage != null or plane.descriptor.attention_kv_format != null or !plane.descriptor.shape.eq(current.desc.shape) or plane.descriptor.view_source != parent.node_id or !metadata.dense(current.desc.shape, plane.descriptor.strides) or plane.logical_bytes != bytes or plane.readable_bytes != bytes or plane.writable != null or plane.layout_key != null or plane.storage_epoch != selected.epoch or backing_bytes < bytes) return false;
         current = parent;
     }
     return current.id == root.id;

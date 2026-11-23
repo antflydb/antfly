@@ -17,7 +17,7 @@
 //! last consumer has been submitted on the same stream. No request is rerun
 //! for planning; capture validates the complete allocation/free event sequence.
 const std = @import("std");
-const arena = @import("execution_arena.zig");
+const arena = @import("../../execution/stream_workspace.zig");
 pub const limit = arena.limit;
 pub const Plan = arena.Plan;
 pub const Scope = arena.Scope;

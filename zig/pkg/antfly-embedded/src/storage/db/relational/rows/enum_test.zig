@@ -411,8 +411,8 @@ test "SQL named enum FK planners retain exact domains across column names and ad
 
 test "SQL named enum JSON predicates and bounds prepare borrowed atoms and preserve declaration order" {
     const a = std.testing.allocator;
-    const predicates = @import("../indexes/predicate.zig");
-    const partial = @import("../indexes/predicate.zig");
+    const predicates = @import("../indexes/partial_predicate.zig");
+    const partial = @import("../indexes/partial_predicate.zig");
     var labels = try types.Owned.create(a, &.{ "z", "a", "" });
     defer labels.deinit();
     const record: types.Record = .{ .identity = try types.Identity.init(7, 2, 1, @splat(3)), .definition = labels.definition, .owner = .auth_disabled };

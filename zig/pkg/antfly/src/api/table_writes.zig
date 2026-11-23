@@ -936,34 +936,9 @@ fn documentArtifactReprocessRequestForCursor(
         .from_key = cursor.next_key,
         .resume_from_key = true,
         .to_key = req.to_key,
+        .selection = req.selection,
         .limit = if (cursor.limit != 0) cursor.limit else req.limit,
     };
-}
-
-test "privacy reprocess continuations preserve empty IDs across shard and owner transport" {
-    const a = std.testing.allocator;
-    for ([_][]const u8{ "", "\x00", "after" }) |key| {
-        const req = documentArtifactReprocessRequestForCursor(.{ .to_key = "end", .limit = 100 }, .{ .group_id = 1, .next_key = key, .limit = 1 });
-        try std.testing.expect(req.resume_from_key);
-        try std.testing.expectEqual(@as(u32, 1), req.limit);
-        const raw = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", req);
-        defer a.free(raw);
-        var decoded = try std.json.parseFromSlice(StorageKernelArtifactRangeRequest, a, raw, .{});
-        defer decoded.deinit();
-        try std.testing.expect(decoded.value.request.resume_from_key);
-        try std.testing.expectEqualStrings(key, decoded.value.request.from_key);
-        try std.testing.expectEqualStrings("end", decoded.value.request.to_key);
-    }
-    const initial = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", .{});
-    defer a.free(initial);
-    try std.testing.expect(std.mem.indexOf(u8, initial, "resume_from_key") == null);
-    const id = try a.alloc(u8, 64 * 1024);
-    defer a.free(id);
-    @memset(id, 'x');
-    const request = documentArtifactReprocessRequestForCursor(.{}, .{ .next_key = id });
-    const bounded = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", request);
-    defer a.free(bounded);
-    try std.testing.expect(bounded.len < id.len + 512);
 }
 
 fn appendOwnedArtifactRepairIssues(
@@ -5288,6 +5263,8 @@ const TestEmbeddingRequest = struct {
     model: std.json.Value,
     input: std.json.Value,
 };
+
+const CommitAttempt = enum { ephemeral, first, replayable };
 
 pub const TableWriteSource = @import("antfly_local_sources").api_local_table_writes.TableWriteSource;
 
@@ -10659,28 +10636,39 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_ready.broadcast(io);
     }
 
-    fn beginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
+    fn waitForGroupOperation(self: *ProvisionedTableWriteSource, io: Io, cancellation: db_mod.types.CancellationToken) !void {
+        if (cancellation.ptr == null) return self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+        // Condition signals wake admitted work immediately. A bounded wait
+        // also observes tokens that cannot signal this condition.
+        self.table_activity_ready.waitTimeout(io, &self.table_activity_mutex, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| if (err != error.Timeout) return err;
+        self.table_activity_mutex.unlock(io);
+        defer self.table_activity_mutex.lockUncancelable(io);
+        try cancellation.check();
+    }
+
+    fn beginGroupOperationLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64, cancellation: db_mod.types.CancellationToken) !void {
         const io = self.tableActivityIo();
         while (self.retiring_replica_groups.contains(group_id)) {
-            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+            try self.waitForGroupOperation(io, cancellation);
         }
         self.activityEntryLocked(table_name, group_id).operation_waiters += 1;
+        errdefer self.cancelGroupOperationWaiterLocked(table_name, group_id);
         while (true) {
             if (self.retiring_replica_groups.contains(group_id)) {
-                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                try self.waitForGroupOperation(io, cancellation);
                 continue;
             }
             if (self.findTableActivityLocked(table_name, null)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0 or entry.status_request_active > 0) {
-                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    try self.waitForGroupOperation(io, cancellation);
                     continue;
                 }
             }
             if (self.findTableActivityLocked(table_name, group_id)) |index| {
                 const entry = self.active_table_activities.items[index];
                 if (entry.operation_active or entry.transition_waiters > 0 or entry.generation_preparation_active) {
-                    self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+                    try self.waitForGroupOperation(io, cancellation);
                     continue;
                 }
             }
@@ -11068,7 +11056,15 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        self.beginGroupOperationLocked(table_name, group_id);
+        self.beginGroupOperationLocked(table_name, group_id, .none) catch unreachable;
+    }
+
+    fn beginDecisionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64, cancellation: db_mod.types.CancellationToken) !void {
+        try cancellation.check();
+        const io = self.tableActivityIo();
+        try self.table_activity_mutex.lock(io);
+        defer self.table_activity_mutex.unlock(io);
+        try self.beginGroupOperationLocked(table_name, group_id, cancellation);
     }
 
     pub fn testingMarkTableRequestActive(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -11451,8 +11447,10 @@ pub const ProvisionedTableWriteSource = struct {
     pub const RoutedWriteAdmission = struct {
         source: *ProvisionedTableWriteSource,
         table_name: []const u8,
+        decision_group: ?u64 = null,
 
         pub fn deinit(self: *@This()) void {
+            if (self.decision_group) |group| self.source.endGroupOperation(self.table_name, group);
             self.source.endTableRequest(self.table_name);
             self.* = undefined;
         }
@@ -11466,21 +11464,64 @@ pub const ProvisionedTableWriteSource = struct {
         deadline_ns: u64,
         cancellation: db_mod.types.CancellationToken,
     ) !RoutedWriteAdmission {
+        return self.acquireProposalAdmission(alloc, table_name, fence, deadline_ns, cancellation, false);
+    }
+
+    pub fn acquireProposalAdmission(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        fence: metadata_api.CatalogRouteFence,
+        deadline_ns: u64,
+        cancellation: db_mod.types.CancellationToken,
+        decision: bool,
+    ) !RoutedWriteAdmission {
         try fence.validate();
         const admission_deadline_ns = if (self.catalog.routeFenceDeadline(fence)) |fence_deadline|
             @min(deadline_ns, fence_deadline)
         else
             deadline_ns;
-        while (!self.tryBeginTableRequest(table_name)) {
+        while (true) {
+            if (self.tryBeginTableRequest(table_name)) {
+                if (!decision or self.tryBeginReadCompatibleGroupOperation(table_name, fence.route.group_id)) break;
+                self.endTableRequest(table_name);
+            }
             try cancellation.check();
             try fence.admission_cancellation.check();
             if (self.catalog.budget(null).nowNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
             try self.catalog.budget(null).sleepNs(std.time.ns_per_ms);
         }
-        errdefer self.endTableRequest(table_name);
+        var admission: RoutedWriteAdmission = .{ .source = self, .table_name = table_name, .decision_group = if (decision) fence.route.group_id else null };
+        errdefer admission.deinit();
         try cancellation.check();
         try fence.admission_cancellation.check();
-        try table_catalog.validateCatalogRouteFenceUntil(
+        if (decision) {
+            // A transition can freeze an owner without changing its range list.
+            // Validate transition state and the route on one cut while holding
+            // the group and table gates through Raft index assignment.
+            var budget = self.catalog.budget(admission_deadline_ns);
+            const CancellationPair = struct {
+                request: db_mod.types.CancellationToken,
+                admission: db_mod.types.CancellationToken,
+
+                fn check(ptr: *const anyopaque) !void {
+                    const pair: *const @This() = @ptrCast(@alignCast(ptr));
+                    try pair.request.check();
+                    try pair.admission.check();
+                }
+
+                fn cancelled(ptr: *const anyopaque) bool {
+                    const pair: *const @This() = @ptrCast(@alignCast(ptr));
+                    return pair.request.isCancelled() or pair.admission.isCancelled();
+                }
+            };
+            const pair: CancellationPair = .{ .request = cancellation, .admission = fence.admission_cancellation };
+            budget.cancellation = if (pair.admission.ptr == null or std.meta.eql(pair.request, pair.admission)) pair.request else if (pair.request.ptr == null) pair.admission else .{ .ptr = &pair, .check_fn = CancellationPair.check, .is_cancelled_fn = CancellationPair.cancelled };
+            table_catalog.validateRaftDecision(self.catalog, table_name, fence, budget) catch |err| switch (err) {
+                error.TableNotFound, error.TopologyChanged => return error.DecisionNotProposed,
+                else => return err,
+            };
+        } else try table_catalog.validateCatalogRouteFenceUntil(
             alloc,
             self.catalog,
             table_name,
@@ -11489,7 +11530,7 @@ pub const ProvisionedTableWriteSource = struct {
         );
         try cancellation.check();
         try fence.admission_cancellation.check();
-        return .{ .source = self, .table_name = table_name };
+        return admission;
     }
 
     fn tryBeginStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
@@ -20331,6 +20372,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_fresh_id = commitTransactionWithFreshId,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
                 .backup_pin_control = backupPinControl,
@@ -22463,7 +22505,7 @@ pub const ProvisionedTableWriteSource = struct {
         const txn_source: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, .ephemeral, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -22486,7 +22528,19 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .replayable, cancellation);
+    }
+
+    fn commitTransactionWithFreshId(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        return try commitProvisionedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .first, cancellation);
     }
 
     fn acknowledgeTransactionCommit(
@@ -22515,7 +22569,7 @@ pub const ProvisionedTableWriteSource = struct {
         begin_timestamp: u64,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
-        retain_terminal: bool,
+        attempt: CommitAttempt,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -22533,7 +22587,8 @@ pub const ProvisionedTableWriteSource = struct {
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
-                .retain_terminal = retain_terminal,
+                .retain_terminal = attempt != .ephemeral,
+                .fresh_retained_id = attempt == .first,
                 .report_post_commit_failure = false,
                 .fanout_io = self.tableActivityIo(),
                 .post_commit_cancellation = cancellation,
@@ -22574,7 +22629,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation) catch |err| {
+        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, .ephemeral, cancellation) catch |err| {
             if (err == error.CommitDecisionUnknown)
                 public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
             return err;
@@ -23869,15 +23924,11 @@ pub const ProvisionedTableWriteSource = struct {
         const sync_level = request.sync_level;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
-        // Serialize the final epoch validation with split/merge transition
-        // admission. If a transition is already waiting, it wins admission;
-        // otherwise this resolve remains ahead of the transition until the
-        // durable decision has been applied.
-        self.beginGroupOperation(table_name, group_id);
-        defer self.endGroupOperation(table_name, group_id);
-        if (topology_epoch != 0)
-            try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (request.route_fence) |fence| if (fence.route.execution == .native_local) {
+            try self.beginDecisionOperation(table_name, group_id, cancellation);
+            defer self.endGroupOperation(table_name, group_id);
+            if (topology_epoch != 0)
+                try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             if (request.external_decision_owner == null) return error.InvalidExternalDecisionOwner;
             const native = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
             return native.txnResolveGroupLocalWithRequest(alloc, group_id, table_name, request, cancellation);
@@ -23888,7 +23939,7 @@ pub const ProvisionedTableWriteSource = struct {
             // dispatcher as begin/prepare; the transaction ID and replicated
             // decision make retries safe, while the forwarded batch hop remains
             // cache-only and bounded inside the data runtime.
-            try batcher.batchGroupWithCancellation(alloc, group_id, table_name, .{
+            const req: db_mod.types.BatchRequest = .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{
                     .txn_id = txn_id,
@@ -23896,9 +23947,35 @@ pub const ProvisionedTableWriteSource = struct {
                     .commit_version = commit_version,
                     .external_decision_owner = request.external_decision_owner,
                 } },
-            }, cancellation);
+            };
+            if (topology_epoch != 0) {
+                var budget = self.catalog.budget(null);
+                budget.deadline_ns = budget.nowNs() +| @as(u64, metadata_api.catalog_route_default_deadline_ms) * std.time.ns_per_ms;
+                budget.cancellation = cancellation;
+                var fence = table_catalog.raftDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, budget) catch |err| switch (err) {
+                    error.TopologyChanged, error.TableNotFound => return error.DecisionNotProposed,
+                    else => return err,
+                };
+                fence.admission_deadline_ns = budget.deadline_ns;
+                fence.admission_deadline_io = budget.io;
+                fence.admission_cancellation = cancellation;
+                try batcher.batchGroupRoutedWithCancellation(alloc, fence, table_name, req, cancellation);
+            } else {
+                try self.beginDecisionOperation(table_name, group_id, cancellation);
+                defer self.endGroupOperation(table_name, group_id);
+                try batcher.batchGroupWithCancellation(alloc, group_id, table_name, req, cancellation);
+            }
             return {};
         }
+        // Serialize the final epoch validation with split/merge transition
+        // admission. If a transition is already waiting, it wins admission;
+        // otherwise this resolve remains ahead of the transition until the
+        // durable decision has been applied.
+        try self.beginDecisionOperation(table_name, group_id, cancellation);
+        defer self.endGroupOperation(table_name, group_id);
+        const local_owner = self.groupLocalWriteSource();
+        if (topology_epoch != 0 and (local_owner == null or !local_owner.?.validates_local_decision_route))
+            _ = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, cancellation);
         if (status == .committed) {
             lockAtomic(&self.local_db_mutex);
             self.invalidateReadCache(table_name);
@@ -23911,7 +23988,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.invalidateWriteCache(table_name);
             }
         }
-        if (self.groupLocalWriteSource()) |owner| {
+        if (local_owner) |owner| {
             if ((try owner.txnResolveGroupLocalWithRequest(alloc, group_id, table_name, request, cancellation)) == null) return null;
             if (status == .committed) {
                 lockAtomic(&self.local_db_mutex);
@@ -26030,6 +26107,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_fresh_id = commitTransactionWithFreshId,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
                 .backup_pin_control = backupPinControl,
@@ -26782,7 +26860,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const txn_source: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, .ephemeral, cancellation);
     }
 
     fn commitBatch(
@@ -26816,7 +26894,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         if (try distributed_txn.executeNativeAtomicBatch(alloc, self.catalog, .{ .ptr = self, .apply = nativeAtomicApply }, tables, nextTxnTimestamp(atomic_io), sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, .ephemeral, cancellation);
     }
 
     fn batchGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: db_mod.types.BatchRequest, route: metadata_api.CatalogRouteFence) !?void {
@@ -26877,7 +26955,19 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .replayable, cancellation);
+    }
+
+    fn commitTransactionWithFreshId(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        return try commitHostedTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, .first, cancellation);
     }
 
     fn acknowledgeTransactionCommit(
@@ -26906,7 +26996,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         begin_timestamp: u64,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
-        retain_terminal: bool,
+        attempt: CommitAttempt,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -26924,7 +27014,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
-                .retain_terminal = retain_terminal,
+                .retain_terminal = attempt != .ephemeral,
+                .fresh_retained_id = attempt == .first,
                 .report_post_commit_failure = false,
                 .fanout_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null,
                 .post_commit_cancellation = cancellation,
@@ -27294,10 +27385,16 @@ pub const HostedProvisionedTableWriteSource = struct {
         try ensurePreDecisionContextActive(context);
         if (comptime control_only_storage_sources) {
             if (context.route_fence != null or req.range_guards.len != 0) return error.CatalogRouteFenceUnsupported;
-            if (topology_epoch != 0)
-                try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
+            if (req.transaction) |transaction| if (transaction == .resolve and topology_epoch != 0) {
+                if (!local_source.validates_local_decision_route)
+                    _ = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, context.cancellation);
+                try ensurePreDecisionContextActive(context);
+                const decision = transaction.resolve;
+                return local_source.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, decision.txn_id, decision.status, decision.commit_version, topology_epoch, req.sync_level, context.cancellation);
+            };
+            if (topology_epoch != 0) try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             return try local_source.batchGroupLocal(alloc, group_id, table_name, req);
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -27314,8 +27411,11 @@ pub const HostedProvisionedTableWriteSource = struct {
             if (fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
         }
-        if (topology_epoch != 0 and context.route_fence == null)
-            try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        if (topology_epoch != 0 and context.route_fence == null) {
+            if (req.transaction != null and req.transaction.? == .resolve) {
+                _ = try table_catalog.localDecisionRoute(alloc, self.catalog, table_name, topology_epoch, group_id, context.cancellation);
+            } else try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        }
         if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);
@@ -28868,7 +28968,25 @@ fn putArtifactEnrichmentInDb(
 ) !void {
     var parsed = try parseArtifactEnrichmentConfig(alloc, artifact_name, enrichment_json);
     defer parsed.deinit();
-    _ = try db.upsertEnrichment(parsed.value);
+    var input = try std.json.parseFromSlice(std.json.Value, alloc, enrichment_json, .{});
+    defer input.deinit();
+    if (input.value != .object) return error.InvalidEnrichmentConfig;
+    if (!input.value.object.contains("producer_json") and !input.value.object.contains("producer") and !input.value.object.contains("transcriber")) {
+        if (try db.getEnrichment(alloc, parsed.value.kind, artifact_name)) |value| {
+            var existing = value;
+            defer existing.deinit(alloc);
+            try input.value.object.put(input.arena.allocator(), "producer_json", .{ .string = try input.arena.allocator().dupe(u8, existing.producer_json) });
+        }
+    }
+    // Use the same public normalization as metadata admission, including typed
+    // producer configuration and the transcription shorthand. A direct parse
+    // of the internal struct silently discards both public spellings.
+    const normalized = try std.json.Stringify.valueAlloc(alloc, .{ .enrichments = .{input.value} }, .{});
+    defer alloc.free(normalized);
+    const configs = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, normalized);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, configs);
+    if (configs.len != 1) return error.InvalidEnrichmentConfig;
+    _ = try db.upsertEnrichment(configs[0]);
 }
 
 const deleteArtifactEnrichmentFromDbByName = @import("antfly_local_sources").api_local_table_writes.deleteArtifactEnrichmentFromDbByName;
@@ -40886,6 +41004,59 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "privacy reprocess continuations preserve empty IDs across shard and owner transport" {
+            const a = std.testing.allocator;
+            for ([_][]const u8{ "", "\x00", "after" }) |key| {
+                const req = documentArtifactReprocessRequestForCursor(.{ .to_key = "end", .limit = 100, .selection = .incomplete }, .{ .group_id = 1, .next_key = key, .limit = 1 });
+                try std.testing.expect(req.resume_from_key);
+                try std.testing.expectEqual(@as(u32, 1), req.limit);
+                const raw = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", req);
+                defer a.free(raw);
+                var decoded = try std.json.parseFromSlice(StorageKernelArtifactRangeRequest, a, raw, .{});
+                defer decoded.deinit();
+                try std.testing.expect(decoded.value.request.resume_from_key);
+                try std.testing.expectEqual(.incomplete, decoded.value.request.selection);
+                try std.testing.expectEqualStrings(key, decoded.value.request.from_key);
+                try std.testing.expectEqualStrings("end", decoded.value.request.to_key);
+            }
+            const initial = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", .{});
+            defer a.free(initial);
+            try std.testing.expect(std.mem.indexOf(u8, initial, "resume_from_key") == null);
+            const id = try a.alloc(u8, 64 * 1024);
+            defer a.free(id);
+            @memset(id, 'x');
+            const request = documentArtifactReprocessRequestForCursor(.{}, .{ .next_key = id });
+            const bounded = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", request);
+            defer a.free(bounded);
+            try std.testing.expect(bounded.len < id.len + 512);
+        }
+
+        test "enrichment shorthand local PUT preserves and replaces producer forms" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/policy-put", .{tmp.sub_path});
+            defer a.free(path);
+            var db = try db_mod.DB.open(a, path, .{});
+            defer db.close();
+            try putArtifactEnrichmentInDb(a, &db, "audio",
+                \\{"name":"audio","kind":"asset","field":"url","transcriber":{"provider":"antfly","model":"first"}}
+            );
+            try putArtifactEnrichmentInDb(a, &db, "audio",
+                \\{"name":"audio","kind":"asset","field":"url","producer":{"type":"document_extraction","config":{"transcription":{"transcriber":{"provider":"antfly","model":"second"}}}}}
+            );
+            try putArtifactEnrichmentInDb(a, &db, "audio",
+                \\{"name":"audio","kind":"asset","field":"url","transcriber":{"provider":"antfly","model":"third"}}
+            );
+            try putArtifactEnrichmentInDb(a, &db, "audio",
+                \\{"name":"audio","kind":"asset","field":"url","content_type":"application/json","execution":{"batch_items":2}}
+            );
+            var saved = (try db.getEnrichment(a, .asset, "audio")).?;
+            defer saved.deinit(a);
+            try std.testing.expect(std.mem.indexOf(u8, saved.producer_json, "third") != null);
+            try std.testing.expectEqual(@as(?u32, 2), saved.execution.?.batch_items);
+        }
+
         // Source quiescence joins source-owned work; cached DB workers also
         // borrow it through runtime hooks and must drain before its destruction.
         fn deinitManagedSourceForTest(source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {

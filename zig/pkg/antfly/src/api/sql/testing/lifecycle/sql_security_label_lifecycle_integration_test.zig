@@ -430,10 +430,36 @@ test "mounted SQL SECURITY LABEL originals retain real provider policy identity 
 
             var clear = intent;
             clear.label = null;
-            const stale = try TestSigner.prepare(svc, scratch, control, clear, @splat(20), key);
-            _ = try metadata.submitSqlSelinuxAuthority(svc, control, .{
+            const pre_rotation = try TestSigner.prepare(svc, scratch, control, clear, @splat(20), key);
+            var next_authority = authority;
+            next_authority.policy = .{ .digest = @splat(21), .sequence = authority.policy.sequence + 1 };
+            const rotated = try metadata.submitSqlSelinuxAuthority(svc, control, .{
                 .incarnation = admission.incarnation,
                 .expected_epoch = installed.epoch,
+                .active = next_authority,
+            });
+            const stale_rotation_result = try ops.mutateSqlCatalog(svc, scratch, control, pre_rotation);
+            const stale_rotation = try std.json.parseFromSliceLeaky(?mutations.Outcome, scratch, stale_rotation_result, .{});
+            try std.testing.expect(stale_rotation != null and stale_rotation.? == .rejected);
+            try std.testing.expectEqual(.CatalogGenerationChanged, stale_rotation.?.rejected);
+
+            // Revalidate the existing label under the new authority, then
+            // prove both relabel and clear can publish under the rotated key.
+            var replacement = intent;
+            replacement.label = "system_u:object_r:rotated_schema_t:s0";
+            const relabeled = try TestSigner.prepare(svc, scratch, control, replacement, @splat(22), key);
+            const relabel_result = try ops.mutateSqlCatalog(svc, scratch, control, relabeled);
+            const relabel_outcome = try std.json.parseFromSliceLeaky(?mutations.Outcome, scratch, relabel_result, .{});
+            try std.testing.expect(relabel_outcome != null and relabel_outcome.? == .success);
+            const cleared = try TestSigner.prepare(svc, scratch, control, clear, @splat(23), key);
+            const clear_result = try ops.mutateSqlCatalog(svc, scratch, control, cleared);
+            const clear_outcome = try std.json.parseFromSliceLeaky(?mutations.Outcome, scratch, clear_result, .{});
+            try std.testing.expect(clear_outcome != null and clear_outcome.? == .success);
+
+            const stale = try TestSigner.prepare(svc, scratch, control, intent, @splat(24), key);
+            _ = try metadata.submitSqlSelinuxAuthority(svc, control, .{
+                .incarnation = admission.incarnation,
+                .expected_epoch = rotated.epoch,
                 .active = null,
             });
             const denied = try ops.mutateSqlCatalog(svc, scratch, control, stale);

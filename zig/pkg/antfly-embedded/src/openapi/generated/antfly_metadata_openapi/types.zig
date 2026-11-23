@@ -3719,7 +3719,7 @@ pub const DocumentArtifactManifest = struct {
     last_error_code: OpenApiOptionalNullable([]const u8) = .absent,
     /// Human-readable last extraction or materialization error summary, when available.
     last_error_message: OpenApiOptionalNullable([]const u8) = .absent,
-    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
+    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses. Newly produced document-extraction generations include the declared execution policy under execution, including on failed generations; it is not a measured provider budget. Older manifests may omit it.
     manifest_json: ?[]const u8 = null,
     /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
     state_json: OpenApiOptionalNullable([]const u8) = .absent,
@@ -3902,6 +3902,8 @@ pub const DocumentArtifactReprocessFailure = struct {
 };
 
 pub const DocumentArtifactReprocessJob = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Server-assigned durable repair job identifier.
     job_id: u64,
     /// Monotonic execution attempt token for the current running pass.
@@ -3947,8 +3949,47 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Unix epoch milliseconds after which the retained job status may be removed.
     expires_at_millis: u64,
 
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
+        .{ "job_id", "job_id", false },
+        .{ "attempt_id", "attempt_id", false },
+        .{ "table_name", "table_name", false },
+        .{ "artifact_name", "artifact_name", false },
+        .{ "phase", "phase", false },
+        .{ "reprocess_status", "reprocess_status", false },
+        .{ "from_key", "from_key", false },
+        .{ "to_key", "to_key", false },
+        .{ "limit", "limit", false },
+        .{ "next_key", "next_key", false },
+        .{ "scanned", "scanned", false },
+        .{ "reprocessed", "reprocessed", false },
+        .{ "skipped", "skipped", false },
+        .{ "failed", "failed", false },
+        .{ "pending_shards", "pending_shards", false },
+        .{ "failures", "failures", false },
+        .{ "shard_cursors", "shard_cursors", false },
+        .{ "last_error", "last_error", false },
+        .{ "cancel_requested", "cancel_requested", false },
+        .{ "created_at_millis", "created_at_millis", false },
+        .{ "last_updated_at_millis", "last_updated_at_millis", false },
+        .{ "expires_at_millis", "expires_at_millis", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         try jw.objectField("job_id");
         try jw.write(self.job_id);
         try jw.objectField("attempt_id");
@@ -4017,6 +4058,8 @@ pub const DocumentArtifactReprocessJob = struct {
 
 /// Request to create a durable table artifact reprocess job.
 pub const DocumentArtifactReprocessJobStartRequest = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Exclusive lower bound source document key.
     from_key: ?[]const u8 = null,
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
@@ -4028,6 +4071,7 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
         .{ "from_key", "from_key", true },
         .{ "to_key", "to_key", true },
         .{ "limit", "limit", true },
@@ -4044,6 +4088,10 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         if (self.from_key) |value| {
             try jw.objectField("from_key");
             try jw.write(value);
@@ -4116,6 +4164,8 @@ pub const DocumentArtifactReprocessShardCursor = struct {
 
 /// Bounded request for reprocessing a derived artifact across source rows in key order.
 pub const DocumentArtifactTableReprocessRequest = struct {
+    /// all explicitly regenerates selected source records, including accepted artifacts. incomplete selects only missing or incomplete document_extraction artifacts, including converged manifests with failed OCR pages. Complete accepted results are skipped. Other producer kinds reject incomplete selection. Selection and cursors are retained by durable jobs. Acceptance does not certify inference completion.
+    selection: ?[]const u8 = null,
     /// Exclusive lower bound source document key. Use the prior response next_key to continue.
     from_key: ?[]const u8 = null,
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
@@ -4127,6 +4177,7 @@ pub const DocumentArtifactTableReprocessRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "selection", "selection", true },
         .{ "from_key", "from_key", true },
         .{ "to_key", "to_key", true },
         .{ "limit", "limit", true },
@@ -4143,6 +4194,10 @@ pub const DocumentArtifactTableReprocessRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
         if (self.from_key) |value| {
             try jw.objectField("from_key");
             try jw.write(value);
@@ -16624,10 +16679,11 @@ pub const StoreRootEnrollmentRequest = struct {
     signature: []const u8,
 };
 
-/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
+/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "query": Wait for durable application and document full-text query visibility - "full_text": Compatibility alias for query - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
 pub const SyncLevel = enum {
     propose,
     write,
+    query,
     full_text,
     enrichments,
     full_index,
@@ -16636,6 +16692,7 @@ pub const SyncLevel = enum {
         const s = switch (self) {
             .propose => "propose",
             .write => "write",
+            .query => "query",
             .full_text => "full_text",
             .enrichments => "enrichments",
             .full_index => "full_index",
@@ -16651,6 +16708,7 @@ pub const SyncLevel = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "propose", .propose },
             .{ "write", .write },
+            .{ "query", .query },
             .{ "full_text", .full_text },
             .{ "enrichments", .enrichments },
             .{ "full_index", .full_index },
@@ -18523,6 +18581,60 @@ pub const TransactionStageWriteRequest = struct {
 pub const TransactionStatusResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
+};
+
+/// A classified write failure. An aborted status confirms that the transaction did not commit.
+pub const TransactionWriteError = struct {
+    /// Set to aborted for a confirmed transaction abort.
+    status: ?[]const u8 = null,
+    /// Machine-readable cause, including row_policy_denied and transaction_precommit_aborted.
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// The transaction ID for session commit responses.
+    transaction_id: ?[]const u8 = null,
+    retry_after_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", true },
+        .{ "code", "code", false },
+        .{ "message", "message", false },
+        .{ "retryable", "retryable", false },
+        .{ "transaction_id", "transaction_id", true },
+        .{ "retry_after_ms", "retry_after_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        try jw.objectField("code");
+        try jw.write(self.code);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        if (self.transaction_id) |value| {
+            try jw.objectField("transaction_id");
+            try jw.write(value);
+        }
+        if (self.retry_after_ms) |value| {
+            try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// In-place document transformation using MongoDB-style operators. Transforms are applied atomically at the storage layer, eliminating read-modify-write races. **Important:** Transform results are NOT validated against the table schema. This improves performance but means it's possible to create invalid documents. Use with care and ensure your operations maintain schema compliance.

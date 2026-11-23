@@ -25,6 +25,8 @@ pub const RmsReductionSchedule = @import("../kernel_geometry.zig").RmsReductionS
 
 pub const PixelScaleStorage = @import("../kernel_geometry.zig").PixelScaleStorage;
 
+pub const PatchFormat = enum(u32) { pixel_rgb_centered, channel_planar_centered, channel_planar_unit };
+
 pub const Attention = struct {
     batch: u32,
     seq: u32,
@@ -464,10 +466,10 @@ pub const Module = struct {
     }
 
     pub fn launchPillowVerticalPatches(self: *Module, ctx: *Context, out: Buffer, horizontal: Buffer, starts: Buffer, offsets: Buffer, weights: Buffer, source_height: u32, target_width: u32, target_height: u32, precision_bits: u32) !void {
-        return self.launchPillowVerticalPatchesStored(ctx, out, horizontal, starts, offsets, weights, source_height, target_width, target_height, precision_bits, .f32);
+        return self.launchPillowVerticalPatchesStored(ctx, out, horizontal, starts, offsets, weights, source_height, target_width, target_height, precision_bits, .f32, .pixel_rgb_centered);
     }
 
-    pub fn launchPillowVerticalPatchesStored(self: *Module, ctx: *Context, out: Buffer, horizontal: Buffer, starts: Buffer, offsets: Buffer, weights: Buffer, source_height: u32, target_width: u32, target_height: u32, precision_bits: u32, storage: PixelScaleStorage) !void {
+    pub fn launchPillowVerticalPatchesStored(self: *Module, ctx: *Context, out: Buffer, horizontal: Buffer, starts: Buffer, offsets: Buffer, weights: Buffer, source_height: u32, target_width: u32, target_height: u32, precision_bits: u32, storage: PixelScaleStorage, format: PatchFormat) !void {
         if (source_height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0 or precision_bits == 0 or precision_bits > 31 or weights.len % @sizeOf(i32) != 0) return error.InvalidEmbeddingGemma2Shape;
         const count = try std.math.mul(usize, try std.math.mul(usize, target_width, target_height), 3);
         if (count > std.math.maxInt(u32)) return error.InvalidEmbeddingGemma2Shape;
@@ -483,10 +485,10 @@ pub const Module = struct {
         var wp = weights.ptr;
         var w = target_width;
         var h = target_height;
-        var patch: u32 = 16;
+        var patch_format = @backingInt(format);
         var bits = precision_bits;
         var source_storage = @backingInt(storage);
-        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&hp), @ptrCast(&sp), @ptrCast(&fp), @ptrCast(&wp), @ptrCast(&w), @ptrCast(&h), @ptrCast(&patch), @ptrCast(&bits), @ptrCast(&source_storage) };
+        var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&hp), @ptrCast(&sp), @ptrCast(&fp), @ptrCast(&wp), @ptrCast(&w), @ptrCast(&h), @ptrCast(&patch_format), @ptrCast(&bits), @ptrCast(&source_storage) };
         try self.launch1d(ctx, self.pillow_vertical_patches, &args, @intCast(count));
     }
 
@@ -2731,7 +2733,7 @@ test "CUDA RGB patch source stores match independent finite byte fixtures and pr
     var out = try Buffer.alloc(&ctx, pixels.len * @sizeOf(f32));
     defer out.free(&ctx);
     for ([_]PixelScaleStorage{ .f32, .bf16 }) |storage| {
-        try module.launchPillowVerticalPatchesStored(&ctx, out, horizontal, y_starts, y_offsets, y_weights, 16, 16, 16, 1, storage);
+        try module.launchPillowVerticalPatchesStored(&ctx, out, horizontal, y_starts, y_offsets, y_weights, 16, 16, 16, 1, storage, .pixel_rgb_centered);
         var values: [16 * 16 * 3]f32 = undefined;
         try out.copyToHost(&ctx, std.mem.sliceAsBytes(&values));
         try ctx.synchronize();

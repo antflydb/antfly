@@ -389,7 +389,7 @@ fn comparisonFingerprint(alloc: Allocator, view: registry.SchemaView, definition
         hash.final(&tuple.fingerprint);
     }
     if (definition.where.len != 0) {
-        var condition = try @import("predicate.zig").Plan.init(alloc, view.tableSchema().*, view.physicalLayout(), definition.where);
+        var condition = try @import("partial_predicate.zig").Plan.init(alloc, view.tableSchema().*, view.physicalLayout(), definition.where);
         defer condition.deinit();
         condition.bindFingerprint(&tuple.fingerprint);
     }

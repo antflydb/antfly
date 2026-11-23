@@ -59,6 +59,7 @@ pub fn supports(op: ml.graph.OpCode) bool {
         .fused_linear_no_bias_pair,
         .fused_to_float32,
         .fused_rope,
+        .fused_sdpa,
         .fused_gqa_causal_attention,
         .fused_elem_add,
         .fused_elem_multiply,
@@ -109,6 +110,8 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
     const reject = partition.CapabilityDecision.reject;
     if (!supports(query.op)) return reject(.unsupported_op);
     const node = query.graph.node(query.node_id);
+    if (query.op == .constant and node.output_shape.dtype == .f32 and node.output_shape.numElements() == 0 and node.op.constant.data_len == 0)
+        return partition.CapabilityDecision.accept();
     if (!concrete(node.output_shape)) return reject(.unsupported_op);
     if (!dense(query, query.node_id)) return reject(.wrong_storage);
     switch (query.op) {
@@ -226,6 +229,30 @@ pub fn decide(query: partition.CapabilityQuery) partition.CapabilityDecision {
         },
         .fused_rope => {
             if (@import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) == null) return reject(.unsupported_op);
+        },
+        .fused_sdpa => |attrs| {
+            if (node.num_inputs < 3 or node.num_inputs > 4 or attrs.batch == 0 or attrs.seq_len == 0 or
+                attrs.num_heads == 0 or attrs.head_dim == 0 or attrs.head_dim > 512 or
+                (attrs.num_kv_heads != 0 and attrs.num_kv_heads != attrs.num_heads) or
+                (attrs.kv_seq_len != 0 and attrs.kv_seq_len != attrs.seq_len)) return reject(.unsupported_op);
+            const heads = std.math.mul(i64, attrs.batch, attrs.num_heads) catch return reject(.unsupported_op);
+            const output = node.output_shape;
+            const expected = switch (output.rank()) {
+                3 => ml.graph.Shape.init(.f32, &.{ heads, attrs.seq_len, attrs.head_dim }),
+                4 => ml.graph.Shape.init(.f32, &.{ attrs.batch, attrs.num_heads, attrs.seq_len, attrs.head_dim }),
+                else => return reject(.unsupported_op),
+            };
+            if (!sameShape(output, expected)) return reject(.unsupported_op);
+            for (node.getInputs()[0..3]) |id| {
+                if (!sameShape(query.graph.node(id).output_shape, expected)) return reject(.unsupported_op);
+            }
+            if (node.num_inputs == 4) {
+                const bias = query.graph.node(node.inputs[3]).output_shape;
+                const shared = ml.graph.Shape.init(.f32, &.{ attrs.num_heads, attrs.seq_len, attrs.seq_len });
+                const batched = ml.graph.Shape.init(.f32, &.{ attrs.batch, attrs.num_heads, attrs.seq_len, attrs.seq_len });
+                const flattened = ml.graph.Shape.init(.f32, &.{ heads, attrs.seq_len, attrs.seq_len });
+                if (!sameShape(bias, shared) and !sameShape(bias, batched) and !sameShape(bias, flattened)) return reject(.unsupported_op);
+            }
         },
         .fused_gqa_causal_attention => {
             const descriptor = @import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) orelse return reject(.unsupported_op);
@@ -402,4 +429,25 @@ test "CUDA graph legality keeps functional grouped prefixes and scalar residuals
     try std.testing.expect(decide(query).can_execute);
     graph.nodeMut(scalar).output_shape = ml.graph.Shape.init(.f32, &.{8});
     try std.testing.expect(!decide(query).can_execute);
+}
+
+test "CUDA places dense square SDPA with shared bias on the device" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{ 2, 3, 16, 64 });
+    const q = try b.parameter("q", shape);
+    const k = try b.parameter("k", shape);
+    const v = try b.parameter("v", shape);
+    const bias = try b.parameter("bias", ml.graph.Shape.init(.f32, &.{ 3, 16, 16 }));
+    const result = try graph.addNode(.{
+        .op = .{ .fused_sdpa = .{ .batch = 2, .seq_len = 16, .num_heads = 3, .head_dim = 64 } },
+        .inputs = .{ q, k, v, bias },
+        .num_inputs = 4,
+        .output_shape = shape,
+    });
+    try std.testing.expect(decide(.{ .graph = &graph, .node_id = result, .op = graph.node(result).op }).can_execute);
+    graph.nodeMut(result).op.fused_sdpa.kv_seq_len = 17;
+    try std.testing.expect(!decide(.{ .graph = &graph, .node_id = result, .op = graph.node(result).op }).can_execute);
 }

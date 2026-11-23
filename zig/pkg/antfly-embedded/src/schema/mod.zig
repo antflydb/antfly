@@ -2019,7 +2019,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
                 cover.deinit();
             }
             if (definition.where.len != 0) {
-                var condition = @import("../storage/db/relational/indexes/predicate.zig").Plan.init(alloc, index_schema, &layout, definition.where) catch |err| switch (err) {
+                var condition = @import("../storage/db/relational/indexes/partial_predicate.zig").Plan.init(alloc, index_schema, &layout, definition.where) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return error.InvalidSchemaUpdateRequest,
                 };

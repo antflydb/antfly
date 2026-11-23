@@ -289,7 +289,7 @@ test "relational index system partial implication stronger ranges null exclusion
     const alloc = std.testing.allocator;
     const schema = @import("../../../schema.zig");
     const codec = @import("../../algebraic/relational_row_codec.zig");
-    const partial = @import("predicate.zig");
+    const partial = @import("partial_predicate.zig");
     const columns = [_]schema.RelationalColumn{
         .{ .name = "x", .path = "x", .column_type = .integer, .allows_null = true },
         .{ .name = "label", .path = "label", .column_type = .string, .allows_null = true },

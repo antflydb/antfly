@@ -1021,9 +1021,14 @@ pub const AntflyApiHandler = struct {
         alloc: std.mem.Allocator,
         server: ?*http_server_mod.ApiHttpServer = null,
         value: @import("../pgwire/completion.zig").Completion = .{},
+        reports_existing_commit: bool = false,
+        reserve_on_prepare: bool = false,
         fn prepareTransaction(raw: *anyopaque, id: [16]u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try @import("sql/session/completion.zig").prepareTransaction(self.server orelse return error.DurabilityUnavailable, self.alloc, &self.value, id);
+            const server = self.server orelse return error.DurabilityUnavailable;
+            const protocol = @import("sql/session/completion.zig");
+            if (self.reserve_on_prepare) try protocol.reserveOnOwner(server, &self.value);
+            try protocol.prepareTransaction(server, self.alloc, &self.value, id);
         }
         fn prepareMetadata(raw: *anyopaque, owner: operation_contract.SQLCompletionOwner) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1069,7 +1074,9 @@ pub const AntflyApiHandler = struct {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
         try establishExecutionDeadlines(ctx);
-        if (try self.admitCompletion(ctx)) |response| return response;
+        if (!std.mem.eql(u8, http_server_mod.stripApiPrefix(ctx.request.uri.path), "/sql")) {
+            if (try self.admitCompletion(ctx)) |response| return response;
+        }
         var response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         errdefer response.deinit();
         try self.completeSQLResponse(ctx, &response);
@@ -1097,7 +1104,8 @@ pub const AntflyApiHandler = struct {
         // manufacture an unresolved durable owner. Ambiguous 409s stay fenced.
         const code = response.status.code;
         const rejected = code == 400 or code == 401 or code == 403 or code == 404 or code == 405 or code == 413 or code == 415 or code == 422 or code == 429;
-        if (!completion.execution_owned and !rejected and code != 204 and ctx.request.method != .GET) {
+        const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+        if (!owned.reports_existing_commit and !completion.execution_owned and !rejected and code != 204 and ctx.request.method != .GET) {
             if (response.body) |body| {
                 const Summary = struct { status: ?[]const u8 = null, transaction_id: ?[]const u8 = null, code: ?[]const u8 = null };
                 var parsed = std.json.parseFromSlice(Summary, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch null;
@@ -4610,6 +4618,10 @@ pub const AntflyApiHandler = struct {
         ) catch |err| return switch (err) {
             error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
+            error.DecisionNotProposed => blk: {
+                try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+                break :blk textResponse(ctx, 409, "decision not proposed");
+            },
             error.TopologyChanged => blk: {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
                 break :blk textResponse(ctx, 409, "topology changed");
@@ -4680,6 +4692,7 @@ pub const AntflyApiHandler = struct {
         return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
             error.TransactionTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
+            error.DecisionNotProposed => textResponse(ctx, 409, "decision not proposed"),
             error.DecisionConflict => textResponse(ctx, 409, "decision conflict"),
             error.TransactionConflict => textResponse(ctx, 409, "transaction conflict"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
@@ -4696,6 +4709,7 @@ pub const AntflyApiHandler = struct {
             error.EnrichmentRetryInProgress,
             => textResponse(ctx, 202, "committed_visibility_pending"),
             error.EnrichmentWorkerFailed => textResponse(ctx, 202, "committed_repair_required"),
+            error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
             error.Unavailable => textResponse(ctx, 503, "transaction unavailable"),
             else => textResponse(ctx, 500, "internal server error"),
@@ -5007,6 +5021,10 @@ pub const AntflyApiHandler = struct {
             identity.* = cached.identity;
             cached.identity = null;
         } else {
+            // Time credential verification and identity resolution once, even when
+            // compressed-body middleware hands the verified identity to the route.
+            const timed = std.mem.eql(u8, ctx.header("X-Antfly-Server-Timing") orelse "", "1");
+            const start_ns = if (timed) platform_time.monotonicNs() else 0;
             identity.* = self.api_server.authenticateRequest(.{
                 .authorization = ctx.header("authorization"),
                 .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
@@ -5016,6 +5034,12 @@ pub const AntflyApiHandler = struct {
                 },
                 else => return err,
             };
+            if (timed) {
+                const elapsed_us = (platform_time.monotonicNs() -| start_ns) / std.time.ns_per_us;
+                var buf: [48]u8 = undefined;
+                const value = std.fmt.bufPrint(&buf, "auth;dur={d}.{d:0>3}", .{ elapsed_us / 1000, elapsed_us % 1000 }) catch unreachable;
+                try ctx.setHeader("Server-Timing", value);
+            }
         }
         const authenticated = identity.*.?;
         if (authenticated.is_internal_service and
@@ -6010,13 +6034,13 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
             },
-            error.TopologyChanged => {
+            error.PreDispatchCatalogGenerationChanged, error.TopologyChanged => {
                 var arena_impl = std.heap.ArenaAllocator.init(alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildCommitResponse(
                     arena_impl.allocator(),
                     "aborted",
-                    transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                    transactions_api.topologyChangedConflict(if (commit_req.tables.len == 1 and err == error.TopologyChanged) commit_req.tables[0].table_name else ""),
                     null,
                 );
                 _ = ctx.status(409);
@@ -6121,7 +6145,9 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("transaction outcome is unknown; do not retry this stateless request because it may already have committed; use a transaction session for retryable commits");
             },
             error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => return self.transactionPreparationError(ctx, err),
-            error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
+            error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .status = "aborted", .@"error" = "row_policy_denied", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+            error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Transaction admission or preparation unavailable.", .retryable = true }),
+            error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
                 _ = ctx.status(503);
                 return ctx.text("transaction coordinator is temporarily unavailable");
             },
@@ -6258,12 +6284,8 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, "")) |response| return response;
-        if (!(try self.api_server.transactionSessionReadable(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
         const alloc = self.api_server.alloc;
-        var details = (self.api_server.txn_sessions.getDetails(alloc, txn_id) catch |err| switch (err) {
+        var details = (self.api_server.authorizedTransactionSessionDetails(txn_id, authenticated_identity, true) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -6289,9 +6311,7 @@ pub const AntflyApiHandler = struct {
         // Principal binding remains authoritative after resource revocation.
         // This read returns no staged rows or catalog identities and must not
         // require participant permissions or a live execution owner.
-        if ((try self.api_server.txn_sessions.principalAccess(self.api_server.alloc, id, http_server_mod.transactionPrincipal(identity))) != .allowed)
-            return textResponse(ctx, 404, "not found");
-        const status = (try self.api_server.txn_sessions.getStatus(self.api_server.alloc, id)) orelse return textResponse(ctx, 404, "not found");
+        const status = (try self.api_server.txn_sessions.getStatusForPrincipal(self.api_server.alloc, id, http_server_mod.transactionPrincipal(identity))) orelse return textResponse(ctx, 404, "not found");
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         return ctx.openApiJson(try transactions_api.buildSessionStatusResponse(arena.allocator(), status));
@@ -6307,10 +6327,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var stage_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidTransactionCommitRequest => {
@@ -6326,7 +6346,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
         var validator: SessionStatementValidator = .{ .server = self.api_server, .context = tableMutationContext(ctx, &authenticated_identity) };
-        const session = (self.api_server.txn_sessions.stageValidated(alloc, txn_id, &stage_req, validator.port()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageValidated(alloc, guard, &stage_req, validator.port()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -6360,10 +6380,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var read_req = transactions_api.parseStageReadPayload(alloc, body_data) catch {
             _ = ctx.status(400);
@@ -6380,7 +6400,7 @@ pub const AntflyApiHandler = struct {
         var stage_req = try transactions_api.ownedRequestFromStageReadRequest(alloc, read_req);
         defer stage_req.deinit(alloc);
         self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), &stage_req, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
-        var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshot(alloc, txn_id, read_req.table_name, read_req.key) catch |err| switch (err) {
+        var owned_snapshot = (self.api_server.txn_sessions.getReadSnapshotForMutation(alloc, guard, read_req.table_name, read_req.key) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -6434,7 +6454,7 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        const session = (self.api_server.txn_sessions.stageRead(alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageRead(alloc, guard, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -6488,10 +6508,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
         const alloc = self.api_server.alloc;
         var stage_req = switch (kind) {
             .write => transactions_api.parseStageWriteRequest(alloc, body_data) catch {
@@ -6510,7 +6530,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
         var validator: SessionStatementValidator = .{ .server = self.api_server, .context = tableMutationContext(ctx, &authenticated_identity) };
-        const session = (self.api_server.txn_sessions.stageValidated(alloc, txn_id, &stage_req, validator.port()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageValidated(alloc, guard, &stage_req, validator.port()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -6544,16 +6564,17 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, txn_id) catch |err| switch (err) {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
+        const info = (self.api_server.txn_sessions.createSavepoint(self.api_server.alloc, guard) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -6587,16 +6608,17 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid savepoint id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, txn_id, parsed_savepoint_id) catch |err| switch (err) {
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err| {
+            if (err == error.SessionLeaseLost) return textResponse(ctx, 409, "session lease lost");
+            return err;
+        }) orelse return textResponse(ctx, 404, "not found");
+        const info = (self.api_server.txn_sessions.rollbackToSavepoint(self.api_server.alloc, guard, parsed_savepoint_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
             },
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.TransactionCommitSealed => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
@@ -6616,6 +6638,7 @@ pub const AntflyApiHandler = struct {
     // separate from post-decision visibility/unknown-outcome handling below.
     fn transactionPreparationError(_: *AntflyApiHandler, ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
+            error.SessionWriteOutcomeUnknown => textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying"),
             error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "transaction preparation deadline exceeded before commit"),
             error.Forbidden, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => textResponse(ctx, 403, "forbidden"),
             error.TransactionTooLarge, error.SessionRecordTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity"),
@@ -6631,6 +6654,8 @@ pub const AntflyApiHandler = struct {
             error.VersionConflict,
             error.PreparedGenerationChanged,
             error.GenerationRetired,
+            error.RowPolicyCatalogChanged,
+            error.RowPolicyUnsupported,
             error.IntegrityCatalogChanged,
             error.SessionLeaseLost,
             error.TransactionCommitSealed,
@@ -6642,6 +6667,7 @@ pub const AntflyApiHandler = struct {
             error.RelationalCheckViolation,
             error.UnsupportedTransformOperation,
             => textResponse(ctx, 400, @errorName(err)),
+            error.RowPolicyAuthorityUnavailable,
             error.IntegrityCatalogUnavailable,
             error.ConstraintActivationInProgress,
             error.ConstraintActivationOwnerChanged,
@@ -6665,6 +6691,26 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn sessionInspectionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.SessionLeaseLost => textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
+            error.SessionWriteOutcomeUnknown => textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying"),
+            error.StorageReadTemporarilyUnavailable, error.ReadIndexUnavailable, error.ReadIndexTimeout, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.Timeout, error.ConcurrencyUnavailable => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk textResponse(ctx, 503, "transaction status unavailable; retry this transaction id");
+            },
+            else => err,
+        };
+    }
+
+    fn abortedSessionResponse(ctx: *httpx.Context, id: db_mod.types.TxnId) !httpx.Response {
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const response = try transactions_api.buildSessionCommitResponse(arena.allocator(), id, "aborted", null, null);
+        _ = ctx.status(409);
+        return ctx.openApiJson(response);
+    }
+
     pub fn commitTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         if (try self.admitCompletion(ctx)) |response| return response;
         var authenticated_identity: ?AuthenticatedIdentity = null;
@@ -6679,18 +6725,19 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
+        if (self.forwardTransactionSession(ctx, txn_id, body_data) catch |err| return sessionInspectionFailure(ctx, err)) |response| return response;
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err|
+            return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
         const execution = try self.api_server.txn_sessions.acquireCommitExecution(txn_id, ctx.io);
         defer execution.release();
         const alloc = self.api_server.alloc;
-        const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
+        const owner = self.api_server.localSessionNodeId();
+        const session = (self.api_server.txn_sessions.readMutationInfo(guard) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
         };
+        if (session.version.owner != owner) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+        if (session.terminal_abort) return abortedSessionResponse(ctx, txn_id);
         var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
         defer if (parsed_req) |*commit_req| commit_req.deinit(alloc);
         if (!transactions_api.isEmptySessionCommitBody(body_data)) {
@@ -6706,25 +6753,15 @@ pub const AntflyApiHandler = struct {
             self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), request, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
             if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
         }
-        var commit_req = (self.api_server.txn_sessions.cloneCommitRequest(alloc, txn_id, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+        var commit_req = (self.api_server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, if (parsed_req) |*value| value else null) catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
+            error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.TransactionCommitRequestMismatch => {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit retry body does not match the sealed request");
             },
-            error.SessionLeaseLost => {
-                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(
-                    arena_impl.allocator(),
-                    txn_id,
-                    "aborted",
-                    transactions_api.sessionLeaseLostConflict(if (parsed_req) |value| if (value.tables.len > 0) value.tables[0].table_name else "" else ""),
-                    null,
-                );
-                _ = ctx.status(409);
-                return ctx.openApiJson(response);
-            },
+            error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
             else => return err,
         }) orelse {
             _ = ctx.status(400);
@@ -6736,7 +6773,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("forbidden");
         }
 
-        if (try self.api_server.txn_sessions.getTerminalCommit(alloc, txn_id)) |terminal_value| {
+        if (self.api_server.txn_sessions.getTerminalCommitForMutation(alloc, guard) catch |err| return sessionInspectionFailure(ctx, err)) |terminal_value| {
             var terminal = terminal_value;
             defer terminal.deinit(alloc);
             var status = terminal.status;
@@ -6760,7 +6797,7 @@ pub const AntflyApiHandler = struct {
                     };
                     if (acknowledged == null) {
                         status = .committed_recovery_pending;
-                    } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch |err| blk: {
+                    } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledgedForMutation(alloc, guard) catch |err| blk: {
                         std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                         break :blk null;
                     }) == null) {
@@ -6781,7 +6818,11 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        var execution_plan = try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id);
+        var execution_plan = self.api_server.txn_sessions.getExecutionPlan(alloc, guard) catch |err| switch (err) {
+            error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
+            error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
+            else => return err,
+        };
         defer if (execution_plan) |*plan| plan.deinit();
         const distributed_tables_view = try commit_req.distributedTables(alloc);
         defer distributed_tables_view.deinit();
@@ -6805,8 +6846,12 @@ pub const AntflyApiHandler = struct {
                 else => return err,
             };
             if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
-                if (!self.api_server.txn_sessions.removeBeforeExecution(alloc, txn_id)) {
-                    execution_plan = (try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id)) orelse
+                if (!(self.api_server.txn_sessions.retireBeforeExecution(alloc, guard, commit_req.session_version.?, false) catch false)) {
+                    execution_plan = (self.api_server.txn_sessions.getExecutionPlan(alloc, guard) catch |err| switch (err) {
+                        error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
+                        error.SessionLeaseLost => return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id"),
+                        else => return err,
+                    }) orelse
                         return textResponse(ctx, 503, "transaction preflight changed; retry this transaction id");
                 } else {
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -6833,28 +6878,33 @@ pub const AntflyApiHandler = struct {
             var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
                 return self.transactionPreparationError(ctx, err);
             defer prepared.deinit();
-            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, prepared.tables) catch |err|
-                return self.transactionPreparationError(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, guard, prepared.tables) catch |err| switch (err) {
+                error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
+                error.SessionLeaseLost, error.TransactionCommitSealed => return textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
+                else => return self.transactionPreparationError(ctx, err),
+            }) orelse return textResponse(ctx, 404, "not found");
         }
-        const outcome = (source.commitTransactionWithIdAndCancellation(
+        const outcome = (source.commitTransactionAttempt(
             alloc,
             txn_id,
             session.begin_timestamp,
             execution_plan.?.value,
             session.sync_level,
+            execution_plan.?.firstAttempt(),
             commit_request.cancellation,
         ) catch |err| rejected: {
-            const rejection = transactions_api.classifyCommitRejection(session, err);
+            const rejection = transactions_api.classifyCommitRejection(execution_plan.?.firstAttempt(), err);
             if (rejection == .ambiguous) return textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying");
-            if (rejection == .fresh) {
+            if (rejection == .fresh or rejection == .confirmed) {
                 // Publish the abort and settle consumers before attempting
                 // payload retirement or returning a safe rejection to callers.
-                const published = self.api_server.txn_sessions.recordTerminalAbort(alloc, txn_id) catch null;
-                if (published == null) return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
+                self.api_server.txn_sessions.publishAbortAndRetireForMutation(alloc, guard, if (rejection == .fresh) execution_plan.?.publication else null) catch return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id before retrying");
             }
             break :rejected switch (err) {
+                error.TransactionPrepareAbortedRowPolicyDenied => return ctx.status(403).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "row_policy_denied", .code = "row_policy_denied", .message = "Row policy denied the write.", .retryable = false }),
+                error.PreDispatchDecisionAdmissionUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Metadata decision admission unavailable.", .retryable = true }),
+                error.TransactionPrepareAbortedUnavailable => return ctx.status(503).json(.{ .transaction_id = transaction_id, .status = "aborted", .@"error" = "transaction_precommit_aborted", .code = "transaction_precommit_aborted", .message = "Commit preparation temporarily unavailable.", .retryable = true }),
                 error.TransactionTooLarge => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
                 },
                 error.InvalidBatchRequest,
@@ -6864,26 +6914,23 @@ pub const AntflyApiHandler = struct {
                 => {
                     // Participant validation terminally aborts this transaction
                     // ID, so retaining the session would only produce conflicts.
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(400);
                     return ctx.text("invalid transaction commit request");
                 },
-                error.TopologyChanged => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                error.PreDispatchCatalogGenerationChanged, error.TopologyChanged => {
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
                         arena_impl.allocator(),
                         txn_id,
                         "aborted",
-                        transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
+                        transactions_api.topologyChangedConflict(if (commit_req.tables.len == 1 and err == error.TopologyChanged) commit_req.tables[0].table_name else ""),
                         null,
                     );
                     _ = ctx.status(409);
                     return ctx.openApiJson(response);
                 },
                 error.DecisionConflict => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6897,7 +6944,6 @@ pub const AntflyApiHandler = struct {
                     return ctx.openApiJson(response);
                 },
                 error.DocIdentityNamespaceMismatch => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6911,17 +6957,14 @@ pub const AntflyApiHandler = struct {
                     return ctx.openApiJson(response);
                 },
                 error.UnsupportedOperation => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(405);
                     return ctx.text("method not allowed");
                 },
                 error.TableNotFound => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     _ = ctx.status(404);
                     return ctx.text("not found");
                 },
                 error.UnknownGroup => {
-                    _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -6964,9 +7007,9 @@ pub const AntflyApiHandler = struct {
                     // throws this legacy outcome cannot return coordinator metadata
                     // in the same call, so maintenance replays the transaction at
                     // write durability solely to recover and release that handoff.
-                    _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(
+                    _ = (self.api_server.txn_sessions.recordTerminalCommitForMutation(
                         alloc,
-                        txn_id,
+                        guard,
                         .committed,
                         true,
                         null,
@@ -6999,7 +7042,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(503);
                     return ctx.text("transaction outcome is unknown; retry this transaction id");
                 },
-                error.AbortDecisionNotDurable, error.TransactionBeginFailed, error.TransactionPrepareAbortedUnavailable => {
+                error.AbortDecisionNotDurable, error.TransactionBeginFailed => {
                     _ = ctx.status(503);
                     return ctx.text("transaction coordinator is temporarily unavailable");
                 },
@@ -7018,9 +7061,9 @@ pub const AntflyApiHandler = struct {
                     committed.visibility_retry_pending,
                     committed.visibility_repair_required,
                 );
-                _ = (self.api_server.txn_sessions.recordTerminalCommitWithRepair(
+                _ = (self.api_server.txn_sessions.recordTerminalCommitForMutation(
                     alloc,
-                    txn_id,
+                    guard,
                     status,
                     committed.visibility_repair_required,
                     committed.coordinator_group_id,
@@ -7048,7 +7091,7 @@ pub const AntflyApiHandler = struct {
                         };
                         if (acknowledged == null) {
                             status = .committed_recovery_pending;
-                        } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledged(alloc, txn_id) catch |err| blk: {
+                        } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledgedForMutation(alloc, guard) catch |err| blk: {
                             std.log.warn("failed to persist stable transaction acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                             break :blk null;
                         }) == null) {
@@ -7069,7 +7112,8 @@ pub const AntflyApiHandler = struct {
                 return ctx.openApiJson(response);
             },
             .conflict => |conflict| {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                self.api_server.txn_sessions.publishAbortAndRetireForMutation(alloc, guard, execution_plan.?.publication) catch
+                    return textResponse(ctx, 503, "transaction rejection persistence unavailable; reconcile this transaction id");
                 const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req, conflict);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
@@ -7095,20 +7139,23 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction id");
         };
-        if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        }
-        if (try self.api_server.txn_sessions.getTerminalCommit(self.api_server.alloc, txn_id)) |terminal_value| {
-            var terminal = terminal_value;
-            defer terminal.deinit(self.api_server.alloc);
-            _ = ctx.status(409);
-            return ctx.text("transaction is already committed");
-        }
-        if (!self.api_server.txn_sessions.remove(self.api_server.alloc, txn_id)) {
-            _ = ctx.status(404);
-            return ctx.text("not found");
+        if (self.forwardTransactionSession(ctx, txn_id, body_data) catch |err| return sessionInspectionFailure(ctx, err)) |response| return response;
+        const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err|
+            return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+        const registry = &self.api_server.txn_sessions;
+        const execution = try registry.acquireCommitExecution(txn_id, ctx.io);
+        defer execution.release();
+        const info = (registry.readMutationInfo(guard) catch |err| return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+        if (info.version.owner != self.api_server.localSessionNodeId())
+            return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+        const retired = info.terminal_abort or (registry.retireBeforeExecution(self.api_server.alloc, guard, info.version, false) catch false);
+        if (!retired) {
+            if (registry.getTerminalCommitForMutation(self.api_server.alloc, guard) catch |err| return sessionInspectionFailure(ctx, err)) |terminal_value| {
+                var terminal = terminal_value;
+                defer terminal.deinit(self.api_server.alloc);
+                return textResponse(ctx, 409, "transaction is already committed");
+            }
+            return textResponse(ctx, 503, "transaction changed; reconcile this transaction id");
         }
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -7217,6 +7264,9 @@ pub const AntflyApiHandler = struct {
         limit: usize,
         execution_limits: sql_runtime.Limits = .{},
         completion_io: std.Io,
+        completion: *@import("../pgwire/completion.zig").Completion,
+        completion_alloc: std.mem.Allocator,
+        observation_unavailable: bool = false,
         cache_io: std.Io,
         cache: *sql_plan_cache.Cache,
         done: std.Io.Event = .unset,
@@ -7374,6 +7424,43 @@ pub const AntflyApiHandler = struct {
             self.runChecked() catch |err| {
                 self.failure = err;
             };
+            if (!self.adapter.reports_existing_commit or self.adapter.context.sql_completion == null) return;
+            const pending = if (self.result) |result| result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required else false;
+            const uncertain = if (self.failure) |err| err == error.SqlTransactionOutcomeUnknown else false;
+            if (!pending and !uncertain) return;
+            const encoded = self.adapter.outcome_transaction_id orelse {
+                self.observation_unavailable = true;
+                return;
+            };
+            const id = distributed_txn.parseTxnIdHex(&encoded) catch {
+                self.observation_unavailable = true;
+                return;
+            };
+            @import("sql/session/completion.zig").observeTransaction(self.adapter.server, self.completion_alloc, self.completion, id) catch {
+                self.observation_unavailable = true;
+            };
+        }
+
+        fn replayCommit(self: *@This(), store: *transactions_api.DurableSessionStore, encoded: []const u8, connection: ?[32]u8, principal: []const u8) !bool {
+            const txn_id = distributed_txn.parseTxnIdHex(encoded) catch return false;
+            const decision = (try store.sqlCommitDecisionStatus(std.heap.page_allocator, txn_id, connection, principal)) orelse return false;
+            self.reportsCommitResult(txn_id);
+            const disposition = decision.disposition;
+            if (disposition == .aborted) if (decision.abort_acknowledgement.diagnostic()) |err| return err;
+            self.result = try sql_runtime.Result.empty(std.heap.page_allocator, if (disposition == .aborted) "ROLLBACK" else "COMMIT");
+            self.result.?.output.mutation_outcome = switch (disposition) {
+                .committed => .committed,
+                .committed_pending => .committed_pending,
+                .committed_repair_required => .committed_repair_required,
+                .aborted => null,
+                .active, .prepared, .outcome_unknown => unreachable,
+            };
+            return true;
+        }
+
+        fn reportsCommitResult(self: *@This(), txn_id: db_mod.types.TxnId) void {
+            self.adapter.reports_existing_commit = true;
+            self.adapter.outcome_transaction_id = std.fmt.bytesToHex(txn_id, .lower);
         }
 
         fn runChecked(self: *@This()) !void {
@@ -7428,11 +7515,29 @@ pub const AntflyApiHandler = struct {
                 self.adapter.setLookupPath(connection.lookup_path);
                 if (connection.active_txn) |active| {
                     self.connection_session_hex = std.fmt.bytesToHex(active, .lower);
-                    if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) return error.SqlTransactionNotActive;
+                    if (self.adapter.session_id) |supplied| if (!std.mem.eql(u8, supplied, &self.connection_session_hex)) {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement) or
+                            !try self.replayCommit(store, supplied, connection_id, resource_principal)) return error.SqlTransactionNotActive;
+                        return;
+                    };
+                    if (connection.state == .uncertain) {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlConnectionBusy;
+                        self.adapter.reports_existing_commit = true;
+                        self.adapter.outcome_transaction_id = self.connection_session_hex;
+                        return error.SqlTransactionOutcomeUnknown;
+                    }
                     self.adapter.session_id = &self.connection_session_hex;
                     self.adapter.setting_overlay = &.{};
                 } else {
-                    if (self.adapter.session_id != null) return error.SqlTransactionNotActive;
+                    if (self.adapter.session_id) |supplied| {
+                        if (self.prepared_mode != .statement or self.parameters.len != 0 or
+                            !@import("../pgwire/session_commands.zig").isCommit(self.statement)) return error.SqlTransactionNotActive;
+                        if (!try self.replayCommit(store, supplied, connection_id, resource_principal))
+                            return error.SqlTransactionNotActive;
+                        return;
+                    }
                     self.adapter.setting_overlay = connection.overlay;
                 }
             }
@@ -7616,6 +7721,11 @@ pub const AntflyApiHandler = struct {
             execution_limits.result_rows = self.limit;
             self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
                 sql_execution.diagnoseCatalogConflictTrace(err, @errorReturnTrace());
+                if (err == error.SqlTransactionNotActive and compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
+                    if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
+                        if (try self.replayCommit(store, supplied, null, resource_principal)) return;
+                    };
+                }
                 self.failure = err;
                 return;
             };
@@ -7749,11 +7859,7 @@ pub const AntflyApiHandler = struct {
                 login_timeout = @intCast(entry.value.integer);
             }
         }
-        @import("sql/session/connections.zig").reconcileExpired(store, &self.api_server.txn_sessions, self.api_server.alloc, now_ms) catch |err| {
-            var buffer: [256]u8 = undefined;
-            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
-        };
-        _ = @import("sql/session/connections.zig").mutate(store, .{ .create = .{
+        @import("sql/session/connections.zig").create(store, &self.api_server.txn_sessions, .{
             .id = connection_id,
             .wire_epoch = try self.api_server.sql_connection_admission.executionInstance(self.api_server.embedding_provider_runtime.io),
             .principal = principal,
@@ -7764,7 +7870,7 @@ pub const AntflyApiHandler = struct {
             .baseline = if (login_defaults) |baseline| baseline.entries else &.{},
             .principal_instance = try http_server_mod.sqlPrincipalInstance(self.api_server, identity),
             .statement_timeout_ms = login_timeout,
-        } }, principal, owner_node_id, now_ms) catch |err| {
+        }, now_ms) catch |err| {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };
@@ -7902,7 +8008,9 @@ pub const AntflyApiHandler = struct {
         try response.headers.set("X-Antfly-SQL-Completion", encoded);
     }
     fn executeSQLMode(self: *AntflyApiHandler, ctx: *httpx.Context, mode: SQLPreparedMode, resource_id: ?[]const u8) !httpx.Response {
-        if (try self.admitCompletion(ctx)) |response| return response;
+        if (mode != .statement) {
+            if (try self.admitCompletion(ctx)) |response| return response;
+        }
         const completion = try requestCompletion(ctx);
         return self.finishOwnedSQLResponse(ctx, try self.executeSQLModeOwned(ctx, mode, resource_id, completion));
     }
@@ -7941,8 +8049,16 @@ pub const AntflyApiHandler = struct {
             return response;
         }
         if (ctx.header("X-Antfly-SQL-Settlement")) |action| {
-            if (!owner_mode and !std.mem.eql(u8, action, "12") and !std.mem.eql(u8, action, "ack-v12") and !std.mem.eql(u8, action, "11") and !std.mem.eql(u8, action, "ack-v11") and !std.mem.eql(u8, action, "10") and !std.mem.eql(u8, action, "ack-v10") and !std.mem.eql(u8, action, "9") and !std.mem.eql(u8, action, "ack-v9") and !std.mem.eql(u8, action, "8") and !std.mem.eql(u8, action, "ack-v8") and !std.mem.eql(u8, action, "7") and !std.mem.eql(u8, action, "ack-v7") and !std.mem.eql(u8, action, "6") and !std.mem.eql(u8, action, "ack-v6") and !std.mem.eql(u8, action, "5") and !std.mem.eql(u8, action, "ack-v5") and !std.mem.eql(u8, action, "4") and !std.mem.eql(u8, action, "ack-v4") and !std.mem.eql(u8, action, "3") and !std.mem.eql(u8, action, "ack-v3")) return ctx.status(400).text("unsupported SQL settlement");
+            const seal_shared_issuer = std.mem.eql(u8, action, "seal-shared-transaction-pin-issuer-v1");
+            const seal_legacy_pins = seal_shared_issuer or std.mem.eql(u8, action, "seal-legacy-transaction-pins-v1");
+            if (!seal_legacy_pins and !owner_mode and !std.mem.eql(u8, action, "12") and !std.mem.eql(u8, action, "ack-v12") and !std.mem.eql(u8, action, "11") and !std.mem.eql(u8, action, "ack-v11") and !std.mem.eql(u8, action, "10") and !std.mem.eql(u8, action, "ack-v10") and !std.mem.eql(u8, action, "9") and !std.mem.eql(u8, action, "ack-v9") and !std.mem.eql(u8, action, "8") and !std.mem.eql(u8, action, "ack-v8") and !std.mem.eql(u8, action, "7") and !std.mem.eql(u8, action, "ack-v7") and !std.mem.eql(u8, action, "6") and !std.mem.eql(u8, action, "ack-v6") and !std.mem.eql(u8, action, "5") and !std.mem.eql(u8, action, "ack-v5") and !std.mem.eql(u8, action, "4") and !std.mem.eql(u8, action, "ack-v4") and !std.mem.eql(u8, action, "3") and !std.mem.eql(u8, action, "ack-v3")) return ctx.status(400).text("unsupported SQL settlement");
             if (!owner_mode and (identity == null or !http_server_mod.permissionsAllow(identity.?.permissions, .@"*", "*", .admin))) return ctx.status(403).text("settlement requires management authority");
+            if (seal_shared_issuer and (self.api_server.txn_sessions.durable_scope != .cluster_shared or self.api_server.localSessionNodeId() == 0))
+                return ctx.status(409).text("SQL completion issuer fence requires a shared store and a routed issuer");
+            if (seal_legacy_pins and !seal_shared_issuer and (self.api_server.cfg.deployment_mode != .standalone or
+                self.api_server.txn_sessions.durable_scope != .node_local or self.api_server.cfg.session_executor != null or
+                self.api_server.cfg.hot_standby_mutation_policy_source != null or !self.api_server.mutationBackgroundExecutionPermitted()))
+                return ctx.status(409).text("SQL completion fence requires an exclusive standalone store");
             const encoded = (try ctx.body()) orelse return ctx.status(400).text("missing completion witness");
             if (encoded.len > 128 * 1024) return ctx.status(400).text("completion witness too large");
             const completion_mod = @import("../pgwire/completion.zig");
@@ -7971,10 +8087,24 @@ pub const AntflyApiHandler = struct {
                 remaining: ?completion_mod.Receipt = null,
                 acknowledge: bool = false,
                 acknowledged: bool = false,
+                seal_legacy_pins: bool = false,
+                shared_issuer: ?u64 = null,
+                seal_error: ?anyerror = null,
                 owner_request: ?owner_mod.OwnerRequest = null,
                 fn run(job: *@This()) void {
                     defer job.done.set(job.network);
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
+                    if (job.seal_legacy_pins) {
+                        const store = job.server.txn_sessions.durable orelse {
+                            job.seal_error = error.DurabilityUnavailable;
+                            return;
+                        };
+                        const sealed = if (job.shared_issuer) |issuer| store.sealSharedLegacySqlPinIssuer(issuer) else store.sealStandaloneLegacySqlPins();
+                        sealed catch |err| {
+                            job.seal_error = err;
+                        };
+                        return;
+                    }
                     if (job.owner_request) |request| {
                         job.acknowledged = owner_mod.ownerAction(job.server, job.alloc, request, false) catch false;
                         return;
@@ -7982,10 +8112,17 @@ pub const AntflyApiHandler = struct {
                     if (job.acknowledge) job.acknowledged = @import("sql/session/completion.zig").acknowledge(job.server, job.alloc, job.receipt, context) catch false else job.remaining = @import("sql/session/completion.zig").remaining(job.server, job.alloc, job.receipt, context) catch null;
                 }
             };
-            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .owner_request = if (parsed_owner) |value| value.value else null };
+            var job = Probe{ .server = self.api_server, .alloc = ctx.allocator, .receipt = parsed_completion.value, .network = ctx.io, .acknowledge = std.mem.eql(u8, action, "ack-v12") or std.mem.eql(u8, action, "ack-v11") or std.mem.eql(u8, action, "ack-v10") or std.mem.eql(u8, action, "ack-v9") or std.mem.eql(u8, action, "ack-v8") or std.mem.eql(u8, action, "ack-v7") or std.mem.eql(u8, action, "ack-v6") or std.mem.eql(u8, action, "ack-v5") or std.mem.eql(u8, action, "ack-v4") or std.mem.eql(u8, action, "ack-v3"), .seal_legacy_pins = seal_legacy_pins, .shared_issuer = if (seal_shared_issuer) self.api_server.localSessionNodeId() else null, .owner_request = if (parsed_owner) |value| value.value else null };
             var future = try io.concurrent(Probe.run, .{&job});
             job.done.waitUncancelable(ctx.io);
             @import("protected_future.zig").wait(io, &future);
+            if (seal_legacy_pins) {
+                if (job.seal_error) |err| switch (err) {
+                    error.CompletionIssuerNotDrained => return ctx.status(409).text("SQL completion issuer still has outstanding registrations"),
+                    else => return err,
+                };
+                return ctx.json(.{ .sealed = true });
+            }
             defer if (job.remaining) |value| ctx.allocator.free(value.outcomes);
             if (job.acknowledge or owner_mode) return ctx.json(.{ .complete = job.acknowledged });
             return ctx.json(.{ .complete = if (job.remaining) |value| !value.unknown and value.outcomes.len == 0 else false, .remaining = job.remaining });
@@ -8019,6 +8156,19 @@ pub const AntflyApiHandler = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        if (mode == .statement) {
+            const no_parameters = if (request.parameters) |parameters| parameters.len == 0 else true;
+            const observe_retry = (request.session_id != null or request.connection_id != null) and no_parameters and
+                @import("../pgwire/session_commands.zig").isCommit(request.statement orelse "");
+            if (observe_retry and ctx.header("X-Antfly-SQL-Fence") != null and
+                ctx.header("X-Antfly-SQL-Probe") == null and ctx.header("X-Antfly-SQL-Settlement") == null)
+            {
+                const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+                owned.server = self.api_server;
+                owned.reserve_on_prepare = true;
+            } else if (try self.admitCompletion(ctx)) |response| return response;
+        }
+
         const execution_limits = sqlExecutionLimits(ctx) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL execution budget" });
         const read_requirements = request.read_requirements orelse @import("antfly_local_sources").sql_read_requirements.Requirements{};
         read_requirements.validate(.sql) catch |err| return ctx.status(if (err == error.UnsupportedReadVisibility) @as(u16, 501) else @as(u16, 400)).json(sql_wire.SQLDiagnostic{ .code = if (err == error.UnsupportedReadVisibility) "0A000" else "22023", .message = "invalid or unsupported SQL read requirements" });
@@ -8103,7 +8253,7 @@ pub const AntflyApiHandler = struct {
         };
         var job = SQLJob{
             .statement_start_ns = platform_time.monotonicNs(),
-            .adapter = .{ .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .adapter = .{ .durable_http_session = true, .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -8114,6 +8264,8 @@ pub const AntflyApiHandler = struct {
             .limit = @intCast(limit),
             .execution_limits = execution_limits,
             .completion_io = ctx.io,
+            .completion = completion,
+            .completion_alloc = ctx.allocator,
             .cache_io = self.api_server.sqlPlanCacheIo(),
             .cache = self.api_server.sqlPlanCache(),
             .preparation = &preparation,
@@ -8136,12 +8288,17 @@ pub const AntflyApiHandler = struct {
         defer if (job.result) |*owned| owned.deinit();
         defer if (job.prepared_response) |encoded| job.prepared_response_budget.allocator().free(encoded);
         defer if (job.encoded_read) |encoded| job.prepared_response_budget.allocator().free(encoded);
-        completion.unknown = false;
+        completion.unknown = job.observation_unavailable;
         if (job.failure) |err| {
             const captured_notices = try noticeWire(ctx.allocator, job.notice_buffer);
             defer if (captured_notices) |notices| ctx.allocator.free(notices);
+            if (job.adapter.reports_existing_commit) {
+                const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+                owned.reports_existing_commit = true;
+            }
             const diagnostic = sql_execution.diagnostic(err);
-            if (std.mem.eql(u8, diagnostic.code, "40003")) completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
+            if (!job.adapter.reports_existing_commit and std.mem.eql(u8, diagnostic.code, "40003"))
+                completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, null);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
             if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
@@ -8160,7 +8317,7 @@ pub const AntflyApiHandler = struct {
         }
         if (job.prepared_response) |encoded| return jsonResponse(ctx, 200, encoded);
         const result = job.result.?;
-        if (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready)) {
+        if (!job.adapter.reports_existing_commit and (result.output.mutation_outcome == .committed_pending or result.output.mutation_outcome == .committed_repair_required or (result.output.ddl_receipt != null and result.output.ddl_receipt.?.state != .ready))) {
             const ddl = if (result.output.ddl_receipt) |value| try std.json.Stringify.valueAlloc(ctx.allocator, value, .{ .emit_null_optional_fields = false }) else null;
             defer if (ddl) |value| ctx.allocator.free(value);
             completion.add(ctx.allocator, if (job.adapter.outcome_transaction_id) |*id| id else null, ddl);
@@ -13618,6 +13775,18 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
         try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
     }
 
+    {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/prepare");
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.StorageReadTemporarilyUnavailable, .prepare);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expectEqualStrings("storage read temporarily unavailable", response.body.?);
+        try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+    }
+
     var unavailable_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
     defer unavailable_request.deinit();
     var unavailable_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &unavailable_request);
@@ -13874,6 +14043,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const FakeWrites = struct {
+        rejection: ?anyerror = null,
         batch_calls: usize = 0,
         transaction_calls: usize = 0,
         batch_commit_calls: usize = 0,
@@ -13936,6 +14106,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.cancellation_transaction_calls += 1;
             try std.testing.expect(cancellation.ptr != null);
+            if (self.rejection) |err| return err;
             if (self.cancel_transaction_visibility_wait) return error.EnrichmentWaitCanceled;
             return commitTransaction(ptr, alloc_, tables, sync_level);
         }
@@ -13973,6 +14144,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.cancellation_batch_calls += 1;
             try std.testing.expect(cancellation.ptr != null);
+            if (self.rejection) |err| return err;
             if (self.cancel_batch_visibility_wait) return error.EnrichmentWaitCanceled;
             return commitBatch(ptr, alloc_, tables, sync_level);
         }
@@ -14003,12 +14175,14 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer alloc.free(transaction_url);
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
 
+    const batch_body = "{\"tables\":{\"users\":{\"inserts\":{\"user:1\":{\"name\":\"Alice\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}";
+    const transaction_body = "{\"read_set\":[],\"tables\":{\"users\":{\"inserts\":{\"user:3\":{\"name\":\"Carol\"}}}}}";
     var response = try requestWithRetry(
         &client,
         client_io.io(),
         .POST,
         batch_url,
-        "{\"tables\":{\"users\":{\"inserts\":{\"user:1\":{\"name\":\"Alice\"}}},\"orders\":{\"deletes\":[\"order:old\"]}},\"sync_level\":\"write\"}",
+        batch_body,
         &headers,
         20,
     );
@@ -14047,7 +14221,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         client_io.io(),
         .POST,
         transaction_url,
-        "{\"read_set\":[],\"tables\":{\"users\":{\"inserts\":{\"user:3\":{\"name\":\"Carol\"}}}}}",
+        transaction_body,
         &headers,
         20,
     );
@@ -14143,6 +14317,21 @@ test "httpx multi batch route uses the batch commit hook and public response con
     defer canceled_transaction_parsed.deinit();
     try std.testing.expectEqualStrings("committed_visibility_pending", canceled_transaction_parsed.value.status);
     try std.testing.expectEqual(@as(usize, 2), writes.cancellation_transaction_calls);
+    for ([_]anyerror{ error.TransactionPrepareAbortedRowPolicyDenied, error.PreDispatchDecisionAdmissionUnavailable, error.TransactionPrepareAbortedUnavailable }, [_]u16{ 403, 503, 503 }) |failure, status_code| {
+        writes.rejection = failure;
+        for ([_][]const u8{ batch_url, transaction_url }, [_][]const u8{ batch_body, transaction_body }) |url, body| {
+            var denied = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+            defer denied.deinit();
+            try std.testing.expectEqual(status_code, denied.status.code);
+            const Reply = struct { status: []const u8, code: []const u8, @"error": []const u8, retryable: bool };
+            var parsed_error = try std.json.parseFromSlice(Reply, alloc, denied.body.?, .{ .ignore_unknown_fields = true });
+            defer parsed_error.deinit();
+            try std.testing.expectEqualStrings("aborted", parsed_error.value.status);
+            try std.testing.expectEqualStrings(parsed_error.value.code, parsed_error.value.@"error");
+            try std.testing.expectEqual(status_code == 503, parsed_error.value.retryable);
+            try std.testing.expectEqualStrings(if (status_code == 503) "transaction_precommit_aborted" else "row_policy_denied", parsed_error.value.code);
+        }
+    }
 }
 
 test "httpx stable transaction commit durably hands off recovery before acknowledgement" {
@@ -16377,7 +16566,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const Route = struct {
-        const Kind = enum { open, sql, prepare, execute, close };
+        const Kind = enum { open, sql, fenced_sql, prepare, execute, close };
         const Reply = struct {
             status: u16,
             body: []u8,
@@ -16389,12 +16578,13 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             var request = try httpx.Request.init(allocator, if (kind == .close) .DELETE else .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             try request.headers.append("authorization", authorization);
+            if (kind == .fenced_sql) try request.headers.set("X-Antfly-SQL-Fence", "connection-test");
             request.body = body;
             var ctx = httpx.Context.init(allocator, std.testing.io, &request);
             defer ctx.deinit();
             var response = switch (kind) {
                 .open => try api.openSQLConnection(&ctx),
-                .sql => try api.executeSQL(&ctx),
+                .sql, .fenced_sql => try api.executeSQL(&ctx),
                 .prepare => try api.prepareSQL(&ctx),
                 .execute => try api.executePreparedSQL(&ctx, id.?),
                 .close => try api.closeSQLConnection(&ctx, id.?),
@@ -16457,7 +16647,64 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             var result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, reply.body, .{});
             defer result.deinit();
             try std.testing.expectEqualStrings(step.tag.?, result.value.command_tag);
+            if (std.mem.eql(u8, step.sql, "COMMIT")) {
+                const committed_id = try distributed_txn.parseTxnIdHex(result.value.transaction_id.?);
+                const status = (try server.txn_sessions.getStatusForPrincipal(alloc, committed_id, "connection_alice")).?;
+                try std.testing.expectEqual(transactions_api.SessionDisposition.committed, status.disposition);
+                try std.testing.expect(!try durable.completionSettled(committed_id));
+                const retry_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .connection_id = connection_id, .session_id = result.value.transaction_id.? }, .{});
+                defer alloc.free(retry_body);
+                var retry = try Route.call(alloc, &handler, alice_auth, .fenced_sql, null, retry_body);
+                defer retry.deinit(alloc);
+                try std.testing.expectEqual(@as(u16, 200), retry.status);
+                var replayed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, retry.body, .{});
+                defer replayed.deinit();
+                try std.testing.expectEqualStrings(result.value.transaction_id.?, replayed.value.transaction_id.?);
+            }
             if (step.value) |value| try std.testing.expectEqualStrings(value, result.value.rows[0][0].string);
+        }
+    }
+
+    {
+        var begun_failed = try Route.statement(alloc, &handler, alice_auth, connection_id, "BEGIN ISOLATION LEVEL READ COMMITTED");
+        defer begun_failed.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), begun_failed.status);
+        var begin_result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begun_failed.body, .{});
+        defer begin_result.deinit();
+        const failed_id = try distributed_txn.parseTxnIdHex(begin_result.value.session_id.?);
+        const failed_guard = try server.txn_sessions.mutation(alloc, failed_id, server.localSessionNodeId());
+        try server.txn_sessions.setSqlFailed(alloc, failed_guard, true);
+        var failed_commit = try Route.statement(alloc, &handler, alice_auth, connection_id, "COMMIT");
+        defer failed_commit.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), failed_commit.status);
+        var commit_result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, failed_commit.body, .{});
+        defer commit_result.deinit();
+        try std.testing.expectEqualStrings("ROLLBACK", commit_result.value.command_tag);
+        const status = (try server.txn_sessions.getStatusForPrincipal(alloc, failed_id, "connection_alice")).?;
+        try std.testing.expectEqual(transactions_api.SessionDisposition.aborted, status.disposition);
+        try std.testing.expect(!try durable.completionSettled(failed_id));
+    }
+
+    {
+        var begin = try Route.call(alloc, &handler, alice_auth, .sql, null, "{\"statement\":\"BEGIN ISOLATION LEVEL READ COMMITTED\"}");
+        defer begin.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), begin.status);
+        var begun = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begin.body, .{});
+        defer begun.deinit();
+        const encoded = begun.value.session_id.?;
+        const id = try distributed_txn.parseTxnIdHex(encoded);
+        var identity = try server.authenticateRequest(.{ .authorization = alice_auth });
+        defer identity.deinit(alloc);
+        try std.testing.expect((try server.authorizedTransactionMutation(id, identity)) == null);
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .session_id = encoded }, .{});
+        defer alloc.free(body);
+        for ([_]Route.Kind{ .sql, .fenced_sql }) |kind| {
+            var reply = try Route.call(alloc, &handler, alice_auth, kind, null, body);
+            defer reply.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 200), reply.status);
+            var committed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, reply.body, .{});
+            defer committed.deinit();
+            try std.testing.expectEqualStrings(encoded, committed.value.transaction_id.?);
         }
     }
 
@@ -16496,6 +16743,116 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var after_close = try Route.statement(alloc, &handler, alice_auth, connection_id, "SHOW app.limit");
     defer after_close.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), after_close.status);
+
+    var second_open = try Route.call(alloc, &handler, alice_auth, .open, null, "{}");
+    defer second_open.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), second_open.status);
+    var second_connection = try std.json.parseFromSlice(sql_wire.SQLConnectionResponse, alloc, second_open.body, .{});
+    defer second_connection.deinit();
+    const uncertain_id = second_connection.value.connection_id;
+    const begin_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "BEGIN ISOLATION LEVEL READ COMMITTED", .connection_id = uncertain_id }, .{});
+    defer alloc.free(begin_body);
+    var begun = try Route.call(alloc, &handler, alice_auth, .fenced_sql, null, begin_body);
+    defer begun.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), begun.status);
+    const principal = "connection_alice";
+    const node = server.localSessionNodeId();
+    const connections = @import("sql/session/connections.zig");
+    const id = std.fmt.bytesToHex(try distributed_txn.parseTxnIdHex(uncertain_id), .lower);
+    const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+    var active = try connections.load(&durable, alloc, id, principal, node, now_ms);
+    defer active.deinit();
+    const txn_id = active.value.active_txn.?;
+    var stored = (try durable.load(txn_id)).?;
+    defer stored.deinit(alloc);
+    try std.testing.expect(stored.prepared_completion_only);
+    const guard = try server.txn_sessions.mutation(alloc, txn_id, node);
+    // The execution seal may have committed while the independent connection
+    // transition is still active. This retry only observes the sealed attempt.
+    var staged = try transactions_api.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{}}}}}");
+    defer staged.deinit(alloc);
+    _ = (try server.txn_sessions.stage(alloc, guard, &staged)).?;
+    var sealed_request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, null)).?;
+    defer sealed_request.deinit(alloc);
+    const tables = try sealed_request.distributedTables(alloc);
+    defer tables.deinit();
+    var plan = (try server.txn_sessions.sealExecutionPlan(alloc, guard, tables.tables)).?;
+    defer plan.deinit();
+    {
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .connection_id = uncertain_id }, .{});
+        defer alloc.free(body);
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        try request.headers.append("authorization", alice_auth);
+        try request.headers.set("X-Antfly-SQL-Fence", "commit-retry");
+        request.body = body;
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var observed = try handler.executeSQL(&ctx);
+        defer observed.deinit();
+        try std.testing.expectEqual(@as(u16, 409), observed.status.code);
+        const completion = try AntflyApiHandler.requestCompletion(&ctx);
+        try std.testing.expect(!completion.unknown);
+        try std.testing.expectEqual(@as(usize, 1), completion.outcomes.items.len);
+        const max_window = @import("completion_outbox.zig").max_window;
+        try durable.reserveRegistrations(max_window);
+        defer durable.releaseRegistrations(max_window);
+        var retry_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer retry_ctx.deinit();
+        var retry_response = try handler.executeSQL(&retry_ctx);
+        defer retry_response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), retry_response.status.code);
+        const retried = try AntflyApiHandler.requestCompletion(&retry_ctx);
+        try std.testing.expectEqual(@as(usize, 1), retried.outcomes.items.len);
+        try std.testing.expectEqualStrings(completion.outcomes.items[0].reference_id.?, retried.outcomes.items[0].reference_id.?);
+    }
+    _ = try connections.mutate(&durable, .{ .uncertain = .{ .id = id, .guard = guard } }, principal, node, now_ms);
+    var blocked_read = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "SELECT 1");
+    defer blocked_read.deinit(alloc);
+    var busy = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, blocked_read.body, .{});
+    defer busy.deinit();
+    try std.testing.expectEqualStrings("25001", busy.value.code);
+    try std.testing.expect(busy.value.transaction_id == null);
+    var repeated = try Route.statement(alloc, &handler, alice_auth, uncertain_id, "COMMIT");
+    defer repeated.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 409), repeated.status);
+    var diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, repeated.body, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings("40003", diagnostic.value.code);
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(txn_id, .lower), diagnostic.value.transaction_id.?);
+
+    const observations = try durable.observationRetirementPage(alloc, null, 8);
+    defer alloc.free(observations.entries);
+    defer if (observations.next_after) |key| alloc.free(key);
+    try std.testing.expectEqual(@as(usize, 1), observations.entries.len);
+    const reference = observations.entries[0].reference;
+    _ = (try server.txn_sessions.recordTerminalAbort(alloc, txn_id)).?;
+    var registration = (try durable.loadRegistration(alloc, reference)).?;
+    defer registration.deinit();
+    registration.value.phase = .acknowledging;
+    try durable.putRegistration(reference, registration.value);
+    try std.testing.expect(try durable.managedCompletion(txn_id, reference, true, try durable.registrationFloorFor(reference)));
+
+    const completions = @import("sql/session/completion.zig");
+    try completions.retireSettledObservations(&server, alloc, 8);
+    try std.testing.expect((try durable.loadRegistration(alloc, reference)) == null);
+    const reference_hex = std.fmt.bytesToHex(reference, .lower);
+    const observed_outcome: @import("../pgwire/completion.zig").Outcome = .{
+        .reference_id = &reference_hex,
+        .registration_node_id = node,
+    };
+    try std.testing.expect(try completions.settled(&server, alloc, .{ .outcomes = &.{observed_outcome} }, .{}));
+    var foreign_reference = reference;
+    foreign_reference[0] ^= 1;
+    const foreign_hex = std.fmt.bytesToHex(foreign_reference, .lower);
+    var foreign_outcome = observed_outcome;
+    foreign_outcome.reference_id = &foreign_hex;
+    try std.testing.expectError(error.CompletionWrongOwner, completions.settled(&server, alloc, .{ .outcomes = &.{foreign_outcome} }, .{}));
+    const ordinary = try durable.createRegistration(@splat(2), .{ .transaction_id = &std.fmt.bytesToHex(txn_id, .lower) });
+    try durable.removeRegistration(ordinary);
+    const ordinary_hex = std.fmt.bytesToHex(ordinary, .lower);
+    const ordinary_outcome: @import("../pgwire/completion.zig").Outcome = .{ .reference_id = &ordinary_hex, .registration_node_id = node };
+    try std.testing.expect(!try completions.settled(&server, alloc, .{ .outcomes = &.{ordinary_outcome} }, .{}));
 }
 
 test "httpx SQL malformed catalog requests fail before publication" {
@@ -19788,7 +20145,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
             self.owner_attempts += 1;
             if (!self.default_conflict) {
                 var empty: EmptyOwner = .{};
-                var effects = try owner.prepare(a, &empty, tables[0].integrity_commands);
+                var effects = try owner.prepare(a, &empty, tables[0].integrity_commands, null);
                 defer effects.deinit();
             }
             self.primary_apply_attempts += 1;
@@ -25006,25 +25363,30 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     defer storage.close();
     var durable = transactions_api.DurableSessionStore.init(a, &storage);
     const Source = struct {
+        calls: usize = 0,
+        failure: anyerror = error.TableNotFound,
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
             return error.TestUnexpectedResult;
         }
-        fn commit(_: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
-            return error.TableNotFound;
+        fn commit(ptr: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.failure;
         }
     };
-    var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = undefined, .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit } });
+    var source: Source = .{};
+    var api = ApiHttpServer.init(a, .{ .session_store = &durable, .imported_runtime_io = .{ .durable = std.testing.io, .api_network = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = &source, .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit } });
     defer api.deinit();
     var handler: AntflyApiHandler = .{ .api_server = &api };
     const session = try api.txn_sessions.begin(a, .{}, 0);
     var staged = try transactions_api.parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{\"n\":1}}}}}");
     defer staged.deinit(a);
-    _ = (try api.txn_sessions.stage(a, session.txn_id, &staged)).?;
+    _ = (try api.txn_sessions.stage(a, try api.txn_sessions.mutation(a, session.txn_id, api.localSessionNodeId()), &staged)).?;
     var committed = (try api.txn_sessions.cloneCommitRequest(a, session.txn_id, null)).?;
     defer committed.deinit(a);
     const tables = try committed.distributedTables(a);
     defer tables.deinit();
-    var sealed = (try api.txn_sessions.sealExecutionPlan(a, session.txn_id, tables.tables)).?;
+    var sealed = (try api.txn_sessions.sealExecutionPlan(a, try api.txn_sessions.mutation(a, session.txn_id, api.localSessionNodeId()), tables.tables)).?;
     defer sealed.deinit();
     const id = std.fmt.bytesToHex(session.txn_id, .lower);
     const uri = try std.fmt.allocPrint(a, "http://localhost/db/v1/transactions/{s}/commit", .{id});
@@ -25046,6 +25408,33 @@ test "SQL pgwire native HTTP commit retry preserves an unknown earlier execution
     const completion = try AntflyApiHandler.requestCompletion(&ctx);
     try std.testing.expect(!completion.unknown and completion.outcomes.items.len == 1);
     try std.testing.expect(!try @import("sql/session/completion.zig").settled(&api, a, .{ .outcomes = completion.outcomes.items }, .{}));
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    // The process can lose the response between publishing abort and retiring the session.
+    _ = (try api.txn_sessions.recordTerminalAbort(a, session.txn_id)).?;
+    var retry = httpx.Context.init(a, std.testing.io, &request);
+    defer retry.deinit();
+    var aborted = try handler.commitTransactionSession(&retry, &id);
+    defer aborted.deinit();
+    try std.testing.expectEqual(@as(u16, 409), aborted.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    for ([_]anyerror{ error.TransactionPrepareAbortedRowPolicyDenied, error.TransactionPrepareAbortedUnavailable }, [_]u16{ 403, 503 }) |failure, expected| {
+        source.failure = failure;
+        const another = try api.txn_sessions.begin(a, .{}, 0);
+        _ = (try api.txn_sessions.stage(a, try api.txn_sessions.mutation(a, another.txn_id, api.localSessionNodeId()), &staged)).?;
+        var bound = (try api.txn_sessions.cloneCommitRequest(a, another.txn_id, null)).?;
+        defer bound.deinit(a);
+        var plan = (try api.txn_sessions.sealExecutionPlan(a, try api.txn_sessions.mutation(a, another.txn_id, api.localSessionNodeId()), tables.tables)).?;
+        defer plan.deinit();
+        var req = try httpx.Request.init(a, .POST, "/");
+        defer req.deinit();
+        try req.setBody("{}");
+        var attempt = httpx.Context.init(a, std.testing.io, &req);
+        defer attempt.deinit();
+        var rejected = try handler.commitTransactionSession(&attempt, &std.fmt.bytesToHex(another.txn_id, .lower));
+        defer rejected.deinit();
+        try std.testing.expectEqual(expected, rejected.status.code);
+        try std.testing.expect((try durable.load(another.txn_id)) == null);
+    }
 }
 
 test "SQL native graph public row policy rejection preserves forbidden without outcome claims" {

@@ -23,6 +23,7 @@ const tag = iso.fourcc;
 pub const Limits = struct {
     max_metadata_bytes: usize = 16 * 1024 * 1024,
     max_index_bytes: usize = 32 * 1024 * 1024,
+    track_limit_error: error{ ResourceLimitExceeded, DecoderEnvelopeExceeded } = error.ResourceLimitExceeded,
     max_samples: usize = 500_000,
     max_boxes: usize = 100_000,
     max_tracks: usize = 64,
@@ -31,13 +32,20 @@ pub const Limits = struct {
     /// Consumers opt into codecs whose decoding route they support. Preserve
     /// the portable AVC/MJPEG envelope for existing readers.
     codecs: std.EnumSet(Codec) = std.EnumSet(Codec).initMany(&.{ .avc, .mjpeg }),
+
+    pub fn validateDimensions(self: Limits, track: Track) !void {
+        if (track.width > self.max_dimension or track.height > self.max_dimension) return self.track_limit_error;
+    }
 };
 pub const Codec = enum { avc, mjpeg, hevc, av1 };
 pub const Track = struct {
     codec: Codec = .avc,
     inband_parameter_sets: bool = false,
+    multiple_avc_parameter_sets: bool = false,
     /// Header inspection resolved HEVC activation and validated one static policy.
     hevc_policy_validated: bool = false,
+    /// Owned packet sync flags were resolved from the first coded HEVC slice.
+    hevc_sync_validated: bool = false,
     id: u32,
     timescale: u32,
     width: u16,
@@ -58,6 +66,10 @@ pub const Track = struct {
     decode_preroll_ticks: u32 = 0,
     /// Exact tkhd display matrix; interpretation belongs to display preparation.
     display_matrix: [9]i32,
+
+    pub fn requiresAvcRegistry(self: Track) bool {
+        return self.codec == .avc and (self.inband_parameter_sets or self.multiple_avc_parameter_sets);
+    }
 };
 pub const Packet = struct {
     offset: u64,
@@ -68,10 +80,33 @@ pub const Packet = struct {
     /// Source presentation ticks in Track.timescale, including the edit mapping.
     pts: i64,
     duration: u32,
+    /// Set by the AVC window planner on verified non-IDR reset pictures.
+    avc_epoch_start: bool = false,
+    /// A coded HEVC reference with pic_output_flag cleared.
+    hidden: bool = false,
     /// Container sync hint, not proof that an open GOP can start here.
     sync: bool,
 };
 const Span = struct { start: u64, end: u64 };
+// Top-level mdat spans are disjoint and ordered by file position. Sequential
+// samples normally use the same span, including when packets are interleaved.
+const MediaDataCursor = struct {
+    current: ?Span = null,
+
+    fn contains(self: *@This(), spans: []const Span, offset: u64, end: u64) bool {
+        if (self.current) |span| if (offset >= span.start and end <= span.end) return true;
+        var lo: usize = 0;
+        var hi = spans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (spans[mid].end <= offset) lo = mid + 1 else hi = mid;
+        }
+        if (lo == spans.len) return false;
+        self.current = spans[lo];
+        return offset >= spans[lo].start and end <= spans[lo].end;
+    }
+};
+
 const Fragment = struct { offset: u64, size: usize };
 const Defaults = struct { description: u32 = 1, duration: u32 = 0, size: u32 = 0, flags: u32 = 0 };
 const Tables = struct {
@@ -90,7 +125,7 @@ const Tables = struct {
     scale: u32 = 0,
     handler: u32 = 0,
     matrix: [9]i32 = @splat(0),
-    description_seen: bool = false,
+    description_bytes: ?[]const u8 = null,
     self_contained: bool = false,
 };
 
@@ -106,13 +141,24 @@ pub const Reader = struct {
     limits: Limits,
 
     pub fn init(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
+        return initTracked(allocator, input, limits, null);
+    }
+
+    pub fn fragmentClock(a: std.mem.Allocator, input: *source.Source, limits: Limits) !timeline.SampleClock {
+        var clock: timeline.SampleClock = undefined;
+        var metadata = try initTracked(a, input, limits, &clock);
+        defer metadata.deinit();
+        return clock;
+    }
+
+    fn initTracked(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*timeline.SampleClock) !Reader {
         // Packet limits describe the returned index. Construction can briefly
         // own old/new growth buffers plus the bounded top-level box lists.
         const lists = try std.math.mul(usize, 3 * (1024 + 8), @sizeOf(Span) + @sizeOf(Fragment));
         const bound = try std.math.add(usize, try std.math.mul(usize, limits.max_index_bytes, 2), lists);
         var scratch = IndexAllocator{ .backing = allocator, .limit = bound, .reservation = if (input.admission_pool) |pool| try pool.acquire(.{}) else @import("admission.zig").Token{} };
         errdefer scratch.reservation.deinit();
-        var reader = initAllocated(scratch.allocator(), input, limits) catch |err| {
+        var reader = initAllocated(scratch.allocator(), input, limits, clock) catch |err| {
             std.debug.assert(scratch.live == 0);
             return if (err == error.OutOfMemory and scratch.denied != null) scratch.denied.? else err;
         };
@@ -121,7 +167,7 @@ pub const Reader = struct {
         reader.index_reservation = scratch.reservation;
         return reader;
     }
-    fn initAllocated(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
+    fn initAllocated(allocator: std.mem.Allocator, input: *source.Source, limits: Limits, clock: ?*timeline.SampleClock) !Reader {
         var metadata: ?source.Lease = null;
         errdefer if (metadata) |*lease| lease.deinit();
         var spans: std.ArrayList(Span) = .empty;
@@ -170,10 +216,10 @@ pub const Reader = struct {
         track.decode_preroll_ticks = try decodePreroll(tables.ctts);
         const packets = if (tables.defaults) |defaults| blk: {
             if (tables.sizes.len < 12 or u32be(tables.sizes[8..12]) != 0) return error.UnsupportedHybridMp4;
-            const result = try buildFragments(allocator, input, &track, defaults, fragments.items, spans.items, limits);
+            const result = try buildFragments(allocator, input, &track, defaults, fragments.items, spans.items, limits, clock);
             break :blk result;
         } else blk: {
-            if (fragments.items.len != 0) return error.MalformedMedia;
+            if (clock != null or fragments.items.len != 0) return error.MalformedMedia;
             break :blk try buildPackets(allocator, tables, track, spans.items, limits, input.control);
         };
         return .{ .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = packets, .limits = limits };
@@ -224,6 +270,12 @@ pub const Reader = struct {
 /// sample tables are not expanded and media payloads are never inspected.
 /// The returned track borrows `bytes`. Full Reader validation still owns errors.
 pub fn probeTrack(bytes: []const u8, limits: Limits, control: source.Control) !Track {
+    const result = try probeMovie(bytes, limits, control);
+    return result.tables.track orelse error.UnsupportedVideoCodec;
+}
+
+const MovieProbe = struct { tables: Tables, movie_scale: u32 };
+fn probeMovie(bytes: []const u8, limits: Limits, control: source.Control) !MovieProbe {
     try control.check();
     var parser = Parser{ .limits = limits, .control = control };
     var cursor: usize = 0;
@@ -238,7 +290,36 @@ pub fn probeTrack(bytes: []const u8, limits: Limits, control: source.Control) !T
         cursor = box.end;
     }
     const tables = try parser.movie(movie orelse return error.MissingMovieMetadata);
-    return tables.track orelse error.UnsupportedVideoCodec;
+    return .{ .tables = tables, .movie_scale = parser.movie_scale };
+}
+
+/// Inspect the presentation clock without building a packet/offset index. A
+/// fragment's timing lives outside moov and requires its fragment reader.
+pub fn probeSampleClock(bytes: []const u8, limits: Limits, control: source.Control) !?timeline.SampleClock {
+    const movie = try probeMovie(bytes, limits, control);
+    const t = movie.tables;
+    if (t.defaults != null) return null;
+    const track = t.track orelse return error.UnsupportedVideoCodec;
+    if (t.sizes.len < 12) return error.MalformedMedia;
+    const samples = u32be(t.sizes[8..12]);
+    if (samples > limits.max_samples) return limits.track_limit_error;
+    const edit = try parseEdit(t.elst, movie.movie_scale, track.timescale);
+    var result = timeline.SampleClock{ .scale = track.timescale, .edit = edit };
+    var durations = Run{ .bytes = try entries(t.stts, 8) };
+    var composition = try compositionRun(t.ctts);
+    var dts: i64 = 0;
+    for (0..samples) |i| {
+        if (i % 256 == 0) try control.check();
+        const duration = try durations.next();
+        if (duration <= 0) return error.UnsupportedTimeline;
+        const offset = if (t.ctts.len == 0) 0 else try composition.next();
+        const pts = try edit.present(try std.math.add(i64, dts, offset));
+        dts = try std.math.add(i64, dts, duration);
+        result.includeInterval(pts, @intCast(duration));
+    }
+    try durations.finish();
+    try composition.finish();
+    return result;
 }
 
 /// Validate a moov payload for fragmented video before any media arrives.
@@ -287,9 +368,12 @@ const Parser = struct {
                 if (self.tracks > self.limits.max_tracks) return error.ResourceLimitExceeded;
                 var t = Tables{};
                 try self.trackBoxes(b.payload, &t, 0);
-                if (t.handler == tag("vide") and t.track != null and selected == null) {
+                if (t.description_bytes) |description_bytes|
+                    try self.description(description_bytes, &t, t.handler == tag("vide") and selected == null);
+                if (t.track != null) {
                     if (t.id == 0 or t.scale == 0) return error.MalformedMedia;
                     if (!t.self_contained) return error.UnsupportedDataReference;
+                    try self.limits.validateDimensions(t.track.?);
                     t.track.?.id = t.id;
                     t.track.?.timescale = t.scale;
                     t.track.?.display_matrix = t.matrix;
@@ -353,7 +437,10 @@ const Parser = struct {
                             std.mem.eql(u8, ref.payload, &.{ 0, 0, 0, 1 });
                     }
                 },
-                tag("stsd") => try self.description(p, t),
+                tag("stsd") => {
+                    if (t.description_bytes != null) return error.MalformedMedia;
+                    t.description_bytes = p;
+                },
                 tag("stsz"), tag("stz2") => {
                     if (t.sizes.len != 0) return error.MalformedMedia;
                     t.sizes = p;
@@ -389,9 +476,7 @@ const Parser = struct {
             cursor = b.end;
         }
     }
-    fn description(self: *Parser, bytes: []const u8, t: *Tables) !void {
-        if (t.description_seen) return error.MalformedMedia;
-        t.description_seen = true;
+    fn description(self: *Parser, bytes: []const u8, t: *Tables, candidate: bool) !void {
         if (bytes.len < 8) return error.MalformedMedia;
         const count = u32be(bytes[4..8]);
         if (count > self.limits.max_tracks) return error.ResourceLimitExceeded;
@@ -400,13 +485,18 @@ const Parser = struct {
             const b = try self.box(bytes, cursor);
             const known: ?Codec = if (b.typ == tag("avc1") or b.typ == tag("avc3")) .avc else if (b.typ == tag("jpeg")) .mjpeg else if (b.typ == tag("hvc1") or b.typ == tag("hev1")) .hevc else if (b.typ == tag("av01")) .av1 else null;
             if (known) |codec| supported: {
-                if (!self.limits.codecs.contains(codec)) break :supported;
+                if (!candidate or !self.limits.codecs.contains(codec)) {
+                    // Count and bound the child boxes of inactive visual entries too.
+                    if (b.payload.len < 78) return error.MalformedMedia;
+                    var child: usize = 78;
+                    while (child < b.payload.len) child = (try self.box(b.payload, child)).end;
+                    break :supported;
+                }
                 if (count != 1) return error.UnsupportedSampleDescription;
                 if (b.payload.len < 78) return error.MalformedMedia;
                 const width = u16be(b.payload[24..26]);
                 const height = u16be(b.payload[26..28]);
                 if (width == 0 or height == 0) return error.MalformedMedia;
-                if (width > self.limits.max_dimension or height > self.limits.max_dimension) return error.ResourceLimitExceeded;
                 // External data references cannot safely resolve against this source.
                 if (u16be(b.payload[6..8]) != 1) return error.UnsupportedDataReference;
                 if (codec == .mjpeg and (u16be(b.payload[8..10]) != 0 or u16be(b.payload[40..42]) != 1)) return error.UnsupportedSampleDescription;
@@ -443,10 +533,11 @@ const Parser = struct {
                 }
                 var config: []const u8 = &.{};
                 var nal_len: u3 = 0;
+                var multiple_avc_sets = false;
                 switch (codec) {
                     .avc => {
                         config = configuration orelse return error.MalformedMedia;
-                        try validateAvcc(config);
+                        multiple_avc_sets = try validateAvcc(config);
                         nal_len = @as(u3, @intCast(config[4] & 3)) + 1;
                     },
                     .hevc => {
@@ -461,7 +552,7 @@ const Parser = struct {
                     .mjpeg => {},
                 }
                 if (nal_len == 3) return error.MalformedMedia;
-                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .pixel_aspect_declared = aspect_declared, .color_info = color, .display_matrix = @splat(0) };
+                t.track = .{ .multiple_avc_parameter_sets = multiple_avc_sets, .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .pixel_aspect_declared = aspect_declared, .color_info = color, .display_matrix = @splat(0) };
             }
             cursor = b.end;
         }
@@ -622,18 +713,18 @@ test "mp4 HEVC and AV1 sample descriptions require explicit consumer codec suppo
         } else @memcpy(bytes[102..106], &[_]u8{ 0x81, 0, 0x0c, 0 });
         var parser = Parser{ .limits = .{}, .control = .{} };
         var tables = Tables{};
-        try parser.description(bytes[0..size], &tables);
+        try parser.description(bytes[0..size], &tables, true);
         try std.testing.expect(tables.track == null);
         parser.limits.codecs = std.EnumSet(Codec).initMany(&.{ .hevc, .av1 });
         tables = .{};
-        try parser.description(bytes[0..size], &tables);
+        try parser.description(bytes[0..size], &tables, true);
         try std.testing.expectEqual(if (hevc) Codec.hevc else Codec.av1, tables.track.?.codec);
         try std.testing.expectEqualStrings(bytes[102..size], tables.track.?.codec_config);
         try std.testing.expectEqual(@as(u3, if (hevc) 4 else 0), tables.track.?.nal_length_bytes);
     }
 }
 
-fn validateAvcc(config: []const u8) !void {
+fn validateAvcc(config: []const u8) !bool {
     if (config.len < 7 or config[0] != 1) return error.MalformedMedia;
     var cursor: usize = 6;
     const sps_count = config[5] & 31;
@@ -645,6 +736,7 @@ fn validateAvcc(config: []const u8) !void {
     if (pps_count == 0) return error.MalformedMedia;
     for (0..pps_count) |_| try configNal(config, &cursor);
     // Optional high-profile extension remains borrowed for the codec backend.
+    return sps_count > 1 or pps_count > 1;
 }
 fn configNal(config: []const u8, cursor: *usize) !void {
     if (config.len - cursor.* < 2) return error.MalformedMedia;
@@ -729,12 +821,20 @@ const Run = struct {
         if (self.remaining != 0 or self.cursor != self.bytes.len) return error.MalformedMedia;
     }
 };
+fn compositionRun(bytes: []const u8) !Run {
+    if (bytes.len == 0) return .{ .bytes = &.{} };
+    if (bytes.len < 8 or bytes[0] > 1 or @as(u64, u32be(bytes[4..8])) * 8 != bytes.len - 8) return error.MalformedMedia;
+    return .{ .bytes = bytes[8..], .signed = bytes[0] == 1 };
+}
+
 fn buildPackets(allocator: std.mem.Allocator, t: Tables, track: Track, spans: []const Span, limits: Limits, control: source.Control) ![]Packet {
+    var media_data: MediaDataCursor = .{};
     if (t.sizes.len < 12) return error.MalformedMedia;
     if (t.sizes[0] != 0) return error.MalformedMedia;
     const n = u32be(t.sizes[8..12]);
     if (n == 0) return error.EmptyVideoTrack;
-    if (n > limits.max_samples or @as(u64, n) * @sizeOf(Packet) > limits.max_index_bytes) return error.ResourceLimitExceeded;
+    if (n > limits.max_samples) return limits.track_limit_error;
+    if (@as(u64, n) * @sizeOf(Packet) > limits.max_index_bytes) return error.ResourceLimitExceeded;
     const fixed = if (t.compact) 0 else u32be(t.sizes[4..8]);
     const bits: u8 = if (t.compact) t.sizes[7] else 32;
     if (t.compact and bits != 4 and bits != 8 and bits != 16) return error.UnsupportedSampleSize;
@@ -753,13 +853,7 @@ fn buildPackets(allocator: std.mem.Allocator, t: Tables, track: Track, spans: []
         previous = first;
     }
     var durations = Run{ .bytes = try entries(t.stts, 8) };
-    var composition = Run{ .bytes = &.{} };
-    if (t.ctts.len != 0) {
-        if (t.ctts.len < 8 or t.ctts[0] > 1) return error.MalformedMedia;
-        const count = u32be(t.ctts[4..8]);
-        if (@as(u64, count) * 8 != t.ctts.len - 8) return error.MalformedMedia;
-        composition = .{ .bytes = t.ctts[8..], .signed = t.ctts[0] == 1 };
-    }
+    var composition = try compositionRun(t.ctts);
     const sync = if (t.stss.len != 0) try entries(t.stss, 4) else &.{};
     previous = 0;
     for (0..sync.len / 4) |i| {
@@ -792,12 +886,7 @@ fn buildPackets(allocator: std.mem.Allocator, t: Tables, track: Track, spans: []
             if (size == 0) return error.MalformedMedia;
             if (size > limits.max_packet_bytes) return error.ResourceLimitExceeded;
             const end = std.math.add(u64, offset, size) catch return error.MalformedMedia;
-            var valid = false;
-            for (spans) |span| if (offset >= span.start and end <= span.end) {
-                valid = true;
-                break;
-            };
-            if (!valid) return error.MalformedMedia;
+            if (!media_data.contains(spans, offset, end)) return error.MalformedMedia;
             const duration = try durations.next();
             if (duration <= 0) return error.UnsupportedTimeline;
             const pts = std.math.add(i64, dts, if (t.ctts.len != 0) try composition.next() else 0) catch return error.TimestampOverflow;
@@ -830,10 +919,14 @@ fn fragmentField(bytes: []const u8, cursor: *usize) !u32 {
     cursor.* += 4;
     return value;
 }
-fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *Track, defaults: Defaults, fragments: []const Fragment, spans: []const Span, limits: Limits) ![]Packet {
+fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *Track, defaults: Defaults, fragments: []const Fragment, spans: []const Span, limits: Limits, clock: ?*timeline.SampleClock) ![]Packet {
+    var media_data: MediaDataCursor = .{};
     if (defaults.description != 1) return error.UnsupportedSampleDescription;
     var packets: std.ArrayList(Packet) = .empty;
     errdefer packets.deinit(allocator);
+    if (clock) |out| out.* = .{ .scale = track.timescale, .edit = track.edit };
+    var sample_count: usize = 0;
+    var previous_end: ?i64 = null;
     var box_count: usize = 0;
     for (fragments) |fragment| {
         try input.control.check();
@@ -891,10 +984,7 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
             const dt = decode_time orelse return error.UnsupportedTimeline;
             if (dt.len < 4 or dt[0] > 1 or dt.len != (if (dt[0] == 0) @as(usize, 8) else 12) or u32be(dt[0..4]) & 0xffffff != 0) return error.MalformedMedia;
             var dts = std.math.cast(i64, if (dt[0] == 0) @as(u64, u32be(dt[4..8])) else u64be(dt[4..12])) orelse return error.TimestampOverflow;
-            if (packets.items.len != 0) {
-                const previous = packets.items[packets.items.len - 1];
-                if (dts < try std.math.add(i64, previous.media_dts, previous.duration)) return error.UnsupportedTimeline;
-            }
+            if (previous_end) |end| if (dts < end) return error.UnsupportedTimeline;
             var data_offset: ?u64 = null;
             nested = 0;
             while (nested < box.payload.len) {
@@ -907,8 +997,9 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
                 const run_flags = u32be(p[0..4]) & 0xffffff;
                 if (run_flags & ~@as(u32, 0xf05) != 0 or (run_flags & 4 != 0 and run_flags & 0x400 != 0)) return error.MalformedMedia;
                 const count = u32be(p[4..8]);
-                const total = try std.math.add(usize, packets.items.len, count);
-                if (total > limits.max_samples or total > limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
+                const total = try std.math.add(usize, sample_count, count);
+                if (total > limits.max_samples) return limits.track_limit_error;
+                if (total > limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
                 var pc: usize = 8;
                 if (run_flags & 1 != 0) {
                     const delta: i32 = @bitCast(try fragmentField(p, &pc));
@@ -917,7 +1008,8 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
                 var first_flags = current.flags;
                 if (run_flags & 4 != 0) first_flags = try fragmentField(p, &pc);
                 var offset = data_offset orelse return error.UnsupportedFragmentedMp4;
-                try packets.ensureTotalCapacityPrecise(allocator, total);
+                sample_count = total;
+                if (clock == null) try packets.ensureTotalCapacityPrecise(allocator, total);
                 for (0..count) |i| {
                     try input.control.check();
                     const duration = if (run_flags & 0x100 != 0) try fragmentField(p, &pc) else current.duration;
@@ -927,16 +1019,13 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
                     const composition: i64 = if (p[0] == 1) @as(i32, @bitCast(raw_composition)) else raw_composition;
                     if (size == 0 or size > limits.max_packet_bytes or duration == 0) return error.ResourceLimitExceeded;
                     const end = try std.math.add(u64, offset, size);
-                    var valid = false;
-                    for (spans) |span| if (offset >= span.start and end <= span.end) {
-                        valid = true;
-                        break;
-                    };
-                    if (!valid) return error.MalformedMedia;
+                    if (!media_data.contains(spans, offset, end)) return error.MalformedMedia;
                     const pts = try std.math.add(i64, dts, composition);
                     if (composition < 0) track.decode_preroll_ticks = @max(track.decode_preroll_ticks, std.math.cast(u32, -composition) orelse return error.TimestampOverflow);
-                    packets.appendAssumeCapacity(.{ .offset = offset, .size = size, .dts = dts, .media_dts = dts, .media_pts = pts, .pts = try track.edit.present(pts), .duration = duration, .sync = sample_flags & 0x10000 == 0 });
+                    const presented = try track.edit.present(pts);
+                    if (clock) |out| out.includeInterval(presented, duration) else packets.appendAssumeCapacity(.{ .offset = offset, .size = size, .dts = dts, .media_dts = dts, .media_pts = pts, .pts = presented, .duration = duration, .sync = sample_flags & 0x10000 == 0 });
                     dts = try std.math.add(i64, dts, duration);
+                    previous_end = dts;
                     offset = end;
                 }
                 if (pc != p.len) return error.MalformedMedia;
@@ -944,7 +1033,7 @@ fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *T
             }
         }
     }
-    if (packets.items.len == 0) return error.EmptyVideoTrack;
+    if (sample_count == 0) return error.EmptyVideoTrack;
     for (packets.items) |*packet| packet.dts = try track.edit.present(try std.math.sub(i64, packet.media_dts, track.decode_preroll_ticks));
     return packets.toOwnedSlice(allocator);
 }
@@ -998,6 +1087,23 @@ test "MP4 metadata probe agrees with indexed track and enforces cancellation and
         var reader = try Reader.init(a, &input, .{});
         defer reader.deinit();
         const track = try probeTrack(bytes, .{}, .{});
+        const clock = try probeSampleClock(bytes, .{}, .{}) orelse try Reader.fragmentClock(a, &input, .{});
+        const edit = reader.track.edit;
+        var count: usize = 0;
+        var first: i64 = std.math.maxInt(i64);
+        var last: i64 = std.math.minInt(i64);
+        for (reader.packets) |packet| {
+            if (edit.source_duration) |span| {
+                const relative = @as(i128, packet.pts) - edit.source_start;
+                if (relative < 0 or relative >= span) continue;
+            }
+            count += 1;
+            first = @min(first, packet.pts);
+            last = @max(last, packet.pts);
+        }
+        try std.testing.expectEqual(count, clock.count);
+        try std.testing.expectEqual(first, clock.first);
+        try std.testing.expectEqual(last, clock.last);
         try std.testing.expectEqualDeep(reader.track.codec, track.codec);
         try std.testing.expectEqual(reader.track.width, track.width);
         try std.testing.expectEqual(reader.track.height, track.height);

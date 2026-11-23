@@ -251,7 +251,7 @@ pub const RowProjection = struct {
     source: ?registry.SchemaView = null,
     tuple: ?tuples.TuplePlan = null,
     cover: ?@import("cover.zig").Source = null,
-    predicate: ?@import("predicate.zig").Source = null,
+    predicate: ?@import("partial_predicate.zig").Source = null,
     encoded: std.ArrayList(u8) = .empty,
     pub fn deinit(self: *@This()) void {
         if (self.tuple) |*value| value.deinit();
@@ -483,7 +483,7 @@ pub const Page = struct {
         return .{ .arena = arena, .pinned = .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, .private_job = command.binding, .claim_source = source, .index_offset = offset, .namespace_generation = core.schemaNamespaceGeneration(), .expected = expected, .control = command.control, .next = next, .candidates = candidates, .failed_source = failed, .records_examined = command.records_examined };
     }
 
-    fn prepareTuple(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, document: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("cover.zig").Source, projected_predicate: *?@import("predicate.zig").Source, encoded: *std.ArrayList(u8)) !?[]const u8 {
+    fn prepareTuple(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, document: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("cover.zig").Source, projected_predicate: *?@import("partial_predicate.zig").Source, encoded: *std.ArrayList(u8)) !?[]const u8 {
         return prepareTupleWithClaims(alloc, payload_alloc, core, pinned, index, value, document, source, projected, projected_cover, projected_predicate, encoded, null);
     }
 
@@ -498,7 +498,7 @@ pub const Page = struct {
         }
     };
 
-    fn prepareTupleWithClaims(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, document: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("cover.zig").Source, projected_predicate: *?@import("predicate.zig").Source, encoded: *std.ArrayList(u8), unique: ?*UniqueScratch) !?[]const u8 {
+    fn prepareTupleWithClaims(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, document: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("cover.zig").Source, projected_predicate: *?@import("partial_predicate.zig").Source, encoded: *std.ArrayList(u8), unique: ?*UniqueScratch) !?[]const u8 {
         if (unique) |scratch| scratch.value = null;
         const version = try row_store.rowSchemaVersion(value);
         if (source.* == null or source.*.?.version() != version) {
@@ -628,7 +628,7 @@ pub const Page = struct {
         defer if (projected) |*tuple| tuple.deinit();
         var projected_cover: ?@import("cover.zig").Source = null;
         defer if (projected_cover) |*cover| cover.deinit();
-        var projected_predicate: ?@import("predicate.zig").Source = null;
+        var projected_predicate: ?@import("partial_predicate.zig").Source = null;
         defer if (projected_predicate) |*condition| condition.deinit();
         var encoded = std.ArrayList(u8).empty;
         defer encoded.deinit(alloc);
@@ -747,7 +747,7 @@ pub const Page = struct {
         defer if (projected) |*tuple| tuple.deinit();
         var projected_cover: ?@import("cover.zig").Source = null;
         defer if (projected_cover) |*cover| cover.deinit();
-        var projected_predicate: ?@import("predicate.zig").Source = null;
+        var projected_predicate: ?@import("partial_predicate.zig").Source = null;
         defer if (projected_predicate) |*condition| condition.deinit();
         var encoded = std.ArrayList(u8).empty;
         defer encoded.deinit(alloc);

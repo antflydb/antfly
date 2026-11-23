@@ -749,7 +749,7 @@ test "SQL command producer native scoped rollback retains its durable abort and 
         try native.submit(source.value, .{ .bind = .{ .command = ticket.command, .transaction = transaction.id } });
         try native.submit(source.value, .{ .effect = .{ .command = ticket.command, .effect = .{ .backend = fence.backend, .sequence = 1, .nonce = id(71), .action = .{ .try_acquire = .{ .resource = @splat(7), .mode = .{ .advisory = .exclusive }, .scope = .session } } } } });
         try native.submit(source.value, .{ .effect = .{ .command = ticket.command, .effect = .{ .backend = fence.backend, .sequence = 2, .nonce = id(72), .action = .{ .try_acquire = .{ .resource = @splat(8), .mode = .{ .advisory = .exclusive }, .scope = .{ .transaction = .{ .id = transaction.id, .subtransaction = 0 } } } } } } });
-        if (failed) try server.txn_sessions.setSqlFailed(a, transaction.id, true);
+        if (failed) try server.txn_sessions.setSqlFailed(a, try server.txn_sessions.mutation(a, transaction.id, server.localSessionNodeId()), true);
         if (rejected) {
             native.failure = .admit;
             native.fail_before = true;
@@ -1286,9 +1286,9 @@ test "SQL command producer native transaction savepoint projection retains monot
             if (pass == 3 or pass == 4 or pass == 5) {
                 source.fail_writes_for_test = true;
                 switch (pass) {
-                    3 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackToSavepoint(a, txn_id, 1)),
-                    4 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.createNamedSavepoint(a, txn_id, "failed")),
-                    5 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.releaseNamedSavepoint(a, txn_id, "point")),
+                    3 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.rollbackToSavepoint(a, try registry.mutation(a, txn_id, ((try registry.readInfo(txn_id)).?).version.owner), 1)),
+                    4 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.createNamedSavepoint(a, try registry.mutation(a, txn_id, ((try registry.readInfo(txn_id)).?).version.owner), "failed")),
+                    5 => try std.testing.expectError(error.InjectedSessionStoreFailure, registry.releaseNamedSavepoint(a, try registry.mutation(a, txn_id, ((try registry.readInfo(txn_id)).?).version.owner), "point")),
                     else => unreachable,
                 }
                 source.fail_writes_for_test = false;
@@ -1297,10 +1297,10 @@ test "SQL command producer native transaction savepoint projection retains monot
                 try std.testing.expectEqual(expected[pass - 1], unchanged.current_subtransaction);
             }
             switch (pass) {
-                1, 2, 4, 7 => _ = (try registry.createNamedSavepoint(a, txn_id, "point")).?,
-                3 => _ = (try registry.rollbackToSavepoint(a, txn_id, 1)).?,
-                5 => _ = (try registry.releaseNamedSavepoint(a, txn_id, "point")).?,
-                6 => _ = (try registry.releaseSavepoint(a, txn_id, 1)).?,
+                1, 2, 4, 7 => _ = (try registry.createNamedSavepoint(a, try registry.mutation(a, txn_id, ((try registry.readInfo(txn_id)).?).version.owner), "point")).?,
+                3 => _ = (try registry.rollbackToSavepoint(a, try registry.mutation(a, txn_id, ((try registry.readInfo(txn_id)).?).version.owner), 1)).?,
+                5 => _ = (try registry.releaseNamedSavepoint(a, try registry.mutation(a, txn_id, ((try registry.readInfo(txn_id)).?).version.owner), "point")).?,
+                6 => _ = (try registry.releaseSavepoint(a, try registry.mutation(a, txn_id, ((try registry.readInfo(txn_id)).?).version.owner), 1)).?,
                 else => unreachable,
             }
         }
@@ -1414,7 +1414,7 @@ test "SQL command producer native savepoint publication atomically rewinds SQL a
         }
         var session_lock = try advisory.Machine.init(advisoryFrame(&source, fence), .pg_advisory_lock, &.{Datum.json(.{ .integer = 3 })}, null, native.nonce());
         _ = try finishMachine(&native, &session_lock);
-        try registry.setSqlFailed(a, txn, true);
+        try registry.setSqlFailed(a, try registry.mutation(a, txn, ((try registry.readInfo(txn)) orelse return error.TestExpectedSession).version.owner), true);
         // Both sides of the local publication abort together. Neither an SQL
         // rewind without an intent nor an intent without its rewind escapes.
         for ([_]@FieldType(transactions.DurableSessionStore, "fail_savepoint_publication_for_test"){ .session, .source }) |failure| {
@@ -1438,7 +1438,7 @@ test "SQL command producer native savepoint publication atomically rewinds SQL a
             try std.testing.expect(registry.sessions.get(txn).?.native_sql_cut.? == retained);
             try std.testing.expectEqual(@as(usize, 0), cut_fixture.closed);
         }
-        try registry.setSqlFailed(a, txn, false);
+        try registry.setSqlFailed(a, try registry.mutation(a, txn, ((try registry.readInfo(txn)) orelse return error.TestExpectedSession).version.owner), false);
         {
             var plan = try savepointPlan(&native, &source, txn);
             defer plan.deinit();
@@ -1483,7 +1483,7 @@ test "SQL command producer native savepoint publication atomically rewinds SQL a
             ticket = try begin(&native, &source, 40);
             fence = try execute(&source, ticket);
         }
-        try registry.setSqlFailed(a, txn, true);
+        try registry.setSqlFailed(a, try registry.mutation(a, txn, ((try registry.readInfo(txn)) orelse return error.TestExpectedSession).version.owner), true);
         {
             var plan = try savepointPlan(&native, &source, txn);
             defer plan.deinit();

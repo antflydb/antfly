@@ -10241,7 +10241,7 @@ test "relational index system expression composite cold covering work avoids wid
 fn partialPreparationAllocations(test_alloc: std.mem.Allocator) !void {
     const registry = @import("../../schema_registry.zig");
     const plans = @import("plan.zig");
-    const partial = @import("predicate.zig");
+    const partial = @import("partial_predicate.zig");
     var schemas = try registry.Registry.initCloned(test_alloc, std.testing.io, .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
         .{ .name = "id", .path = "id", .column_type = .integer },
         .{ .name = "label", .path = "label", .column_type = .string, .allows_null = true },
@@ -10303,7 +10303,7 @@ test "relational index system partial canonical typed identities and allocation 
 }
 
 test "relational index system partial implication hashes wide operands once with bounded merge work" {
-    const partial = @import("predicate.zig");
+    const partial = @import("partial_predicate.zig");
     const predicates = @import("predicate.zig");
     var schemas = try @import("../../schema_registry.zig").Registry.initCloned(alloc, std.testing.io, .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
         .{ .name = "label", .path = "label", .column_type = .string },

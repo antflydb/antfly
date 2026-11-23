@@ -195,6 +195,9 @@ pub const Cursor = struct {
         seek_at_or_before: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         set_upper_bound: ?*const fn (*anyopaque, ?[]const u8) void = null,
         set_keys_only: ?*const fn (*anyopaque) void = null,
+        set_length_only: ?*const fn (*anyopaque) void = null,
+        last_value_len: ?*const fn (*anyopaque) usize = null,
+        bound_persisted_run_block_residency: ?*const fn (*anyopaque) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -231,9 +234,37 @@ pub const Cursor = struct {
         if (self.vtable.set_upper_bound) |set_upper_bound| set_upper_bound(self.ptr, upper);
     }
 
+    /// Keep decoded persisted blocks only for the active merge source.
+    /// Call before the first move and consume each value before advancing.
+    pub fn boundPersistedRunBlockResidency(self: *Cursor) void {
+        if (self.vtable.bound_persisted_run_block_residency) |bound| bound(self.ptr);
+    }
+
     /// Call before the first move. Unsupported adapters retain normal reads.
     pub fn setKeysOnly(self: *Cursor) void {
         if (self.vtable.set_keys_only) |set| set(self.ptr);
+    }
+
+    /// Use lengths without loading external values when the backend can
+    /// supply them. Other backends keep returning ordinary entries.
+    pub fn setLengthOnly(self: *Cursor) void {
+        if (self.vtable.set_length_only) |set| set(self.ptr);
+    }
+
+    pub fn valueLen(self: *Cursor, entry: Entry) usize {
+        return if (self.vtable.last_value_len) |len| len(self.ptr) else entry.value.len;
+    }
+
+    /// Count borrowed keys on this snapshot without retaining or copying values.
+    pub fn countPrefix(self: *Cursor, prefix: []const u8) !u64 {
+        self.setKeysOnly();
+        var row = try self.seekAtOrAfter(prefix);
+        var count: u64 = 0;
+        while (row) |entry| : (row = try self.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            count += 1;
+        }
+        return count;
     }
 
     pub fn start(self: *Cursor, options: backend_types.CursorOptions) !?Entry {
@@ -261,6 +292,7 @@ pub const ReadScope = struct {
     const VTable = struct {
         get_ranges_many: ?*const fn (*anyopaque, []const RangeRequest) anyerror!void = null,
         get_ranges: ?*const fn (*anyopaque, []const u8, []const ValueRange, [][]const u8) anyerror!void = null,
+        probe_prefix: ?*const fn (*anyopaque, []const u8, usize) anyerror![]const u8 = null,
         get_range: ?*const fn (*anyopaque, []const u8, u64, usize) anyerror![]const u8 = null,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -304,6 +336,12 @@ pub const ReadScope = struct {
     pub fn supportsRange(self: *const @This()) bool {
         return self.vtable.get_range != null;
     }
+    /// Read a bounded prefix without requiring a full-value compatibility read.
+    pub fn probePrefix(self: *@This(), key: []const u8, length: usize) ![]const u8 {
+        if (self.vtable.probe_prefix) |probe| return BoundaryAbi.call("probe_prefix", self.boundary_dispatch, probe, .{ self.ptr, key, length });
+        return self.getRange(key, 0, length);
+    }
+
     pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
         const read_range = self.vtable.get_range orelse return error.Unsupported;
         return BoundaryAbi.call("get_range", self.boundary_dispatch, read_range, .{ self.ptr, key, offset, length });
@@ -453,6 +491,11 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRanges(key, ranges, output);
         }
+        fn probePrefix(ptr: *anyopaque, key: []const u8, length: usize) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.probePrefix(key, length);
+        }
+
         fn getRange(ptr: *anyopaque, key: []const u8, offset: u64, length: usize) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getRange(key, offset, length);
@@ -546,7 +589,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get_ranges_many = if (@hasDecl(@TypeOf(handle), "getRangesMany")) State.getRangesMany else null, .get_ranges = if (@hasDecl(@TypeOf(handle), "getRanges")) State.getRanges else null, .get_range = if (@hasDecl(@TypeOf(handle), "getRange")) State.getRange else null, .probe_prefix = if (@hasDecl(@TypeOf(handle), "probePrefix")) State.probePrefix else null, .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .begin_score_batch = if (@hasDecl(@TypeOf(handle), "beginScoreBatch")) State.beginScoreBatch else null, .reset_score_batch = if (@hasDecl(@TypeOf(handle), "resetScoreBatch")) State.resetScoreBatch else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .read_sorted_score_column = if (@hasDecl(@TypeOf(handle), "readSortedScoreColumn")) State.readSortedScoreColumn else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -595,6 +638,8 @@ pub const ReadTxn = struct {
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
+        read_prefix_page: ?*const fn (*anyopaque, Allocator, []const u8, ?[]const u8, usize) anyerror![]Entry = null,
+        count_prefix: ?*const fn (*anyopaque, []const u8) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -607,6 +652,20 @@ pub const ReadTxn = struct {
     pub fn decodedResultsNamespace(self: *const ReadTxn) ?[]const u8 {
         if (!self.canReuseDecodedResults()) return null;
         return if (self.vtable.decoded_results_namespace) |get_namespace| get_namespace(self.ptr) else null;
+    }
+
+    /// Up to 64 rows, after an exclusive continuation, from this snapshot.
+    /// Keys and bounded value prefixes are allocated by the caller.
+    pub fn readPrefixPage(self: *ReadTxn, alloc: Allocator, prefix: []const u8, after: ?[]const u8, value_prefix_len: usize) ![]Entry {
+        const read = self.vtable.read_prefix_page orelse return error.Unsupported;
+        return BoundaryAbi.call("read_prefix_page", self.boundary_dispatch, read, .{ self.ptr, alloc, prefix, after, value_prefix_len });
+    }
+
+    pub fn countPrefix(self: *ReadTxn, prefix: []const u8) !u64 {
+        if (self.vtable.count_prefix) |count| return BoundaryAbi.call("count_prefix", self.boundary_dispatch, count, .{ self.ptr, prefix });
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        return cursor.countPrefix(prefix);
     }
 
     pub fn abort(self: *ReadTxn) void {
@@ -815,15 +874,29 @@ pub const WriteTxn = struct {
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
         contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
+        delete_index_catalog_scope: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+        count_prefix: ?*const fn (*anyopaque, []const u8) anyerror!u64 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     /// Stages index-catalog mutations to commit in this transaction's own
     /// native commit, as `Batch.putIndexCatalogBatch` does. `error.Unsupported`
     /// on every backend but Lite.
+    pub fn deleteIndexCatalogScope(self: *WriteTxn, scope: []const u8) !void {
+        const delete_scope = self.vtable.delete_index_catalog_scope orelse return error.Unsupported;
+        try BoundaryAbi.call("delete_index_catalog_scope", self.boundary_dispatch, delete_scope, .{ self.ptr, scope });
+    }
+
     pub fn putIndexCatalogBatch(self: *WriteTxn, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
         const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
         try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
+    }
+
+    pub fn countPrefix(self: *WriteTxn, prefix: []const u8) !u64 {
+        if (self.vtable.count_prefix) |count| return BoundaryAbi.call("count_prefix", self.boundary_dispatch, count, .{ self.ptr, prefix });
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        return cursor.countPrefix(prefix);
     }
 
     pub fn abort(self: *WriteTxn) void {
@@ -1131,6 +1204,8 @@ pub const Batch = struct {
             // the pre-split contract that a failed `commit` leaves `self`
             // safely abortable, even though there is nothing left to abort.
             self.vtable = &consumed_vtable;
+            if (self.write_gate) |gate| gate.unlock();
+            self.write_gate = null;
             return ticket;
         }
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
@@ -1227,6 +1302,36 @@ pub const Batch = struct {
         try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
     }
 };
+
+test "erased staged batch releases its write gate at handoff" {
+    const Stage = struct {
+        fn run(_: Allocator, ptr: *anyopaque) !Ticket {
+            const fail: *bool = @ptrCast(@alignCast(ptr));
+            if (fail.*) return error.TestStageFailed;
+            return Ticket.alreadyDurable();
+        }
+    };
+    var fail = true;
+    var vtable = Batch.consumed_vtable;
+    vtable.commit_staged = Stage.run;
+    var gate: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(gate.tryLock());
+    var batch: Batch = .{
+        .allocator = std.testing.allocator,
+        .ptr = &fail,
+        .vtable = &vtable,
+        .write_gate = &gate,
+    };
+    try std.testing.expectError(error.TestStageFailed, batch.commitStaged());
+    try std.testing.expect(!gate.tryLock());
+    fail = false;
+    const ticket = try batch.commitStaged();
+    try std.testing.expect(gate.tryLock());
+    batch.abort();
+    try std.testing.expect(!gate.tryLock());
+    gate.unlock();
+    try ticket.wait();
+}
 
 test "ordered artifact inventory erased batches reject unsupported commit participants" {
     const Raw = struct {
@@ -1789,8 +1894,20 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             };
         }
 
+        pub fn boundPersistedRunBlockResidency(ptr: *anyopaque) void {
+            unbox(ptr).handle.boundPersistedRunBlockResidency();
+        }
+
         pub fn setKeysOnly(ptr: *anyopaque) void {
             unbox(ptr).handle.setKeysOnly();
+        }
+
+        fn setLengthOnly(ptr: *anyopaque) void {
+            unbox(ptr).handle.setLengthOnly();
+        }
+
+        fn lastValueLen(ptr: *anyopaque) usize {
+            return unbox(ptr).handle.lastValueLen();
         }
 
         pub fn setUpperBound(ptr: *anyopaque, upper: ?[]const u8) void {
@@ -1811,6 +1928,9 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             .seek_at_or_before = vt.seekAtOrBefore,
             .set_upper_bound = if (@hasDecl(Handle, "setUpperBound")) vt.setUpperBound else null,
             .set_keys_only = if (@hasDecl(Handle, "setKeysOnly")) vt.setKeysOnly else null,
+            .set_length_only = if (@hasDecl(Handle, "setLengthOnly") and @hasDecl(Handle, "lastValueLen")) vt.setLengthOnly else null,
+            .last_value_len = if (@hasDecl(Handle, "setLengthOnly") and @hasDecl(Handle, "lastValueLen")) vt.lastValueLen else null,
+            .bound_persisted_run_block_residency = if (@hasDecl(Handle, "boundPersistedRunBlockResidency")) vt.boundPersistedRunBlockResidency else null,
         },
     };
 }
@@ -2142,6 +2262,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
 
+        pub fn deleteIndexCatalogScope(ptr: *anyopaque, scope: []const u8) anyerror!void {
+            return unbox(ptr).handle.deleteIndexCatalogScope(scope);
+        }
+
         pub fn putIndexCatalogBatch(ptr: *anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void {
             return unbox(ptr).handle.putIndexCatalogBatch(scope, mutations);
         }
@@ -2162,6 +2286,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .open_cursor = vt.openCursor,
             .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
             .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,
+            .delete_index_catalog_scope = if (@hasDecl(Handle, "deleteIndexCatalogScope")) vt.deleteIndexCatalogScope else null,
         },
     };
 }
@@ -2287,18 +2412,18 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             parent.finalizing = true;
             parent.mutex.unlock();
 
-            const payload = parent.handle.commitStaged() catch |err| {
+            errdefer {
                 platform.sync.lockYielding(&parent.mutex);
                 parent.finalizing = false;
                 parent.mutex.unlock();
-                return err;
-            };
-
+            }
             const TicketBox = struct {
                 parent: *ParentBox(Handle),
-                payload: @TypeOf(payload),
+                payload: @typeInfo(@typeInfo(@TypeOf(Handle.commitStaged)).@"fn".return_type.?).error_union.payload,
             };
             const box = try ticket_allocator.create(TicketBox);
+            errdefer ticket_allocator.destroy(box);
+            const payload = try parent.handle.commitStaged();
             box.* = .{ .parent = parent, .payload = payload };
             return .{
                 .allocator = ticket_allocator,

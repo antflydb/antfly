@@ -105,7 +105,7 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
         };
         var tuple = try @import("../storage/db/relational/indexes/keys.zig").TuplePlan.init(arena, runtime, &layout.?, keys);
         defer tuple.deinit();
-        var predicate = if (unique.where.len != 0) try @import("../storage/db/relational/indexes/predicate.zig").Plan.init(arena, runtime, &layout.?, unique.where) else null;
+        var predicate = if (unique.where.len != 0) try @import("../storage/db/relational/indexes/partial_predicate.zig").Plan.init(arena, runtime, &layout.?, unique.where) else null;
         defer if (predicate) |*plan| plan.deinit();
         // Preserve generations of existing plain-column declarations. New
         // shapes use compiled identities, including referenced types and the

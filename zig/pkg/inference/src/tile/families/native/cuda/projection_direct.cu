@@ -950,3 +950,99 @@ extern "C" __global__ void termite_gemma4_small_ple_projection_q8_1_f32(float* d
  a+=__shfl_down_sync(0xffffffffu,a,8,16);a+=__shfl_down_sync(0xffffffffu,a,4,16);a+=__shfl_down_sync(0xffffffffu,a,2,16);a+=__shfl_down_sync(0xffffffffu,a,1,16);
  if(half_lane==0){a=__fadd_rn(0.f,a);a=__fadd_rn(a,0.f);a=__fadd_rn(a,0.f);a=__fadd_rn(a,0.f);dst[col]=a;}
 }
+// native-program:entry termite_short_row_matmul_f32
+extern "C" __global__ void termite_short_row_matmul_f32(ANTFLY_CUDA_SHORT_ROW_MATMUL_PARAMS) {
+    // For few-row projections, distribute the reduction over eight warps.
+    // Each warp reads contiguous RHS columns in the row-major weight.
+    __shared__ float partial[8][32];
+    const unsigned int lane = threadIdx.x % 32u;
+    const unsigned int warp = threadIdx.x / 32u;
+    const unsigned int tiles = (n - 1u) / 32u + 1u;
+    const unsigned int row_batch = blockIdx.x / tiles;
+    const unsigned int batch = row_batch / m;
+    const unsigned int col = (blockIdx.x % tiles) * 32u + lane;
+
+    float sum = 0.0f;
+    if (col < n) {
+        for (unsigned int inner = warp; inner < k; inner += 8u) {
+            sum += lhs[(size_t)row_batch * k + inner] *
+                rhs[((size_t)batch * k + inner) * n + col];
+        }
+    }
+    partial[warp][lane] = sum;
+    __syncthreads();
+    if (warp == 0u && col < n) {
+        for (unsigned int other = 1; other < 8u; ++other) sum += partial[other][lane];
+        output[(size_t)row_batch * n + col] = epilogue != 0u ? termite_decoder_activation_f32(sum, epilogue) : sum;
+    }
+}
+
+// native-program:entry termite_tiled_row_matmul_f32
+extern "C" __global__ void termite_tiled_row_matmul_f32(ANTFLY_CUDA_SHORT_ROW_MATMUL_PARAMS) {
+    __shared__ float lhs_tile[8][32];
+    __shared__ float rhs_tile[32][32];
+    const unsigned int lane = threadIdx.x % 32u;
+    const unsigned int warp = threadIdx.x / 32u;
+    const unsigned int col = blockIdx.x * 32u + lane;
+    const unsigned int row = blockIdx.y * 8u + warp;
+    float sum = 0.0f;
+    for (unsigned int start = 0; start < k; start += 32u) {
+        const unsigned int lhs_col = start + lane;
+        lhs_tile[warp][lane] = row < m && lhs_col < k ? lhs[(size_t)row * k + lhs_col] : 0.0f;
+        for (unsigned int inner = warp; inner < 32u; inner += 8u) {
+            const unsigned int rhs_row = start + inner;
+            rhs_tile[inner][lane] = col < n && rhs_row < k ? rhs[(size_t)rhs_row * n + col] : 0.0f;
+        }
+        __syncthreads();
+        const unsigned int active = min(32u, k - start);
+        for (unsigned int inner = 0; inner < active; ++inner)
+            sum += lhs_tile[warp][inner] * rhs_tile[inner][lane];
+        __syncthreads();
+    }
+    if (row < m && col < n) output[(size_t)row * n + col] = epilogue != 0u ? termite_decoder_activation_f32(sum, epilogue) : sum;
+}
+
+// native-program:entry termite_wide_tiled_row_matmul_f32
+extern "C" __global__ void termite_wide_tiled_row_matmul_f32(ANTFLY_CUDA_SHORT_ROW_MATMUL_PARAMS) {
+    __shared__ float lhs_tile[32][32];
+    __shared__ float rhs_tile[32][64];
+    const unsigned int lid = threadIdx.x;
+    const unsigned int lane = lid % 32u;
+    const unsigned int warp = lid / 32u;
+    const unsigned int col = blockIdx.x * 64u + lane;
+    const unsigned int first_row = blockIdx.y * 32u + warp * 4u;
+    float sum[4][2] = {};
+    for (unsigned int start = 0; start < k; start += 32u) {
+        for (unsigned int i = lid; i < 1024u; i += 256u) {
+            const unsigned int row = blockIdx.y * 32u + i / 32u;
+            const unsigned int inner = start + i % 32u;
+            lhs_tile[i / 32u][i % 32u] = row < m && inner < k ? lhs[(size_t)row * k + inner] : 0.0f;
+        }
+        for (unsigned int i = lid; i < 2048u; i += 256u) {
+            const unsigned int rhs_col = blockIdx.x * 64u + i % 64u;
+            const unsigned int inner = start + i / 64u;
+            rhs_tile[i / 64u][i % 64u] = rhs_col < n && inner < k ? rhs[(size_t)inner * n + rhs_col] : 0.0f;
+        }
+        __syncthreads();
+        #pragma unroll 4
+        for (unsigned int inner = 0; inner < min(32u, k - start); ++inner) {
+            const float r0 = rhs_tile[inner][lane];
+            const float r1 = rhs_tile[inner][lane + 32u];
+            #pragma unroll
+            for (unsigned int rr = 0; rr < 4u; ++rr) {
+                const float a = lhs_tile[warp * 4u + rr][inner];
+                sum[rr][0] += a * r0;
+                sum[rr][1] += a * r1;
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned int rr = 0; rr < 4u; ++rr) {
+        const unsigned int row = first_row + rr;
+        if (row < m && col < n)
+            output[(size_t)row * n + col] = epilogue != 0u ? termite_decoder_activation_f32(sum[rr][0], epilogue) : sum[rr][0];
+        if (row < m && col + 32u < n)
+            output[(size_t)row * n + col + 32u] = epilogue != 0u ? termite_decoder_activation_f32(sum[rr][1], epilogue) : sum[rr][1];
+    }
+}

@@ -765,7 +765,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     api_session_maintenance_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const retained_quota_tests = b.addTest(.{
         .root_module = api_session_maintenance_test_mod,
-        .filters = &.{ "retained quota", "api http server routes table batches through the batch commit hook", "api http client preserves public batch retry safety classifications", "internal routed batch preserves typed validation across the HTTP forwarding hop", "typed routed batch preserves forwarding cancellation and identity conflicts", "httpx antfly reads preserve availability and terminal failures" },
+        .filters = &.{ "httpx multi batch route uses the batch commit hook", "retained quota", "api http server routes table batches through the batch commit hook", "api http client preserves public batch retry safety classifications", "internal routed batch preserves typed validation across the HTTP forwarding hop", "typed routed batch preserves forwarding cancellation and identity conflicts", "httpx antfly reads preserve availability and terminal failures" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-retained-quota-test", "Run retained-effects pressure outcome and retry contracts").dependOn(&addFilteredTestRunArtifact(b, retained_quota_tests).step);
@@ -789,6 +789,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "session maintenance activation follows current range leadership without follower RPCs",
             "api http server serves status using control metadata without diagnostic transfers",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
+            "durable session limits",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
             "transaction session registry reports status and cleans expired durable sessions",
@@ -1089,6 +1090,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     write_implementation_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
     write_implementation_imports.configure(b, write_implementation_module, true, true);
     write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const artifact_policy_local_filters = &.{ "enrichment shorthand local PUT", "privacy reprocess continuations" };
+    const artifact_policy_local_tests = b.addTest(.{
+        .root_module = write_implementation_module,
+        .filters = artifact_policy_local_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-execution-policy-local-api-test", "Verify native producer PUT normalization and policy cursor transport")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_policy_local_tests, artifact_policy_local_filters).step);
+
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
         .target = target,
@@ -1897,7 +1907,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("cypher-transaction-contract-test", "Verify graph transaction staging, receipts and principal identity").dependOn(&addFilteredTestRunArtifact(b, cypher_transaction_contract_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids", "durable SQL session restores generation after child rollback" },
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids", "durable SQL session restores generation after child rollback", "SQL session metadata", "replicated session" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);

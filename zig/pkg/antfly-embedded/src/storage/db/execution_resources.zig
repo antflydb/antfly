@@ -989,7 +989,7 @@ pub const PreparedRowEffects = struct {
 };
 
 pub const RelationalPriorMembership = struct {
-    const Source = @import("relational/indexes/predicate.zig").Source;
+    const Source = @import("relational/indexes/partial_predicate.zig").Source;
     alloc: Allocator,
     members: []bool,
     sources: []?Source,
@@ -1167,6 +1167,7 @@ pub const BatchExecutionOptions = struct {
     /// retained by asynchronous publication or shared across retries.
     prepared_commit_disposition: ?*PreparedCommitDisposition = null,
     force_generated_artifact_names: []const []const u8 = &.{},
+    force_only_incomplete_assets: bool = false,
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
     bypass_replication_write_gate: bool = false,

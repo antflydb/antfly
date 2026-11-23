@@ -994,10 +994,13 @@ pub const MetalTensor = struct {
         dims: []const i32,
         fresh: bool,
     ) !MetalTensor {
+        // Metal cannot create a zero-byte buffer. Preserve the logical
+        // extent, using the same minimal backing as checked allocations.
+        const physical_bytes = @max(byte_len, 1);
         const handle = (if (fresh)
-            termite_metal_buffer_alloc_fresh(runtime, byte_len, @backingInt(mode))
+            termite_metal_buffer_alloc_fresh(runtime, physical_bytes, @backingInt(mode))
         else
-            termite_metal_buffer_alloc(runtime, byte_len, @backingInt(mode))) orelse
+            termite_metal_buffer_alloc(runtime, physical_bytes, @backingInt(mode))) orelse
             return error.MetalBufferAllocFailed;
         var tensor = deviceOwned(runtime, handle, 0, byte_len, dims);
         errdefer tensor.deinit();
@@ -1198,6 +1201,15 @@ pub const MetalTensor = struct {
         return d.ref.release_on_drop;
     }
 
+    pub fn standaloneOutputBytes(self: *const MetalTensor) ?usize {
+        const device = self.device orelse return null;
+        const ref = device.ref;
+        if (ref.released or ref.ref_count.load(.acquire) != 1 or !ref.release_on_drop or
+            ref.physical_lease != null or ref.write_owner != null or
+            device.byte_offset != 0 or device.byte_len != ref.byte_len or device.byte_len == 0) return null;
+        return self.allocatedDeviceBytes();
+    }
+
     pub fn deviceHandle(self: *const MetalTensor) ?*anyopaque {
         if (self.device) |d| {
             if (d.ref.released or d.ref.ref_count.load(.acquire) == 0) return null;
@@ -1355,6 +1367,7 @@ pub const MetalTensor = struct {
 
         if (self.device) |src_dev| {
             if (src_dev.ref.released or src_dev.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
+            if (byte_len == 0) return;
             const rc = termite_metal_buffer_copy(
                 dst_dev.ref.runtime,
                 src_dev.ref.handle,
@@ -1369,6 +1382,7 @@ pub const MetalTensor = struct {
         }
 
         if (self.len * @sizeOf(f32) != byte_len) return error.InvalidTensorShape;
+        if (byte_len == 0) return;
         const rc = termite_metal_buffer_upload(
             dst_dev.ref.runtime,
             dst_dev.ref.handle,

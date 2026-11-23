@@ -1296,6 +1296,7 @@ fn computePleVectorsDirect(
     defer cb.free(token_embd_raw);
 
     started_at = monotonicNowNs();
+    const projection_epsilon = try gpt_arch.gemmaPleProjectionEpsilon(cb, hidden, total, gpt_config);
     const model_proj_raw = (try cb.decoderRuntimeApplyLinear(&.{
         .slot = pleModelProjSlot(configured_layer_count),
         .input = hidden,
@@ -1314,7 +1315,7 @@ fn computePleVectorsDirect(
         .slot = pleProjNormSlot(configured_layer_count),
         .input = reshaped,
         .hidden_size = ple_dim,
-        .eps = gpt_config.pleProjectionNormEps(),
+        .eps = projection_epsilon,
     })) orelse return null;
     defer cb.free(normed_flat);
 
@@ -1391,6 +1392,7 @@ fn computePleVectorsDirectFromTokenTensor(
     defer cb.free(token_embd_raw);
 
     started_at = monotonicNowNs();
+    const projection_epsilon = try gpt_arch.gemmaPleProjectionEpsilon(cb, hidden, total, gpt_config);
     const model_proj_raw = (try cb.decoderRuntimeApplyLinear(&.{
         .slot = pleModelProjSlot(configured_layer_count),
         .input = hidden,
@@ -1409,7 +1411,7 @@ fn computePleVectorsDirectFromTokenTensor(
         .slot = pleProjNormSlot(configured_layer_count),
         .input = reshaped,
         .hidden_size = ple_dim,
-        .eps = gpt_config.pleProjectionNormEps(),
+        .eps = projection_epsilon,
     })) orelse return null;
     defer cb.free(normed_flat);
 

@@ -68,7 +68,7 @@ pub const Index = struct {
             at += part.bytes.len;
         }
     }
-    fn initParsed(parsed: audio.flac.ParsedStream, length: usize, max_frames: usize, admission: ?Admission) !Index {
+    pub fn initParsed(parsed: audio.flac.ParsedStream, length: usize, max_frames: usize, admission: ?Admission) !Index {
         if (parsed.stream_info.total_samples == 0) return error.UnsupportedStreamingAudioProfile;
         const sample_count = std.math.cast(usize, parsed.stream_info.total_samples) orelse return error.ResourceLimitExceeded;
         const min_block = @max(1, parsed.stream_info.min_block_size);
@@ -141,8 +141,9 @@ pub const Owner = struct {
                 if (part.bytes.len == 0) return error.IncompleteAudioStream;
                 buffer.appendSliceAssumeCapacity(part.bytes);
             }
-            return audio.flac.decodeFrameAlloc(a, self.info, buffer.items) catch |err| {
-                if (err != error.UnsupportedAudioFormat or size == limit or known_size != null) return err;
+            return audio.flac.decodeFramePrefixAlloc(a, self.info, buffer.items) catch |err| {
+                if (err != error.IncompleteFlacFrame) return err;
+                if (size == limit or known_size != null) return error.UnsupportedAudioFormat;
                 size = @min(limit, size *| 2);
                 continue;
             };

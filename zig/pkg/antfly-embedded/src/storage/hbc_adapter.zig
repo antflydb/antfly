@@ -5242,45 +5242,7 @@ pub const HBCIndex = struct {
         };
     }
 
-    /// Durably removes this index's own native-catalog KV records (dims,
-    /// root node, postings, ...) so a later re-admission of a differently
-    /// configured index under the same name starts fresh instead of
-    /// resurrecting this generation's stale metadata (#1216: a dimension
-    /// change survived delete+re-admission because nothing ever cleared
-    /// this scope). A no-op for every other backend, which either owns no
-    /// persistent root of its own to leak (`.lsm`, deleted by the caller's
-    /// own directory removal) or is the raw-storage-authority `.native`
-    /// mode this adapter never promotes a `.native_catalog` index into.
-    /// Callers must call this -- and let it complete -- before committing
-    /// the catalog mutation that makes the index's removal visible; see
-    /// `native_catalog_backend.deleteAllForScope`.
-    /// A delete for each record under this index's native-catalog scope, for
-    /// index removal to commit in the same transaction as the catalog
-    /// mutation that makes the removal visible: a crash can never leave the
-    /// catalog naming this index over an erased scope, nor a removed index's
-    /// stale scope under a later re-admission. Null for every other backend.
-    pub fn nativeCatalogScopeDeletesForRemoval(self: *HBCIndex) !?native_catalog_backend.ScopeDeletes {
-        const backend = switch (self.env_owner) {
-            .native_catalog => |backend| backend,
-            .lsm, .native => return null,
-        };
-        return try native_catalog_backend.ScopeDeletes.load(self.alloc, backend.sink, backend.scope);
-    }
-
-    /// perf/lwa-maint-serialize (#1216's own two-commit race): call before
-    /// `deleteNativeCatalogScopeForRemoval` and keep held -- via the
-    /// paired `resumeMaintenanceAcrossRemoval`, called only after the
-    /// *separate* catalog-removal commit that makes this index's removal
-    /// visible has also landed -- so background maintenance can never
-    /// observe the scope-clear commit's own retirement debt and reclaim
-    /// against it in the gap between these two commits. That gap is real:
-    /// each commit is individually protected while it runs, but nothing
-    /// before this excluded the maintenance loop's *later* work from
-    /// running between them, and reclaiming in that window raced a
-    /// concurrently-running redo commit (crash sweeps "dense native-catalog
-    /// dimension replacement delete/admit and delete (#1216)").
-    /// A no-op for every backend other than `.native_catalog`, matching
-    /// `deleteNativeCatalogScopeForRemoval`'s own scope.
+    /// Pause maintenance while the catalog transaction removes this index.
     pub fn pauseMaintenanceAcrossRemoval(self: *HBCIndex) void {
         const backend = switch (self.env_owner) {
             .native_catalog => |backend| backend,

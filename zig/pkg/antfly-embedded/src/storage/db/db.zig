@@ -623,6 +623,10 @@ pub const OpenOptions = struct {
     sql_persistence: ?@import("../../common/relation_persistence.zig").Descriptor = null,
     sql_persistence_context: ?@import("../../common/relation_persistence.zig").Context = null,
     persistence_boot: ?@import("../../common/relation_persistence.zig").Boot = null,
+    /// Upgrade writable non-Lite journals to the single-record credit format.
+    /// Set false before the upgrade when rollback to a v3-only binary is required.
+    /// Deployments can also set ANTFLY_KEEP_REPLAY_CREDIT_V3=true.
+    enable_protected_replay_credit: bool = true,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
     /// source projections. Do not open intentionally omitted index artifacts.
@@ -4875,6 +4879,16 @@ pub const DB = struct {
                 db.scheduleGeneratedArtifactCleanup();
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) _ = try db.drainStandaloneGraphEndpointCleanup();
+            // Switch formats after startup validation and recovery have
+            // succeeded. An earlier open failure leaves the old reader
+            // able to reopen the journal.
+            if (opts.enable_protected_replay_credit and
+                !platform.env.getenvBool("ANTFLY_KEEP_REPLAY_CREDIT_V3") and
+                !openModeRequiresReadOnlyBackends(opts.open_mode) and
+                !db.core.store.sharedReplayLane())
+            {
+                try db.core.store.enableProtectedReplayCredit();
+            }
             profile.total_ns = monotonicTimeNs() - open_started_ns;
             if (openProfileEnabled()) {
                 logOpenProfile(path, opts.open_mode, db.start_index_workers, profile);
@@ -13968,7 +13982,7 @@ pub const DB = struct {
         artifact_name: []const u8,
     ) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("reprocessDocumentArtifact", .{ self, alloc, doc_key, artifact_name });
-        return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false);
+        return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false, false);
     }
 
     fn reprocessDocumentArtifactWithCompletionWait(
@@ -13977,13 +13991,16 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
         wait_for_completion: bool,
+        only_incomplete: bool,
     ) !bool {
-        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
+        var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse {
+            if (only_incomplete) return error.InvalidArgument;
             return self.reprocessEmbeddingArtifactIssue(alloc, .{
                 .artifact_kind = .embedding,
                 .doc_key = doc_key,
                 .artifact_name = artifact_name,
             }, wait_for_completion);
+        };
         defer cfg.deinit(alloc);
         // A missing producer definition means this artifact cannot currently be
         // regenerated. A missing source document is a distinct, actionable
@@ -13995,6 +14012,7 @@ pub const DB = struct {
         const force_artifacts = [_][]const u8{artifact_name};
         var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
         defer producer.deinit(alloc);
+        if (only_incomplete and producer.type != .document_extraction) return error.InvalidArgument;
         // Document extraction persists a config-fenced target generation with
         // this source mutation. Replay owns provider work, including cold starts
         // and retries; accepting it must never wait for remote OCR. Other asset
@@ -14007,6 +14025,7 @@ pub const DB = struct {
         }, null, .{
             .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
+            .force_only_incomplete_assets = only_incomplete,
         });
         return true;
     }
@@ -15938,7 +15957,7 @@ pub const DB = struct {
     ) !bool {
         return switch (issue.artifact_kind) {
             .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue, true),
-            .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true),
+            .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true, false),
             .chunk => try self.reprocessChunkArtifactIssue(alloc, issue),
             .graph, .full_text, .algebraic => false,
         };
@@ -22959,6 +22978,14 @@ pub const DB = struct {
         return result;
     }
 
+    fn appendArtifactReprocessFailure(alloc: Allocator, failures: *std.ArrayListUnmanaged(types.DocumentArtifactReprocessFailure), document: []const u8, err: anyerror) !void {
+        const key = try alloc.dupe(u8, document);
+        errdefer alloc.free(key);
+        const code = try alloc.dupe(u8, @errorName(err));
+        errdefer alloc.free(code);
+        try failures.append(alloc, .{ .key = key, .error_code = code });
+    }
+
     pub fn reprocessDocumentArtifactRange(
         self: *DB,
         alloc: Allocator,
@@ -22991,6 +23018,12 @@ pub const DB = struct {
             (try self.getEnrichment(alloc, .embedding, artifact_name)) orelse return error.NotFound;
         defer cfg.deinit(alloc);
 
+        if (req.selection == .incomplete) {
+            if (cfg.kind != .asset) return error.InvalidArgument;
+            var producer = try asset_producer_mod.parseProducerConfig(alloc, cfg.producer_json);
+            defer producer.deinit(alloc);
+            if (producer.type != .document_extraction) return error.InvalidArgument;
+        }
         var effective_req = req;
         if (req.shard_cursors.len > 0) {
             if (req.shard_cursors.len != 1) return error.InvalidArgument;
@@ -23000,6 +23033,7 @@ pub const DB = struct {
                 .from_key = cursor.next_key,
                 .resume_from_key = true,
                 .to_key = req.to_key,
+                .selection = req.selection,
                 .limit = if (cursor.limit != 0) cursor.limit else req.limit,
             };
         }
@@ -23029,14 +23063,32 @@ pub const DB = struct {
         const process_len = @min(scanned.documents.len, @as(usize, @intCast(limit)));
         for (scanned.documents[0..process_len]) |doc| {
             result.scanned += 1;
-            const handled = self.reprocessDocumentArtifact(alloc, doc.id, artifact_name) catch |err| switch (err) {
+            if (effective_req.selection == .incomplete) {
+                // Select against published coverage, not repair counters or
+                // merge convergence: a converged PDF can contain failed pages.
+                const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc.id, "asset", artifact_name);
+                defer alloc.free(key);
+                if (try self.core.getStoreValue(alloc, key)) |manifest| {
+                    defer alloc.free(manifest);
+                    const complete = @import("enrichment/document_extraction_completion.zig").isComplete(alloc, manifest) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => {
+                            result.failed += 1;
+                            try appendArtifactReprocessFailure(alloc, &failures, doc.id, err);
+                            continue;
+                        },
+                    };
+                    if (complete) {
+                        result.skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            const handled = self.reprocessDocumentArtifactWithCompletionWait(alloc, doc.id, artifact_name, false, effective_req.selection == .incomplete) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     result.failed += 1;
-                    try failures.append(alloc, .{
-                        .key = try alloc.dupe(u8, doc.id),
-                        .error_code = try alloc.dupe(u8, @errorName(err)),
-                    });
+                    try appendArtifactReprocessFailure(alloc, &failures, doc.id, err);
                     continue;
                 },
             };
@@ -23881,7 +23933,7 @@ pub const DB = struct {
     fn lookupPrimarySnapshotWithSchemaAndOutput(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64) !?types.LookupResult {
         return self.lookupPrimarySnapshotWithPreparedProjection(alloc, output, key, opts, probe, schema_view, primary, primary_timestamp, null);
     }
-    fn lookupPrimarySnapshotWithPreparedProjection(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64, prepared: ?*LookupProjectionPlans) !?types.LookupResult {
+    fn lookupPrimarySnapshotWithPreparedProjection(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, supplied: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64, prepared: ?*LookupProjectionPlans) !?types.LookupResult {
         // Virtual group sources have no independently authorized public row.
         // Owner control queries use the dedicated private lookup path above;
         // producers read their physical source through authenticated snapshots.
@@ -23898,28 +23950,34 @@ pub const DB = struct {
         // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        var page: ?[]u8 = null;
-        defer if (page) |bytes| alloc.free(bytes);
-        const raw = primary orelse (probe.getLeased(store_key) catch |err| switch (err) {
-            error.NotFound => virtual: {
-                if (opts.include_primary_digest) return null;
-                page = try virtualPdfPageUnit(self, alloc, probe, store_key);
-                break :virtual page orelse return null;
-            },
+        const unit_key = internal_keys.isDocumentUnitArtifactRecordKey(store_key);
+        const preloaded = if (unit_key) primary else primary orelse supplied.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => return null,
             else => return err,
-        });
+        };
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = if (opts.privacy_original) null else try privacy.capture(self, privacy_arena.allocator());
-        if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
         const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+        var pinned: ?docstore_mod.DocStore.Txn = if (protected and supplied.probe != null and unit_key) try self.core.store.beginReadTxn() else null;
+        defer if (pinned) |*txn| txn.abort();
+        const probe = if (pinned) |*txn| txn else supplied;
+        const stored_primary = (if (pinned == null) preloaded else null) orelse probe.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (stored_primary == null and opts.include_primary_digest) return null;
+        if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
+        const page = if (stored_primary == null) try virtualPdfPageUnit(self, alloc, probe, store_key, if (protected) policy else null) else null;
+        defer if (page) |bytes| alloc.free(bytes);
+        const raw = stored_primary orelse page orelse return null;
         if (protected) {
             if (opts.include_primary_digest) return error.PrivacyUnsupportedMutation;
             const special = db_query_projection.buildLookupFieldSelectionPlan(opts).special;
             if (special.all_artifacts or special.all_chunks or special.all_embeddings) return error.PrivacyUnsupportedProjection;
         }
-        const safe_raw = if (protected and internal_keys.isInternalUserKey(key)) try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, probe) else if (protected) privacy.project(privacy_arena.allocator(), policy.?, key, raw, probe) catch |err| {
+        const safe_raw = if (page != null) raw else if (protected and internal_keys.isInternalUserKey(key)) try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, probe) else if (protected) privacy.project(privacy_arena.allocator(), policy.?, key, raw, probe) catch |err| {
             if (privacy.pending(err)) return null;
             return err;
         } else raw;
@@ -24021,7 +24079,7 @@ pub const DB = struct {
             std.crypto.hash.sha2.Sha256.hash(raw, &primary_digest, .{});
             digest = primary_digest;
             if (version == null) {
-                version = primary_timestamp orelse try lookupSnapshotTimestamp(alloc, key, probe);
+                version = (if (pinned == null) primary_timestamp else null) orelse try lookupSnapshotTimestamp(alloc, key, probe);
             }
         }
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -51981,6 +52039,13 @@ pub const DB = struct {
         if (resident >= primary_sequence) return true;
         const applied = @max(resident, try self.core.loadAppliedSequence(alloc, index_name));
         if (applied >= primary_sequence) return true;
+        // Direct text projections can use the indexed hint lane to ignore
+        // unrelated replay. Artifact inputs have their own revision frontier.
+        if (self.core.textIndexEntry(index_name)) |entry| {
+            if (entry.source_artifact_names.len == 0 and entry.chunk_name == null) {
+                if (try self.core.store.replayHintRecordBetween(.full_text, applied, primary_sequence)) |pending| return !pending;
+            }
+        }
         return (try self.managedIndexReplayTargetSequence(alloc, index_name, .full_text, applied)) <= applied;
     }
 
@@ -56843,17 +56908,19 @@ pub const DB = struct {
     fn loadStoredSearchDocumentProbe(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
         const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
         defer alloc.free(store_key);
-        var txn = try self.core.store.beginProbeTxn();
-        defer txn.abort();
-        const member = try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key);
-        const page = if (member == null) try virtualPdfPageUnit(self, alloc, &txn, store_key) else null;
-        defer if (page) |bytes| alloc.free(bytes);
-        const raw = member orelse page orelse return null;
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = try privacy.capture(self, privacy_arena.allocator());
-        if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+        const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+        var txn = if (protected and internal_keys.isDocumentUnitArtifactRecordKey(store_key)) try self.core.store.beginReadTxn() else try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        const member = try @import("artifact_chunk_generation.zig").readMember(alloc, &txn, store_key);
+        if (member == null and !internal_keys.isDocumentUnitArtifactRecordKey(store_key)) return null;
+        const page = if (member == null) try virtualPdfPageUnit(self, alloc, &txn, store_key, if (protected) policy else null) else null;
+        if (page) |bytes| return bytes;
+        const raw = member orelse return null;
+        if (protected) {
             if (internal_keys.isInternalUserKey(key)) {
                 const safe = try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, &txn);
                 return if (scalarSearchAsset(self, store_key)) try std.json.Stringify.valueAlloc(alloc, .{ .@"$" = safe }, .{}) else try alloc.dupe(u8, safe);
@@ -57191,15 +57258,15 @@ fn scalarSearchAsset(self: *DB, key: []const u8) bool {
 
 // A PDF page is stored as a generated vector under its logical unit key.
 // Read only the primary-owned artifact header, including for external payloads.
-fn virtualPdfPageUnit(self: *DB, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, key: []const u8) !?[]u8 {
+fn virtualPdfPageUnit(self: *DB, alloc: Allocator, txn: *docstore_mod.DocStore.Txn, key: []const u8, policy: ?@import("privacy_read.zig").PolicySnapshot) !?[]u8 {
     var values: [1]?[]const u8 = .{null};
-    try hydrateVirtualPdfPageUnits(self, alloc, txn, &.{key}, &values);
+    try hydrateVirtualPdfPageUnits(self, alloc, txn, &.{key}, &values, policy, null);
     return if (values[0]) |page| @constCast(page) else null;
 }
 
 // Resolve one output per still-missing page per round. Read only physical headers,
 // keeping the configured output precedence and a single catalog cut for the batch.
-fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.DocStore.Txn, keys: []const []const u8, values: []?[]const u8) !void {
+fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.DocStore.Txn, keys: []const []const u8, values: []?[]const u8, policy: ?@import("privacy_read.zig").PolicySnapshot, verified: ?*std.AutoHashMapUnmanaged(usize, void)) !void {
     const Candidate = struct { index: usize, unit: []const u8, number: u32, outputs: []const []const u8 };
     const Probe = struct {
         candidate: Candidate,
@@ -57218,6 +57285,14 @@ fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.D
     while (offset < keys.len) {
         const end = @min(offset + 128, keys.len);
         _ = batch.reset(.retain_capacity);
+        var receipts: ?@import("privacy_read.zig").PageValidation = if (policy) |active| .{ .alloc = batch.allocator(), .policy = active } else null;
+        defer if (receipts) |*cache| cache.deinit();
+        // Proof borrows expire per candidate. Header borrows live through
+        // the entire sorted wave, so each needs its own scope on the same txn.
+        var proof_backing = inference_work.ReclaimingInvocationAllocator.init(output);
+        const proof_allocator = proof_backing.allocator();
+        var proof_scope: ?backend_erased_mod.ReadScope = null;
+        defer if (proof_scope) |*read| read.close();
         var candidates: [128]Candidate = undefined;
         var count: usize = 0;
         for (offset..end) |i| {
@@ -57241,14 +57316,32 @@ fn hydrateVirtualPdfPageUnits(self: *DB, output: Allocator, txn: *docstore_mod.D
             for (candidates[0..count], probes[0..count]) |item, *probe| probe.* = .{ .candidate = item, .key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(wave.allocator(), keys[item.index], item.outputs[0]) };
             if (!std.sort.isSorted(Probe, probes[0..count], {}, Probe.less)) std.mem.sort(Probe, probes[0..count], {}, Probe.less);
             for (probes[0..count], physical[0..count]) |probe, *key| key.* = probe.key;
-            try txn.getManySortedPhysical(physical[0..count], headers[0..count]);
+            var scope = if (policy != null) try txn.openReadScope(wave.allocator()) else null;
+            defer if (scope) |*read| read.close();
+            if (scope) |*read| {
+                try read.getManySorted(physical[0..count], headers[0..count]);
+            } else try txn.getManySortedPhysical(physical[0..count], headers[0..count]);
             const received = count;
             count = 0;
             for (probes[0..received], headers[0..received]) |probe, header| {
                 var item = probe.candidate;
-                if (header) |bytes| {
+                if (header) |bytes| candidate: {
+                    if (receipts) |*cache| {
+                        if (proof_scope) |*read| read.reset() catch |err| {
+                            if (err != error.ReadScopeResetUnsupported) return err;
+                            read.close();
+                            proof_scope = null;
+                        };
+                        if (proof_scope == null) proof_scope = try txn.openReadScope(proof_allocator);
+                        var validation = std.heap.ArenaAllocator.init(proof_allocator);
+                        defer validation.deinit();
+                        if (!try cache.permits(validation.allocator(), probe.key, bytes, proof_scope.?, txn.payload_session)) break :candidate;
+                    }
                     const meta = try @import("../artifact_payload.zig").Metadata.decode(bytes);
                     if (meta.sourceHash()) |source| {
+                        if (policy != null) {
+                            if (verified) |indices| try indices.put(output, item.index, {});
+                        }
                         const fingerprint = try std.fmt.allocPrint(wave.allocator(), "{s}:{x:0>16}", .{ item.outputs[0], source });
                         values[item.index] = try std.json.Stringify.valueAlloc(output, .{ .unit_id = item.unit, .unit_type = "page", .provenance = .{ .page_number = item.number }, ._artifact_unit_fingerprint = fingerprint }, .{});
                         continue;
@@ -57537,7 +57630,15 @@ fn loadStoredSearchDocumentsMany(
     for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
 
     const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    var txn = try self.core.store.beginProbeTxn();
+    var privacy_arena = std.heap.ArenaAllocator.init(alloc);
+    defer privacy_arena.deinit();
+    const privacy = @import("privacy_read.zig");
+    const policy = try privacy.capture(self, privacy_arena.allocator());
+    const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
+    const pin_units = protected and for (read_keys) |key| {
+        if (internal_keys.isDocumentUnitArtifactRecordKey(key)) break true;
+    } else false;
+    var txn = if (pin_units) try self.core.store.beginReadTxn() else try self.core.store.beginProbeTxn();
     defer txn.abort();
     if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
     const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -57556,22 +57657,19 @@ fn loadStoredSearchDocumentsMany(
         .pinned = if (schema_view) |*view| view else null,
     };
     defer schema_plans.deinit();
-    var privacy_arena = std.heap.ArenaAllocator.init(alloc);
-    defer privacy_arena.deinit();
-    const privacy = @import("privacy_read.zig");
-    const policy = try privacy.capture(self, privacy_arena.allocator());
     var virtual_pages = std.heap.ArenaAllocator.init(alloc);
     defer virtual_pages.deinit();
-    try hydrateVirtualPdfPageUnits(self, virtual_pages.allocator(), &txn, read_keys, read_values);
+    var verified_pages: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    try hydrateVirtualPdfPageUnits(self, virtual_pages.allocator(), &txn, read_keys, read_values, if (protected) policy else null, &verified_pages);
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
-        if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+        if (protected) {
             var row_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
             var row_arena = std.heap.ArenaAllocator.init(row_backing.allocator());
             defer row_arena.deinit();
             const row = row_arena.allocator();
             const id = keys[item.original_index];
-            const safe = (if (internal_keys.isInternalUserKey(id))
+            const safe = if (verified_pages.contains(i)) value else (if (internal_keys.isInternalUserKey(id))
                 privacy.projectArtifact(row, policy.?, item.store_key, &txn)
             else
                 privacy.project(row, policy.?, id, value, &txn)) catch |err| {
@@ -59159,8 +59257,10 @@ test "db document extraction failure manifest preserves prior artifacts" {
         "RemoteDocumentFetchFailed",
         "remote content download failed",
         "remote_content_download",
+        "{\"max_output_tokens_per_item\":8192}",
     );
     defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"execution\":{\"max_output_tokens_per_item\":8192}") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"unit_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"chunk_count\":1") != null);
@@ -97274,6 +97374,59 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     try std.testing.expect(embedding.len > 0);
 }
 
+test "db execution policy retains legacy local asset publications" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("policy-reuse");
+    defer tmp.cleanup();
+    var fake = TestAssetProducer{};
+    var db = try DB.open(a, tmp.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "policy-test", .asset_producer = fake.producer() } });
+    var db_open = true;
+    defer if (db_open) db.close();
+    var cfg = types.EnrichmentConfig{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"first\"}}", .execution = .{ .max_output_tokens_per_item = 64 } };
+    try db.addEnrichment(cfg);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged input\"}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    const calls = fake.generator_calls;
+    try std.testing.expect(calls > 0);
+    try std.testing.expectError(error.InvalidArgument, db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "summary", false, true));
+    try std.testing.expectEqual(calls, fake.generator_calls);
+
+    const local = @import("artifact_local_publication.zig");
+    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "summary");
+    defer a.free(artifact);
+    const receipt_key = try local.key(a, artifact);
+    defer a.free(receipt_key);
+    const output = try db.core.store.get(a, artifact);
+    defer a.free(output);
+    // Simulate a receipt accepted by the released policy-dependent writer.
+    const old = local.encode(local.legacyRecipe(db.core.index_manager.getEnrichment(.asset, "summary").?), "unchanged input", output);
+    try db.core.store.put(receipt_key, &old);
+    cfg.execution = .{ .max_output_tokens_per_item = 8192 };
+    _ = try db.upsertEnrichment(cfg);
+    db.close();
+    db_open = false;
+    db = try DB.open(a, tmp.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "policy-test", .asset_producer = fake.producer() } });
+    db_open = true;
+    var restored = (try db.getEnrichment(a, .asset, "summary")).?;
+    defer restored.deinit(a);
+    try std.testing.expectEqual(@as(?u32, 8192), restored.execution.?.max_output_tokens_per_item);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged input\",\"unrelated\":1}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(calls, fake.generator_calls);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const entry = db.core.index_manager.getEnrichment(.asset, "summary").?;
+        try local.requireCompatible(a, &read, artifact, local.recipe(entry), local.legacyRecipe(entry), "unchanged input", output);
+        try std.testing.expectError(error.EnrichmentSourceChanged, local.requireCompatible(a, &read, artifact, local.recipe(entry), local.legacyRecipe(entry), "changed input", output));
+    }
+    cfg.producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"second\"}}";
+    _ = try db.upsertEnrichment(cfg);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged input\",\"unrelated\":2}" }}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    try std.testing.expect(fake.generator_calls > calls);
+}
+
 test "db document extraction manifest inspection and reprocess API" {
     const alloc = std.testing.allocator;
 
@@ -97457,6 +97610,56 @@ test "db document extraction manifest inspection and reprocess API" {
     var range_after_b = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")) orelse return error.TestUnexpectedResult;
     defer range_after_b.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 2), range_after_b.generation);
+
+    // A non-semantic update must leave accepted generations untouched.
+    var producer = (try db.getEnrichment(alloc, .asset, "document_units_v1")).?;
+    defer producer.deinit(alloc);
+    const semantic_hash = types.enrichmentConfigHash(producer);
+    producer.execution = .{ .max_output_tokens_per_item = 8192 };
+    try std.testing.expectEqual(semantic_hash, types.enrichmentConfigHash(producer));
+    _ = try db.upsertEnrichment(producer);
+    var incomplete = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .selection = .incomplete });
+    defer incomplete.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), incomplete.skipped);
+    try std.testing.expectEqual(@as(usize, 0), incomplete.reprocessed);
+    try db.runUntilIdle();
+    var kept = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")).?;
+    defer kept.deinit(alloc);
+    try std.testing.expectEqual(range_after_a.generation, kept.generation);
+    // Model completion between the range prefilter and mutation preparation:
+    // the internal recheck must recognize the actual merge_plan manifest.
+    try std.testing.expect(try db.reprocessDocumentArtifactWithCompletionWait(alloc, "doc:a", "document_units_v1", false, true));
+    try db.runUntilIdle();
+    var concurrent = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")).?;
+    defer concurrent.deinit(alloc);
+    try std.testing.expectEqual(kept.generation, concurrent.generation);
+
+    // Publication convergence alone does not make a truncated page complete.
+    const partial_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "asset", "document_units_v1");
+    defer alloc.free(partial_key);
+    var partial = try std.json.parseFromSlice(std.json.Value, alloc, range_after_b.manifest_json, .{});
+    defer partial.deinit();
+    try partial.value.object.put(partial.arena.allocator(), "ocr_failed_count", .{ .integer = 1 });
+    const partial_bytes = try std.json.Stringify.valueAlloc(alloc, partial.value, .{});
+    defer alloc.free(partial_bytes);
+    try db.core.store.put(partial_key, partial_bytes);
+    var retry = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .selection = .incomplete });
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), retry.skipped);
+    try std.testing.expectEqual(@as(usize, 1), retry.reprocessed);
+    try db.runUntilIdle();
+    var repaired = (try db.getDocumentArtifactManifest(alloc, "doc:b", "document_units_v1")).?;
+    defer repaired.deinit(alloc);
+    try std.testing.expectEqual(range_after_b.generation + 1, repaired.generation);
+    try std.testing.expect(std.mem.indexOf(u8, repaired.manifest_json, "\"max_output_tokens_per_item\":8192") != null);
+    // A corrupt manifest is reported without preventing healthy siblings from
+    // being inspected, or guessing a generation and forcing an unsafe retry.
+    try db.core.store.put(partial_key, "{");
+    var corrupt = try db.reprocessDocumentArtifactRange(alloc, "document_units_v1", .{ .selection = .incomplete });
+    defer corrupt.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), corrupt.failed);
+    try std.testing.expectEqual(@as(usize, 1), corrupt.skipped);
+    try std.testing.expectEqualStrings("InvalidDocumentExtractionManifest", corrupt.failures[0].error_code);
 }
 
 test "db generic artifact repair queue reprocesses document asset artifacts" {
@@ -108629,7 +108832,7 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
             defer a.free(value);
             try db.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .enrichments }, null, .{ .force_generated_artifact_names = &.{"vectors"}, .wait_for_sync_level = false });
         } else {
-            try std.testing.expect(if (synchronous) try db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "vectors", true) else try db.reprocessDocumentArtifact(a, "doc", "vectors"));
+            try std.testing.expect(if (synchronous) try db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "vectors", true, false) else try db.reprocessDocumentArtifact(a, "doc", "vectors"));
             try db.runUntilIdle();
         }
     }
@@ -112667,6 +112870,38 @@ test "WS5 hosted replay retirement is leader-gated: the leader bounds the journa
             try std.testing.expectEqual(entries_before.len, entries_after.len);
         }
     }
+}
+
+test "db replay credit format defaults to v4 on non-Lite storage" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db-protected-credit");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const version = try db.core.store.get(alloc, &internal_keys.replay_journal_format_version_key);
+    defer alloc.free(version);
+    try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_protected_credit), internal_keys.decodeReplayJournalFormatVersion(version));
+}
+
+test "db replay credit format preserves v3 when explicitly requested" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db-compatible-credit");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{
+        .enable_protected_replay_credit = false,
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+    try db.core.store.appendReplayOpaque(alloc, db.core.store.nextReplaySequence(1), "compatible");
+
+    const version = try db.core.store.get(alloc, &internal_keys.replay_journal_format_version_key);
+    defer alloc.free(version);
+    try std.testing.expectEqual(@as(?u32, internal_keys.replay_journal_format_current), internal_keys.decodeReplayJournalFormatVersion(version));
 }
 
 test "WS5 runUntilIdle drains journal retirement to completion at credit capacity" {
@@ -164543,6 +164778,170 @@ test "source semantic media input rejects PDF ancestry on nonempty sources and p
         try std.testing.expectEqual(@TypeOf(request.input_kind).materialized_chunks, request.input_kind);
     };
     try std.testing.expectEqual(@as(usize, 1), dense_requests);
+}
+
+test "source semantic media input virtual PDF pages require the physical vector privacy receipt" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("privacy-virtual-pdf");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "PDF citation");
+    const source = "{\"ordinal\":1}";
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = source }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    const policy = (try @import("privacy_read.zig").capture(&db, scratch)).?;
+    const name = try std.fmt.allocPrint(scratch, "_privacy_{s}_visual", .{policy.prepared.version});
+    const legacy = "0legacy";
+    for ([_][]const u8{ legacy, name }, [_][]const u8{ "orphan", "images" }) |output_name, index_name| {
+        const config = try std.json.Stringify.valueAlloc(scratch, .{ .field = "v", .dims = 3, .generator = .{ .source_field = "url", .input = "pdf_page_images", .artifact_name = "pdf_pages", .embedding_name = output_name } }, .{});
+        try db.addIndex(.{ .name = index_name, .kind = .dense_vector, .config_json = config });
+    }
+    const unit = try internal_keys.documentUnitArtifactKeyAlloc(scratch, "doc", "pdf_pages", "page:000001");
+    const invalid = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, unit, legacy);
+    try db.core.store.put(invalid, @import("../artifact_payload.zig").magic); // Truncated reference from an ineligible producer.
+    const vector_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, unit, name);
+    const vector = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(scratch, 19, &.{ 1, 2, 3 });
+    try db.core.store.put(vector_key, vector);
+    const local = @import("../../privacy/local_publication.zig");
+    const witness = try local.key(scratch, vector_key);
+    for ([_][]const u8{ "", source, "{\"ordinal\":2}" }, 0..) |witness_source, index| {
+        if (witness_source.len != 0) try db.core.store.put(witness, &local.encode(policy.prepared.version, witness_source, vector));
+        const lookup = try db.lookup(scratch, unit, .{});
+        const single = try db.loadStoredSearchDocumentProbe(scratch, unit);
+        const batch = try loadStoredSearchDocumentsMany(&db, scratch, &.{unit}, null);
+        if (index == 1) {
+            try std.testing.expect(lookup != null and single != null and batch[0] != null);
+            try std.testing.expectEqualStrings(single.?, batch[0].?);
+            const citation = try std.json.parseFromSliceLeaky(std.json.Value, scratch, single.?, .{});
+            try std.testing.expectEqualStrings("page:000001", citation.object.get("unit_id").?.string);
+            try std.testing.expectEqual(@as(i64, 1), citation.object.get("provenance").?.object.get("page_number").?.integer);
+        } else {
+            try std.testing.expect(lookup == null and single == null and batch[0] == null);
+        }
+    }
+
+    // Make the payload resolver publish a replacement witness after the page
+    // header has been read. The in-flight citation belongs to the older cut.
+    const payloads = @import("../artifact_payload.zig");
+    const External = struct {
+        store: *docstore_mod.DocStore,
+        bytes: []const u8,
+        witness_key: []const u8,
+        replacement: ?[192]u8 = null,
+        fetched_bytes: usize = 0,
+        fn retain(_: *anyopaque) void {}
+        fn release(_: *anyopaque) void {}
+        fn prepare(_: *anyopaque, _: []const payloads.Prepared) !void {}
+        fn resolve(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: payloads.Reference) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.fetched_bytes += self.bytes.len;
+            if (self.replacement) |next| {
+                self.replacement = null;
+                try self.store.put(self.witness_key, &next);
+            }
+            return allocator.dupe(u8, self.bytes);
+        }
+    };
+    const reference = try payloads.Reference.forArtifact(vector_key, vector);
+    try db.core.store.put(vector_key, &reference.encode());
+    var external = External{ .store = db.core.store, .bytes = vector, .witness_key = witness };
+    db.core.store.configurePayloadPolicy(.{ .ptr = &external, .vtable = &.{ .retain = External.retain, .release = External.release, .prepare = External.prepare, .resolve = External.resolve } }, false, null);
+    defer db.core.store.configurePayloadPolicy(null, false, null);
+    // The first candidate is a pre-policy external vector. Its resolver may
+    // be unavailable; it cannot authorize this page or mask the next output.
+    const orphan = try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, unit, "legacy");
+    const orphan_reference = try payloads.Reference.forArtifact(orphan, vector);
+    try db.core.store.put(witness, &local.encode(policy.prepared.version, source, vector));
+    {
+        var txn = try db.core.store.beginReadTxn();
+        defer txn.abort();
+        const privacy = @import("privacy_read.zig");
+        const CountingRead = struct {
+            inner: backend_erased_mod.ReadScope,
+            primary: []const u8,
+            primary_reads: *usize,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                if (std.mem.eql(u8, self.primary, key)) self.primary_reads.* += 1;
+                return self.inner.get(key);
+            }
+            pub fn close(self: *@This()) void {
+                self.inner.close();
+            }
+        };
+        var primary_reads: usize = 0;
+        var scope = try backend_erased_mod.readScopeFrom(scratch, CountingRead{
+            .inner = try txn.openReadScope(scratch),
+            .primary = try internal_keys.documentKeyAlloc(scratch, "doc"),
+            .primary_reads = &primary_reads,
+        });
+        defer scope.close();
+        var cache = privacy.PageValidation{ .alloc = scratch, .policy = policy };
+        defer cache.deinit();
+        try std.testing.expect(!try cache.permits(scratch, orphan, &orphan_reference.encode(), scope, txn.payload_session));
+        try std.testing.expectEqual(@as(usize, 0), external.fetched_bytes);
+        for (0..2) |_| try std.testing.expect(try cache.permits(scratch, vector_key, &reference.encode(), scope, txn.payload_session));
+        try std.testing.expectEqual(@as(usize, 1), primary_reads);
+        try std.testing.expectEqual(2 * vector.len, external.fetched_bytes);
+    }
+    external.fetched_bytes = 0;
+    try db.core.store.delete(witness);
+    try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) == null);
+    try std.testing.expectEqual(@as(usize, 0), external.fetched_bytes);
+    for (0..3) |path| {
+        try db.core.store.put(witness, &local.encode(policy.prepared.version, source, vector));
+        external.replacement = local.encode(policy.prepared.version, "stale", vector);
+        const present = switch (path) {
+            0 => (try db.lookup(scratch, unit, .{})) != null,
+            1 => (try db.loadStoredSearchDocumentProbe(scratch, unit)) != null,
+            else => (try loadStoredSearchDocumentsMany(&db, scratch, &.{unit}, null))[0] != null,
+        };
+        try std.testing.expect(present);
+        try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) == null);
+    }
+    try std.testing.expectEqual(3 * vector.len, external.fetched_bytes);
+
+    // Ordered publications carry an output revision and causal source proof.
+    // A valid citation and a superseded revision both cost zero payload reads.
+    const publication = @import("artifact_publication.zig");
+    const provenance = @import("artifact_producer_provenance.zig");
+    const namespace: publication.Namespace = @splat(1);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try @import("../source_authority.zig").bind(&write, .raft, namespace);
+        var marker: [16]u8 = undefined;
+        std.mem.writeInt(u64, marker[0..8], 1, .little);
+        std.mem.writeInt(u64, marker[8..16], 1, .little);
+        try write.put(&internal_keys.ordered_document_applied_entry_key, &marker);
+        const primary = try publication.capturePrimarySource(scratch, &write, namespace, "doc");
+        var command: publication.Command = .{ .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "images", .producer_artifact_name = name, .producer_generation = 1, .sources = &.{primary}, .mutations = &.{.{ .family = .derived_vector, .key = vector_key, .value = vector, .source_index = 0 }}, .publication_digest = @splat(0) };
+        command.publication_digest = command.digest();
+        var activate = command;
+        activate.mode = .activate;
+        try publication.stageAuthority(&write, activate);
+        var proof = try provenance.fromCommand(scratch, command);
+        defer proof.deinit();
+        const encoded = try provenance.encodeAlloc(scratch, proof.proof);
+        const position: publication.Position = .{ .raft = .{ .term = 1, .index = 1 } };
+        try publication.stageArtifactRevisions(scratch, &write, command, position);
+        try provenance.stage(&write, command, encoded, position);
+        try write.commit();
+    }
+    const before = external.fetched_bytes;
+    try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) != null);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try publication.stageArtifactTombstoneRevision(&write, namespace, vector_key, .{ .raft = .{ .term = 1, .index = 2 } });
+        try write.commit();
+    }
+    try std.testing.expect((try db.loadStoredSearchDocumentProbe(scratch, unit)) == null);
+    try std.testing.expectEqual(before, external.fetched_bytes);
 }
 
 test "source semantic media input PDF cardinality changes require removing dense consumers" {

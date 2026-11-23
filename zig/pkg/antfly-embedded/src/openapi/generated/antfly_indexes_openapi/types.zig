@@ -5185,8 +5185,10 @@ pub const EnrichmentRuntimeStatus = struct {
     }
 };
 
-/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+/// Non-semantic execution policy for one producer or index maintenance operation. Updates persist separately from the frozen publication catalog and affect future invocations without invalidating accepted artifacts. To retry incomplete extraction or regenerate accepted output, explicitly use the bounded reprocess APIs. Node/provider ceilings still apply.
 pub const ExecutionPolicy = struct {
+    /// Invocation output-token budget for reader/generator assets and document-extraction OCR pages. Overrides producer max_tokens at execution only; it does not change the stored recipe, source fingerprint, or completed outputs. A lower value does not retroactively reject accepted output. Omit to use the producer budget.
+    max_output_tokens_per_item: ?u32 = null,
     /// Maximum items to process in one batch for this operation.
     batch_items: ?i64 = null,
     /// Approximate maximum source bytes to process in one batch for this operation.
@@ -5196,6 +5198,7 @@ pub const ExecutionPolicy = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "max_output_tokens_per_item", "max_output_tokens_per_item", true },
         .{ "batch_items", "batch_items", true },
         .{ "batch_bytes", "batch_bytes", true },
         .{ "max_document_pages", "max_document_pages", true },
@@ -5211,6 +5214,10 @@ pub const ExecutionPolicy = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.max_output_tokens_per_item) |value| {
+            try jw.objectField("max_output_tokens_per_item");
+            try jw.write(value);
+        }
         if (self.batch_items) |value| {
             try jw.objectField("batch_items");
             try jw.write(value);

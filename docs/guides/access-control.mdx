@@ -137,16 +137,30 @@ curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/
 An API key acts as its owner, narrowed by whatever `permissions` and `row_filter` you give it. Asking for a permission the owner does not hold returns `403`, and the narrowing is reapplied on every request.
 
 ```bash
-curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/users/alice/api-keys \
+ALICE_KEY=$(curl --fail-with-body -sS -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/users/alice/api-keys \
   -H "Content-Type: application/json" \
   -d '{
     "name": "reporting",
     "expires_in": "720h",
     "permissions": [{"resource": "docs", "resource_type": "table", "type": "read"}]
-  }'
+  }' | jq -er '.encoded')
 ```
 
-The response holds `key_id`, `key_secret`, and `encoded`, which is `base64(key_id:key_secret)`. The secret is shown once. Send `encoded` as `Authorization: Bearer <encoded>` or `Authorization: ApiKey <encoded>`; the CLI reads it from `ANTFLY_TOKEN`. Revoke a key with `DELETE /auth/v1/users/alice/api-keys/{key_id}`. This key is the `$ALICE_KEY` in The Result above.
+The response holds `key_id`, `key_secret`, and `encoded`, which is `base64(key_id:key_secret)`. The secret is shown once. Send `encoded` as `Authorization: Bearer <encoded>` or `Authorization: ApiKey <encoded>`; the CLI reads it from `ANTFLY_TOKEN`. Revoke a key with `DELETE /auth/v1/users/alice/api-keys/{key_id}`. Use this key for the query in The Result above. Store the encoded value as a secret.
+
+For services and search benchmarks, provision a scoped key once and send it on each request. Basic authentication runs bcrypt on every request, including both requests when an application runs lexical search followed by dense search. A generated API key uses a fast salted hash and still enforces the owner's current permissions and row filters.
+
+To see the cost on your instance, request timing on a query. This example prints the HTTP headers and response body, then the client-observed duration in seconds.
+
+```bash
+curl --fail-with-body -sS -i -w '\nclient_seconds=%{time_total}\n' \
+  -H "Authorization: Bearer $ALICE_KEY" -H 'X-Antfly-Server-Timing: 1' \
+  -H 'Content-Type: application/json' \
+  -d '{"full_text_search":{"match_all":{}},"limit":10}' \
+  http://127.0.0.1:8080/db/v1/tables/docs/query
+```
+
+The `auth;dur` value in `Server-Timing` measures credential verification and identity resolution in milliseconds. The query reports execution time in whole milliseconds in `responses[0].took`. The client duration also includes transport and other request handling. To compare credentials, repeat the same query with `-u "alice:change-me-alice-1"` in place of the Authorization header and check that both return only `doc:acme-gold`.
 
 ### 5. Sign In Through Your Identity Provider
 

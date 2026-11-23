@@ -273,7 +273,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
-    const native_inference = @import("shared_library.zig").addProviderArchive(
+    const shared_library = @import("shared_library.zig");
+    const inference_compile_rss = shared_library.inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory);
+    const native_inference = shared_library.addProviderArchive(
         b,
         native_inference_mod,
         "antfly-inference-core",
@@ -282,7 +284,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
             target.result.cpu.arch == .aarch64 and optimize == .debug)
             14 * 1024 * 1024 * 1024
         else
-            @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory, antfly_imports.darwin_cross_release_memory),
+            shared_library.nativeInferenceCompileMaxRss(b.graph.host.result, target.result, optimize, inference_compile_rss),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;

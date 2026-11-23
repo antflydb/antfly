@@ -24,7 +24,8 @@ const native = @import("antfly_local_sources").storage_relational_index;
 const domain = @import("antfly_local_sources").system_catalog_domain;
 const operation = @import("antfly_local_sources").api_operation;
 
-pub fn set(server: *http.ApiHttpServer, alloc: std.mem.Allocator, identity: ?http.AuthenticatedIdentity, context: operation.RequestContext, scope: sql.Scope, lookup_namespace: []const u8, id: sql.Id, names: []const []const u8, deferred: bool) !void {
+pub fn set(server: *http.ApiHttpServer, alloc: std.mem.Allocator, identity: ?http.AuthenticatedIdentity, context: operation.RequestContext, scope: sql.Scope, lookup_namespace: []const u8, guard: sessions.Mutation, names: []const []const u8, deferred: bool) !void {
+    const id = guard.id;
     try context.ensureActive();
     if (names.len > 256) return error.SqlLimitExceeded;
     if (try server.txn_sessions.principalAccess(alloc, id, http.transactionPrincipal(identity)) != .allowed) return error.SqlTransactionNotActive;
@@ -36,7 +37,6 @@ pub fn set(server: *http.ApiHttpServer, alloc: std.mem.Allocator, identity: ?htt
     if (state.metadata.failed) return error.SqlTransactionAborted;
     if (state.owner_node_id != server.localSessionNodeId()) return error.SessionLeaseLost;
     if (!std.mem.eql(u8, state.metadata.database, scope.database) or !std.mem.eql(u8, state.metadata.namespace, scope.namespace)) return error.SqlTransactionNotActive;
-    try server.txn_sessions.validateSqlLease(alloc, id, state.owner_node_id);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -66,7 +66,7 @@ pub fn set(server: *http.ApiHttpServer, alloc: std.mem.Allocator, identity: ?htt
     };
     var validation = Validation{ .server = server, .identity = identity, .context = context, .modes = modes, .immediate = !deferred };
     const empty: sessions.OwnedTransactionCommitRequest = .{};
-    _ = (try server.txn_sessions.stageValidated(server.alloc, id, &empty, .{ .ptr = &validation, .validate = Validation.apply })) orelse return error.SqlTransactionNotActive;
+    _ = (try server.txn_sessions.stageValidated(server.alloc, guard, &empty, .{ .ptr = &validation, .validate = Validation.apply })) orelse return error.SqlTransactionNotActive;
 }
 
 const Validation = struct {

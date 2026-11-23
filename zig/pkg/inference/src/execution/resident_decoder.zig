@@ -251,10 +251,11 @@ pub const Decoder = struct {
         return .{ .allocator = a, .source = source, .config = .{}, .encoder_decoder_config = cfg, .encoder_rows = encoder_rows, .capacity = cfg.max_target_positions, .limit = cfg.max_target_positions, .bank_bytes = bytes, .reservation = reservation, .control = control };
     }
 
-    pub fn encoderDecoderText(self: *Decoder, history: []const i64, encoder: Tensor, mask: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+    pub fn encoderDecoderSuffix(self: *Decoder, suffix: @import("decoder_position.zig").Suffix, encoder: Tensor, mask: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
         if (self.failed) return error.DecoderRequestFailed;
         const cfg = self.encoder_decoder_config orelse return error.UnsupportedResidentDecode;
-        if (history.len == 0 or history.len > self.limit or (self.position != 0 and history.len <= self.position) or mask.len != self.encoder_rows) return error.InvalidResidentDecodePosition;
+        const end = suffix.endAt(self.position) catch return error.InvalidResidentDecodePosition;
+        if (end > self.limit or mask.len != self.encoder_rows) return error.InvalidResidentDecodePosition;
         errdefer self.failed = true;
         const mask_digest = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(mask));
         if (self.encoder_identity) |identity| {
@@ -265,7 +266,7 @@ pub const Decoder = struct {
         }
         // Language detection can expose several already-known forced tokens.
         // Submit the complete new suffix; never drop those intermediate rows.
-        const ids = history[self.position..];
+        const ids = suffix.tokens;
         var staging = try self.source.withAdmissionControl(control).admitRetainedMedia(try std.math.add(usize, try std.math.mul(usize, ids.len, 3 * @sizeOf(i64)), try std.math.add(usize, try std.math.mul(usize, mask.len, @sizeOf(i64)), 6 * @sizeOf(i64))), 0);
         defer staging.deinit();
         const positions = try a.alloc(i64, ids.len);
@@ -747,12 +748,12 @@ test "resident encoder decoder accepts forced prompt suffixes and rejects immuta
     defer hidden.deinit();
     const history = [_]i64{ 0, 1, 2, 3, 4 };
     for ([_]usize{ 1, 3, 4 }) |length| {
-        const logits = try decoder.encoderDecoderText(history[0..length], hidden, &.{ 1, 1 }, a, null);
+        const logits = try decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = history[decoder.position..length] }, hidden, &.{ 1, 1 }, a, null);
         a.free(logits);
     }
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
-    try std.testing.expectError(error.InvalidResidentDecodePosition, decoder.encoderDecoderText(history[0..4], hidden, &.{ 1, 1 }, a, null));
-    try std.testing.expectError(error.ImmutableEncoderContractChanged, decoder.encoderDecoderText(&history, hidden, &.{ 1, 0 }, a, null));
+    try std.testing.expectError(error.InvalidResidentDecodePosition, decoder.encoderDecoderSuffix(.{ .position = 0, .tokens = history[0..4] }, hidden, &.{ 1, 1 }, a, null));
+    try std.testing.expectError(error.ImmutableEncoderContractChanged, decoder.encoderDecoderSuffix(.{ .position = decoder.position, .tokens = history[decoder.position..] }, hidden, &.{ 1, 0 }, a, null));
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expect(decoder.failed);
 }

@@ -239,6 +239,11 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub fn pinCachedLinearDeclaration(self: *MetalNativeProvider, slot: usize, expected: u64, payload: prepared_slot.Owner.Pin) !PrivateLinearPin {
         if (!self.linear_slot_index_mutex.tryLock()) return error.QueueFull;
         defer self.linear_slot_index_mutex.unlock();
+        return self.pinCachedLinearDeclarationWithIndexHeld(slot, expected, payload);
+    }
+
+    /// Caller holds this provider's linear slot index on the current thread.
+    pub fn pinCachedLinearDeclarationWithIndexHeld(self: *MetalNativeProvider, slot: usize, expected: u64, payload: prepared_slot.Owner.Pin) !PrivateLinearPin {
         var found = false;
         var iterator = self.embeddinggemma2_linear_cache.valueIterator();
         while (iterator.next()) |entry| if (entry.slot == slot and entry.owner == payload.owner) {
@@ -616,6 +621,11 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub fn pinLinearSlotForPersistentUse(self: *MetalNativeProvider, slot: usize) !?prepared_slot.Owner.Pin {
         if (!self.linear_slot_index_mutex.tryLock()) return error.QueueFull;
         defer self.linear_slot_index_mutex.unlock();
+        return self.pinLinearSlotForPersistentUseWithIndexHeld(slot);
+    }
+
+    /// Caller holds this provider's linear slot index on the current thread.
+    pub fn pinLinearSlotForPersistentUseWithIndexHeld(self: *MetalNativeProvider, slot: usize) !?prepared_slot.Owner.Pin {
         var iterator = self.embeddinggemma2_linear_cache.valueIterator();
         while (iterator.next()) |entry| {
             if (entry.slot != slot) continue;

@@ -45,13 +45,14 @@ pub const ConstraintFailure = enum { unique_constraint_violation, foreign_key_pa
 pub const CommitResult = struct {
     outcome: CommitOutcome,
     reconciliation_id: Id,
+    abort_cause: ?error{ RowPolicyDenied, StorageReadTemporarilyUnavailable } = null,
     constraint_failure: ?ConstraintFailure = null,
 };
 pub const Control = union(enum) { begin: Begin, commit, rollback, savepoint: []const u8, rollback_to: []const u8, release: []const u8 };
 pub const Result = struct { status: Status, transaction_id: ?Id, commit: ?CommitResult = null };
 
 pub fn abortError(result: CommitResult) anyerror {
-    return switch (result.constraint_failure orelse return error.SqlWriteConflict) {
+    return switch (result.constraint_failure orelse return result.abort_cause orelse error.SqlWriteConflict) {
         .unique_constraint_violation => error.UniqueConstraintViolation,
         .foreign_key_parent_missing => error.ForeignKeyParentMissing,
         .foreign_key_referenced => error.ForeignKeyReferenced,
@@ -93,6 +94,11 @@ pub const Session = struct {
     pub fn attach(self: *Session, id: Id) !void {
         if (self.transaction_id != null) return error.SqlTransactionAlreadyActive;
         const transaction = try self.owner.vtable.inspect(self.owner.ptr, self.scope, id);
+        return self.attachInspected(id, transaction);
+    }
+
+    pub fn attachInspected(self: *Session, id: Id, transaction: Transaction) !void {
+        if (self.transaction_id != null) return error.SqlTransactionAlreadyActive;
         if (!std.mem.eql(u8, &transaction.id, &id)) return error.InvalidSqlBackendResponse;
         switch (transaction.state) {
             .committed, .prepared, .aborted => return error.SqlTransactionNotActive,

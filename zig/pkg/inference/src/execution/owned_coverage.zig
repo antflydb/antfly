@@ -152,7 +152,7 @@ fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: rou
     const scratch = @max(needed.workspace.byte_size, needed.probe_workspace.byte_size);
     const host = @max(needed.workspace.host_byte_size, needed.probe_workspace.host_byte_size);
     if (kernel.workspace_bytes != scratch or kernel.host_workspace_bytes != host) return false;
-    if (scratch != 0 and (kernel.backend_index >= pool.workspace_allocations.len or !allocation(pool, pool.workspace_allocations[kernel.backend_index], scratch, .workspace))) return false;
+    if (scratch != 0 and pool.workspaceBank(kernel.backend_index, scratch, @max(needed.workspace.alignment, needed.probe_workspace.alignment)) == null) return false;
     if (host != 0 and (!allocation(pool, pool.host_workspace_allocation, host, .workspace) or pool.host_alignment.toByteUnits() < @max(needed.host_alignment, needed.probe_host_alignment))) return false;
     var count: usize = 0;
     for (kernel.auxiliaries) |maybe| if (maybe) |aux| {

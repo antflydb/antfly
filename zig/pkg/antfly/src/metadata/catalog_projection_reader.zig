@@ -437,6 +437,14 @@ pub const CatalogProjectionReader = struct {
         flight.release();
     }
 
+    pub fn cachedRoutingGeneration(self: *CatalogProjectionReader) ?*@import("../api/table_catalog.zig").RoutingGeneration {
+        if (!self.mutex.tryLock()) return null;
+        defer self.unlock();
+        const cached = self.cache.snapshot orelse return null;
+        cached.routing.retain();
+        return cached.routing;
+    }
+
     pub fn acquireRoutingGeneration(self: *CatalogProjectionReader, alloc: std.mem.Allocator, metadata_group_id: u64, source: Source, deadline_ns: ?u64) !*@import("../api/table_catalog.zig").RoutingGeneration {
         var lease = try self.snapshotLease(alloc, metadata_group_id, source, deadline_ns);
         defer lease.deinit();

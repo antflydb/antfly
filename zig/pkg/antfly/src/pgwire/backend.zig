@@ -63,11 +63,13 @@ pub const Identity = struct {
 
 pub const SelinuxIngress = @import("antfly_local_sources").system_catalog_domain.security_labels.KernelRelabel.Ingress;
 
+pub const CursorCapture = enum { none, if_select, require_select };
+
 pub const Request = struct {
     /// Borrowed from the accepted transport for this request only.
     selinux_ingress: ?SelinuxIngress = null,
     backend_pid: i32 = 0,
-    capture_cursor_authority: bool = false,
+    capture_cursor_authority: CursorCapture = .none,
     completion: ?*@import("completion.zig").Completion = null,
     completion_allocator: ?std.mem.Allocator = null,
     statement: []const u8,

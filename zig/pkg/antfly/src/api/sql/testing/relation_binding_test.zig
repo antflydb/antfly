@@ -174,7 +174,7 @@ test "SQL relation lifetime TEMP access is sticky across savepoint rollback and 
     var registry = transactions.SessionRegistry.init(&durable);
     defer registry.deinit(a);
     const info = try registry.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, 7, "alice");
-    const savepoint = (try registry.createSavepoint(a, info.txn_id)).?;
+    const savepoint = (try registry.createSavepoint(a, try registry.mutation(a, info.txn_id, info.version.owner))).?;
     durable.fail_writes_for_test = true;
     try std.testing.expectError(error.InjectedSessionStoreFailure, registry.markSqlTemporaryAccess(a, info.txn_id));
     durable.fail_writes_for_test = false;
@@ -191,7 +191,7 @@ test "SQL relation lifetime TEMP access is sticky across savepoint rollback and 
     durable.fail_writes_for_test = true;
     try registry.markSqlTemporaryAccess(a, info.txn_id);
     durable.fail_writes_for_test = false;
-    _ = try registry.rollbackToSavepoint(a, info.txn_id, savepoint.savepoint_id);
+    _ = try registry.rollbackToSavepoint(a, try registry.mutation(a, info.txn_id, info.version.owner), savepoint.savepoint_id);
     var recovered = (try durable.load(info.txn_id)).?;
     defer recovered.deinit(a);
     try std.testing.expect(recovered.sql.?.temporary_relation_access);

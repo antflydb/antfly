@@ -89,6 +89,218 @@ pub const header_len: usize = 32;
 pub const legacy_format_version: u16 = 1;
 pub const legacy_header_len: usize = 24;
 
+/// Two preallocated WAL extents. A checkpoint publishes the selected
+/// extent and the sequence that retired the previous one together.
+pub const SegmentRotation = struct {
+    active: u1 = 0,
+    retired_through: ?u64 = null,
+
+    /// Select the other extent only if the checkpoint covers the extent
+    /// being retired and no reader still needs the destination extent.
+    /// The caller publishes the result before appending to the new extent.
+    pub fn afterCheckpoint(self: SegmentRotation, checkpoint_sequence: u64, active_end_sequence: u64, oldest_reader: ?u64) ?SegmentRotation {
+        if (active_end_sequence > checkpoint_sequence) return null;
+        if (self.retired_through) |retired| {
+            if (retired > checkpoint_sequence) return null;
+            if (oldest_reader) |reader| {
+                if (reader < retired) return null;
+            }
+        }
+        return .{ .active = self.active ^ 1, .retired_through = checkpoint_sequence };
+    }
+
+    pub fn offset(self: SegmentRotation, base_offset: u64, extent_capacity: u64) !u64 {
+        return std.math.add(u64, base_offset, if (self.active == 0) 0 else extent_capacity);
+    }
+};
+
+test "redo segment rotation leaves the retired extent available to pinned readers" {
+    const initial: SegmentRotation = .{};
+    const rotated = initial.afterCheckpoint(12, 11, 4).?;
+    try std.testing.expectEqual(@as(u64, 8192), try rotated.offset(4096, 4096));
+    try std.testing.expect(rotated.afterCheckpoint(20, 19, 4) == null);
+    try std.testing.expect(rotated.afterCheckpoint(20, 21, null) == null);
+    const reused = rotated.afterCheckpoint(20, 19, 12).?;
+    try std.testing.expectEqual(@as(u64, 4096), try reused.offset(4096, 4096));
+    try std.testing.expectEqual(@as(?u64, 20), reused.retired_through);
+}
+
+/// A durable group frontier, stored separately from the records it covers.
+pub const Frontier = struct {
+    generation: u64,
+    sequence: u64,
+    end_offset: u64,
+
+    pub const encoded_len = 40;
+    const signature = "AFRF\x01\x00\x00\x00";
+
+    pub fn encode(self: Frontier) [encoded_len]u8 {
+        var raw: [encoded_len]u8 = @splat(0);
+        raw[0..8].* = signature.*;
+        std.mem.writeInt(u64, raw[8..16], self.generation, .little);
+        std.mem.writeInt(u64, raw[16..24], self.sequence, .little);
+        std.mem.writeInt(u64, raw[24..32], self.end_offset, .little);
+        std.mem.writeInt(u32, raw[36..40], Crc32.hash(raw[0..36]), .little);
+        return raw;
+    }
+
+    pub fn decode(raw: *const [encoded_len]u8) ?Frontier {
+        if (!std.mem.eql(u8, raw[0..8], signature)) return null;
+        if (std.mem.readInt(u32, raw[36..40], .little) != Crc32.hash(raw[0..36])) return null;
+        return .{
+            .generation = std.mem.readInt(u64, raw[8..16], .little),
+            .sequence = std.mem.readInt(u64, raw[16..24], .little),
+            .end_offset = std.mem.readInt(u64, raw[24..32], .little),
+        };
+    }
+};
+
+/// The two offsets must lie in separate failure units outside the log.
+pub const FrontierSlots = struct {
+    offsets: [2]u64,
+
+    pub const Published = struct {
+        slot: u1,
+        frontier: Frontier,
+    };
+
+    pub fn readLatest(self: FrontierSlots, file: File, io: Io) !?Published {
+        return self.read(file, io, null);
+    }
+
+    /// Find the frontier named by a live publication. The other slot can
+    /// already contain the next group's frontier before that group is visible.
+    pub fn readSequence(self: FrontierSlots, file: File, io: Io, sequence: u64) !?Published {
+        return self.read(file, io, sequence);
+    }
+
+    fn read(self: FrontierSlots, file: File, io: Io, sequence: ?u64) !?Published {
+        var latest: ?Published = null;
+        var read_error: ?error{InputOutput} = null;
+        for (self.offsets, 0..) |offset, page| {
+            var raw: [2 * Frontier.encoded_len]u8 = undefined;
+            const len = file.readPositionalAll(io, &raw, offset) catch |err| switch (err) {
+                error.InputOutput => {
+                    read_error = error.InputOutput;
+                    continue;
+                },
+                else => return err,
+            };
+            for (0..len / Frontier.encoded_len) |copy| {
+                const record = raw[copy * Frontier.encoded_len ..][0..Frontier.encoded_len];
+                const frontier = Frontier.decode(record) orelse continue;
+                if (sequence) |want| if (frontier.sequence != want) continue;
+                if (latest) |prior| {
+                    if (frontier.sequence < prior.frontier.sequence) continue;
+                    if (frontier.sequence == prior.frontier.sequence) {
+                        if (!std.meta.eql(frontier, prior.frontier)) return error.ConflictingRedoFrontiers;
+                        continue;
+                    }
+                }
+                latest = .{ .slot = @intCast(page ^ copy), .frontier = frontier };
+            }
+        }
+        if (latest == null) if (read_error) |err| return err;
+        return latest;
+    }
+
+    /// Each logical slot has one copy on each frontier page. Updating it
+    /// leaves the other logical slot intact on both pages.
+    // A visibility hint for writers that cannot publish to the shared
+    // lock region. It is written after the frontier barrier and can be
+    // lost on crash. Recovery still uses the mirrored frontier itself.
+    pub fn noteSyncedWithoutRegion(self: FrontierSlots, file: File, io: Io, frontier: Frontier) !void {
+        const raw = frontier.encode();
+        try file.writePositionalAll(io, &raw, self.offsets[0] + 2 * Frontier.encoded_len);
+    }
+
+    pub fn readSyncedWithoutRegion(self: FrontierSlots, file: File, io: Io) !?Frontier {
+        var raw: [Frontier.encoded_len]u8 = undefined;
+        if (try file.readPositionalAll(io, &raw, self.offsets[0] + 2 * Frontier.encoded_len) != raw.len) return null;
+        return Frontier.decode(&raw);
+    }
+
+    pub fn writeSlot(self: FrontierSlots, file: File, io: Io, publication: Published) !void {
+        const raw = publication.frontier.encode();
+        try file.writePositionalAll(io, &raw, self.offsets[publication.slot]);
+        try file.writePositionalAll(io, &raw, self.offsets[publication.slot ^ 1] + Frontier.encoded_len);
+    }
+
+    /// The caller must sync the redo bytes before calling this under writer
+    /// authority and sync again after writing the slot. After an I/O error
+    /// the covered redo bytes must be retained until reconciliation.
+    pub fn writeNext(self: FrontierSlots, file: File, io: Io, previous: ?Published, frontier: Frontier) !Published {
+        const slot: u1 = if (previous) |prior| next: {
+            if (frontier.sequence <= prior.frontier.sequence) return error.RedoFrontierOutOfOrder;
+            break :next prior.slot ^ 1;
+        } else 0;
+        const next: Published = .{ .slot = slot, .frontier = frontier };
+        try self.writeSlot(file, io, next);
+        return next;
+    }
+};
+
+test "redo frontier reads either mirror after a positional I/O error" {
+    const io = std.testing.io;
+    var region = try makeTempRegion(io, 8192);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    const slots: FrontierSlots = .{ .offsets = .{ 0, 4096 } };
+    const frontier: Frontier = .{ .generation = 7, .sequence = 8, .end_offset = 9 };
+    const expected = try slots.writeNext(region.file, io, null, frontier);
+    const Fault = struct {
+        real: Io,
+        offset: u64,
+
+        fn read(userdata: ?*anyopaque, file: File, data: []const []u8, offset: u64) File.ReadPositionalError!usize {
+            const self: *const @This() = @ptrCast(@alignCast(userdata.?));
+            if (offset == self.offset) return error.InputOutput;
+            return self.real.vtable.fileReadPositional(self.real.userdata, file, data, offset);
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.fileReadPositional = Fault.read;
+    for (slots.offsets) |offset| {
+        var fault: Fault = .{ .real = io, .offset = offset };
+        const failing_io: Io = .{ .userdata = &fault, .vtable = &vtable };
+        try std.testing.expectEqual(expected, (try slots.readLatest(region.file, failing_io)).?);
+    }
+}
+
+test "redo frontier slots retain the preceding publication after a torn slot write" {
+    const io = std.testing.io;
+    var region = try makeTempRegion(io, 8192);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    const slots: FrontierSlots = .{ .offsets = .{ 0, 4096 } };
+    try std.testing.expect(try slots.readLatest(region.file, io) == null);
+    const first = try slots.writeNext(region.file, io, null, .{ .generation = 12, .sequence = 97, .end_offset = 60 });
+    try region.file.sync(io);
+    const second = try slots.writeNext(region.file, io, first, .{ .generation = 12, .sequence = 101, .end_offset = 92 });
+    try region.file.sync(io);
+    try std.testing.expect(first.slot != second.slot);
+    try std.testing.expectEqual(second, (try slots.readLatest(region.file, io)).?);
+
+    try region.file.writePositionalAll(io, &[_]u8{0}, slots.offsets[second.slot]);
+    try std.testing.expectEqual(second, (try slots.readLatest(region.file, io)).?);
+    try region.file.writePositionalAll(io, &[_]u8{0}, slots.offsets[second.slot ^ 1] + Frontier.encoded_len);
+    try std.testing.expectEqual(first, (try slots.readLatest(region.file, io)).?);
+}
+
+test "redo frontier rejects a torn publication" {
+    const durable: Frontier = .{ .generation = 12, .sequence = 97, .end_offset = 4096 };
+    const next: Frontier = .{ .generation = 12, .sequence = 98, .end_offset = 4198 };
+    const raw = durable.encode();
+    try std.testing.expectEqual(durable, Frontier.decode(&raw).?);
+    for (raw, 0..) |_, i| {
+        var damaged = raw;
+        damaged[i] ^= 1;
+        try std.testing.expect(Frontier.decode(&damaged) == null);
+    }
+    var torn = raw;
+    const next_raw = next.encode();
+    torn[0..32].* = next_raw[0..32].*;
+    try std.testing.expect(Frontier.decode(&torn) == null);
+}
+
 pub const RecordHeader = struct {
     magic: u32 = magic,
     format_version: u16 = format_version,
@@ -222,11 +434,15 @@ fn readHeaderAt(file: File, io: Io, offset: u64, available: u64) !ReadHeader {
     var buf: [header_len]u8 = @splat(0);
     const want: usize = @intCast(@min(available, header_len));
     const got = try file.readPositionalAll(io, buf[0..want], offset);
+    return decodeReadHeader(&buf, got);
+}
+
+fn decodeReadHeader(buf: *const [header_len]u8, got: usize) ReadHeader {
     if (got < legacy_header_len) return .short;
     if (isAllZero(buf[0..legacy_header_len])) return .zero;
     if (std.mem.readInt(u32, buf[0..4], .little) == trailer_magic) {
         if (got < header_len) return .short;
-        return if (Trailer.decode(&buf)) |trailer| .{ .trailer = trailer } else .garbage;
+        return if (Trailer.decode(buf)) |trailer| .{ .trailer = trailer } else .garbage;
     }
     var header = RecordHeader.decodeLegacy(buf[0..legacy_header_len]);
     const len = header.knownLength() orelse return .garbage;
@@ -263,6 +479,7 @@ pub const Writer = struct {
     /// Offset of the next write, relative to `base_offset`.
     tail: u64 = 0,
     last_sequence: ?u64 = null,
+    last_record_start: ?u64 = null,
     /// This run of the log's salt; learned on the first append (see
     /// `currentSalt`).
     salt: ?u64 = null,
@@ -325,7 +542,7 @@ pub const Writer = struct {
             if (commit_sequence != last + 1) return error.SequenceOutOfOrder;
         }
         const record_len: u64 = header_len + payload.len;
-        if (record_len > self.remaining()) return error.LogFull;
+        if (record_len + header_len > self.remaining()) return error.LogFull;
 
         var header_buf: [header_len]u8 = undefined;
         const header = (RecordHeader{
@@ -363,17 +580,17 @@ pub const Writer = struct {
         // retryable torn-tail recovery this design promises for exactly
         // this case.
         //
-        // An all-zero header-sized end marker goes right after the record,
+        // A header-sized end trailer goes right after the record,
         // in the same write as the payload. A failed earlier append may
         // have left payload bytes past this record's end (recovery clears
         // only a torn header), and without the marker replay would read
         // them as the next header whenever this record is shorter.
         var end_marker: [header_len]u8 = undefined;
         (Trailer{ .sequence = commit_sequence, .salt = header.salt }).encode(&end_marker);
-        const marker_len: usize = if (record_len + header_len <= self.remaining()) header_len else 0;
-        try writePositionalPairAll(self.file, self.io, payload, end_marker[0..marker_len], offset + header_len);
+        try writePositionalPairAll(self.file, self.io, payload, &end_marker, offset + header_len);
         try self.file.writePositionalAll(self.io, &header_buf, offset);
 
+        self.last_record_start = self.tail;
         self.tail += record_len;
         self.last_sequence = commit_sequence;
     }
@@ -390,11 +607,11 @@ pub const Writer = struct {
     /// so a caller whose own durability barrier (`sync()`) fails afterward
     /// can undo them via `rollbackTo`. See that function's own doc comment
     /// for why this matters.
-    pub const Mark = struct { tail: u64, last_sequence: ?u64 };
+    pub const Mark = struct { tail: u64, last_sequence: ?u64, last_record_start: ?u64 = null };
 
     /// Captures the writer's current position.
     pub fn mark(self: *const Writer) Mark {
-        return .{ .tail = self.tail, .last_sequence = self.last_sequence };
+        return .{ .tail = self.tail, .last_sequence = self.last_sequence, .last_record_start = self.last_record_start };
     }
 
     /// Undoes every `append` made since `m` was captured: zeroes the
@@ -435,9 +652,11 @@ pub const Writer = struct {
     pub fn rollbackTo(self: *Writer, m: Mark) void {
         if (m.tail >= self.tail) return;
         const zeros: [4096]u8 = @splat(0);
+        // The record's trailer lies just outside the writer cursor.
+        const erase_end = @min(self.capacity, self.tail +| header_len);
         var pos = m.tail;
-        while (pos < self.tail) {
-            const chunk = @min(zeros.len, self.tail - pos);
+        while (pos < erase_end) {
+            const chunk = @min(zeros.len, erase_end - pos);
             // Best-effort, like every other write into this fixed,
             // preallocated extent (§9.1): a failure here leaves some stale
             // bytes behind, no worse off than not rolling back at all, so
@@ -454,6 +673,7 @@ pub const Writer = struct {
         };
         self.tail = m.tail;
         self.last_sequence = m.last_sequence;
+        self.last_record_start = m.last_record_start;
     }
 };
 
@@ -558,6 +778,7 @@ pub const ReplayOutcome = struct {
     /// baseline passed in if no record was replayed.
     last_sequence: ?u64,
     stop_reason: StopReason,
+    generation: ?u64 = null,
 };
 
 /// `replay`'s own I/O and allocation failures. Its actual return type is
@@ -644,6 +865,84 @@ pub fn replayBounded(
     on_record: ?Callback,
     ctx: ?*anyopaque,
 ) anyerror!ReplayOutcome {
+    var window: ReplayReadWindow = .{};
+    return replayBoundedWithWindow(allocator, file, io, base_offset, capacity, start_after_sequence, max_sequence, unlogged_through, on_record, ctx, &window);
+}
+
+/// Verify a sealed prefix with sequential reads, keeping the scratch size
+/// independent of the extent size. Each record is still checked.
+pub fn replayBufferedPrefix(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    start_after_sequence: ?u64,
+    max_sequence: ?u64,
+    unlogged_through: ?u64,
+    on_record: ?Callback,
+    ctx: ?*anyopaque,
+) anyerror!ReplayOutcome {
+    const scratch = try allocator.alloc(u8, @intCast(@min(capacity, 64 * 1024)));
+    defer allocator.free(scratch);
+    var window: ReplayReadWindow = .{ .scratch = scratch };
+    return replayBoundedWithWindow(allocator, file, io, base_offset, capacity, start_after_sequence, max_sequence, unlogged_through, on_record, ctx, &window);
+}
+
+/// Copy precisely the bytes that passed framing, CRC and sequence checks.
+pub fn copyVerifiedPrefix(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    folded: u64,
+    sequence: u64,
+    slot_sequence: u64,
+    output: *File.Writer,
+) anyerror!ReplayOutcome {
+    const scratch = try allocator.alloc(u8, @intCast(@min(capacity, 64 * 1024)));
+    defer allocator.free(scratch);
+    var window: ReplayReadWindow = .{ .scratch = scratch, .output = output };
+    return replayBoundedWithWindow(allocator, file, io, base_offset, capacity, folded, sequence, slot_sequence, null, null, &window);
+}
+
+const ReplayReadWindow = struct {
+    scratch: []u8 = &.{},
+    start: u64 = 0,
+    len: usize = 0,
+    output: ?*File.Writer = null,
+
+    fn read(window: *ReplayReadWindow, file: File, io: Io, out: []u8, offset: u64, limit: u64) !usize {
+        if (out.len == 0) return 0;
+        if (out.len > window.scratch.len) return file.readPositionalAll(io, out, offset);
+        if (offset < window.start or offset - window.start > window.len or
+            out.len > window.len - (offset - window.start))
+        {
+            window.start = offset;
+            const want: usize = @intCast(@min(limit - offset, window.scratch.len));
+            window.len = try file.readPositionalAll(io, window.scratch[0..want], offset);
+        }
+        const index: usize = @intCast(offset - window.start);
+        const count = @min(out.len, window.len - index);
+        @memcpy(out[0..count], window.scratch[index..][0..count]);
+        return count;
+    }
+};
+
+fn replayBoundedWithWindow(
+    allocator: Allocator,
+    file: File,
+    io: Io,
+    base_offset: u64,
+    capacity: u64,
+    start_after_sequence: ?u64,
+    max_sequence: ?u64,
+    unlogged_through: ?u64,
+    on_record: ?Callback,
+    ctx: ?*anyopaque,
+    window: *ReplayReadWindow,
+) anyerror!ReplayOutcome {
     var pos: u64 = 0;
     var count: u64 = 0;
     var last_sequence = start_after_sequence;
@@ -668,16 +967,20 @@ pub fn replayBounded(
 
     while (true) {
         const remaining = capacity - pos;
-        const header, const record_header_len = switch (try readHeaderAt(file, io, base_offset + pos, remaining)) {
+        var raw_header: [header_len]u8 = undefined;
+        const want: usize = @intCast(@min(remaining, header_len));
+        const got = if (want < legacy_header_len) 0 else try window.read(file, io, raw_header[0..want], base_offset + pos, base_offset + capacity);
+        const header, const record_header_len = switch (decodeReadHeader(&raw_header, got)) {
             // Too little room left for any header: the region's end.
-            .short => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (remaining < legacy_header_len) .end_of_region else .torn_tail },
-            // Untouched, preallocated space or an end marker: a clean end,
-            // never a torn write (a real torn write leaves whatever bytes
-            // landed, not all-zero bytes).
-            .zero => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region },
+            .short => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = if (remaining < legacy_header_len) .end_of_region else .torn_tail },
+            // The append writes the payload and trailer before its
+            // header. At a zero header those bytes cannot distinguish an
+            // interrupted append from an erased record. The durable
+            // sequence promised by the caller is checked at recovery.
+            .zero => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .end_of_region },
             // This run's end. A retired run's trailer (another salt) past a
             // lost one is the end too, after a restart.
-            .trailer => |trailer| return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = stop: {
+            .trailer => |trailer| return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = stop: {
                 const salt = run_salt orelse break :stop .end_of_region;
                 if (trailer.salt == salt) break :stop if (trailer.sequence == (last_sequence orelse 0)) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence);
                 break :stop if (restartable) .end_of_region else .corrupt_record;
@@ -688,7 +991,7 @@ pub fn replayBounded(
             // Unparseable bytes after the first record of a log that has
             // been folded (the only kind ever restarted) may be the middle
             // of a retired record: the end, as in point-in-time recovery.
-            .garbage => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) },
+            .garbage => return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) },
             .record => |record| .{ record.header, record.len },
         };
         // A retired record, or retired payload bytes that happen to read as
@@ -702,41 +1005,49 @@ pub fn replayBounded(
             // A retired run's record is whole under its own salt: the end.
             // Anything else here (a committed record with a damaged salt,
             // retired payload bytes that read as a header) is unclear.
-            const retired = try recordIntact(allocator, file, io, base_offset + pos, remaining, header, record_header_len, &payload_buf);
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = if (retired and restartable) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) };
+            const complete = try readRecordPayload(allocator, file, io, base_offset + pos, remaining, header, record_header_len, &payload_buf);
+            const retired = complete and header.checksum(payload_buf.items) == header.crc32;
+            // The older writer could leave no trailer at the extent edge.
+            // A checksum that matches only with this run's salt provides
+            // evidence that its last record is damaged, not retired bytes.
+            if (complete and !retired and record_header_len == header_len and
+                remaining - record_header_len - header.payload_len < header_len and
+                header.commit_sequence > (last_sequence orelse 0))
+            {
+                var corrected = header;
+                corrected.salt = salt;
+                if (corrected.checksum(payload_buf.items) == header.crc32) {
+                    return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
+                }
+            }
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = if (retired and restartable) .end_of_region else try unclearStop(file, io, base_offset, capacity, pos, restartable, run_salt, last_sequence) };
         };
 
         if (max_sequence) |ceiling| {
             const new_record = start_after_sequence == null or header.commit_sequence > start_after_sequence.?;
             if (new_record and header.commit_sequence > ceiling) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .durable_ceiling };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .durable_ceiling };
             }
         }
 
         const payload_len: u64 = header.payload_len;
         if (record_header_len + payload_len > remaining) {
-            // The header is well-formed but claims more payload than the
-            // region has left. A real write can never produce this (the
-            // writer checks `remaining()` before appending), so this is
-            // either a torn write that landed a plausible-looking header
-            // with garbage length bits, or genuine corruption. Either way
-            // the record cannot be validated (there aren't enough bytes to
-            // checksum), so treat it as a torn tail: there is no complete
-            // record here to call corrupt.
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .torn_tail };
+            // This framing can be left by an interrupted header write.
+            // Protected recovery independently verifies the promised end.
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .torn_tail };
         }
 
         payload_buf.clearRetainingCapacity();
         try payload_buf.resize(allocator, payload_len);
         if (payload_len != 0) {
-            const payload_got = try file.readPositionalAll(io, payload_buf.items, base_offset + pos + record_header_len);
+            const payload_got = try window.read(file, io, payload_buf.items, base_offset + pos + record_header_len, base_offset + capacity);
             if (payload_got < payload_len) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .torn_tail };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .torn_tail };
             }
         }
 
         if (header.checksum(payload_buf.items) != header.crc32) {
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
         }
 
         // Superseded, not corrupt: a structurally valid, correctly
@@ -788,14 +1099,19 @@ pub fn replayBounded(
             const baseline = start_after_sequence.?;
             const covered_jump = header.commit_sequence > baseline + 1 and unlogged_through != null and header.commit_sequence - 1 <= unlogged_through.?;
             if (header.commit_sequence != baseline + 1 and !covered_jump) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
             }
             in_superseded_run = false;
         } else if (last_sequence) |last| {
             const covered_jump = header.commit_sequence > last + 1 and unlogged_through != null and header.commit_sequence - 1 <= unlogged_through.?;
             if (header.commit_sequence != last + 1 and !covered_jump) {
-                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .corrupt_record };
             }
+        }
+
+        if (window.output) |output| {
+            try output.interface.writeAll(raw_header[0..record_header_len]);
+            try output.interface.writeAll(payload_buf.items);
         }
 
         if (!superseded) {
@@ -808,6 +1124,9 @@ pub fn replayBounded(
         if (run_salt == null) run_salt = header.salt;
         pos += record_header_len + payload_len;
         last_sequence = header.commit_sequence;
+        if (window.output != null and max_sequence == header.commit_sequence) {
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .generation = run_salt, .stop_reason = .durable_ceiling };
+        }
     }
 }
 
@@ -830,15 +1149,13 @@ pub fn firstRecordNewerThan(allocator: Allocator, file: File, io: Io, base_offse
     return header.commit_sequence;
 }
 
-/// Whether the record whose header is at `offset` is whole: its payload is
-/// all there and matches its checksum. Reuses `buf`.
-fn recordIntact(allocator: Allocator, file: File, io: Io, offset: u64, available: u64, header: RecordHeader, header_bytes: usize, buf: *std.ArrayList(u8)) !bool {
+/// Reads a complete record payload at `offset`. Reuses `buf`.
+fn readRecordPayload(allocator: Allocator, file: File, io: Io, offset: u64, available: u64, header: RecordHeader, header_bytes: usize, buf: *std.ArrayList(u8)) !bool {
     const payload_len: u64 = header.payload_len;
     if (header_bytes + payload_len > available) return false;
     buf.clearRetainingCapacity();
     try buf.resize(allocator, payload_len);
-    if (try file.readPositionalAll(io, buf.items, offset + header_bytes) < payload_len) return false;
-    return header.checksum(buf.items) == header.crc32;
+    return try file.readPositionalAll(io, buf.items, offset + header_bytes) == payload_len;
 }
 
 /// How a scan stops at `pos` on bytes that are neither this run's next
@@ -1278,12 +1595,74 @@ test "replay rejects a damaged salt inside a run, not a short log" {
     try testing.expectEqual(StopReason.corrupt_record, last.stop_reason);
     try testing.expectEqual(third, last.valid_bytes);
 
+    // The legacy capacity rule could omit the trailer at the extent edge.
+    const trailerless = try replayBounded(testing.allocator, region.file, io, 0, writer.tail, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.corrupt_record, trailerless.stop_reason);
+    try testing.expectEqual(third, trailerless.valid_bytes);
+
     // A run that really ends there stops cleanly at the trailer.
     var clean = Writer.init(region.file, io, 0, capacity);
     try clean.append(11, "a");
     const ended = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
     try testing.expectEqual(StopReason.end_of_region, ended.stop_reason);
     try testing.expectEqual(clean.tail, ended.valid_bytes);
+}
+
+test "replay accepts an interrupted first append with a prepared trailer" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var trailer: [header_len]u8 = undefined;
+    (Trailer{ .sequence = 11, .salt = 123 }).encode(&trailer);
+    try writePositionalPairAll(region.file, io, "prepared", &trailer, header_len);
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+    try testing.expectEqual(@as(u64, 0), outcome.valid_bytes);
+}
+
+test "rollback of the first append erases its prepared trailer" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    var writer = Writer.initAt(region.file, io, 0, capacity, 0, 10);
+    const mark = writer.mark();
+    try writer.append(11, "rolled back");
+    const trailer_at = writer.tail;
+    writer.rollbackTo(mark);
+    var trailer: [header_len]u8 = undefined;
+    try testing.expectEqual(header_len, try region.file.readPositionalAll(io, &trailer, trailer_at));
+    try testing.expect(isAllZero(&trailer));
+}
+
+test "replay reports a short prefix when a record length exceeds the extent" {
+    const io = testing.io;
+    const capacity: u64 = 2 * (header_len + 1) + header_len;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "a");
+    const last = writer.tail;
+    try writer.append(12, "b");
+
+    // Older writers could fill the extent without writing a trailer.
+    try region.file.writePositionalAll(io, &.{0x80}, last + 11);
+    const outcome = try replayBounded(testing.allocator, region.file, io, 0, capacity - header_len, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.torn_tail, outcome.stop_reason);
+    try testing.expectEqual(last, outcome.valid_bytes);
+
+    try region.file.writePositionalAll(io, &.{0x80}, 11);
+    const first = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.torn_tail, first.stop_reason);
+    try testing.expectEqual(@as(u64, 0), first.valid_bytes);
+
+    var single = Writer.init(region.file, io, 0, capacity);
+    try single.append(11, "a");
+    try region.file.writePositionalAll(io, &.{0x80}, 11);
+    const only = try replayBounded(testing.allocator, region.file, io, 0, capacity, 10, null, null, null, null);
+    try testing.expectEqual(StopReason.torn_tail, only.stop_reason);
 }
 
 test "replay keeps rejecting what retired bytes can never be" {
@@ -1514,7 +1893,12 @@ test "rollbackTo is a no-op when nothing was appended since the mark" {
 
 test "writer rejects a record that would overflow the region" {
     const io = testing.io;
-    const capacity: u64 = header_len + 4; // room for exactly one 4-byte payload.
+    const capacity: u64 = 2 * header_len + 4;
+    var short_region = try makeTempRegion(io, capacity - 1);
+    defer cleanupTempRegion(io, &short_region.file, short_region.path[0..short_region.path_len]);
+    var short_writer = Writer.init(short_region.file, io, 0, capacity - 1);
+    try testing.expectError(error.LogFull, short_writer.append(1, "abcd"));
+    try testing.expectEqual(@as(u64, 0), short_writer.tail);
     var region = try makeTempRegion(io, capacity);
     defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
 
@@ -1523,7 +1907,7 @@ test "writer rejects a record that would overflow the region" {
     try testing.expectError(error.LogFull, writer.append(2, "e"));
 }
 
-test "replay stops at a torn tail and reports the valid prefix" {
+test "replay reports the valid prefix before an impossible header" {
     const io = testing.io;
     const capacity: u64 = 4096;
     var region = try makeTempRegion(io, capacity);
@@ -1535,16 +1919,8 @@ test "replay stops at a torn tail and reports the valid prefix" {
     try writer.sync();
     const good_tail = writer.tail;
 
-    // Simulate a crash mid-append of a third record whose header landed
-    // (the magic/version/header_len fields are intact and well-formed) but
-    // whose claimed payload length is physically impossible for the
-    // remaining region -- the one way `replay` can tell "this header is
-    // real but the record behind it never finished landing" apart from
-    // "this header is garbage" without being able to checksum bytes that
-    // were never written. A real torn write can produce exactly this: the
-    // header is a single small write that lands atomically more often than
-    // not, while the much larger payload write that follows it is what the
-    // crash interrupts.
+    // Recovery needs a durable watermark to tell whether this short
+    // prefix covers every acknowledged commit.
     var header_buf: [header_len]u8 = undefined;
     const torn: RecordHeader = .{ .payload_len = @intCast(capacity), .commit_sequence = 3, .crc32 = 0, .salt = writer.salt.? };
     torn.encode(&header_buf);
@@ -1555,16 +1931,6 @@ test "replay stops at a torn tail and reports the valid prefix" {
     try testing.expectEqual(@as(u64, 2), outcome.last_sequence.?);
     try testing.expectEqual(good_tail, outcome.valid_bytes);
     try testing.expectEqual(StopReason.torn_tail, outcome.stop_reason);
-
-    // A writer resuming from this outcome must be able to append right
-    // where the valid prefix ended, overwriting the torn record.
-    var resumed = Writer.initAt(region.file, io, 0, capacity, outcome.valid_bytes, outcome.last_sequence);
-    try resumed.append(3, "three");
-    try resumed.sync();
-    const resumed_outcome = try replay(testing.allocator, region.file, io, 0, capacity, null, null, null);
-    try testing.expectEqual(@as(u64, 3), resumed_outcome.valid_count);
-    try testing.expectEqual(@as(u64, 3), resumed_outcome.last_sequence.?);
-    try testing.expectEqual(StopReason.end_of_region, resumed_outcome.stop_reason);
 }
 
 test "replay stops at a torn tail when the file is physically shorter than the region" {

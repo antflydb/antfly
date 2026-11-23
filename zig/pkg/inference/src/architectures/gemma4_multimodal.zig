@@ -39,13 +39,13 @@ const SpecialTokenIds = struct {
 pub fn expandVideoPromptText(allocator: std.mem.Allocator, prompt: []const u8, timestamps_us: []const i64) ![]u8 {
     const marker = "<|video|>";
     const offset = std.mem.indexOf(u8, prompt, marker) orelse return error.VideoPlaceholderCountMismatch;
-    if (std.mem.indexOfPos(u8, prompt, offset + marker.len, marker) != null or timestamps_us.len == 0 or timestamps_us.len > 60) return error.VideoPlaceholderCountMismatch;
+    if (std.mem.indexOfPos(u8, prompt, offset + marker.len, marker) != null or timestamps_us.len == 0 or timestamps_us.len > @import("antfly_video").packet_sampling.gemma4_max_frames) return error.VideoPlaceholderCountMismatch;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, prompt[0..offset]);
     var last: i64 = -1;
     for (timestamps_us, 0..) |us, i| {
-        if (us < 0 or us <= last or us >= 60_000_000) return error.InvalidVideoTimestamp;
+        if (us <= last) return error.InvalidVideoTimestamp;
         last = us;
         if (i != 0) try out.append(allocator, ' ');
         var buffer: [32]u8 = undefined;

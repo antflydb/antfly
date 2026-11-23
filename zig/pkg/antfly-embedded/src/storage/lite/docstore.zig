@@ -1874,7 +1874,7 @@ fn reclamationExternallyLockedRefreshDefersDebtToItsMaintenanceOwnerImpl(alloc: 
         .externally_locked = true,
         .reclamation = policy,
     });
-    initial.file.releaseWriterOwnership();
+    try initial.file.releaseWriterOwnership();
     var lease = try native.lockWriterPathWithIo(alloc, std.testing.io, path);
     defer lease.close();
     {
@@ -2846,6 +2846,7 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
 }
 
 pub const OpenOptions = struct {
+    redo_recovery_base: ?native.RedoRecoveryCursor = null,
     externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
     read_only: bool = false,
@@ -2916,6 +2917,10 @@ const MutationRequest = struct {
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
+    scope_delete_prefix: ?[]const u8 = null,
+    scope_delete_exact_key: ?[]const u8 = null,
+    scope_delete_only: bool = false,
+    scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
     /// Never closes a group by becoming its leader, and never durable on
     /// its own: it joins whichever group a foreground (non-ride-along)
     /// member next forms, or `forceDrainDurable`'s forced group if none
@@ -3181,6 +3186,8 @@ pub const Store = struct {
     /// publish a checkpoint on `file` while any commit is suspended there
     /// -- see `lockStoreExclusive`.
     commit_in_sync: usize = 0,
+    exclusive_wait_epoch: std.atomic.Value(u32) = .init(0),
+    exclusive_parked: u32 = 0,
     /// Count of callers currently blocked in `lockStoreExclusive`'s wait
     /// loop. `releaseStoreMutexForSync` checks this before releasing: once
     /// non-zero, a new group's own sync no longer overlaps another's --
@@ -3459,6 +3466,7 @@ pub const Store = struct {
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !Store {
         const policy = try reclamation.Policy.init(opts.reclamation);
         const native_opts = native.OpenOptions{
+            .redo_recovery_base = opts.redo_recovery_base,
             .externally_locked = opts.externally_locked,
             .read_only = opts.read_only,
             .wait_for_reader_lock = opts.read_only,
@@ -3552,8 +3560,13 @@ pub const Store = struct {
         // of the budget, floored at 64 KiB so there is still a usable log
         // -- rather than the flat default; an unbounded (`0`) budget, the
         // common/production case, keeps the full default untouched.
-        const redo_log_capacity_bytes = native.NativeFile.redoLogCapacityForBudget(opts.reclamation.max_storage_bytes);
-        const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| (if (use_redo_log) redo_log_capacity_bytes else 0);
+        const redo_log_capacity_bytes = if (opts.no_sync)
+            native.NativeFile.redoLogCapacityForBudget(opts.reclamation.max_storage_bytes)
+        else
+            native.NativeFile.segmentedRedoCapacityForBudget(opts.reclamation.max_storage_bytes);
+        const frontier_bytes = if (opts.no_sync) 0 else native.NativeFile.default_redo_frontier_reservation_bytes;
+        const redo_reservation = if (use_redo_log) redo_log_capacity_bytes *| @as(u64, if (opts.no_sync) 1 else 2) +| frontier_bytes else 0;
+        const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| redo_reservation;
         if (opts.reclamation.max_storage_bytes != 0 and minimum > opts.reclamation.max_storage_bytes) return error.LiteStorageBudgetExceeded;
         const available = if (opts.reclamation.capacity_probe) |probe|
             try probe.available(probe.context, path)
@@ -4292,7 +4305,11 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
-        if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
+        if (self.file.checkpoint_publication_uncertain) {
+            waitForStoreSyncAssumeLocked(self);
+            if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            try self.file.reconcilePublicationUncertaintyForRead();
+        }
         return self.file.getCatalogRecordAlloc(a, key);
     }
 
@@ -4369,7 +4386,8 @@ pub const Store = struct {
         // entirely in that case -- this is exactly equivalent to the
         // previous unconditional check, not a new heuristic.
         const cheap_already_due = self.maintenance_policy.options.enabled and
-            self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
+            (self.needsProtectedRedoUpgrade() or
+                self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes);
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
             // §9 (redo retirement signal): back on the full, redo-aware
@@ -4487,6 +4505,13 @@ pub const Store = struct {
         }
     }
 
+    fn needsProtectedRedoUpgrade(self: *const Store) bool {
+        const header = self.file.header;
+        if (header.redo_log_capacity == 0 or self.file.no_sync) return false;
+        const budget = self.maintenance_policy.options.max_storage_bytes;
+        return !header.segmented_redo or (budget != 0 and native.NativeFile.segmentedRedoCapacityForBudget(budget) < header.redo_log_capacity);
+    }
+
     // Adoption discards the cached ledger. This probe can therefore replay a
     // whole allocator snapshot; it must share the worker's cancellation fence
     // even though the preceding maintenance cycle has restored its token.
@@ -4586,7 +4611,12 @@ pub const Store = struct {
                 // retirement pressure still reclaims durably through
                 // reclaimRetirementPressure, called separately from
                 // applyMutationGroup before a foreground transaction opens.
-                _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel, false);
+                _ = self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel, false) catch |err| blk: {
+                    if (err != error.LiteStorageBudgetExceeded or !self.maintenance_policy.options.enabled or !self.needsProtectedRedoUpgrade()) return err;
+                    // The replacement image can release reservation space
+                    // that the current generation cannot allocate around.
+                    break :blk 0;
+                };
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
@@ -4600,6 +4630,7 @@ pub const Store = struct {
         var assessed_size: u64 = undefined;
         var assessed_indexed: bool = undefined;
         var assessed_generation: u64 = undefined;
+        var upgrade_redo = false;
         {
             if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
@@ -4625,7 +4656,12 @@ pub const Store = struct {
             // via `fixed_overhead`) need this file's own fixed redo-log
             // reservation subtracted; see `Policy.worthwhile`'s own doc
             // comment (Bug 3, perf/lwa-budget-tail, §9.7a).
-            if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
+            // The initial maintenance pass in openWithOptions services
+            // existing debt. Defer format migration until the owner may
+            // schedule background work or calls maintenance explicitly.
+            upgrade_redo = (!self.maintenance_start_suppressed or self.file.externally_locked) and self.needsProtectedRedoUpgrade();
+            const upgrade_due = upgrade_redo and self.maintenance_policy.rewrite_retry_at_ns == null;
+            if (!force and !self.maintenance_policy.due(size) and !retry_due and !upgrade_due) return;
             if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
             assessed_checkpoint = self.file.activeCheckpoint();
@@ -4669,9 +4705,9 @@ pub const Store = struct {
             if (cancel) |token| try token.check();
             if (self.assessment_generation != assessed_generation) return error.FileBusy;
             const due = if (cached_stats != null)
-                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size, self.file.header.redo_log_capacity)
+                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size, self.file.header.redoReservation())
             else
-                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence, self.file.header.redo_log_capacity);
+                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence, self.file.header.redoReservation());
             if (cached_stats == null) {
                 // Spend at most ~1/64 of elapsed time rescanning changed roots
                 // under sustained pressure, with a 30-second minimum interval.
@@ -4682,7 +4718,7 @@ pub const Store = struct {
             self.maintenance_policy.status.state = .idle;
             self.maintenance_policy.status.reason = .none;
             self.maintenance_policy.status.last_error = null;
-            if (!due) {
+            if (!due and !upgrade_redo) {
                 self.maintenance_policy.rewrite_retry_at_ns = null;
                 break :blk false;
             }
@@ -4730,19 +4766,43 @@ pub const Store = struct {
         // redo-log reservation (passed as `fixed_overhead`) is this new
         // generation's own, same as the assessment path above; see
         // `Policy.worthwhile`'s own doc comment.
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redoReservation());
+    }
+
+    // The rewrite of an oversized or legacy redo reservation needs a
+    // temporary second inode. Bound that image by its compact data and
+    // target reservation, then enforce the normal cap on retained files
+    // and the installed generation before the swap.
+    fn canUseRedoRewriteWorkspace(self: *Store, temporary_total: u64) !bool {
+        const options = self.maintenance_policy.options;
+        if (options.redo_rewrite_workspace_overage_bytes == 0 or
+            temporary_total > options.max_storage_bytes +| options.redo_rewrite_workspace_overage_bytes or
+            !self.needsProtectedRedoUpgrade() or self.currentGenerationHasReaders()) return false;
+        const region = (try self.file.regionForInode()) orelse return false;
+        return region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, 0) == null;
+    }
+
+    fn vacuumWorkspaceBytes(self: *Store, compact: u64) u64 {
+        const budget = self.maintenance_policy.options.max_storage_bytes;
+        // Live statistics estimate data pages only. Every redo successor
+        // also needs its own reservation, including ordinary compaction.
+        const image_workspace = compact *| 2 +| self.file.vacuumRedoReservation(budget);
+        if (budget != 0 and self.needsProtectedRedoUpgrade()) return image_workspace;
+        return @max(image_workspace, self.maintenance_policy.options.assessment_bytes);
     }
 
     fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
         const accounting = try self.reclamationStatusAssumeLockedWithCancel(cancel);
-        const workspace = @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
         const budget = self.maintenance_policy.options.max_storage_bytes;
-        if (budget != 0 and accounting.totalBytes() +| workspace > budget) {
+        const workspace = self.vacuumWorkspaceBytes(compact);
+        const temporary_total = accounting.totalBytes() +| workspace;
+        if (budget != 0 and temporary_total > budget and !try self.canUseRedoRewriteWorkspace(temporary_total)) {
             self.maintenance_policy.status.state = .deferred;
             self.maintenance_policy.status.reason = .storage_budget;
             return null;
         }
-        self.admitEstimatedGenerationAssumeLocked(compact, accounting.current_file_bytes) catch |err| {
+        const estimated = compact +| if (budget != 0 and self.needsProtectedRedoUpgrade()) self.file.vacuumRedoReservation(budget) else 0;
+        self.admitEstimatedGenerationAssumeLocked(estimated, accounting.current_file_bytes) catch |err| {
             if (err != error.LiteStorageBudgetExceeded) return err;
             self.maintenance_policy.status.state = .deferred;
             self.maintenance_policy.status.reason = .storage_budget;
@@ -4898,6 +4958,12 @@ pub const Store = struct {
         return try self.reclamationStatusAssumeLocked();
     }
 
+    pub fn copyStableSnapshot(self: *Store, dest_path: []const u8, replace: bool) !native.StableSnapshotReport {
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        return self.file.copyStableSnapshotToPath(dest_path, replace);
+    }
+
     pub fn reclamationStatusAssumeLocked(self: *Store) !reclamation.Status {
         return self.reclamationStatusAssumeLockedWithCancel(null);
     }
@@ -5032,7 +5098,7 @@ pub const Store = struct {
         // redo-log reservation (passed as `fixed_overhead`) is this new
         // generation's own, same as the assessment path above; see
         // `Policy.worthwhile`'s own doc comment.
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redoReservation());
         return report;
     }
 
@@ -5111,6 +5177,7 @@ pub const Store = struct {
             var snapshot = try self.file.captureFullReadSnapshot();
             snapshot.page_cache_policy = .metadata_only;
             snapshot.vacuum_target_indexed = self.file.vacuum_target_indexed;
+            snapshot.redo_log_budget_bytes = self.maintenance_policy.options.max_storage_bytes;
             self.file.change_capture = &capture;
             break :blk snapshot;
         };
@@ -5131,14 +5198,20 @@ pub const Store = struct {
             break :blk self.maintenance_policy.status.temporary_bytes;
         };
         const compact = if (workspace_reservation == 0) (try source.liveStats(cancel)).compact_size else 0;
+        var redo_rewrite = false;
         {
             lockStore(self);
             defer self.mutex.unlock();
             const status = try self.reclamationStatusAssumeLockedWithCancel(cancel);
-            const workspace = if (status.temporary_bytes != 0) status.temporary_bytes else @max(compact *| 2, self.maintenance_policy.options.assessment_bytes);
             const budget = self.maintenance_policy.options.max_storage_bytes;
-            if (budget != 0 and status.current_file_bytes +| status.retired_file_bytes +| self.artifactBytes() +| workspace > budget) return error.LiteStorageBudgetExceeded;
-            try self.admitEstimatedGenerationAssumeLocked(if (compact != 0) compact else self.maintenance_policy.status.compact_size_estimate orelse workspace / 2, status.current_file_bytes);
+            const compact_estimate = if (compact != 0) compact else self.maintenance_policy.status.compact_size_estimate orelse workspace_reservation / 2;
+            const occupied = status.current_file_bytes +| status.retired_file_bytes +| self.artifactBytes();
+            const workspace = if (workspace_reservation != 0) workspace_reservation else self.vacuumWorkspaceBytes(compact_estimate);
+            const temporary_total = occupied +| workspace;
+            redo_rewrite = budget != 0 and temporary_total > budget;
+            if (redo_rewrite and !try self.canUseRedoRewriteWorkspace(temporary_total)) return error.LiteStorageBudgetExceeded;
+            const estimated = compact_estimate +| if (budget != 0 and self.needsProtectedRedoUpgrade()) self.file.vacuumRedoReservation(budget) else 0;
+            try self.admitEstimatedGenerationAssumeLocked(estimated, status.current_file_bytes);
             if (try self.availableDiskBytes()) |available| {
                 self.maintenance_policy.status.available_disk_bytes = available;
                 if (available < workspace +| self.futureArtifactBytes() +| self.maintenance_policy.options.disk_headroom_bytes) return error.LiteInsufficientDiskSpace;
@@ -5150,8 +5223,10 @@ pub const Store = struct {
         defer {
             // The image defer closes its retired descriptor first. Release
             // this additional old-inode descriptor before returning capacity.
-            source.close();
-            source_open = false;
+            if (source_open) {
+                source.close();
+                source_open = false;
+            }
             lockStore(self);
             self.maintenance_policy.status.temporary_bytes = 0;
             self.admission_refresh_size = 0;
@@ -5160,6 +5235,10 @@ pub const Store = struct {
         if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .copy);
         var image = try source.prepareVacuum(cancel);
         defer image.deinit();
+        if (redo_rewrite) {
+            source.close();
+            source_open = false;
+        }
         image.prepared.no_sync = true;
         image.prepared.allocator_cancel_token = cancel;
         const initial_sequence = blk: {
@@ -5269,7 +5348,17 @@ pub const Store = struct {
                     try image.prepared.finishPublicationSequence(self.file.activeCheckpoint().commit_sequence + 1, image.prepared.activeCheckpoint());
                     image.report.after_size = (try image.prepared.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
-                    try self.admitPreparedGenerationAssumeLockedWithCancel(&image.prepared, image.report.before_size, cancel);
+                    var retirement_fence: ?inode_lock.Handle = null;
+                    defer if (retirement_fence) |fence| fence.release(io);
+                    const replaces_redo = redo_rewrite and image.prepared.header.segmented_redo and
+                        (!self.file.header.segmented_redo or image.prepared.header.redoReservation() < self.file.header.redoReservation());
+                    if (replaces_redo) {
+                        retirement_fence = try self.file.tryFenceGenerationRetirement();
+                        if (self.currentGenerationHasReaders()) return error.FileBusy;
+                        const region = (try self.file.regionForInode()) orelse return error.FileBusy;
+                        if (region.minimumPinnedSequence() != null) return error.FileBusy;
+                    }
+                    try self.admitPreparedGenerationAssumeLockedWithCancel(&image.prepared, if (replaces_redo) 0 else image.report.before_size, cancel);
                     const old_handle = self.file.file.handle;
                     const retained_old = self.currentGenerationHasReaders();
                     defer if (self.file.file.handle != old_handle) {
@@ -5560,6 +5649,10 @@ pub const Store = struct {
         durable: bool = true,
         index_only: bool = false,
         artifact_lease: bool = false,
+        scope_delete_prefix: ?[]const u8 = null,
+        scope_delete_exact_key: ?[]const u8 = null,
+        scope_delete_only: bool = false,
+        scope_delete_redo_bytes: ?*const fn (*anyopaque, *const native.NativeFile) usize = null,
         /// Estimated size of this member's writes. Used only to bound group
         /// formation (`group_max_bytes`); never required to be exact. Also
         /// what `stageRideAlong` tracks against `ride_along_byte_threshold`.
@@ -5726,6 +5819,10 @@ pub const Store = struct {
             .durable = !ride_along and plan.durable,
             .index_only = plan.index_only,
             .artifact_lease = plan.artifact_lease,
+            .scope_delete_prefix = plan.scope_delete_prefix,
+            .scope_delete_exact_key = plan.scope_delete_exact_key,
+            .scope_delete_only = plan.scope_delete_only,
+            .scope_delete_redo_bytes = plan.scope_delete_redo_bytes,
             .ride_along = ride_along,
             .estimated_bytes = plan.estimated_bytes,
         };
@@ -6093,7 +6190,7 @@ pub const Store = struct {
         lockStoreExclusive(self);
         defer self.mutex.unlock();
         if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return error.FileBusy;
-        if (self.file.redo == null) return false;
+        if (self.file.redo == null or self.file.header.segmented_redo) return false;
         const before = self.file.header.redo_log_capacity;
         const oversized = native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < before;
         // An interrupted shrink can leave the capacity at its target with the
@@ -6303,7 +6400,8 @@ pub const Store = struct {
         var tail: ?*MutationRequest = null;
         var bytes: usize = 0;
         while (self.commit_head) |request| {
-            if (batch.head != null and (batch.size >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
+            if (batch.head != null and (request.scope_delete_prefix != null or
+                batch.size >= self.group_max_requests or bytes +| request.estimated_bytes > self.group_max_bytes)) break;
             self.commit_head = request.next;
             if (self.commit_head == null) self.commit_tail = null;
             request.next = null;
@@ -6317,6 +6415,7 @@ pub const Store = struct {
             } else {
                 self.non_ride_along_pending_count -|= 1;
             }
+            if (request.scope_delete_prefix != null) break;
         }
         return batch;
     }
@@ -6457,7 +6556,38 @@ pub const Store = struct {
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .durable = durable, .index_only = true });
+    }
+
+    pub fn submitIndexScopeDeletion(self: *Store, scope: []const u8, prefix: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitIndexPlanForScope(scope, .{
+            .context = context,
+            .apply = apply,
+            .index_only = true,
+            .scope_delete_prefix = prefix,
+            .scope_delete_only = true,
+        });
+    }
+
+    pub fn submitIndexTreeDeletion(self: *Store, prefix: []const u8, exact_key: []const u8) !void {
+        const Request = struct {
+            prefix: []const u8,
+            exact_key: []const u8,
+
+            fn apply(context: *anyopaque, file: *native.NativeFile) !void {
+                const request: *const @This() = @ptrCast(@alignCast(context));
+                try file.deleteIndexCatalogPrefix(request.prefix, request.exact_key);
+            }
+        };
+        var request = Request{ .prefix = prefix, .exact_key = exact_key };
+        try self.submitScopedMutation(.{
+            .context = &request,
+            .apply = Request.apply,
+            .index_only = true,
+            .scope_delete_prefix = prefix,
+            .scope_delete_exact_key = exact_key,
+            .scope_delete_only = true,
+        });
     }
 
     /// A durability barrier allocates no pages and requires no allocator
@@ -6478,7 +6608,7 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .durable = durable });
     }
 
     /// WS7/WS5 interim ride-along commit, one named helper so every caller
@@ -6498,7 +6628,7 @@ pub const Store = struct {
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true);
+        return self.submitScopedMutation(.{ .context = context, .apply = apply, .artifact_lease = true });
     }
 
     /// `submitIndexMutation` for one native-catalog index scope. Through a
@@ -6509,8 +6639,12 @@ pub const Store = struct {
     /// whole). Checked under the writer admission, which excludes every
     /// other writer until this commit lands.
     pub fn submitIndexMutationForScope(self: *Store, scope: []const u8, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        if (self.write_target == null) return self.submitIndexMutation(context, apply, durable);
-        const admission = self.writer_admission orelse return self.submitIndexMutation(context, apply, durable);
+        return self.submitIndexPlanForScope(scope, .{ .context = context, .apply = apply, .durable = durable, .index_only = true });
+    }
+
+    fn submitIndexPlanForScope(self: *Store, scope: []const u8, plan: MutationPlan) !void {
+        if (self.write_target == null) return self.submitScopedMutation(plan);
+        const admission = self.writer_admission orelse return self.submitScopedMutation(plan);
         try admission.enter(admission.ptr, .index);
         defer admission.leave(admission.ptr);
         const io = self.file.runtime();
@@ -6521,7 +6655,7 @@ pub const Store = struct {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
         }
-        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitIndexMutation(context, apply, durable);
+        const shared = if (self.file.redo) |*redo| redo.shared else return self.submitScopedMutation(plan);
         if (shared.scopeLatestSequence(io, scope) > self.indexScopeFence(scope)) {
             self.index_fence_refused.store(true, .release);
             return error.EnrichmentWaitCanceled;
@@ -6529,7 +6663,7 @@ pub const Store = struct {
         // Reserved before publishing: recording the commit afterwards must
         // not fail once storage has changed.
         try self.reserveIndexScope(scope);
-        try self.submitIndexMutation(context, apply, durable);
+        try self.submitScopedMutation(plan);
         self.noteIndexScopeCommit(scope, shared.scopeLatestSequence(io, scope));
     }
 
@@ -6617,7 +6751,7 @@ pub const Store = struct {
         value.* = @max(value.*, sequence);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
+    fn submitScopedMutation(self: *Store, plan: MutationPlan) !void {
         // A forwarded request commits in the writer store's group, which
         // enters that store's admission, not this one's. The detached work
         // that built it must still hold the writer lease and pass this
@@ -6628,9 +6762,9 @@ pub const Store = struct {
         // current writer reads the owner's serving root, which only the
         // admission below may do.
         const forwarded_admission = if (self.write_target != null) self.writer_admission else null;
-        if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease) .artifact_lease else if (index_only) .index else .primary);
+        if (forwarded_admission) |admission| try admission.enter(admission.ptr, if (plan.artifact_lease) .artifact_lease else if (plan.index_only) .index else .primary);
         defer if (forwarded_admission) |admission| admission.leave(admission.ptr);
-        const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+        const ticket = try self.stage(plan);
         ticket.wait() catch |err| {
             // §9.7f: a redo-log file's own fixed log-capacity reservation
             // can go stale -- frozen at whatever it was sized to when
@@ -6658,7 +6792,7 @@ pub const Store = struct {
                 // request), and retry only if the reservation shrank.
                 const shrank = (if (forwarded_admission != null) self.reclaimOversizedRedoReservationAdmitted() else self.reclaimOversizedRedoReservation()) catch false;
                 if (shrank) {
-                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+                    const retry_ticket = try self.stage(plan);
                     return retry_ticket.wait();
                 }
             }
@@ -6712,6 +6846,31 @@ pub const Store = struct {
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
         errdefer self.publishReadCheckpointAssumeLocked();
+        if (head.scope_delete_prefix) |prefix| {
+            std.debug.assert(head.next == null);
+            // This is under the writer lease and store mutex, so an empty
+            // scope cannot acquire postings between the probe and the delete.
+            const other_bytes = if (head.scope_delete_redo_bytes) |measure| measure(head.context, &self.file) else 0;
+            var probe_gate: SyncExclusiveGate = .{ .store = self };
+            const probe_hooks: native.SyncLockHooks = .{
+                .context = &probe_gate,
+                .release = releaseStoreMutexForOverlayProbe,
+                .reacquire = reacquireStoreMutexAfterSync,
+            };
+            switch (try self.file.planIndexScopeDeletion(prefix, head.scope_delete_exact_key, other_bytes, probe_hooks)) {
+                .empty => if (head.scope_delete_only) {
+                    // An earlier ride-along may be the reason this scope
+                    // is empty. Honor the durable request even without edits.
+                    if (force_durable or head.durable or self.writer_admission != null) try self.file.sync();
+                    head.committed_sequence = self.file.committedSequence();
+                    return;
+                },
+                .inline_delete => {},
+                // Older overlay entries could shadow physical deletes in
+                // later private batches. Settle them before the transaction.
+                .fold_first => try self.file.checkpointRedoLog(),
+            }
+        }
         if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
@@ -6802,6 +6961,14 @@ pub const Store = struct {
         held_through_sync: bool = false,
     };
 
+    fn releaseStoreMutexForOverlayProbe(context: *anyopaque) void {
+        const gate: *SyncExclusiveGate = @ptrCast(@alignCast(context));
+        // The coordinator still owns mutation authority. Exclusive callers
+        // wait for this group under the same counter used during sync.
+        gate.store.commit_in_sync += 1;
+        gate.store.mutex.unlock();
+    }
+
     fn releaseStoreMutexForSync(context: *anyopaque) void {
         const gate: *SyncExclusiveGate = @ptrCast(@alignCast(context));
         const self = gate.store;
@@ -6835,6 +7002,10 @@ pub const Store = struct {
         self.mutex.lock();
         std.debug.assert(self.commit_in_sync > 0);
         self.commit_in_sync -= 1;
+        if (self.commit_in_sync == 0 and self.exclusive_parked != 0) {
+            _ = self.exclusive_wait_epoch.fetchAdd(1, .release);
+            self.file.runtime().futexWake(u32, &self.exclusive_wait_epoch.raw, self.exclusive_parked);
+        }
     }
 
     fn writerSlotAvailable(self: *Store) bool {
@@ -7345,6 +7516,7 @@ pub const Txn = struct {
     // `PrimaryCommitContext.apply`). Encoded keys are owned by
     // `index_catalog_arena`, created lazily on first use.
     index_catalog_pending: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
+    index_catalog_delete_prefix: ?[]const u8 = null,
     index_catalog_arena: ?std.heap.ArenaAllocator = null,
     read_only: bool = true,
     writer_reserved: bool = false,
@@ -7460,28 +7632,20 @@ pub const Txn = struct {
             store.read_mutex.lockUncancelable(io);
         }
         defer store.read_mutex.unlock(io);
-        // A prior publish may have left durability unknown. Try to resolve
-        // it in-process (re-reads the on-disk slot the failed publish
-        // targeted; see `NativeFile.reconcilePublicationUncertainty`)
-        // before refusing the read outright -- that call's own
-        // `notifyPublication` keeps `read_outcome_unknown` in sync via the
-        // same `observeReadCheckpoint` callback an ordinary successful
-        // publish already notifies. Only a secret-store uncertainty (no
-        // in-process reconciliation exists for that yet) or a disk that is
-        // still failing falls through to the original refusal.
-        //
-        // `reconcilePublicationUncertainty` must run with `read_mutex`
-        // released: its own success path calls `notifyPublication`, which
-        // invokes this same `Store`'s `observeReadCheckpoint` observer --
-        // and that locks `read_mutex` too. Held across the call, that is an
-        // immediate self-deadlock on this non-reentrant mutex (caught by a
-        // hung regression run; see this file's test of the same name).
         if (store.read_outcome_unknown) {
-            if (store.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             store.read_mutex.unlock(io);
-            const reconciled = store.file.reconcilePublicationUncertainty();
+            const reconciled = repair: {
+                if (!serialized_admission) lockStore(store);
+                defer if (!serialized_admission) store.mutex.unlock();
+                // Repair can publish and notify read-generation observers.
+                // Serialize it with writers while read_mutex is released.
+                waitForStoreSyncAssumeLocked(store);
+                if (store.secret_store_uncertain) break :repair error.OutcomeReconciliationRequired;
+                break :repair store.file.reconcilePublicationUncertaintyForRead();
+            };
             store.read_mutex.lockUncancelable(io);
             try reconciled;
+            if (store.read_outcome_unknown) return error.OutcomeReconciliationRequired;
         }
         const checkpoint = store.read_generation.?.checkpoint;
         // Nested reads borrow the current writer's publication lease. Taking
@@ -7595,10 +7759,17 @@ pub const Txn = struct {
         // as `mutations` above. Empty for every write that does not use
         // `Txn.putIndexCatalogBatch`.
         index_catalog_mutations: []const native.CatalogMutation = &.{},
+        index_catalog_delete_prefix: ?[]const u8 = null,
+        fn scopeDeleteRedoBytes(ptr: *anyopaque, file: *const native.NativeFile) usize {
+            const context: *const @This() = @ptrCast(@alignCast(ptr));
+            return file.indexScopeCompanionRedoBytes(context.mutations, context.index_catalog_mutations);
+        }
+
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             try file.putDocumentBatch(context.mutations);
             if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
+            if (context.index_catalog_delete_prefix) |prefix| try file.deleteIndexCatalogPrefix(prefix, null);
         }
     };
 
@@ -7695,7 +7866,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0 and self.index_catalog_delete_prefix == null) {
             self.abort();
             return .{};
         }
@@ -7712,6 +7883,17 @@ pub const Txn = struct {
             if (Store.test_commit_key_hook) |hook| hook(mutations[i].key, mutations[i].key.len + mutations[i].value.len);
             node = current.next();
         }
+        // Scope deletion wins over every staged mutation within the scope.
+        // Discard those edits before they can enter the private redo overlay.
+        if (self.index_catalog_delete_prefix) |prefix| {
+            var retained: usize = 0;
+            for (self.index_catalog_pending.items) |mutation| {
+                if (std.mem.startsWith(u8, mutation.key, prefix)) continue;
+                self.index_catalog_pending.items[retained] = mutation;
+                retained += 1;
+            }
+            self.index_catalog_pending.items.len = retained;
+        }
         for (self.index_catalog_pending.items) |m| {
             estimated_bytes += m.key.len + m.value.len;
             if (Store.test_commit_key_hook) |hook| hook(m.key, m.key.len + m.value.len);
@@ -7724,7 +7906,7 @@ pub const Txn = struct {
         // `StagedCommit.wait()`/`abort()`, both of which run after the
         // group's `apply` callback has already consumed it, mirroring how
         // `mutations` above borrows `self.pending`'s own buffers.
-        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items };
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -7765,11 +7947,18 @@ pub const Txn = struct {
             const first_key = if (mutations.len != 0) mutations[0].key else "<none>";
             std.debug.print("[native-recovery] Txn.commitStaged ride_along={} mutation_count={d} first_key={s} index_catalog_mutation_count={d}\n", .{ self.ride_along, mutations.len, first_key, self.index_catalog_pending.items.len });
         }
+        const plan = Store.MutationPlan{
+            .context = context,
+            .apply = PrimaryCommitContext.apply,
+            .estimated_bytes = estimated_bytes,
+            .scope_delete_redo_bytes = if (self.index_catalog_delete_prefix != null) PrimaryCommitContext.scopeDeleteRedoBytes else null,
+            .scope_delete_prefix = self.index_catalog_delete_prefix,
+        };
         var ride_along_ticket: ?Store.Ticket = null;
         const staged: ?Store.Staged = if (self.ride_along) staged: {
-            ride_along_ticket = try store.stageRideAlong(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
+            ride_along_ticket = try store.stageRideAlong(plan);
             break :staged null;
-        } else try store.enqueue(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
+        } else try store.enqueue(plan);
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             // Keep `writer_admission` held past this point: staging is not
@@ -8543,10 +8732,20 @@ pub const Txn = struct {
         }
     }
 
+    /// Removes the scope at commit, including catalog edits staged in
+    /// this transaction, regardless of their order.
+    pub fn deleteIndexCatalogScope(self: *Txn, scope: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.index_catalog_delete_prefix != null) return error.InvalidBatch;
+        if (self.index_catalog_arena == null) self.index_catalog_arena = std.heap.ArenaAllocator.init(self.allocator);
+        self.index_catalog_delete_prefix = try @import("native_catalog_sink.zig").scopePrefixAlloc(self.index_catalog_arena.?.allocator(), scope);
+    }
+
     fn freeIndexCatalogPending(self: *Txn) void {
         if (self.index_catalog_arena) |*arena| arena.deinit();
         self.index_catalog_arena = null;
         self.index_catalog_pending = .empty;
+        self.index_catalog_delete_prefix = null;
     }
 
     fn pendingNode(node: *PendingTree.Node) *PendingNode {
@@ -9674,10 +9873,24 @@ fn lockStoreExclusive(store: *Store) void {
     _ = store.exclusive_waiting.fetchAdd(1, .monotonic);
     defer _ = store.exclusive_waiting.fetchSub(1, .monotonic);
     store.mutex.lock();
+    waitForStoreSync(store);
+}
+
+fn waitForStoreSyncAssumeLocked(store: *Store) void {
+    _ = store.exclusive_waiting.fetchAdd(1, .monotonic);
+    defer _ = store.exclusive_waiting.fetchSub(1, .monotonic);
+    waitForStoreSync(store);
+}
+
+fn waitForStoreSync(store: *Store) void {
     while (store.commit_in_sync != 0) {
+        const observed_epoch = store.exclusive_wait_epoch.load(.acquire);
+        const io = store.file.runtime();
+        store.exclusive_parked += 1;
         store.mutex.unlock();
-        antfly_platform.time.yieldNow();
+        io.futexWaitUncancelable(u32, &store.exclusive_wait_epoch.raw, observed_epoch);
         store.mutex.lock();
+        store.exclusive_parked -= 1;
     }
 }
 
@@ -10258,7 +10471,7 @@ test "lite externally locked read pins wait for fork-inherited publication fence
     var seed = try store.beginWrite();
     try seed.put("doc", "committed");
     try seed.commit();
-    store.file.releaseWriterOwnership();
+    try store.file.releaseWriterOwnership();
 
     var pipe: [2]std.c.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
@@ -10406,6 +10619,278 @@ test "lite native docstore putIndexCatalogBatch publishes primary and index-cata
     const active_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_active_key)).?;
     defer allocator.free(active_value);
     try std.testing.expectEqualStrings("1", active_value);
+}
+
+test "lite native docstore skips redo folding for an empty index scope" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-empty-scope.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("unrelated", "pending fold");
+        try txn.commit();
+    }
+    const before = store.file.committedSequence();
+    var sink: @import("native_catalog_sink.zig").Sink = .{ .store = &store, .allocator = allocator };
+    try @import("../native_catalog_backend.zig").deleteAllForScope(allocator, sink.sink(), "unused");
+    try std.testing.expectEqual(before, store.file.committedSequence());
+}
+
+test "lite overlay probe lends the Store mutex even with an exclusive waiter" {
+    var store: Store = undefined;
+    store.mutex = .{};
+    store.commit_in_sync = 0;
+    store.exclusive_parked = 0;
+    store.exclusive_waiting = .init(1);
+    var gate: Store.SyncExclusiveGate = .{ .store = &store };
+    store.mutex.lock();
+
+    Store.releaseStoreMutexForOverlayProbe(&gate);
+    try std.testing.expect(store.mutex.tryLock());
+    try std.testing.expectEqual(@as(usize, 1), store.commit_in_sync);
+    store.mutex.unlock();
+    try std.testing.expect(!tryLockStoreExclusive(&store));
+
+    Store.reacquireStoreMutexAfterSync(&gate);
+    try std.testing.expectEqual(@as(usize, 0), store.commit_in_sync);
+    store.mutex.unlock();
+}
+
+test "lite exclusive waiter parks until the released overlay probe finishes" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "native-docstore-probe-wait.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .no_sync = true });
+    defer store.close();
+
+    const Exclusive = struct {
+        fn run(owner: *Store, completed: *std.atomic.Value(bool)) void {
+            lockStoreExclusive(owner);
+            defer owner.mutex.unlock();
+            completed.store(true, .release);
+        }
+    };
+    var completed: std.atomic.Value(bool) = .init(false);
+    var gate: Store.SyncExclusiveGate = .{ .store = &store };
+    store.mutex.lock();
+    Store.releaseStoreMutexForOverlayProbe(&gate);
+    const thread = std.Thread.spawn(.{}, Exclusive.run, .{ &store, &completed }) catch |err| {
+        Store.reacquireStoreMutexAfterSync(&gate);
+        store.mutex.unlock();
+        return err;
+    };
+
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s;
+    var parked = false;
+    while (std.Io.Clock.awake.now(io).nanoseconds < deadline) {
+        store.mutex.lock();
+        parked = store.exclusive_parked != 0;
+        store.mutex.unlock();
+        if (parked) break;
+        antfly_platform.time.yieldNow();
+    }
+    const completed_early = completed.load(.acquire);
+    Store.reacquireStoreMutexAfterSync(&gate);
+    store.mutex.unlock();
+    thread.join();
+    try std.testing.expect(parked);
+    try std.testing.expect(!completed_early);
+    try std.testing.expect(completed.load(.acquire));
+}
+
+test "lite redo read repair waits for an in-flight publication" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "native-docstore-read-repair-wait.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .use_redo_log = true });
+    defer store.close();
+    {
+        var read = try store.beginRead();
+        read.abort();
+    }
+
+    const Reader = struct {
+        fn run(owner: *Store, result: *?anyerror) void {
+            var read = owner.beginRead() catch |err| {
+                result.* = err;
+                return;
+            };
+            read.abort();
+        }
+    };
+    var result: ?anyerror = null;
+    var gate: Store.SyncExclusiveGate = .{ .store = &store };
+    store.mutex.lock();
+    store.read_mutex.lockUncancelable(io);
+    store.read_outcome_unknown = true;
+    store.read_mutex.unlock(io);
+    Store.releaseStoreMutexForOverlayProbe(&gate);
+    const thread = std.Thread.spawn(.{}, Reader.run, .{ &store, &result }) catch |err| {
+        Store.reacquireStoreMutexAfterSync(&gate);
+        store.mutex.unlock();
+        return err;
+    };
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s;
+    var parked = false;
+    while (std.Io.Clock.awake.now(io).nanoseconds < deadline) {
+        store.mutex.lock();
+        parked = store.exclusive_parked != 0;
+        store.mutex.unlock();
+        if (parked) break;
+        antfly_platform.time.yieldNow();
+    }
+    Store.reacquireStoreMutexAfterSync(&gate);
+    store.read_mutex.lockUncancelable(io);
+    store.read_outcome_unknown = false;
+    store.read_mutex.unlock(io);
+    store.mutex.unlock();
+    thread.join();
+    try std.testing.expect(parked);
+    if (result) |err| return err;
+}
+
+test "lite durable empty index deletion syncs an earlier ride-along tombstone" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-empty-scope-barrier.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = false, .io = std.testing.io });
+    defer store.close();
+    store.ride_along_idle_ns = 10 * std.time.ns_per_s;
+
+    const prefix = "/directory/";
+    const key = prefix ++ "entry";
+    try store.file.putIndexCatalogRecord(key, "value");
+    {
+        try store.file.beginTransaction();
+        errdefer store.file.abortTransaction();
+        try store.file.deleteIndexCatalogRecord(key);
+        try store.file.commitTransactionWithDurability(false, null);
+    }
+    const pending = store.file.activeCheckpoint().commit_sequence;
+    try std.testing.expectEqual(native.NativeFile.IndexScopeDeletion.empty, try store.file.planIndexScopeDeletion(prefix, "/directory", 0, null));
+    try std.testing.expect(store.file.durableSequence() < pending);
+
+    try store.submitIndexTreeDeletion(prefix, "/directory");
+    try std.testing.expectEqual(pending, store.file.durableSequence());
+}
+
+test "lite native docstore deletes a small index scope without folding unrelated redo" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-small-scope.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.putIndexCatalogBatch("small", &.{.{ .namespace = null, .key = "posting", .value = "data" }});
+        try txn.commit();
+    }
+    try store.checkpointRedoLog();
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("unrelated", "unfolded");
+        try txn.commit();
+    }
+    const folded = store.file.activeCheckpoint().redo_folded_through;
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        const value: [32 * 1024]u8 = @splat('x');
+        try txn.put("catalog", &value);
+        try txn.putIndexCatalogBatch("small", &.{.{ .namespace = null, .key = "pending", .value = "discard" }});
+        try txn.deleteIndexCatalogScope("small");
+        try txn.putIndexCatalogBatch("neighbor", &.{.{ .namespace = null, .key = "pending", .value = "keep" }});
+        try txn.commit();
+    }
+    try std.testing.expectEqual(folded, store.file.activeCheckpoint().redo_folded_through);
+    const key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "small", null, "posting");
+    defer allocator.free(key);
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(allocator, key)) == null);
+    const pending = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "small", null, "pending");
+    defer allocator.free(pending);
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(allocator, pending)) == null);
+    const neighbor = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "neighbor", null, "pending");
+    defer allocator.free(neighbor);
+    const kept = (try store.file.getIndexCatalogRecordAlloc(allocator, neighbor)).?;
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("keep", kept);
+}
+
+test "lite native docstore deletes a large index scope in one publication" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-scope-delete.aflite");
+    defer allocator.free(path);
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.put("catalog", "present");
+        for (0..150) |i| {
+            var key: [160]u8 = @splat('k');
+            std.mem.writeInt(u64, key[0..8], i, .big);
+            try txn.putIndexCatalogBatch("idx", &.{.{ .namespace = null, .key = &key, .value = "posting" }});
+        }
+        try txn.putIndexCatalogBatch("idx-neighbor", &.{.{ .namespace = null, .key = "keep", .value = "neighbor" }});
+        try txn.commit();
+    }
+
+    {
+        var txn = try store.beginWrite();
+        defer txn.abort();
+        try txn.delete("catalog");
+        try txn.deleteIndexCatalogScope("idx");
+    }
+    const prefix = try @import("native_catalog_sink.zig").scopePrefixAlloc(allocator, "idx");
+    defer allocator.free(prefix);
+    {
+        var cursor = try store.file.indexCatalogCursor(store.file.activeCheckpoint(), prefix);
+        defer cursor.deinit();
+        const first = (try cursor.next()).?;
+        store.file.allocator.free(first.key);
+    }
+
+    {
+        var txn = try store.beginWrite();
+        errdefer txn.abort();
+        try txn.delete("catalog");
+        try txn.deleteIndexCatalogScope("idx");
+        try txn.commit();
+    }
+    var cursor = try store.file.indexCatalogCursor(store.file.activeCheckpoint(), prefix);
+    defer cursor.deinit();
+    if (try cursor.next()) |record| {
+        store.file.allocator.free(record.key);
+        return error.TestUnexpectedResult;
+    }
+    const keep = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx-neighbor", null, "keep");
+    defer allocator.free(keep);
+    const value = (try store.file.getIndexCatalogRecordAlloc(allocator, keep)).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("neighbor", value);
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get("catalog"));
 }
 
 test "lite native docstore putIndexCatalogBatch alone (no primary writes) still commits once" {
@@ -10714,12 +11199,19 @@ test "lite redo log maintainOnce's ride-along reclaim commit never advances redo
     try store.maintainOnce(false);
 
     const live = store.file.activeCheckpoint();
+    {
+        var reader = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{ .read_only = true });
+        defer reader.close();
+        const recovered = reader.activeCheckpoint();
+        try std.testing.expectEqual(live.redo_folded_through, recovered.redo_folded_through);
+        try std.testing.expectEqual(store.file.durableSequence(), recovered.commit_sequence);
+    }
+
+    // A fresh open sees a deferred commit only after the writer seals it.
+    try store.sync();
     var reader = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{ .read_only = true });
     defer reader.close();
-    const recovered = reader.activeCheckpoint();
-
-    try std.testing.expectEqual(live.redo_folded_through, recovered.redo_folded_through);
-    try std.testing.expectEqual(live.commit_sequence, recovered.commit_sequence);
+    try std.testing.expectEqual(store.file.activeCheckpoint().commit_sequence, reader.activeCheckpoint().commit_sequence);
 }
 
 test "lite native docstore cold writes and large disk-index cursors stay bounded" {
@@ -10855,6 +11347,55 @@ test "lite online vacuum retires generations without waiting for pinned readers"
     var fresh = try store.beginRead();
     defer fresh.abort();
     try std.testing.expectEqualStrings("new", try fresh.get("doc"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite maintenance upgrades a v11 redo file without reclamation debt" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "maintenance-protected-redo.aflite");
+    defer alloc.free(path);
+    {
+        var legacy = try native.NativeFile.createWithRedoLog(alloc, io, path, .{ .no_sync = true, .indexed_reclamation = true }, 64 * 1024);
+        defer legacy.close();
+        try legacy.beginTransaction();
+        try legacy.putDocument("doc", "old");
+        try legacy.commitTransaction();
+        try legacy.file.sync(io);
+    }
+
+    var store = try Store.openWithOptions(alloc, path, .{ .io = io, .reclamation = .{ .max_storage_bytes = 512 * 1024 } });
+    defer store.close();
+    try std.testing.expectEqual(native.format_version, store.file.header.diskFormatVersion());
+    try store.maintainOnce(false);
+    try std.testing.expectEqual(native.segmented_redo_format_version, store.file.header.diskFormatVersion());
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("old", try read.get("doc"));
+}
+
+test "lite redo maintenance shrinks a segmented reservation under a lowered cap" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "maintenance-shrink-redo.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .use_redo_log = true });
+    defer store.close();
+    const cap = 512 * 1024;
+    try std.testing.expect((try store.file.file.stat(io)).size > cap);
+
+    store.maintenance_policy.options.max_storage_bytes = cap;
+    try store.maintainOnce(true);
+    try std.testing.expect((try store.file.file.stat(io)).size > cap);
+    store.maintenance_policy.options.redo_rewrite_workspace_overage_bytes = 2 * 1024 * 1024;
+    try store.maintainOnce(true);
+    try std.testing.expectEqual(native.NativeFile.segmentedRedoCapacityForBudget(cap), store.file.header.redo_log_capacity);
+    try std.testing.expect((try store.file.file.stat(io)).size < cap);
+    try store.putCatalogRecord("after-shrink", "value");
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
@@ -19387,4 +19928,40 @@ test "lite native docstore replay targets ignore a base-revision hint marker aft
     var docstore = try docstore_root.DocStore.openRuntime(allocator, &runtime);
     defer docstore.close();
     try std.testing.expectEqual(@as(u64, 2), try docstore.latestReplaySequenceForHint(.full_text, 1));
+}
+
+test "lite native docstore retires a planned replay prefix across hint lanes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-docstore-retire-prefix.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    var runtime = try store.runtimeStore(allocator);
+    defer runtime.deinit();
+    var docs = try docstore_root.DocStore.openRuntime(allocator, &runtime);
+    defer docs.close();
+
+    const first = try encodeTestReplayRecord(allocator, 1, .full_text);
+    defer allocator.free(first);
+    const second = try encodeTestReplayRecord(allocator, 2, .full_text);
+    defer allocator.free(second);
+    try docs.appendReplayOpaque(allocator, 1, first);
+    try docs.appendReplayOpaque(allocator, 2, second);
+    try docs.truncateReplayUpTo(allocator, 1);
+    try docs.truncateReplayUpTo(allocator, 1);
+
+    var read = try docs.beginReadTxn();
+    defer read.abort();
+    const all = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    const hint = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    try std.testing.expectError(error.NotFound, read.get(&all));
+    try std.testing.expectError(error.NotFound, read.get(&hint));
+    const live = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+    try std.testing.expectEqualSlices(u8, second, try read.get(&live));
+    const journal_credit = try read.get(&internal_keys.journal_credit_ledger_key);
+    const ledger = internal_keys.JournalCreditLedger.decode(journal_credit) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), ledger.records);
+    try std.testing.expectEqual(@as(u64, 2 * internal_keys.replay_key_len + second.len), ledger.bytes);
 }

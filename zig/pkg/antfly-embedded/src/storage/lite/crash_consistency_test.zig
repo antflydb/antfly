@@ -1518,16 +1518,14 @@ fn runDenseVectorUpdateDeleteScenario(allocator: Allocator, path: []const u8, io
 /// metadata (dims, root node, postings), held under a fixed name-derived
 /// scope in `native_catalog_backend.Backend`, survives underneath --
 /// nor still name the index over a scope whose postings are erased:
-/// `removeWithAtomicMutation`'s dense branch commits the scope's deletes
-/// (`HBCIndex.nativeCatalogScopeDeletesForRemoval`) in the same
-/// transaction as the catalog removal.
+/// `removeWithAtomicMutation`'s dense branch commits its bounded scope
+/// deletion batches in the same transaction as the catalog removal.
 ///
 /// Setup (admitting "img" at dims=3, writing one document, draining to
 /// idle) runs on plain `std.testing.io`, fully durable, *before* the swept
 /// region starts, so the harness's barrier discovery only ever sees the
-/// reopen and the delete itself -- the scope-delete batch's own sync and
-/// the catalog-removal commit's own sync, plus whatever reopen/reload
-/// needs (reads, harmless to interrupt). A broader sweep that also crossed
+/// reopen and the delete itself, including the single publication of the
+/// scope and catalog removal. A broader sweep that also crossed
 /// the *initial* admission's own commit surfaced a second, separate
 /// finding (a crash during first-ever admission can similarly split
 /// "scope has fresh metadata" from "catalog has the config" -- a creation-
