@@ -28805,17 +28805,19 @@ pub fn tryApplyDenseRuntimeLinearQkvInto(
     if (in_dim == 0 or q_out_dim == 0 or kv_out_dim == 0 or in_dim > std.math.maxInt(i32) or q_out_dim > std.math.maxInt(i32) or kv_out_dim > std.math.maxInt(i32)) return null;
     const slots = [3]usize{ q_slot, k_slot, v_slot };
     if (!denseLinearQkvSlotsReady(self, slots, in_dim, q_out_dim, kv_out_dim)) return null;
-    if (!input.isDevice() or !k_out.isDevice() or !v_out.isDevice()) return null;
-    if (input.ndim() != 2 or @as(usize, @intCast(input.dim(0))) != 1 or @as(usize, @intCast(input.dim(1))) != in_dim) return null;
-    if (k_out.ndim() != 2 or @as(usize, @intCast(k_out.dim(0))) != 1 or @as(usize, @intCast(k_out.dim(1))) != kv_out_dim) return null;
-    if (v_out.ndim() != 2 or @as(usize, @intCast(v_out.dim(0))) != 1 or @as(usize, @intCast(v_out.dim(1))) != kv_out_dim) return null;
+    if (q_slot == k_slot or q_slot == v_slot or k_slot == v_slot) return null;
+    for (slots) |slot| {
+        if (termite_metal_decode_runtime_linear_slot_dtype(runtime, slot) != @backingInt(DenseLinearSlotDtype.f32)) return null;
+    }
+    if (!denseRegionShape(input, 1, in_dim) or !denseRegionShape(k_out, 1, kv_out_dim) or !denseRegionShape(v_out, 1, kv_out_dim)) return null;
     const q_shape = [_]i32{ 1, @intCast(q_out_dim) };
     var q_device = try MetalTensor.deviceAllocate(runtime, q_out_dim * @sizeOf(f32), .private, &q_shape);
     errdefer q_device.deinit();
-    const device_rc = encodeDenseLinearQkvDevice(runtime, slots, input, 1, in_dim, q_out_dim, kv_out_dim, .{ q_device, k_out, v_out });
-    if (device_rc == 0) return q_device;
-    q_device.deinit();
-    return null;
+    // K/V already belong to the receiver. Once the encoder is entered,
+    // a failure may leave only one projection encoded; retrying would mix
+    // two submissions in the same cache rows.
+    _ = try assignedDenseDispatch(encodeDenseLinearQkvDevice(runtime, slots, input, 1, in_dim, q_out_dim, kv_out_dim, .{ q_device, k_out, v_out }));
+    return q_device;
 }
 
 pub fn tryApplyDenseRuntimeLinearQkv(
