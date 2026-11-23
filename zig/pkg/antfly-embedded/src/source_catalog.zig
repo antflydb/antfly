@@ -401,6 +401,7 @@ pub const storage_db_enrichment_enrichment_runtime = @import("storage/db/enrichm
 pub const storage_db_enrichment_enrichment_state = @import("storage/db/enrichment/enrichment_state.zig");
 pub const storage_db_enrichment_enrichment_types = @import("storage/db/enrichment/enrichment_types.zig");
 pub const storage_db_enrichment_enrichment_worker = @import("storage/db/enrichment/enrichment_worker.zig");
+pub const storage_db_enrichment_execution_policy = @import("storage/db/enrichment/execution_policy.zig");
 pub const storage_db_enrichment_media_pass = @import("storage/db/enrichment/media_pass.zig");
 pub const storage_db_enrichment_neighbor_context = @import("storage/db/enrichment/neighbor_context.zig");
 pub const storage_db_enrichment_scoped_retries = @import("storage/db/enrichment/scoped_retries.zig");

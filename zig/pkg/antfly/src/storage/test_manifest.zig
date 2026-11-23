@@ -283,6 +283,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_state;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_types;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_worker;
+    _ = @import("antfly_local_sources").storage_db_enrichment_execution_policy;
     _ = @import("antfly_local_sources").storage_db_enrichment_media_pass;
     _ = @import("antfly_local_sources").storage_db_enrichment_scoped_retries;
     _ = @import("antfly_local_sources").storage_db_enrichment_scoped_retry_source;

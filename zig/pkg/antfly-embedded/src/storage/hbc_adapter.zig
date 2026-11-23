@@ -6547,6 +6547,32 @@ pub const HBCIndex = struct {
             break :blk loaded;
         };
 
+        var idx = try initOwnedRuntime(alloc, std.mem.span(path), config, opened, store, metadata);
+        if (lsm_options.retain_native_posting_startup_snapshot) {
+            idx.native_posting_startup_snapshot = posting_snapshot;
+            posting_snapshot = null;
+        }
+        return idx;
+    }
+
+    /// A separate dense index runtime owns the queued catalog root, HBC
+    /// metadata and caches. The serving index stays on its durable root.
+    pub fn forkInlineWriter(self: *HBCIndex) !HBCIndex {
+        if (self.leann != null or self.env_owner != .native_catalog) return error.StagedPublicationUnsupported;
+        const backend = try self.alloc.create(native_catalog_backend.Backend);
+        errdefer self.alloc.destroy(backend);
+        backend.* = try self.env_owner.native_catalog.forkWriterView();
+        errdefer backend.close();
+        const opened: EnvOwner = .{ .native_catalog = backend };
+        var store = try openVectorIndexStore(self.alloc, opened);
+        errdefer store.deinit();
+        var txn = try store.beginRead();
+        defer txn.abort();
+        const metadata = IndexMetadata.decode(try txn.get(.meta, meta_key));
+        return initOwnedRuntime(self.alloc, self.cache_path, self.config, opened, store, metadata);
+    }
+
+    fn initOwnedRuntime(alloc: Allocator, path: []const u8, config: HBCConfig, opened: EnvOwner, store: vectorindex_store.NamespaceStore, metadata: IndexMetadata) !HBCIndex {
         var effective_config = config;
         if (metadata.version != hbc_index_version) return error.UnsupportedVersion;
         if (metadata.dims != config.dims) return error.DimensionMismatch;
@@ -6575,8 +6601,6 @@ pub const HBCIndex = struct {
         // writes that were already accepted.
         if (effective_config.quantization_bits > 1 and effective_config.dims < 2)
             return error.InvalidIndexConfig;
-
-        const env_owner: EnvOwner = opened;
 
         var quantizer = try quantizer_mod.RaBitQuantizer.init(
             alloc,
@@ -6627,13 +6651,14 @@ pub const HBCIndex = struct {
         @memset(metadata_clock_keys, 0);
         @memset(metadata_clock_states, .empty);
 
-        const cache_identity = try hbcCacheIdentityAlloc(alloc, std.mem.span(path));
+        const cache_identity = try hbcCacheIdentityAlloc(alloc, path);
         errdefer alloc.free(cache_identity.stable_path);
 
         const posting_wal_authoritative = if (opened == .native)
             true
         else blk: {
-            var marker_txn = try store.beginRead();
+            var readable_store = store;
+            var marker_txn = try readable_store.beginRead();
             defer marker_txn.abort();
             break :blk if (marker_txn.get(.meta, posting_wal_authoritative_key)) |value|
                 std.mem.eql(u8, value, posting_wal_authoritative_value)
@@ -6648,7 +6673,7 @@ pub const HBCIndex = struct {
 
         var idx = HBCIndex{
             .alloc = alloc,
-            .env_owner = env_owner,
+            .env_owner = opened,
             .store = store,
             .config = effective_config,
             .metadata = metadata,
@@ -6734,10 +6759,6 @@ pub const HBCIndex = struct {
             alloc,
             max_cached_search_scratches - 1,
         );
-        if (lsm_options.retain_native_posting_startup_snapshot) {
-            idx.native_posting_startup_snapshot = posting_snapshot;
-            posting_snapshot = null;
-        }
         return idx;
     }
 
@@ -15373,6 +15394,19 @@ pub const HBCIndex = struct {
         defer idx.close();
 
         const scope = idx.nativeCatalogScope().?;
+
+        {
+            const submit_calls = test_sink.submit_calls;
+            var writer = try idx.forkInlineWriter();
+            defer writer.close();
+            var first = try writer.insertWithMetadataStaged(11, &.{ 1.0, 0.0 }, "");
+            try writer.installStagedWrite(&first);
+            var next = try writer.insertWithMetadataStaged(12, &.{ 0.0, 1.0 }, "");
+            try writer.installStagedWrite(&next);
+            try std.testing.expectEqual(@as(u64, 2), writer.publishedActiveCount());
+            try std.testing.expectEqual(@as(u64, 0), idx.publishedActiveCount());
+            try std.testing.expectEqual(submit_calls, test_sink.submit_calls);
+        }
 
         // --- Insert, staged ---
         const submits_before = test_sink.submit_calls;
