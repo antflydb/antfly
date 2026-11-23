@@ -65954,6 +65954,24 @@ test "SQL pgwire native restart discards unpublished subscriptions without claim
         restarted_durable.fail_writes_for_test = true;
         try std.testing.expectError(error.InjectedSessionStoreFailure, completion_mod.recoverUnpublished(&restarted, a, 32));
         restarted_durable.fail_writes_for_test = false;
+        if (!terminal) {
+            const outbox: @import("completion_outbox.zig").Namespace = .{};
+            const malformed = created: {
+                var txn = try storage.beginWriteTxn();
+                errdefer txn.abort();
+                const bad = try outbox.create(&txn, a, @splat(7), .{ .ddl_receipt_json = "{" }, false);
+                try outbox.stagePublication(&txn, bad, 1);
+                try txn.commit();
+                break :created bad;
+            };
+            const live_failed = failed: {
+                completion_mod.recoverUnpublished(&restarted, a, 32) catch break :failed true;
+                break :failed false;
+            };
+            try std.testing.expect(live_failed);
+            try std.testing.expect((try restarted_durable.loadRegistration(a, reference)) == null);
+            try restarted_durable.removeRegistration(malformed);
+        }
         for (0..3) |_| try completion_mod.recoverUnpublished(&restarted, a, 32);
         try std.testing.expect((try restarted_durable.loadRegistration(a, reference)) == null);
         // Forget is not positive settlement, even for a terminal former owner.
