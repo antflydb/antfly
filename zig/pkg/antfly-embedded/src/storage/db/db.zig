@@ -52605,7 +52605,8 @@ pub const DB = struct {
         const has_text = req.full_text != null or req.full_text_queries.len != 0 or
             (!db_query_search.isDefaultMatchAll(req.query) and db_query_search.isTextQuery(req.query));
         const has_dense = req.dense != null or req.dense_queries.len != 0;
-        const can_overlap = !req.count_only and req.limit != 0 and
+        const can_overlap = !req.count_only and req.limit != 0 and req.aggregations_json.len == 0 and
+            (!req.include_stored or db_query_search.composedDefersComponentBodies(req)) and
             has_text and has_dense and req.full_text_queries.len <= 1 and
             req.dense_queries.len <= 1 and req.sparse == null and req.sparse_queries.len == 0 and
             req.graph_queries.len == 0 and dense_profile_sink == null and
@@ -52622,22 +52623,17 @@ pub const DB = struct {
             HybridComponents.ownerAllocatorCanOverlap(self.alloc) and
             (HybridComponents.Budget.reusableHeadroom(alloc) orelse 0) >= HybridComponents.workspace_bytes;
         const io = if (can_overlap and reusable) exec_ctx.io orelse self.backend_runtime.io() else null;
+        const revisions = if (io != null) HybridComponents.quietRevisions(self) else null;
         const probe = if (builtin.is_test) test_hybrid_probe else null;
+        const sources = if (revisions != null) HybridComponents.resolveSources(self, alloc, req, probe) else null;
         var hybrid: HybridComponents = .{
             .db = self,
-            .io = io,
-            .sources = if (io != null) .{
-                .text = self.core.textIndexEntry(if (req.full_text_queries.len == 1) req.full_text_queries[0].index_name else req.index_name),
-                .filter_text = if (req.primary_text_index_name) |name|
-                    self.core.textIndexEntry(name) orelse self.core.textIndexEntry(req.index_name) orelse self.core.textIndexEntry(null)
-                else
-                    self.core.textIndexEntry(req.index_name) orelse self.core.textIndexEntry(null),
-                .dense = self.core.denseIndex(if (req.dense_queries.len == 1) req.dense_queries[0].index_name else req.index_name),
-            } else .{},
+            .io = if (sources != null) io else null,
+            .sources = sources orelse .{},
             .probe = probe,
             .component_alloc = .{ .backing = alloc },
         };
-        if (io != null) hybrid.cut = hybrid.readCut();
+        if (sources != null) hybrid.cut = hybrid.readCutFrom(revisions.?);
         hybrid.lexical_budget = .{ .backing = hybrid.component_alloc.allocator(), .limit = if (probe) |test_probe| test_probe.workspace_bytes else HybridComponents.workspace_bytes };
         defer if (has_text and has_dense and benchQueryProfileEnabled()) {
             std.log.info("antfly_bench_hybrid launched={} accepted={} replay={s}", .{
@@ -52699,6 +52695,8 @@ pub const DB = struct {
         replacement: ?struct { id: u64, bytes: []const u8 } = null,
         cancellation: ?*std.atomic.Value(bool) = null,
         overlapped: bool = false,
+        read_cut_samples: usize = 0,
+        source_resolutions: usize = 0,
         retry: ?anyerror = null,
         meet_in_retrieval: bool = false,
         dense_retrieved: Io.Event = .unset,
@@ -52728,6 +52726,7 @@ pub const DB = struct {
         const scheduler = @import("../../sql/parallel_scheduler.zig");
         const Budget = @import("../../sql/memory_budget.zig");
         const workspace_bytes = 16 * 1024 * 1024;
+        const Revisions = struct { primary: u64, replay: u64 };
         const Cut = struct {
             primary: u64,
             replay: u64,
@@ -52754,6 +52753,34 @@ pub const DB = struct {
         retry_reason: ?anyerror = null,
         lexical_budget: Budget = undefined,
 
+        fn resolveSources(db: *DB, alloc: Allocator, req: types.SearchRequest, probe: ?*HybridTestProbe) ?Sources {
+            if (builtin.is_test) {
+                if (probe) |active| active.source_resolutions += 1;
+            }
+            const named_text = if (req.full_text_queries.len == 1) req.full_text_queries[0] else null;
+            const query = if (named_text) |named| named.query else req.full_text;
+            if (query) |text_query| if (text_query == .match_all) return null;
+
+            const dense_name = if (req.dense_queries.len == 1) req.dense_queries[0].index_name else req.index_name;
+            const dense = db.core.denseIndex(dense_name) orelse return null;
+            // LEANN can drop apply-shared around external inference.
+            if (dense.index.leann != null) return null;
+
+            const primary_text = db.core.textIndexEntry(req.index_name);
+            const text = if (named_text) |named| db.core.textIndexEntry(named.index_name) else primary_text;
+            // Resolve the same default index as the ranker, even on tables
+            // with multiple text indexes. Chunk hydration stays serial.
+            if (text) |entry| {
+                if (db.core.textIndexIsChunkBacked(alloc, entry.config.name) catch return null) return null;
+            }
+            const filter_text = if (req.primary_text_index_name) |name| db.core.textIndexEntry(name) else null;
+            return .{
+                .text = text,
+                .filter_text = filter_text orelse primary_text orelse db.core.textIndexEntry(null),
+                .dense = dense,
+            };
+        }
+
         fn ownerAllocatorCanOverlap(owner: Allocator) bool {
             const scratch = Budget.reclaimingAllocator(owner);
             return owner.ptr == scratch.ptr and owner.vtable == scratch.vtable and
@@ -52764,16 +52791,28 @@ pub const DB = struct {
             return (entry orelse return null).persistent.writer.snapshotEpoch();
         }
 
+        fn quietRevisions(db: *DB) ?Revisions {
+            return .{
+                .primary = db.core.snapshot_admission.quietRevision() orelse return null,
+                .replay = db.core.snapshot_replay_admission.quietRevision() orelse return null,
+            };
+        }
+
         fn readCut(self: *HybridComponents) ?Cut {
+            return self.readCutFrom(quietRevisions(self.db) orelse return null);
+        }
+
+        fn readCutFrom(self: *HybridComponents, revisions: Revisions) ?Cut {
+            if (builtin.is_test) {
+                if (self.probe) |probe| probe.read_cut_samples += 1;
+            }
             const db = self.db;
-            const primary = db.core.snapshot_admission.quietRevision() orelse return null;
-            const replay = db.core.snapshot_replay_admission.quietRevision() orelse return null;
             const generation = if (self.sources.dense) |entry| entry.index.publishedGeneration() else null;
             const mutation = if (self.sources.dense) |entry| entry.index.publishedMutationEpoch() else null;
             if (((generation orelse 0) | (mutation orelse 0)) & 1 != 0) return null;
             const cut: Cut = .{
-                .primary = primary,
-                .replay = replay,
+                .primary = revisions.primary,
+                .replay = revisions.replay,
                 .revision = db.core.store.query_generation_revision.load(.acquire),
                 .text_epoch = textEpoch(self.sources.text),
                 .filter_text_epoch = if (self.sources.text == self.sources.filter_text) null else textEpoch(self.sources.filter_text),
@@ -52782,8 +52821,8 @@ pub const DB = struct {
             };
             // Bracket source sampling in reverse order so both mutation
             // domains were quiet over a common interval.
-            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, replay) or
-                db.core.snapshot_admission.quietRevision() != @as(?u64, primary)) return null;
+            if (db.core.snapshot_replay_admission.quietRevision() != @as(?u64, revisions.replay) or
+                db.core.snapshot_admission.quietRevision() != @as(?u64, revisions.primary)) return null;
             return cut;
         }
 
@@ -52834,26 +52873,8 @@ pub const DB = struct {
             const self: *HybridComponents = @ptrCast(@alignCast(raw.?));
             const io = self.io orelse return null;
             if (components.len != 2 or components[1].query != .dense) return null;
-            const text = components[0];
-            switch (text.query) {
-                .text => |query| if (query == .match_all) return null,
-                .default_text => {},
-                else => return null,
-            }
-            // Chunk hydration and aggregation can perform long postprocessing
-            // outside the stoppable ranker. Resolve the same default index as
-            // the ranker, including when multiple text indexes exist.
-            if (text.request.include_stored or text.request.aggregations_json.len != 0) return null;
-            if (self.db.core.textIndexEntry(text.request.index_name)) |entry| {
-                if (self.db.core.textIndexIsChunkBacked(a, entry.config.name) catch return null) return null;
-            }
-
+            if (components[0].query != .text and components[0].query != .default_text) return null;
             const dense = components[1];
-            const entry = self.db.core.denseIndex(dense.request.index_name) orelse return null;
-            // LEANN can drop apply-shared around external inference. Keep
-            // those requests serial so the coordinator's pinned cut remains
-            // valid throughout both component reads.
-            if (entry.index.leann != null) return null;
             try db_query_search.checkSearchRequestDeadline(dense.request);
 
             var lexical: Lexical = .{ .owner = self, .component = components[0] };
@@ -132968,6 +132989,43 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     try std.testing.expectEqual(@as(usize, 2), parallel.hits.len);
     for (parallel.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:c"));
 
+    // Eager stored fields, aggregations, and explicit match-all stay
+    // serial without touching the read cut. Deferred hydration still overlaps.
+    var eager = filtered;
+    eager.include_stored = true;
+    eager.return_mode = .member;
+    var aggregations = filtered;
+    aggregations.aggregations_json = "{}";
+    var match_all = filtered;
+    match_all.full_text = .{ .match_all = {} };
+    for ([_]types.SearchRequest{ eager, aggregations, match_all }) |serial_only| {
+        probe = .{};
+        var outcome = try db.searchWithExecutionContext(alloc, serial_only, parallel_context);
+        defer outcome.deinit();
+        try std.testing.expectEqual(@as(usize, 0), probe.read_cut_samples);
+        try std.testing.expect(!probe.overlapped);
+    }
+
+    var hydrated = filtered;
+    hydrated.include_stored = true;
+    probe = .{};
+    var hydrated_result = try db.searchWithExecutionContext(alloc, hydrated, parallel_context);
+    defer hydrated_result.deinit();
+    try std.testing.expect(probe.overlapped);
+    try std.testing.expect(probe.read_cut_samples != 0);
+    try std.testing.expect(hydrated_result.hits[0].stored_data != null);
+
+    {
+        var mutation = db.core.snapshot_replay_admission.acquireMutation();
+        defer mutation.release();
+        probe = .{};
+        var busy = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
+        defer busy.deinit();
+        try std.testing.expectEqual(@as(usize, 0), probe.source_resolutions);
+        try std.testing.expectEqual(@as(usize, 0), probe.read_cut_samples);
+        try std.testing.expectEqualDeep(serial.hits, busy.hits);
+    }
+
     probe = .{};
     probe.scheduler.max_workers = 0;
     var saturated = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
@@ -133093,6 +133151,46 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     try std.testing.expectError(error.IndexNotFound, db.searchWithExecutionContext(alloc, invalid, .{ .max_parallelism = 1 }));
     try std.testing.expectError(error.IndexNotFound, db.searchWithExecutionContext(alloc, invalid, parallel_context));
     try std.testing.expect(probe.overlapped);
+
+    try db.addIndex(.{
+        .name = "leann_admission",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"leann_admission\",\"algorithm\":\"leann\"}",
+    });
+    try std.testing.expect(db.core.denseIndex("leann_admission").?.index.leann != null);
+    var leann = req;
+    var leann_dense = req.dense_queries[0];
+    leann_dense.index_name = "leann_admission";
+    leann.dense_queries = &.{leann_dense};
+    probe = .{};
+    var leann_result = try db.searchWithExecutionContext(alloc, leann, parallel_context);
+    defer leann_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.source_resolutions);
+    try std.testing.expectEqual(@as(usize, 0), probe.read_cut_samples);
+    try std.testing.expect(!probe.overlapped);
+
+    try db.addEnrichment(.{
+        .name = "hybrid_admission_chunks",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}",
+    });
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"hybrid_admission_chunks\"}]}",
+    });
+    const default_text = db.core.textIndexEntry(null).?;
+    try std.testing.expectEqualStrings("full_text_index_v0", default_text.config.name);
+    try std.testing.expect(try db.core.textIndexIsChunkBacked(alloc, default_text.config.name));
+    var chunks = req;
+    chunks.index_name = null;
+    probe = .{};
+    var chunk_result = try db.searchWithExecutionContext(alloc, chunks, parallel_context);
+    defer chunk_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.source_resolutions);
+    try std.testing.expectEqual(@as(usize, 0), probe.read_cut_samples);
+    try std.testing.expect(!probe.overlapped);
 }
 
 test "db search fuses full_text and dense named searches before graph expansion with durable lsm primary backend" {
