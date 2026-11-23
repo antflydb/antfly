@@ -255,8 +255,14 @@ fn settleOriginalAttempt(
     if (!pending.retain_payload) return error.SourceOutcomeUnresolved;
     const proof = admission.fenceUnadmittedAttempt(a, state, manifest, fence, context) catch |err| switch (err) {
         error.SourcePendingWork, error.SourceOutcomeUnresolved => recovered: {
-            if (try admission.retireDisplacedDelivery(svc, a, manifest, fence, context))
+            var next_member = state.epoch_retirement_next_member orelse 0;
+            if (try admission.retireDisplacedDelivery(svc, a, manifest, fence, &next_member, context))
                 break :recovered try admission.fenceUnadmittedAttempt(a, state, manifest, fence, context);
+            if (next_member != (state.epoch_retirement_next_member orelse 0))
+                return mutate(svc, a, binding, catalog_digest, state, .{ .checkpoint_epoch_retirement = .{
+                    .reservation_digest = record.reservation,
+                    .next_member = next_member,
+                } }, context);
             if (state.checkpoint_transfer_target == null) return err;
             // The original leases are still published. Finish the enlisted
             // attempt under its immutable plan before the planned cutover.

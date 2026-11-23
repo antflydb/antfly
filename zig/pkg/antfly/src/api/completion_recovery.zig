@@ -1125,10 +1125,11 @@ test "data raft ordered history completion recovery retains guard checkpoints an
 
     const readiness = struct {
         pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, required: u16) !void {
-            try std.testing.expectEqual(source_control.epoch_attempt_retirement_protocol_version, required);
+            try std.testing.expect(required == source_control.epoch_attempt_retirement_protocol_version or required == source_control.epoch_attempt_progress_protocol_version);
         }
     };
     var service: readiness = .{};
+    var next_member: u16 = 0;
     reclaim_admission.retirements = .{ .ptr = &fake, .execute_fn = Fake.retire };
     fake.state = committed_record;
     fake.state.status = .pending;
@@ -1140,7 +1141,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     fake.resolved = .{ false, false };
     fake.epoch_retirement = true;
     const manifest = retained_source.manifest;
-    try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, source_fence, .{}));
+    try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, source_fence, &next_member, .{}));
     var changed_ranges = ranges;
     changed_ranges[0].end_key = "n";
     changed_ranges[1].start_key = "n";
@@ -1159,17 +1160,29 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     changed_fence.catalog_revision = 11;
     try std.testing.expect(changed_fence.topology_epoch != source_fence.topology_epoch);
 
+    const cursor_write: source_control.Mutation = .{ .checkpoint_epoch_retirement = .{
+        .reservation_digest = journal.state.pending.?.identity(actor_scope),
+        .next_member = 1,
+    } };
+    const checkpointed_state = try cursor_write.apply(actor_alloc, journal.state);
+    const checkpointed_bytes = try source_control.encode(actor_alloc, checkpointed_state);
+    var reopened_progress = try source_control.parse(a, checkpointed_bytes);
+    defer reopened_progress.deinit();
+    try std.testing.expectEqual(@as(?u16, 1), reopened_progress.value.epoch_retirement_next_member);
+    try std.testing.expectError(error.SourceControlConflict, cursor_write.apply(actor_alloc, reopened_progress.value));
+
     const pending_record = fake.state;
     fake.state = committed_record;
-    try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
+    try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
     try std.testing.expectEqual(.committed, fake.state.status);
     fake.state = pending_record;
 
-    try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
+    try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
     try std.testing.expectEqual(.aborted, fake.state.status);
     try std.testing.expect(!fake.resolved[0] and fake.resolved[1] and fake.state.acknowledgments_pending);
-    try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
-    try std.testing.expect(fake.resolved[0] and !fake.state.acknowledgments_pending);
+    try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
+    try std.testing.expectEqual(@as(u16, 1), next_member);
+    try std.testing.expect(fake.resolved[0] and fake.state.acknowledgments_pending);
     // The follower can leave the catalog after its cleanup was acknowledged.
     var final_ranges = [_]tables.RangeRecord{changed_ranges[1]};
     final_ranges[0].start_key = "";
@@ -1184,9 +1197,11 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     fake.generation = final_routes;
     changed_fence.topology_epoch = (try final_routes.indexed.tableRoutingView("docs", .{})).topology_epoch;
     changed_fence.catalog_revision = 12;
+    try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
+    try std.testing.expect(!fake.state.acknowledgments_pending);
     fake.expect_coordinator_release = true;
     const acknowledgments_before_release = fake.acknowledgments;
-    try std.testing.expect(try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
+    try std.testing.expect(try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, &next_member, .{}));
     try std.testing.expectEqual(acknowledgments_before_release + 1, fake.acknowledgments);
     try std.testing.expectEqual(original_begins, fake.begins);
     try std.testing.expectEqual(original_prepares, fake.prepares);

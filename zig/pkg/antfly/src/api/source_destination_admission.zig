@@ -298,7 +298,7 @@ pub const Admission = struct {
     }
     /// Retire an exact enlisted attempt after the catalog revoked one of its
     /// routes. No frozen writes are replayed under the refreshed leases.
-    pub fn retireDisplacedDelivery(self: Admission, svc: anytype, a: A, manifest: destination.Manifest, fence: metadata.CatalogRouteFence, context: Context) !bool {
+    pub fn retireDisplacedDelivery(self: Admission, svc: anytype, a: A, manifest: destination.Manifest, fence: metadata.CatalogRouteFence, next_member: *u16, context: Context) !bool {
         const recovery = self.coordinator.recovery;
         const request: @import("history_decision_operations.zig").Request = .{
             .version = 1,
@@ -337,20 +337,22 @@ pub const Admission = struct {
         budget.cancellation = context.cancellation;
         var session = try catalog.RoutingSession.initWithBudget(a, recovery.catalog, budget);
         defer session.deinit();
-        const routes = try a.alloc(metadata.CatalogRouteFence, admission.participants.len);
-        defer a.free(routes);
+        const routes: []metadata.CatalogRouteFence = if (decision.record.status == .pending) try a.alloc(metadata.CatalogRouteFence, admission.participants.len) else &.{};
+        defer if (routes.len != 0) a.free(routes);
         var displaced = false;
-        for (admission.participants, routes) |member, *route| {
-            const owner = member.routed_owner orelse return error.InvalidSourceAdmission;
-            route.* = try @import("completion_recovery.zig").routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
-            displaced = displaced or route.topology_epoch != owner.topology_epoch;
+        if (decision.record.status == .pending) {
+            for (admission.participants, routes) |member, *route| {
+                const owner = member.routed_owner orelse return error.InvalidSourceAdmission;
+                route.* = try @import("completion_recovery.zig").routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
+                displaced = displaced or route.topology_epoch != owner.topology_epoch;
+            }
         }
         if (decision.record.status == .pending and !displaced) return false;
         const retirement_port = if (admission.participants.len > 1)
             self.retirements orelse return error.ChangefeedCapabilityUnsupported
         else
             null;
-        _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, source.epoch_attempt_retirement_protocol_version);
+        _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, source.epoch_attempt_progress_protocol_version);
         if (decision.record.status == .pending) {
             for (admission.participants, routes) |member, route| {
                 var owner = member.routed_owner.?;
@@ -364,10 +366,20 @@ pub const Admission = struct {
             try recovery.participants.abortDisplacedSource(a, request.binding(), observed.value, fence, timestamp, context);
             return error.SourcePendingWork;
         }
-        // Retirement proves both the enlisted and never-enlisted cases at
-        // each follower before the coordinator may acknowledge its cleanup.
-        for (admission.participants, routes) |member, route| {
+        // The cursor records a confirmed retirement before acknowledgment.
+        // On restart, acknowledge that follower by locator even if its route
+        // has since disappeared. The ordered fence still checks the full set.
+        if (next_member.* > admission.participants.len) return error.SourceOutcomeUnresolved;
+        if (next_member.* != 0) {
+            const previous = admission.participants[next_member.* - 1];
+            var routed = manifest.owner;
+            routed.topology_epoch = fence.topology_epoch;
+            try recovery.participants.acknowledgeRetiredFollower(a, routed, fence, coordinator.locator, manifest.transaction_id, previous.locator, context);
+        }
+        for (admission.participants[next_member.*..], next_member.*..) |member, index| {
             if (std.meta.eql(member.owner_fence, admission.coordinator_fence)) continue;
+            const owner = member.routed_owner orelse return error.InvalidSourceAdmission;
+            const route = try @import("completion_recovery.zig").routeRetainedOwnerForCleanup(&session, owner, member.locator, budget, context);
             try context.ensureActive();
             const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
             const wire = @import("source_retirement_operations.zig").wire;
@@ -394,8 +406,9 @@ pub const Admission = struct {
                 .rejected => |reason| return reason.asError(),
                 .superseded => return error.SourceOutcomeUnresolved,
             }
+            next_member.* = @intCast(index + 1);
+            return false;
         }
-        try recovery.participants.acknowledgeResolved(a, request.binding(), observed.value, fence, context);
         return error.SourcePendingWork;
     }
 

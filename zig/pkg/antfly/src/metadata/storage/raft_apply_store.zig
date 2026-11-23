@@ -33338,7 +33338,7 @@ pub const RaftApplyStore = struct {
             },
             // Already accepted work can drain after configuration replacement;
             // its current catalog CAS and original source binding still fence it.
-            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_unsealed_delivery_attempt, .fence_delivery_attempt, .reclaim_superseded_payload, .checkpoint_payload_cleanup, .discard_fenced_pending, .discard_payload_prewrite, .clear_payload_prewrite, .checkpoint_payload_prewrite, .fence_checkpoint, .close => {},
+            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_unsealed_delivery_attempt, .fence_delivery_attempt, .checkpoint_epoch_retirement, .reclaim_superseded_payload, .checkpoint_payload_cleanup, .discard_fenced_pending, .discard_payload_prewrite, .clear_payload_prewrite, .checkpoint_payload_prewrite, .fence_checkpoint, .close => {},
         }
         if (write.mutation == .pin_payload_prewrite) {
             const prewrite = write.mutation.pin_payload_prewrite;

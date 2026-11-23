@@ -396,7 +396,7 @@ pub const iceberg_acceptance_status_version: u16 = 132;
 /// Version 257 pins successor ranges against retirement until adoption.
 /// Version 258 tracks shared spool prewrites through recovery.
 pub const source_successor_retirement_guard_version: u16 = 257;
-pub const current_version: u16 = @import("source_control.zig").epoch_attempt_retirement_protocol_version;
+pub const current_version: u16 = @import("source_control.zig").epoch_attempt_progress_protocol_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

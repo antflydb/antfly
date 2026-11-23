@@ -35,6 +35,7 @@ pub const qualified_completion_stall_protocol_version: u16 = 254;
 pub const retained_payload_protocol_version: u16 = 255;
 pub const payload_prewrite_protocol_version: u16 = 258;
 pub const epoch_attempt_retirement_protocol_version: u16 = 259;
+pub const epoch_attempt_progress_protocol_version: u16 = 260;
 pub const max_payload_cleanup_cursor_bytes = 2048;
 pub const completion_wait_timeout_ms = 30 * std.time.ms_per_s;
 pub const completion_wait_error = "SourceOutcomeUnresolved";
@@ -286,6 +287,7 @@ pub const State = struct {
     scope: ?Scope = null,
     pending: ?Reservation = null,
     pending_no_admission_receipt: ?[]const u8 = null,
+    epoch_retirement_next_member: ?u16 = null,
     superseded_payload: ?artifact_control.RecoveryManifest = null,
     payload_prewrite: ?PayloadPrewrite = null,
     payload_cleanup_cursor: ?[]const u8 = null,
@@ -486,6 +488,12 @@ pub const State = struct {
             if (self.pending == null or !self.pending.?.retain_payload or self.scope == null)
                 return error.InvalidSourceControl;
         }
+        if (self.epoch_retirement_next_member) |next_member| {
+            if (next_member == 0 or next_member > 1024 or self.pending_no_admission_receipt != null or
+                self.pending == null or !self.pending.?.retain_payload or
+                self.artifact_control == null or self.artifact_control.?.current == null or
+                self.artifact_control.?.current.?.phase != .sealed) return error.InvalidSourceControl;
+        }
         if (self.pending_no_admission_receipt) |receipt| {
             if (!text(receipt, 8192, false)) return error.InvalidSourceControl;
             const pending = self.pending orelse return error.InvalidSourceControl;
@@ -604,6 +612,7 @@ pub const Mutation = union(enum) {
     reclaim_superseded_payload: Digest,
     discard_fenced_pending: Digest,
     checkpoint_payload_cleanup: struct { manifest_digest: Digest, cursor: []const u8 },
+    checkpoint_epoch_retirement: struct { reservation_digest: Digest, next_member: u16 },
     fence_delivery_attempt: struct { reservation_digest: Digest, no_admission_receipt: []const u8 },
     retire_artifact: struct { reservation_digest: Digest, proof: Digest, reason: enum { unsealed, not_admitted, committed } },
     reclaim_artifact: struct { reservation_digest: Digest, proof: Digest },
@@ -658,6 +667,7 @@ pub const Mutation = union(enum) {
             .seal_artifact => |seal| if (!nonzero(seal.reservation_digest) or !nonzero(seal.stamp)) return error.InvalidSourceControl,
             .checkpoint_payload_cleanup => |progress| if (!nonzero(progress.manifest_digest) or !text(progress.cursor, max_payload_cleanup_cursor_bytes, true)) return error.InvalidSourceControl,
             .fence_unsealed_delivery_attempt, .reclaim_superseded_payload, .discard_fenced_pending => |id| if (!nonzero(id)) return error.InvalidSourceControl,
+            .checkpoint_epoch_retirement => |progress| if (!nonzero(progress.reservation_digest) or progress.next_member == 0 or progress.next_member > 1024) return error.InvalidSourceControl,
             .fence_delivery_attempt => |fence| if (!nonzero(fence.reservation_digest) or !text(fence.no_admission_receipt, 8192, false)) return error.InvalidSourceControl,
             .retire_artifact => |retirement| if (!nonzero(retirement.reservation_digest) or !nonzero(retirement.proof)) return error.InvalidSourceControl,
             .reclaim_artifact => |reclaimed| if (!nonzero(reclaimed.reservation_digest) or !nonzero(reclaimed.proof)) return error.InvalidSourceControl,
@@ -980,6 +990,7 @@ pub const Mutation = union(enum) {
                     return error.SourcePendingWork;
                 if (!std.meta.eql(pending.identity(scope), id)) return error.SourcePayloadConflict;
                 next.pending = null;
+                next.epoch_retirement_next_member = null;
                 next.pending_no_admission_receipt = null;
                 next.payload_cleanup_cursor = null;
             },
@@ -995,6 +1006,16 @@ pub const Mutation = union(enum) {
                 const receipt = try std.fmt.allocPrint(a, "metadata-unsealed-v1:{x}:{d}", .{ &id, state.revision });
                 next.artifact_control = try ledger.retire(id, digest(receipt));
                 next.pending_no_admission_receipt = receipt;
+            },
+            .checkpoint_epoch_retirement => |progress| {
+                const pending = state.pending orelse return error.SourcePendingWork;
+                const scope = state.scope orelse return error.SourceBindingConflict;
+                if (!std.meta.eql(pending.identity(scope), progress.reservation_digest)) return error.SourcePayloadConflict;
+                const previous = state.epoch_retirement_next_member orelse 0;
+                // At most one follower and the coordinator can be consumed
+                // in a single recovery turn.
+                if (progress.next_member <= previous or progress.next_member - previous > 2) return error.SourceControlConflict;
+                next.epoch_retirement_next_member = progress.next_member;
             },
             .fence_delivery_attempt => |fence| {
                 const pending = state.pending orelse return error.SourcePendingWork;
@@ -1016,6 +1037,7 @@ pub const Mutation = union(enum) {
                 if (ledger.current == null or ledger.current.?.phase != .sealed) return error.SourcePendingWork;
                 next.artifact_control = try ledger.retire(fence.reservation_digest, digest(fence.no_admission_receipt));
                 next.pending_no_admission_receipt = try a.dupe(u8, fence.no_admission_receipt);
+                next.epoch_retirement_next_member = null;
             },
             .retire_artifact => |retirement| {
                 const ledger = state.artifact_control orelse return error.SourcePendingWork;
@@ -1068,6 +1090,7 @@ pub const Mutation = union(enum) {
                 next.accepted = .{ .sequence = pending.sequence, .checkpoint = pending.checkpoint, .receipt_digest = digest(accepted.receipt), .reservation_digest = id, .reference = accepted.receipt };
                 if (state.superseded_payload != null) return error.SourcePendingWork;
                 next.pending = null;
+                next.epoch_retirement_next_member = null;
                 next.pending_no_admission_receipt = null;
                 if (accepted.commit_reference) |ref| {
                     const revision = next.revision;
@@ -1118,6 +1141,7 @@ pub const Mutation = union(enum) {
                 }
                 if (state.superseded_payload != null) return error.SourcePendingWork;
                 next.pending = null;
+                next.epoch_retirement_next_member = null;
                 next.pending_no_admission_receipt = null;
                 next.retired = true;
                 next.retired_reservation_digest = retirement.reservation_digest;
@@ -1796,7 +1820,7 @@ test "source control replans only proven unadmitted delivery while retaining log
 fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest") or std.mem.eql(u8, name, "retain_payload") or std.mem.eql(u8, name, "completion_wait_independent")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "checkpoint_transfer_merge_id") or std.mem.eql(u8, name, "checkpoint_transfer_target") or std.mem.eql(u8, name, "checkpoint_preparation") or std.mem.eql(u8, name, "checkpoint_install_receipt") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page") or std.mem.eql(u8, name, "payload_cleanup_cursor") or std.mem.eql(u8, name, "payload_prewrite") or std.mem.eql(u8, name, "superseded_payload") or std.mem.eql(u8, name, "pending_no_admission_receipt") or std.mem.eql(u8, name, "stream_failure") or std.mem.eql(u8, name, "completion_wait_since_ms") or std.mem.eql(u8, name, "completion_stalled_at_ms")) @field(value, name) != null else true;
+        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest") or std.mem.eql(u8, name, "retain_payload") or std.mem.eql(u8, name, "completion_wait_independent")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "checkpoint_transfer_merge_id") or std.mem.eql(u8, name, "checkpoint_transfer_target") or std.mem.eql(u8, name, "checkpoint_preparation") or std.mem.eql(u8, name, "checkpoint_install_receipt") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page") or std.mem.eql(u8, name, "payload_cleanup_cursor") or std.mem.eql(u8, name, "payload_prewrite") or std.mem.eql(u8, name, "superseded_payload") or std.mem.eql(u8, name, "epoch_retirement_next_member") or std.mem.eql(u8, name, "pending_no_admission_receipt") or std.mem.eql(u8, name, "stream_failure") or std.mem.eql(u8, name, "completion_wait_since_ms") or std.mem.eql(u8, name, "completion_stalled_at_ms")) @field(value, name) != null else true;
         if (include) {
             try stream.objectField(name);
             try stream.write(@field(value, name));
@@ -1819,6 +1843,7 @@ pub fn requiredProtocol(mutation: Mutation) u16 {
         .reserve => |reservation| if (reservation.retain_payload) retained_payload_protocol_version else if (reservation.retain_manifest) manifest_protocol_version else if (reservation.artifact != null) artifact_control.protocol_version else protocol_version,
         .replan => |plan| if (plan.retain_payload) retained_payload_protocol_version else if (plan.retain_manifest) manifest_protocol_version else if (plan.artifact != null) artifact_control.protocol_version else protocol_version,
         .fence_unsealed_delivery_attempt, .fence_delivery_attempt, .reclaim_superseded_payload, .checkpoint_payload_cleanup, .discard_fenced_pending => retained_payload_protocol_version,
+        .checkpoint_epoch_retirement => epoch_attempt_progress_protocol_version,
         .pin_payload_prewrite, .discard_payload_prewrite, .clear_payload_prewrite, .checkpoint_payload_prewrite => payload_prewrite_protocol_version,
         .seal_artifact, .retire_artifact, .reclaim_artifact => artifact_control.protocol_version,
         else => protocol_version,

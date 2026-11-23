@@ -166,6 +166,14 @@ pub const Port = struct {
         try self.acknowledgeParticipants(a, owner, fence, locator.table_name, transaction_id, &.{locator_bytes}, scope.context(), scope.deadline_ns);
     }
 
+    pub fn acknowledgeRetiredFollower(self: Port, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, coordinator_locator: []const u8, txn_id: types.TxnId, follower: []const u8, original: operation.RequestContext) !void {
+        const coordinator = local.api_local_transaction_contract.parseParticipantRef(coordinator_locator) orelse return error.InvalidParticipant;
+        if (std.mem.eql(u8, coordinator_locator, follower)) return error.InvalidParticipant;
+        try validateParticipantFence(owner, coordinator.group_id, fence);
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        try self.acknowledgeParticipants(a, owner, fence, coordinator.table_name, txn_id, &.{follower}, scope.context(), scope.deadline_ns);
+    }
+
     fn acknowledgeParticipants(self: Port, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, table: []const u8, txn_id: types.TxnId, participants: []const []const u8, context: operation.RequestContext, deadline_ns: u64) !void {
         return self.writeRequest(a, fence, owner, table, .{ .sync_level = .write, .transaction = .{ .acknowledge_many = .{ .txn_id = txn_id, .participants = participants } } }, context, deadline_ns);
     }
