@@ -14808,6 +14808,22 @@ test "actual Metal stage admits two learned audio arenas in one quiescent pause"
         compute.provider_impl.embeddinggemma2_cache_admission = cache;
         compute.provider_impl.audio_schedules[i] = plan;
     }
+    const baseline = pin.controller().snapshot();
+    const standby = limits.backend_limit_bytes - baseline.backendTotalBytes() - 1024;
+    var peer = try pin.controller().tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = standby }, false);
+    var peer_live = true;
+    defer if (peer_live) peer.release();
+    const cold_yields = timings.stage_yields;
+    try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}));
+    try std.testing.expectEqual(cold_yields + 1, timings.stage_yields);
+    try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+    try std.testing.expectEqual(baseline.backend_weight_bytes, pin.controller().snapshot().backend_weight_bytes);
+    for (compute.provider_impl.audio_schedules[0..keys.len]) |entry| {
+        const plan = entry orelse return error.MissingPreparedAudioCache;
+        try std.testing.expect(plan.bindings_ready and !plan.prepared and plan.arena == null);
+    }
+    peer.release();
+    peer_live = false;
     const yields = timings.stage_yields;
     try std.testing.expect(try prepare(hook.ptr, cb, &keys, &.{input}));
     try std.testing.expectEqual(yields + 1, timings.stage_yields);
