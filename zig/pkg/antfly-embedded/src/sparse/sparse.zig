@@ -2776,12 +2776,12 @@ pub const SparseIndex = struct {
         try self.refreshCounters();
     }
 
-    pub fn refreshChangedFromTip(self: *SparseIndex, keys: []const native_catalog_backend.Mutation) !void {
+    pub fn refreshPeerDelta(self: *SparseIndex, delta: []const native_catalog_backend.Mutation) !void {
         const backend = switch (self.owner) {
             .native_catalog => |backend| backend,
             else => return error.UnsupportedRefresh,
         };
-        try backend.refreshCommittedKeys(keys);
+        try backend.applyExternallyCommittedMutations(delta);
         try self.refreshCounters();
     }
 

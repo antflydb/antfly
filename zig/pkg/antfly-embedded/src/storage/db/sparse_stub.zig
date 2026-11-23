@@ -149,6 +149,10 @@ pub const SparseIndex = struct {
     pub fn installInlineSparsePublication(_: *SparseIndex, _: *InlineSparsePublication) !void {}
 
     /// Stub builds have no native-catalog sparse index.
+    pub fn refreshPeerDelta(_: *SparseIndex, _: []const @import("../native_catalog_backend.zig").Mutation) !void {
+        return error.UnsupportedRefresh;
+    }
+
     pub fn nativeCatalogScope(_: *const SparseIndex) ?[]const u8 {
         return null;
     }

@@ -2196,6 +2196,27 @@ pub const PersistentIndex = struct {
     /// Apply the changed records from a peer publication, including the
     /// segment additions and retirements made by a merge.
     pub fn refreshChangedFromTip(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !void {
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const delta = try alloc.dupe(native_catalog_backend.Mutation, changed);
+        const values = try alloc.alloc(?[]const u8, delta.len);
+        try backend.loadCommittedValues(alloc, delta, values);
+        for (delta, values) |*key, value| {
+            key.is_delete = value == null;
+            key.value = value orelse "";
+        }
+        return self.refreshPeerDelta(delta) catch |err| switch (err) {
+            error.UnsupportedRefresh => self.refreshFromTip(),
+            else => err,
+        };
+    }
+
+    pub fn refreshPeerDelta(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !void {
         if (!self.versioned or self.inline_in_flight.load(.acquire) != 0) return error.UnsupportedRefresh;
         const backend = switch (self.main_store_owner) {
             .native_catalog => |backend| backend,
@@ -2206,31 +2227,27 @@ pub const PersistentIndex = struct {
         const alloc = arena.allocator();
         var keys = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
         for (changed) |key| {
-            const namespace = key.namespace orelse return self.refreshFromTip();
+            const namespace = key.namespace orelse return error.UnsupportedRefresh;
             if (std.mem.eql(u8, namespace, native_catalog_backend.tip_namespace)) continue;
             if (!std.mem.eql(u8, namespace, dead_namespace) and
                 !std.mem.eql(u8, namespace, l0_namespace) and
                 !std.mem.eql(u8, namespace, runtimeNamespace(.deletions).name.?) and
                 !std.mem.eql(u8, namespace, runtimeNamespace(.segments).name.?) and
                 !std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?))
-                return self.refreshFromTip();
+                return error.UnsupportedRefresh;
             try keys.append(alloc, key);
         }
         if (keys.items.len == 0) return;
 
-        const values = try alloc.alloc(?[]const u8, keys.items.len);
-        try backend.loadCommittedValues(alloc, keys.items, values);
-        for (keys.items, values) |*key, value| {
+        for (keys.items) |key| {
             if (std.mem.eql(u8, key.namespace.?, runtimeNamespace(.meta).name.?) and std.mem.eql(u8, key.key, meta_text_storage_format)) {
-                const bytes = value orelse return error.UnsupportedRefresh;
-                if (bytes.len != 4 or std.mem.readInt(u32, bytes[0..4], .little) != text_storage_format_versions) return error.UnsupportedRefresh;
+                if (key.is_delete or key.value.len != 4 or std.mem.readInt(u32, key.value[0..4], .little) != text_storage_format_versions)
+                    return error.UnsupportedRefresh;
             }
             // Versioned segments derive liveness from the dead set. Merge
             // and reset still emit tombstones for legacy deletion bitmaps.
-            if (value != null and std.mem.eql(u8, key.namespace.?, runtimeNamespace(.deletions).name.?))
-                return self.refreshFromTip();
-            key.is_delete = value == null;
-            key.value = value orelse "";
+            if (!key.is_delete and std.mem.eql(u8, key.namespace.?, runtimeNamespace(.deletions).name.?))
+                return error.UnsupportedRefresh;
         }
 
         self.lockStorage();
@@ -9560,9 +9577,17 @@ test "persistent index applies peer level-0, merge and rebuild deltas" {
     const second = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:a", .term = "beta", .version = newer }});
     defer alloc.free(second);
 
+    // The pinned cut contains this segment even though the live sink does
+    // not. Peer refresh must install the supplied value without rereading it.
+    try index.refreshPeerDelta(&.{.{ .namespace = l0_namespace, .key = &old_key, .value = first }});
+    {
+        const snapshot = index.writer.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+        try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+    }
     try sink.foreignPut(l0_namespace, &old_key, first);
     try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(older));
-    try index.refreshChangedFromTip(&.{.{ .namespace = l0_namespace, .key = &old_key }});
 
     var dead = roaring.RoaringBitmap.init(alloc);
     defer dead.deinit();

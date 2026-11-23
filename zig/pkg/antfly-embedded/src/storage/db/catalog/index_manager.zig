@@ -17457,7 +17457,7 @@ pub const IndexManager = struct {
                 if (!std.mem.eql(u8, owned, scope)) continue;
                 const name = try self.alloc.dupe(u8, entry.config.name);
                 defer self.alloc.free(name);
-                return self.refreshSparseIndexFromTipCatalogLocked(name, keys);
+                return self.refreshSparseIndexFromTipCatalogLocked(name, scope, keys, file);
             }
             for (self.graph_indexes.items) |*entry| {
                 const forward = entry.index.forwardCatalogScope() orelse continue;
@@ -17503,7 +17503,10 @@ pub const IndexManager = struct {
         var guard = try self.lockManagedIndexApply(.{ .name = name, .kind = .full_text });
         defer guard.unlock();
         const entry = self.textIndexEntry(name) orelse return .reopen;
-        entry.persistent.refreshChangedFromTip(keys) catch |err| switch (err) {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const delta = try readScopeDelta(arena.allocator(), file, scope, keys);
+        entry.persistent.refreshPeerDelta(delta) catch |err| switch (err) {
             error.UnsupportedRefresh => return .reopen,
             else => return err,
         };
@@ -17511,11 +17514,14 @@ pub const IndexManager = struct {
     }
 
     /// Caller holds the catalog shared; this takes the index's own mutex.
-    fn refreshSparseIndexFromTipCatalogLocked(self: *IndexManager, name: []const u8, keys: []const @import("../../native_catalog_backend.zig").Mutation) !ScopeRefresh {
+    fn refreshSparseIndexFromTipCatalogLocked(self: *IndexManager, name: []const u8, scope: []const u8, keys: []const native_catalog_backend.Mutation, file: *RefreshFile) !ScopeRefresh {
         const entry = self.sparseIndex(name) orelse return .reopen;
         self.lockAtomicWithBackoff(entry.apply_mutex);
         defer entry.apply_mutex.unlock();
-        entry.index.refreshChangedFromTip(keys) catch |err| switch (err) {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const delta = try readScopeDelta(arena.allocator(), file, scope, keys);
+        entry.index.refreshPeerDelta(delta) catch |err| switch (err) {
             error.UnsupportedRefresh => return .reopen,
             else => return err,
         };
