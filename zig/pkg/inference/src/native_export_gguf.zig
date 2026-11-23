@@ -536,7 +536,11 @@ const ExportScratchDir = struct {
         while (true) {
             var nonce: u64 = undefined;
             io.random(@ptrCast(&nonce));
-            const name = ".antfly-export-" ++ std.fmt.hex(nonce);
+            const prefix = ".antfly-export-";
+            const suffix = std.fmt.hex(nonce);
+            var name: [prefix.len + suffix.len]u8 = undefined;
+            @memcpy(name[0..prefix.len], prefix);
+            @memcpy(name[prefix.len..], &suffix);
             const permissions: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o700) else .default_dir;
             parent.createDir(io, &name, permissions) catch |err| switch (err) {
                 error.PathAlreadyExists => continue,
