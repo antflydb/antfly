@@ -20690,20 +20690,15 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     const out = try self.createEmbeddingGemma2Tensor(first_input.shape, .f32);
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
-    var published_directly = false;
-    const stable_inputs = replay or capture;
-    const input_bank = if (stable_inputs) try audioBufferView(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
+    const published_directly = !replay and !capture and output.bytes == output_bytes;
+    if (published_directly) try execution_scope.?.bindPublishedOutput(tensorFromCt(out).buffer.ptr, output_bytes);
+    const input_bank = if (replay or capture) try audioBufferView(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
     defer arena.noteUse(&self.ctx);
-    if (arena.timing == null) arena.timing = self.ctx.createProfileEventPair() catch null;
-    if (arena.timing_replay == null) if (arena.timing) |pair| try self.ctx.recordProfileStart(pair);
-    if (stable_inputs) for (inputs, spans) |ct, span| {
-        const destination = try audioBufferView(input_bank, span.offset, span.bytes);
-        try copyFromDeviceTracked(self, destination, tensorFromCt(ct).buffer, span.bytes);
-    };
-    if (replay) {
-        try arena.launch(&self.ctx);
-        self.audio_graph_replays += 1;
-    } else {
+    if (!capture_sample) {
+        if (arena.timing == null) arena.timing = self.ctx.createProfileEventPair() catch null;
+        if (arena.timing_replay == null) if (arena.timing) |pair| try self.ctx.recordProfileStart(pair);
+    }
+    if (!replay) {
         // Eager execution borrows the same logical input spans from the caller.
         // Recording binds them to the cache's fixed addresses.
         const scope = &execution_scope.?;
@@ -20721,10 +20716,6 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             view.owns_shape = false;
             stable[count] = borrowed;
             count += 1;
-        }
-        if (!capture and output.bytes == output_bytes) {
-            try scope.bindPublishedOutput(tensorFromCt(out).buffer.ptr, output_bytes);
-            published_directly = true;
         }
         if (capture) self.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED) catch {
             arena.disabled = true;
@@ -20763,8 +20754,17 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
                 entry.disabled = true;
                 return null;
             };
-            try arena.launch(&self.ctx);
         }
+    }
+    if (replay or capture) {
+        // Capture only records the stable addresses. Stage bytes after a
+        // successful recording and immediately before the common launch.
+        for (inputs, spans) |ct, span| {
+            const destination = try audioBufferView(input_bank, span.offset, span.bytes);
+            try copyFromDeviceTracked(self, destination, tensorFromCt(ct).buffer, span.bytes);
+        }
+        try arena.launch(&self.ctx);
+        if (replay) self.audio_graph_replays += 1;
     }
     if (!published_directly) {
         const result = try audioBufferView(arena.buffers[0], output.offset, output_bytes);
@@ -20772,9 +20772,9 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     // Include the publication copy in replay samples. The direct ordinary
     // route already publishes its result as part of the measured work.
-    if (arena.timing_replay == null) if (arena.timing) |pair| {
+    if (!capture_sample and arena.timing_replay == null) if (arena.timing) |pair| {
         try self.ctx.recordProfileEnd(pair);
-        arena.timing_replay = if (capture_sample) null else replay;
+        arena.timing_replay = replay;
     };
     self.audio_arena_executes += 1;
     out_owned = false;
@@ -60169,6 +60169,10 @@ test "public source audio linear recreates input bank through actual learning ca
         cb: ops.ComputeBackend,
         calls: usize = 0,
         output_pointer: driver_mod.CUdeviceptr = 0,
+        fn cancel(_: *anyopaque, _: []const CT) !CT {
+            return error.Cancelled;
+        }
+
         fn call(raw: *anyopaque, inputs: []const CT) !CT {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
@@ -60204,6 +60208,13 @@ test "public source audio linear recreates input bank through actual learning ca
         defer cb.free(projected);
         const ordinary_pointer = compute.source_linear_scratch.buffer.ptr;
         try std.testing.expect(ordinary_pointer != 0 and compute.source_linear_scratch.active);
+        if (iteration == 2) {
+            // Learning is complete. A cancelled recording must leave no
+            // input staging copies, and the next recording can still succeed.
+            const copies_before = compute.stats.d2d_bytes;
+            try std.testing.expectError(error.Cancelled, cb.audioExecution(0x303, &.{ projected, identity }, &run, Run.cancel));
+            try std.testing.expectEqual(copies_before, compute.stats.d2d_bytes);
+        }
         const before_calls = run.calls;
         var transfers = transfer_audit.Audit{};
         const output = observed: {
