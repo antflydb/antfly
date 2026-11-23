@@ -2066,14 +2066,23 @@ const Projections = struct {
     q: CT,
     k: CT,
     v: CT,
+    wrote_cache_banks: bool = false,
 };
 
-fn projectQkv(cb: *const ComputeBackend, w: *const LayerWeights, normed: CT, rows: usize, d_model: usize, profile: *StepProfile) !Projections {
+fn projectQkv(cb: *const ComputeBackend, w: *const LayerWeights, normed: CT, rows: usize, d_model: usize, profile: *StepProfile, cache_row: ?@import("../ops/kernel_backend.zig").QkvCacheRow) !Projections {
     if (profile.assigned) |schedule| {
         const q = [3]CT{ normed, w.q.w, w.q.b orelse w.q.w };
         const k = [3]CT{ normed, w.k.w, w.k.b orelse w.k.w };
         const v = [3]CT{ normed, w.v.w, w.v.b orelse w.v.w };
-        const projected = try schedule.executeQkv(.{ q[0..if (w.q.b == null) 2 else 3], k[0..if (w.k.b == null) 2 else 3], v[0..if (w.v.b == null) 2 else 3] });
+        const operands = [3][]const CT{ q[0..if (w.q.b == null) 2 else 3], k[0..if (w.k.b == null) 2 else 3], v[0..if (w.v.b == null) 2 else 3] };
+        if (cache_row) |cache| {
+            if (try schedule.executeQkvCacheRow(operands, cache)) |query| {
+                profile.fused_qkv += 1;
+                profile.in_place_kv += 1;
+                return .{ .q = query, .k = cache.keys, .v = cache.values, .wrote_cache_banks = true };
+            }
+        }
+        const projected = try schedule.executeQkv(operands);
         return .{ .q = projected.first, .k = projected.second, .v = projected.third };
     }
     if (w.qkv_slots) |slots| {
@@ -2131,8 +2140,11 @@ fn decoderBlockCached(
     // no blit splits the command sequence.
     var proj: Projections = undefined;
     var in_place = false;
-    var borrowed_cache_banks = false;
-    if (cache.preallocated() and w.qkv_slots != null and total <= cache.capacity) {
+    const cache_row: ?@import("../ops/kernel_backend.zig").QkvCacheRow = if (cache.preallocated() and start != 0 and dec_seq == 1 and total <= cache.capacity)
+        .{ .keys = layer_cache.k_self.?, .values = layer_cache.v_self.?, .position = start, .capacity = cache.capacity }
+    else
+        null;
+    if (profile.assigned == null and cache.preallocated() and w.qkv_slots != null and total <= cache.capacity) {
         const slots = w.qkv_slots.?;
         const request = ops.DecoderRuntimeApplyLinearQkvRequest{
             .q_slot = slots[0],
@@ -2143,12 +2155,9 @@ fn decoderBlockCached(
             .q_out_dim = d_model,
             .kv_out_dim = d_model,
         };
-        if (start != 0 and dec_seq == 1 and profile.assigned == null) {
-            const keys = layer_cache.k_self.?;
-            const values = layer_cache.v_self.?;
-            if (try dense_backend.projectionQkvCacheRow(cb, &request, .{ .keys = keys, .values = values, .position = start, .capacity = cache.capacity }, null)) |q| {
-                proj = .{ .q = q, .k = keys, .v = values };
-                borrowed_cache_banks = true;
+        if (cache_row) |row| {
+            if (try dense_backend.projectionQkvCacheRow(cb, &request, row, null)) |q| {
+                proj = .{ .q = q, .k = row.keys, .v = row.values, .wrote_cache_banks = true };
                 in_place = true;
                 profile.fused_qkv += 1;
                 profile.in_place_kv += 1;
@@ -2180,8 +2189,11 @@ fn decoderBlockCached(
             dst_live = false;
         }
     }
-    if (!in_place) proj = try projectQkv(cb, w, normed, dec_seq, d_model, profile);
-    var kv_consumed = borrowed_cache_banks;
+    if (!in_place) {
+        proj = try projectQkv(cb, w, normed, dec_seq, d_model, profile, cache_row);
+        in_place = proj.wrote_cache_banks;
+    }
+    var kv_consumed = proj.wrote_cache_banks;
     defer {
         stepRelease(cb, profile, proj.q);
         if (!kv_consumed) {
@@ -2202,12 +2214,16 @@ fn decoderBlockCached(
         // Slabs take a copy of the fresh rows unless they were projected in
         // place; concatenation copies too. In every case the projections
         // are released with this block.
-        const k_rows = if (in_place)
+        const k_rows = if (proj.wrote_cache_banks and profile.assigned != null)
+            CachedRows{ .tensor = proj.k, .owned_view = false }
+        else if (in_place)
             CachedRows{ .tensor = try cb.sliceRows2D(allocator, layer_cache.k_self.?, 0, total, d_model), .owned_view = true }
         else
             try appendSelfCache(cb, allocator, cache, &layer_cache.k_self, proj.k, start, dec_seq, d_model, profile.assigned != null);
         defer if (k_rows.owned_view) stepRelease(cb, profile, k_rows.tensor);
-        const v_rows = if (in_place)
+        const v_rows = if (proj.wrote_cache_banks and profile.assigned != null)
+            CachedRows{ .tensor = proj.v, .owned_view = false }
+        else if (in_place)
             CachedRows{ .tensor = try cb.sliceRows2D(allocator, layer_cache.v_self.?, 0, total, d_model), .owned_view = true }
         else
             try appendSelfCache(cb, allocator, cache, &layer_cache.v_self, proj.v, start, dec_seq, d_model, profile.assigned != null);

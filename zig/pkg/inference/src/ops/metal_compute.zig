@@ -12575,7 +12575,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             return false;
         }
-        const table: region.Owned.VTable = .{ .pinned_input = pinnedInput, .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = @This().deinit };
+        fn dispatchQkvCacheRow(raw: *anyopaque, invocation: region.Invocation) !region.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.count != 3 or self.packed_request != null or invocation.workspace != null) return error.UnsupportedDenseSchedule;
+            for (invocation.validation.inputs, invocation.inputs) |binding, value| {
+                if (binding == .tensor and binding.tensor.value != value) return error.PreparedRegionBindingChanged;
+            }
+            const q: *const PreparedDenseLinear = @ptrCast(@alignCast(self.linears[0].context));
+            const k: *const PreparedDenseLinear = @ptrCast(@alignCast(self.linears[1].context));
+            const v: *const PreparedDenseLinear = @ptrCast(@alignCast(self.linears[2].context));
+            const q_dims = q.descriptor.operation.linear;
+            const k_dims = k.descriptor.operation.linear;
+            const v_dims = v.descriptor.operation.linear;
+            if (q_dims.rows != 1 or k_dims.rows != 1 or v_dims.rows != 1 or
+                q_dims.in_dim != k_dims.in_dim or q_dims.in_dim != v_dims.in_dim or k_dims.out_dim != v_dims.out_dim) return error.PreparedRegionBindingChanged;
+            const output = invocation.outputs[0];
+            try self.compute.validateProjectionOutput(try self.tensor(output.tensor), output.authority orelse return error.InvalidPhysicalStorageAuthority);
+            _ = (try denseDecoderProjectionQkvCacheRow(self.compute, &.{
+                .q_slot = q.slot,
+                .k_slot = k.slot,
+                .v_slot = v.slot,
+                .input = invocation.inputs[0],
+                .in_dim = q_dims.in_dim,
+                .q_out_dim = q_dims.out_dim,
+                .kv_out_dim = k_dims.out_dim,
+            }, invocation.qkv_cache_row.?, output.tensor)) orelse return error.PreparedRegionBindingChanged;
+            return .completed;
+        }
+
+        const table: region.Owned.VTable = .{ .pinned_input = pinnedInput, .matches = matches, .validate = validate, .dispatch = dispatch, .dispatch_qkv_cache_row = dispatchQkvCacheRow, .deinit = @This().deinit };
     };
     const DenseRegionReadiness = struct {
         const region = @import("../execution/region_route.zig");
@@ -56046,6 +56074,21 @@ const PreparedDenseRegionFixture = struct {
                     defer a.free(actual);
                     for (actual, wants) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
                 }
+                if (installed.outputs.len == 3) {
+                    const untouched: [128]f32 = @splat(-11);
+                    const keys = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&untouched, &.{ 2, 64 }));
+                    defer cb.free(keys);
+                    const vals = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&untouched, &.{ 2, 64 }));
+                    defer cb.free(vals);
+                    const query = try frame.executeProgramQkvCacheRow(installed, bound_values, .{ .keys = keys, .values = vals, .position = 1, .capacity = 2 });
+                    try std.testing.expectEqual(bound_values[installed.outputs[0].slot.node].?, query);
+                    for ([_]CT{ keys, vals }, expected[1..3]) |bank, want| {
+                        const actual = try cb.toFloat32(bank, a);
+                        defer a.free(actual);
+                        try std.testing.expectEqualSlices(f32, untouched[0..64], actual[0..64]);
+                        for (actual[64..], want) |found, reference_value| try std.testing.expectApproxEqAbs(reference_value, found, 0.0001);
+                    }
+                }
             }
             return;
         }
@@ -56317,11 +56360,11 @@ const PreparedDenseRegionFixture = struct {
                 }
             }
             try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..count], true, false);
+            const outputs = graph.outputs.items;
+            outputs[0] = try builder.neg(outputs[0]);
+            for (expected[0]) |*value| value.* = -value.*;
+            try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..count], false, true);
             if (count == 2) {
-                const outputs = graph.outputs.items;
-                outputs[0] = try builder.neg(outputs[0]);
-                for (expected[0]) |*value| value.* = -value.*;
-                try runInstalled(cb, &graph, nodes[0..parameters], values[0..parameters], expected[0..2], false, true);
                 graph.outputs.items.len = 1;
                 try runInstalled(cb, &graph, nodes[0..3], values[0..3], expected[0..1], false, false);
             }

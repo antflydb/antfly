@@ -900,7 +900,7 @@ pub const Schedule = struct {
     }
     /// Consume a semantic projection group with one cursor contract. Validate
     /// all member operands before submitting the first numerical operation.
-    pub fn executeQkv(self: *Schedule, inputs: [3][]const CT) !ops.LinearTripleResult {
+    fn validateQkv(self: *const Schedule, inputs: [3][]const CT) ![]const ml.graph.NodeId {
         if (self.cursor > self.steps.len or self.steps.len - self.cursor < inputs.len) return error.DenseScheduleOrderChanged;
         const members = self.steps[self.cursor..][0..inputs.len];
         const activation = self.graph.node(members[0]).inputs[0];
@@ -914,11 +914,44 @@ pub const Schedule = struct {
                 if (self.graph.node(source).op != .parameter or self.values[source] != value) return error.PreparedKernelBindingChanged;
             }
         }
+        return members;
+    }
+
+    fn validateQkvRegion(installed: *const @import("region_binding.zig").Installed, members: []const ml.graph.NodeId) !void {
+        if (!std.mem.eql(ml.graph.NodeId, installed.owner.covered_nodes, members) or installed.outputs.len != members.len)
+            return error.DenseScheduleOrderChanged;
+        for (installed.outputs, members) |output, member| if (output.slot.node != member) return error.DenseScheduleOrderChanged;
+    }
+
+    /// The receiving prefix must refer to the same admitted cache banks.
+    pub fn executeQkvCacheRow(self: *Schedule, inputs: [3][]const CT, cache: @import("../ops/kernel_backend.zig").QkvCacheRow) !?CT {
+        if (self.backend.kind() != .metal) return null;
+        const members = try self.validateQkv(inputs);
+        const installed = self.selected.pool.regionAtEntry(members[0]) orelse return null;
+        if (installed.owner.vtable.dispatch_qkv_cache_row == null) return null;
+        try validateQkvRegion(installed, members);
+        const next = self.cursor + members.len;
+        if (next >= self.steps.len) return error.DenseScheduleOrderChanged;
+        const next_id = self.steps[next];
+        const descriptor = self.descriptors[next_id] orelse return error.DenseScheduleOrderChanged;
+        if (descriptor.operation != .dense_attention_prefix) return null;
+        const receiving = self.graph.node(next_id);
+        if (receiving.inputs[0] != members[0] or self.values[receiving.inputs[1]] != cache.keys or self.values[receiving.inputs[2]] != cache.values or
+            descriptor.operation.dense_attention_prefix.max_key_rows != cache.capacity or cache.position >= cache.capacity)
+            return error.PreparedDensePrefixBindingChanged;
+        const frame = self.frame orelse return error.DenseScheduleNotEntered;
+        self.values[self.graph.node(members[0]).inputs[0]] = inputs[0][0];
+        const query = try frame.executeProgramQkvCacheRow(installed, self.values, cache);
+        self.cursor = next;
+        return query;
+    }
+
+    pub fn executeQkv(self: *Schedule, inputs: [3][]const CT) !ops.LinearTripleResult {
+        const members = try self.validateQkv(inputs);
+        const activation = self.graph.node(members[0]).inputs[0];
         if (self.selected.pool.regionAtEntry(members[0])) |installed| {
             const frame = self.frame orelse return error.DenseScheduleNotEntered;
-            if (!std.mem.eql(ml.graph.NodeId, installed.owner.covered_nodes, members) or installed.outputs.len != members.len)
-                return error.DenseScheduleOrderChanged;
-            for (installed.outputs, members) |output, member| if (output.slot.node != member) return error.DenseScheduleOrderChanged;
+            try validateQkvRegion(installed, members);
             self.values[activation] = inputs[0][0];
             const outputs = try frame.executeProgramRegion(installed, self.values);
             self.cursor += members.len;

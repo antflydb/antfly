@@ -120,6 +120,9 @@ pub const Invocation = struct {
     workspace: ?ops.CT = null,
     host_workspace: []u8 = &.{},
     prepared_resources: ?*const AssignedResources = null,
+    /// Optional persistent destination for the K/V members of a row QKV.
+    /// Only an explicit provider callback can consume this capability.
+    qkv_cache_row: ?@import("../ops/kernel_backend.zig").QkvCacheRow = null,
 };
 
 pub const AssignedResources = struct {
@@ -160,6 +163,7 @@ pub const Owned = struct {
         /// Runs the same tuned implementation selected by this owner. An error
         /// is committed/uncertain and always propagates; it never means decline.
         dispatch: *const fn (*anyopaque, Invocation) anyerror!Outcome,
+        dispatch_qkv_cache_row: ?*const fn (*anyopaque, Invocation) anyerror!Outcome = null,
         deinit: *const fn (*anyopaque) void,
     };
 
@@ -217,7 +221,11 @@ pub const Owned = struct {
         try self.validate(request.validation);
         try self.validateAssigned(request);
         if (request.prepared_resources) |resources| try resources.validate(resources.context, request);
-        const outcome = try self.vtable.dispatch(self.context, request);
+        const apply = if (request.qkv_cache_row != null)
+            self.vtable.dispatch_qkv_cache_row orelse return error.UnsupportedDenseSchedule
+        else
+            self.vtable.dispatch;
+        const outcome = try apply(self.context, request);
         if (outcome == .declined_before_submission and self.requirements.replacementEligible()) return error.PreparedRegionDeclined;
         return outcome;
     }

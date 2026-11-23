@@ -3039,6 +3039,15 @@ pub const Frame = struct {
     }
 
     pub fn executeProgramRegion(self: *Frame, installed: *const @import("region_binding.zig").Installed, values: []const ?CT) ![]const @import("region_route.zig").Assigned {
+        return self.executeProgramRegionBound(installed, values, null);
+    }
+
+    pub fn executeProgramQkvCacheRow(self: *Frame, installed: *const @import("region_binding.zig").Installed, values: []const ?CT, cache: @import("../ops/kernel_backend.zig").QkvCacheRow) !CT {
+        if (installed.owner.vtable.dispatch_qkv_cache_row == null or installed.outputs.len != 3) return error.UnsupportedDenseSchedule;
+        return (try self.executeProgramRegionBound(installed, values, cache))[0].tensor;
+    }
+
+    fn executeProgramRegionBound(self: *Frame, installed: *const @import("region_binding.zig").Installed, values: []const ?CT, cache: ?@import("../ops/kernel_backend.zig").QkvCacheRow) ![]const @import("region_route.zig").Assigned {
         const node = installed.owner.entry_node;
         if (self.pool.regionAtEntry(node) != installed) return error.PreparedRegionOwnerChanged;
         const index = self.pool.region_by_node[node];
@@ -3055,7 +3064,7 @@ pub const Frame = struct {
             if (input >= values.len) return error.PreparedRegionBindingChanged;
             actual.* = if (fact == .tensor) fact.tensor.value else values[input] orelse return error.MissingValue;
         }
-        try self.dispatchBoundRegion(installed, index, facts[0..count], inputs[0..count], try self.regionDispatchPolicy(installed), bound);
+        try self.dispatchBoundRegion(installed, index, facts[0..count], inputs[0..count], try self.regionDispatchPolicy(installed), bound, cache);
         return bound.outputs[0..bound.output_count];
     }
 
@@ -3067,11 +3076,11 @@ pub const Frame = struct {
         const backend = self.pool.backends[installed.backend_index];
         var bound = try self.acquireRegionOutputs(&backend, installed, facts, policy);
         errdefer bound.deinit();
-        try self.dispatchBoundRegion(installed, index, facts, inputs, policy, &bound);
+        try self.dispatchBoundRegion(installed, index, facts, inputs, policy, &bound, null);
         return bound;
     }
 
-    fn dispatchBoundRegion(self: *Frame, installed: *const @import("region_binding.zig").Installed, index: usize, facts: []const route.Binding, inputs: []const CT, policy: u64, bound: *const @import("region_binding.zig").Bound) !void {
+    fn dispatchBoundRegion(self: *Frame, installed: *const @import("region_binding.zig").Installed, index: usize, facts: []const route.Binding, inputs: []const CT, policy: u64, bound: *const @import("region_binding.zig").Bound, cache: ?@import("../ops/kernel_backend.zig").QkvCacheRow) !void {
         const region = @import("region_route.zig");
         const backend = self.pool.backends[installed.backend_index];
         if (!self.in_use or self.claimed or index >= self.region_claims.len) return error.InvalidPreparedRegionClaim;
@@ -3080,6 +3089,7 @@ pub const Frame = struct {
         var invocation = bound.invocation(.{ .context = backend.ptr, .table = backend.vtable }, policy, facts, inputs);
         invocation.validation.payload_claim = claim;
         invocation.validation.operation = self.scope_cleanup.operation;
+        invocation.qkv_cache_row = cache;
         // Preparing resources can itself submit packing/probe work. A thrown
         // error from here therefore requires checked drain before releasing pins.
         self.region_started[index] = true;
