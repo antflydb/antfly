@@ -430,7 +430,8 @@ fn loadMode(store: *transactions.DurableSessionStore, a: A, id: [32]u8, comptime
 const Change = union(enum) {
     create: struct { value: Record, now_ms: u64 },
     replace: struct { revision: u64, prior_digest: [32]u8, next: Record },
-    begin_observed: struct { revision: u64, prior_digest: [32]u8, next: Record },
+    begin_observed: struct { revision: u64, prior_digest: [32]u8, next: Record, now_ms: u64, native_transaction: bool },
+    handoff_renewal: struct { revision: u64, instance: Id, now_ms: u64, head: u64, nonce: Id },
     take: struct { revision: u64, prior_digest: [32]u8, ticket: Ticket },
     temporary_owner: struct { owner: TemporaryOwner, fence: authority.scopes.CommandFence, database: []const u8, now_ms: u64 },
     temporary_progress: struct { revision: u64, prior_digest: [32]u8, retirement: ?TemporaryRetirement },
@@ -503,9 +504,26 @@ fn changeTxn(a: A, txn: anytype, id: [32]u8, principal: []const u8, node: u64, a
             if (!std.meta.eql(old.temporary_owner, update.next.temporary_owner) or !std.meta.eql(old.temporary_retirement, update.next.temporary_retirement)) return error.InvalidSqlConnection;
             if (old.revision != update.revision or !std.mem.eql(u8, &try digest(a, old), &update.prior_digest)) return error.SqlConnectionChanged;
             if (old.phase != .idle or old.pending != null or old.temporary_retirement != null or old.recovery or live.state == .beginning or live.state == .uncertain) return error.SqlConnectionBusy;
+            try live.requireOwner(&id, principal, node, update.now_ms);
+            if (!std.mem.eql(u8, &old.instance, &update.next.instance) and live.wire_epoch != null and
+                (update.native_transaction or !canHandOffIdle(live, old, update.now_ms))) return error.SqlConnectionNotFound;
             if (update.next.phase != .beginning or !std.meta.eql(old.registration, update.next.registration) or
                 old.next_command != update.next.next_command or update.next.revision != old.revision + 1) return error.InvalidSqlConnection;
             break :blk update.next;
+        },
+        .handoff_renewal => |update| blk: {
+            const live = (connection orelse return error.SqlConnectionNotFound).value;
+            var next = if (previous) |value| value.value else return error.SqlConnectionNotFound;
+            if (next.revision != update.revision) return error.SqlConnectionChanged;
+            if (!canHandOffIdle(live, next, update.now_ms)) return error.SqlConnectionBusy;
+            next.instance = update.instance;
+            next.revision = std.math.add(u64, next.revision, 1) catch return error.SqlProgramLimitExceeded;
+            next.pending = next.controlRequest(update.head, update.nonce, .{ .renew = .{
+                .expected_expiry = next.registration.lease.expires_at_ms,
+                .expires_at_ms = update.now_ms +| execution_lease_ms,
+                .observed_at_ms = update.now_ms,
+            } });
+            break :blk next;
         },
         .temporary_progress => |update| blk: {
             var old = if (previous) |value| value.value else return error.SqlConnectionNotFound;
@@ -609,7 +627,13 @@ pub fn beginObserved(store: *transactions.DurableSessionStore, a: A, principal: 
     next.phase = .beginning;
     next.pending = next.controlRequest(observed.value.head, nonce, .{ .begin = command });
     next.revision = std.math.add(u64, prior.revision, 1) catch return error.SqlProgramLimitExceeded;
-    try change(store, prior.registration.connection, principal, prior.registration.lease.node, .{ .begin_observed = .{ .revision = prior.revision, .prior_digest = try digest(a, prior), .next = next } });
+    try change(store, prior.registration.connection, principal, prior.registration.lease.node, .{ .begin_observed = .{
+        .revision = prior.revision,
+        .prior_digest = try digest(a, prior),
+        .next = next,
+        .now_ms = now_ms,
+        .native_transaction = scope.transaction != null,
+    } });
     return ticket;
 }
 /// Persist execution-start before returning authority. Neither retrying this
@@ -1177,6 +1201,7 @@ pub fn drainCurrentProcess(server: *@import("../../http_server.zig").ApiHttpServ
                 const prior = retained.value;
                 if (prior.registration.lease.node != node or !std.mem.eql(u8, &prior.instance, &instance)) continue;
                 if (prior.phase == .retired and prior.temporaryRetirementComplete()) continue;
+                if (try canRetainHttpSession(store, a, prior, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms)) continue;
                 pending = true;
                 requestRecovery(store, prior.principal, prior) catch |err| switch (err) {
                     error.SqlConnectionChanged => continue,
@@ -1205,6 +1230,64 @@ pub fn drainCurrentProcess(server: *@import("../../http_server.zig").ApiHttpServ
     return error.SqlRelationRecoveryIncomplete;
 }
 
+fn canResumeHttpControl(prior: Record, now_ms: u64) bool {
+    if (prior.recovery or prior.temporary_owner != null or prior.temporary_retirement != null or
+        prior.registration.lease.expires_at_ms <= now_ms) return false;
+    return switch (prior.phase) {
+        .idle => prior.pending == null or prior.pending.?.operation == .renew,
+        // The foreground has returned its execution permit. A replacement
+        // facade can deliver the exact control receipt without evaluating SQL.
+        .finishing => prior.control_effect == null and prior.pending != null and
+            (prior.pending.?.operation == .finish or prior.pending.?.operation == .renew),
+        else => false,
+    };
+}
+
+fn isDurableIdleHttp(connection: connections.Record, now_ms: u64) bool {
+    return connection.durable_http and connection.state == .idle and connection.expires_at_ms > now_ms;
+}
+
+fn canHandOffIdle(connection: connections.Record, prior: Record, now_ms: u64) bool {
+    return isDurableIdleHttp(connection, now_ms) and canResumeHttpControl(prior, now_ms) and
+        prior.phase == .idle and prior.pending == null;
+}
+
+fn handOffIdleRenewal(store: *transactions.DurableSessionStore, a: A, prior: Record, instance: Id, now_ms: u64, nonce: Id, port: Port) !void {
+    var observed = try port.snapshot(a, prior);
+    defer observed.deinit();
+    const scope = observed.value.scope orelse return error.SqlConnectionNotFound;
+    const owner = observed.value.owner orelse return error.InvalidSqlBackendResponse;
+    if (scope.state != .active or scope.registration.lease.expires_at_ms <= now_ms or scope.releasing or scope.command != null or scope.transaction != null or
+        owner.state != .active or owner.waiting != null or owner.job != null)
+    {
+        try requestRecovery(store, prior.principal, prior);
+        return;
+    }
+    try change(store, prior.registration.connection, prior.principal, prior.registration.lease.node, .{ .handoff_renewal = .{
+        .revision = prior.revision,
+        .instance = instance,
+        .now_ms = now_ms,
+        .head = observed.value.head,
+        .nonce = nonce,
+    } });
+    const pending = prior.controlRequest(observed.value.head, nonce, .{ .renew = .{
+        .expected_expiry = prior.registration.lease.expires_at_ms,
+        .expires_at_ms = now_ms +| execution_lease_ms,
+        .observed_at_ms = now_ms,
+    } });
+    if (try port.deliver(a, pending) == null) try acknowledgeRenewal(store, a, prior.principal, prior.registration.connection, pending);
+}
+
+fn canRetainHttpSession(store: *transactions.DurableSessionStore, a: A, prior: Record, now_ms: u64) !bool {
+    if (!canResumeHttpControl(prior, now_ms)) return false;
+    var connection = @import("connections.zig").load(store, a, prior.registration.connection, prior.principal, prior.registration.lease.node, now_ms) catch |err| switch (err) {
+        error.SqlConnectionNotFound => return false,
+        else => return err,
+    };
+    defer connection.deinit();
+    return isDurableIdleHttp(connection.value, now_ms);
+}
+
 /// Only a still-live local connection can lend its existing TEMP capsule to
 /// pending command control. Restart/retirement recovery deliberately stays on
 /// its independent sealed/retirement authority and never recreates that Owner.
@@ -1220,7 +1303,7 @@ fn backgroundControlOwner(store: *transactions.DurableSessionStore, a: A, prior:
     };
     defer current.deinit();
     if (current.value.expires_at_ms <= now_ms or current.value.state == .beginning or current.value.state == .uncertain or current.value.wire_epoch == null or
-        !std.mem.eql(u8, &current.value.wire_epoch.?, &instance)) return null;
+        (!current.value.durable_http and !std.mem.eql(u8, &current.value.wire_epoch.?, &instance))) return null;
     const actual = try @import("../catalog/relation_lifetimes.zig").ownerFromConnection(current.value, instance, node);
     if (!actual.eql(retained)) return null;
     return actual;
@@ -1292,11 +1375,18 @@ fn advanceConnectionWithContext(server: *@import("../../http_server.zig").ApiHtt
         };
         defer if (connection) |*value| value.deinit();
         if (connection) |value| if (value.value.wire_epoch) |epoch| {
-            if (!std.mem.eql(u8, &epoch, &instance)) {
+            const process = if (value.value.durable_http) prior.instance else epoch;
+            if (!std.mem.eql(u8, &process, &instance)) {
+                if (isDurableIdleHttp(value.value, now_ms) and canResumeHttpControl(prior, now_ms)) {
+                    if (prior.pending != null) {
+                        try advance(store, a, prior.principal, prior, instance, now_ms, nonce, native.port());
+                    } else if (due) try handOffIdleRenewal(store, a, prior, instance, now_ms, nonce, native.port());
+                    return;
+                }
                 try requestRecovery(store, prior.principal, prior);
                 return;
             }
-            if (prior.phase == .idle) try @import("connections.zig").keepWireAlive(store, a, connection_id, prior.principal, prior.registration.lease.node, instance, now_ms);
+            if (!value.value.durable_http and prior.phase == .idle) try @import("connections.zig").keepWireAlive(store, a, connection_id, prior.principal, prior.registration.lease.node, instance, now_ms);
         };
     }
     const live: ?Liveness = if (!due or !std.mem.eql(u8, &prior.instance, &instance) or prior.recovery or (prior.pending != null and prior.pending.?.operation == .renew)) null else switch (prior.phase) {

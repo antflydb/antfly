@@ -28,6 +28,9 @@ pub const State = enum { idle, beginning, active, uncertain };
 
 pub const Record = struct {
     wire_epoch: ?[16]u8 = null,
+    /// An idle HTTP connection can move between facade processes. Its native
+    /// command and TEMP ownership still carry independent process fences.
+    durable_http: bool = false,
     notification_pid: ?i32 = null,
     notification_listen_seen: bool = false,
 

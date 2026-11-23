@@ -21,6 +21,7 @@ const fixture = @import("../catalog_owner_test_fixture.zig");
 const http = @import("../../../http_server.zig");
 const users = @import("../../../../usermgr/mod.zig");
 const transport = @import("../../../../raft/transport/http_common.zig");
+const wire = @import("antfly_metadata_openapi").types;
 
 const Entry = struct {
     id: []const u8,
@@ -47,6 +48,13 @@ fn command(ctx: *fixture.Context, statement: []const u8, sqlstate: ?[]const u8) 
         defer parsed.deinit();
         try std.testing.expectEqualStrings(code, parsed.value.code);
     } else {
+        if (response.status == 202 and std.mem.startsWith(u8, statement, "DROP DATABASE ")) {
+            var accepted = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer accepted.deinit();
+            try std.testing.expectEqualStrings("DDL PENDING", accepted.value.command_tag);
+            try std.testing.expectEqual(@as(i64, 0), accepted.value.rows_affected);
+            return awaitDatabaseDrop(ctx, accepted.value.catalog_receipt orelse return error.MissingSqlDropToken);
+        }
         if (response.status != 200) std.debug.print("role default SQL failed statement={s} status={} body={s}\n", .{ statement, response.status, response.body });
         try std.testing.expectEqual(@as(u16, 200), response.status);
         var result = try std.json.parseFromSlice(struct { command_tag: []const u8, rows_affected: u64 }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
@@ -55,6 +63,33 @@ fn command(ctx: *fixture.Context, statement: []const u8, sqlstate: ?[]const u8) 
         try std.testing.expectEqualStrings(tag, result.value.command_tag);
         try std.testing.expectEqual(@as(u64, 0), result.value.rows_affected);
     }
+}
+
+fn awaitDatabaseDrop(ctx: *fixture.Context, receipt: wire.SQLCatalogOperationReceipt) !void {
+    try std.testing.expectEqual(.database, receipt.kind);
+    try std.testing.expectEqual(.drop, receipt.operation);
+    try std.testing.expectEqual(.pending, receipt.state);
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, wire.SQLCatalogRecoveryRequest{ .recovery_token = receipt.recovery_token }, .{});
+    defer ctx.alloc.free(body);
+    const platform_time = @import("antfly_platform").time;
+    const deadline = platform_time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (platform_time.monotonicNs() < deadline) {
+        var response = try @import("../owner_test_fixture.zig").requestWithTimeout(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.base, "/db/v1/sql/operations/status", .POST, body, 1000);
+        defer response.deinit(ctx.alloc);
+        if (response.status != 503 and response.status != 504) {
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var status = try std.json.parseFromSlice(wire.SQLCatalogOperationReceipt, ctx.alloc, response.body, .{});
+            defer status.deinit();
+            try std.testing.expectEqualStrings(receipt.recovery_token, status.value.recovery_token);
+            try std.testing.expectEqualStrings(receipt.database, status.value.database);
+            try std.testing.expectEqual(.database, status.value.kind);
+            try std.testing.expectEqual(.drop, status.value.operation);
+            if (status.value.state == .committed) return;
+            if (status.value.state == .rejected) return error.SqlDatabaseDropRejected;
+        }
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.SqlDatabaseDropPublicationTimeout;
 }
 
 fn open(ctx: *fixture.Context, headers: []const transport.RequestHeader) ![32]u8 {
@@ -102,7 +137,24 @@ fn expectQueryValue(ctx: *fixture.Context, headers: []const transport.RequestHea
     defer ctx.alloc.free(statement);
     var response = try send(ctx, headers, statement, id);
     defer response.deinit(ctx.alloc);
-    if (response.status != 200) std.debug.print("role default observation failed status={} body={s}\n", .{ response.status, response.body });
+    if (response.status != 200) {
+        std.debug.print("role default observation failed setting={s} expected={?s} status={} body={s}\n", .{ name, expected, response.status, response.body });
+        if (ctx.metadata.server.owned_public_http_server) |api| if (api.txn_sessions.durable) |store| {
+            const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+            if (@import("../../session/connections.zig").load(store, ctx.alloc, id.*, "app_writer", api.localSessionNodeId(), now)) |owned| {
+                var connection = owned;
+                defer connection.deinit();
+                std.debug.print("cold SQL logical connection state={t} durable_http={} ttl_ms={}\n", .{ connection.value.state, connection.value.durable_http, connection.value.expires_at_ms -| now });
+            } else |err| std.debug.print("cold SQL logical connection lookup failed: {t}\n", .{err});
+            if (@import("../../session/command_producer.zig").load(store, ctx.alloc, id.*)) |maybe_source| {
+                if (maybe_source) |owned| {
+                    var source = owned;
+                    defer source.deinit();
+                    std.debug.print("cold SQL command source phase={t} recovering={} safe_lease_ms={} temp={} pending={}\n", .{ source.value.phase, source.value.recovery, source.value.registration.lease.expires_at_ms -| now, source.value.temporary_owner != null, source.value.pending != null });
+                } else std.debug.print("cold SQL command source missing\n", .{});
+            } else |err| std.debug.print("cold SQL command source lookup failed: {t}\n", .{err});
+        };
+    }
     try std.testing.expectEqual(@as(u16, 200), response.status);
     var result = try std.json.parseFromSlice(struct { rows: []const []const std.json.Value }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
     defer result.deinit();
@@ -202,6 +254,7 @@ const Campaign = struct {
     }
 
     pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        errdefer std.debug.print("mounted role defaults failed before restart scoped_bootstrap={}\n", .{self.scoped_bootstrap});
         try command(ctx, "CREATE DATABASE appdb", null);
         const source = http.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
         const auth = try authorization(ctx);
@@ -314,6 +367,7 @@ const Campaign = struct {
     }
 
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        errdefer std.debug.print("mounted role defaults failed after restart scoped_bootstrap={}\n", .{self.scoped_bootstrap});
         const auth = try authorization(ctx);
         defer ctx.alloc.free(auth);
         const headers = [_]transport.RequestHeader{.{ .name = "authorization", .value = auth }};

@@ -8759,6 +8759,7 @@ pub const AntflyApiHandler = struct {
         @import("sql/session/connections.zig").create(store, &self.api_server.txn_sessions, .{
             .id = connection_id,
             .wire_epoch = try self.api_server.sql_connection_admission.executionInstance(self.api_server.embedding_provider_runtime.io),
+            .durable_http = true,
             .principal = principal,
             .owner_node_id = owner_node_id,
             .expires_at_ms = now_ms +| @import("sql/session/connection_record.zig").ttl_ms,

@@ -43,6 +43,7 @@ const Native = struct {
     database: []const u8 = "main",
     principal: []const u8 = "alice",
     wire_epoch: ?[16]u8 = null,
+    durable_http: bool = false,
     before: bool = false,
     after: bool = false,
     calls: usize = 0,
@@ -180,7 +181,7 @@ fn setup(metadata: *storage.RaftApplyStore, source: *transactions.DurableSession
     try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
     const node: u64 = if (standalone) 0 else 9;
     const created_at_ms = if (native.expiry_ms == 1000) 1 else native.expiry_ms - 60000;
-    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .wire_epoch = native.wire_epoch, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
+    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .wire_epoch = native.wire_epoch, .durable_http = native.durable_http, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
     const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = node, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = native.expiry_ms }, .connection = connection, .nonce = id(3), .standalone = standalone };
     try producer.create(source, native.principal, registration, actor, instance, try native.head(), native.nonce(), created_at_ms);
 }
@@ -463,7 +464,7 @@ test "SQL command producer native idle facade handoff stages one command and can
     defer metadata.deinit();
     var source = transactions.DurableSessionStore.init(a, &metadata.store);
     var peer = transactions.DurableSessionStore.init(a, &metadata.store);
-    var native: Native = .{ .metadata = &metadata };
+    var native: Native = .{ .metadata = &metadata, .wire_epoch = instance, .durable_http = true };
     try setup(&metadata, &source, false, &native);
     try native.until(&source, .idle, 2);
     var idle = (try producer.load(&source, a, connection)).?;
