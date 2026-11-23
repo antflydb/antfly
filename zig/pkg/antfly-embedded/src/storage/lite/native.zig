@@ -5358,6 +5358,7 @@ const LockFile = struct {
 
 pub const CreateOptions = struct {
     indexed_reclamation: bool = false,
+    versioned_text_required: bool = false,
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -7755,21 +7756,21 @@ pub const NativeFile = struct {
     }
 
     pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, false, false, null, "", false, false);
+        return try createWithMode(allocator, path, false, false, null, "", false, false, false);
     }
 
     pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, true, false, null, "", false, false);
+        return try createWithMode(allocator, path, true, false, null, "", false, false, false);
     }
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, opts.indexed_reclamation, opts.full_fsync);
+        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, opts.indexed_reclamation, opts.full_fsync, opts.versioned_text_required);
     }
 
     /// Creates a Lite file using a caller-owned std.Io runtime. The runtime
     /// must outlive the returned file.
     pub fn createWithIo(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, undefined, io, opts.indexed_reclamation, opts.full_fsync);
+        return try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, undefined, io, opts.indexed_reclamation, opts.full_fsync, opts.versioned_text_required);
     }
 
     /// Creates a file with a log-structured commit region (docs/design/
@@ -10471,10 +10472,11 @@ pub const NativeFile = struct {
         writer_lock_marker: []const u8,
         indexed: bool,
         full_fsync: bool,
+        versioned_text_required: bool,
     ) !NativeFile {
         var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
-        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, writer_lock_marker, io_impl, null, indexed, full_fsync);
+        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, writer_lock_marker, io_impl, null, indexed, full_fsync, versioned_text_required);
     }
 
     fn createWithRuntime(
@@ -10488,6 +10490,7 @@ pub const NativeFile = struct {
         borrowed_io: ?std.Io,
         indexed: bool,
         full_fsync: bool,
+        versioned_text_required: bool,
     ) !NativeFile {
         var owned_io_impl = io_impl;
         const io = borrowed_io orelse owned_io_impl.io();
@@ -10524,7 +10527,8 @@ pub const NativeFile = struct {
         }
 
         var encoded: [header_size]u8 = undefined;
-        encodeHeader(&encoded, .{});
+        var initialized_header: Header = .{ .versioned_text_required = versioned_text_required };
+        encodeHeader(&encoded, initialized_header);
 
         const replace_existing = !exclusive and pathExists(io, path);
         const replacement_path = if (replace_existing)
@@ -10560,7 +10564,6 @@ pub const NativeFile = struct {
         // decodePagePayload's magic check) until something actually
         // publishes to it.
         try file.setLength(io, reserved_header_pages * @as(u64, default_page_size));
-        var initialized_header: Header = .{};
         {
             var slot_buf: [max_page_size]u8 = undefined;
             const slot_page = slot_buf[0..default_page_size];
@@ -10569,7 +10572,7 @@ pub const NativeFile = struct {
         }
         if (indexed) {
             // Finish every fallible initialization step on the private inode.
-            var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = .{}, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
+            var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = initialized_header, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
             defer staged.invalidateLedger();
             defer staged.page_cache.deinit(allocator);
             // `staged` never goes through `close()` (it shares `file`/`path`/
@@ -42624,6 +42627,29 @@ test "lite header format fence migrates and survives a generation rewrite" {
     defer reader.close();
     try std.testing.expect(reader.header.versioned_text_required);
     const value = (try reader.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("retained", value);
+}
+
+test "lite header format fence reopens after uncertain migration publication" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "text-format-interrupted.aflite");
+    defer alloc.free(path);
+    {
+        var writer = try NativeFile.createWithIo(alloc, io, path, .{});
+        defer writer.close();
+        try writer.putDocument("doc", "retained");
+        writer.failNextGenerationDirectorySyncForTest();
+        try std.testing.expectError(error.OutcomeUnknown, writer.requireVersionedTextFormat());
+    }
+    var writer = try NativeFile.openWithIo(alloc, io, path, .{});
+    defer writer.close();
+    try writer.requireVersionedTextFormat();
+    try std.testing.expect(writer.header.versioned_text_required);
+    const value = (try writer.getDocumentAlloc(alloc, "doc")).?;
     defer alloc.free(value);
     try std.testing.expectEqualStrings("retained", value);
 }

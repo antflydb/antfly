@@ -2848,6 +2848,7 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
 pub const OpenOptions = struct {
     redo_recovery_base: ?native.RedoRecoveryCursor = null,
     externally_locked: bool = false,
+    require_versioned_text: bool = false,
     reclamation: reclamation.Options = .{},
     read_only: bool = false,
     no_sync: bool = false,
@@ -2870,6 +2871,7 @@ pub const OpenOptions = struct {
 
 pub const CreateOptions = struct {
     externally_locked: bool = false,
+    require_versioned_text: bool = false,
     reclamation: reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
@@ -3493,6 +3495,12 @@ pub const Store = struct {
             .maintenance_policy = policy,
             .maintenance_start_suppressed = true,
         };
+        if (opts.require_versioned_text and !opts.read_only) {
+            result.file.requireVersionedTextFormat() catch |err| {
+                result.close();
+                return err;
+            };
+        }
         if (opts.ride_along_idle_ns) |idle_ns| result.ride_along_idle_ns = idle_ns;
         if (opts.redo_idle_checkpoint_ns) |idle_ns| result.redo_idle_checkpoint_ns = idle_ns;
         errdefer result.close();
@@ -3520,6 +3528,7 @@ pub const Store = struct {
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !Store {
         const policy = try reclamation.Policy.init(opts.reclamation);
         const native_opts = native.CreateOptions{
+            .versioned_text_required = opts.require_versioned_text,
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
