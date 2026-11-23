@@ -939,6 +939,30 @@ pub const HandleGuard = struct {
     /// off an undurable tip. Only `leave`'s reacquire (which runs after the
     /// ticket this guard is shielding has resolved) may close or hand off
     /// the lease to someone else, exactly as it always has.
+    fn releaseWriterLaneForIndexedWait(self: *HandleGuard) bool {
+        if (!self.lane_managed or !self.connection_gate_held or self.writer_lane_released) return false;
+        self.releaseWriterLaneBeforeWait();
+        return true;
+    }
+
+    fn resumeWriterLaneAfterIndexedWait(self: *HandleGuard) !void {
+        std.debug.assert(self.lane_managed and self.writer_lane_released);
+        const connection = self.connection.?;
+        const io = handleLockIo();
+        connection.mutex.lockUncancelable(io);
+        errdefer connection.mutex.unlock(io);
+        const lane = &connection.owner.writer_lane;
+        const root = try lane.checkout(connection, .mutation);
+        // checkout acquired another pin; the original stays with this guard.
+        defer _ = root.lane_pins.fetchSub(1, .release);
+        if (root != self.lane_pinned_root.?) {
+            lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+            return error.EnrichmentSourceChanged;
+        }
+        self.connection_gate_held = true;
+        self.writer_lane_released = false;
+    }
+
     pub fn releaseWriterLaneBeforeWait(self: *HandleGuard) void {
         const connection = self.connection orelse return;
         if (!self.connection_gate_held or self.writer_lane_released) return;
@@ -1196,6 +1220,18 @@ pub fn writerLaneHookFromGuard(guard: *HandleGuard) @import("../storage/db/execu
             fn run(ptr: *anyopaque) void {
                 const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
                 typed.releaseWriterLaneBeforeWait();
+            }
+        }.run,
+        .release_for_indexed_wait = struct {
+            fn run(ptr: *anyopaque) bool {
+                const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
+                return typed.releaseWriterLaneForIndexedWait();
+            }
+        }.run,
+        .resume_after_indexed_wait = struct {
+            fn run(ptr: *anyopaque) anyerror!void {
+                const typed: *HandleGuard = @ptrCast(@alignCast(ptr));
+                return typed.resumeWriterLaneAfterIndexedWait();
             }
         }.run,
     };

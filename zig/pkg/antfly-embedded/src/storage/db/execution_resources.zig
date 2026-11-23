@@ -1088,6 +1088,8 @@ pub const BatchVisibilityCompletion = struct {
 pub const WriterLaneReleaseHook = struct {
     ptr: *anyopaque,
     release: *const fn (ptr: *anyopaque) void,
+    release_for_indexed_wait: ?*const fn (ptr: *anyopaque) bool = null,
+    resume_after_indexed_wait: ?*const fn (ptr: *anyopaque) anyerror!void = null,
 };
 
 /// One synchronous prepared attempt's irreversible disposition. It is separate

@@ -1387,6 +1387,7 @@ pub const WriterLane = struct {
                 // reconciles them.
                 const take_fast_path = likely_root != null and likely_root == connection.owner.current and
                     !connection.owner.foreground_runtime_stale and !connection.owner.writer_reopen_pending and
+                    !Owner.needsOutcomeReconciliation(likely_root.?) and
                     likely_root.?.owned_lite_backend.?.native_docstore.?.file.adoptionEpoch() == likely_root.?.lite_refresh_adoption_epoch and
                     likely_root.?.immutable_query_borrows == 0 and
                     !mightNeedRefreshAdmission(connection, likely_root.?, intent);

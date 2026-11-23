@@ -4516,6 +4516,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
+            var indexed_lane_yielded = false;
+            if (primary_ticket != null and (inline_graph_publication != null or inline_sparse_publication != null or inline_dense_publication != null)) {
+                if (opts.writer_lane_release_before_wait) |hook| {
+                    if (hook.resume_after_indexed_wait != null) {
+                        if (hook.release_for_indexed_wait) |release| indexed_lane_yielded = release(hook.ptr);
+                    }
+                }
+            }
             // WS3: wait for the primary write's durability only now, with the
             // apply lock (and, above `batchInternalPreparedOwned`, the capi
             // connection gate) already released, so this call's fsync can
@@ -4576,6 +4584,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (opts.primary_committed) |committed| committed.* = false;
                     return err;
                 };
+            }
+            if (indexed_lane_yielded) {
+                const hook = opts.writer_lane_release_before_wait.?;
+                try hook.resume_after_indexed_wait.?(hook.ptr);
             }
             // WS4 phase 2: the primary commit is durable now, and every
             // inline text publication's mutations rode in that SAME
