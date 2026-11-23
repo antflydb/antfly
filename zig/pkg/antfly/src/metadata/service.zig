@@ -5040,6 +5040,10 @@ fn topologyActivationAdmission(service: anytype, bytes: []const u8, readiness: T
     return .{ .readiness = readiness, .source_mutation = false };
 }
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !CoordinatedDecoderAdmission {
+    return prepareCoordinatedDecoderAdmissionWithContext(service, commands, .{});
+}
+
+fn prepareCoordinatedDecoderAdmissionWithContext(service: anytype, commands: []const metadata_storage.TransitionCommand, request: api_operation.RequestContext) !CoordinatedDecoderAdmission {
     // Reject malformed requirement facts before acquiring the runtime/apply
     // lock. Keep payload scanning out of final append's cheap group-ID checks.
     for (commands) |command| try metadata_storage.raft_apply_store.validateTransitionCommandSchemaReaderRequirements(command);
@@ -5058,7 +5062,10 @@ fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metada
     if (required_version == 0) return .{ .source_mutation = has_source };
     if (comptime !@hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness"))
         return error.TableTopologyProtocolUpgradeRequired;
-    const readiness = try service.cachedCoordinatedDecoderReadiness(required_version);
+    const readiness = if (comptime @TypeOf(service.*) == MetadataHttpService)
+        try service.ensureTableTopologyProtocolReadyMode(request, required_version, true, true)
+    else
+        try service.cachedCoordinatedDecoderReadiness(required_version);
     for (commands) |command| if (command == .apply_relation_reconciliation) {
         const intent = try @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation);
         try validateRelationCapabilityProof(intent, readiness);
@@ -6358,6 +6365,7 @@ const StoreProjectionLease = struct {
 const ProjectedCoreSnapshot = struct {
     store_leases: std.ArrayListUnmanaged(*StoreProjectionLease) = .empty,
     store_positions: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    first_store_by_node: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     // Capability identity, not a separately maintained ordinal count, owns
     // the storage shape. New (or sparse) enum tags cannot overrun this map.
     capability_counts: std.enums.EnumArray(StoreCapabilities.Kind, usize) = .initFill(0),
@@ -6397,16 +6405,27 @@ const ProjectedCoreSnapshot = struct {
             self.adjustCapabilities(lease.capabilities, true);
         }
     }
+    fn rebuildNodeStoreIndex(self: *@This(), alloc: std.mem.Allocator) !void {
+        try self.first_store_by_node.ensureTotalCapacity(alloc, @intCast(self.stores.len));
+        self.first_store_by_node.clearRetainingCapacity();
+        for (self.stores) |record| {
+            const entry = self.first_store_by_node.getOrPutAssumeCapacity(record.node_id);
+            if (!entry.found_existing) entry.value_ptr.* = record.store_id;
+        }
+    }
+
     fn deinitStores(self: *@This(), alloc: std.mem.Allocator) void {
         // During initialization, only the prefix has transferred ownership.
         for (self.stores[self.store_leases.items.len..]) |record| metadata_table_manager.freeStore(alloc, record);
         for (self.store_leases.items) |lease| lease.release(alloc);
         self.store_leases.deinit(alloc);
         self.store_positions.deinit(alloc);
+        self.first_store_by_node.deinit(alloc);
         if (self.stores.len > 0) alloc.free(self.stores);
         self.stores = &.{};
         self.store_leases = .empty;
         self.store_positions = .empty;
+        self.first_store_by_node = .empty;
         self.capability_counts = .initFill(0);
     }
 
@@ -10871,11 +10890,24 @@ pub const MetadataHttpService = struct {
         activation_admission: ?CoordinatedDecoderAdmission,
         submitted: ?*bool,
     ) !MetadataProposalReceipt {
-        const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
+        return self.proposeTransitionCommandWithReceiptInContext(command, expected_term, activation_admission, submitted, .{}, true);
+    }
+
+    fn proposeTransitionCommandWithReceiptInContext(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: ?u64,
+        activation_admission: ?CoordinatedDecoderAdmission,
+        submitted: ?*bool,
+        request: api_operation.RequestContext,
+        track_receipt: bool,
+    ) !MetadataProposalReceipt {
+        try request.ensureActive();
+        const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmissionWithContext(self, &.{command}, request);
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
         const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
-        self.lockRuntime();
+        try self.lockRuntimeForRequest(request);
         defer self.unlockRuntime();
         try validateCoordinatedDecoderAdmissionLocked(self, decoder);
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
@@ -10894,9 +10926,10 @@ pub const MetadataHttpService = struct {
             return error.MetadataTopologyCommandTooLarge;
         // Reserve proof storage before Raft accepts the entry. This keeps the
         // accepted-but-untrackable state impossible under allocator pressure.
-        try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
+        if (track_receipt) try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
         var accepted_index: ?u64 = null;
         var dispatch_error: ?anyerror = null;
+        try request.ensureDeadlineActive();
         self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
             dispatch_error = err;
         };
@@ -10904,7 +10937,7 @@ pub const MetadataHttpService = struct {
             observed.* = true;
         };
         const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
-        try self.raft.host.http_host.host.trackProposalReceipt(
+        if (track_receipt) try self.raft.host.http_host.host.trackProposalReceipt(
             self.metadata_group_id,
             raft_status.hard.current_term,
             index,
@@ -11033,11 +11066,35 @@ pub const MetadataHttpService = struct {
         return receipt;
     }
 
-    pub fn proposeSessionCommandObserved(self: *MetadataHttpService, bytes: []const u8, term: u64, submitted: *bool) !MetadataProposalReceipt {
+    pub fn proposeSessionCommandObserved(self: *MetadataHttpService, bytes: []const u8, term: u64, submitted: *bool, context: api_operation.RequestContext) !bool {
         if (term == 0) return error.NotLeader;
-        const receipt = try self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .apply_transaction_sessions = bytes }, term, null, submitted);
-        try self.waitForTransitionApplied(receipt);
-        return receipt;
+        var request = try context.platformDeadline();
+        const controlled = hasRequestControl(context);
+        const local_deadline = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        if (controlled) request.deadline_ns = @min(request.deadline_ns orelse local_deadline, local_deadline);
+        const receipt = try self.proposeTransitionCommandWithReceiptInContext(.{ .apply_transaction_sessions = bytes }, term, null, submitted, request, !controlled);
+        if (!controlled) try self.waitForTransitionApplied(receipt);
+        const projected = self.projectedStore() orelse return error.MissingMetadataStore;
+        while (true) {
+            try request.ensureActive();
+            const observed = self.lifecycle_signal.snapshot(null);
+            const result = result: {
+                var txn = try projected.openSessionRead(self.alloc, self.metadata_group_id);
+                defer txn.abort();
+                break :result @import("transaction_session_record.zig").readApplyResult(&txn, self.alloc, self.metadata_group_id, receipt.term, receipt.index);
+            };
+            return result catch |err| switch (err) {
+                error.SessionApplyResultUnavailable => if (controlled) {
+                    // The managed owner keeps the accepted proposal alive.
+                    // Return unknown if its exact projection cannot be observed.
+                    _ = self.proposal_progress_driver.notifyManagedOwner();
+                    const remaining = request.deadline_ns.? -| platform_time.monotonicNs();
+                    if (remaining > 0) self.lifecycle_signal.wait(observed, @min(remaining, metadata_proposal_passive_wait_ns));
+                    continue;
+                } else err,
+                else => err,
+            };
+        }
     }
 
     pub fn upsertNode(self: *MetadataHttpService, record: metadata_table_manager.NodeRecord) !void {
@@ -12979,7 +13036,7 @@ pub const MetadataHttpService = struct {
         // release it before any network I/O.
         diagnostic_stage = .membership;
         const observation = locked: {
-            self.lockRuntime();
+            try self.lockRuntimeForRequest(request);
             defer self.unlockRuntime();
             const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
                 return zig017_failure: {
@@ -14131,6 +14188,18 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
     ) !void {
+        return self.ensureLinearizableReadMode(request, false);
+    }
+
+    pub fn ensureSessionLinearizableRead(self: *MetadataHttpService, request: api_operation.RequestContext) !void {
+        return self.ensureLinearizableReadMode(request, hasRequestControl(request));
+    }
+
+    fn ensureLinearizableReadMode(
+        self: *MetadataHttpService,
+        request: api_operation.RequestContext,
+        passive: bool,
+    ) !void {
         try request.ensureActive();
         const request_id = try self.linearizable_read_tracker.registerRequest();
         defer self.linearizable_read_tracker.finishRequest(request_id);
@@ -14157,7 +14226,7 @@ pub const MetadataHttpService = struct {
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             const now_ns = platform_time.monotonicNs();
             if (now_ns >= next_request_ns) {
-                self.lockRuntime();
+                try self.lockRuntimeForRequest(request);
                 {
                     defer self.unlockRuntime();
                     request_attempts += 1;
@@ -14176,8 +14245,10 @@ pub const MetadataHttpService = struct {
             }
             var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
             var drove_progress = false;
-            self.lockRuntime();
-            {
+            if (passive) {
+                _ = self.proposal_progress_driver.notifyManagedOwner();
+            } else {
+                self.lockRuntime();
                 defer self.unlockRuntime();
                 // Registered runtimes coalesce a wake instead of persisting
                 // on the request thread. Standalone callers retain their
@@ -14925,6 +14996,16 @@ pub const MetadataHttpService = struct {
     pub fn localMetadataLeadershipTerm(self: *MetadataHttpService) ?u64 {
         self.lockRuntime();
         defer self.unlockRuntime();
+        return self.localMetadataLeadershipTermLocked();
+    }
+
+    pub fn localSessionLeadershipTerm(self: *MetadataHttpService, context: api_operation.RequestContext) !?u64 {
+        try self.lockRuntimeForRequest(context);
+        defer self.unlockRuntime();
+        return self.localMetadataLeadershipTermLocked();
+    }
+
+    fn localMetadataLeadershipTermLocked(self: *MetadataHttpService) ?u64 {
         const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return null;
         if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or raft_status.soft.leader_id.? != raft_status.id) return null;
         return raft_status.hard.current_term;
@@ -14957,7 +15038,7 @@ pub const MetadataHttpService = struct {
         return self.reconcile_lease.stats();
     }
 
-    fn refreshProjectedStoreLocked(self: *MetadataHttpService, snapshot: *ProjectedCoreSnapshot, change: CoreProjectionChanges.StoreChange, selected_ids: ?[]const u64) !void {
+    fn refreshProjectedStoreLocked(self: *MetadataHttpService, snapshot: *ProjectedCoreSnapshot, change: CoreProjectionChanges.StoreChange, selected_ids: ?[]const u64) !bool {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const position = snapshot.store_positions.get(change.id);
         const reports = change.reports or position == null;
@@ -14982,7 +15063,9 @@ pub const MetadataHttpService = struct {
                 snapshot.adjustCapabilities(lease.capabilities, true);
                 snapshot.store_leases.items[i] = lease;
                 snapshot.stores[i] = lease.record;
+                const node_changed = prior.record.node_id != record.node_id;
                 prior.release(self.alloc);
+                return node_changed;
             } else {
                 const next = try self.alloc.alloc(metadata_table_manager.StoreRecord, snapshot.stores.len - 1);
                 @memcpy(next[0..i], snapshot.stores[0..i]);
@@ -14994,6 +15077,7 @@ pub const MetadataHttpService = struct {
                 prior.release(self.alloc);
                 self.alloc.free(snapshot.stores);
                 snapshot.stores = next;
+                return true;
             }
         } else if (replacement) |record| {
             try snapshot.store_leases.ensureUnusedCapacity(self.alloc, 1);
@@ -15009,7 +15093,9 @@ pub const MetadataHttpService = struct {
             snapshot.adjustCapabilities(lease.capabilities, true);
             self.alloc.free(snapshot.stores);
             snapshot.stores = next;
+            return true;
         }
+        return false;
     }
 
     fn projectedCoreComponentsLocked(self: *MetadataHttpService, kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind)) !*const ProjectedCoreSnapshot {
@@ -15033,15 +15119,21 @@ pub const MetadataHttpService = struct {
                     errdefer fresh.deinit(self.alloc);
                     fresh.stores = try store.listStores(self.alloc, self.metadata_group_id);
                     try fresh.initializeStoreLeases(self.alloc);
+                    try fresh.rebuildNodeStoreIndex(self.alloc);
                     snapshot.deinitStores(self.alloc);
                     snapshot.stores = fresh.stores;
                     snapshot.store_leases = fresh.store_leases;
                     snapshot.store_positions = fresh.store_positions;
+                    snapshot.first_store_by_node = fresh.first_store_by_node;
                     snapshot.capability_counts = fresh.capability_counts;
-                } else for (changes.stores[0..changes.store_count]) |change| {
-                    const ids = try changes.groupIds(self.alloc, change);
-                    defer if (ids) |owned| self.alloc.free(owned);
-                    try self.refreshProjectedStoreLocked(snapshot, change, ids);
+                } else {
+                    var rebuild_index = false;
+                    for (changes.stores[0..changes.store_count]) |change| {
+                        const ids = try changes.groupIds(self.alloc, change);
+                        defer if (ids) |owned| self.alloc.free(owned);
+                        rebuild_index = (try self.refreshProjectedStoreLocked(snapshot, change, ids)) or rebuild_index;
+                    }
+                    if (rebuild_index) try snapshot.rebuildNodeStoreIndex(self.alloc);
                 }
             }
             if (changes.kinds.contains(.placement_intent)) {
@@ -15294,6 +15386,16 @@ pub const MetadataHttpService = struct {
         store.freeNodes(alloc, records);
     }
 
+    pub fn projectedStoreEndpoint(self: *MetadataHttpService, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+        self.lockProjection();
+        defer self.unlockProjection();
+        const snapshot = try self.projectedCoreComponentsLocked(.initMany(&.{.store}));
+        const store_id = snapshot.first_store_by_node.get(node_id) orelse return null;
+        const record = snapshot.stores[snapshot.store_positions.get(store_id).?];
+        if (record.api_url.len == 0) return null;
+        return try alloc.dupe(u8, record.api_url);
+    }
+
     pub fn listProjectedStores(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.StoreRecord {
         self.lockProjection();
         const view = blk: {
@@ -15378,6 +15480,26 @@ pub const MetadataHttpService = struct {
 
     fn unlockProjection(self: *MetadataHttpService) void {
         self.projection_mutex.unlock(std.Options.debug_io);
+    }
+
+    fn hasRequestControl(request: api_operation.RequestContext) bool {
+        return request.deadline_ns != null or request.cancellation.ptr != null;
+    }
+
+    fn lockRuntimeForRequest(self: *MetadataHttpService, request: api_operation.RequestContext) !void {
+        if (!hasRequestControl(request)) {
+            self.lockRuntime();
+            return;
+        }
+        try request.ensureActive();
+        while (!self.runtime_mutex.tryLock()) {
+            try request.ensureActive();
+            platform_time.yieldBriefly();
+        }
+        errdefer self.unlockRuntime();
+        // Cancellation callbacks can consult metadata leadership and take
+        // this same lock. Only the clock is sampled after acquisition.
+        try request.ensureDeadlineActive();
     }
 
     fn lockRuntime(self: *MetadataHttpService) void {

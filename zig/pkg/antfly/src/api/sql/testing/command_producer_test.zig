@@ -2845,7 +2845,7 @@ test "SQL command producer native autocommit advisory reads lazily decide and re
         var catalog_ready = false;
         while (@import("antfly_platform").time.monotonicNs() < bootstrap_deadline) {
             catalog_bootstrap.next_round_at_ns = 0;
-            _ = try catalog_bootstrap.step(&metadata, a, group, @splat('1'), 0, @import("antfly_platform").time.monotonicNs(), .background);
+            _ = try catalog_bootstrap.step(&metadata, a, group, @splat('1'), 0, @import("antfly_platform").time.monotonicNs(), .startup);
             const work = try metadata.relationReconciliationWork(group);
             if (work.current) |state| if (state.phase == .ready and state.coverage == .constraint_names and work.root != null and work.root.?.eql(local.system_catalog_relation_reconciliation.Generation.of(&state))) {
                 catalog_ready = true;

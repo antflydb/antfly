@@ -27,16 +27,15 @@ pub const ttl_ms: u64 = 60 * 60 * 1000;
 pub const State = enum { idle, beginning, active, uncertain };
 
 pub const Record = struct {
+    // Keep the routing fields first for bounded ownership reads.
+    id: [32]u8,
+    owner_node_id: u64,
+    principal: []const u8,
     wire_epoch: ?[16]u8 = null,
-    /// An idle HTTP connection can move between facade processes. Its native
-    /// command and TEMP ownership still carry independent process fences.
+    /// Native command and TEMP ownership carry independent process fences.
     durable_http: bool = false,
     notification_pid: ?i32 = null,
     notification_listen_seen: bool = false,
-
-    id: [32]u8,
-    principal: []const u8,
-    owner_node_id: u64,
     expires_at_ms: u64,
     generation: u64 = 1,
     revision: u64 = 1,

@@ -277,7 +277,8 @@ pub const RequestContext = struct {
         return false;
     }
 
-    fn ensureDeadlineActive(self: RequestContext) ApiError!void {
+    /// Check time without calling a fallible cancellation callback.
+    pub fn ensureDeadlineActive(self: RequestContext) ApiError!void {
         if (self.deadline_ns) |deadline| {
             const now_ns = if (self.deadline_io) |borrow| blk: {
                 var receiver = borrow.receive() catch return error.Internal;

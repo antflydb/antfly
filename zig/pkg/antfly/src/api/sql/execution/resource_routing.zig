@@ -16,6 +16,7 @@
 // HTTP SQL handles carry their immutable issuer, independently of transactions.
 const std = @import("std");
 const transactions = @import("../../transactions.zig");
+const RequestAdmission = @import("antfly_local_sources").common_request_admission.RequestAdmission;
 pub const Kind = enum { prepared, connection };
 pub fn encode(issuer: u64, entropy: [16]u8) [32]u8 {
     var bytes = entropy;
@@ -28,18 +29,67 @@ pub fn owner(id: []const u8) !u64 {
     _ = try std.fmt.hexToBytes(&bytes, id);
     return std.mem.readInt(u64, bytes[0..8], .big);
 }
-fn owns(txn: anytype, alloc: std.mem.Allocator, id: []const u8, kind: Kind, local_node_id: u64) !bool {
-    const key: []const u8 = switch (kind) {
-        .prepared => &(try @import("../session/prepared.zig").resourceKey(id)),
-        .connection => &(try @import("../session/connection_record.zig").key(id)),
+const ownership_prefix = "\x00sql-resource-owner-v1/";
+
+fn ownershipKey(kind: Kind, id: []const u8) ![ownership_prefix.len + 1 + 32]u8 {
+    if (id.len != 32) return error.InvalidArgument;
+    var key: [ownership_prefix.len + 1 + 32]u8 = undefined;
+    @memcpy(key[0..ownership_prefix.len], ownership_prefix);
+    key[ownership_prefix.len] = switch (kind) {
+        .prepared => 'p',
+        .connection => 'c',
     };
+    @memcpy(key[ownership_prefix.len + 1 ..], id);
+    return key;
+}
+
+pub fn putOwnership(txn: anytype, kind: Kind, id: []const u8, node: u64) !void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, node, .big);
+    try txn.put(&(try ownershipKey(kind, id)), &bytes);
+}
+
+pub fn deleteOwnership(txn: anytype, kind: Kind, id: []const u8) !void {
+    txn.delete(&(try ownershipKey(kind, id))) catch |err| if (err != error.NotFound) return err;
+}
+
+fn containsKey(txn: anytype, key: []const u8) !bool {
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    cursor.setKeysOnly();
+    const row = (try cursor.seekAtOrAfter(key)) orelse return false;
+    return std.mem.eql(u8, row.key, key);
+}
+
+fn owns(txn: anytype, alloc: std.mem.Allocator, id: []const u8, kind: Kind, local_node_id: u64, bounded: bool) !bool {
+    return switch (kind) {
+        .prepared => ownsKey(txn, alloc, &(try @import("../session/prepared.zig").resourceKey(id)), id, local_node_id, @import("../session/prepared.zig").max_resource_bytes, bounded),
+        .connection => ownsKey(txn, alloc, &(try @import("../session/connection_record.zig").key(id)), id, local_node_id, @import("../session/connection_record.zig").max_record_bytes, bounded),
+    };
+}
+
+const id_field = "{\"id\":\"";
+const owner_field = "\",\"owner_node_id\":";
+const owner_offset = id_field.len + 32 + owner_field.len;
+
+fn ownsKey(txn: anytype, alloc: std.mem.Allocator, key: []const u8, id: []const u8, node: u64, limit: usize, bounded: bool) !bool {
+    if (bounded) {
+        var scope = try txn.openReadScope(alloc);
+        defer scope.close();
+        const prefix = scope.probePrefix(key, owner_offset + 21) catch |err| switch (err) {
+            error.NotFound => return false,
+            error.EndOfStream => return error.Unsupported,
+            else => return err,
+        };
+        if (prefix.len <= owner_offset or !std.mem.startsWith(u8, prefix, id_field) or !std.mem.eql(u8, prefix[id_field.len + 32 .. owner_offset], owner_field))
+            return error.Unsupported;
+        const end = std.mem.indexOfScalarPos(u8, prefix, owner_offset, ',') orelse return error.InvalidSqlConnection;
+        const owner_node_id = std.fmt.parseUnsigned(u64, prefix[owner_offset..end], 10) catch return error.InvalidSqlConnection;
+        return std.mem.eql(u8, prefix[id_field.len..][0..32], id) and owner_node_id == node;
+    }
     const raw = txn.get(key) catch |err| switch (err) {
         error.NotFound => return false,
         else => return err,
-    };
-    const limit: usize = switch (kind) {
-        .connection => @import("../session/connection_record.zig").max_record_bytes,
-        .prepared => @import("../session/prepared.zig").max_resource_bytes,
     };
     if (raw.len > limit) return error.SqlProgramLimitExceeded;
     // Read only routing metadata. Authentication, expiry and resource validation
@@ -47,27 +97,89 @@ fn owns(txn: anytype, alloc: std.mem.Allocator, id: []const u8, kind: Kind, loca
     const Ownership = struct { id: [32]u8, owner_node_id: u64 };
     var parsed = try std.json.parseFromSlice(Ownership, alloc, raw, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    return std.mem.eql(u8, &parsed.value.id, id) and parsed.value.owner_node_id == local_node_id;
+    return std.mem.eql(u8, &parsed.value.id, id) and parsed.value.owner_node_id == node;
 }
 // Legacy random handles may override their encoded issuer only when the
 // persisted record is owned here. Shared-store visibility does not imply ownership.
-pub fn ownsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64) !bool {
+pub fn ownsLocal(store: *transactions.DurableSessionStore, id: []const u8, kind: Kind, local_node_id: u64, admission: ?*RequestAdmission, context: @import("antfly_local_sources").api_operation.RequestContext) !bool {
+    try context.ensureActive();
     return switch (store.backend) {
         .docstore => |backend| blk: {
             var txn = try backend.beginReadTxn();
             defer txn.abort();
-            break :blk try owns(&txn, store.alloc, id, kind, local_node_id);
+            break :blk try ownsAdmitted(&txn, store.alloc, id, kind, local_node_id, admission);
         },
         .runtime => |backend| blk: {
-            var txn = try backend.beginRead();
+            var txn = try store.beginRoutingRead(backend, context);
             defer txn.abort();
-            break :blk try owns(&txn, store.alloc, id, kind, local_node_id);
+            break :blk try ownsAdmitted(&txn, store.alloc, id, kind, local_node_id, admission);
         },
     };
 }
+fn ownsAdmitted(txn: anytype, alloc: std.mem.Allocator, id: []const u8, kind: Kind, node: u64, admission: ?*RequestAdmission) !bool {
+    const key = try ownershipKey(kind, id);
+    if (txn.get(&key)) |owner_bytes| {
+        if (owner_bytes.len != 8) return error.InvalidSqlConnection;
+        if (std.mem.readInt(u64, owner_bytes[0..8], .big) != node) return false;
+        // A reader after a downgrade can see an index row left behind by an
+        // older delete. Never override the encoded route without a live key.
+        return switch (kind) {
+            .prepared => containsKey(txn, &(try @import("../session/prepared.zig").resourceKey(id))),
+            .connection => containsKey(txn, &(try @import("../session/connection_record.zig").key(id))),
+        };
+    } else |err| if (err != error.NotFound) return err;
+    if (admission) |capacity| {
+        return owns(txn, alloc, id, kind, node, true) catch |err| switch (err) {
+            error.Unsupported => fallback: {
+                var lease = capacity.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+                defer lease.release();
+                break :fallback try owns(txn, alloc, id, kind, node, false);
+            },
+            else => return err,
+        };
+    }
+    return owns(txn, alloc, id, kind, node, false);
+}
+
 test "SQL pgwire native HTTP handles bind issuer and preserve entropy" {
     const id = encode(7, @splat(0xaa));
     try std.testing.expectEqual(@as(u64, 7), try owner(&id));
     try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaa", id[16..]);
     try std.testing.expectError(error.InvalidArgument, owner("bad"));
+}
+
+test "HTTP connection record ownership probe reads only routing fields" {
+    const a = std.testing.allocator;
+    const id: [32]u8 = @splat('a');
+    const Fixture = struct {
+        raw: []const u8,
+        fn openReadScope(self: *@This(), _: std.mem.Allocator) !*@This() {
+            return self;
+        }
+        fn close(_: *@This()) void {}
+        fn probePrefix(self: *@This(), _: []const u8, length: usize) ![]const u8 {
+            return self.raw[0..length];
+        }
+        fn get(self: *@This(), _: []const u8) ![]const u8 {
+            return self.raw;
+        }
+    };
+    const record: @import("../session/connection_record.zig").Record = .{
+        .id = id,
+        .owner_node_id = 7,
+        .principal = "alice",
+        .expires_at_ms = 1000,
+        .database = "main",
+        .namespace = "public",
+    };
+    const modern = try std.json.Stringify.valueAlloc(a, record, .{});
+    defer a.free(modern);
+    var fixture: Fixture = .{ .raw = modern };
+    try std.testing.expect(try ownsKey(&fixture, a, "key", &id, 7, 0, true));
+    try std.testing.expect(!try ownsKey(&fixture, a, "key", &id, 8, 0, true));
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .id = id, .principal = "alice", .owner_node_id = @as(u64, 7), .database = "main", .namespace = "public" }, .{});
+    defer a.free(legacy);
+    fixture.raw = legacy;
+    try std.testing.expectError(error.Unsupported, ownsKey(&fixture, a, "key", &id, 7, legacy.len, true));
+    try std.testing.expect(try ownsKey(&fixture, a, "key", &id, 7, legacy.len, false));
 }
