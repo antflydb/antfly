@@ -118,7 +118,9 @@ const magic: [8]u8 = "AFLLOCK1".*;
 // keep the multiple-of-16 invariant `ticketOwnerOffset`'s own comment
 // requires. A v4 (or earlier) region is rebuilt the same way any earlier
 // version mismatch always was -- including this one.
-const format_version: u32 = 5;
+// v6 serializes each WAL watermark publication with a crash-recoverable
+// owner word. Older writers cannot participate in this protocol.
+const format_version: u32 = 6;
 
 /// Fixed size of the header itself. The header's own `region_bytes` and
 /// `max_readers` fields (not this constant) are the source of truth for
@@ -709,7 +711,7 @@ fn acquireProcessFdUntil(io: Io, region_path: []const u8, deadline: ?Io.Timestam
     var attempted_repair = false;
     while (true) {
         var waiter: AdmissionWaiter = .{};
-        return acquireProcessFdOnce(io, region_path, &attempted_repair, &waiter) catch |err| switch (err) {
+        return acquireProcessFdOnce(io, region_path, &attempted_repair, &waiter, until) catch |err| switch (err) {
             error.DescriptorOpening, error.ResampleDescriptorPath => {
                 const now = Io.Clock.now(.awake, io);
                 if (until == null) until = now.addDuration(.fromSeconds(30));
@@ -725,7 +727,7 @@ fn acquireProcessFdUntil(io: Io, region_path: []const u8, deadline: ?Io.Timestam
     }
 }
 
-fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool, waiter: *AdmissionWaiter) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath })!*FdEntry {
+fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool, waiter: *AdmissionWaiter, deadline: ?Io.Timestamp) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath, Timeout })!*FdEntry {
     // A name past the filesystem limit cannot exist or be created. Refuse it
     // before `statFile`: Linux's statx wrapper treats ENAMETOOLONG as a
     // caller bug and panics in safe builds.
@@ -752,7 +754,7 @@ fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool
         }
     }
     fd_registry_mutex.unlock(io);
-    const pending = reserveDescriptor(io, device, region_path, path_identity, waiter) catch |err| retry: {
+    const pending = reserveDescriptor(io, device, region_path, path_identity, waiter, !attempted_repair.*) catch |err| retry: {
         const quarantined_path = switch (err) {
             error.DescriptorQuarantined => region_path,
             error.DescriptorReserveFull => null,
@@ -760,8 +762,8 @@ fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool
         };
         if (attempted_repair.*) return error.RegionUnavailable;
         attempted_repair.* = true;
-        resolveUnidentifiedDescriptors(io, device, quarantined_path);
-        break :retry reserveDescriptor(io, device, region_path, path_identity, waiter) catch |retry_err| switch (retry_err) {
+        try resolveUnidentifiedDescriptors(io, device, quarantined_path, deadline);
+        break :retry reserveDescriptor(io, device, region_path, path_identity, waiter, false) catch |retry_err| switch (retry_err) {
             error.DescriptorQuarantined, error.DescriptorReserveFull => return error.RegionUnavailable,
             else => |e| return e,
         };
@@ -798,7 +800,7 @@ fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool
     return RegionError.RegionUnavailable;
 }
 
-fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_identity.NativeFileIdentity, waiter: ?*AdmissionWaiter) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath, DescriptorQuarantined, DescriptorReserveFull })!*FdEntry {
+fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_identity.NativeFileIdentity, waiter: ?*AdmissionWaiter, try_quarantine: bool) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath, DescriptorQuarantined, DescriptorReserveFull })!*FdEntry {
     const page = std.heap.page_allocator;
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
@@ -809,20 +811,22 @@ fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_iden
     }
 
     if (unidentified_by_device.getPtr(device)) |bucket| {
-        var opening = false;
+        var active_probe = false;
+        var recoverable = false;
         var occupied: usize = 0;
         for (bucket) |slot| {
             const entry = slot orelse continue;
             if (std.mem.eql(u8, entry.unresolved_path.?, path)) {
-                if (entry.fd != -1) return error.DescriptorQuarantined;
+                if (!entry.probing_identity) return error.DescriptorQuarantined;
                 try linkAdmissionWaiter(waiter, device, path);
                 return error.DescriptorOpening;
             }
             occupied += 1;
-            opening = opening or entry.fd == -1;
+            active_probe = active_probe or entry.probing_identity;
+            recoverable = recoverable or (entry.fd != -1 and !entry.probing_identity);
         }
         if (occupied == bucket.len) {
-            if (!opening) return error.DescriptorReserveFull;
+            if (!active_probe or (try_quarantine and recoverable)) return error.DescriptorReserveFull;
             try linkAdmissionWaiter(waiter, device, null);
             return error.DescriptorOpening;
         }
@@ -900,15 +904,29 @@ fn retainSpareDescriptor(entry: *FdEntry, spare: *FdEntry) void {
     entry.spare_descriptors = spare;
 }
 
-fn resolveUnidentifiedDescriptors(io: Io, device: u64, path: ?[]const u8) void {
+fn resolveUnidentifiedDescriptors(io: Io, device: u64, path: ?[]const u8, deadline: ?Io.Timestamp) error{Timeout}!void {
     for (0..max_unidentified_descriptors) |i| {
         fd_registry_mutex.lockUncancelable(io);
-        const pending = if (unidentified_by_device.getPtr(device)) |bucket| bucket[i] else null;
+        const bucket = unidentified_by_device.getPtr(device) orelse {
+            fd_registry_mutex.unlock(io);
+            return;
+        };
+        if (path == null and std.mem.indexOfScalar(?*FdEntry, bucket, null) != null) {
+            fd_registry_mutex.unlock(io);
+            return;
+        }
+        const pending = bucket[i];
         if (pending == null or pending.?.probing_identity) {
             fd_registry_mutex.unlock(io);
             continue;
         }
         const entry = pending.?;
+        if (deadline) |until| {
+            if (Io.Clock.now(.awake, io).compare(.gte, until)) {
+                fd_registry_mutex.unlock(io);
+                return error.Timeout;
+            }
+        }
         if (path) |name| {
             if (!std.mem.eql(u8, name, entry.unresolved_path.?)) {
                 fd_registry_mutex.unlock(io);
@@ -924,16 +942,18 @@ fn resolveUnidentifiedDescriptors(io: Io, device: u64, path: ?[]const u8) void {
         defer fd_registry_mutex.unlock(io);
         if (identity == null and fd_registry.count() != 0) {
             entry.probing_identity = false;
+            wakeAdmissionWaiters(device, entry.unresolved_path.?);
             continue;
         }
         unreserveDescriptor(device, entry);
         if (identity) |known| {
             if (fd_registry.get(known)) |registered| {
                 retainSpareDescriptor(registered, entry);
-                continue;
+                return;
             }
         }
         closeSpareDescriptors(entry);
+        return;
     }
 }
 
@@ -1215,6 +1235,18 @@ pub const Region = struct {
 
     fn publisherRegionBytes(max_readers: u32) u64 {
         return logNonceOffset(max_readers) + @as(u64, max_readers) * @sizeOf(std.atomic.Value(u64));
+    }
+
+    fn publicationOwnerOffset(max_readers: u32) u64 {
+        return std.mem.alignForward(u64, publisherRegionBytes(max_readers), @alignOf(std.atomic.Value(u128)));
+    }
+
+    fn publicationRegionBytes(max_readers: u32) u64 {
+        return publicationOwnerOffset(max_readers) + @sizeOf(std.atomic.Value(u128));
+    }
+
+    fn publicationOwner(self: *const Region) *std.atomic.Value(u128) {
+        return @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(publicationOwnerOffset(self.header().max_readers)))));
     }
 
     fn previousRegionBytes(max_readers: u32) u64 {
@@ -1661,7 +1693,7 @@ pub const Region = struct {
             try ensureNoLivePeer(io, fd_entry, &existing_raw, size);
         }
         if (need_init) {
-            const region_bytes = publisherRegionBytes(max_readers);
+            const region_bytes = publicationRegionBytes(max_readers);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -1714,7 +1746,7 @@ pub const Region = struct {
             const existing: *const Header = @ptrCast(@alignCast(&existing_raw));
             break :blk existing.max_readers;
         };
-        const map_len: usize = @intCast(publisherRegionBytes(final_max_readers));
+        const map_len: usize = @intCast(publicationRegionBytes(final_max_readers));
         if (!need_init and size < map_len) try setup_file.setLength(io, map_len);
 
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
@@ -2853,37 +2885,44 @@ pub const Region = struct {
         self.publishLogStateWithPublisher(state, publisher);
     }
 
+    fn publicationToken(self: *const Region) u128 {
+        const slot = self.own_liveness_slot;
+        const nonce = logNonces(self.mapping, self.header().max_readers)[slot].load(.acquire);
+        return (@as(u128, nonce) << 64) | (@as(u128, self.own_liveness_generation) << 32) | slot;
+    }
+
+    fn tryOwnPublication(self: *const Region, token: u128) bool {
+        const owner = self.publicationOwner();
+        if (owner.cmpxchgStrong(0, token, .acq_rel, .acquire)) |held| {
+            const slot: u32 = @truncate(held);
+            const generation: u32 = @truncate(held >> 32);
+            if (slot < self.header().max_readers and !self.isReferenceDead(slot, generation)) return false;
+            return owner.cmpxchgStrong(held, token, .acq_rel, .acquire) == null;
+        }
+        return true;
+    }
+
     fn publishLogStateWithPublisher(self: *Region, state: LogState, publisher: u128) void {
         const hdr = self.header();
-        // Sequentially consistent throughout: the generation brackets the
-        // payload in one total order, and a fold's publish followed by its
-        // pin scan (`minimumUncoveredPinnedSequence`) cannot both miss a
-        // reader's pin followed by its watermark read (`pinReader`).
-        //
-        // The even-to-odd CAS makes publishers mutually exclusive, so two
-        // publishers (a writer and a recovering opener) can never
-        // interleave their stores under one generation. An odd generation
-        // that never moves belongs to a publisher that died mid-publish;
-        // this one takes it over and repairs it with a complete tuple.
-        var stuck: u32 = 0;
-        var last_odd: u32 = 0;
-        const publishing: u32 = while (true) {
-            const generation = hdr.log_generation.load(.seq_cst);
-            if (generation & 1 != 0) {
-                if (generation != last_odd) {
-                    last_odd = generation;
-                    stuck = 0;
-                } else {
-                    stuck += 1;
-                    if (stuck >= log_state_stuck_spins) break generation;
-                }
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            if (state.durable_sequence < hdr.log_durable_sequence.load(.seq_cst) or
-                state.checkpoint_sequence < hdr.log_checkpoint_sequence.load(.seq_cst)) return;
-            if (hdr.log_generation.cmpxchgWeak(generation, generation | 1, .seq_cst, .seq_cst) == null) break generation | 1;
-        };
+        const token = self.publicationToken();
+        // Only contention requires probing liveness or sleeping. The owner
+        // refers to the publishing mapping, even when the visible publisher
+        // is attributed to a separate fair writer lease.
+        const owner = self.publicationOwner();
+        while (!self.tryOwnPublication(token)) {
+            const generation = hdr.log_generation.load(.acquire);
+            antfly_platform.sync.rawFutexWaitShared(&hdr.log_generation.raw, generation, 1);
+        }
+        defer owner.store(0, .release);
+
+        // Sequential consistency still brackets the tuple and orders the
+        // publisher's fold against readers publishing their pins.
+        const generation = hdr.log_generation.load(.seq_cst);
+        if (generation & 1 == 0 and
+            (state.durable_sequence < hdr.log_durable_sequence.load(.seq_cst) or
+                state.checkpoint_sequence < hdr.log_checkpoint_sequence.load(.seq_cst))) return;
+        const publishing = generation | 1;
+        hdr.log_generation.store(publishing, .seq_cst);
         hdr.log_checkpoint_sequence.store(state.checkpoint_sequence, .seq_cst);
         hdr.log_durable_sequence.store(state.durable_sequence, .seq_cst);
         hdr.log_durable_offset.store(state.durable_offset, .seq_cst);
@@ -3788,7 +3827,7 @@ test "shared lock region: discarding quarantined descriptors wakes capacity wait
     const io = std.testing.io;
     var waiter: AdmissionWaiter = .{};
     const device = 1;
-    const pending = try reserveDescriptor(io, device, "discard", null, null);
+    const pending = try reserveDescriptor(io, device, "discard", null, null, false);
     {
         fd_registry_mutex.lockUncancelable(io);
         defer fd_registry_mutex.unlock(io);
@@ -3802,13 +3841,48 @@ test "shared lock region: discarding quarantined descriptors wakes capacity wait
     try std.testing.expect(!unidentified_by_device.contains(device));
 }
 
+test "shared lock region: saturated reserve probes before waiting and stops at the first free slot" {
+    const io = std.testing.io;
+    const device = 1;
+    var reservations: [max_unidentified_descriptors]*FdEntry = undefined;
+    for (&reservations, 0..) |*reservation, i| {
+        var buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "saturated-{d}", .{i});
+        reservation.* = try reserveDescriptor(io, device, path, null, null, false);
+    }
+    defer {
+        fd_registry_mutex.lockUncancelable(io);
+        defer fd_registry_mutex.unlock(io);
+        if (unidentified_by_device.get(device)) |bucket| for (bucket) |slot| {
+            const entry = slot orelse continue;
+            if (entry.probing_identity) pending_opens -= 1;
+            unreserveDescriptor(device, entry);
+            std.heap.page_allocator.destroy(entry);
+        };
+    }
+    // Use invalid fd values to model identity failures with an empty
+    // registry, where discarding them cannot drop any record lock.
+    for (reservations[0..2]) |entry| {
+        entry.fd = -2;
+        entry.probing_identity = false;
+        pending_opens -= 1;
+    }
+    try std.testing.expectError(error.DescriptorReserveFull, reserveDescriptor(io, device, "next", null, null, true));
+    try resolveUnidentifiedDescriptors(io, device, null, null);
+    var remaining: usize = 0;
+    for (unidentified_by_device.get(device).?) |slot| {
+        if (slot != null) remaining += 1;
+    }
+    try std.testing.expectEqual(max_unidentified_descriptors - 1, remaining);
+}
+
 test "shared lock region: descriptor reserves are independent per device" {
     const io = std.testing.io;
     var reservations: [max_unidentified_descriptors]*FdEntry = undefined;
     for (&reservations, 0..) |*reservation, i| {
         var buf: [32]u8 = undefined;
         const path = try std.fmt.bufPrint(&buf, "device-one-{d}", .{i});
-        reservation.* = try reserveDescriptor(io, 1, path, null, null);
+        reservation.* = try reserveDescriptor(io, 1, path, null, null, false);
     }
     defer {
         fd_registry_mutex.lockUncancelable(io);
@@ -3819,9 +3893,9 @@ test "shared lock region: descriptor reserves are independent per device" {
             std.heap.page_allocator.destroy(reservation);
         }
     }
-    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-0", null, null));
-    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-extra", null, null));
-    const other = try reserveDescriptor(io, 2, "device-two", null, null);
+    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-0", null, null, false));
+    try std.testing.expectError(error.DescriptorOpening, reserveDescriptor(io, 1, "device-one-extra", null, null, false));
+    const other = try reserveDescriptor(io, 2, "device-two", null, null, false);
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
     pending_opens -= 1;
@@ -5744,14 +5818,8 @@ test "shared lock region extends the publisher proof without invalidating existi
     try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
     observer.noteSyncedFrontier(5, 7, 512, false);
     try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
-    // An older extension-aware opener can shrink a file that still
-    // advertises the legacy size. Keep every live proof field mapped.
     const file: Io.File = .{ .handle = observer.fd_entry.fd, .flags = .{ .nonblocking = false } };
-    const publisher_bytes = Region.publisherRegionBytes(observer.header().max_readers);
-    try std.testing.expectEqual(publisher_bytes, (try file.stat(io)).size);
-    try file.setLength(io, Region.previousRegionBytes(observer.header().max_readers));
-    try file.setLength(io, publisher_bytes);
-    try std.testing.expect(observer.hasSyncedFrontier(5, 7, 512, true));
+    try std.testing.expectEqual(Region.publicationRegionBytes(observer.header().max_readers), (try file.stat(io)).size);
     try std.testing.expect(!observer.isLogStateLive(state));
     {
         var publisher = try Region.open(a, io, db_path);
@@ -5760,6 +5828,26 @@ test "shared lock region extends the publisher proof without invalidating existi
         try std.testing.expect(observer.isLogStateLive(state));
     }
     try std.testing.expect(!observer.isLogStateLive(state));
+}
+
+test "shared lock region: watermark takeover requires a dead publisher" {
+    var fixture = try TicketFixture.init("region-publication-owner.aflite");
+    defer fixture.deinit();
+    const observer = &fixture.region;
+    var publisher = try Region.open(std.testing.allocator, std.testing.io, fixture.path);
+    const token = observer.publicationToken();
+    try std.testing.expect(publisher.tryOwnPublication(publisher.publicationToken()));
+    publisher.tearLogStateForTest();
+    try std.testing.expect(!observer.tryOwnPublication(token));
+    try std.testing.expect(observer.readLogStateChecked() == null);
+
+    // Close the publishing mapping without clearing its owner word, just
+    // as closing all of a dead process's descriptors drops its liveness.
+    publisher.close();
+    const recovered: Region.LogState = .{ .checkpoint_sequence = 3, .durable_sequence = 5, .durable_offset = 512 };
+    observer.publishLogState(recovered);
+    try std.testing.expectEqual(recovered, observer.readLogState());
+    try std.testing.expectEqual(@as(u128, 0), observer.publicationOwner().load(.acquire));
 }
 
 test "shared lock region: publishLogState/readLogState round-trip a consistent triple" {
@@ -5817,7 +5905,7 @@ test "shared lock region: readLogState sees publishLogState across a second hand
     try std.testing.expectEqual(@as(u64, 512), seen.durable_offset);
 }
 
-test "shared lock region: a v2 region is rebuilt on open by a v3 binary" {
+test "shared lock region: a legacy publisher format is rebuilt only after its live peer closes" {
     // Same posture as the existing corrupt-header tests: an old
     // format_version is just another kind of "fails isValidHeader",
     // rebuilt from scratch when no live peer holds it (no migration --
@@ -5836,7 +5924,9 @@ test "shared lock region: a v2 region is rebuilt on open by a v3 binary" {
 
     {
         var region = try Region.open(a, io, db_path);
-        region.close();
+        defer region.close();
+        region.header().format_version = 5;
+        try std.testing.expectError(error.RegionCorrupt, Region.open(a, io, db_path));
     }
     // Downgrade the on-disk `format_version` directly, as a v2 writer
     // would have left it. `isValidHeader`'s version check runs before
