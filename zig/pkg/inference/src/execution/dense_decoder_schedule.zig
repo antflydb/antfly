@@ -52,7 +52,7 @@ pub const ProgramSpec = struct {
     family: enum { whisper, florence },
     phase: enum { decode, initial },
     geometry: struct { layers: usize, width: usize, heads: usize, ffn_dim: usize, vocab_size: usize, encoder_rows: usize, capacity: usize, query_rows: usize },
-    semantics: struct { epsilon: f32 = 1e-5, activation: enum { gelu, gelu_exact }, norm_order: enum { pre, post }, position_offset: usize, global_final_norm: bool },
+    semantics: struct { epsilon: f32 = 1e-5, activation: enum { gelu, gelu_exact }, norm_order: enum { pre, post }, position_offset: usize, global_final_norm: bool, all_keys_visible: bool = false },
     parameters: []const ParameterSpec,
 
     fn validate(self: *const ProgramSpec) !void {
@@ -83,7 +83,7 @@ const SliceSpecSource = struct {
 };
 fn hashSpecHeader(hash: *std.crypto.hash.sha2.Sha256, spec: *const ProgramSpec, count: usize) void {
     hash.update("dense.semantic.binding.recipe.v1");
-    const header = [_]u64{ @backingInt(spec.family), @backingInt(spec.phase), spec.geometry.layers, spec.geometry.width, spec.geometry.heads, spec.geometry.ffn_dim, spec.geometry.vocab_size, spec.geometry.encoder_rows, spec.geometry.capacity, spec.geometry.query_rows, @as(u32, @bitCast(spec.semantics.epsilon)), @backingInt(spec.semantics.activation), @backingInt(spec.semantics.norm_order), spec.semantics.position_offset, @intFromBool(spec.semantics.global_final_norm), count };
+    const header = [_]u64{ @backingInt(spec.family), @backingInt(spec.phase), spec.geometry.layers, spec.geometry.width, spec.geometry.heads, spec.geometry.ffn_dim, spec.geometry.vocab_size, spec.geometry.encoder_rows, spec.geometry.capacity, spec.geometry.query_rows, @as(u32, @bitCast(spec.semantics.epsilon)), @backingInt(spec.semantics.activation), @backingInt(spec.semantics.norm_order), spec.semantics.position_offset, @intFromBool(spec.semantics.global_final_norm), @intFromBool(spec.semantics.all_keys_visible), count };
     hash.update(std.mem.sliceAsBytes(&header));
 }
 fn hashParameter(hash: *std.crypto.hash.sha2.Sha256, parameter: ParameterSpec) void {
@@ -587,11 +587,11 @@ pub const Builder = struct {
         return self.operation(op, inputs[0..if (b != null) @as(usize, 3) else 2], .{ .operation = .{ .linear = geometry }, .output_shape = Shape.init(.f32, &.{ @intCast(rows), @intCast(out) }), .input_shapes = .{ self.logicalShape(x), self.logicalShape(w), if (b) |id| self.logicalShape(id) else undefined }, .input_count = if (b != null) 3 else 2 });
     }
     pub fn prefix(self: *Builder, q: Node, k: Node, v: Node, heads: usize, dim: usize, capacity: usize) !Node {
-        const geometry = ops.kernel_descriptor.DenseAttentionPrefix{ .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .max_key_rows = std.math.cast(u32, capacity) orelse return error.DimensionOverflow };
+        const geometry = ops.kernel_descriptor.DenseAttentionPrefix{ .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .max_key_rows = std.math.cast(u32, capacity) orelse return error.DimensionOverflow, .all_keys_visible = if (self.program_spec) |spec| spec.semantics.all_keys_visible else false };
         return self.operation(.{ .fused_cross_attention = .{ .batch = 1, .dec_seq = 1, .enc_seq = geometry.max_key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim } }, &.{ q, k, v }, .{ .operation = .{ .dense_attention_prefix = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
     }
     pub fn attentionRows(self: *Builder, kind: ops.kernel_descriptor.DenseAttentionRows.Kind, q: Node, k: Node, v: Node, heads: usize, dim: usize, query_rows: usize, key_rows: usize) !Node {
-        const geometry = ops.kernel_descriptor.DenseAttentionRows{ .kind = kind, .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .query_rows = std.math.cast(u32, query_rows) orelse return error.DimensionOverflow, .key_rows = std.math.cast(u32, key_rows) orelse return error.DimensionOverflow };
+        const geometry = ops.kernel_descriptor.DenseAttentionRows{ .kind = kind, .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .query_rows = std.math.cast(u32, query_rows) orelse return error.DimensionOverflow, .key_rows = std.math.cast(u32, key_rows) orelse return error.DimensionOverflow, .all_keys_visible = if (self.program_spec) |spec| kind == .cross and spec.semantics.all_keys_visible else false };
         const op: ml.graph.OpCode = .{ .fused_cross_attention = .{ .batch = 1, .dec_seq = geometry.query_rows, .enc_seq = geometry.key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim } };
         return self.operation(op, &.{ q, k, v }, .{ .operation = .{ .dense_attention_rows = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
     }
@@ -1302,7 +1302,11 @@ fn packedSpecNameCase(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(@intFromPtr(owned_names.names.ptr) + 5, @intFromPtr(owned_names.value.parameters[1].source_name.ptr));
     var expected = header;
     expected.parameters = &parameters;
-    try std.testing.expectEqual(try specKey(&expected), try specKey(&owned_names.value));
+    const original_key = try specKey(&expected);
+    try std.testing.expectEqual(original_key, try specKey(&owned_names.value));
+    expected.semantics.all_keys_visible = true;
+    const all_valid_key = try specKey(&expected);
+    try std.testing.expect(!std.mem.eql(u8, &original_key, &all_valid_key));
     query_name[0] = 'X';
     try std.testing.expectEqualStrings("query", owned_names.value.parameters[0].source_name);
     query_name[0] = 'q';

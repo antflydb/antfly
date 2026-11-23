@@ -31,7 +31,7 @@ struct Params {
     num_heads: u32,
     head_dim: u32,
     scale: f32,       // 1.0 / sqrt(head_dim), precomputed on host
-    _pad: u32,        // align to 24 bytes (6 x u32)
+    has_mask: u32,
 };
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
@@ -69,17 +69,16 @@ fn cross_attention(
     var local_max: f32 = -3.402823466e+38;
 
     for (var ki = tid; ki < ES; ki += WG) {
+        if (params.has_mask != 0u && enc_mask[b * ES + ki] == 0u) {
+            scores[ki] = -3.402823466e+38;
+            continue;
+        }
         var dot: f32 = 0.0;
         let k_base = (b * ES + ki) * k_stride + h * D;
         for (var d: u32 = 0u; d < D; d++) {
             dot += Q[q_base + d] * K[k_base + d];
         }
         dot *= params.scale;
-
-        // Apply encoder padding mask
-        if (enc_mask[b * ES + ki] == 0u) {
-            dot = -3.402823466e+38;
-        }
 
         scores[ki] = dot;
         local_max = max(local_max, dot);
@@ -100,7 +99,10 @@ fn cross_attention(
     // ---- Step 3: exp(score - max) and partial sum ----
     var local_sum: f32 = 0.0;
     for (var ki = tid; ki < ES; ki += WG) {
-        let e = exp(scores[ki] - row_max);
+        var e = 0.0;
+        if (params.has_mask == 0u || enc_mask[b * ES + ki] != 0u) {
+            e = exp(scores[ki] - row_max);
+        }
         scores[ki] = e;
         local_sum += e;
     }
@@ -128,6 +130,7 @@ fn cross_attention(
     for (var d = tid; d < D; d += WG) {
         var acc: f32 = 0.0;
         for (var vi: u32 = 0u; vi < ES; vi++) {
+            if (params.has_mask != 0u && enc_mask[b * ES + vi] == 0u) { continue; }
             acc += scores[vi] * V[(b * ES + vi) * k_stride + h * D + d];
         }
         out[out_base + d] = acc;

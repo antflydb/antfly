@@ -16329,7 +16329,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         q_ct: CT,
         k_ct: CT,
         v_ct: CT,
-        enc_mask: []const i64,
+        enc_mask: ?[]const i64,
         batch: usize,
         dec_seq: usize,
         enc_seq: usize,
@@ -16378,7 +16378,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         q_ct: CT,
         k_ct: CT,
         v_ct: CT,
-        enc_mask: []const i64,
+        enc_mask: ?[]const i64,
         batch: usize,
         dec_seq: usize,
         enc_seq: usize,
@@ -16388,8 +16388,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !?CT {
         if (batch == 0 or dec_seq == 0 or enc_seq == 0 or num_heads == 0 or head_dim == 0) return null;
         const mask_len = std.math.mul(usize, batch, enc_seq) catch return null;
-        if (enc_mask.len < mask_len) return null;
-        const use_mask = std.mem.indexOfScalar(i64, enc_mask[0..mask_len], 0) != null;
+        const use_mask = if (enc_mask) |values| masked: {
+            if (values.len < mask_len) return null;
+            break :masked std.mem.indexOfScalar(i64, values[0..mask_len], 0) != null;
+        } else false;
         const q_buf = toBuf(q_ct);
         const k_buf = toBuf(k_ct);
         const v_buf = toBuf(v_ct);
@@ -16427,7 +16429,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer if (heap_mask) |memory| self.allocator.free(memory);
         const key_mask = if (use_mask) heap_mask orelse inline_mask[0..mask_len] else null;
         if (key_mask) |packed_mask| {
-            for (packed_mask, enc_mask[0..mask_len]) |*destination, source| destination.* = @intFromBool(source != 0);
+            for (packed_mask, enc_mask.?[0..mask_len]) |*destination, source| destination.* = @intFromBool(source != 0);
         }
 
         if (try metal_runtime.decoderRuntimeApplyAttentionF32DeviceBatched(self.provider_impl, .{

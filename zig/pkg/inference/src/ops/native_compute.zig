@@ -34877,7 +34877,7 @@ fn causalSelfAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bia
     return self.makeBuf(output, true);
 }
 
-fn crossAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+fn crossAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: ?[]const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const Q = getData(q_ct);
     const K = getData(k_ct);
@@ -50763,6 +50763,12 @@ test "ComputeBackend crossAttention call site matches masked reference" {
     const ref = try referenceCrossSeqMajorAttention(allocator, &q_data, &k_data, &v_data, &enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim);
     defer allocator.free(ref);
     try expectApproxEqSlice(ref, getData(out_ct), 1e-4);
+    const visible = try cb.crossAttention(q_ct, k_ct, v_ct, null, batch, dec_seq, enc_seq, num_heads, head_dim);
+    defer freeTensor(&compute, visible);
+    const all_valid: [batch * enc_seq]i64 = @splat(1);
+    const explicit = try cb.crossAttention(q_ct, k_ct, v_ct, &all_valid, batch, dec_seq, enc_seq, num_heads, head_dim);
+    defer freeTensor(&compute, explicit);
+    try std.testing.expectEqualSlices(f32, getData(explicit), getData(visible));
 }
 
 test "dot_general flattens lhs suffix for shared rhs source tensor" {
@@ -53195,12 +53201,13 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
     if ((descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix or descriptor.operation == .dense_attention_rows) and request.prepared_route == null) return false;
     const dense_prefix: ?@import("../graph/backend_contracts.zig").DenseAttentionPrefixBinding = if (descriptor.operation == .dense_attention_prefix) (request.attention orelse return false).dense_attention_prefix orelse return false else null;
     if (dense_prefix) |binding| {
-        if (binding.live_key_rows == 0 or binding.live_key_rows > descriptor.operation.dense_attention_prefix.max_key_rows or binding.mask.len != binding.live_key_rows) return error.InvalidAttentionShape;
+        if (binding.live_key_rows == 0 or binding.live_key_rows > descriptor.operation.dense_attention_prefix.max_key_rows) return error.InvalidAttentionShape;
+        if (binding.mask) |mask| if (descriptor.operation.dense_attention_prefix.all_keys_visible or mask.len != binding.live_key_rows) return error.InvalidAttentionShape;
     }
     const dense_rows: ?@import("../graph/backend_contracts.zig").DenseAttentionRowsBinding = if (descriptor.operation == .dense_attention_rows) (request.attention orelse return false).dense_attention_rows orelse return false else null;
     if (dense_rows) |binding| {
         const rows = descriptor.operation.dense_attention_rows;
-        if (rows.kind == .causal and binding.mask != null) return error.InvalidAttentionShape;
+        if ((rows.kind == .causal or rows.all_keys_visible) and binding.mask != null) return error.InvalidAttentionShape;
         if (binding.mask) |mask| if (mask.len != rows.key_rows) return error.InvalidAttentionShape;
     }
     const paged: ?AssignedPagedBinding = if (descriptor.operation == .paged_attention)
@@ -53311,7 +53318,7 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
             if (geometry.kind == .causal) {
                 try linalg.flashCausalAttentionHostInto(dense_inputs[0], dense_inputs[1], dense_inputs[2], null, null, 0, 1, geometry.query_rows, geometry.key_rows, 0, 0, geometry.num_heads, geometry.num_heads, geometry.head_dim, output, std.mem.bytesAsSlice(f32, @as([]align(64) u8, @alignCast(workspace))));
             } else {
-                linalg.crossAttentionHostInto(dense_inputs[0], dense_inputs[1], dense_inputs[2], binding.mask orelse return error.InvalidAttentionShape, 1, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.head_dim, output, std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) u8, @alignCast(workspace))));
+                linalg.crossAttentionHostInto(dense_inputs[0], dense_inputs[1], dense_inputs[2], binding.mask, 1, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.head_dim, output, std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) u8, @alignCast(workspace))));
             }
         },
         .dense_attention_prefix => |geometry| {
@@ -53321,8 +53328,10 @@ fn runAssignedKernelImpl(comptime authored: bool, ctx: *anyopaque, request: ops.
             const scratch_bytes = request.host_workspace[0..bytes];
             for (dense_inputs) |input| if (kernel_geometry.byteRangesOverlap(@intFromPtr(scratch_bytes.ptr), bytes, @intFromPtr(input.ptr), input.len * 4)) return error.InvalidAssignedAlias;
             if (kernel_geometry.byteRangesOverlap(@intFromPtr(scratch_bytes.ptr), bytes, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
-            const mask_bytes = try std.math.mul(usize, binding.mask.len, @sizeOf(i64));
-            if (kernel_geometry.byteRangesOverlap(@intFromPtr(binding.mask.ptr), mask_bytes, @intFromPtr(output.ptr), output.len * 4) or kernel_geometry.byteRangesOverlap(@intFromPtr(binding.mask.ptr), mask_bytes, @intFromPtr(scratch_bytes.ptr), bytes)) return error.InvalidAssignedAlias;
+            if (binding.mask) |mask| {
+                const mask_bytes = try std.math.mul(usize, mask.len, @sizeOf(i64));
+                if (kernel_geometry.byteRangesOverlap(@intFromPtr(mask.ptr), mask_bytes, @intFromPtr(output.ptr), output.len * 4) or kernel_geometry.byteRangesOverlap(@intFromPtr(mask.ptr), mask_bytes, @intFromPtr(scratch_bytes.ptr), bytes)) return error.InvalidAssignedAlias;
+            }
             const live_elements = try std.math.mul(usize, binding.live_key_rows, output.len);
             const scores = std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) u8, @alignCast(scratch_bytes)));
             linalg.crossAttentionHostInto(dense_inputs[0], dense_inputs[1][0..live_elements], dense_inputs[2][0..live_elements], binding.mask, 1, 1, binding.live_key_rows, geometry.num_heads, geometry.head_dim, output, scores);
@@ -60756,6 +60765,18 @@ fn nativeDensePrefixParity(a: std.mem.Allocator) !void {
         }
         for (expected, toBuf(output).data) |gold, actual| try std.testing.expectApproxEqAbs(gold, @as(f64, actual), 0.000002);
     }
+    const visible = [_]i64{ 1, 1, 1 };
+    const unmasked_reference = try cb.crossAttention(q, k, v, &visible, 1, 1, visible.len, 2, 2);
+    defer cb.free(unmasked_reference);
+    @memset(toBuf(k).data[visible.len * 4 ..], std.math.nan(f32));
+    @memset(toBuf(v).data[visible.len * 4 ..], std.math.nan(f32));
+    context.dense_attention_prefix = .{ .live_key_rows = visible.len };
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    const unmasked_execution = program.run(&cb, &inputs, output, &context, 1);
+    compute.allocator = a;
+    try std.testing.expect(try unmasked_execution);
+    try std.testing.expectEqualSlices(f32, getData(unmasked_reference), toBuf(output).data);
     const held = toBuf(output).data[0..4].*;
     const target = toBuf(output);
     const original_data = target.data;

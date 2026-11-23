@@ -2704,7 +2704,7 @@ pub const WasmCompute = struct {
         Q_ct: CT,
         K_ct: CT,
         V_ct: CT,
-        enc_mask: []const i64,
+        enc_mask: ?[]const i64,
         batch: usize,
         dec_seq: usize,
         enc_seq: usize,
@@ -2721,19 +2721,33 @@ pub const WasmCompute = struct {
         if (build_options.enable_webgpu and self.use_gpu and
             batch * dec_seq * H >= WEBGPU_ATTN_THRESHOLD and enc_seq <= WEBGPU_ATTN_MAX_SEQ)
         {
-            const out = try self.allocator.alloc(f32, batch * dec_seq * H);
+            const data = try self.allocator.alloc(f32, batch * dec_seq * H);
+            const out = WasmBuf.fromSlice(self.allocator, data, true);
+            errdefer out.deinit();
+            try out.setShape2D(batch * dec_seq, H);
             var q_gpu = GpuInputTensor.fromBuf(Q);
             defer q_gpu.deinit();
             var k_gpu = GpuInputTensor.fromBuf(K);
             defer k_gpu.deinit();
             var v_gpu = GpuInputTensor.fromBuf(V);
             defer v_gpu.deinit();
-            var out_gpu = gpuCrossAttention(batch, dec_seq, enc_seq, num_heads, head_dim, q_gpu.id, k_gpu.id, v_gpu.id, enc_mask, out);
-            return fromBuf(try setBufShape2D(WasmBuf.fromSliceWithGpu(self.allocator, out, true, out_gpu.detach(), true), batch * dec_seq, H));
+            var out_gpu = try gpuCrossAttention(self.allocator, batch, dec_seq, enc_seq, num_heads, head_dim, q_gpu.id, k_gpu.id, v_gpu.id, enc_mask, data);
+            out.gpu_tensor = out_gpu.detach();
+            out.gpu_tensor_owned = true;
+            return fromBuf(out);
         }
 
-        const output = try linalg.crossAttentionHost(self.allocator, Q.data, K.data, V.data, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim);
-        return fromBuf(try setBufShape2D(WasmBuf.fromSlice(self.allocator, output, true), batch * dec_seq, H));
+        const q = try Q.viewF32(self.allocator);
+        defer if (q.allocated) self.allocator.free(q.data);
+        const k = try K.viewF32(self.allocator);
+        defer if (k.allocated) self.allocator.free(k.data);
+        const v = try V.viewF32(self.allocator);
+        defer if (v.allocated) self.allocator.free(v.data);
+        const output = try linalg.crossAttentionHost(self.allocator, q.data, k.data, v.data, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim);
+        const out = WasmBuf.fromSlice(self.allocator, output, true);
+        errdefer out.deinit();
+        try out.setShape2D(batch * dec_seq, H);
+        return fromBuf(out);
     }
 
     fn relativePositionBiasOp(ctx: *anyopaque, weight_ct: CT, q_len: usize, k_len: usize, num_heads: usize, num_buckets: usize, max_distance: usize, bidirectional: bool) anyerror!CT {
@@ -4345,6 +4359,7 @@ pub const WasmCompute = struct {
     /// Dispatch cross-attention to WebGPU compute shader.
     /// Q is [batch, dec_seq, H], K/V are [batch, enc_seq, H].
     fn gpuCrossAttention(
+        allocator: std.mem.Allocator,
         batch: usize,
         dec_seq: usize,
         enc_seq: usize,
@@ -4353,31 +4368,32 @@ pub const WasmCompute = struct {
         q_buf: wasm_extern.GpuBufferId,
         k_buf: wasm_extern.GpuBufferId,
         v_buf: wasm_extern.GpuBufferId,
-        enc_mask: []const i64,
+        enc_mask: ?[]const i64,
         out: []f32,
-    ) GpuTensor {
+    ) !GpuTensor {
         if (!build_options.enable_webgpu) unreachable;
 
-        const H = num_heads * head_dim;
-        const mask_elems = batch * enc_seq;
-        const mask_bytes: u32 = @intCast(mask_elems * 4);
-        const out_bytes: u32 = @intCast(batch * dec_seq * H * 4);
+        const mask_buf = if (enc_mask) |mask| present: {
+            const count = try std.math.mul(usize, batch, enc_seq);
+            if (mask.len < count) return error.InvalidAttentionShape;
+            const converted = try allocator.alloc(u32, count);
+            defer allocator.free(converted);
+            for (converted, mask[0..count]) |*value, bit| value.* = @intFromBool(bit != 0);
+            const bytes = std.mem.sliceAsBytes(converted);
+            const buffer = wasm_extern.createBuffer(std.math.cast(u32, bytes.len) orelse return error.InvalidAttentionShape);
+            if (buffer == wasm_extern.invalid_buffer) return error.OutOfMemory;
+            wasm_extern.writeBufferAtOffset(buffer, 0, bytes);
+            break :present buffer;
+        } else wasm_extern.invalid_buffer;
+        defer if (mask_buf != wasm_extern.invalid_buffer) wasm_extern.freeBuffer(mask_buf);
 
-        const mask_buf = wasm_extern.createBuffer(mask_bytes);
-        const out_buf = GpuTensor.create(out_bytes);
-
-        // Convert i64 mask to u32 for GPU (reuse out buffer as scratch)
-        const mask_u32: [*]u32 = @ptrCast(@alignCast(out.ptr));
-        for (0..mask_elems) |i| {
-            mask_u32[i] = if (enc_mask[i] != 0) 1 else 0;
-        }
-        wasm_extern.upload(mask_buf, @as([*]const u8, @ptrCast(mask_u32))[0..mask_bytes]);
+        const out_buf = GpuTensor.create(std.math.cast(u32, std.mem.sliceAsBytes(out).len) orelse return error.InvalidAttentionShape);
+        if (out_buf.id == wasm_extern.invalid_buffer) return error.OutOfMemory;
 
         wasm_extern.crossAttention(q_buf, k_buf, v_buf, mask_buf, out_buf.id, @intCast(batch), @intCast(dec_seq), @intCast(enc_seq), @intCast(num_heads), @intCast(head_dim));
 
         out_buf.downloadF32(out);
 
-        wasm_extern.freeBuffer(mask_buf);
         return out_buf;
     }
 

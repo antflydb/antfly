@@ -720,6 +720,7 @@ pub const CrossAttentionAttrs = struct {
     enc_seq: u32,
     num_heads: u32,
     head_dim: u32,
+    all_keys_visible: bool = false,
 };
 
 pub const WindowedAttentionAttrs = struct {

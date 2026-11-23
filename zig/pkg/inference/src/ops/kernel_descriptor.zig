@@ -187,6 +187,8 @@ pub const DenseAttentionPrefix = struct {
     num_heads: u32,
     head_dim: u32,
     max_key_rows: u32,
+    /// The runtime binds the live extent but cannot supply a key mask.
+    all_keys_visible: bool = false,
 
     pub fn valid(self: @This(), descriptor: *const Descriptor) bool {
         if (self.num_heads == 0 or self.head_dim == 0 or self.max_key_rows == 0 or descriptor.input_count != 3) return false;
@@ -211,6 +213,7 @@ pub const DenseAttentionRows = struct {
     key_rows: u32,
     num_heads: u32,
     head_dim: u32,
+    all_keys_visible: bool = false,
     /// Zero retains the authored equal-head contract. Explicit KV heads name
     /// a functional grouped-query program with an exact static key extent.
     num_kv_heads: u32 = 0,

@@ -32519,7 +32519,7 @@ fn prepareDenseCrossKv(ctx: *anyopaque, k_ct: CT, v_ct: CT) anyerror!?ops.Linear
     return .{ .first = first, .second = second };
 }
 
-fn denseSplitCrossAttention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, batch: usize, queries: usize, keys: usize, heads: usize, dim: usize) !CT {
+fn denseSplitCrossAttention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64, batch: usize, queries: usize, keys: usize, heads: usize, dim: usize) !CT {
     if (dim != 64) return error.InvalidShape;
     const partial_count = try kernels_mod.KernelModule.crossSplitHd64WorkspaceElements(batch, queries, keys, heads);
     const q = tensorFromCt(q_ct);
@@ -32540,11 +32540,13 @@ fn denseSplitCrossAttention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT, ma
     try ensureCount(q, q_count);
     try ensureCount(k, kv_count);
     try ensureCount(v, kv_count);
-    const mask_count = try checkedMul(batch, keys);
-    if (mask.len < mask_count) return error.InvalidShape;
     try requireUncapturedDenseCross(self);
-    const mask_values = mask[0..mask_count];
-    const mask_device = if (allOnesI64(mask_values)) buffer_mod.DeviceBuffer{} else try uploadCachedAttentionMaskI64(self, mask_values);
+    const mask_device = if (mask) |values| masked: {
+        const count = try checkedMul(batch, keys);
+        if (values.len < count) return error.InvalidShape;
+        const live = values[0..count];
+        break :masked if (allOnesI64(live)) buffer_mod.DeviceBuffer{} else try uploadCachedAttentionMaskI64(self, live);
+    } else buffer_mod.DeviceBuffer{};
     const bytes = try checkedMul(partial_count, 4);
     if (self.run_budget) |budget| {
         const limit = budget.limits.scratch_limit_bytes;
@@ -32568,7 +32570,7 @@ fn denseSplitCrossAttention(self: *CudaCompute, q_ct: CT, k_ct: CT, v_ct: CT, ma
     return output.intoTensor();
 }
 
-fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: ?[]const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile == .transformer_seq2seq and self.runtime_policy.seq2seq.cross_schedule == .split_kv_128) {
         const k = tensorFromCt(k_ct);
@@ -32591,10 +32593,12 @@ fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []con
     try ensureCount(q_tensor, q_count);
     try ensureCount(k_tensor, kv_count);
     try ensureCount(v_tensor, kv_count);
-    if (enc_mask.len < try checkedMul(batch, enc_seq)) return error.InvalidShape;
-
-    const mask_values = enc_mask[0 .. batch * enc_seq];
-    const mask_device = if (allOnesI64(mask_values)) buffer_mod.DeviceBuffer{} else try uploadTempI64(self, mask_values);
+    const mask_device = if (enc_mask) |values| masked: {
+        const count = try checkedMul(batch, enc_seq);
+        if (values.len < count) return error.InvalidShape;
+        const live = values[0..count];
+        break :masked if (allOnesI64(live)) buffer_mod.DeviceBuffer{} else try uploadTempI64(self, live);
+    } else buffer_mod.DeviceBuffer{};
     var output = try OwnedF32Output.alloc(self, q_tensor.shape, q_count);
     defer output.deinit();
     if (self.capability_profile == .florence2 and self.florence_fused_cross_enabled and
@@ -40258,7 +40262,12 @@ const DenseAssignedAttention = struct {
             },
             else => return null,
         }
-        result.mask_bytes = if (result.causal) 0 else std.math.mul(usize, result.keys, @sizeOf(i64)) catch return null;
+        const all_keys_visible = switch (descriptor.operation) {
+            .dense_attention_prefix => |g| g.all_keys_visible,
+            .dense_attention_rows => |g| g.all_keys_visible,
+            else => unreachable,
+        };
+        result.mask_bytes = if (result.causal or all_keys_visible) 0 else std.math.mul(usize, result.keys, @sizeOf(i64)) catch return null;
         return result;
     }
     fn select(self: *CudaCompute, descriptor: *const ops.kernel_descriptor.Descriptor) !?@This() {
@@ -40317,13 +40326,14 @@ fn runAssignedDenseAttention(self: *CudaCompute, request: ops.kernel_descriptor.
         switch (descriptor.operation) {
             .dense_attention_prefix => {
                 const binding = attention.dense_attention_prefix orelse return false;
-                if (binding.live_key_rows == 0 or binding.live_key_rows > keys or binding.mask.len != binding.live_key_rows) return error.InvalidAttentionShape;
+                if (binding.live_key_rows == 0 or binding.live_key_rows > keys) return error.InvalidAttentionShape;
+                if (binding.mask) |values| if (plan.mask_bytes == 0 or values.len != binding.live_key_rows) return error.InvalidAttentionShape;
                 keys = binding.live_key_rows;
                 mask = binding.mask;
             },
             .dense_attention_rows => {
                 const binding = attention.dense_attention_rows orelse return false;
-                if (plan.causal and binding.mask != null) return error.InvalidAttentionShape;
+                if (plan.mask_bytes == 0 and binding.mask != null) return error.InvalidAttentionShape;
                 if (binding.mask) |values| if (values.len != keys) return error.InvalidAttentionShape;
                 mask = binding.mask;
             },
@@ -59311,6 +59321,10 @@ test "CUDA dense decoder readiness preserves F32 policy and exact attention scra
     compute.runtime_policy.seq2seq.cross_schedule = .split_kv_128;
     const split = (try DenseAssignedAttention.select(&compute, &cross)).?;
     try std.testing.expect(split.split and split.partial_bytes > 0);
+    cross.operation.dense_attention_prefix.all_keys_visible = true;
+    const unmasked_split = (try DenseAssignedAttention.select(&compute, &cross)).?;
+    try std.testing.expectEqual(split.partial_bytes, try unmasked_split.workspaceBytes());
+    try std.testing.expectEqual(@as(usize, 0), unmasked_split.mask_bytes);
     compute.kernels.cross_split_hd64_merge_f32 = null;
     try std.testing.expect(try DenseAssignedAttention.select(&compute, &cross) == null);
     compute.runtime_policy.seq2seq.cross_schedule = .legacy;

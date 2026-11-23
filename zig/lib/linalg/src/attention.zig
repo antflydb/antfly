@@ -1723,13 +1723,16 @@ pub fn crossAttentionHost(
     Q: []const f32,
     K: []const f32,
     V: []const f32,
-    enc_mask: []const i64,
+    enc_mask: ?[]const i64,
     batch: usize,
     dec_seq: usize,
     enc_seq: usize,
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
+    if (enc_mask) |mask| {
+        if (mask.len < try std.math.mul(usize, batch, enc_seq)) return error.InvalidAttentionShape;
+    }
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
     const output = try allocator.alloc(f32, std.math.mul(usize, batch * dec_seq, H) catch return error.InvalidAttentionShape);
     errdefer allocator.free(output);
@@ -1745,7 +1748,7 @@ pub fn crossAttentionHostInto(
     Q: []const f32,
     K: []const f32,
     V: []const f32,
-    enc_mask: []const i64,
+    enc_mask: ?[]const i64,
     batch: usize,
     dec_seq: usize,
     enc_seq: usize,
@@ -1759,13 +1762,14 @@ pub fn crossAttentionHostInto(
     @memset(output, 0.0);
 
     for (0..batch) |b| {
+        const key_mask = if (enc_mask) |mask| mask[b * enc_seq ..][0..enc_seq] else null;
         for (0..num_heads) |h| {
             for (0..dec_seq) |qi| {
                 const q_ptr = Q[(b * dec_seq + qi) * H + h * head_dim ..].ptr;
                 const row = scores[qi * enc_seq ..][0..enc_seq];
                 for (0..enc_seq) |ki| {
                     const k_ptr = K[(b * enc_seq + ki) * H + h * head_dim ..].ptr;
-                    row[ki] = if (enc_mask[b * enc_seq + ki] == 0)
+                    row[ki] = if (key_mask != null and key_mask.?[ki] == 0)
                         -std.math.inf(f32)
                     else
                         primitives.dotPtrs(q_ptr, k_ptr, head_dim) * scale;

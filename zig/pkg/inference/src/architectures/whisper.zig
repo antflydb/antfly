@@ -911,23 +911,19 @@ pub const CacheGeometry = struct {
     width: usize,
     encoder_rows: usize,
     capacity: usize,
-    encoder_mask_elements: usize,
-    self_mask_elements: usize,
     cross_tensor_bytes: usize,
     self_tensor_bytes: usize,
     known_metadata_bytes: usize,
 
     pub fn init(config: Config, encoder_rows: usize) !CacheGeometry {
         const mul = cacheMul;
-        const add = cacheAdd;
         const width: usize = config.d_model;
         const capacity = @max(@as(usize, 1), config.max_target_positions);
         if (encoder_rows == 0 or width == 0) return error.InvalidInputShape;
         const cross_bytes = try mul(usize, try mul(usize, encoder_rows, width), @sizeOf(f32));
         const self_bytes = try mul(usize, try mul(usize, capacity, width), @sizeOf(f32));
-        const masks = try mul(usize, try add(usize, encoder_rows, capacity), @sizeOf(i64));
         const vectors = try mul(usize, config.decoder_layers, @sizeOf(DecodeCache.LayerCache) + @sizeOf(LayerWeights));
-        return .{ .layers = config.decoder_layers, .width = width, .encoder_rows = encoder_rows, .capacity = capacity, .encoder_mask_elements = encoder_rows, .self_mask_elements = capacity, .cross_tensor_bytes = cross_bytes, .self_tensor_bytes = self_bytes, .known_metadata_bytes = try add(usize, masks, vectors) };
+        return .{ .layers = config.decoder_layers, .width = width, .encoder_rows = encoder_rows, .capacity = capacity, .cross_tensor_bytes = cross_bytes, .self_tensor_bytes = self_bytes, .known_metadata_bytes = vectors };
     }
 
     pub fn cacheAmounts(self: CacheGeometry, cb: *const ComputeBackend) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
@@ -1073,8 +1069,6 @@ pub const PreparedSingleToken = struct {
     position_rows: usize,
     adopted: bool = false,
     cache_layers: []DecodeCache.LayerCache,
-    encoder_mask: []i64,
-    self_mask: []i64,
 
     const schedule_mod = @import("../execution/dense_decoder_schedule.zig");
     const NodeId = @import("ml").graph.NodeId;
@@ -1126,7 +1120,7 @@ pub const PreparedSingleToken = struct {
             return count;
         }
         pub fn header(self: @This()) schedule_mod.ProgramSpec {
-            return .{ .family = .whisper, .phase = if (self.initial) .initial else .decode, .geometry = .{ .layers = self.config.decoder_layers, .width = self.config.d_model, .heads = self.config.decoder_attention_heads, .ffn_dim = self.config.decoder_ffn_dim, .vocab_size = self.config.vocab_size, .encoder_rows = self.rows, .capacity = @max(@as(usize, 1), self.config.max_target_positions), .query_rows = self.query_rows }, .semantics = .{ .epsilon = 1e-5, .activation = .gelu, .norm_order = .pre, .position_offset = 0, .global_final_norm = true }, .parameters = &.{} };
+            return .{ .family = .whisper, .phase = if (self.initial) .initial else .decode, .geometry = .{ .layers = self.config.decoder_layers, .width = self.config.d_model, .heads = self.config.decoder_attention_heads, .ffn_dim = self.config.decoder_ffn_dim, .vocab_size = self.config.vocab_size, .encoder_rows = self.rows, .capacity = @max(@as(usize, 1), self.config.max_target_positions), .query_rows = self.query_rows }, .semantics = .{ .epsilon = 1e-5, .activation = .gelu, .norm_order = .pre, .position_offset = 0, .global_final_norm = true, .all_keys_visible = true }, .parameters = &.{} };
         }
         pub fn len(self: @This()) usize {
             return self.parameter_count;
@@ -1330,13 +1324,7 @@ pub const PreparedSingleToken = struct {
         errdefer authored.schedule.deinit(.{ .outside_execution = true });
         const cache_layers = try a.alloc(DecodeCache.LayerCache, config.decoder_layers);
         errdefer a.free(cache_layers);
-        const encoder_mask = try a.alloc(i64, geometry.encoder_mask_elements);
-        errdefer a.free(encoder_mask);
-        @memset(encoder_mask, 1);
-        const self_mask = try a.alloc(i64, geometry.self_mask_elements);
-        errdefer a.free(self_mask);
-        @memset(self_mask, 1);
-        return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = authored.schedule, .source_data = source_data, .self_slabs = slabs, .token_node = authored.token_node, .position_node = authored.position_node, .cache_layers = cache_layers, .encoder_mask = encoder_mask, .self_mask = self_mask, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
+        return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = authored.schedule, .source_data = source_data, .self_slabs = slabs, .token_node = authored.token_node, .position_node = authored.position_node, .cache_layers = cache_layers, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
     }
     fn authorPhase(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, slabs: []const Slab, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !Authored {
         const source = (try specSource(cb, source_data, config, rows, weights, spec.geometry.query_rows, spec.phase == .initial)) orelse return error.UnsupportedDenseSchedule;
@@ -1453,8 +1441,6 @@ pub const PreparedSingleToken = struct {
                 self.backend.free(slab.cross_v);
             }
             self.allocator.free(self.cache_layers);
-            self.allocator.free(self.encoder_mask);
-            self.allocator.free(self.self_mask);
         }
         self.allocator.free(self.self_slabs);
         self.* = undefined;
@@ -1469,9 +1455,7 @@ pub const DecodeCache = struct {
     /// Tokens already folded into the self-attention cache.
     positions: usize = 0,
     enc_seq: usize,
-    encoder_mask: []i64,
     /// All-ones mask covering `max_target_positions` cached keys.
-    self_mask: []i64,
     /// Rows per preallocated self-cache slab; 0 when the cache grows by
     /// concatenation instead.
     capacity: usize = 0,
@@ -1614,11 +1598,6 @@ pub const DecodeCache = struct {
             }
         }
 
-        const encoder_mask = if (native) |program| program.encoder_mask else try allocator.alloc(i64, geometry.encoder_mask_elements);
-        errdefer if (native == null) allocator.free(encoder_mask);
-        @memset(encoder_mask, 1);
-        const self_mask = if (native) |program| program.self_mask else try allocator.alloc(i64, geometry.self_mask_elements);
-        @memset(self_mask, 1);
         var fetcher = prepared.fetcher;
         prepared.fetcher.handles = .empty;
         prepared.weights.layers = &.{};
@@ -1636,8 +1615,6 @@ pub const DecodeCache = struct {
             .weights = weights,
             .fetcher = fetcher,
             .enc_seq = enc_seq,
-            .encoder_mask = encoder_mask,
-            .self_mask = self_mask,
             .capacity = capacity,
             .native_program = program_value,
         };
@@ -1658,8 +1635,6 @@ pub const DecodeCache = struct {
         self.allocator.free(self.layers);
         self.allocator.free(self.weights.layers);
         self.fetcher.release(cb);
-        self.allocator.free(self.encoder_mask);
-        self.allocator.free(self.self_mask);
         self.* = undefined;
     }
 
@@ -1857,17 +1832,17 @@ fn validatePrefixRows(cb: *const ComputeBackend, actual: CT, whole: CT, bytes: u
     if (observed.backing == null or !std.meta.eql(observed.backing, full.backing) or observed.byte_offset != full.byte_offset or observed.readable_bytes < bytes) return error.PreparedDensePrefixBindingChanged;
 }
 
-fn stepPrefix(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, mask: []const i64, live: usize, heads: usize, dim: usize) !CT {
+fn stepPrefix(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, live: usize, heads: usize, dim: usize) !CT {
     if (profile.assigned) |schedule| {
-        if (schedule.descriptors[schedule.steps[schedule.cursor]].?.operation == .dense_attention_rows) return stepCrossRows(cb, profile, q, k, v, mask, 1, live, heads, dim);
+        if (schedule.descriptors[schedule.steps[schedule.cursor]].?.operation == .dense_attention_rows) return stepCrossRows(cb, profile, q, k, v, 1, live, heads, dim);
         const node = schedule.graph.node(schedule.steps[schedule.cursor]);
         const whole_k = schedule.values[node.inputs[1]] orelse return error.MissingValue;
         const whole_v = schedule.values[node.inputs[2]] orelse return error.MissingValue;
         for ([_]CT{ k, v }, [_]CT{ whole_k, whole_v }) |actual, whole| try validatePrefixRows(cb, actual, whole, live * heads * dim * 4);
-        const attention = ops.AttentionContext{ .total_sequence_len = live, .query_sequence_len = 1, .kv_sequence_len = live, .dense_attention_prefix = .{ .live_key_rows = live, .mask = mask } };
+        const attention = ops.AttentionContext{ .total_sequence_len = live, .query_sequence_len = 1, .kv_sequence_len = live, .dense_attention_prefix = .{ .live_key_rows = live } };
         return schedule.execute(&.{ q, whole_k, whole_v }, &attention);
     }
-    return cb.crossAttention(q, k, v, mask, 1, 1, live, heads, dim);
+    return cb.crossAttention(q, k, v, null, 1, 1, live, heads, dim);
 }
 
 fn stepCausal(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, rows: usize, heads: usize, dim: usize) !CT {
@@ -1877,12 +1852,12 @@ fn stepCausal(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v:
     }
     return cb.causalSelfAttention(q, k, v, null, 1, rows, heads, dim);
 }
-fn stepCrossRows(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, mask: []const i64, rows: usize, keys: usize, heads: usize, dim: usize) !CT {
+fn stepCrossRows(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT, v: CT, rows: usize, keys: usize, heads: usize, dim: usize) !CT {
     if (profile.assigned) |schedule| {
-        const attention = ops.AttentionContext{ .total_sequence_len = keys, .query_sequence_len = rows, .kv_sequence_len = keys, .dense_attention_rows = .{ .mask = mask } };
+        const attention = ops.AttentionContext{ .total_sequence_len = keys, .query_sequence_len = rows, .kv_sequence_len = keys, .dense_attention_rows = .{} };
         return schedule.execute(&.{ q, k, v }, &attention);
     }
-    return cb.crossAttention(q, k, v, mask, 1, rows, keys, heads, dim);
+    return cb.crossAttention(q, k, v, null, 1, rows, keys, heads, dim);
 }
 
 fn addNorm(cb: *const ComputeBackend, a: CT, b: CT, norm: Norm, dim: usize, profile: ?*StepProfile) !AddNormPair {
@@ -2205,7 +2180,7 @@ fn decoderBlockCached(
             self_attn = try stepCausal(cb, profile, proj.q, proj.k, proj.v, dec_seq, num_heads, head_dim);
         } else {
             // One new query over every cached key: causal by construction.
-            self_attn = if (dec_seq == 1) try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, cache.self_mask[0..total], total, num_heads, head_dim) else try cb.crossAttention(proj.q, k_rows.tensor, v_rows.tensor, cache.self_mask[0..total], 1, dec_seq, total, num_heads, head_dim);
+            self_attn = if (dec_seq == 1) try stepPrefix(cb, profile, proj.q, k_rows.tensor, v_rows.tensor, total, num_heads, head_dim) else try cb.crossAttention(proj.q, k_rows.tensor, v_rows.tensor, null, 1, dec_seq, total, num_heads, head_dim);
         }
     }
     defer stepRelease(cb, profile, self_attn);
@@ -2223,7 +2198,7 @@ fn decoderBlockCached(
     const Q_cross = try stepLinear(cb, profile, w.cross_q, after_self.normed, dec_seq, d_model, d_model);
     defer stepRelease(cb, profile, Q_cross);
     profile.mark(cb, .cross_norm_q);
-    const cross_attn = if (dec_seq == 1) try stepPrefix(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.encoder_mask, cache.enc_seq, num_heads, head_dim) else try stepCrossRows(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.encoder_mask, dec_seq, cache.enc_seq, num_heads, head_dim);
+    const cross_attn = if (dec_seq == 1) try stepPrefix(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, cache.enc_seq, num_heads, head_dim) else try stepCrossRows(cb, profile, Q_cross, layer_cache.k_cross, layer_cache.v_cross, dec_seq, cache.enc_seq, num_heads, head_dim);
     defer stepRelease(cb, profile, cross_attn);
     profile.mark(cb, .cross_attn);
     const cross_proj = try stepLinear(cb, profile, w.cross_o, cross_attn, dec_seq, d_model, d_model);
@@ -2328,8 +2303,6 @@ test "incremental canonical cache geometry bounds full encoder constructor and r
     const config: Config = .{ .d_model = 64, .decoder_layers = 2, .decoder_attention_heads = 2, .decoder_ffn_dim = 128, .max_target_positions = 8, .vocab_size = 4 };
     const geometry = try CacheGeometry.init(config, 1024);
     try std.testing.expect(try geometry.workspaceBytes(config) >= 6 * 1024 * 64 * @sizeOf(f32));
-    try std.testing.expectEqual(@as(usize, 1024), geometry.encoder_mask_elements);
-    try std.testing.expectEqual(@as(usize, 8), geometry.self_mask_elements);
     try std.testing.expectError(error.ResourceLimitExceeded, CacheGeometry.init(config, std.math.maxInt(usize)));
     try std.testing.expectError(error.InvalidInputShape, CacheGeometry.init(config, 0));
 }

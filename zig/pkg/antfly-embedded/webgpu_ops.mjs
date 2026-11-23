@@ -513,7 +513,7 @@ export class WebGPUOps {
 
   _dispatchCrossAttention(qId, kId, vId, maskId, outId, batch, decSeq, encSeq, numHeads, headDim) {
     const qBuf = this.buffers.get(qId), kBuf = this.buffers.get(kId);
-    const vBuf = this.buffers.get(vId), maskBuf = this.buffers.get(maskId);
+    const vBuf = this.buffers.get(vId), maskBuf = (maskId === 0 ? qBuf : this.buffers.get(maskId));
     const outBuf = this.buffers.get(outId);
     if (!qBuf || !kBuf || !vBuf || !maskBuf || !outBuf) return;
 
@@ -521,7 +521,7 @@ export class WebGPUOps {
     const u32 = new Uint32Array(ab);
     const f32 = new Float32Array(ab);
     u32[0] = decSeq; u32[1] = encSeq; u32[2] = numHeads; u32[3] = headDim;
-    f32[4] = 1.0 / Math.sqrt(headDim); u32[5] = 0;
+    f32[4] = 1.0 / Math.sqrt(headDim); u32[5] = maskId !== 0 ? 1 : 0;
     const paramsBuffer = this.device.createBuffer({ size: 24, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.device.queue.writeBuffer(paramsBuffer, 0, ab);
 

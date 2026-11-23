@@ -622,14 +622,16 @@ pub fn compilePartitionWithOptions(
             },
 
             .fused_cross_attention => |attrs| {
-                if (resident.capacity == 0 or attrs.batch != 1 or ins.len != 4) return error.UnsupportedResidentDecode;
+                const input_count: usize = if (attrs.all_keys_visible) 3 else 4;
+                if (resident.capacity == 0 or attrs.batch != 1 or ins.len != input_count) return error.UnsupportedResidentDecode;
+                const visibility = if (attrs.all_keys_visible) null else try getHloId(node_map, ins[3]);
                 try resident.queryRows(attrs.dec_seq);
                 const shape = hlo.Shape.init(.f32, &.{ attrs.enc_seq, @as(i64, attrs.num_heads) * attrs.head_dim });
                 const key = if (options.resident_initial) try getHloId(node_map, ins[1]) else try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[1], shape);
                 const value = if (options.resident_initial) try getHloId(node_map, ins[2]) else try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[2], shape);
                 try resident.output(allocator, ins[1], key);
                 try resident.output(allocator, ins[2], value);
-                node_map[nid] = try emitResidentCrossAttention(&b, n, try getHloId(node_map, ins[0]), key, value, try getHloId(node_map, ins[3]), attrs, &reducer_comp, &max_reducer_comp, options.precision == .bf16);
+                node_map[nid] = try emitResidentCrossAttention(&b, n, try getHloId(node_map, ins[0]), key, value, visibility, attrs, &reducer_comp, &max_reducer_comp, options.precision == .bf16);
                 needs_reducer = true;
                 needs_max_reducer = true;
             },
@@ -782,7 +784,7 @@ pub fn compilePartitionWithOptions(
 
 /// Fixed immutable cross banks share the existing head layout and reduction
 /// programs. Visibility remains dynamic, including masked NaNs and empty rows.
-fn emitResidentCrossAttention(b: *hlo.Builder, node: *const Node, q: hlo.Id, k: hlo.Id, v: hlo.Id, visibility: hlo.Id, attrs: ml.graph.node.CrossAttentionAttrs, add: *const hlo.Computation, maximum: *const hlo.Computation, bf16: bool) !hlo.Id {
+fn emitResidentCrossAttention(b: *hlo.Builder, node: *const Node, q: hlo.Id, k: hlo.Id, v: hlo.Id, visibility: ?hlo.Id, attrs: ml.graph.node.CrossAttentionAttrs, add: *const hlo.Computation, maximum: *const hlo.Computation, bf16: bool) !hlo.Id {
     const heads: i64 = attrs.num_heads;
     const rows: i64 = attrs.dec_seq;
     const keys: i64 = attrs.enc_seq;
@@ -793,11 +795,13 @@ fn emitResidentCrossAttention(b: *hlo.Builder, node: *const Node, q: hlo.Id, k: 
     const scores_shape = hlo.Shape.init(.f32, &.{ heads, rows, keys });
     var scores = try b.dot(qh, try b.transpose(kh, &.{ 0, 2, 1 }, hlo.Shape.init(.f32, &.{ heads, dim, keys })), scores_shape, .{ .lhs_contracting_dimensions = &.{2}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
     scores = try b.multiply(scores, try b.constantScalarF32(1 / @sqrt(@as(f32, @floatFromInt(dim)))));
-    const mask = try b.reshape(visibility, hlo.Shape.init(.pred, &.{keys}));
-    const visible = try b.broadcast(mask, &.{2}, hlo.Shape.init(.pred, scores_shape.dimensions));
-    scores = try b.select(visible, scores, try b.broadcast(try b.constantScalarF32(-std.math.inf(f32)), &.{}, scores_shape));
-    const value_shape = hlo.Shape.init(.f32, &.{ heads, keys, dim });
-    vh = try b.select(try b.broadcast(mask, &.{1}, hlo.Shape.init(.pred, value_shape.dimensions)), vh, try b.broadcast(try b.constantScalarF32(0), &.{}, value_shape));
+    if (visibility) |predicate| {
+        const mask = try b.reshape(predicate, hlo.Shape.init(.pred, &.{keys}));
+        const visible = try b.broadcast(mask, &.{2}, hlo.Shape.init(.pred, scores_shape.dimensions));
+        scores = try b.select(visible, scores, try b.broadcast(try b.constantScalarF32(-std.math.inf(f32)), &.{}, scores_shape));
+        const value_shape = hlo.Shape.init(.f32, &.{ heads, keys, dim });
+        vh = try b.select(try b.broadcast(mask, &.{1}, hlo.Shape.init(.pred, value_shape.dimensions)), vh, try b.broadcast(try b.constantScalarF32(0), &.{}, value_shape));
+    }
     const reduced = hlo.Shape.init(.f32, &.{ heads, rows });
     const max_value = try b.maximum(try b.reduce(scores, try b.constantScalarF32(-std.math.inf(f32)), &.{2}, reduced, maximum.id), try b.constantScalarF32(-std.math.floatMax(f32)));
     const exp = try b.exponential(try b.subtract(scores, try b.broadcast(max_value, &.{ 0, 1 }, scores_shape)));

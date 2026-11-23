@@ -1159,20 +1159,20 @@ pub const TracingCompute = struct {
         return tc.makeHandle(id);
     }
 
-    fn crossAttentionOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    fn crossAttentionOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: ?[]const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
         const tc = fromCtx(ctx);
         if (tc.resident_decoder) {
-            if (batch != 1 or mask.len != enc_seq) return error.UnsupportedShape;
-            const visible = try tc.maskVisibility(mask, batch, enc_seq);
+            if (batch != 1) return error.UnsupportedShape;
+            const visible = if (mask) |values| (try tc.maskVisibility(values, batch, enc_seq)).node else null_node;
             const id = try tc.graph.addNode(.{
-                .op = .{ .fused_cross_attention = .{ .batch = @intCast(batch), .dec_seq = @intCast(dec_seq), .enc_seq = @intCast(enc_seq), .num_heads = @intCast(num_heads), .head_dim = @intCast(head_dim) } },
+                .op = .{ .fused_cross_attention = .{ .batch = @intCast(batch), .dec_seq = @intCast(dec_seq), .enc_seq = @intCast(enc_seq), .num_heads = @intCast(num_heads), .head_dim = @intCast(head_dim), .all_keys_visible = mask == null } },
                 .output_shape = tc.graph.node(nodeIdFromCT(Q)).output_shape,
-                .inputs = .{ nodeIdFromCT(Q), nodeIdFromCT(K), nodeIdFromCT(V), visible.node },
-                .num_inputs = 4,
+                .inputs = .{ nodeIdFromCT(Q), nodeIdFromCT(K), nodeIdFromCT(V), visible },
+                .num_inputs = if (mask == null) 3 else 4,
             });
             return tc.makeHandle(id);
         }
-        if (tc.require_resident_outputs) return tc.denseAttention(Q, K, V, mask, null, batch, dec_seq, enc_seq, num_heads, head_dim, false, true);
+        if (tc.require_resident_outputs or mask == null) return tc.denseAttention(Q, K, V, mask orelse &.{}, null, batch, dec_seq, enc_seq, num_heads, head_dim, false, true);
         const q_id = nodeIdFromCT(Q);
         const out_shape = tc.graph.node(q_id).output_shape;
         const id = try tc.graph.addNode(.{
@@ -2031,6 +2031,31 @@ test "TracingCompute basic tracing" {
 
     // Should have parameters
     try std.testing.expect(graph.parameters.items.len >= 4);
+}
+
+test "TracingCompute resident cross attention omits all-valid mask operands" {
+    var tc = try TracingCompute.initWithWeights(std.testing.allocator, &.{
+        .{ .name = "q", .shape = Shape.init(.f32, &.{ 1, 4 }) },
+        .{ .name = "k", .shape = Shape.init(.f32, &.{ 3, 4 }) },
+        .{ .name = "v", .shape = Shape.init(.f32, &.{ 3, 4 }) },
+    });
+    defer tc.deinit();
+    tc.resident_decoder = true;
+    const cb = tc.backend();
+    const q = try cb.getWeight("q");
+    const k = try cb.getWeight("k");
+    const v = try cb.getWeight("v");
+
+    const plain = try cb.crossAttention(q, k, v, null, 1, 1, 3, 2, 2);
+    const plain_node = tc.graph.node(nodeIdFromCT(plain));
+    try std.testing.expect(plain_node.op.fused_cross_attention.all_keys_visible);
+    try std.testing.expectEqual(@as(usize, 3), plain_node.getInputs().len);
+
+    const masked = try cb.crossAttention(q, k, v, &.{ 1, 0, 1 }, 1, 1, 3, 2, 2);
+    const masked_node = tc.graph.node(nodeIdFromCT(masked));
+    try std.testing.expect(!masked_node.op.fused_cross_attention.all_keys_visible);
+    try std.testing.expectEqual(@as(usize, 4), masked_node.getInputs().len);
+    try std.testing.expectEqual(.bool_, tc.graph.node(masked_node.inputs[3]).output_shape.dtype);
 }
 
 test "TracingCompute backend kind" {

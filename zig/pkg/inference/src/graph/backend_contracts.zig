@@ -997,7 +997,7 @@ pub const AttentionSinkMetadata = struct {
 /// program. The supplying cache and Frame retain the actual K/V capacity CTs.
 pub const DenseAttentionPrefixBinding = struct {
     live_key_rows: usize,
-    mask: []const i64,
+    mask: ?[]const i64 = null,
 };
 
 pub const DenseAttentionRowsBinding = struct { mask: ?[]const i64 = null };

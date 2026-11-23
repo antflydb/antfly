@@ -3428,7 +3428,7 @@ pub const ComputeBackend = struct {
         /// Q: [batch*dec_seq, num_heads*head_dim], K/V: [batch*enc_seq, num_heads*head_dim].
         /// enc_mask: [batch, enc_seq] with 0=masked, 1=attend.
         /// Returns: [batch*dec_seq, num_heads*head_dim].
-        crossAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+        crossAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, enc_mask: ?[]const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
         /// Compute T5-style relative position bias.
         /// weight: [num_heads, num_buckets] learned bias table.
@@ -5426,7 +5426,8 @@ pub const ComputeBackend = struct {
         return self.observeBackendEntry(.causal_attention, self.vtable.causalSelfAttention, .{ self.ptr, Q, K, V, attn_bias, batch, seq_len, num_heads, head_dim });
     }
 
-    pub fn crossAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, enc_mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) !CT {
+    /// A null mask proves all keys visible. An explicit mask remains borrowed.
+    pub fn crossAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, enc_mask: ?[]const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) !CT {
         return self.observeBackendEntry(.cross_attention, self.vtable.crossAttention, .{ self.ptr, Q, K, V, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim });
     }
 

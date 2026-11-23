@@ -2966,8 +2966,7 @@ pub fn executeNode(
         },
 
         .fused_cross_attention => |attrs| {
-            const mask = state.options.cross_attention_mask orelse
-                return error.MissingRuntimeInput;
+            const mask: ?[]const i64 = if (attrs.all_keys_visible) null else state.options.cross_attention_mask orelse return error.MissingRuntimeInput;
             return cb.crossAttention(
                 V.get(ins[0]),
                 V.get(ins[1]),
@@ -5261,7 +5260,7 @@ const TestCompute = struct {
     fn stubSdpa(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: ?CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
-    fn stubCrossAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: []const i64, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
+    fn stubCrossAttn(_: *anyopaque, _: CT, _: CT, _: CT, _: ?[]const i64, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
         return error.UnsupportedPrimitiveOp;
     }
     fn stubRelPosBias(_: *anyopaque, _: CT, _: usize, _: usize, _: usize, _: usize, _: usize, _: bool) anyerror!CT {
