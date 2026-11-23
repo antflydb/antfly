@@ -1987,6 +1987,17 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
         const binding = try owned.acquireBinding(.{ .sequence_id = 91, .layer_index = 0 }, 0, false, true);
         try std.testing.expect(binding.slot >= metal_runtime.paged_kv_slot_base);
         const layout = owned.rowLayout(kv_heads, head_dim);
+        const reserved: ?MetalKvStorage.SlotInfo = if (dtype == .f16) blk: {
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
+                metal,
+                binding.slot,
+                @backingInt(owned.format),
+                rows,
+                layout.key_row_bytes,
+                layout.v_row_stride,
+            ));
+            break :blk try owned.slotInfo(binding.slot);
+        } else null;
         // Exercise F16 seeding and suffix append with nonzero source and slot offsets.
         const updates: []const usize = if (dtype == .f16) &.{ 2, rows } else &.{rows};
         var prior_rows: usize = 0;
@@ -2009,6 +2020,12 @@ test "selected Metal GPU scorer matches decoded-key oracle before and after repa
                 0,
             ));
             prior_rows = covered_rows;
+        }
+        if (reserved) |before| {
+            const after = try owned.slotInfo(binding.slot);
+            try std.testing.expectEqual(rows * width * @sizeOf(f16), after.v_capacity);
+            try std.testing.expectEqual(before.v_handle, after.v_handle);
+            try std.testing.expectEqual(before.encoded_key_handle, after.encoded_key_handle);
         }
         binding.written_tokens = rows;
         // This fixture writes the native slot directly, bypassing the storage

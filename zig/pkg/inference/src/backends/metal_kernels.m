@@ -65415,14 +65415,25 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         if (suffix_start == kv_tokens) return 0;
     }
     const size_t suffix_tokens = kv_tokens - suffix_start;
-    const size_t encoded_bytes = kv_tokens * key_row_bytes;
-    const size_t v_bytes = kv_tokens * v_row_stride * sizeof(float);
-    const size_t suffix_v_bytes = suffix_tokens * v_row_stride * sizeof(float);
-    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return -5;
-
     id<MTLBuffer> k_buffer = (__bridge id<MTLBuffer>)k_handle;
     id<MTLBuffer> v_buffer = (__bridge id<MTLBuffer>)v_handle;
     if (k_buffer == nil || v_buffer == nil) return -9;
+    const size_t value_element_bytes = format == 3u ? sizeof(uint16_t) : sizeof(float);
+    if (kv_tokens > SIZE_MAX / key_row_bytes || v_row_stride > SIZE_MAX / sizeof(float)) return -3;
+    const size_t value_row_bytes = v_row_stride * value_element_bytes;
+    const size_t raw_value_row_bytes = v_row_stride * sizeof(float);
+    if (kv_tokens > SIZE_MAX / value_row_bytes || suffix_tokens > SIZE_MAX / raw_value_row_bytes) return -3;
+    const size_t encoded_bytes = kv_tokens * key_row_bytes;
+    const size_t v_bytes = kv_tokens * value_row_bytes;
+    const size_t suffix_v_bytes = suffix_tokens * raw_value_row_bytes;
+    if (format == 3u) {
+        // The paired converter writes dense rows and reads exactly the supplied suffix.
+        if (num_kv_heads > SIZE_MAX / head_dim || num_kv_heads * head_dim != v_row_stride ||
+            key_row_bytes != value_row_bytes) return -2;
+        if (k_offset > k_buffer.length || suffix_v_bytes > k_buffer.length - k_offset ||
+            v_offset > v_buffer.length || suffix_v_bytes > v_buffer.length - v_offset) return -9;
+    }
+    if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return -5;
 
     if (format == 2u) {
         uint32_t contiguous_block_table[1] = { 0u };
@@ -65499,7 +65510,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         if (encoder == nil) return -11;
         antfly_metal_encode_f16_kv(encoder, pipeline,
             k_buffer, k_offset, runtime->attention_span_encoded_key_buffers[slot], suffix_start * key_row_bytes,
-            v_buffer, v_offset, runtime->attention_span_v_buffers[slot], suffix_start * v_row_stride * sizeof(uint16_t),
+            v_buffer, v_offset, runtime->attention_span_v_buffers[slot], suffix_start * value_row_bytes,
             &params);
         [encoder endEncoding];
     } else {
