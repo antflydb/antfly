@@ -33,9 +33,10 @@ var test_fail_published_file_directory_sync: std.atomic.Value(bool) = .init(fals
 const PreparedGenerationAdoption = struct {
     live: *@import("backend.zig").Handle,
     prepared: *@import("backend.zig").Handle,
+    target_path: []const u8,
 
     fn adopt(context: PreparedGenerationAdoption) !db_mod.DB.PortableGenerationPublication {
-        return switch (try context.live.replaceWithPreparedGeneration(context.prepared)) {
+        return switch (try context.live.native_docstore.?.replaceWithPreparedGenerationAt(context.prepared.native_docstore.?, context.target_path)) {
             .complete => .complete,
             .durability_unknown => .durability_unknown,
         };
@@ -135,7 +136,11 @@ pub fn importPreparedIntoLiteDb(
     if (!(try db.isPortableImportTargetEmpty(allocator))) return error.LiteImportTargetNotEmpty;
     if (lite_backend.engine != .native_single_file) return error.UnsupportedOperation;
 
-    const target_path = lite_backend.native_docstore.?.file.path;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const target_path = try @import("native.zig").realPathAlloc(allocator, io, lite_backend.native_docstore.?.file.path);
+    defer allocator.free(target_path);
     const nonce = @atomicRmw(u64, &portable_generation_nonce, .Add, 1, .monotonic);
     const tmp_path = try std.fmt.allocPrint(
         allocator,
@@ -144,9 +149,6 @@ pub fn importPreparedIntoLiteDb(
     );
     defer allocator.free(tmp_path);
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     scavengePortableRestoreGenerations(allocator, io, target_path) catch |err| {
         std.log.warn("Lite portable restore scavenging failed target={s} class={s}", .{ target_path, @errorName(err) });
     };
@@ -154,6 +156,9 @@ pub fn importPreparedIntoLiteDb(
     const tmp_lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{tmp_path});
     defer allocator.free(tmp_lock_path);
     defer deleteFileIfExists(io, tmp_lock_path) catch {};
+    const tmp_region_path = try std.fmt.allocPrint(allocator, "{s}.aflite-lock", .{tmp_path});
+    defer allocator.free(tmp_region_path);
+    defer deleteFileIfExists(io, tmp_region_path) catch {};
     errdefer deleteFileIfExists(io, tmp_path) catch {};
 
     var workspace = try lite_backend.native_docstore.?.reserveGenerationWorkspace();
@@ -198,6 +203,7 @@ pub fn importPreparedIntoLiteDb(
         PreparedGenerationAdoption{
             .live = lite_backend,
             .prepared = &prepared_backend,
+            .target_path = target_path,
         },
         PreparedGenerationAdoption.adopt,
     );
@@ -275,6 +281,12 @@ pub fn scavengePortableRestoreGenerations(
         if (!std.mem.eql(u8, &magic, portable_generation_lease_magic)) continue;
 
         try deleteFileIfExists(io, candidate);
+        const region_path = try std.fmt.allocPrint(allocator, "{s}.aflite-lock", .{candidate});
+        defer allocator.free(region_path);
+        deleteFileIfExists(io, region_path) catch |err| switch (err) {
+            error.NameTooLong => {},
+            else => return err,
+        };
         lease.close(io);
         lease_open = false;
         try deleteFileIfExists(io, lease_path);

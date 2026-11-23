@@ -5545,6 +5545,10 @@ pub const Store = struct {
     /// all live readers and writers. The prepared store remains valid only so
     /// its retired descriptor can be closed by normal teardown.
     pub fn replaceWithPreparedGeneration(self: *Store, prepared: *Store) !native.GenerationPublicationOutcome {
+        return self.replaceWithPreparedGenerationAt(prepared, null);
+    }
+
+    pub fn replaceWithPreparedGenerationAt(self: *Store, prepared: *Store, canonical_destination: ?[]const u8) !native.GenerationPublicationOutcome {
         if (self == prepared) return error.InvalidArgument;
         // The finalized disposable owner is about to surrender its descriptor.
         // Join before taking its mutex: maintenance can need that mutex while
@@ -5594,7 +5598,7 @@ pub const Store = struct {
             self.requestReassessment();
             self.maintenance_policy.assessed_retirement_bytes = self.file.retirement_activity_bytes;
         };
-        return try self.file.replaceWithPreparedGeneration(&prepared.file);
+        return self.file.replaceWithPreparedGenerationAt(&prepared.file, canonical_destination);
     }
 
     /// Refuse a predictably inadmissible rewrite before allocating/copying its

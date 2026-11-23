@@ -23527,12 +23527,18 @@ pub const NativeFile = struct {
     /// with `self`; `prepared` receives the retired descriptor and can be
     /// closed normally after this returns.
     pub fn replaceWithPreparedGeneration(self: *NativeFile, prepared: *NativeFile) !GenerationPublicationOutcome {
+        return self.replaceWithPreparedGenerationAt(prepared, null);
+    }
+
+    /// The supplied destination is the canonical path captured by staging.
+    pub fn replaceWithPreparedGenerationAt(self: *NativeFile, prepared: *NativeFile, canonical_destination: ?[]const u8) !GenerationPublicationOutcome {
         if (self.read_only or prepared.read_only) return error.ReadOnly;
         if (std.mem.eql(u8, self.path, prepared.path) or self.sameDataFile(prepared)) return error.InvalidNativeSnapshotPath;
 
         const io = self.runtimeIo();
-        const destination = try realPathAlloc(self.allocator, io, self.path);
-        defer self.allocator.free(destination);
+        const resolved = if (canonical_destination == null) try realPathAlloc(self.allocator, io, self.path) else null;
+        defer if (resolved) |owned| self.allocator.free(owned);
+        const destination = canonical_destination orelse resolved.?;
         if (self.writer_lock_file) |lease| {
             const lock_path = try appendLockSuffix(self.allocator, destination);
             defer self.allocator.free(lock_path);
@@ -24025,6 +24031,7 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
         const owned_region = try std.heap.page_allocator.create(shared_lock_region.Region);
         owned_region.* = region;
         const registration = registerOwnSidecarLock(io, file);
+        noteOwnSidecarWriterClaim(io, registration, owned_region.writerClaim());
         return .{
             .sidecar_registration = registration,
             .io_impl = undefined,
@@ -24052,29 +24059,7 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
 /// continue to exclude readers using the data inode as their lock authority.
 ///
 /// Not migrated onto the region, for either of `writer`'s two callers.
-/// The reader case (`writer == false`, `capi/lite_connection.zig`'s own
-/// blocking fallback when `lockReaderPathWithIo` returns busy) moves onto
-/// the region's reader-pin table in a later, separate cutover; left
-/// alone here so that cutover is a one-line swap, not a signature
-/// change. The writer case (`writer == true`) is purely
-/// `plainWriterLockUntil`'s own nested retry primitive -- never a public
-/// admission decision of its own, since whatever ticket mattered for
-/// fairness was already won (or never needed) by whichever top-level
-/// constructor called `plainWriterLockUntil` in the first place. A first
-/// attempt at migrating this one onto `Region.waitWriterStep`
-/// opened a *fresh* `Region` on every retry iteration -- `Region.open`'s
-/// own one-time setup section takes a real, blocking `fcntl` lock
-/// (`setup_lock_offset`) that serializes against every other `openSized`
-/// call on this file, existing-and-valid or not -- so three threads
-/// retrying concurrently (`lite fair writer lock bounds every writer's
-/// wait under sustained contention`) serialized through that setup lock
-/// on *every* retry and intermittently blew the test's own 10 s per-
-/// attempt deadline. Reusing the caller's own already-open `Region`
-/// would fix it, but threading one through means changing this
-/// function's signature (or `plainWriterLockUntil`'s) -- exactly the
-/// kind of call this design's own delivery plan reserves for a real
-/// decision, not a guess under this step's own "keep the constructor's
-/// signature stable" instruction.
+/// Bounded kernel wait for a reader or writer sidecar lease.
 pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, writer: bool, deadline_ns: i96) !PathWriterLock {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
@@ -24229,7 +24214,7 @@ fn fairLockRecoverDeadWriter(ctx_ptr: ?*anyopaque) anyerror!void {
     const ctx: *FairLockRecoveryCtx = @ptrCast(@alignCast(ctx_ptr.?));
     // A writer admitted by the sidecar flock alone (no region slot) may be
     // writing right now; recovery must exclude it before touching the file.
-    if (ctx.lease == null) ctx.lease = try sidecarWriterLockUntil(ctx.allocator, ctx.io, ctx.wait_io, ctx.path, ctx.deadline_ns, false);
+    if (ctx.lease == null) ctx.lease = try plainWriterLockUntil(ctx.allocator, ctx.io, ctx.wait_io, ctx.path, ctx.deadline_ns);
     try recoverCrashedWriterDataFile(ctx.allocator, ctx.io, ctx.path, ctx.region, null, true);
 }
 
@@ -24273,7 +24258,7 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
     // ticket-won path always did, unless recovery already holds it. This
     // caller now holds the region's writer word itself, so it waits on the
     // flock directly: waiting for that word to clear would wait on itself.
-    var lease = recovery_ctx.lease orelse try sidecarWriterLockUntil(allocator, io, wait_io, path, deadline_ns, false);
+    var lease = recovery_ctx.lease orelse try plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
     recovery_ctx.lease = null;
     // Without this, a `create` failure just below would return holding
     // the sidecar flock forever: `lease` is a local the caller never
@@ -24340,53 +24325,9 @@ pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u
     };
 }
 
-const PathRegionForWait = struct { entry: *inode_lock.Entry, region: *shared_lock_region.Region };
-
-/// Gets (not opens fresh) the shared lock region for `path` through the
-/// per-inode registry: `inode_lock.open`'s own `Entry` is cached per
-/// inode per process, and `ensureRegion` opens the region at most once
-/// per `Entry`, reusing it across every call -- unlike an earlier,
-/// reverted attempt at this same migration, which called
-/// `shared_lock_region.Region.open` fresh on every retry iteration and
-/// serialized every concurrent retrier through that call's own one-time
-/// setup lock. On success the caller owns the returned `Entry`
-/// reference and must `unref` it; on error (including a
-/// `inode_lock.isRegionUnusable` one) there is nothing to release.
-fn pathRegionForWait(io: std.Io, path: []const u8) !PathRegionForWait {
-    const entry = try inode_lock.open(io, path);
-    const region = inode_lock.ensureRegion(entry, io) catch |err| {
-        inode_lock.unref(entry, io);
-        return err;
-    };
-    return .{ .entry = entry, .region = region };
-}
-
-/// The region-based wait when one is available; otherwise (region
-/// unusable, or not yet applicable -- the region is genuinely optional
-/// here, unlike `fairWriterLockWithIo`'s own ticket) the single plain-
-/// flock fallback's own OS-lock-queue wait (`waitPathLockWithIo`), §8.6.
-/// Every caller of this function -- region-backed or not -- ends up
-/// here for the one, real, authoritative kernel lease.
+// Plain admission and dead-writer recovery both wait on the authoritative
+// flock. Optional region setup must not consume their busy deadline.
 fn plainWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
-    return sidecarWriterLockUntil(allocator, io, wait_io, path, deadline_ns, true);
-}
-
-/// `region_wait`: between attempts, wait on the region's writer word. A
-/// dead-writer recovery passes false: that word still names the dead
-/// holder it is about to clear, so it waits on the flock itself.
-fn sidecarWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96, region_wait: bool) !PathWriterLock {
-    // Set up lazily, on the first retry only -- never on a warm,
-    // uncontended call that wins `acquireWriterLock` below on its very
-    // first attempt. An earlier version of this call set this up
-    // unconditionally, up front, which added `inode_lock.open`'s own
-    // `statFile` syscall to every single acquisition, uncontended or
-    // not; that silently cost this design's own "0 syscalls on a warm
-    // write" property and tightened enough margin on a few busy-timeout
-    // tests to make them flake.
-    var cached: ?PathRegionForWait = null;
-    var cache_attempted = false;
-    defer if (cached) |c| inode_lock.unref(c.entry, wait_io);
-
     var backoff_ns: i96 = 50 * std.time.ns_per_us;
     while (true) {
         if (acquireWriterLock(allocator, io, path)) |held| {
@@ -24394,40 +24335,6 @@ fn sidecarWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, pat
             return .{ .io_impl = undefined, .borrowed_io = io, .file = held.file, .sidecar_registration = registration };
         } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
         if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
-        if (region_wait and !cache_attempted) {
-            cache_attempted = true;
-            // `null` when the region can't be used here --
-            // `inode_lock.open`'s own `statFile` on the *data* file (not
-            // the sidecar `acquireWriterLock` above creates on demand)
-            // can fail with `FileNotFound` on a caller's first-ever
-            // acquire, before that data file exists yet, which is not
-            // the "this filesystem/region can't be used at all"
-            // condition `inode_lock.isRegionUnusable` means -- falls
-            // back to the single plain-flock path's own OS-lock-queue
-            // wait below either way. Anything else (notably
-            // `OutOfMemory`) propagates instead of being swallowed into
-            // a fallback that would likely fail the same way, the same
-            // posture every other migrated constructor's own
-            // `isRegionUnusable` check takes.
-            cached = blk: {
-                break :blk pathRegionForWait(wait_io, path) catch |err| {
-                    if (err != error.FileNotFound and !inode_lock.isRegionUnusable(err)) return err;
-                    break :blk null;
-                };
-            };
-        }
-        // A real wake signal (or a short internal re-check step, not a
-        // dumb poll) on the region's own futex -- loop straight back to
-        // retry the real flock, no extra backoff on top of it. Only while
-        // the region names a writer: a flock-only writer or a sidecar
-        // reader leaves the word clear, so the wait would return at once
-        // and spin; that case joins the kernel's own wait queue below.
-        if (cached) |c| if (c.region.writerWordHeld()) {
-            c.region.waitWriterStep(wait_io, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-            };
-            continue;
-        };
         if (waitPathLockWithIo(allocator, wait_io, path, true, deadline_ns)) |held| {
             var lease = held;
             lease.borrowed_io = io;
@@ -41163,6 +41070,22 @@ fn exerciseDeadLifetimeWriterRecovery(has_records: bool) !void {
     defer successor.close();
     try std.testing.expect(successor.lifetime_writer_claimed);
     try std.testing.expectEqual(successor.durableSequence(), observer.readyLogState().?.durable_sequence);
+}
+
+test "lite redo nonblocking writer lease registers its mapped publisher claim" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "nonblocking-writer-claim.aflite");
+    defer allocator.free(path);
+    {
+        var writer = try NativeFile.createWithRedoLog(allocator, io, path, .{}, 64 * 1024);
+        defer writer.close();
+    }
+    var lease = try lockWriterPathWithIo(allocator, io, path);
+    defer lease.close();
+    try std.testing.expectEqual(@as(?u128, lease.region.?.writerClaim()), ownSidecarWriterClaim(io, lease.sidecar_registration.?.identity));
 }
 
 test "lite redo lifetime writer rechecks an unchanged claim after its holder dies" {
