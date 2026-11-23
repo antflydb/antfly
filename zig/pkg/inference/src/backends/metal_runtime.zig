@@ -3559,21 +3559,41 @@ pub fn decoderRuntimeApplyAttentionF32DeviceOnly(self: anytype, request: Attenti
     return applyAttentionF32(true, self, request);
 }
 
-/// A strict suffix bypasses the full-prompt F16 KV staging path. The
-/// existing attention dispatcher therefore needs only the four bound buffers.
-pub fn decoderRuntimeDenseSuffixAttentionInto(
+const DenseAttentionRows = @import("../ops/kernel_descriptor.zig").DenseAttentionRows;
+
+pub fn denseAttentionWorkspaceBytes(runtime: *RawMetalDecodeRuntime, geometry: DenseAttentionRows) !usize {
+    var bytes: usize = 0;
+    if (antfly_metal_dense_attention_workspace(runtime, geometry.query_rows, geometry.key_rows, geometry.num_heads, geometry.num_kv_heads, geometry.head_dim, geometry.sliding_window, &bytes) != 0)
+        return error.InvalidAttentionShape;
+    return bytes;
+}
+
+/// Encode the existing dense attention program with caller-owned output and
+/// packed F16 staging planes. A suffix's staging requirement is zero.
+pub fn decoderRuntimeDenseAttentionInto(
     runtime: *RawMetalDecodeRuntime,
-    geometry: @import("../ops/kernel_descriptor.zig").DenseAttentionRows,
+    geometry: DenseAttentionRows,
     q: MetalTensor,
     k: MetalTensor,
     v: MetalTensor,
     out: MetalTensor,
+    workspace: ?MetalTensor,
+    workspace_bytes: usize,
 ) !void {
-    for ([_]MetalTensor{ q, k, v, out }) |tensor| {
+    const inputs = [_]MetalTensor{ q, k, v, out };
+    for (inputs) |tensor| {
         const device = tensor.device orelse return error.InvalidTensorShape;
         if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return error.InvalidTensorShape;
     }
-    try attentionDeviceCompleted(termite_metal_decode_runtime_apply_attention_f32_device(
+    if (workspace) |tensor| {
+        const device = tensor.device orelse return error.InvalidTensorShape;
+        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or tensor.isReadOnlyPhysical() or tensor.deviceByteLen() < workspace_bytes) return error.InvalidTensorShape;
+        for (inputs) |operand| {
+            if (operand.deviceHandle() == tensor.deviceHandle() and
+                @import("../ops/kernel_geometry.zig").byteRangesOverlap(@intCast(operand.deviceByteOffset()), operand.deviceByteLen(), @intCast(tensor.deviceByteOffset()), workspace_bytes)) return error.InvalidAssignedAlias;
+        }
+    } else if (workspace_bytes != 0) return error.InvalidTensorShape;
+    try attentionDeviceCompleted(antfly_metal_dense_attention_planned(
         runtime,
         q.deviceHandle(),
         q.deviceByteOffset(),
@@ -3586,16 +3606,12 @@ pub fn decoderRuntimeDenseSuffixAttentionInto(
         geometry.num_heads,
         geometry.num_kv_heads,
         geometry.head_dim,
-        geometry.key_rows - geometry.query_rows,
-        0,
         geometry.sliding_window,
-        null,
-        0,
-        null,
-        null,
-        geometry.key_rows,
         out.deviceHandle(),
         out.deviceByteOffset(),
+        if (workspace) |tensor| tensor.deviceHandle() else null,
+        if (workspace) |tensor| tensor.deviceByteOffset() else 0,
+        workspace_bytes,
     ));
 }
 
@@ -21322,6 +21338,8 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32(
     output: [*c]f32,
 ) c_int;
 pub extern fn antfly_metal_dense_suffix_attention_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn antfly_metal_dense_attention_workspace(runtime: *RawMetalDecodeRuntime, q_rows: usize, k_rows: usize, heads: usize, kv_heads: usize, head_dim: usize, window: usize, bytes: *usize) c_int;
+extern fn antfly_metal_dense_attention_planned(runtime: *RawMetalDecodeRuntime, q: ?*anyopaque, qo: usize, k: ?*anyopaque, ko: usize, v: ?*anyopaque, vo: usize, q_rows: usize, k_rows: usize, heads: usize, kv_heads: usize, head_dim: usize, window: usize, out: ?*anyopaque, oo: usize, workspace: ?*anyopaque, workspace_offset: usize, workspace_bytes: usize) c_int;
 pub extern fn termite_metal_decode_runtime_apply_attention_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
     q_handle: ?*anyopaque,

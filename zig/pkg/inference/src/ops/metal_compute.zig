@@ -35,7 +35,7 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
     switch (descriptor.operation) {
         .paged_attention, .dense_attention_prefix => return false,
         .dense_attention_rows => |attention| {
-            if (!attention.isGroupedCausalSuffix() or !attention.valid(descriptor)) return false;
+            if (attention.kind != .causal or attention.num_kv_heads == 0 or !attention.valid(descriptor)) return false;
             for (descriptor.input_shapes[0..3]) |shape| {
                 if (shape.numElements().? > std.math.maxInt(u32)) return false;
             }
@@ -11965,8 +11965,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn ownedPayloadRoute(ctx: *anyopaque, owned: *const @import("../execution/kernel_route.zig").Owned) bool {
         if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
         const req = owned.requirements;
-        if (req.workspace.byte_size != 0 or req.workspace.host_byte_size != 0 or req.probe_workspace.byte_size != 0 or req.probe_workspace.host_byte_size != 0 or req.auxiliaries.count != 0) return false;
-        if (owned.vtable == &PreparedDenseLinear.vtable) return PreparedDenseLinear.belongs(@ptrCast(@alignCast(ctx)), owned);
+        if (req.workspace.host_byte_size != 0 or req.probe_workspace.byte_size != 0 or req.probe_workspace.host_byte_size != 0 or req.auxiliaries.count != 0) return false;
+        if (owned.vtable == &PreparedDenseLinear.vtable) return req.workspace.byte_size == 0 and PreparedDenseLinear.belongs(@ptrCast(@alignCast(ctx)), owned);
         return @import("../execution/assigned_kernel_route.zig").belongsToProgram(owned, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(owned.implementation.table)) }, directRouteSupported);
     }
 
@@ -11992,6 +11992,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else => true,
         };
     }
+    fn assignedKernelWorkspaceOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) anyerror!ops.kernel_descriptor.WorkspaceRequirement {
+        if (descriptor.operation != .dense_attention_rows) return .{};
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.InvalidAttentionShape;
+        const bytes = try metal_runtime.denseAttentionWorkspaceBytes(runtime, descriptor.operation.dense_attention_rows);
+        return if (bytes != 0) .{ .byte_size = bytes, .alignment = 256 } else .{};
+    }
+
     fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_route.zig").Prepare) anyerror!?@import("../execution/kernel_route.zig").Owned {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const implementation = request.implementation orelse return null;
@@ -12981,8 +12989,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const descriptor = request.descriptor;
         if (!supportsAssignedDescriptor(descriptor)) return false;
         if (descriptor.operation == .add_mul_scalar and !metal_runtime.assignedAddMulScalarAvailable(self.provider_impl)) return false;
+        var attention_workspace: ops.kernel_descriptor.WorkspaceRequirement = .{};
         if (descriptor.operation == .dense_attention_rows) {
             if (request.auxiliaries.len != 0 or !directRouteSupported(ctx, descriptor)) return false;
+            attention_workspace = try assignedKernelWorkspaceOp(ctx, descriptor);
+            if (request.prepared_route) |route| {
+                const direct = @import("../execution/assigned_kernel_route.zig");
+                if (!acceptsPhysicalImplementation(route.implementation.table) or
+                    !direct.belongsToProgram(route, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(route.implementation.table)) }, directRouteSupported)) return false;
+                try direct.validateDescriptor(route, descriptor);
+                if (!std.meta.eql(route.requirements.workspace, attention_workspace)) return error.PreparedKernelBindingChanged;
+            } else if (attention_workspace.byte_size != 0) return false;
+            if (request.output != null and (request.workspace != null) != (attention_workspace.byte_size != 0))
+                return error.InvalidAssignedWorkspace;
             if (request.attention) |binding| {
                 if (binding.attn_or_mask != null or binding.attention_sink.hasMetadata()) return false;
                 if (binding.dense_attention_rows) |rows| if (rows.mask != null) return false;
@@ -13057,13 +13076,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const written: bool = switch (descriptor.operation) {
             .paged_attention, .dense_attention_prefix => return false,
             .dense_attention_rows => |geometry| blk: {
-                try metal_runtime.decoderRuntimeDenseSuffixAttentionInto(
+                try metal_runtime.decoderRuntimeDenseAttentionInto(
                     self.provider_impl.raw_decode_runtime.?,
                     geometry,
                     input,
                     toBuf(request.inputs[1]).metal_tensor.?,
                     toBuf(request.inputs[2]).metal_tensor.?,
                     out_tensor,
+                    if (request.workspace) |workspace| toBuf(workspace).metal_tensor orelse return error.InvalidAssignedWorkspace else null,
+                    attention_workspace.byte_size,
                 );
                 break :blk true;
             },
@@ -40709,7 +40730,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return (descriptor.operation == .slice or descriptor.operation == .broadcast) and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -55085,6 +55106,78 @@ test "Metal assigned suffix attention preserves causal positions and sliding win
     const values = try cb.toFloat32(output, a);
     defer a.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 4, 5, 6, 7, 6, 7 }, values);
+}
+
+test "Metal planned full prompt attention consumes assigned F16 KV staging" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.metal_hosted.compute.ownedComputeBackend();
+    const functions = cb.vtable.kernels.?;
+    const rows = 16;
+    const dim = 32;
+    const width = 2 * dim;
+    const q_values: [rows * width]f32 = @splat(0);
+    const k_values: [rows * dim]f32 = @splat(0);
+    var v_values: [rows * dim]f32 = undefined;
+    for (&v_values, 0..) |*value, index| value.* = @floatFromInt(index % 11);
+    const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&q_values, &.{ rows, width }));
+    defer cb.free(q);
+    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&k_values, &.{ rows, dim }));
+    defer cb.free(k);
+    const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&v_values, &.{ rows, dim }));
+    defer cb.free(v);
+
+    const route = @import("../execution/kernel_route.zig");
+    const Shape = @import("ml").graph.Shape;
+    const query = Shape.init(.f32, &.{ rows, width });
+    const key = Shape.init(.f32, &.{ rows, dim });
+    const bindings = [_]route.Binding{
+        .{ .imported_host = .{ .logical = query, .target = .metal } },
+        .{ .imported_host = .{ .logical = key, .target = .metal } },
+        .{ .imported_host = .{ .logical = key, .target = .metal } },
+    };
+    const descriptor: ops.kernel_descriptor.Descriptor = .{
+        .operation = .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = rows, .key_rows = rows, .num_heads = 2, .num_kv_heads = 1, .head_dim = dim } },
+        .input_count = 3,
+        .input_shapes = .{ query, key, key },
+        .output_shape = query,
+    };
+    const out_bytes = rows * width * @sizeOf(f32);
+    var selected = (try functions.prepareKernelRoute.?(cb.ptr, .{
+        .allocator = a,
+        .implementation = .{ .context = cb.ptr, .table = cb.vtable },
+        .descriptor = &descriptor,
+        .inputs = &bindings,
+        .output = .{ .node = 1, .allocation = 0, .epoch = 0, .logical = query, .writable_bytes = out_bytes },
+    })) orelse return error.MissingOwnedPreparedRoute;
+    defer selected.deinit();
+    const scratch_bytes = selected.requirements.workspace.byte_size;
+    if (scratch_bytes == 0) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 2 * rows * dim * @sizeOf(u16)), scratch_bytes);
+    const lease = (try ops.physical_storage.Lease.create(a, cb, out_bytes)).?;
+    defer lease.release();
+    const scratch_lease = (try ops.physical_storage.Lease.create(a, cb, scratch_bytes)).?;
+    defer scratch_lease.release();
+    const output = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = &.{ rows, width } })).?;
+    defer cb.free(output);
+    const scratch = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = scratch_lease, .shape = &.{@intCast(scratch_bytes / @sizeOf(f32))} })).?;
+    defer cb.free(scratch);
+    var invocation: ops.kernel_descriptor.Invocation = .{ .descriptor = &descriptor, .inputs = &.{ q, k, v }, .output = output, .prepared_route = &selected };
+    try std.testing.expectError(error.InvalidAssignedWorkspace, functions.runAssignedKernel.?(cb.ptr, invocation));
+    invocation.workspace = scratch;
+    try std.testing.expect(try functions.runAssignedKernel.?(cb.ptr, invocation));
+    const actual = try cb.toFloat32(output, a);
+    defer a.free(actual);
+    for (0..rows) |row| {
+        for (0..width) |column| {
+            var sum: f32 = 0;
+            for (0..row + 1) |i| sum += v_values[i * dim + column % dim];
+            try std.testing.expectApproxEqAbs(sum / @as(f32, @floatFromInt(row + 1)), actual[row * width + column], 0.005);
+        }
+    }
 }
 
 test "Metal assigned fused scalar uses a device scalar for both operation orders" {

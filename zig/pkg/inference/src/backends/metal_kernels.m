@@ -36647,7 +36647,23 @@ int antfly_metal_dense_suffix_attention_ready(termite_metal_decode_runtime *runt
     return runtime != NULL && runtime->attention_f32_pipeline != nil;
 }
 
-int termite_metal_decode_runtime_apply_attention_f32_device(
+// Two disjoint half-precision planes in one physical workspace span.
+static bool antfly_metal_attention_workspace_layout(size_t plane, size_t *stride, size_t *required) {
+    if (!antfly_workspace_geometry_add(plane, 255u, stride)) return false;
+    *stride &= ~(size_t)255u;
+    return antfly_workspace_geometry_add(*stride, plane, required);
+}
+
+int antfly_metal_dense_attention_workspace(termite_metal_decode_runtime *runtime,
+    size_t q_len, size_t kv_len, size_t heads, size_t kv_heads, size_t head_dim, size_t window, size_t *bytes) {
+    const antfly_metal_dense_attention_request geometry = { q_len == kv_len && window == 0 ? q_len : 0u, heads, kv_heads, head_dim };
+    size_t plane, stride;
+    if (antfly_workspace_geometry_dense_f16kv(&geometry, antfly_metal_dense_f16kv_capabilities(runtime), &plane) != 0 ||
+        !antfly_metal_attention_workspace_layout(plane, &stride, bytes)) return -1;
+    return 0;
+}
+
+static int antfly_metal_apply_attention_f32_device(
     termite_metal_decode_runtime *runtime,
     void *q_handle,
     size_t q_offset,
@@ -36669,7 +36685,11 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
     const uint8_t *mask,
     size_t total_sequence_len,
     void *output_handle,
-    size_t output_offset
+    size_t output_offset,
+    bool planned,
+    void *workspace_handle,
+    size_t workspace_offset,
+    size_t workspace_bytes
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || output_handle == NULL) return -1;
     if (runtime->attention_f32_pipeline == nil) return -2;
@@ -36735,6 +36755,31 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
             .batch = 1u,
             .reserved0 = 0u,
         };
+        const BOOL use_dense_sg = (runtime->attention_f32_dense_sg_pipeline != nil &&
+            q_len >= 8u && kv_len == q_len && !has_bias_input && !has_mask_input &&
+            query_position_offset == 0u && kv_position_offset == 0u && sliding_window == 0u &&
+            head_dim % 32u == 0u && head_dim <= 256u);
+        const BOOL use_q16 = (use_dense_sg && runtime->attention_f32_dense_sg_q16_pipeline != nil &&
+            q_len >= 16u && head_dim <= 128u);
+        const antfly_metal_dense_attention_request staging_request = { use_q16 ? q_len : 0u, num_heads, num_kv_heads, head_dim };
+        size_t kv_half_bytes;
+        if (antfly_workspace_geometry_dense_f16kv(&staging_request,
+            antfly_metal_dense_f16kv_capabilities(runtime), &kv_half_bytes) != 0) return -5;
+        id<MTLBuffer> stage_k = nil, stage_v = nil;
+        size_t stage_k_offset = 0, stage_v_offset = 0;
+        if (planned) {
+            size_t stride, required;
+            if (!antfly_metal_attention_workspace_layout(kv_half_bytes, &stride, &required)) return -5;
+            if (workspace_bytes != required || (required && workspace_handle == NULL)) return -6;
+            if (required) {
+                stage_k = (__bridge id<MTLBuffer>)workspace_handle;
+                if (workspace_offset % 256u || workspace_offset > stage_k.length ||
+                    required > stage_k.length - workspace_offset) return -6;
+                stage_v = stage_k;
+                stage_k_offset = workspace_offset;
+                stage_v_offset = workspace_offset + stride;
+            }
+        }
         const bool frame_owned = (runtime->active_frame_cb == nil);
         id<MTLCommandBuffer> command_buffer = frame_owned
             ? termite_metal_new_command_buffer(runtime->queue, __func__)
@@ -36757,19 +36802,9 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
         // Flash accumulation order and f16 K/V staging are not bit-identical
         // to the scalar kernels, so only full causal self-attention from
         // position zero (the dense embedding/prefill shape) takes this route.
-        const BOOL use_dense_sg = (runtime->attention_f32_dense_sg_pipeline != nil &&
-            q_len >= 8u && kv_len == q_len && !has_bias_input && !has_mask_input &&
-            query_position_offset == 0u && kv_position_offset == 0u && sliding_window == 0u &&
-            head_dim % 32u == 0u && head_dim <= 256u);
         if (use_dense_sg) {
-            const BOOL use_q16 = (runtime->attention_f32_dense_sg_q16_pipeline != nil &&
-                q_len >= 16u && head_dim <= 128u);
-            const antfly_metal_dense_attention_request staging_request = { q_len, num_heads, num_kv_heads, head_dim };
-            size_t kv_half_bytes;
-            if (antfly_workspace_geometry_dense_f16kv(&staging_request,
-                antfly_metal_dense_f16kv_capabilities(runtime), &kv_half_bytes) != 0) return -5;
             BOOL use_f16kv = (use_q16 && kv_half_bytes != 0);
-            if (use_f16kv) {
+            if (use_f16kv && !planned) {
                 // Growth only happens on the first layer of a new (larger)
                 // shape; earlier frames have drained, so dropping the old
                 // buffers is safe.
@@ -36789,6 +36824,10 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
                 }
             }
             if (use_f16kv) {
+                if (!planned) {
+                    stage_k = runtime->dense_sg_f16_k_buffer;
+                    stage_v = runtime->dense_sg_f16_v_buffer;
+                }
                 termite_metal_encode_key_params convert_params = {
                     .rows = (uint32_t)kv_len,
                     .num_kv_heads = (uint32_t)num_kv_heads,
@@ -36799,9 +36838,9 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
                 const size_t convert_items = kv_len * num_kv_heads * head_dim;
                 const size_t convert_width = termite_metal_thread_width(runtime->encode_f16_convert_pipeline, convert_items);
                 antfly_metal_set_compute_pipeline(encoder, (runtime->encode_f16_convert_pipeline));
-                termite_metal_bind_two_buffers(encoder, k_buffer, k_offset, runtime->dense_sg_f16_k_buffer, 0, &convert_params, sizeof(convert_params));
+                termite_metal_bind_two_buffers(encoder, k_buffer, k_offset, stage_k, stage_k_offset, &convert_params, sizeof(convert_params));
                 antfly_metal_dispatch_threads(encoder, MTLSizeMake(convert_items, 1, 1), MTLSizeMake(convert_width, 1, 1));
-                termite_metal_bind_two_buffers_only(encoder, v_buffer, v_offset, runtime->dense_sg_f16_v_buffer, 0);
+                termite_metal_bind_two_buffers_only(encoder, v_buffer, v_offset, stage_v, stage_v_offset);
                 antfly_metal_dispatch_threads(encoder, MTLSizeMake(convert_items, 1, 1), MTLSizeMake(convert_width, 1, 1));
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
@@ -36818,8 +36857,8 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
                     : (use_q16 ? runtime->attention_f32_dense_sg_q16_pipeline : runtime->attention_f32_dense_sg_pipeline)))));
             [encoder setBuffer:q_buffer offset:q_offset atIndex:0];
             if (use_f16kv) {
-                [encoder setBuffer:runtime->dense_sg_f16_k_buffer offset:0 atIndex:1];
-                [encoder setBuffer:runtime->dense_sg_f16_v_buffer offset:0 atIndex:2];
+                [encoder setBuffer:stage_k offset:stage_k_offset atIndex:1];
+                [encoder setBuffer:stage_v offset:stage_v_offset atIndex:2];
             } else {
                 [encoder setBuffer:k_buffer offset:k_offset atIndex:1];
                 [encoder setBuffer:v_buffer offset:v_offset atIndex:2];
@@ -36877,6 +36916,46 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
         }
         return 0;
     }
+}
+
+int termite_metal_decode_runtime_apply_attention_f32_device(
+    termite_metal_decode_runtime *runtime,
+    void *q_handle,
+    size_t q_offset,
+    void *k_handle,
+    size_t k_offset,
+    void *v_handle,
+    size_t v_offset,
+    size_t q_len,
+    size_t kv_len,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t query_position_offset,
+    size_t kv_position_offset,
+    size_t sliding_window,
+    void *bias_handle,
+    size_t bias_offset,
+    const float *bias_host,
+    const uint8_t *mask,
+    size_t total_sequence_len,
+    void *output_handle,
+    size_t output_offset
+) {
+    return antfly_metal_apply_attention_f32_device(runtime, q_handle, q_offset, k_handle, k_offset,
+        v_handle, v_offset, q_len, kv_len, num_heads, num_kv_heads, head_dim, query_position_offset,
+        kv_position_offset, sliding_window, bias_handle, bias_offset, bias_host, mask, total_sequence_len,
+        output_handle, output_offset, false, NULL, 0, 0);
+}
+
+int antfly_metal_dense_attention_planned(termite_metal_decode_runtime *runtime,
+    void *q, size_t qo, void *k, size_t ko, void *v, size_t vo, size_t q_len, size_t kv_len,
+    size_t heads, size_t kv_heads, size_t head_dim, size_t window, void *out, size_t oo,
+    void *workspace, size_t workspace_offset, size_t workspace_bytes) {
+    if (q_len > kv_len) return -3;
+    return antfly_metal_apply_attention_f32_device(runtime, q, qo, k, ko, v, vo, q_len, kv_len,
+        heads, kv_heads, head_dim, kv_len - q_len, 0, window, NULL, 0, NULL, NULL, kv_len,
+        out, oo, true, workspace, workspace_offset, workspace_bytes);
 }
 
 int termite_metal_decode_runtime_apply_attention_f32_device_batched(
