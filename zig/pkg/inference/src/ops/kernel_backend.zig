@@ -46,6 +46,7 @@ pub const DenseDecoderServices = struct {
     available: *const fn (*anyopaque) bool,
     weight_access: enum { shared, acquired } = .shared,
     heldWeightF32: *const fn (*anyopaque, *const anyopaque, CT, ?[]const u8) anyerror!@import("../execution/storage_ownership.zig").Plane,
+    prepareEmbeddingF32: ?*const fn (*anyopaque, *const anyopaque, CT) anyerror!bool = null,
     projectionInto: *const fn (*anyopaque, *const kernel_descriptor.Descriptor, []const CT, CT, ProjectionMode) anyerror!bool,
     /// Optional query storage is borrowed, or null to allocate just the query.
     /// K/V are written directly into the specified row of the cache banks.

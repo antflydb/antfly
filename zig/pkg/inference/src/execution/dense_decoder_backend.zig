@@ -51,6 +51,12 @@ pub fn heldShape(cb: *const ops.ComputeBackend, model: *const anyopaque, value: 
     return (try heldWeight(cb, model, value, name)).descriptor.shape;
 }
 
+pub fn prepareEmbeddingF32(cb: *const ops.ComputeBackend, model: *const anyopaque, value: ops.CT) !bool {
+    const selected = services(cb) orelse return false;
+    const prepare = selected.prepareEmbeddingF32 orelse return false;
+    return prepare(cb.ptr, model, value);
+}
+
 pub fn projectionInto(cb: *const ops.ComputeBackend, descriptor: *const ops.kernel_descriptor.Descriptor, inputs: []const ops.CT, output: ops.CT, mode: ProjectionMode) !bool {
     const selected = services(cb) orelse return error.UnsupportedDenseSchedule;
     return selected.projectionInto(cb.ptr, descriptor, inputs, output, mode);

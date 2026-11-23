@@ -5687,22 +5687,27 @@ fn prepareColdNativeWhisper(session: Session, allocator: std.mem.Allocator, cont
 }
 fn denseWhisperPreparationModelData(session: Session) ?*const anyopaque {
     if (session.backend() == .native) return nativeWeightPreparationModelData(session);
-    if (comptime build_options.enable_cuda) {
-        if (session.backend() != .cuda or session.vtable != &arch_vtable) return null;
-        const provider = session.compute_backend_provider orelse return null;
-        const model = session.model_lifetime orelse return null;
-        if (provider.services != &archComputeServices or provider.ptr != session.ptr or model.owner != provider.ptr or model.destroy_fn != archClose or session.execution_gate != &model.execution_gate) return null;
-        const owner: *ArchSession = @ptrCast(@alignCast(provider.ptr));
-        if (&owner.model_lifetime != model or owner.backend_type != .cuda or owner.arch_config != .whisper or owner.graph_runtime_strategy != null) return null;
-        if (session.run_admission) |policy| if (policy.backend_class != .gpu) return null;
-        return owner.backend_data.cuda.compute;
-    }
-    return null;
+    const backend = session.backend();
+    if ((backend != .cuda and backend != .metal) or session.vtable != &arch_vtable) return null;
+    const provider = session.compute_backend_provider orelse return null;
+    const model = session.model_lifetime orelse return null;
+    if (provider.services != &archComputeServices or provider.ptr != session.ptr or model.owner != provider.ptr or model.destroy_fn != archClose or session.execution_gate != &model.execution_gate) return null;
+    const owner: *ArchSession = @ptrCast(@alignCast(provider.ptr));
+    if (&owner.model_lifetime != model or owner.backend_type != backend or owner.arch_config != .whisper or owner.graph_runtime_strategy != null) return null;
+    if (session.run_admission) |policy| if (policy.backend_class != .gpu) return null;
+    return switch (backend) {
+        .cuda => if (build_options.enable_cuda) owner.backend_data.cuda.compute else null,
+        .metal => if (build_options.enable_metal) &owner.backend_data.metal else null,
+        else => null,
+    };
 }
 
 fn prepareColdNativeWhisperWithInitial(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, initial_rows: ?usize) !?*ColdNativeWhisper {
     if (initial_rows) |rows| if (rows == 0 or rows > config.max_target_positions or rows > 2048) return error.UnsupportedDenseSchedule;
-    if (session.backend() != .native and session.backend() != .cuda) return null;
+    // A resident Metal source can hold this same provider. Its separate
+    // decoder handoff borrows the source operation before acquiring weights.
+    if (session.backend() != .native and session.backend() != .cuda and
+        !(session.backend() == .metal and encoder == .host)) return null;
     if (!@import("dense_decoder_schedule.zig").preparationBackingSupported(allocator)) return null;
     // This actual published source/Model pins the native store throughout cold
     // metadata queries and any existing typed lazy-weight preparation.
@@ -5740,7 +5745,7 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     const cb = &self.cb.?.backend;
     if (!@import("dense_decoder_backend.zig").available(cb)) return false;
     var kv_only = try geometry.cacheAmounts(cb);
-    const expected = runtime.tier.memory.AdmissionAmounts{ .host_scratch_bytes = geometry.known_metadata_bytes, .host_kv_bytes = if (cb.kind() == .native) kv_only.host_kv_bytes else 0, .backend_kv_bytes = if (cb.kind() == .cuda) kv_only.backend_kv_bytes else 0 };
+    const expected = runtime.tier.memory.AdmissionAmounts{ .host_scratch_bytes = geometry.known_metadata_bytes, .host_kv_bytes = if (cb.kind() == .native) kv_only.host_kv_bytes else 0, .backend_kv_bytes = if (cb.kind() == .cuda or cb.kind() == .metal) kv_only.backend_kv_bytes else 0 };
     if (!std.meta.eql(kv_only, expected)) return error.UnsupportedDenseSchedule;
     // Every old known metadata allocation (layer vectors, retained weight
     // vector, encoder/self masks) is now exclusively charged by metadata AA.
@@ -5754,13 +5759,15 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
         .resident => |value| value,
         .host => |values| block: {
             const shape = [_]i32{ 1, @intCast(geometry.encoder_rows), @intCast(config.d_model) };
-            const value = try cb.fromFloat32Shape(values, &shape);
+            const host = try cb.fromFloat32Shape(values, &shape);
+            const value = if (cb.kind() == .metal) try cb.ensureDeviceResidentOwned(host) else host;
             self.encoder_owned = true;
             break :block value;
         },
     };
     self.weights = try whisper_arch.PreparedDecoderWeights.initWithSource(cb, metadata.allocator(), config, true, .{ .expected_data = data, .domain = domain });
     if (cb.kind() == .native) try NativeCompute.stampHeldF32WeightSources(cb, data, self.weights.?.fetcher.handles.items);
+    if (cb.kind() == .metal and !try self.weights.?.prepareMetalSchedulePayload(cb, data, config)) return false;
     const schedule = @import("dense_decoder_schedule.zig");
     const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, 1, false)) orelse return false;
@@ -5768,11 +5775,12 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     const shared_lookup = domain != null and schedule.sharedBackingSupported(arch.allocator);
     var preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_definitions else null, &header, &source, domain, current);
     defer preparation.deinit(current);
+    const scheduled_initial_rows = if (cb.kind() == .metal and initial_rows != null and initial_rows.? != 1) null else initial_rows;
     var initial_preparation = schedule.Preparation{ .key = @splat(0) };
     defer initial_preparation.deinit(current);
     var initial_source: ?@TypeOf(source) = null;
     var initial_header: ?schedule.ProgramSpec = null;
-    if (initial_rows) |query_rows| {
+    if (scheduled_initial_rows) |query_rows| {
         initial_source = (try whisper_arch.PreparedSingleToken.specSource(cb, data, config, geometry.encoder_rows, &self.weights.?, query_rows, true)) orelse return false;
         initial_header = initial_source.?.header();
         initial_preparation = try selectDensePreparationForSpec(if (shared_lookup) &arch.dense_decoder_initial_definitions else null, &initial_header.?, &initial_source.?, domain, current);
@@ -5807,7 +5815,7 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     if (preparation.cached == null) if (definition.shared) |shared| {
         try shared.sealBeforeExecution();
     };
-    if (initial_rows) |query_rows| {
+    if (scheduled_initial_rows) |query_rows| {
         if (domain != null and schedule.sharedBackingSupported(arch.allocator) and initial_preparation.cached == null) initial_preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
         var owned_initial_spec: ?schedule.ProgramSpecStorage = null;
         defer if (owned_initial_spec) |*storage| storage.deinit();
@@ -11567,9 +11575,12 @@ test "native incremental actual Metal owned provider preserves source lease and 
         for (host) |*value| value.deinit();
         a.free(host);
     }
-    var reference = (try whisperNativeDecoder(session, a, control, host[0].asFloat32(), 2)).?;
+    var host_session = session;
+    host_session.execution_gate = &session.model_lifetime.?.execution_gate;
+    var reference = (try whisperNativeDecoder(host_session, a, control, host[0].asFloat32(), 2)).?;
     var reference_open = true;
     defer if (reference_open) reference.deinit();
+    try std.testing.expect(reference.cache.native_program != null);
     const first = try reference.step(&.{ 0, 1 });
     defer a.free(first);
     const second = try reference.step(&.{2});

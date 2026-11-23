@@ -1061,6 +1061,35 @@ pub const PreparedDecoderWeights = struct {
         fetcher.cold = null;
         return .{ .allocator = allocator, .backend = cb.withoutSynchronousBorrows(), .weights = weights, .fetcher = fetcher, .cross = cross, .lm_head_source = lm_head_source };
     }
+    pub fn prepareMetalSchedulePayload(self: *const PreparedDecoderWeights, cb: *const ComputeBackend, model: *const anyopaque, config: Config) !bool {
+        const cross = self.cross orelse return false;
+        const w = self.weights;
+        const width = config.d_model;
+        if (!try dense_backend.prepareEmbeddingF32(cb, model, w.embed) or
+            !try dense_backend.prepareEmbeddingF32(cb, model, w.positions)) return false;
+        for (w.layers, cross) |layer, projections| {
+            if (layer.qkv_slots == null) return false;
+            for ([_]Norm{ layer.self_ln, layer.cross_ln, layer.ffn_ln }) |norm| {
+                if (!try prepareScheduleNorm(cb, norm, width)) return false;
+            }
+            for ([_]Linear{ layer.o, layer.cross_q, layer.cross_o, projections.k, projections.v }) |linear| {
+                if (!try prepareScheduleLinear(cb, linear, width, width)) return false;
+            }
+            if (!try prepareScheduleLinear(cb, layer.fc1, width, config.decoder_ffn_dim) or
+                !try prepareScheduleLinear(cb, layer.fc2, config.decoder_ffn_dim, width)) return false;
+        }
+        return try prepareScheduleNorm(cb, w.final_ln, width) and
+            try prepareScheduleLinear(cb, .{ .w = w.lm_head, .b = null }, width, config.vocab_size);
+    }
+
+    fn prepareScheduleNorm(cb: *const ComputeBackend, norm: Norm, width: usize) !bool {
+        return (try cb.decoderRuntimeEnsureLayerNormSlot(&.{ .weight = norm.w, .bias = norm.b, .hidden_size = width })) != null;
+    }
+
+    fn prepareScheduleLinear(cb: *const ComputeBackend, linear: Linear, in_dim: usize, out_dim: usize) !bool {
+        return (try cb.decoderRuntimeEnsureLinearSlot(&.{ .weight = linear.w, .bias = linear.b, .in_dim = in_dim, .out_dim = out_dim })) != null;
+    }
+
     pub fn deinit(self: *PreparedDecoderWeights) void {
         self.fetcher.release(&self.backend);
         self.allocator.free(self.weights.layers);
@@ -1294,7 +1323,7 @@ pub const PreparedSingleToken = struct {
     };
     pub fn specSource(cb: *const ComputeBackend, data: *const anyopaque, config: Config, rows: usize, weights: *const PreparedDecoderWeights, query_rows: usize, initial: bool) !?SpecSource {
         if (!dense_backend.available(cb) or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
-        for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
+        if (cb.kind() != .metal) for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
         const embed = try dense_backend.heldWeight(cb, data, weights.weights.embed, "model.decoder.embed_tokens.weight");
         const position = try dense_backend.heldWeight(cb, data, weights.weights.positions, "model.decoder.embed_positions.weight");
         if (embed.descriptor.shape.rank() != 2 or position.descriptor.shape.rank() != 2 or embed.descriptor.shape.dims[1] != config.d_model or position.descriptor.shape.dims[1] != config.d_model or embed.descriptor.shape.dims[0] <= 0 or position.descriptor.shape.dims[0] <= 0) return null;
@@ -1308,7 +1337,7 @@ pub const PreparedSingleToken = struct {
 
     pub fn init(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage) !?PreparedSingleToken {
         if (!dense_backend.available(cb) or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
-        for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
+        if (cb.kind() != .metal) for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
         const embed_shape = (try dense_backend.heldWeight(cb, source_data, weights.weights.embed, "model.decoder.embed_tokens.weight")).descriptor.shape;
         const position_shape = (try dense_backend.heldWeight(cb, source_data, weights.weights.positions, "model.decoder.embed_positions.weight")).descriptor.shape;
         if (embed_shape.rank() != 2 or position_shape.rank() != 2 or embed_shape.dims[1] != config.d_model or position_shape.dims[1] != config.d_model) return null;
@@ -1876,9 +1905,11 @@ fn stepCrossRows(cb: *const ComputeBackend, profile: *StepProfile, q: CT, k: CT,
 }
 
 fn addNorm(cb: *const ComputeBackend, a: CT, b: CT, norm: Norm, dim: usize, profile: ?*StepProfile) !AddNormPair {
-    if (try cb.addLayerNormSum(a, b, norm.w, norm.b, dim, 1e-5)) |fused| {
-        if (profile) |prof| prof.fused_add_norm += 1;
-        return .{ .sum = fused.sum, .normed = fused.normed };
+    if (stepSchedule(profile) == null) {
+        if (try cb.addLayerNormSum(a, b, norm.w, norm.b, dim, 1e-5)) |fused| {
+            if (profile) |prof| prof.fused_add_norm += 1;
+            return .{ .sum = fused.sum, .normed = fused.normed };
+        }
     }
     const sum = try stepAdd(cb, profile, a, b);
     errdefer stepRelease(cb, profile, sum);

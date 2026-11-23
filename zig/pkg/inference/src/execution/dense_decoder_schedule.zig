@@ -588,11 +588,14 @@ pub const Builder = struct {
     }
     pub fn prefix(self: *Builder, q: Node, k: Node, v: Node, heads: usize, dim: usize, capacity: usize) !Node {
         const geometry = ops.kernel_descriptor.DenseAttentionPrefix{ .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .max_key_rows = std.math.cast(u32, capacity) orelse return error.DimensionOverflow, .all_keys_visible = if (self.program_spec) |spec| spec.semantics.all_keys_visible else false };
-        return self.operation(.{ .fused_cross_attention = .{ .batch = 1, .dec_seq = 1, .enc_seq = geometry.max_key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim } }, &.{ q, k, v }, .{ .operation = .{ .dense_attention_prefix = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
+        return self.operation(.{ .fused_cross_attention = .{ .batch = 1, .dec_seq = 1, .enc_seq = geometry.max_key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim, .all_keys_visible = geometry.all_keys_visible } }, &.{ q, k, v }, .{ .operation = .{ .dense_attention_prefix = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
     }
     pub fn attentionRows(self: *Builder, kind: ops.kernel_descriptor.DenseAttentionRows.Kind, q: Node, k: Node, v: Node, heads: usize, dim: usize, query_rows: usize, key_rows: usize) !Node {
         const geometry = ops.kernel_descriptor.DenseAttentionRows{ .kind = kind, .num_heads = std.math.cast(u32, heads) orelse return error.DimensionOverflow, .head_dim = std.math.cast(u32, dim) orelse return error.DimensionOverflow, .query_rows = std.math.cast(u32, query_rows) orelse return error.DimensionOverflow, .key_rows = std.math.cast(u32, key_rows) orelse return error.DimensionOverflow, .all_keys_visible = if (self.program_spec) |spec| kind == .cross and spec.semantics.all_keys_visible else false };
-        const op: ml.graph.OpCode = .{ .fused_cross_attention = .{ .batch = 1, .dec_seq = geometry.query_rows, .enc_seq = geometry.key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim } };
+        const op: ml.graph.OpCode = switch (kind) {
+            .cross => .{ .fused_cross_attention = .{ .batch = 1, .dec_seq = geometry.query_rows, .enc_seq = geometry.key_rows, .num_heads = geometry.num_heads, .head_dim = geometry.head_dim, .all_keys_visible = geometry.all_keys_visible } },
+            .causal => .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = geometry.query_rows, .kv_seq_len = geometry.key_rows, .num_heads = geometry.num_heads, .num_kv_heads = geometry.num_heads, .head_dim = geometry.head_dim, .functional_kv = true, .sliding_window = 0 } },
+        };
         return self.operation(op, &.{ q, k, v }, .{ .operation = .{ .dense_attention_rows = geometry }, .input_count = 3, .output_shape = self.logicalShape(q), .input_shapes = .{ self.logicalShape(q), self.logicalShape(k), self.logicalShape(v) } });
     }
     pub fn lastRow(self: *Builder, input: Node, rows: usize, width: usize) !Node {

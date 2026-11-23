@@ -12079,8 +12079,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const req = owned.requirements;
         if (req.workspace.host_byte_size != 0 or req.probe_workspace.byte_size != 0 or req.probe_workspace.host_byte_size != 0 or req.auxiliaries.count != 0) return false;
         if (owned.vtable == &PreparedDenseLinear.vtable) return req.workspace.byte_size == 0 and PreparedDenseLinear.belongs(@ptrCast(@alignCast(ctx)), owned);
-        const direct = if (owned.vtable == &PreparedCachedGather.vtable) gather: {
-            const prepared: *const PreparedCachedGather = @ptrCast(@alignCast(owned.context));
+        const direct = if (PreparedCachedOperands.selected(owned)) gather: {
+            const prepared: *const PreparedCachedOperands = @ptrCast(@alignCast(owned.context));
             break :gather &prepared.direct;
         } else owned;
         return @import("../execution/assigned_kernel_route.zig").belongsToProgram(direct, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(owned.implementation.table)) }, directRouteSupported);
@@ -12146,7 +12146,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.descriptor.operation == .gather) {
             if (try direct.prepareHostGather(backend, request, directRouteSupported)) |owned| return owned;
             if (!self.ownsMetadataIndex() or !DenseProjectionProfile.noFrame(self)) return null;
-            return PreparedCachedGather.prepare(self, backend, request);
+            return PreparedCachedOperands.prepare(self, backend, request);
         }
         if (request.descriptor.operation == .linear) {
             // Only the genuine cold metadata scope can acquire a new pin.
@@ -12154,71 +12154,138 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!self.ownsMetadataIndex() or !DenseProjectionProfile.noFrame(self)) return null;
             return PreparedDenseLinear.prepare(self, request, table);
         }
-        return direct.prepare(backend, request, directRouteSupported);
+        if (try direct.prepare(backend, request, directRouteSupported)) |owned| return owned;
+        if (request.descriptor.operation == .norm and self.ownsMetadataIndex() and DenseProjectionProfile.noFrame(self))
+            return PreparedCachedOperands.prepare(self, backend, request);
+        return null;
     }
 
-    const PreparedCachedGather = struct {
+    const PreparedCachedOperands = struct {
         const route = @import("../execution/kernel_route.zig");
         const direct_route = @import("../execution/assigned_kernel_route.zig");
         allocator: std.mem.Allocator,
-        source: CT,
-        plane: @import("../execution/storage_ownership.zig").Plane,
-        table: MetalTensor,
+        operands: [3]?Operand,
         direct: route.Owned,
         output: route.OutputSlot,
 
+        const Operand = struct {
+            source: CT,
+            plane: @import("../execution/storage_ownership.zig").Plane,
+            device: MetalTensor = .empty,
+
+            fn checked(compute: *MetalCompute, implementation: route.Implementation, binding: route.Binding, shape: ml.graph.Shape) ?Operand {
+                if (binding != .tensor or binding.tensor.implementation.context != implementation.context or
+                    binding.tensor.implementation.table != implementation.table) return null;
+                const source = binding.tensor.value;
+                const plane = denseDecoderHeldWeight(compute, compute.data, source, null) catch return null;
+                if (!shape.eq(plane.descriptor.shape) or plane.descriptor.resident_backend != .native) return null;
+                return .{ .source = source, .plane = plane };
+            }
+            fn fact(self: *const Operand, implementation: route.Implementation) route.Binding {
+                return .{ .resident = .{ .implementation = implementation, .logical = self.plane.descriptor.shape, .planes = (&self.plane)[0..1] } };
+            }
+        };
+
         fn prepare(compute: *MetalCompute, backend: ops.ComputeBackend, request: route.Prepare) !?route.Owned {
-            if (request.inputs.len != 2 or request.inputs[0] != .tensor or request.descriptor.operation.gather.axis != 0) return null;
-            const source = request.inputs[0].tensor;
-            if (source.implementation.context != backend.ptr or source.implementation.table != @as(*const anyopaque, backend.vtable)) return null;
-            const plane = denseDecoderHeldWeight(compute, compute.data, source.value, null) catch return null;
-            const shape = request.descriptor.input_shapes[0];
-            if (!shape.eq(plane.descriptor.shape) or shape.rank() != 2 or shape.dim(0) <= 0 or shape.dim(1) <= 0 or plane.descriptor.resident_backend != .native) return null;
-            const key = embeddingTableIdentity(toBuf(source.value)) orelse return null;
-            const runtime = compute.provider_impl.raw_decode_runtime orelse return null;
-            var table = (try metal_runtime.retainPreparedEmbeddingF32(runtime, key, @intCast(shape.dim(0)), @intCast(shape.dim(1)))) orelse return null;
+            const implementation = request.implementation orelse return null;
+            var operands: [3]?Operand = @splat(null);
+            if (!try pinOperands(compute, request, implementation, &operands)) return null;
             var committed = false;
-            defer if (!committed) table.deinit();
-            const facts = [_]route.Binding{ .{ .resident = .{ .implementation = source.implementation, .logical = shape, .planes = &.{plane} } }, request.inputs[1] };
+            defer if (!committed) releaseOperands(&operands);
+            var facts: [3]route.Binding = undefined;
+            @memcpy(facts[0..request.inputs.len], request.inputs);
+            for (&operands, 0..) |*maybe, index| if (maybe.*) |*operand| {
+                facts[index] = operand.fact(implementation);
+            };
             var checked = request;
-            checked.inputs = &facts;
-            var direct = (try direct_route.prepareHostGather(backend, checked, directRouteSupported)) orelse return null;
+            checked.inputs = facts[0..request.inputs.len];
+            var direct = (if (request.descriptor.operation == .gather)
+                try direct_route.prepareHostGather(backend, checked, directRouteSupported)
+            else
+                try direct_route.prepare(backend, checked, directRouteSupported)) orelse return null;
             defer if (!committed) direct.deinit();
-            const owner = try request.allocator.create(PreparedCachedGather);
+            const owner = try request.allocator.create(PreparedCachedOperands);
             var output = request.output;
             output.writable_bytes = direct.requirements.primary_bytes;
-            owner.* = .{ .allocator = request.allocator, .source = source.value, .plane = plane, .table = table, .direct = direct, .output = output };
+            owner.* = .{ .allocator = request.allocator, .operands = operands, .direct = direct, .output = output };
             committed = true;
-            return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .output_plane_metadata = .assigned_dense, .vtable = &vtable };
+            return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .output_plane_metadata = .assigned_dense, .vtable = if (request.descriptor.operation == .gather) &vtable else &norm_vtable };
+        }
+
+        fn pinOperands(compute: *MetalCompute, request: route.Prepare, implementation: route.Implementation, output: *[3]?Operand) !bool {
+            const descriptor = request.descriptor;
+            const runtime = compute.provider_impl.raw_decode_runtime orelse return false;
+            switch (descriptor.operation) {
+                .gather => |gather| {
+                    if (request.inputs.len != 2 or gather.axis != 0) return false;
+                    const shape = descriptor.input_shapes[0];
+                    if (shape.rank() != 2 or shape.dim(0) <= 0 or shape.dim(1) <= 0) return false;
+                    var table = Operand.checked(compute, implementation, request.inputs[0], shape) orelse return false;
+                    const key = embeddingTableIdentity(toBuf(table.source)) orelse return false;
+                    table.device = (try metal_runtime.retainPreparedEmbeddingF32(runtime, key, @intCast(shape.dim(0)), @intCast(shape.dim(1)))) orelse return false;
+                    output[0] = table;
+                },
+                .norm => |norm| {
+                    if (norm.kind != .layer or request.inputs.len != 3) return false;
+                    var gamma = Operand.checked(compute, implementation, request.inputs[1], descriptor.input_shapes[1]) orelse return false;
+                    var beta = Operand.checked(compute, implementation, request.inputs[2], descriptor.input_shapes[2]) orelse return false;
+                    const key = dynamicLayerNormSlotKey(gamma.source, beta.source, norm.dim);
+                    const slot = compute.livePreparedSlot("dynamic_layer_norm_slots", .layer_norm, key) orelse return false;
+                    const buffers = (try metal_runtime.retainPreparedLayerNormF32(runtime, slot.slot, norm.dim)) orelse return false;
+                    gamma.device = buffers[0];
+                    beta.device = buffers[1];
+                    output[1] = gamma;
+                    output[2] = beta;
+                },
+                else => return false,
+            }
+            return true;
         }
 
         fn pinnedInput(raw: *anyopaque, index: usize, binding: route.Binding) bool {
-            const self: *const PreparedCachedGather = @ptrCast(@alignCast(raw));
-            return index == 0 and binding == .tensor and binding.tensor.value == self.source and
-                binding.tensor.implementation.context == self.direct.implementation.context and
+            const self: *const PreparedCachedOperands = @ptrCast(@alignCast(raw));
+            if (index >= self.operands.len or binding != .tensor) return false;
+            const operand = self.operands[index] orelse return false;
+            return binding.tensor.value == operand.source and binding.tensor.implementation.context == self.direct.implementation.context and
                 binding.tensor.implementation.table == self.direct.implementation.table;
         }
         fn matches(raw: *anyopaque, request: route.Validate) bool {
-            const self: *const PreparedCachedGather = @ptrCast(@alignCast(raw));
-            if (request.inputs.len != 2 or !pinnedInput(raw, 0, request.inputs[0])) return false;
-            const facts = [_]route.Binding{ .{ .resident = .{ .implementation = self.direct.implementation, .logical = self.plane.descriptor.shape, .planes = &.{self.plane} } }, request.inputs[1] };
+            const self: *const PreparedCachedOperands = @ptrCast(@alignCast(raw));
+            if (request.inputs.len > self.operands.len) return false;
+            var facts: [3]route.Binding = undefined;
+            @memcpy(facts[0..request.inputs.len], request.inputs);
+            for (self.operands[0..request.inputs.len], 0..) |*maybe, index| if (maybe.*) |*operand| {
+                if (!pinnedInput(raw, index, request.inputs[index])) return false;
+                facts[index] = operand.fact(self.direct.implementation);
+            };
             var checked = request;
-            checked.inputs = &facts;
+            checked.inputs = facts[0..request.inputs.len];
             return self.direct.vtable.matches(self.direct.context, checked);
         }
         fn validate(raw: *anyopaque, request: route.Validate) !void {
             if (!matches(raw, request)) return error.PreparedKernelBindingChanged;
         }
         fn indexConstraint(raw: *anyopaque, operand: usize) ?@import("../execution/host_ingress.zig").IndexBounds {
-            const self: *const PreparedCachedGather = @ptrCast(@alignCast(raw));
+            const self: *const PreparedCachedOperands = @ptrCast(@alignCast(raw));
             return self.direct.vtable.host_input_constraint.?(self.direct.context, operand);
         }
         fn deinit(raw: *anyopaque) void {
-            const self: *PreparedCachedGather = @ptrCast(@alignCast(raw));
+            const self: *PreparedCachedOperands = @ptrCast(@alignCast(raw));
             self.direct.deinit();
-            self.table.deinit();
+            releaseOperands(&self.operands);
             self.allocator.destroy(self);
         }
+        fn releaseOperands(operands: *[3]?Operand) void {
+            for (operands) |*maybe| if (maybe.*) |*operand| operand.device.deinit();
+        }
+        fn deviceInput(owner: ?*const PreparedCachedOperands, value: CT, index: usize) ?MetalTensor {
+            if (owner) |prepared| if (prepared.operands[index]) |operand| return operand.device;
+            return toBuf(value).metal_tensor;
+        }
+        fn selected(owner: *const route.Owned) bool {
+            return owner.vtable == &vtable or owner.vtable == &norm_vtable;
+        }
+        const norm_vtable: route.Owned.VTable = .{ .pinned_input = pinnedInput, .matches = matches, .validate = validate, .deinit = @This().deinit };
         const vtable: route.Owned.VTable = .{ .pinned_input = pinnedInput, .host_input_constraint = indexConstraint, .matches = matches, .validate = validate, .deinit = @This().deinit };
     };
 
@@ -12323,7 +12390,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = output_slot, .slot = slot, .key = key, .host_sources = host_sources, .payload = payload, .declaration = declaration };
             committed = true;
-            return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .vtable = &vtable };
+            return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .output_plane_metadata = .assigned_dense, .vtable = &vtable };
         }
         fn matches(raw: *anyopaque, request: route.Validate) bool {
             const self: *PreparedDenseLinear = @ptrCast(@alignCast(raw));
@@ -13364,18 +13431,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
         const typed_gather = descriptor.operation == .gather and descriptor.input_shapes[1].dtype != .f32;
-        const cached_gather: ?*const PreparedCachedGather = if (typed_gather and request.prepared_route != null and request.prepared_route.?.vtable == &PreparedCachedGather.vtable) cached: {
-            const route = request.prepared_route.?;
+        const cached_operands: ?*const PreparedCachedOperands = if (request.prepared_route) |route| cached: {
+            if (!PreparedCachedOperands.selected(route)) break :cached null;
             if (route.implementation.context != ctx or !acceptsPhysicalImplementation(route.implementation.table)) return error.PreparedKernelBindingChanged;
-            const owner: *const PreparedCachedGather = @ptrCast(@alignCast(route.context));
-            if (owner.source != request.inputs[0]) return error.PreparedKernelBindingChanged;
+            const owner: *const PreparedCachedOperands = @ptrCast(@alignCast(route.context));
+            try @import("../execution/assigned_kernel_route.zig").validateDescriptor(&owner.direct, descriptor);
+            for (owner.operands[0..request.inputs.len], request.inputs) |operand, input| {
+                if (operand != null and operand.?.source != input) return error.PreparedKernelBindingChanged;
+            }
             break :cached owner;
         } else null;
         for (request.inputs, 0..) |input, index| {
             const buf = toBuf(input);
             const typed_index = typed_gather and index == 1;
             if (buf.integer_storage != typed_index or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf)) return false;
-            const tensor = (if (index == 0 and cached_gather != null) cached_gather.?.table else buf.metal_tensor) orelse {
+            const tensor = PreparedCachedOperands.deviceInput(cached_operands, input, index) orelse {
                 const prepared = request.prepared_route orelse return false;
                 if (descriptor.operation != .linear or index == 0 or prepared.vtable != &PreparedDenseLinear.vtable) return false;
                 const source = denseDecoderHeldWeight(ctx, self.data, input, null) catch return false;
@@ -13390,7 +13460,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         if (typed_gather) {
-            const route = if (cached_gather) |owner| &owner.direct else request.prepared_route orelse return false;
+            const route = if (cached_operands) |owner| &owner.direct else request.prepared_route orelse return false;
             const direct = @import("../execution/assigned_kernel_route.zig");
             if (!acceptsPhysicalImplementation(route.implementation.table) or
                 !direct.belongsToProgram(route, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(route.implementation.table)) }, directRouteSupported) or
@@ -13442,23 +13512,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 assigned.slot.writable_bytes != planned.writable_bytes or !assigned.slot.logical.eq(planned.logical)) return error.InvalidPhysicalStorageAuthority;
             try self.validateProjectionOutput(out_tensor, assigned.*);
         }
-        if (cached_gather) |gather| {
+        if (cached_operands) |owner| {
             const assigned = request.assigned_output orelse return error.InvalidPhysicalStorageAuthority;
-            const planned = gather.output;
+            const planned = owner.output;
             if (assigned.slot.node != planned.node or assigned.slot.epoch != planned.epoch or assigned.slot.allocation != planned.allocation or
                 assigned.slot.writable_bytes != planned.writable_bytes or !assigned.slot.logical.eq(planned.logical)) return error.InvalidPhysicalStorageAuthority;
             try self.validateProjectionOutput(out_tensor, assigned.*);
         }
         if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
             for (request.inputs, 0..) |source, index| {
-                const tensor = (if (index == 0 and cached_gather != null) cached_gather.?.table else toBuf(source).metal_tensor) orelse continue;
+                const tensor = PreparedCachedOperands.deviceInput(cached_operands, source, index) orelse continue;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
             }
         }
         // Inputs and output are already admitted device views. Borrow them for
         // synchronous encoding instead of retaining/materializing each through
         // the general CT adapters; the command/frame layer retains GPU resources.
-        const input = if (cached_gather) |owner| owner.table else toBuf(request.inputs[0]).metal_tensor.?;
+        const input = PreparedCachedOperands.deviceInput(cached_operands, request.inputs[0], 0).?;
         const written: bool = switch (descriptor.operation) {
             .paged_attention => return false,
             .dense_attention_rows, .dense_attention_prefix => blk: {
@@ -13538,7 +13608,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             .rope => |r| try metal_runtime.decoderRuntimeApplyRopeDeviceInto(self.provider_impl, input, r, out_tensor),
             .norm => |norm| blk: {
-                const weight = toBuf(request.inputs[1]).metal_tensor.?;
+                const weight = PreparedCachedOperands.deviceInput(cached_operands, request.inputs[1], 1).?;
                 if (norm.kind == .rms) {
                     if (rms_clamped) break :blk try metal_runtime.decoderRuntimeNormClampedInto(self.provider_impl, input, weight, .{ .rows = @intCast(descriptor.elements() / norm.dim), .dim = norm.dim, .eps = norm.eps, .flags = 0, .lo = 0, .hi = 0 }, out_tensor);
                     break :blk try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceInto(self.provider_impl, input, weight, norm.dim, norm.eps, out_tensor);
@@ -13546,7 +13616,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (!mutable_layer_norm) {
                     const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
                     defer self.endActivePlannedComputeScope(scope);
-                    break :blk metal_runtime.decoderRuntimeLayerNormBuffersInto(self.provider_impl, input, weight, toBuf(request.inputs[2]).metal_tensor.?, norm.dim, norm.eps, out_tensor);
+                    break :blk metal_runtime.decoderRuntimeLayerNormBuffersInto(self.provider_impl, input, weight, PreparedCachedOperands.deviceInput(cached_operands, request.inputs[2], 2).?, norm.dim, norm.eps, out_tensor);
                 }
                 const kernel = layerNormDeviceRequest(norm, descriptor.elements()) orelse return error.InvalidTensorShape;
                 var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
@@ -40662,7 +40732,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.data.prefetch.lock();
         defer self.data.prefetch.unlock();
         const loaded = if (entry.host_loaded) |*value| value else return error.DenseWeightPreparationChanged;
-        if (entry.pin_count == 0 or loaded.tensor.dtype != .f32 or !std.mem.eql(i64, loaded.tensor.shape, shape.dims[0..shape.rank()])) return error.DenseWeightPreparationChanged;
+        if (loaded.tensor.dtype != .f32) return error.UnsupportedDenseSchedule;
+        if (entry.pin_count == 0 or !std.mem.eql(i64, loaded.tensor.shape, shape.dims[0..shape.rank()])) return error.DenseWeightPreparationChanged;
         const root = if (buffer.owns_lazy_pin)
             loaded.tensor.asFloat32IfAligned() orelse return error.UnsupportedDenseSchedule
         else cached: {
@@ -40677,6 +40748,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         desc.current_backend = .metal;
         desc.resident_backend = .native;
         return .{ .descriptor = desc, .role = .primary, .backing = .{ .kind = .host, .base = @intFromPtr(root.ptr) }, .byte_offset = 0, .base_alignment = @alignOf(f32), .logical_bytes = bytes, .readable_bytes = bytes };
+    }
+
+    fn denseDecoderPrepareEmbeddingF32(ctx: *anyopaque, model: *const anyopaque, value: CT) !bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.ownsMetadataIndex() or !DenseProjectionProfile.noFrame(self)) return false;
+        const token = currentEngineOperation(ctx) orelse return false;
+        try token.validate(.{ .implementation = .{ .context = ctx, .table = &vtable_impl }, .program = null, .mode = .managed });
+        const plane = try denseDecoderHeldWeight(ctx, model, value, null);
+        const shape = plane.descriptor.shape;
+        if (shape.rank() != 2 or shape.dim(0) <= 0 or shape.dim(1) <= 0) return false;
+        if (plane.descriptor.resident_backend == .metal) return true;
+        const source = toBuf(value);
+        const identity = embeddingTableIdentity(source) orelse return false;
+        const status = metal_runtime.termite_metal_decode_runtime_prepare_embedding_table_value(
+            self.provider_impl.raw_decode_runtime,
+            source.data.ptr,
+            @intCast(shape.dim(0)),
+            @intCast(shape.dim(1)),
+            identity.value,
+            identity.revision,
+        );
+        return status == 0;
     }
 
     fn denseDecoderProjectionInto(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor, inputs: []const CT, destination: CT, mode: @import("kernel_backend.zig").ProjectionMode) !bool {
@@ -40780,6 +40873,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const dense_decoder_services: @import("kernel_backend.zig").DenseDecoderServices = .{
         .available = denseDecoderAvailable,
         .heldWeightF32 = denseDecoderHeldWeight,
+        .prepareEmbeddingF32 = denseDecoderPrepareEmbeddingF32,
         .projectionInto = denseDecoderProjectionInto,
         .projectionQkvCacheRow = denseDecoderProjectionQkvCacheRow,
     };
@@ -56747,9 +56841,15 @@ test "Metal prepared dense row projections install pair QKV owners and preserve 
     try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, PreparedDenseRegionFixture.check);
 }
 
-test "Metal prepared typed gather retains a named cached embedding table" {
+test "Metal prepared typed gather and layer norm retain named cached operands" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const Fixture = struct {
+        fn populate(store: *@import("native_compute.zig").WeightStore) !void {
+            const helper = @import("media_residency_test.zig");
+            try helper.putWeight(store, "q", &.{ 64, 64 }, null);
+            try helper.putWeight(store, "gamma", &.{64}, null);
+            try helper.putWeight(store, "beta", &.{64}, null);
+        }
         fn check(cb: ops.ComputeBackend, reference: ops.ComputeBackend) !void {
             const a = std.testing.allocator;
             const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -56759,6 +56859,12 @@ test "Metal prepared typed gather retains a named cached embedding table" {
             const runtime = compute.provider_impl.raw_decode_runtime.?;
             try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_prepare_embedding_table_value(runtime, MetalCompute.toBuf(source).data.ptr, 64, 64, key.value, key.revision));
 
+            const gamma = try cb.getWeight("gamma");
+            defer cb.free(gamma);
+            const beta = try cb.getWeight("beta");
+            defer cb.free(beta);
+            const norm_slot = (try cb.decoderRuntimeEnsureLayerNormSlot(&.{ .weight = gamma, .bias = beta, .hidden_size = 64 })) orelse return error.MissingPreparedLayerNorm;
+
             var graph = ml.graph.Graph.init(a);
             defer graph.deinit();
             var builder = ml.graph.Builder.init(&graph);
@@ -56766,7 +56872,15 @@ test "Metal prepared typed gather retains a named cached embedding table" {
             const index_shape = ml.graph.Shape.init(.i64, &.{1});
             const index_node = try builder.parameter("index", index_shape);
             const output = try builder.gather(table_node, index_node, ml.graph.Shape.init(.f32, &.{ 1, 64 }));
-            try graph.markOutput(output);
+            const gamma_node = try builder.parameter("gamma", ml.graph.Shape.init(.f32, &.{64}));
+            const beta_node = try builder.parameter("beta", ml.graph.Shape.init(.f32, &.{64}));
+            const normalized = try graph.addNode(.{
+                .op = .{ .fused_layer_norm = .{ .dim = 64, .eps = 1e-5 } },
+                .output_shape = graph.node(output).output_shape,
+                .inputs = .{ output, gamma_node, beta_node, ml.graph.null_node },
+                .num_inputs = 3,
+            });
+            try graph.markOutput(normalized);
             var analysis = try @import("../graph/interpreter.zig").CachedAnalysis.compute(a, &graph);
             defer analysis.deinit(a);
             var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&cb}, .{}, false);
@@ -56781,6 +56895,12 @@ test "Metal prepared typed gather retains a named cached embedding table" {
             const selected = (try physical.Pool.preparePrivateDecoderSourcesConsuming(&private, .{ .slice = &.{.{
                 .node_id = table_node,
                 .value = .{ .tensor = .{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .value = source } },
+            }, .{
+                .node_id = gamma_node,
+                .value = .{ .tensor = .{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .value = gamma } },
+            }, .{
+                .node_id = beta_node,
+                .value = .{ .tensor = .{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .value = beta } },
             }} }, .{ .slice = &.{.{
                 .node_id = index_node,
                 .value = .{ .imported_host = .{ .logical = index_shape, .target = .metal, .owned_ingress = true } },
@@ -56788,8 +56908,11 @@ test "Metal prepared typed gather retains a named cached embedding table" {
             defer selected.release();
             _ = selected.pool.completeOwnedPayload() orelse return error.MissingOwnedPayloadWitness;
             const route = selected.pool.preparedKernelRoute(output) orelse return error.MissingPreparedRoutes;
-            try std.testing.expect(route.vtable == &MetalCompute.PreparedCachedGather.vtable);
+            try std.testing.expect(route.vtable == &MetalCompute.PreparedCachedOperands.vtable);
 
+            const norm_route = selected.pool.preparedKernelRoute(normalized) orelse return error.MissingPreparedRoutes;
+            try std.testing.expect(norm_route.vtable == &MetalCompute.PreparedCachedOperands.norm_vtable);
+            metal_runtime_mod.clearRawLayerNormSlot(compute.provider_impl, norm_slot);
             var scope = try @import("../execution/backend_operation.zig").enter(cb, &graph, null, .managed);
             defer scope.deinitChecked() catch unreachable;
             const cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = scope.token() };
@@ -56803,8 +56926,10 @@ test "Metal prepared typed gather retains a named cached embedding table" {
             const ingress = [_]@import("../execution/host_ingress.zig").Input{.{ .node_id = index_node, .value = &indices }};
             const token = scope.token().?;
             const first = (try frame.bindHostInputsWithOperation(&ingress, null, &token))[0].value;
-            var values: [3]?CT = @splat(null);
+            var values: [6]?CT = @splat(null);
             values[table_node] = source;
+            values[gamma_node] = gamma;
+            values[beta_node] = beta;
             values[index_node] = first;
             try frame.prepareProgramViews(&cb, &graph, &values, cleanup);
             try frame.sealProgramStorage();
@@ -56812,6 +56937,10 @@ test "Metal prepared typed gather retains a named cached embedding table" {
             defer reference.free(ref_table);
             const expected = try reference.toFloat32(ref_table, a);
             defer a.free(expected);
+            const reference_gamma = try reference.getWeight("gamma");
+            defer reference.free(reference_gamma);
+            const reference_beta = try reference.getWeight("beta");
+            defer reference.free(reference_beta);
             const attention = ops.AttentionContext{ .total_sequence_len = 0, .query_sequence_len = 0, .kv_sequence_len = 0 };
             for ([_]i64{ 7, 13 }) |row| {
                 index = row;
@@ -56821,11 +56950,22 @@ test "Metal prepared typed gather retains a named cached embedding table" {
                 const result = try frame.executePreparedProgram(&cb, &values, output, null, &attention);
                 const actual = try cb.toFloat32(result, a);
                 defer a.free(actual);
-                try std.testing.expectEqualSlices(f32, expected[@as(usize, @intCast(row)) * 64 ..][0..64], actual);
+                const expected_row = expected[@as(usize, @intCast(row)) * 64 ..][0..64];
+                try std.testing.expectEqualSlices(f32, expected_row, actual);
+                const target = try frame.executePreparedProgram(&cb, &values, normalized, null, &attention);
+                const source_row = try reference.fromFloat32Shape(expected_row, &.{ 1, 64 });
+                defer reference.free(source_row);
+                const norm = try reference.layerNorm(source_row, reference_gamma, reference_beta, 64, 1e-5);
+                defer reference.free(norm);
+                const found = try cb.toFloat32(target, a);
+                defer a.free(found);
+                const want = try reference.toFloat32(norm, a);
+                defer a.free(want);
+                for (found, want) |value, expected_value| try std.testing.expectApproxEqAbs(expected_value, value, 2e-4);
             }
         }
     };
-    try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, Fixture.check);
+    try @import("media_residency_test.zig").onMetal(Fixture.populate, Fixture.check);
 }
 
 test "Metal prepared pair and QKV dispatch mixed bias operands without readback" {
