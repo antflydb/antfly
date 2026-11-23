@@ -36,6 +36,30 @@ pub const StorageMode = enum(c_int) {
     private = 1,
 };
 
+/// A detached allocator capability. It pins the SDK device independently
+/// from the provider runtime and can be used during outside admission.
+pub const StandaloneDevice = struct {
+    handle: *anyopaque,
+
+    pub fn retain(runtime: *anyopaque) ?StandaloneDevice {
+        if (comptime !@import("build_options").enable_metal) return null;
+        return .{ .handle = antfly_metal_standalone_device_retain(runtime) orelse return null };
+    }
+
+    pub fn release(self: StandaloneDevice) void {
+        antfly_metal_standalone_device_release(self.handle);
+    }
+
+    pub fn allocationBytes(self: StandaloneDevice, bytes: usize, mode: StorageMode) ?usize {
+        const bound = antfly_metal_standalone_allocation_bytes_mode(self.handle, bytes, @backingInt(mode));
+        return if (bound < bytes or bound == 0) null else bound;
+    }
+
+    pub fn allocate(self: StandaloneDevice, bytes: usize, mode: StorageMode) ?*anyopaque {
+        return antfly_metal_standalone_buffer_alloc_mode(self.handle, bytes, @backingInt(mode));
+    }
+};
+
 pub const DType = enum(u8) {
     f32 = 0,
     i32 = 1,
@@ -531,6 +555,7 @@ extern fn termite_metal_decode_runtime_release_buffer(runtime: *anyopaque, handl
 extern fn antfly_metal_decode_runtime_release_charged_buffer(runtime: *anyopaque, handle: *anyopaque) void;
 extern fn antfly_metal_standalone_device_retain(runtime: *anyopaque) ?*anyopaque;
 extern fn antfly_metal_standalone_device_release(device: *anyopaque) void;
+extern fn antfly_metal_standalone_allocation_bytes_mode(device: *anyopaque, bytes: usize, storage_mode: c_int) usize;
 extern fn antfly_metal_standalone_buffer_alloc_mode(device: *anyopaque, bytes: usize, storage_mode: c_int) ?*anyopaque;
 extern fn termite_metal_buffer_contents(handle: *anyopaque) ?*anyopaque;
 extern fn termite_metal_buffer_download(
@@ -910,7 +935,7 @@ pub const MetalTensor = struct {
 
     /// A cold bank is still owned by the caller while its views are prepared.
     /// Encoding, rather than allocation, retains it for the consuming frame.
-    pub fn deviceAllocateUnpublishedBank(allocator: std.mem.Allocator, runtime: *anyopaque, byte_len: usize, mode: StorageMode, dims: []const i32) !MetalTensor {
+    pub fn deviceAllocateUnpublishedBank(allocator: std.mem.Allocator, runtime: *anyopaque, device: StandaloneDevice, byte_len: usize, mode: StorageMode, dims: []const i32) !MetalTensor {
         if (comptime !@import("build_options").enable_metal) return error.MetalUnavailable;
         if (dims.len > max_dims or byte_len == 0) return error.InvalidTensorShape;
         var elements: usize = 1;
@@ -921,11 +946,9 @@ pub const MetalTensor = struct {
         if (try std.math.mul(usize, elements, @sizeOf(f32)) != byte_len) return error.InvalidTensorShape;
         // The provider supplies its device, but its active frame, pools and
         // workspace budget have no custody of this separately admitted bank.
-        const device = antfly_metal_standalone_device_retain(runtime) orelse return error.MetalUnavailable;
-        defer antfly_metal_standalone_device_release(device);
         const ref = try allocator.create(DeviceBufferRef);
         errdefer allocator.destroy(ref);
-        const handle = antfly_metal_standalone_buffer_alloc_mode(device, byte_len, @backingInt(mode)) orelse return error.MetalBufferAllocFailed;
+        const handle = device.allocate(byte_len, mode) orelse return error.MetalBufferAllocFailed;
         ref.* = .{
             .handle = handle,
             .runtime = runtime,

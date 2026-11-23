@@ -74053,8 +74053,12 @@ static size_t antfly_metal_allocation_bytes_for_mode(id<MTLDevice> device, size_
     }
     return bound;
 }
+size_t antfly_metal_standalone_allocation_bytes_mode(void *device_handle, size_t bytes, int storage_mode) {
+    MTLResourceOptions options = storage_mode == 1 ? MTLResourceStorageModePrivate : MTLResourceStorageModeShared;
+    return antfly_metal_allocation_bytes_for_mode((__bridge id<MTLDevice>)device_handle, bytes, options);
+}
 size_t antfly_metal_standalone_allocation_bytes(void *device_handle, size_t bytes) {
-    return antfly_metal_allocation_bytes_for_mode((__bridge id<MTLDevice>)device_handle, bytes, MTLResourceStorageModePrivate);
+    return antfly_metal_standalone_allocation_bytes_mode(device_handle, bytes, 1);
 }
 // Host-initialized banks may use direct Shared writes only on a unified-memory
 // device. Discrete/managed devices keep their existing Private+staging policy.

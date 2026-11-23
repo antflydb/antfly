@@ -13408,11 +13408,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const entry_host = try projectionPackMetadataBytes();
         const storage_host = if (self.provider_impl.operations.hasStorageBacking()) 0 else operation_owner_mod.Owner.retainedStorageBytes();
         const host_bytes = try std.math.add(usize, entry_host, storage_host);
-        const device = metal_runtime.antfly_metal_standalone_device_retain(self.provider_impl.raw_decode_runtime orelse return error.MetalUnavailable) orelse return error.MetalUnavailable;
-        defer metal_runtime.antfly_metal_standalone_device_release(device);
-        const weight_physical = metal_runtime.antfly_metal_standalone_allocation_bytes(device, layout.weight_bytes);
-        const bias_physical = metal_runtime.antfly_metal_standalone_allocation_bytes(device, layout.bias_bytes);
-        if (weight_physical < layout.weight_bytes or bias_physical < layout.bias_bytes) return error.InvalidPhysicalAllocation;
+        const device = metal_tensor_mod.StandaloneDevice.retain(self.provider_impl.raw_decode_runtime orelse return error.MetalUnavailable) orelse return error.MetalUnavailable;
+        defer device.release();
+        const weight_physical = device.allocationBytes(layout.weight_bytes, .private) orelse return error.InvalidPhysicalAllocation;
+        const bias_physical = device.allocationBytes(layout.bias_bytes, .private) orelse return error.InvalidPhysicalAllocation;
         const physical_bytes = try std.math.add(usize, weight_physical, bias_physical);
         const logical_bytes = try std.math.add(usize, layout.weight_bytes, layout.bias_bytes);
         self.data.prefetch.lock();
@@ -13451,9 +13450,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const charge = try shell.armCacheBackings(&backings);
         pending_charge = charge;
-        const weight = metal_runtime.antfly_metal_standalone_buffer_alloc(device, layout.weight_bytes) orelse return error.OutOfMemory;
+        const weight = device.allocate(layout.weight_bytes, .private) orelse return error.OutOfMemory;
         errdefer metal_runtime.termite_metal_buffer_release(weight);
-        const bias = metal_runtime.antfly_metal_standalone_buffer_alloc(device, layout.bias_bytes) orelse return error.OutOfMemory;
+        const bias = device.allocate(layout.bias_bytes, .private) orelse return error.OutOfMemory;
         errdefer metal_runtime.termite_metal_buffer_release(bias);
         if (metal_runtime.termite_metal_buffer_allocated_size(weight) != weight_physical or metal_runtime.termite_metal_buffer_allocated_size(bias) != bias_physical) return error.PhysicalAllocationSizeChanged;
         try ProjectionPack.Owner.attachSDKRoots(charge, .{ weight, bias });
@@ -22789,15 +22788,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return bank;
     }
 
-    fn audioPlanAllocationBound(self: *MetalCompute, bytes: usize, shared: bool) ?usize {
-        if (bytes == 0) return null;
-        // Shared coefficient banks also support devices without Shared heaps.
-        const bound = if (shared)
+    fn audioPlanAllocationBound(device: metal_tensor_mod.StandaloneDevice, bytes: usize, mode: metal_tensor_mod.StorageMode) ?usize {
+        const bound = device.allocationBytes(bytes, mode) orelse return null;
+        // Keep the coefficient cache's established conservative bucket while
+        // also respecting the actual SDK bound for this exact storage mode.
+        const cache_bound = if (mode == .shared)
             (std.math.add(usize, bytes, 65535) catch return null) & ~@as(usize, 65535)
         else
-            physicalStorageReservationBytesOp(self, bytes) catch return null;
-        // Match the cache charge from the actual SDK allocation.
-        return roundAudioBankCharge(bound);
+            bytes;
+        return roundAudioBankCharge(@max(bound, cache_bound));
     }
 
     fn roundAudioBankCharge(bytes: usize) ?usize {
@@ -22812,7 +22811,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         if (bytes % @sizeOf(f32) != 0) return null;
         const elements = std.math.cast(i32, bytes / @sizeOf(f32)) orelse return null;
-        const admitted = self.audioPlanAllocationBound(bytes, shared) orelse return null;
+        const device = metal_tensor_mod.StandaloneDevice.retain(runtime) orelse return null;
+        defer device.release();
+        const mode: metal_tensor_mod.StorageMode = if (shared) .shared else .private;
+        const admitted = audioPlanAllocationBound(device, bytes, mode) orelse return null;
         const cache = if (self.data.tier_cache) |*v| v else return null;
         const host_reservation = try std.math.add(usize, metal_tensor_mod.device_buffer_ref_bytes, wrapper_bytes);
         const host_total = try std.math.add(usize, storage_owner.host_bytes, host_reservation);
@@ -22834,7 +22836,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             cache.noteRelease(.host, host_reservation);
             self.data.prefetch.unlock();
         };
-        var tensor = try MetalTensor.deviceAllocateUnpublishedBank(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{elements});
+        var tensor = try MetalTensor.deviceAllocateUnpublishedBank(std.heap.c_allocator, runtime, device, bytes, mode, &.{elements});
         errdefer self.retireTemporaryWorkspaceValue(&tensor);
         const sdk_bytes = metal_runtime.termite_metal_buffer_allocated_size(tensor.deviceHandle());
         const actual = roundAudioBankCharge(@max(bytes, sdk_bytes)) orelse {
@@ -62092,8 +62094,10 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
     }
     try compute.audioFreezePlan(plan);
     const recipe = try plan.arenaLayout();
-    const output_bound = compute.audioPlanAllocationBound(recipe.outputs_bytes, false) orelse return error.TestUnexpectedResult;
-    const full_bound = compute.audioPlanAllocationBound(recipe.total_bytes, false) orelse return error.TestUnexpectedResult;
+    const device = metal_tensor_mod.StandaloneDevice.retain(compute.provider_impl.raw_decode_runtime orelse return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
+    defer device.release();
+    const output_bound = MetalCompute.audioPlanAllocationBound(device, recipe.outputs_bytes, .private) orelse return error.TestUnexpectedResult;
+    const full_bound = MetalCompute.audioPlanAllocationBound(device, recipe.total_bytes, .private) orelse return error.TestUnexpectedResult;
     try std.testing.expect(full_bound > output_bound);
     cache.budget.backend_limit_bytes = full_bound + output_bound;
     cache.budget.host_limit_bytes = cache.host_bytes + metal_tensor_mod.device_buffer_ref_bytes + MetalCompute.persistentTensorBytes(1) + MetalCompute.persistentTensorBytes(2);
