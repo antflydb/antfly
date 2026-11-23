@@ -192,7 +192,7 @@ test("a delete racing an ingest never resurrects the message or orphans objects"
   m.search.hooks.beforeMutate = async (input) => {
     if (input.operation_id !== "mail/ingest/" + doomed) return;
     m.search.hooks.beforeMutate = null;
-    await m.actor.delete(m.id, doomed);
+    assert.deepEqual(await m.actor.delete(m.id, doomed), { id: doomed, deleted: true, more: "purge" });
     assert.equal(await m.actor.message(m.id, doomed), null);
     assert.deepEqual(await m.actor.purge(m.id, doomed), { deferred: true });
     assert.deepEqual((await m.actor.pending(m.id)).purge, [doomed]);

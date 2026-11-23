@@ -284,7 +284,7 @@ test("DELETE removes a message through the session's mailbox and queues its purg
         delete: async (box, id) => {
           calls.push({ actor, box, id });
           if (id === "00000000-0000-4000-8000-000000000000") throw Error("UnknownMessage");
-          return { id, deleted: true };
+          return { id, deleted: true, more: "purge" };
         },
         purge: async (box, id) => {
           calls.push({ purge: id });

@@ -635,6 +635,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .max_rss = (if (strip) @as(u64, 20) else 32) * 1024 * 1024 * 1024,
     });
     antfly_wasm.entry = .disabled;
+    // Embedded batch commits can have over 1 MiB of nested wasm32 frames.
+    antfly_wasm.stack_size = 4 * 1024 * 1024;
     antfly_wasm.rdynamic = true;
     antfly_wasm.export_memory = true;
     const install_antfly_wasm = b.addInstallArtifact(antfly_wasm, .{

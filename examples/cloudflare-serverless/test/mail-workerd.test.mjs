@@ -228,7 +228,7 @@ test("actual workerd auth and mailbox isolation, native search, attachments and 
     const deleted = await call("/mail/messages/" + doomed, null, "alice", "127.0.0.1", "DELETE");
     assert.equal(deleted.status, 200, await deleted.clone().text());
     assert.deepEqual(await deleted.json(), { id: doomed, deleted: true });
-    assert.equal(await mail.flush(), '["ack"]', "the purge hint finds nothing left to do");
+    assert.equal(await mail.flush(), "[]", "a completed purge needs no queue hint");
     assert.deepEqual((await json("/mail/messages", null, "alice")).messages.map((message) => message.id), [id]);
     assert.equal((await call("/mail/messages/" + doomed, null, "alice")).status, 404);
     assert.equal((await call("/mail/messages/" + doomed + "/attachments/0", null, "alice")).status, 404);

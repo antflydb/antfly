@@ -302,8 +302,12 @@ export class Mailbox extends R2CommitCoordinator {
     this.scope(mailbox);
     if (!uuid(id)) throw Error("InvalidMessageIdentity");
     const marked = await this.deletion.mark(id);
-    if (marked) await this.purge(mailbox, id);
-    return { id, deleted: true };
+    const result = marked ? await this.purge(mailbox, id) : null;
+    return {
+      id,
+      deleted: true,
+      ...(result?.deferred ? { more: "purge" } : result?.done === false ? { more: "publish" } : {}),
+    };
   }
   async purge(mailbox, id) {
     const finished = await this.purgeObjects(mailbox, id);

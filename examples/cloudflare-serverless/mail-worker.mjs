@@ -191,9 +191,9 @@ export default {
         return reply(await takeRpcData(action[2] === "trash" ? stub.trash(mailbox.id, action[1]) : stub.restore(mailbox.id, action[1])));
       // DELETE is "delete forever" (from Trash or directly), like Gmail's API.
       if (match && !match[2] && request.method === "DELETE") {
-        const result = await takeRpcData(stub.delete(mailbox.id, match[1]));
-        // The durable purge may still be waiting for in-flight ingest.
-        await hint(env, mailbox.id, "purge", match[1]);
+        const { more, ...result } = await takeRpcData(stub.delete(mailbox.id, match[1]));
+        if (more === "purge") await hint(env, mailbox.id, "purge", match[1]);
+        if (more === "publish") await hint(env, mailbox.id, "publish");
         return reply(result);
       }
       if (match && request.method === "GET") {
