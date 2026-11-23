@@ -353,7 +353,14 @@ pub const Admission = struct {
             return error.SourcePendingWork;
         }
         if (!decision.record.intents_resolved) return error.SourcePendingWork;
-        if (!decision.record.acknowledgments_pending) return true;
+        if (!decision.record.acknowledgments_pending) {
+            // The decision read excludes the deliberately retained coordinator
+            // acknowledgment. The ordered fence requires every member settled.
+            var routed = manifest.owner;
+            routed.topology_epoch = fence.topology_epoch;
+            try recovery.participants.acknowledgeRetainedCoordinator(a, routed, fence, coordinator.locator, manifest.transaction_id, context);
+            return true;
+        }
 
         // Retirement proves both the enlisted and never-enlisted cases at
         // each follower before the coordinator may acknowledge its cleanup.

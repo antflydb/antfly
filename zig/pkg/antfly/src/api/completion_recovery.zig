@@ -1170,7 +1170,10 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expect(!fake.resolved[0] and fake.resolved[1] and fake.state.acknowledgments_pending);
     try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
     try std.testing.expect(fake.resolved[0] and !fake.state.acknowledgments_pending);
+    fake.expect_coordinator_release = true;
+    const acknowledgments_before_release = fake.acknowledgments;
     try std.testing.expect(try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
+    try std.testing.expectEqual(acknowledgments_before_release + 1, fake.acknowledgments);
     try std.testing.expectEqual(original_begins, fake.begins);
     try std.testing.expectEqual(original_prepares, fake.prepares);
 }
