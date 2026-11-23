@@ -13752,7 +13752,7 @@ pub const StagedExecution = struct {
         const model = self.model_retention orelse return;
         const pin = if (model.admission_domain) |*value| value else return;
         const Metal = @import("../ops/metal_compute.zig").MetalCompute;
-        const Upgrade = @import("audio_schedule.zig").Plan.ScratchUpgrade;
+        const Upgrade = @import("audio_schedule.zig").Plan.ArenaRequest;
         var requests: [12]Upgrade = undefined;
         if (keys.len > requests.len) return error.UnsupportedPreparedAudioCache;
         var count: usize = 0;

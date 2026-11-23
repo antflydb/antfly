@@ -187,12 +187,14 @@ pub const Plan = struct {
     retry_delay: u8 = 1,
     workspaces: []?CT = &.{},
     arena: ?CT = null,
+    arena_charge: ?*@import("resource_retirement.zig").Charge = null,
     arena_size: usize = 0,
     input_workspace_bytes: usize = 0,
     arena_recipe: ArenaLayout = .{},
     input_workspace_bank: ?CT = null,
     input_workspace_charge: ?*@import("resource_retirement.zig").Charge = null,
     prepared: bool = false,
+    bindings_ready: bool = false,
     linear_only: bool = false,
     nodes: []Node = &.{},
     count: usize = 0,
@@ -235,12 +237,14 @@ pub const Plan = struct {
 
     /// Caller owns residency exclusion and has destroyed all published views.
     /// The logical cache slot can retire while the SDK retains the charge.
-    pub fn retireFundedScratchLocked(self: *Plan, cache: *@import("../runtime/tier/cache.zig").SharedCache, logical_bytes: usize) void {
-        const charge = self.input_workspace_charge orelse return;
-        std.debug.assert(self.input_workspace_bank == null);
-        self.input_workspace_charge = null;
-        cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, logical_bytes);
-        charge.deferCacheCreatorDrop() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    pub fn retireFundedArenasLocked(self: *Plan, cache: *@import("../runtime/tier/cache.zig").SharedCache, arena_bytes: usize, scratch_bytes: usize) void {
+        std.debug.assert(self.arena == null and self.input_workspace_bank == null);
+        for ([_]*?*@import("resource_retirement.zig").Charge{ &self.arena_charge, &self.input_workspace_charge }, [_]usize{ arena_bytes, scratch_bytes }) |slot, bytes| {
+            const charge = slot.* orelse continue;
+            slot.* = null;
+            cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, bytes);
+            charge.deferCacheCreatorDrop() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
     }
 
     pub fn deinit(self: *Plan) void {
@@ -396,21 +400,51 @@ pub const Plan = struct {
         }
     };
 
+    pub const InitialArena = struct {
+        bytes: usize,
+        output_views: usize,
+        workspace_bytes: usize,
+        workspace_views: usize,
+        output_only_bytes: usize,
+    };
+
+    pub fn initialArena(self: *const Plan, bank_limit: usize) !?InitialArena {
+        const recipe = self.arena_recipe;
+        const bank = recipe.initialBank(self.workspaces.len, self.count, bank_limit) orelse return null;
+        const views = try self.arenaViewCounts(recipe, true, if (bank.workspace_bytes == 0) null else .combined);
+        return .{
+            .bytes = bank.bytes,
+            .output_views = views.outputs,
+            .workspace_bytes = bank.workspace_bytes,
+            .workspace_views = views.workspaces,
+            .output_only_bytes = recipe.outputs_bytes,
+        };
+    }
+
     /// A value-only request may cross the provider boundary. The receiver
     /// revalidates it against the current learned plan after admission.
-    pub const ScratchUpgrade = struct {
+    pub const ArenaRequest = struct {
         key: u64,
         stamp: u64,
         bytes: usize,
         views: usize,
+        initial: ?InitialArena = null,
     };
 
-    pub fn scratchUpgrade(self: *const Plan, clock: u64, bank_limit: usize) !?ScratchUpgrade {
+    pub fn scratchUpgrade(self: *const Plan, clock: u64, bank_limit: usize) !?ArenaRequest {
         if (!self.prepared or self.disabled or clock < self.retry_after or self.input_workspace_bytes != 0) return null;
         const bytes = self.arena_recipe.workspaceBytes(self.workspaces.len, self.count, bank_limit);
         if (bytes == 0) return null;
         const counts = try self.arenaViewCounts(self.arena_recipe, false, .separate);
         return .{ .key = self.key, .stamp = self.stamp, .bytes = bytes, .views = counts.workspaces };
+    }
+
+    pub fn pendingArena(self: *const Plan, clock: u64, bank_limit: usize) !?ArenaRequest {
+        if (self.prepared) return self.scratchUpgrade(clock, bank_limit);
+        if (!self.bindings_ready or self.disabled or clock < self.retry_after or self.arena != null) return null;
+        const request = (try self.initialArena(bank_limit)) orelse return null;
+        if (request.bytes == 0) return null;
+        return .{ .key = self.key, .stamp = self.stamp, .bytes = request.bytes, .views = try std.math.add(usize, request.output_views, request.workspace_views), .initial = request };
     }
 
     pub const ArenaViewCounts = struct {

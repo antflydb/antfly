@@ -22982,7 +22982,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return;
         }
         self.audioPreparePlan(plan) catch |err| {
-            self.audioUnpreparePlan(plan);
+            if (err != error.AudioScheduleAdmission or !plan.bindings_ready or plan.arena != null) self.audioUnpreparePlan(plan);
             plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
             plan.retry_delay = @min(@as(u8, 64), plan.retry_delay *| 2);
             switch (err) {
@@ -22998,7 +22998,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// A refused optional tail can recover without dropping the active output
     /// bank, resetting selection history or invalidating queued old commands.
     /// Stage every quota and view before publishing the complete scratch bank.
-    fn audioUpgradeInputWorkspace(self: *MetalCompute, plan: *audio_tape.Plan, request: audio_tape.Plan.ScratchUpgrade, funded: ?*FundedAudioBank) !void {
+    fn audioUpgradeInputWorkspace(self: *MetalCompute, plan: *audio_tape.Plan, request: audio_tape.Plan.ArenaRequest, funded: ?*FundedAudioBank) !void {
         var views: [audio_tape.instruction_capacity]?CT = @splat(null);
         var staged: PreparedTensorStorage = .{ .outputs = views[0..plan.count] };
         var staged_bank: ?CT = null;
@@ -23040,12 +23040,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.retry_delay = 1;
     }
     fn audioUnpreparePlan(self: *MetalCompute, plan: *audio_tape.Plan) void {
+        const arena_bytes = plan.arena_size;
         const scratch_bytes = plan.input_workspace_bytes;
         plan.dropPrepared();
         if (self.data.tier_cache) |*cache| {
             self.data.prefetch.lock();
             defer self.data.prefetch.unlock();
-            plan.retireFundedScratchLocked(cache, scratch_bytes);
+            plan.retireFundedArenasLocked(cache, arena_bytes, scratch_bytes);
             cache.noteRelease(.host, plan.storage.host_bytes - plan.metadata_bytes);
             cache.noteRelease(.backend, plan.storage.backend_bytes);
         }
@@ -23055,6 +23056,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.arena_recipe = .{};
         plan.storage.drop_ct = null;
         plan.prepared = false;
+        plan.bindings_ready = false;
         for (plan.constants[0..plan.constant_count]) |*c| c.required = true;
         for (plan.nodes[0..plan.count]) |*node| {
             node.prepared_slot = null;
@@ -23062,6 +23064,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     }
     fn audioPreparePlan(self: *MetalCompute, plan: *audio_tape.Plan) !void {
+        if (!plan.bindings_ready) try self.audioPrepareBindings(plan);
+        try self.audioPrepareInitialArena(plan, null);
+        plan.prepared = true;
+    }
+
+    fn audioPrepareBindings(self: *MetalCompute, plan: *audio_tape.Plan) !void {
         const p = self.provider_impl;
         const cb = self.computeBackend();
         // Bind only model-owned immutable slots. Request-local slots are never
@@ -23162,23 +23170,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 };
             }
         }
-        const recipe = try plan.arenaLayout();
-        plan.arena_recipe = recipe;
+        plan.arena_recipe = try plan.arenaLayout();
+        plan.bindings_ready = true;
+    }
+
+    fn audioPrepareInitialArena(self: *MetalCompute, plan: *audio_tape.Plan, funded: ?*FundedAudioBank) !void {
+        const recipe = plan.arena_recipe;
         // Preserve the previous output-bank eligibility and admission fallback.
         // Optional clamp scratch must not evict an otherwise fitting bank.
-        if (recipe.initialBank(plan.workspaces.len, plan.count, audio_schedule_bank_limit)) |request| {
-            const view_counts = try plan.arenaViewCounts(recipe, true, if (request.workspace_bytes == 0) null else .combined);
+        if (try plan.initialArena(audio_schedule_bank_limit)) |request| {
             const view_bytes = persistentTensorBytes(2);
-            const output_headers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, view_counts.outputs, view_bytes));
-            const scratch_headers = try std.math.mul(usize, view_counts.workspaces, view_bytes);
+            const output_headers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, request.output_views, view_bytes));
+            const scratch_headers = try std.math.mul(usize, request.workspace_views, view_bytes);
             var workspace_bytes = request.workspace_bytes;
             var bytes = request.bytes;
             const headers = try std.math.add(usize, output_headers, scratch_headers);
-            var bank: ?MetalTensor = if (bytes != 0) try self.metalAudioArenaBank(&plan.storage, bytes, headers) else null;
-            if (bank == null and workspace_bytes != 0) {
-                workspace_bytes = 0;
-                bytes = recipe.outputs_bytes;
-                if (bytes != 0) bank = try self.metalAudioArenaBank(&plan.storage, bytes, output_headers);
+            var bank: ?MetalTensor = null;
+            if (funded) |candidate| {
+                if (plan.arena != null or candidate.data != self.data) return error.AudioScheduleRouteChanged;
+                if (candidate.logical_bytes == bytes and candidate.wrapper_bytes == headers) {
+                    bank = try candidate.tensor.retainedCopy();
+                } else if (candidate.logical_bytes == request.output_only_bytes and candidate.wrapper_bytes == output_headers) {
+                    bytes = request.output_only_bytes;
+                    workspace_bytes = 0;
+                    bank = try candidate.tensor.retainedCopy();
+                } else return error.AudioScheduleRouteChanged;
+                plan.storage.drop_ct = dropMetalPersistentTensor;
+            } else {
+                if (bytes != 0) bank = try self.metalAudioArenaBank(&plan.storage, bytes, headers);
+                if (bank == null and workspace_bytes != 0) {
+                    workspace_bytes = 0;
+                    bytes = request.output_only_bytes;
+                    if (bytes != 0) bank = try self.metalAudioArenaBank(&plan.storage, bytes, output_headers);
+                }
             }
             if (bank) |mt| {
                 plan.arena = try wrapOwnedMetalPersistentTensor(mt);
@@ -23191,9 +23215,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (workspace_bytes != 0) for (plan.nodes[0..plan.count], 0..) |*node, i| if (try recipe.workspaceView(node, .combined)) |region| {
                     plan.workspaces[i] = try wrapOwnedMetalPersistentTensor(try mt.retainedView(region.offset, region.bytes, &region.shape));
                 };
-            } else if (recipe.outputs_bytes != 0) return error.AudioScheduleAdmission;
+                if (funded) |candidate| {
+                    plan.arena_charge = candidate.charge;
+                    candidate.tensor.deinit();
+                    candidate.* = undefined;
+                }
+            } else if (request.output_only_bytes != 0) return error.AudioScheduleAdmission;
         }
-        plan.prepared = true;
     }
     fn audioArenaViewOp(ctx: *anyopaque, arena: CT, offset: usize, bytes: usize, shape: [2]i32) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -23387,31 +23415,49 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .key = schedule_key.finish(), .policy = policy };
     }
 
-    pub fn pendingAudioScratch(cb: *const ops.ComputeBackend, key: u64, inputs: []const CT) !?audio_tape.Plan.ScratchUpgrade {
+    pub fn pendingAudioScratch(cb: *const ops.ComputeBackend, key: u64, inputs: []const CT) !?audio_tape.Plan.ArenaRequest {
         if (!acceptsEmbeddingStage(cb)) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         const selection = audioExecutionSelection(self, key, inputs) orelse return null;
         const provider = self.provider_impl;
         for (provider.audio_schedules) |entry| {
             const plan = entry orelse continue;
-            if (plan.key == selection.key) return plan.scratchUpgrade(provider.audio_schedule_clock +| 1, audio_schedule_bank_limit);
+            if (plan.key == selection.key) return plan.pendingArena(provider.audio_schedule_clock +| 1, audio_schedule_bank_limit);
         }
         return null;
     }
 
-    pub fn fundAudioScratch(cb: *const ops.ComputeBackend, request: audio_tape.Plan.ScratchUpgrade, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !FundedAudioBank {
+    pub fn fundAudioScratch(cb: *const ops.ComputeBackend, request: audio_tape.Plan.ArenaRequest, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !FundedAudioBank {
         if (!acceptsEmbeddingStage(cb)) return error.UnsupportedEmbeddingStage;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         const wrappers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, request.views, persistentTensorBytes(2)));
-        return self.fundAudioBankOutsideExecution(request.bytes, .private, wrappers, pin);
+        return self.fundAudioBankOutsideExecution(request.bytes, .private, wrappers, pin) catch |err| {
+            const initial = request.initial orelse return err;
+            if (err != error.MemoryBudgetExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+            if (initial.output_only_bytes == 0 or initial.output_only_bytes == request.bytes) return err;
+            const output_wrappers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, initial.output_views, persistentTensorBytes(2)));
+            return self.fundAudioBankOutsideExecution(initial.output_only_bytes, .private, output_wrappers, pin);
+        };
     }
 
-    pub fn publishAudioScratch(cb: *const ops.ComputeBackend, request: audio_tape.Plan.ScratchUpgrade, bank: *FundedAudioBank) !bool {
+    pub fn publishAudioScratch(cb: *const ops.ComputeBackend, request: audio_tape.Plan.ArenaRequest, bank: *FundedAudioBank) !bool {
         if (!acceptsEmbeddingStage(cb)) return error.UnsupportedEmbeddingStage;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         for (self.provider_impl.audio_schedules) |entry| {
             const plan = entry orelse continue;
             if (plan.key != request.key) continue;
+            if (request.initial != null) {
+                const current = (try plan.pendingArena(self.provider_impl.audio_schedule_clock +| 1, audio_schedule_bank_limit)) orelse return false;
+                if (!std.meta.eql(request, current)) return false;
+                self.audioPrepareInitialArena(plan, bank) catch |err| {
+                    self.audioUnpreparePlan(plan);
+                    return err;
+                };
+                plan.prepared = true;
+                plan.selection = .{};
+                plan.retry_delay = 1;
+                return true;
+            }
             self.audioUpgradeInputWorkspace(plan, request, bank) catch |err| switch (err) {
                 error.AudioScheduleRouteChanged => return false,
                 else => return err,
