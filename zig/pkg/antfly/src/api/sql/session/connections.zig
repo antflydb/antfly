@@ -1110,7 +1110,7 @@ test "HTTP connection publishes terminal detachment once across lost replies and
         };
         defer session.deinit(a);
         try session.setting_committed.append(a, .{ .identity = .{ .id = 17, .generation = 1 }, .value = .{ .integer = 5 } });
-        try store.save(session, null);
+        try store.saveForTest(session, null);
         try std.testing.expectError(error.SqlTransactionOutcomeUnknown, mutate(&store, terminal, "alice", 7, 2));
         {
             var registry = transactions.SessionRegistry.init(&store);
