@@ -243,7 +243,13 @@ doc map, as full-text has) before it pays.
    durable progress other processes recorded (`raiseWorkersToDurableProgress`),
    as a reopen would start them. Without that, a worker replayed another
    process's already-applied records and revived versions they had
-   overwritten: the stale results an earlier attempt saw.
+   overwritten: the stale results an earlier attempt saw. The revival itself
+   came from merges: a replay published a second copy of a version already
+   in the dead set, and a merge that dropped one copy pruned the version from
+   the dead set while the other copy still carried it. A replay now skips
+   every copy whose version the tip already covers
+   (`PersistentIndex.versionCoveredAtTip`), so a version lives in one segment
+   and pruning stays safe.
    Releasing the writer lease before the durability wait is not possible as
    built: the group leader stages commit participants (full-text `stage`)
    inside `Ticket.wait`, so the waiting writer can be the one publishing.

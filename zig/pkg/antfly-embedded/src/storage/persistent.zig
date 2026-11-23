@@ -2505,6 +2505,23 @@ pub const PersistentIndex = struct {
     /// index's segment/range/active-set records must scope them exactly
     /// the same way `native_catalog_sink.zig`'s `Sink.submit` does, or
     /// they will not be found by this index's own reads.
+    /// Whether `key`'s current version at the tip is at least as new as
+    /// `version`: a copy at `version` is already published or superseded.
+    /// Replaying a record some process already applied would add a second
+    /// copy of a published version; a merge that drops one copy prunes the
+    /// version from the dead set while the other still carries it, and the
+    /// overwritten copy is live again. False without tip reads.
+    pub fn versionCoveredAtTip(self: *PersistentIndex, alloc: Allocator, key: []const u8, version: u64) !bool {
+        if (!self.versioned) return false;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            .mem, .lsm => return false,
+        };
+        const bytes = (try backend.loadTipOneAlloc(alloc, native_catalog_backend.tip_namespace, key)) orelse return false;
+        defer alloc.free(bytes);
+        return DocVersion.order(version) <= DocVersion.order(try DocVersion.decode(bytes));
+    }
+
     pub fn nativeCatalogScope(self: *const PersistentIndex) ?[]const u8 {
         return switch (self.main_store_owner) {
             .native_catalog => |backend| backend.scope,
@@ -6513,6 +6530,44 @@ test "persistent index doc map names each key's current version" {
     var cursor = try txn.openCursor(.docmap);
     defer cursor.close();
     try std.testing.expect((try cursor.first()) == null);
+}
+
+// A replay of a record some process already applied must not publish a
+// second copy of a published version: a merge that drops one copy prunes the
+// version from the dead set, and the other copy is live again. The replay
+// path skips every copy whose version the tip already covers.
+test "persistent index reports versions the tip already covers" {
+    const alloc = std.testing.allocator;
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try openVersionedTestIndex(alloc, &test_sink, path);
+    defer pi.close();
+
+    const first = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    defer alloc.free(first);
+    try pi.indexSegment(first);
+    const v1 = (try test_sink.docVersion("doc:a")).?;
+    const second = try buildSimpleSegment(alloc, "doc:a", "beta");
+    defer alloc.free(second);
+    try pi.indexSegment(second);
+    const v2 = (try test_sink.docVersion("doc:a")).?;
+
+    // Superseded and current versions are covered; a newer one and an
+    // unknown key are not.
+    try std.testing.expect(try pi.versionCoveredAtTip(alloc, "doc:a", v1));
+    try std.testing.expect(try pi.versionCoveredAtTip(alloc, "doc:a", v2));
+    const v3 = try DocVersion.of(nextTestWriteSequence(), 0);
+    try std.testing.expect(!try pi.versionCoveredAtTip(alloc, "doc:a", v3));
+    try std.testing.expect(!try pi.versionCoveredAtTip(alloc, "doc:never", v1));
+
+    // A delete covers everything up to its version, not a later write.
+    const delete_version = try DocVersion.of(nextTestWriteSequence(), 0);
+    try pi.deleteVersioned(&.{"doc:a"}, &.{delete_version});
+    try std.testing.expect(try pi.versionCoveredAtTip(alloc, "doc:a", v3));
+    try std.testing.expect(!try pi.versionCoveredAtTip(alloc, "doc:a", try DocVersion.of(nextTestWriteSequence(), 0)));
 }
 
 // A merge decides nothing per document: a write another process commits

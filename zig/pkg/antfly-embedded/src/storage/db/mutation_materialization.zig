@@ -4494,6 +4494,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
                 var replay_versions = try TextReplayVersions.init(ctx.alloc, batch, collected.docs.items);
                 defer replay_versions.deinit();
+                // Copies some process already published, or that a newer
+                // write superseded, would only be born dead, and a second
+                // copy of a published version lets a merge revive it
+                // (`PersistentIndex.versionCoveredAtTip`). Replays run under
+                // the writer lease, so the tip cannot move to an older
+                // version before this commit. A skipped key stays in
+                // `replay_versions.indexed`: whoever published its newer
+                // version already superseded its older copies.
+                try dropReplayCopiesCoveredAtTip(ctx, index_ref.name, &collected);
 
                 const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
                 var write_start: usize = 0;
@@ -6842,6 +6851,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         /// journal records: each copy and each delete takes its own record's
         /// sequence (`DerivedDocument.sequence`, `DerivedBatch.delete_sequences`),
         /// with positions counted per sequence.
+        fn dropReplayCopiesCoveredAtTip(ctx: *const AsyncContext, index_name: []const u8, collected: anytype) !void {
+            ctx.index_manager.catalog_mutex.lockShared();
+            defer ctx.index_manager.catalog_mutex.unlockShared();
+            const entry = ctx.index_manager.textIndexEntry(index_name) orelse return;
+            if (!entry.persistent.versioned) return;
+            var kept: usize = 0;
+            for (collected.docs.items) |doc| {
+                if (doc.doc_version) |version| if (try entry.persistent.versionCoveredAtTip(ctx.alloc, doc.key, version)) continue;
+                collected.docs.items[kept] = doc;
+                kept += 1;
+            }
+            collected.docs.shrinkRetainingCapacity(kept);
+        }
+
         pub const TextReplayVersions = struct {
             alloc: Allocator,
             batch: derived_types.DerivedBatch,
