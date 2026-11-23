@@ -474,12 +474,10 @@ test "Native recurrent header-only cache owns exact cold storage and current B t
     try std.testing.expectEqual(@as(usize, 0), try NativeHostState.requiredBytes(cfg));
 }
 
-test "Native numerical recurrent owner never grants outside raw cleanup authority" {
+test "Native numerical recurrent owner never grants outside cleanup authority" {
     const owner = try NativeHostState.prepareWithAllocator(std.testing.allocator, native_host_test_config);
     defer owner.destroyAfterUnlock() catch unreachable;
-    var pending: @import("resource_retirement.zig").SynchronousOutsideRawLeases = .{};
-    try std.testing.expectError(error.MissingOutsideCleanupOwner, owner.cleanupOwner().synchronousOutsideContext(&pending));
-    try std.testing.expect(pending.boundary_context == null);
+    try std.testing.expectError(error.MissingOutsideCleanupOwner, owner.cleanupOwner().outsideCleanupEpoch());
     try std.testing.expect(!try owner.cleanupOwner().epoch().?.isSealed());
 }
 

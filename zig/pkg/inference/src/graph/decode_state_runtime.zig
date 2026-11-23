@@ -709,14 +709,9 @@ pub const NativeDecodeState = struct {
                 // This function will own KV/graph mutexes below. Its genuine
                 // local B is reserved before either lock and seals only after
                 // the recursive typed teardown has released ALL those locks.
-                var pending: @import("../execution/resource_retirement.zig").SynchronousOutsideRawLeases = .{};
                 var local = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
-                defer {
-                    const registered = pending.boundary_context != null;
-                    local.finishAfterUnlock();
-                    if (registered) std.debug.assert(pending.finished);
-                }
-                const kv_current = try local.synchronousOutsideContext(&pending);
+                defer local.finishAfterUnlock();
+                const kv_current: Cleanup = .{ .boundary = try local.outsideCleanupEpoch() };
                 // Only our KV/graph critical section needs this local B. Raw
                 // recurrent quota remains explicit outside AFTER KV unlock.
                 return self.deinitUsing(kv_current, current);

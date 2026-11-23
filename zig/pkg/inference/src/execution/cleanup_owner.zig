@@ -41,13 +41,6 @@ pub const Owner = struct {
         return .{ .retained_sink = retained, .guard = guard, .owned_epoch = epoch_value, .outside_cleanup = true };
     }
 
-    /// This capability is valid only for our genuine local outside guard;
-    /// admitted/resident/borrowed B owners cannot turn raw leases into late work.
-    pub fn synchronousOutsideContext(self: *const Owner, pending: *@import("resource_retirement.zig").SynchronousOutsideRawLeases) !@import("cleanup_context.zig").Context {
-        const epoch_value = try self.outsideCleanupEpoch();
-        try pending.begin(self);
-        return .{ .boundary = epoch_value, .synchronous_outside_raw = pending };
-    }
     pub fn outsideCleanupEpoch(self: *const Owner) !*const sink.Epoch {
         const guard = if (self.guard) |*value| value else return error.MissingOutsideCleanupOwner;
         const epoch_value = self.epoch() orelse return error.MissingOutsideCleanupOwner;

@@ -63,10 +63,7 @@ pub const Quota = union(enum) {
         if (try epoch.isSealed()) return error.RetirementEpochSealed;
         switch (self) {
             .none => unreachable,
-            .raw => |lease| {
-                const pending = current.synchronous_outside_raw orelse return error.MissingPreparedCacheRetirement;
-                try pending.validateValue(lease, epoch);
-            },
+            .raw => return error.MissingPreparedCacheRetirement,
             .prepared => |charge| {
                 if (charge.domain == null or charge.prepared_groups == null or charge.prepared_boundary == null) return error.MissingPreparedCacheRetirement;
             },
@@ -80,15 +77,10 @@ pub const Quota = union(enum) {
         switch (self.*) {
             .none => {},
             .raw => |value| {
-                if (!current.outside_execution) {
-                    const pending = current.synchronous_outside_raw orelse return error.MissingPreparedCacheRetirement;
-                    try pending.take(&self.raw, current.boundary.?);
-                    self.* = .none;
-                } else {
-                    self.* = .none;
-                    var lease = value;
-                    lease.release(); // explicit outside-execution contract above
-                }
+                std.debug.assert(current.outside_execution);
+                self.* = .none;
+                var lease = value;
+                lease.release();
             },
             .prepared => |charge| {
                 if (!current.outside_execution) try charge.holdUntilBoundary(try current.boundary.?.boundary());

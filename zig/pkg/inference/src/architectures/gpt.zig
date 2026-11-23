@@ -3881,7 +3881,7 @@ test "LightOnOCR3 rolling chunks omit empty final frames and preserve prefix mod
 fn decoderOverridesWithCleanup(overrides: Layer0DecoderOverrides, decode: ?*const DecodeContext) Layer0DecoderOverrides {
     if (overrides.cleanup != null) return overrides;
     const context = decode orelse return overrides;
-    if (context.cleanup.boundary == null and context.cleanup.operation == null and !context.cleanup.outside_execution and context.cleanup.synchronous_outside_raw == null) return overrides;
+    if (context.cleanup.boundary == null and context.cleanup.operation == null and !context.cleanup.outside_execution) return overrides;
     var current = overrides;
     current.cleanup = &context.cleanup;
     return current;
@@ -3893,7 +3893,7 @@ inline fn validateForwardCleanup(cb: *const ComputeBackend, cleanup: ?*const @im
 
 inline fn validateDecoderForwardCleanup(cb: *const ComputeBackend, cleanup: ?*const @import("../execution/cleanup_context.zig").Context, decode: ?*const DecodeContext) !void {
     if (cleanup) |current| {
-        if (current.outside_execution or current.synchronous_outside_raw != null or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+        if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
         if (comptime build_options.enable_cuda) if (decode) |context| if (context.dense_ffn_program) |program| if (cb.kind() == .cuda) {
             // A private Model/cohort receiver has no Engine token. Its actual
             // program independently validates the receiving Session and held

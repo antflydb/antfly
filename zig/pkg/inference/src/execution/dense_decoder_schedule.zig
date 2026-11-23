@@ -882,7 +882,7 @@ pub const Schedule = struct {
     pub fn beginExecution(self: *Schedule, current: Cleanup) !void {
         const frame = self.frame orelse return error.DenseScheduleNotEntered;
         if (frame.scope_backends != 0 or self.numerical_epoch != null) return error.DenseScheduleAlreadyEntered;
-        if (current.operation != null or current.synchronous_outside_raw != null) return error.UnsupportedDenseScheduleCleanup;
+        if (current.operation != null) return error.UnsupportedDenseScheduleCleanup;
         const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
         const operation = if (self.selected.pool.requiresManagedExecution()) operation: {
             const token = self.backend.operationToken() orelse return error.UnsupportedDenseSchedule;
