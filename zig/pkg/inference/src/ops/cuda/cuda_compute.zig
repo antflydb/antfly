@@ -20574,7 +20574,16 @@ fn audioBufferView(buffer: buffer_mod.DeviceBuffer, offset: usize, bytes: usize)
     return .{ .ptr = buffer.ptr + offset, .len = bytes, .borrowed = true };
 }
 fn audioOutputMatches(input: *const CudaTensor, output: *const CudaTensor, bytes: usize) bool {
-    return output.dtype == .f32 and output.elem_count == input.elem_count and output.buffer.len >= bytes;
+    return output.dtype == .f32 and output.elem_count == input.elem_count and
+        std.mem.eql(i64, output.shape, input.shape) and output.buffer.len >= bytes;
+}
+
+test "CUDA audio replay output contract rejects changed logical geometry" {
+    const input: CudaTensor = .{ .buffer = .{ .ptr = 256, .len = 16 }, .shape = @constCast(&[_]i64{ 2, 2 }), .elem_count = 4, .dtype = .f32 };
+    const padded: CudaTensor = .{ .buffer = .{ .ptr = 512, .len = 32 }, .shape = input.shape, .elem_count = 4, .dtype = .f32 };
+    const reshaped: CudaTensor = .{ .buffer = padded.buffer, .shape = @constCast(&[_]i64{ 1, 4 }), .elem_count = 4, .dtype = .f32 };
+    try std.testing.expect(audioOutputMatches(&input, &padded, 16));
+    try std.testing.expect(!audioOutputMatches(&input, &reshaped, 16));
 }
 
 fn stageAudioGraphInputs(self: *CudaCompute, input_bank: buffer_mod.DeviceBuffer, inputs: []const CT, spans: []const CudaCompute.AudioInputSpan) !void {
