@@ -599,7 +599,7 @@ test "SQL command producer native retired sources preserve independent connectio
             _ = try connections.mutateWithCommand(&source, .{ .bind = .{ .id = connection, .txn_id = txn_id } }, "alice", 0, 2, &fence);
             var session: transactions.Session = .{ .txn_id = txn_id, .owner_node_id = 0, .principal = try a.dupe(u8, "alice"), .connection_id = connection, .begin_timestamp = 1, .last_touched_timestamp = 1, .sync_level = .propose, .commit_body_digest = @splat(4), .commit_execution_started = true, .terminal_abort = true, .sql = .{ .database = try a.dupe(u8, "main"), .namespace = try a.dupe(u8, "public"), .isolation = .read_committed, .mode = .read_write } };
             defer session.deinit(a);
-            try source.save(session, null);
+            try source.saveForTest(session, null);
         }
         {
             var executing = (try producer.load(&source, a, connection)).?;
