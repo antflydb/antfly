@@ -15908,7 +15908,7 @@ pub const Node = struct {
             consumers.speaker_outputs = request.execute_outputs;
             var needs_speakers = request.policy.audio_speaker_turns;
             for (outputs_config.targets) |output| needs_speakers = needs_speakers or (output.execute and output.hasDiarization());
-            if ((needs_speakers and request.execute_outputs) or request.policy.audio_speaker_turns) request.speaker_analysis = .{ .context = &consumers, .prepare = MediaOutputExecution.prepareSpeakers, .ensure = MediaOutputExecution.ensureSpeakers, .samples = MediaOutputExecution.speakerSamples, .checkpoint = MediaOutputExecution.checkpointSpeakers, .close = MediaOutputExecution.closeSpeakers, .boundary = if (request.policy.audio_speaker_turns) MediaOutputExecution.speakerBoundary else null, .recipe_id = if (request.policy.audio_speaker_turns) &consumers.resolved[try consumers.boundaryIndex()].recipe_id else null };
+            if ((needs_speakers and request.execute_outputs) or request.policy.audio_speaker_turns) request.speaker_analysis = .{ .context = &consumers, .prepare = MediaOutputExecution.prepareSpeakers, .ensure = MediaOutputExecution.ensureSpeakers, .ensure_video = MediaOutputExecution.ensureVideoSpeakers, .samples = MediaOutputExecution.speakerSamples, .checkpoint = MediaOutputExecution.checkpointSpeakers, .close = MediaOutputExecution.closeSpeakers, .boundary = if (request.policy.audio_speaker_turns) MediaOutputExecution.speakerBoundary else null, .recipe_id = if (request.policy.audio_speaker_turns) &consumers.resolved[try consumers.boundaryIndex()].recipe_id else null };
             request.audio_boundary = request.transcribe_boundary or consumers.resolved[try consumers.boundaryIndex()].uses_audio;
             if (request.transcribe_boundary or !boundary.execute) request.execute = false;
             return self.chunkAndEmbedAdmitted(a, io, supplied, request, .{ .model = boundary.model, .model_identity = boundary.model_identity, .task_type = if (boundary.kind == .diarize) "DIARIZE" else if (boundary.kind == .transcribe) "TRANSCRIBE" else boundary.task_type, .dimensions = boundary.dimensions }, sink);
@@ -52422,8 +52422,50 @@ const MediaOutputExecution = struct {
     }
     /// Analyze only the prefix needed by this chunk. One embedding per model
     /// and grid window feeds every clustering configuration that needs it.
+    const VideoSpeakerWork = struct {
+        through: [16]?i64,
+        window: chunks.VideoSpeakerWindow,
+        provider: ?audio_providers.Provider,
+        result: *chunks.VideoSpeakerResult,
+    };
+
+    fn ensureVideoSpeakers(raw: *anyopaque, window: chunks.VideoSpeakerWindow, optional_provider: ?audio_providers.Provider, result: *chunks.VideoSpeakerResult) !void {
+        const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        if (self.speaker_provider == null) return;
+        var wanted: [16]?i64 = @splat(null);
+        var required: [16]?i64 = @splat(null);
+        var optional: [16]?i64 = @splat(null);
+        for (self.config.targets, 0..) |target, index| {
+            const state = self.speaker_states[index] orelse continue;
+            if (self.resolved[index].failure != null or target.skipsOrdinalWithMask(self.mask(index), window.ordinal)) continue;
+            var windows = window.extent.windows(self.resolved[index].max_audio_ns);
+            while (try windows.next()) |span| {
+                if (!target.wantsWithMask(self.mask(index), window.ordinal, span.sub_index)) continue;
+                wanted[index] = @min(window.end, span.end_ns);
+            }
+            const through = wanted[index] orelse continue;
+            for (self.speaker_states[0 .. index + 1], 0..) |leader_state, leader_index| {
+                if (leader_state != state) continue;
+                const goals = if (target.required and !self.allow_partial) &required else &optional;
+                goals[leader_index] = @max(goals[leader_index] orelse through, through);
+                break;
+            }
+        }
+        try self.ensureSpeakerWork(window.start, window.end, false, .{ .through = required, .window = window, .provider = null, .result = result });
+        self.ensureSpeakerWork(window.start, window.end, false, .{ .through = optional, .window = window, .provider = optional_provider, .result = result }) catch |err| {
+            if (!chunks.Runner.optionalAudioPressure(err)) return err;
+            for (wanted, 0..) |goal, index| if (goal) |through| {
+                if (!self.enough(self.speaker_states[index].?, window.start, through, false)) result.failures[index] = err;
+            };
+        };
+    }
+
     fn ensureSpeakers(raw: *anyopaque, _: std.mem.Allocator, start: i64, end: i64, stop_at_turn: bool) !void {
         const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        return self.ensureSpeakerWork(start, end, stop_at_turn, null);
+    }
+
+    fn ensureSpeakerWork(self: *MediaOutputExecution, start: i64, end: i64, stop_at_turn: bool, work: ?VideoSpeakerWork) !void {
         if (self.speaker_provider == null) return;
         const scratch = self.speaker_scratch;
         const Flights = @import("../pipelines/media_speaker_flights.zig").Registry;
@@ -52432,13 +52474,17 @@ const MediaOutputExecution = struct {
         var eligible: [16]bool = @splat(false);
         var keys: [16][32]u8 = undefined;
         var keys_count: usize = 0;
+        var has_work = false;
         for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
-            eligible[i] = self.leader(i) and !self.enough(state, start, end, stop_at_turn);
+            const through = if (work) |video_work| video_work.through[i] orelse continue else end;
+            eligible[i] = self.leader(i) and !self.enough(state, start, through, stop_at_turn);
+            has_work = has_work or eligible[i];
             if (eligible[i] and state.cacheable) {
                 keys[keys_count] = state.identity;
                 keys_count += 1;
             }
         };
+        if (!has_work) return;
         const Ordering = struct {
             fn less(_: void, left: [32]u8, right: [32]u8) bool {
                 return std.mem.order(u8, &left, &right) == .lt;
@@ -52449,7 +52495,7 @@ const MediaOutputExecution = struct {
         var held_count: usize = 0;
         defer {
             // Waiters must see this accepted model prefix before its gate opens.
-            checkpointSpeakers(raw, false);
+            checkpointSpeakers(self, false);
             while (held_count != 0) {
                 held_count -= 1;
                 held[held_count].deinit();
@@ -52460,7 +52506,7 @@ const MediaOutputExecution = struct {
             held_count += 1;
         }
         for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
-            if (!self.leader(i) or !state.cacheable or self.enough(state, start, end, stop_at_turn)) continue;
+            if (!eligible[i] or !state.cacheable) continue;
             if (self.node.host_caches.media_index_cache.get(state.identity)) |entry| {
                 defer self.node.host_caches.media_index_cache.release(entry);
                 if (entry.data == .speaker_analysis and entry.data.speaker_analysis.next_window > state.next_window) {
@@ -52475,18 +52521,33 @@ const MediaOutputExecution = struct {
             try self.control.check();
             var ordinal: ?u64 = null;
             for (self.speaker_states, 0..) |maybe_state, i| if (maybe_state) |state| {
-                if (eligible[i] and !self.enough(state, start, end, stop_at_turn)) ordinal = @min(ordinal orelse std.math.maxInt(u64), state.next_window);
+                if (!eligible[i]) continue;
+                const through = if (work) |video_work| video_work.through[i].? else end;
+                if (!self.enough(state, start, through, stop_at_turn)) ordinal = @min(ordinal orelse std.math.maxInt(u64), state.next_window);
             };
             const next_window = ordinal orelse return;
-            if (self.speaker_fork == null) if (self.speaker_provider.?.fork) |fork| {
+            const scoped_provider = if (work) |video_work| video_work.provider else null;
+            if (scoped_provider == null and self.speaker_fork == null) if (self.speaker_provider.?.fork) |fork| {
                 self.speaker_fork = try fork(self.speaker_provider.?.context, scratch);
                 self.speaker_provider = self.speaker_fork.?.provider;
             };
-            const provider = self.speaker_provider.?;
+            const provider = scoped_provider orelse self.speaker_provider.?;
             const first = std.math.cast(usize, @as(u128, next_window) * provider.sample_rate * 3 / 2) orelse return error.TimestampOverflow;
             const requested = @min(provider.samples, try std.math.add(usize, first, try std.math.mul(usize, provider.sample_rate, 3)));
-            var lease = try provider.read(provider.context, scratch, first, requested);
-            defer lease.deinit(scratch);
+            var prior: ?audio_providers.Lease = null;
+            if (work) |video_work| {
+                prior = video_work.result.pcm;
+                video_work.result.pcm = null;
+                if (prior) |*held_pcm| {
+                    if (first != video_work.window.first or held_pcm.pcm.samples.len != requested -| first) {
+                        held_pcm.deinit(scratch);
+                        prior = null;
+                    }
+                }
+            }
+            var lease = prior orelse try provider.read(provider.context, scratch, first, requested);
+            var transferred = false;
+            defer if (!transferred) lease.deinit(scratch);
             const next = std.math.cast(usize, @as(u128, next_window + 1) * provider.sample_rate * 3 / 2) orelse return error.TimestampOverflow;
             const step = @min(lease.pcm.samples.len, next - first);
             if (step == 0) return error.InvalidSpeakerCheckpoint;
@@ -52509,7 +52570,9 @@ const MediaOutputExecution = struct {
             defer for (vectors[0..vector_count]) |vector| if (vector) |owned| scratch.free(owned);
             for (self.config.targets, 0..) |target, i| {
                 const state = self.speaker_states[i] orelse continue;
-                if (!self.leader(i) or !state.valid or state.complete or state.next_window != next_window or !eligible[i]) continue;
+                if (!eligible[i] or state.next_window != next_window) continue;
+                const through = if (work) |video_work| video_work.through[i].? else end;
+                if (self.enough(state, start, through, stop_at_turn)) continue;
                 state.valid = false; // Publication excludes a partially applied model result.
                 const config = target.speakerConfig();
                 var label: ?u32 = null;
@@ -52556,6 +52619,12 @@ const MediaOutputExecution = struct {
                 state.total_samples = total orelse state.total_samples;
                 state.complete = final;
                 state.valid = true;
+            }
+            if (work) |video_work| {
+                if (first == video_work.window.first and lease.pcm.samples.len == video_work.window.extent.samples) {
+                    video_work.result.pcm = lease;
+                    transferred = true;
+                }
             }
             if ((next_window + 1) % 16 == 0) checkpointSpeakers(self, true);
         }
@@ -52847,7 +52916,7 @@ const MediaOutputExecution = struct {
                         try results.append(a, value);
                         continue;
                     }
-                    if (payload == .video and resolved.speaker_path != null) if (payload.video.speaker_failure) |err| {
+                    if (payload == .video and resolved.speaker_path != null) if (payload.video.speaker_failure orelse (if (payload.video.speaker_failures) |failures| failures[index] else null)) |err| {
                         if (!allow_partial and target.required) return err;
                         value.status = .failed;
                         value.code = @errorName(err);
@@ -53131,6 +53200,67 @@ test "model aware media masked secondary video bypasses execution" {
     consumers.resolved[1] = .{ .path = "", .identity = @splat('4'), .revision = @splat('5'), .recipe_id = @splat('6'), .uses_video = true };
     const values = try MediaOutputExecution.execute(&consumers, a, .{ .video = .{ .bytes = &.{}, .policy = .{} } }, .{ .ordinal = 3, .input_tokens = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 1, .selected_pictures = &.{7} } }, null, null, null, true);
     try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .skipped), values[1].status);
+}
+
+test "model aware media schedules video speaker recipes by priority and mask and reuses PCM" {
+    const a = std.testing.allocator;
+    const O = lib_chunker.outputs;
+    const Provider = struct {
+        reads: usize = 0,
+        deny: bool = false,
+
+        fn read(raw: *anyopaque, _: std.mem.Allocator, first: usize, last: usize) !MediaOutputExecution.audio_providers.Lease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            if (self.deny) return error.OptionalAudioBudgetExceeded;
+            const pcm: []const f32 = &.{ 0, 0, 0 };
+            return .{ .pcm = .{ .samples = pcm[first..last], .sample_rate = 2 } };
+        }
+
+        fn provider(self: *@This()) MediaOutputExecution.audio_providers.Provider {
+            return .{ .context = self, .samples = 3, .sample_rate = 2, .read = read };
+        }
+    };
+    var main = Provider{};
+    var optional = Provider{ .deny = true };
+    var targets = [_]O.Target{
+        .{ .name = "required", .kind = .diarize, .model = "required", .required = true },
+        .{ .name = "optional", .kind = .diarize, .model = "optional", .required = false },
+    };
+    var execution = MediaOutputExecution{ .node = undefined, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "required", .targets = &targets }, .allocator = a };
+    execution.speaker_scratch = a;
+    execution.speaker_provider = main.provider();
+    var required_state = MediaOutputExecution.SpeakerState{ .complete = true };
+    defer required_state.timeline.deinit(a);
+    var optional_state = MediaOutputExecution.SpeakerState{};
+    defer optional_state.timeline.deinit(a);
+    execution.speaker_states[0] = &required_state;
+    execution.speaker_states[1] = &optional_state;
+    execution.resolved[0] = .{ .path = "", .identity = @splat('1'), .revision = @splat('2'), .recipe_id = @splat('3') };
+    execution.resolved[1] = execution.resolved[0];
+    const window = MediaOutputExecution.chunks.VideoSpeakerWindow{
+        .ordinal = 3,
+        .start = 0,
+        .end = 1500 * std.time.ns_per_ms,
+        .extent = .{ .samples = 3, .sample_rate = 2, .start_ns = 0 },
+        .first = 0,
+    };
+    var result = MediaOutputExecution.chunks.VideoSpeakerResult{};
+    defer if (result.pcm) |*lease| lease.deinit(a);
+    try MediaOutputExecution.ensureVideoSpeakers(&execution, window, optional.provider(), &result);
+    try std.testing.expectEqual(@as(usize, 0), main.reads);
+    try std.testing.expectEqual(@as(usize, 1), optional.reads);
+    try std.testing.expect(result.failures[0] == null);
+    try std.testing.expectEqual(error.OptionalAudioBudgetExceeded, result.failures[1].?);
+
+    result = .{};
+    targets[1].skip_windows = &.{.{ .ordinal = 3, .sub_index = 0 }};
+    required_state.complete = false;
+    try MediaOutputExecution.ensureVideoSpeakers(&execution, window, optional.provider(), &result);
+    try std.testing.expectEqual(@as(usize, 1), main.reads);
+    try std.testing.expectEqual(@as(usize, 1), optional.reads);
+    try std.testing.expect(result.failures[1] == null);
+    try std.testing.expectEqual(@as(usize, 3), result.pcm.?.pcm.samples.len);
 }
 
 test "model aware media speaker pressure applies only to speaker outputs" {

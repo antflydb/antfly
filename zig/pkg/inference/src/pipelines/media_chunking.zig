@@ -38,7 +38,7 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, masked_audio: ?AudioExtent = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, speaker_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, masked_audio: ?AudioExtent = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, speaker_failure: ?anyerror = null, speaker_failures: ?*const [16]?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
 pub const AudioExtent = struct {
     samples: usize,
@@ -67,10 +67,24 @@ pub const Executor = struct {
     start_video: ?*const fn (*anyopaque, Payload, *media.admission.Pool) anyerror!?*@import("embedding_gemma2.zig").VideoAhead = null,
 };
 pub const Limits = @import("media_chunk_limits.zig").Limits;
+pub const VideoSpeakerWindow = struct {
+    ordinal: u64,
+    start: i64,
+    end: i64,
+    extent: AudioExtent,
+    first: usize,
+};
+
+pub const VideoSpeakerResult = struct {
+    failures: [16]?anyerror = @splat(null),
+    pcm: ?@import("media_chunking_audio.zig").Lease = null,
+};
+
 pub const SpeakerAnalysis = struct {
     context: *anyopaque,
     prepare: *const fn (*anyopaque, std.mem.Allocator, @import("media_chunking_audio.zig").Provider, usize, [32]u8, []const u8, bool) anyerror!void,
     ensure: ?*const fn (*anyopaque, std.mem.Allocator, i64, i64, bool) anyerror!void = null,
+    ensure_video: ?*const fn (*anyopaque, VideoSpeakerWindow, ?@import("media_chunking_audio.zig").Provider, *VideoSpeakerResult) anyerror!void = null,
     samples: ?*const fn (*anyopaque) ?usize = null,
     checkpoint: ?*const fn (*anyopaque, bool) void = null,
     /// Idempotent: the provider scope closes first; run() also closes on failure.
@@ -286,6 +300,8 @@ pub const Runner = struct {
         var output_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer output_arena.deinit();
         var output_payload = payload;
+        var speaker_result: VideoSpeakerResult = .{};
+        defer if (speaker_result.pcm) |*lease| lease.deinit(self.allocator);
         var borrowed_audio: ?@import("media_chunking_audio.zig").Lease = null;
         defer if (borrowed_audio) |*lease| lease.deinit(self.allocator);
         const video_needs_audio = payload == .video and self.request.needs_audio and self.ordinalNeedsAudio(ordinal);
@@ -310,7 +326,28 @@ pub const Runner = struct {
                 if (known_samples != null and extent.samples != 0 and !try self.audioReplayNeeded(ordinal, extent)) {
                     output_payload.video.masked_audio = extent;
                 } else {
-                    borrowed_audio = if (extent.samples == 0) .{ .pcm = .{ .samples = &.{}, .sample_rate = provider.sample_rate } } else provider.read(provider.context, self.allocator, first, first + extent.samples) catch |err| blk: {
+                    if (self.request.execute_outputs and extent.samples != 0 and output_payload.video.speaker_failure == null) {
+                        if (self.request.speaker_analysis) |analysis| {
+                            const speaker_start = descriptor.coordinates.start_ns.?;
+                            const speaker_end = descriptor.coordinates.end_ns.?;
+                            if (analysis.ensure_video) |ensure| {
+                                const owner = self.video_audio.?;
+                                const optional_provider = if (!owner.optional_audio and owner.speaker_reader != null) owner.speaker_reader.?.provider() else null;
+                                try ensure(analysis.context, .{ .ordinal = ordinal, .start = speaker_start, .end = speaker_end, .extent = extent, .first = first }, optional_provider, &speaker_result);
+                                output_payload.video.speaker_failures = &speaker_result.failures;
+                            } else if (analysis.ensure) |ensure| {
+                                ensure(analysis.context, output_arena.allocator(), speaker_start, speaker_end, false) catch |err| {
+                                    const optional = if (self.video_audio) |owner| owner.optional_speakers else false;
+                                    if (!optional or !optionalAudioPressure(err)) return err;
+                                    output_payload.video.speaker_failure = err;
+                                };
+                            }
+                        }
+                    }
+                    borrowed_audio = if (speaker_result.pcm) |lease| reused: {
+                        speaker_result.pcm = null;
+                        break :reused lease;
+                    } else if (extent.samples == 0) .{ .pcm = .{ .samples = &.{}, .sample_rate = provider.sample_rate } } else provider.read(provider.context, self.allocator, first, first + extent.samples) catch |err| blk: {
                         const optional = if (self.video_audio) |owner| owner.optional_audio else false;
                         if (abort(err) and !(optional and optionalAudioPressure(err))) return err;
                         output_payload.video.audio_failure = err;
@@ -324,16 +361,8 @@ pub const Runner = struct {
             }
         }
         if (self.request.execute_outputs) {
-            if (payload != .video or (video_needs_audio and self.audio_provider != null)) if (self.request.speaker_analysis) |analysis| if (analysis.ensure) |ensure| {
-                if (item.descriptor.coordinates.start_ns) |start| {
-                    if (payload != .video or (output_payload.video.audio_failure == null and output_payload.video.speaker_failure == null)) {
-                        ensure(analysis.context, output_arena.allocator(), start, item.descriptor.coordinates.end_ns.?, false) catch |err| {
-                            const optional = if (self.video_audio) |owner| owner.optional_speakers else false;
-                            if (!optional or !optionalAudioPressure(err)) return err;
-                            output_payload.video.speaker_failure = err;
-                        };
-                    }
-                }
+            if (payload != .video) if (self.request.speaker_analysis) |analysis| if (analysis.ensure) |ensure| {
+                if (item.descriptor.coordinates.start_ns) |start| try ensure(analysis.context, output_arena.allocator(), start, item.descriptor.coordinates.end_ns.?, false);
             };
             if (self.request.output_executor) |consumer| item.outputs = try consumer.execute(consumer.context, output_arena.allocator(), output_payload, descriptor, item.context, result, item.failure, self.request.allow_partial);
         }
@@ -1030,7 +1059,7 @@ pub const Runner = struct {
         return true;
     }
 
-    fn optionalAudioPressure(err: anyerror) bool {
+    pub fn optionalAudioPressure(err: anyerror) bool {
         return pageReadPressure(err) or err == error.ResourceLimitExceeded or err == error.OptionalAudioBudgetExceeded or
             err == error.SharedAdmissionExceeded or err == error.AudioTooLarge;
     }
@@ -1098,8 +1127,12 @@ pub const Runner = struct {
         self.restoreAudioFrames(self.audio_provider.?, &owner.frames);
         if (self.request.speaker_analysis != null) {
             owner.optional_speakers = owner.range_webm and !self.requiresAudioRanges(true);
-            const speaker_provider = if (owner.optional_speakers != optional) scoped: {
-                const speaker_source = if (owner.optional_speakers) view: {
+            // Keep one optional view alive for all optional recipe groups.
+            // The main provider keeps the priority selected for PCM outputs.
+            const video_groups = self.request.speaker_analysis.?.ensure_video != null;
+            var speaker_provider = self.audio_provider.?;
+            if (owner.range_webm and ((!optional and video_groups) or owner.optional_speakers != optional)) {
+                const speaker_source = if (!optional) view: {
                     owner.audio_source = optionalAudioSource(owner.source);
                     break :view &owner.audio_source.?;
                 } else owner.source;
@@ -1108,8 +1141,8 @@ pub const Runner = struct {
                 reader.lane = 1;
                 reader.frame_capture = null;
                 owner.speaker_reader = reader;
-                break :scoped owner.speaker_reader.?.provider();
-            } else self.audio_provider.?;
+                if (!video_groups or optional) speaker_provider = owner.speaker_reader.?.provider();
+            }
             self.prepareSpeakers(speaker_provider) catch |err| {
                 if (!owner.optional_speakers or !optionalAudioPressure(err)) return err;
                 self.video_speaker_failure = err;
