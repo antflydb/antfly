@@ -218,8 +218,6 @@ pub const Coordinator = struct {
             }
         }
         errdefer if (!shared) if (slot) |s| if (region) |r| {
-            if (metadata) r.unpinMetadataReader(s);
-            r.unpinReader(s);
             r.releaseReaderSlot(s);
         };
         errdefer if (promoted_metadata) {
@@ -262,16 +260,15 @@ pub const Coordinator = struct {
                 }
             };
             self.allocator.destroy(fence);
-            if (region) |r| if (slot) |s| {
-                if (shared_by_others) {
-                    if (metadata and !metadata_still_needed) r.unpinMetadataReader(s);
-                } else {
-                    r.unpinReader(s);
-                    if (metadata) r.unpinMetadataReader(s);
-                    r.releaseReaderSlot(s);
-                }
-            };
+            if (shared_by_others and metadata and !metadata_still_needed) {
+                region.?.unpinMetadataReader(slot.?);
+            }
             self.mutex.unlock(self.io);
+            // An unshared slot cannot be reused until this release clears
+            // its owner, so its wake syscall stays outside the mutex.
+            if (!shared_by_others) if (region) |r| if (slot) |s| {
+                r.releaseReaderSlot(s);
+            };
             self.release();
             return;
         };
