@@ -13232,6 +13232,24 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
         try claim.deinitChecked();
         try std.testing.expect(!metal.hasActiveFrame(compute.provider_impl.raw_decode_runtime) and !metal.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
     }
+    if (comptime count == 3) {
+        const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
+        const qkv = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
+        // A pair shares the QKV lead slot and two source bindings, but owns
+        // separate roots and a separate compatibility alias.
+        var pair = request;
+        pair.count = 2;
+        pair.slots[2] = 0;
+        pair.generations[2] = 0;
+        pair.declarations[2] = 0;
+        pair.widths[2] = 0;
+        try MetalCompute.prepareProjectionPackOutsideExecution(&target.cb, target.executable.graph, pair, &pin, .{ .outside_execution = true });
+        const packed_pair = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
+        try std.testing.expect(packed_pair != qkv);
+        const current_runtime = compute.provider_impl.raw_decode_runtime;
+        try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, qkv.owner.entry));
+        try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, packed_pair.owner.entry));
+    }
     // A second genuine component loader shares this manager's Domain and
     // actual compute context. The same binding is reported by both Models;
     // conservation counts that exact independently charged ledger once.

@@ -21455,14 +21455,21 @@ int antfly_metal_packed_projection_publish(termite_metal_decode_runtime *runtime
     if (!owner_context || !antfly_metal_packed_projection_matches(runtime, handle)) return -1;
     AntflyMetalPackedProjection *entry = handle;
     if (entry->owner_context && entry->owner_context != owner_context) return -1;
+    // Publication replaces one compatibility alias and leaves all source
+    // declarations intact. Other packs using those slots remain valid.
+    const size_t slot = entry->slots[0];
+    id<MTLBuffer> previous;
+    if (entry->count == 2) {
+        if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -1;
+        previous = runtime->dense_pair_packed_weight_buffers[slot];
+    } else {
+        if (slot >= TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY) return -1;
+        previous = runtime->dense_qkv_packed_weight_buffers[slot];
+    }
+    if (antfly_metal_prepare_packed_root_use(runtime, previous, 2) < 0) return -1;
     if (!antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->weight, entry, false) ||
         !antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->bias, entry, false)) return -1;
-    for (size_t i = 0; i < entry->count; ++i) if (antfly_metal_prepare_packed_slot_mutation(runtime, entry->slots[i]) != 0) return -1;
     entry->owner_context = owner_context;
-    for (size_t i = 0; i < entry->count; ++i) {
-        termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(runtime, entry->slots[i]);
-        termite_metal_decode_runtime_invalidate_dense_pair_pack_slot(runtime, entry->slots[i]);
-    }
     antfly_metal_publish_projection_pack(runtime, entry->count, entry->slots, entry->width, entry->widths,
         (__bridge id<MTLBuffer>)entry->weight, (__bridge id<MTLBuffer>)entry->bias);
     return 0;
