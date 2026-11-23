@@ -53968,14 +53968,18 @@ pub const DB = struct {
     fn speculativeHbcSearch(ctx: ?*anyopaque, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.SearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx.?));
         const probe = try HybridTestProbe.denseStarting();
-        defer if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        defer if (builtin.is_test) {
+            if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        };
         return self.core.index_manager.searchDenseEntryWithRequest(entry, req);
     }
 
     fn speculativeHbcSearchProfiled(ctx: ?*anyopaque, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx.?));
         const probe = try HybridTestProbe.denseStarting();
-        defer if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        defer if (builtin.is_test) {
+            if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        };
         return self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
     }
 
@@ -54030,7 +54034,9 @@ pub const DB = struct {
 
     fn speculativeExactDenseSearch(ctx: ?*anyopaque, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!dense_exact.SearchOutcome {
         const probe = try HybridTestProbe.denseStarting();
-        defer if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        defer if (builtin.is_test) {
+            if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        };
         return exactDenseSearchCallback(ctx, entry, req);
     }
 
