@@ -9369,7 +9369,7 @@ pub const BackendHandle = struct {
             }
         }
 
-        backend.* = Backend.init(allocator, resolved_options);
+        backend.initInPlace(allocator, resolved_options);
         errdefer backend.close();
         if (config.internal_flush_worker) {
             internal_flush_worker = try startInternalFlushWorker(allocator, backend, config.maintenance_io orelse if (owned_runtime) |*runtime| runtime.ptr().io() else null);

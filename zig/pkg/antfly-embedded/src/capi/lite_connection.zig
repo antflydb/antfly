@@ -9080,17 +9080,6 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
     const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
     defer a.free(path);
     const options: api.LiteResolvedOpenOptions = .{ .profile = .native, .busy_timeout_ms = 10_000 };
-    {
-        const setup = try open(path, options, true);
-        const setup_id = try api.publishHandle(setup);
-        defer api.antfly_db_close(setup_id);
-        var deleted = false;
-        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(setup_id, .fromSlice("full_text_index_v0"), &deleted));
-        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(setup_id, .fromSlice(
-            \\{"name":"vec","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":8,\"external\":true,\"metric\":\"l2_squared\"}"}
-        )));
-        try setup.lite_connection.?.owner.current.?.db.core.index_manager.installEmptyLiteDenseV2Fixture("vec");
-    }
     const Dense = struct {
         fn stopMaintenance(owner: *Owner) void {
             owner.stopping.store(true, .release);
@@ -9195,6 +9184,22 @@ test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold
             try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], quoted_key) != null);
         }
     };
+    {
+        const setup = try open(path, options, true);
+        const setup_connection = setup.lite_connection.?;
+        const setup_owner = setup_connection.owner;
+        Dense.stopMaintenance(setup_owner);
+        const setup_id = try api.publishHandle(setup);
+        defer api.antfly_db_close(setup_id);
+        var deleted = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(setup_id, .fromSlice("full_text_index_v0"), &deleted));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(setup_id, .fromSlice(
+            \\{"name":"vec","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":8,\"external\":true,\"metric\":\"l2_squared\"}"}
+        )));
+        const setup_root = try setup_owner.writer_lane.checkout(setup_connection, .mutation);
+        defer setup_owner.writer_lane.checkin(setup_connection, setup_root.owned_lite_backend.?.native_docstore.?);
+        try setup_root.db.core.index_manager.installEmptyLiteDenseV2Fixture("vec");
+    }
     const wrapper = try open(path, options, false);
     const owner = wrapper.lite_connection.?.owner;
     Dense.stopMaintenance(owner);
