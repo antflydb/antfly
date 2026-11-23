@@ -108,6 +108,7 @@ pub const Timeline = struct {
         self.count = 0;
     }
     pub fn restore(self: *Timeline, a: std.mem.Allocator, view_: View) !void {
+        if (view_.blocks.len > self.max_blocks) return error.ChunkWorkingBudgetExceeded;
         const saved = try view_.copy(a);
         self.deinit(a);
         self.blocks = .fromOwnedSlice(@constCast(saved.blocks));
