@@ -250,9 +250,11 @@ pub const Plan = struct {
                 }
             }
         }
+        if (!owned[self.output]) return error.AudioScheduleInvalid;
+        const output = values[self.output] orelse return error.AudioScheduleInvalid;
         owned[self.output] = false;
         self.replays += 1;
-        return values[self.output] orelse error.AudioScheduleInvalid;
+        return output;
     }
 };
 pub const Capture = struct {
@@ -308,13 +310,19 @@ pub const Capture = struct {
         self.plan.count += 1;
     }
     pub fn finish(self: *Capture, ct: CT) void {
-        self.plan.output = self.find(ct) orelse {
-            self.failed = true;
-            self.plan.ready = false;
-            self.plan.disabled = true;
-            return;
-        };
-        self.plan.ready = !self.failed and self.plan.count > 0;
+        self.plan.ready = false;
+        if (!self.failed) {
+            if (self.find(ct)) |output| {
+                // A replay returns an owned result. Borrowed inputs and
+                // retained constants cannot escape as that result.
+                for (self.plan.nodes[0..self.plan.count]) |node| {
+                    if (node.output != output) continue;
+                    self.plan.output = output;
+                    self.plan.ready = true;
+                    break;
+                }
+            }
+        }
         self.plan.disabled = !self.plan.ready;
     }
 };
@@ -479,6 +487,25 @@ test "embeddinggemma2 audio schedule rejects an unrecorded output without retain
     capture.finish(@ptrFromInt(1));
     try std.testing.expect(plan.disabled);
     try std.testing.expect(!plan.ready);
+}
+
+test "audio schedule only publishes a value produced by the captured stage" {
+    const a = std.testing.allocator;
+    const plan = try a.create(Plan);
+    defer a.destroy(plan);
+    plan.* = .{};
+    const input: CT = @ptrFromInt(16);
+    const result: CT = @ptrFromInt(32);
+    var capture = Capture.init(plan, &.{input});
+    capture.append(.{ .args = .{ .sliceLastDim = .{ .tensor = 0, .start = 0, .stop = 1 } }, .inputs = @splat(0), .input_count = 1 }, result);
+    capture.finish(input);
+    try std.testing.expect(plan.disabled);
+    try std.testing.expect(!plan.ready);
+
+    capture.finish(result);
+    try std.testing.expect(!plan.disabled);
+    try std.testing.expect(plan.ready);
+    try std.testing.expectEqual(@as(u16, 1), plan.output);
 }
 
 /// A declining optional route must not invalidate a correctly recorded request.
