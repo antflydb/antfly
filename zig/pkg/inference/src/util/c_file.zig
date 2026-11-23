@@ -564,7 +564,7 @@ pub fn readRegionInto(allocator: std.mem.Allocator, path: []const u8, offset: u6
     try readRegionFromFd(fd, buf, offset);
 }
 
-fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
+pub fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
     var total: usize = 0;
     while (total < buf.len) {
         const read_off = try std.math.add(u64, offset, total);

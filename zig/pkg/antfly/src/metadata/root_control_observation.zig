@@ -182,6 +182,12 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectEqual(@as(u64, 1200), renewed.effect.progress.renewed.expires_at);
         streaming = try fixture.apply(scratch, streaming, .{ .root_control = .{ .namespace = ns, .operation = .{ .reconciled = renewed } } });
         try std.testing.expectEqual(@as(u64, 1200), streaming.roots[0].renewed_through);
+        // Renewing the grant does not settle the native history collection
+        // deferred by the earlier metadata acknowledgment.
+        try std.testing.expect(streaming.needsMaintenance(150));
+        const collected = streaming.pendingNativeAcknowledgment() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(ns, collected.namespace);
+        streaming = try fixture.apply(scratch, streaming, .{ .native_collected = .{ .namespace = ns, .consumer_epoch = 7, .through = 10 } });
         try std.testing.expect(!streaming.needsMaintenance(150));
         try std.testing.expectEqual(@as(u64, 10), streaming.roots[0].reclaimed_through);
         try std.testing.checkAllAllocationFailures(a, checkAllocations, .{ state, ns });

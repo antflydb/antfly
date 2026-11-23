@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const read_session_source_path = "pkg/antfly-embedded/src/storage/read_session_source.zig";
 /// Independently compiled ELF owners and their callers share Zig callback ABI.
 pub fn llvmBackend(target: std.Target) ?bool {
     return if (target.ofmt == .elf) true else null;
@@ -307,7 +308,7 @@ fn sessionTypesBridge(module: *std.Build.Module, canonical: *std.Build.Module, s
 fn createSessionBackend(module: *std.Build.Module, canonical: *std.Build.Module, source: bool) SessionBackend {
     const b = module.owner;
     const backend = b.createModule(.{
-        .root_source_file = b.path(if (source) "pkg/antfly-embedded/src/storage/read_session_source.zig" else "pkg/antfly-embedded/src/storage/read_session_client.zig"),
+        .root_source_file = b.path(if (source) read_session_source_path else "pkg/antfly-embedded/src/storage/read_session_client.zig"),
         .target = canonical.resolved_target,
         .optimize = canonical.optimize,
     });

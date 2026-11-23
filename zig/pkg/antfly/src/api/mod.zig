@@ -18,9 +18,9 @@ const document_mapper = @import("antfly_local_sources").storage_db_document_mapp
 
 pub const cluster = @import("cluster.zig");
 pub const operation = @import("antfly_local_sources").api_operation;
-const sql_execution = @import("sql_execution.zig");
-const sql_pgwire = @import("sql_pgwire.zig");
-const sql_session = @import("sql_session.zig");
+const sql_execution = @import("sql/execution/execution.zig");
+const sql_pgwire = @import("sql/transport/pgwire.zig");
+const sql_session = @import("sql/session/session.zig");
 pub const probe_operations = @import("probe_operations.zig");
 pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("antfly_local_sources").api_batch;
@@ -28,6 +28,10 @@ pub const backups = @import("backups.zig");
 pub const restore_owner = @import("restore_owner.zig");
 pub const restore_parent_activation = @import("restore_parent_activation.zig");
 pub const relational_fk_generation_publication = @import("relational_fk_generation_publication.zig");
+pub const relational_index_owner_execution = @import("relational_index/owner_execution.zig");
+pub const schema_validation_preparation = @import("schema_validation/preparation.zig");
+pub const table_retirement_preparation = @import("table_retirement_preparation.zig");
+pub const native_relation_maintenance = @import("native_relation_maintenance.zig");
 pub const row_policy_install = @import("row_policy_install.zig");
 pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
 pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");
@@ -243,17 +247,27 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
-    _ = @import("sql_catalog_campaign_test.zig");
+    _ = @import("sql/session/session_overlay.zig");
+    _ = @import("relational_integrity_errors.zig");
+    _ = @import("sql/testing/catalog_campaign_test.zig");
+    _ = @import("sql/testing/name_resolution_test.zig");
+    _ = @import("sql/testing/document_root_test.zig");
+    _ = @import("sql/testing/conflict_scope_test.zig");
+    _ = @import("sql/testing/join_campaign_test.zig");
+    _ = @import("sql/testing/text_campaign_test.zig");
+    _ = @import("sql/testing/array_expansion_test.zig");
+    _ = @import("sql/testing/array_mutation_test.zig");
     _ = @import("online_merge_io.zig");
-    _ = @import("sql_truncate.zig");
-    _ = @import("sql_policy_ddl.zig");
+    _ = @import("sql/catalog/truncate.zig");
+    _ = @import("sql/catalog/policy_ddl.zig");
     _ = sql_execution;
-    _ = @import("sql_schema_cache.zig");
+    _ = @import("sql/execution/schema_cache.zig");
+    _ = @import("sql/execution/retained_snapshot.zig");
     _ = sql_pgwire;
     _ = sql_session;
-    _ = @import("sql_prepared.zig");
-    _ = @import("sql_connection_record.zig");
-    _ = @import("sql_connections.zig");
+    _ = @import("sql/session/prepared.zig");
+    _ = @import("sql/session/connection_record.zig");
+    _ = @import("sql/session/connections.zig");
     _ = cluster;
     _ = batch;
     _ = backups;
@@ -544,4 +558,8 @@ test "api query contract tensor program envelope preserves dictionary identity" 
     try std.testing.expectEqual(@as(usize, 2), view.program.outputs.len);
     try std.testing.expectEqual(@as(?usize, 0), view.program.outputs[0].input);
     try std.testing.expectEqual(@as(?usize, 0), view.program.outputs[1].step);
+}
+
+comptime {
+    if (@import("builtin").is_test) _ = @import("sql/testing/text_campaign_test.zig");
 }

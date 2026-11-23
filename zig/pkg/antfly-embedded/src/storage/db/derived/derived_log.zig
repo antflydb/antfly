@@ -96,6 +96,10 @@ const UnsupportedDerivedLog = struct {
     next_sequence: u64 = 1,
     stats_value: wal.WalStats = .{},
 
+    pub fn sync(_: *DerivedLog, _: bool) !void {}
+
+    pub fn checkpointAfterDurableBoundary(_: *DerivedLog) !void {}
+
     pub fn open(_: [*:0]const u8, _: OpenOptions) !DerivedLog {
         return .{
             .alloc = std.heap.page_allocator,
@@ -191,6 +195,14 @@ const UnsupportedDerivedLog = struct {
 };
 const PlatformDerivedLog = struct {
     wal_impl: wal.WAL,
+
+    pub fn sync(self: *DerivedLog, force: bool) !void {
+        try self.wal_impl.sync(force);
+    }
+
+    pub fn checkpointAfterDurableBoundary(self: *DerivedLog) !void {
+        try self.wal_impl.checkpointLsmWalAfterDurableBoundary();
+    }
 
     pub fn open(path: [*:0]const u8, opts: OpenOptions) !DerivedLog {
         return .{

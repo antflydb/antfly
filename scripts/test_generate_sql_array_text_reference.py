@@ -45,13 +45,14 @@ class ArrayTextReferenceTest(unittest.TestCase):
                 with self.subTest(input=entry["input"], kind=entry["sql_type"]):
                     kind = entry["sql_type"]
                     self.assertEqual(types[kind], entry["element_type"])
-                    (binary,) = db.execute(
-                        "SELECT pg_catalog.encode(pg_catalog.array_send(%s::"
+                    binary, text = db.execute(
+                        "SELECT pg_catalog.encode(pg_catalog.array_send(v), 'hex'), v::text FROM (SELECT %s::"
                         + kind
-                        + "[]), 'hex')",
+                        + "[] AS v) s",
                         (entry["input"],),
                     ).fetchone()
                     self.assertEqual(entry["binary"], binary)
+                    self.assertEqual(entry["text"], text)
             for entry in fixture["errors"]:
                 with self.subTest(input=entry["input"], kind=entry["sql_type"]):
                     kind = entry["sql_type"]

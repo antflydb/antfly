@@ -1115,7 +1115,7 @@ test "api query contract raw aliases retain selected provenance without DOM read
 
 test "api query contract normalized receipts preserve work depth bytes and cancellation" {
     const budget = @import("../sql/raw_json_budget.zig");
-    const Work = @import("../sql/numeric_value.zig").Context;
+    const Work = @import("../sql/numeric/value.zig").Context;
     const a = std.testing.allocator;
     var work: Work = .{ .alloc = a, .remaining = 10 };
     const value = try budget.normalizePrepared(a, "{\"n\":[1,null]}", .{ .depth = 3, .wire_bytes = 1024 }, &work);

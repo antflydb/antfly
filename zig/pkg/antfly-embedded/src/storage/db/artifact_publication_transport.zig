@@ -129,13 +129,12 @@ pub fn validateBatchRequest(request: anytype) !void {
     try control.validate();
     const defaults: @TypeOf(request) = .{};
     inline for (@typeInfo(@TypeOf(request)).@"struct".field_names, @typeInfo(@TypeOf(request)).@"struct".field_types) |reflected_name, field_type| {
-        if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, reflected_name, "artifact_publication_transport") and
             !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "timestamp"))
         {
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (@field(request, reflected_name).len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(@field(request, reflected_name), @field(defaults, reflected_name))) return error.InvalidBatchRequest;
+            } else if (!@import("../control_field_defaults.zig").isolatedFieldMatchesDefault(reflected_name, @field(request, reflected_name), @field(defaults, reflected_name))) return error.InvalidBatchRequest;
         }
     }
 }

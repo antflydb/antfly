@@ -45,6 +45,7 @@ pub const Sequence = @import("video_cache_budget.zig").Sequence;
 /// legacy callback ABI cannot report failure; never forget an uncertain handle
 /// or refund its quota when physical SDK death could not be established.
 fn closeDecoderOwned(decoder: *anyopaque) callconv(.c) void {
+    if (comptime !has_nvdec_backend) @import("antfly_platform").inference_process_supervisor.restartWorker();
     if (antfly_nvdec_close_checked(decoder) != 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
 }
 fn openDecoderOwned(out: *?*anyopaque, stream: ?*anyopaque, user: *anyopaque, callback: Callback) !void {
@@ -2289,7 +2290,7 @@ test "CUDA detached NVDEC retirement frees old surfaces and quota without touchi
 }
 
 test "CUDA unsupported video retirement refuses opaque endpoints before touching an unavailable SDK" {
-    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
+    if (comptime has_nvdec_backend) return error.SkipZigTest;
     // Rejection-only opaque sentinel: no valid context, decoder or SDK exists.
     // Every unsupported adapter must refuse before reading another field.
     var ctx: context.CudaContext = undefined;

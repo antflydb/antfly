@@ -421,7 +421,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.sealSlot(a, write, 101, context));
         try std.testing.expectEqual(@as(usize, 1), fake.mutations);
         fake.commit = true;
-        const commands = @import("sql_pgwire.zig").SlotCommands;
+        const commands = @import("sql/transport/pgwire.zig").SlotCommands;
         const created = try commands.create(port, scratch, .{ .slot = configuration.name, .snapshot = .nothing }, write, 101, context);
         try std.testing.expectEqualStrings("CREATE_REPLICATION_SLOT", created.command_tag);
         try std.testing.expectEqualStrings("0/2000", created.rows[0][1].string);
