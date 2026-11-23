@@ -1286,8 +1286,9 @@ pub const Runner = struct {
                     builder.deinit();
                     audio_owner.observed = null;
                 };
-                self.pool.setReclaimer(.{ .callback = .{ .context = &builder, .release = reclaimVideoAudio }, .measure = reclaimableVideoAudio });
-                defer self.pool.setReclaimer(null);
+                const required_audio = self.requiresAudioRanges(false);
+                if (!required_audio) self.pool.setReclaimer(.{ .callback = .{ .context = &builder, .release = reclaimVideoAudio }, .measure = reclaimableVideoAudio });
+                defer if (!required_audio) self.pool.setReclaimer(null);
                 var reader = try media.webm.Reader.initObserved(self.allocator, source, .{ .max_packets = count, .max_index_bytes = self.request.max_working_bytes }, builder.observer());
                 defer reader.deinit();
                 if (builder.failure) |err| {
@@ -1297,6 +1298,9 @@ pub const Runner = struct {
                         }
                     }
                 }
+                // Seal required geometry before video picture planning and
+                // decoder reservations can force a second container scan.
+                if (required_audio) try self.prepareVideoAudio();
                 return self.webmWindowsCached(&reader, identity, &build);
             }
         }
