@@ -1338,7 +1338,9 @@ fn stageSavepointRow(registry: *transactions.SessionRegistry, txn: [16]u8, key: 
     defer a.free(body);
     var parsed = try transactions.parseStageWriteRequest(a, body);
     defer parsed.deinit(a);
-    _ = (try registry.stage(a, txn, &parsed)).?;
+    const owner = (try registry.getOwnerNodeId(a, txn)) orelse return error.TestUnexpectedResult;
+    const guard = try registry.mutation(a, txn, owner);
+    _ = (try registry.stage(a, guard, &parsed)).?;
 }
 fn savepointRows(registry: *transactions.SessionRegistry, txn: [16]u8) !usize {
     const durable = registry.durable orelse return error.MissingDurableSessionStore;
