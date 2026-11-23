@@ -114,7 +114,10 @@ fn createLocked(alloc: Allocator, io: std.Io, root_dir: []const u8, path: []cons
     return loadPath(alloc, io, path, root_incarnation) catch |err| switch (err) {
         error.FileNotFound => {
             const created = try newState(io, root_incarnation);
-            try writePath(alloc, io, path, created);
+            writePath(alloc, io, path, created) catch |write_err| switch (write_err) {
+                error.PathAlreadyExists => return try loadPath(alloc, io, path, root_incarnation),
+                else => return write_err,
+            };
             return created;
         },
         else => return err,
@@ -169,9 +172,16 @@ fn writePath(alloc: Allocator, io: std.Io, path: []const u8, state: State) !void
         try writer.end();
         try file.sync(io);
     }
-    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-        return err;
+    const cwd = std.Io.Dir.cwd();
+    errdefer cwd.deleteFile(io, tmp_path) catch {};
+    // A physical root's first published key is immutable, including if
+    // another opener wins while this checkpoint is staged.
+    cwd.renamePreserve(tmp_path, cwd, path, io) catch |err| switch (err) {
+        error.OperationUnsupported => {
+            try cwd.hardLink(tmp_path, cwd, path, io, .{});
+            try cwd.deleteFile(io, tmp_path);
+        },
+        else => return err,
     };
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
 }
@@ -213,6 +223,10 @@ test "root signing identity survives reopen, rotates with root, and rejects corr
     const second_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/signing-b", .{tmp.sub_path});
     defer alloc.free(second_path);
     const first = try loadOrCreate(alloc, std.testing.io, first_path);
+    const checkpoint = try checkpointPathAlloc(alloc, first_path);
+    defer alloc.free(checkpoint);
+    const competing = try newState(std.testing.io, first.root_incarnation);
+    try std.testing.expectError(error.PathAlreadyExists, writePath(alloc, std.testing.io, checkpoint, competing));
     const reopened = try load(alloc, std.testing.io, first_path);
     try std.testing.expectEqualDeep(first, reopened);
     const second = try loadOrCreate(alloc, std.testing.io, second_path);

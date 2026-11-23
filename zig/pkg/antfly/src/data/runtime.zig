@@ -23842,11 +23842,15 @@ pub const DataServer = struct {
         if (signing_ready) {
             const runtime = try self.ensureBackendRuntime();
             const api_io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
-            const signing = try @import("antfly_local_sources").storage_db_root_signing_identity.loadOrCreate(
-                self.alloc,
-                api_io,
-                self.write_source.replica_root_dir,
-            );
+            const identity = @import("antfly_local_sources").storage_db_root_signing_identity;
+            const root_dir = self.write_source.replica_root_dir;
+            const signing = if (previously_enrolled)
+                identity.load(self.alloc, api_io, root_dir) catch |err| switch (err) {
+                    error.FileNotFound => return error.StoreRootSigningIdentityChanged,
+                    else => return err,
+                }
+            else
+                try identity.loadOrCreate(self.alloc, api_io, root_dir);
             if (signing.root_incarnation != root_incarnation) return error.StoreRootSigningIdentityUnconfirmed;
             public_key = signing.public_key;
         }
