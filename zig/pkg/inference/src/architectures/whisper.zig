@@ -975,7 +975,24 @@ pub const PreparedDecoderWeights = struct {
     // Captured by the original lookup, never inferred from a later witness.
     lm_head_source: enum { projection, tied_embedding } = .projection,
 
-    pub const Cross = struct { k: Linear, v: Linear };
+    pub const Cross = struct {
+        k: Linear,
+        v: Linear,
+
+        fn projectInto(self: Cross, cb: *const ComputeBackend, source_data: *const anyopaque, encoder: CT, destinations: [2]CT, rows: usize, width: usize, mode: dense_backend.ProjectionMode) !bool {
+            const schedule_mod = @import("../execution/dense_decoder_schedule.zig");
+            const projections = [2]Linear{ self.k, self.v };
+            var descriptors: [2]ops.kernel_descriptor.Descriptor = undefined;
+            for (projections, destinations, &descriptors) |projection, target, *descriptor| {
+                descriptor.* = try schedule_mod.projectionDescriptor(cb, source_data, encoder, projection.w, projection.b, target, rows, width, width);
+            }
+            for (projections, destinations, &descriptors) |projection, target, *descriptor| {
+                const inputs = [3]CT{ encoder, projection.w, projection.b orelse projection.w };
+                if (!try dense_backend.projectionInto(cb, descriptor, inputs[0..descriptor.input_count], target, mode)) return false;
+            }
+            return true;
+        }
+    };
 
     pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, resolve_cross: bool) !PreparedDecoderWeights {
         return initWithSource(cb, allocator, config, resolve_cross, null);
@@ -1350,9 +1367,8 @@ pub const PreparedSingleToken = struct {
                 _ = try dense_backend.heldWeight(cb, source_data, pair.w, try std.fmt.bufPrint(&buffer, "model.decoder.layers.{d}.encoder_attn.{s}.weight", .{ layer, projection }));
                 if (pair.b) |bias| _ = try dense_backend.heldWeight(cb, source_data, bias, try std.fmt.bufPrint(&buffer, "model.decoder.layers.{d}.encoder_attn.{s}.bias", .{ layer, projection }));
             }
-            const k_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.k.w, cross.k.b, slab.cross_k, rows, config.d_model, config.d_model);
-            const v_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.v.w, cross.v.b, slab.cross_v, rows, config.d_model, config.d_model);
-            if (!try dense_backend.projectionInto(cb, &k_desc, if (cross.k.b) |bias| &.{ encoder, cross.k.w, bias } else &.{ encoder, cross.k.w }, slab.cross_k, .query) or !try dense_backend.projectionInto(cb, &v_desc, if (cross.v.b) |bias| &.{ encoder, cross.v.w, bias } else &.{ encoder, cross.v.w }, slab.cross_v, .query)) return error.UnsupportedDenseSchedule;
+            if (!try cross.projectInto(cb, source_data, encoder, .{ slab.cross_k, slab.cross_v }, rows, config.d_model, .query))
+                return error.UnsupportedDenseSchedule;
         }
     }
     fn authorPure(cb: *const ComputeBackend, a: std.mem.Allocator, preparation: ?*schedule_mod.Preparation, spec: *const schedule_mod.ProgramSpec, storage: ?*schedule_mod.ProgramSpecStorage, bound: []const schedule_mod.BoundParameter) !Authored {
@@ -1532,11 +1548,8 @@ pub const DecodeCache = struct {
             var v_cross: CT = undefined;
             if (native) |program| {
                 const slab = program.self_slabs[layer];
-                const schedule_mod = @import("../execution/dense_decoder_schedule.zig");
-                const k_descriptor = try schedule_mod.projectionDescriptor(cb, program.source_data, encoder_hidden, k, k_b, slab.cross_k, enc_seq, d_model, d_model);
-                const v_descriptor = try schedule_mod.projectionDescriptor(cb, program.source_data, encoder_hidden, v, v_b, slab.cross_v, enc_seq, d_model, d_model);
-                if (!try dense_backend.projectionInto(cb, &k_descriptor, if (k_b) |bias| &.{ encoder_hidden, k, bias } else &.{ encoder_hidden, k }, slab.cross_k, .apply)) return error.PreparedDenseProjectionChanged;
-                if (!try dense_backend.projectionInto(cb, &v_descriptor, if (v_b) |bias| &.{ encoder_hidden, v, bias } else &.{ encoder_hidden, v }, slab.cross_v, .apply)) return error.PreparedDenseProjectionChanged;
+                if (!try cross.projectInto(cb, program.source_data, encoder_hidden, .{ slab.cross_k, slab.cross_v }, enc_seq, d_model, .apply))
+                    return error.PreparedDenseProjectionChanged;
                 k_cross = slab.cross_k;
                 v_cross = slab.cross_v;
             } else {
