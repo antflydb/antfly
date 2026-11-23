@@ -51020,9 +51020,25 @@ fn consumerTests() type {
                 fn tableSnapshot(ptr: *anyopaque, _: []const u8, deadline: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
                     return routingSnapshot(ptr, deadline);
                 }
+                fn decisionAdmission(ptr: *anyopaque, request: antfly.metadata_api.DecisionAdmissionRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.DecisionAdmission {
+                    const catalog_api = antfly.public_api.table_catalog;
+                    var cut = try routingSnapshot(ptr, budget.deadline_ns);
+                    defer catalog_api.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot(ptr, &cut);
+                    const generation = try catalog_api.RoutingGeneration.create(std.testing.allocator, cut, budget);
+                    defer generation.release();
+                    const check = request.route_check orelse return error.InvalidBatchRequest;
+                    const current = try catalog_api.generationDecisionRoute(generation, request.table_name, check.route.group_id, budget);
+                    return .{
+                        .metadata_group_id = current.metadata_group_id,
+                        .metadata_incarnation = current.metadata_incarnation,
+                        .catalog_revision = current.catalog_revision,
+                        .stable = current.table_id == request.table_id and current.topology_epoch == check.topology_epoch and std.meta.eql(current.route, check.route),
+                        .route_checked = true,
+                    };
+                }
                 fn iface(ptr: *anyopaque) antfly.public_api.table_catalog.CatalogSource {
                     const Adapter = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free);
-                    return .{ .ptr = ptr, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = routingSnapshot, .table_routing_snapshot = tableSnapshot, .linearizable_table_routing_snapshot = tableSnapshot, .linearizable_routing_snapshot = routingSnapshot, .free_routing_snapshot = Adapter.freeRoutingSnapshot } };
+                    return .{ .ptr = ptr, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = routingSnapshot, .table_routing_snapshot = tableSnapshot, .linearizable_table_routing_snapshot = tableSnapshot, .linearizable_routing_snapshot = routingSnapshot, .free_routing_snapshot = Adapter.freeRoutingSnapshot, .decision_admission = decisionAdmission } };
                 }
             };
             var tmp = std.testing.tmpDir(.{});
@@ -59284,6 +59300,7 @@ fn implementationTests() type {
             var server: DataServer = undefined;
             server.data_raft = &host;
             server.data_raft_mutex = .unlocked;
+            server.api_server_cfg = .{ .deployment_mode = .distributed };
             server.group_leadership_source = .{ .ptr = &fake, .vtable = &.{ .is_local_leader = Fake.owns } };
             const source = server.relationalMaintenanceLeadershipSource().?;
             try std.testing.expect(server.data_raft_mutex.tryLock());
@@ -59298,7 +59315,9 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 3), fake.calls);
             server.group_leadership_source = null;
             server.data_raft = null;
-            try std.testing.expectEqual(null, server.relationalMaintenanceLeadershipSource());
+            try std.testing.expect(!source.isLocalLeader(7));
+            server.api_server_cfg.deployment_mode = .standalone;
+            try std.testing.expect(source.isLocalLeader(7));
         }
 
         test "data runtime status refresh skips opening the active startup group when no cached snapshot exists yet" {

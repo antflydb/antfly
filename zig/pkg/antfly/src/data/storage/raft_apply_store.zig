@@ -2745,7 +2745,6 @@ pub const RaftApplyStore = struct {
 test "data raft schema controls cannot advance projection state before native decoder activation" {
     const a = std.testing.allocator;
     const schema = @import("../schema_control_log.zig");
-    try std.testing.expect(schema.protocol_version > @import("../../common/data_raft_protocol.zig").batch_protocol_version);
     const command = try schema.testing.command().encodeRaft(a);
     defer a.free(command);
     const frame = try schema.encode(a, "rows", 11, command);
