@@ -45,8 +45,9 @@ pub const Block = struct {
     fn release(self: *Block) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
             const a = self.allocator;
-            if (self.lease) |*owned| owned.release();
+            var lease = self.lease;
             a.destroy(self);
+            if (lease) |*owned| owned.release();
         }
     }
 };
@@ -85,6 +86,54 @@ pub const View = struct {
         if (self.count != 0 and self.blocks[self.blocks.len - 1].max_label_plus_one > registry_count) return error.InvalidSpeakerCheckpoint;
     }
 };
+/// Read-only geometry from immutable blocks or a decoded checkpoint.
+pub const ReadView = union(enum) {
+    shared: View,
+    flat: []const speakers.Span,
+
+    pub fn len(self: ReadView) usize {
+        return switch (self) {
+            .shared => |view| view.count,
+            .flat => |spans| spans.len,
+        };
+    }
+    pub fn at(self: ReadView, i: usize) speakers.Span {
+        return switch (self) {
+            .shared => |view| view.at(i),
+            .flat => |spans| spans[i],
+        };
+    }
+    pub fn coverage(self: ReadView) i64 {
+        return if (self.len() == 0) 0 else self.at(self.len() - 1).end_ns;
+    }
+    pub fn first(self: ReadView, start: i64) usize {
+        var lo: usize = 0;
+        var hi = self.len();
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.at(mid).end_ns <= start) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+    pub fn label(self: ReadView, start: i64, end: i64) ?u32 {
+        const i = self.first(start);
+        if (start >= end or i == self.len()) return null;
+        const span = self.at(i);
+        return if (span.start_ns <= start and span.end_ns >= end) span.speaker_index else null;
+    }
+    pub fn slice(self: ReadView, a: std.mem.Allocator, start: i64, end: i64) ![]const speakers.Span {
+        var out: std.ArrayList(speakers.Span) = .empty;
+        errdefer out.deinit(a);
+        var i = self.first(start);
+        while (i < self.len()) : (i += 1) {
+            const span = self.at(i);
+            if (span.start_ns >= end) break;
+            try out.append(a, .{ .start_ns = @max(start, span.start_ns), .end_ns = @min(end, span.end_ns), .speaker_index = span.speaker_index });
+        }
+        return out.toOwnedSlice(a);
+    }
+};
+
 pub const Timeline = struct {
     blocks: std.ArrayList(*Block) = .empty,
     count: usize = 0,
@@ -107,6 +156,7 @@ pub const Timeline = struct {
         self.count = 0;
     }
     pub fn restore(self: *Timeline, a: std.mem.Allocator, view_: View) !void {
+        if (view_.blocks.len > self.max_blocks) return error.ChunkWorkingBudgetExceeded;
         const saved = try view_.copy(a);
         self.deinit(a);
         self.blocks = .fromOwnedSlice(@constCast(saved.blocks));
@@ -161,34 +211,17 @@ pub const Timeline = struct {
         self.count += 1;
     }
     pub fn first(self: Timeline, start: i64) usize {
-        var lo: usize = 0;
-        var hi = self.count;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.at(mid).end_ns <= start) lo = mid + 1 else hi = mid;
-        }
-        return lo;
+        return (ReadView{ .shared = self.view() }).first(start);
     }
     pub fn label(self: Timeline, start: i64, end: i64) ?u32 {
-        const i = self.first(start);
-        if (start >= end or i == self.count) return null;
-        const span = self.at(i);
-        return if (span.start_ns <= start and span.end_ns >= end) span.speaker_index else null;
+        return (ReadView{ .shared = self.view() }).label(start, end);
     }
     pub fn turnEnd(self: Timeline, start: i64, end: i64) i64 {
         const i = self.first(start);
         return if (i < self.count) @min(end, self.at(i).end_ns) else end;
     }
     pub fn slice(self: Timeline, a: std.mem.Allocator, start: i64, end: i64) ![]const speakers.Span {
-        var out: std.ArrayList(speakers.Span) = .empty;
-        errdefer out.deinit(a);
-        var i = self.first(start);
-        while (i < self.count) : (i += 1) {
-            const span = self.at(i);
-            if (span.start_ns >= end) break;
-            try out.append(a, .{ .start_ns = @max(start, span.start_ns), .end_ns = @min(end, span.end_ns), .speaker_index = span.speaker_index });
-        }
-        return out.toOwnedSlice(a);
+        return (ReadView{ .shared = self.view() }).slice(a, start, end);
     }
 };
 
