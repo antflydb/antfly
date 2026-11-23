@@ -4513,34 +4513,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if ((primary_ticket != null or txn_ticket != null) and !commits_after_wait) {
                 if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
             }
-            // Graph, sparse and dense publications read-modify-write their
-            // mirrors at prepare, so each holds its index's apply guard until
-            // its mirror carries the write. Install them once staged rather
-            // than once durable: the group applies writes in staging order,
-            // so the next writer of the index prepares from a mirror that
-            // already includes this one, and the guard no longer spans the
-            // fsync. A write that then fails to become durable leaves the
-            // outcome uncertain, which reopens the runtime.
-            var graph_installed = false;
-            var sparse_installed = false;
-            var dense_installed = false;
-            if (primary_ticket != null or txn_ticket != null) {
-                if (inline_graph_publication) |prepared| {
-                    prepared.install();
-                    inline_graph_publication = null;
-                    graph_installed = true;
-                }
-                if (inline_sparse_publication) |prepared| {
-                    prepared.install();
-                    inline_sparse_publication = null;
-                    sparse_installed = true;
-                }
-                if (inline_dense_publication) |prepared| {
-                    prepared.install();
-                    inline_dense_publication = null;
-                    dense_installed = true;
-                }
-            }
             // WS3: wait for the primary write's durability only now, with the
             // apply lock (and, above `batchInternalPreparedOwned`, the capi
             // connection gate) already released, so this call's fsync can
@@ -4636,26 +4608,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (inline_text_publication_count != 0) {
                 if (S.ownerField(self, "text_merge_runtime").*) |runtime| runtime.notify();
             }
+            const executor = S.ownerField(self, "executor").*;
             if (inline_graph_publication) |prepared| {
                 prepared.install();
                 inline_graph_publication = null;
-                graph_installed = true;
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
             }
             if (inline_sparse_publication) |prepared| {
                 prepared.install();
                 inline_sparse_publication = null;
-                sparse_installed = true;
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
             }
             if (inline_dense_publication) |prepared| {
                 prepared.install();
                 inline_dense_publication = null;
-                dense_installed = true;
-            }
-            if (S.ownerField(self, "executor").*.hasWorkers()) {
-                const executor = S.ownerField(self, "executor").*;
-                if (graph_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_graph_handled_name, sequence);
-                if (sparse_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_sparse_handled_name, sequence);
-                if (dense_installed) _ = executor.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
+                if (executor.hasWorkers()) _ = executor.advanceAppliedSequenceIfContiguous(inline_dense_handled_name, sequence);
             }
             // Same durability boundary as the inline text publications just
             // above, for the algebraic ones. Mirror each now-durable

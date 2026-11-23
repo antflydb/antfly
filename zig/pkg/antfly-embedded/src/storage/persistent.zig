@@ -2161,6 +2161,7 @@ pub const PersistentIndex = struct {
                 else => {},
             }
             for (tip_entries) |entry| try txn.delete(.docmap, entry.key);
+            try deleteAllInKeyspace(self.alloc, &txn, .l0);
             try deleteAllInKeyspace(self.alloc, &txn, .dead);
             txn.delete(.meta, meta_rebuild_versions) catch |err| switch (err) {
                 error.NotFound => {},
@@ -2624,7 +2625,18 @@ pub const PersistentIndex = struct {
     /// the writer snapshot, after which the write's ack may return. A failure
     /// leaves memory behind the file; the next refresh reloads it.
     pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) void {
-        var replacement = [_]index_mod.ReplacementSegmentData{.{ .id = publication.seg_id, .data = index_mod.SegmentData.fromOwnedHeap(publication.segment_bytes) }};
+        var deleted = self.inlineDeletionBitmap(publication.copies) catch |err| {
+            std.log.err("full-text level-0 deletion lookup failed seg={d} err={s}", .{ publication.seg_id, @errorName(err) });
+            publication.abort(self.alloc);
+            self.invalidateNativeCatalogMirror();
+            return;
+        };
+        defer if (deleted) |*bitmap| bitmap.deinit();
+        var replacement = [_]index_mod.ReplacementSegmentData{.{
+            .id = publication.seg_id,
+            .data = index_mod.SegmentData.fromOwnedHeap(publication.segment_bytes),
+            .deleted = if (deleted) |*bitmap| bitmap else null,
+        }};
         publication.copies_arena.deinit();
         publication.* = undefined;
         var prepared = self.writer.prepareSegmentsManyData(&.{}, &replacement) catch |err| {
@@ -2634,6 +2646,30 @@ pub const PersistentIndex = struct {
             return;
         };
         prepared.publish();
+    }
+
+    /// Install can run after a later commit on the same key. Read the
+    /// authoritative doc map so the incoming snapshot never exposes that copy.
+    fn inlineDeletionBitmap(self: *PersistentIndex, copies: []const VersionedChange) !?roaring.RoaringBitmap {
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        var bitmap = roaring.RoaringBitmap.init(self.alloc);
+        errdefer bitmap.deinit();
+        for (copies, 0..) |copy, local| {
+            const bytes = txn.get(.docmap, copy.key) catch |err| switch (err) {
+                error.NotFound => {
+                    try bitmap.add(@intCast(local));
+                    continue;
+                },
+                else => return err,
+            };
+            if (try DocVersion.decode(bytes) != copy.version) try bitmap.add(@intCast(local));
+        }
+        if (bitmap.isEmpty()) {
+            bitmap.deinit();
+            return null;
+        }
+        return bitmap;
     }
 
     /// Like indexSegment(), but takes ownership of segment_bytes.
@@ -6706,6 +6742,7 @@ test "persistent index merge folds level-0 records into a segment" {
     var publication = try pi.prepareInlineSegmentPublication(level0);
     const l0_id = publication.seg_id;
     const va = publication.copies[0].version;
+    try test_sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(va));
     const mutations = publication.mutations();
     try InlinePublicationTestSink.submit(&test_sink, "", &mutations, true);
     pi.installInlineSegmentPublication(&publication);
@@ -6761,6 +6798,7 @@ test "persistent index publishes an inline write as a level-0 record and reloads
             defer snap.release();
             try std.testing.expectEqual(@as(usize, 0), snap.segments.len);
         }
+        try test_sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(publication.copies[0].version));
         // Stands in for the write's own native transaction committing it.
         const mutations = publication.mutations();
         try InlinePublicationTestSink.submit(&test_sink, "", &mutations, true);
@@ -6788,6 +6826,45 @@ test "persistent index publishes an inline write as a level-0 record and reloads
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
     // A level-0 id never advances the segment counter.
     try std.testing.expect(!isL0SegmentId(reopened.writer.next_segment_id));
+}
+
+test "persistent index masks a late level-0 install and clears it on rebuild" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var pi = try openVersionedTestIndex(alloc, &sink, path);
+        defer pi.close();
+        const bytes = try buildSimpleSegment(alloc, "doc:a", "old");
+        var publication = pi.prepareInlineSegmentPublication(bytes) catch |err| {
+            alloc.free(bytes);
+            return err;
+        };
+        const version = publication.copies[0].version;
+        const mutations = publication.mutations();
+        try InlinePublicationTestSink.submit(&sink, "", &mutations, true);
+        try pi.applyExternallyCommittedMutationsIfNativeCatalog(&mutations);
+        try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(DocVersion.deletion(version)));
+
+        pi.installDeadVersions(&.{version});
+        pi.installInlineSegmentPublication(&publication);
+        {
+            const snapshot = pi.writer.acquireSnapshot();
+            defer snapshot.release();
+            try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+            try std.testing.expectEqual(@as(u32, 0), snapshot.liveDocCount());
+        }
+        try pi.resetAllForRebuild();
+    }
+    var reopened = try openVersionedTestIndex(alloc, &sink, path);
+    defer reopened.close();
+    const snapshot = reopened.writer.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.segments.len);
 }
 
 test "persistent index prepares a merged seal mutation without committing, and returns null once already covered" {
