@@ -33056,7 +33056,7 @@ pub const RaftApplyStore = struct {
             var table_buffer: [256]u8 = undefined;
             const raw = (try stagingGet(txn, try tableKeyForGroup(&table_buffer, group_id, member.table.table_id))) orelse return;
             const table = try decodeTableRecord(a, raw);
-            if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, table.table_id)) return;
+            if (!try self.committedTopologyMutationAllowedTxn(txn, group_id, table.table_id)) return;
             if (table.storage.engine != .local or !std.meta.eql(member.table.binding, changefeed_control.tableBinding(table))) return;
         };
         const encoded = try std.json.Stringify.valueAlloc(a, next, .{});
@@ -55421,10 +55421,12 @@ const TransitionTag = enum(u8) {
     apply_sql_lock_scope = 95,
     apply_sql_prepared_transaction = 92,
     comment_column = 88,
-    apply_sql_sequence_counter = 86,
-    apply_schema_validation = 85,
-    cancel_relational_index_publication = 84,
-    decide_relational_index_publication = 83,
+    // The ordered source, changefeed, PostgreSQL publication and bootstrap
+    // controls already own tags 83–86 on main.
+    decide_relational_index_publication = 104,
+    cancel_relational_index_publication = 105,
+    apply_schema_validation = 106,
+    apply_sql_sequence_counter = 107,
     accept_relational_index_delivery = 91,
     complete_relational_index_source = 100,
     ack_relational_index_publication = 90,
