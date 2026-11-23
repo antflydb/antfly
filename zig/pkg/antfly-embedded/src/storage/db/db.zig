@@ -102500,7 +102500,7 @@ test "db query drops full text hits whose stored document row was deleted direct
                 .{ .id = remote_key },
                 .{ .id = @constCast("doc:off-shard"), .artifact_ref = embedding_ref },
                 .{ .id = @constCast("doc:b"), .artifact_ref = .{ .document_id = @constCast("doc:b"), .name = @constCast("absent_embedding"), .kind = .embedding } },
-            }, null);
+            }, null, null);
             defer test_alloc.free(keep);
             try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, keep);
             // A single managed vector source uses chunk metadata even when
@@ -102508,7 +102508,7 @@ test "db query drops full text hits whose stored document row was deleted direct
             const single = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
                 .{ .id = remote_key },
                 .{ .id = source_key },
-            }, "remote_dense");
+            }, "remote_dense", null);
             defer test_alloc.free(single);
             try std.testing.expectEqualSlices(bool, &.{ false, true }, single);
         }
