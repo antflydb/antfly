@@ -1186,57 +1186,123 @@ pub fn quantizeQ4_KBlock(input: []const f32, output: []u8) void {
     std.debug.assert(input.len == tensor_types.valuesPerBlock(.{ .known = .Q4_K }).?);
     std.debug.assert(output.len == tensor_types.bytesPerBlock(.{ .known = .Q4_K }).?);
 
-    @memset(output, 0);
-    var sub_scales: [8]f32 = undefined;
-    var sub_mins: [8]f32 = undefined;
-    var scs: [8]u8 = undefined;
-    var mins: [8]u8 = undefined;
-    var max_scale: f32 = 0.0;
-    var max_min: f32 = 0.0;
-
-    for (0..8) |sub| {
-        const start = sub * 32;
-        const sub_input = input[start .. start + 32];
-        var min_v = sub_input[0];
-        var max_v = sub_input[0];
-        for (sub_input[1..]) |value| {
-            min_v = @min(min_v, value);
-            max_v = @max(max_v, value);
-        }
-        const min_mag = @max(-min_v, 0.0);
-        const scale = if (max_v + min_mag == 0.0) @as(f32, 1.0) else (max_v + min_mag) / 15.0;
-        sub_scales[sub] = scale;
-        sub_mins[sub] = min_mag;
-        max_scale = @max(max_scale, scale);
-        max_min = @max(max_min, min_mag);
+    var fits: [8]Q4KFit = undefined;
+    var max_scale: f32 = 0;
+    var max_offset: f32 = 0;
+    for (&fits, 0..) |*fit, sub| {
+        fit.* = fitQ4KGroup(input[sub * 32 ..][0..32]);
+        max_scale = @max(max_scale, fit.scale);
+        max_offset = @max(max_offset, -fit.minimum);
     }
 
-    const d = if (max_scale == 0.0) @as(f32, 1.0) else max_scale / 63.0;
-    const dmin = if (max_min == 0.0) @as(f32, 1.0) else max_min / 63.0;
-    writeF16Le(output[0..2], d);
-    writeF16Le(output[2..4], dmin);
+    const scale_factor = if (max_scale > 0) 63.0 / max_scale else 0;
+    const offset_factor = if (max_offset > 0) 63.0 / max_offset else 0;
+    writeF16Le(output[0..2], max_scale / 63.0);
+    writeF16Le(output[2..4], max_offset / 63.0);
 
-    for (0..8) |sub| {
-        scs[sub] = if (max_scale == 0.0) 0 else @intFromFloat(@min(@max(std.math.round(sub_scales[sub] / d), 0.0), 63.0));
-        mins[sub] = if (max_min == 0.0) 0 else @intFromFloat(@min(@max(std.math.round(sub_mins[sub] / dmin), 0.0), 63.0));
+    var scales: [8]u8 = undefined;
+    var offsets: [8]u8 = undefined;
+    for (fits, &scales, &offsets) |fit, *scale, *offset| {
+        scale.* = roundQ4KCode(fit.scale * scale_factor, 63);
+        offset.* = roundQ4KCode(-fit.minimum * offset_factor, 63);
     }
-    packQ4KScaleMins(output[4..16], scs, mins);
+    packQ4KScaleMins(output[4..16], scales, offsets);
 
-    for (0..4) |chunk| {
-        const sub0 = chunk * 2;
-        const sub1 = sub0 + 1;
-        const scale0 = if (sub_scales[sub0] == 0.0) @as(f32, 1.0) else sub_scales[sub0];
-        const scale1 = if (sub_scales[sub1] == 0.0) @as(f32, 1.0) else sub_scales[sub1];
-        const inv0 = if (sub_scales[sub0] == 0.0) 0.0 else 1.0 / scale0;
-        const inv1 = if (sub_scales[sub1] == 0.0) 0.0 else 1.0 / scale1;
-        const q_off = 16 + chunk * 32;
-
-        for (0..32) |i| {
-            const q0 = quantizeUnsigned(input[sub0 * 32 + i] + sub_mins[sub0], inv0, 15);
-            const q1 = quantizeUnsigned(input[sub1 * 32 + i] + sub_mins[sub1], inv1, 15);
-            output[q_off + i] = q0 | (q1 << 4);
+    // Use the same rounded scales as the decoder when assigning the nibbles.
+    const block_scale = decodeFp16Le(output[0], output[1]);
+    const block_offset = decodeFp16Le(output[2], output[3]);
+    for (0..4) |pair| {
+        const low = pair * 2;
+        const high = low + 1;
+        const low_scale = block_scale * @as(f32, @floatFromInt(scales[low]));
+        const high_scale = block_scale * @as(f32, @floatFromInt(scales[high]));
+        const low_offset = block_offset * @as(f32, @floatFromInt(offsets[low]));
+        const high_offset = block_offset * @as(f32, @floatFromInt(offsets[high]));
+        for (output[16 + pair * 32 ..][0..32], 0..) |*byte, i| {
+            const lo = if (low_scale > 0) roundQ4KCode((input[low * 32 + i] + low_offset) / low_scale, 15) else 0;
+            const hi = if (high_scale > 0) roundQ4KCode((input[high * 32 + i] + high_offset) / high_scale, 15) else 0;
+            byte.* = lo | (hi << 4);
         }
     }
+}
+
+const Q4KFit = struct {
+    scale: f32,
+    minimum: f32,
+};
+
+fn roundQ4KCode(value: f32, comptime limit: u8) u8 {
+    // Adding 2^23 + 2^22 rounds a small nonnegative f32 to an even integer.
+    const bounded = @min(@max(value, 0), @as(f32, @floatFromInt(limit)));
+    return @intFromFloat((bounded + 12582912.0) - 12582912.0);
+}
+
+// Use the unweighted-quantization reference strategy from ggml: weight each
+// sample by its magnitude plus the group's RMS, then fit legal affine grids.
+fn fitQ4KGroup(input: *const [32]f32) Q4KFit {
+    var squared_sum: f32 = 0;
+    var minimum = input[0];
+    var maximum = input[0];
+    for (input) |value| {
+        squared_sum += value * value;
+        minimum = @min(minimum, value);
+        maximum = @max(maximum, value);
+    }
+    minimum = @min(minimum, 0);
+    const range = maximum - minimum;
+    if (range == 0) return .{ .scale = 0, .minimum = minimum };
+
+    const rms = @sqrt(squared_sum / 32.0);
+    var weights: [32]f32 = undefined;
+    var weight_sum: f32 = 0;
+    var weighted_input: f32 = 0;
+    for (input, &weights) |value, *weight| {
+        weight.* = rms + @abs(value);
+        weight_sum += weight.*;
+        weighted_input += weight.* * value;
+    }
+
+    const initial_inverse = 15.0 / range;
+    var best: Q4KFit = .{ .scale = 1.0 / initial_inverse, .minimum = minimum };
+    var best_error: f32 = 0;
+    for (input, weights) |value, weight| {
+        const code: f32 = @floatFromInt(roundQ4KCode(initial_inverse * (value - minimum), 15));
+        const residual = best.scale * code + minimum - value;
+        best_error += weight * (residual * residual);
+    }
+
+    for (0..21) |step| {
+        const inverse = (14.0 + 0.1 * @as(f32, @floatFromInt(step))) / range;
+        var codes: [32]f32 = undefined;
+        var weighted_code: f32 = 0;
+        var weighted_code_squared: f32 = 0;
+        var weighted_cross: f32 = 0;
+        for (input, weights, &codes) |value, weight, *code| {
+            code.* = @floatFromInt(roundQ4KCode(inverse * (value - best.minimum), 15));
+            const weighted = weight * code.*;
+            weighted_code += weighted;
+            weighted_code_squared += weighted * code.*;
+            weighted_cross += weighted * value;
+        }
+        const determinant = weight_sum * weighted_code_squared - weighted_code * weighted_code;
+        if (determinant <= 0) continue;
+        var fit: Q4KFit = .{
+            .scale = (weight_sum * weighted_cross - weighted_input * weighted_code) / determinant,
+            .minimum = (weighted_code_squared * weighted_input - weighted_code * weighted_cross) / determinant,
+        };
+        if (fit.minimum > 0) fit = .{ .scale = weighted_cross / weighted_code_squared, .minimum = 0 };
+        if (fit.scale <= 0) continue;
+        var candidate_error: f32 = 0;
+        for (input, weights, codes) |value, weight, code| {
+            const residual = fit.scale * code + fit.minimum - value;
+            candidate_error += weight * (residual * residual);
+        }
+        if (candidate_error < best_error) {
+            best = fit;
+            best_error = candidate_error;
+        }
+    }
+    return best;
 }
 
 fn maxAbs(input: []const f32) f32 {
@@ -2508,6 +2574,30 @@ test "quantize q4_k block packs exact header and representative qs bytes" {
     try std.testing.expectEqualSlices(u8, &expected_qs, raw[48..80]);
     try std.testing.expectEqualSlices(u8, &expected_qs, raw[80..112]);
     try std.testing.expectEqualSlices(u8, &expected_qs, raw[112..144]);
+}
+
+test "quantize q4_k fits skewed groups using the stored scales" {
+    var input: [256]f32 = undefined;
+    for (&input, 0..) |*value, index| {
+        const sample = @as(i32, @intCast(index * 37 % 113)) - 56;
+        const group_scale: i32 = @intCast(1 + index / 32);
+        const outlier_scale: i32 = if (index % 32 == 0) 4 else 1;
+        value.* = @as(f32, @floatFromInt(sample * group_scale * outlier_scale)) / 64.0;
+    }
+
+    var raw: [144]u8 = undefined;
+    quantizeQ4_KBlock(&input, &raw);
+    var decoded: [256]f32 = undefined;
+    try dequantizeToFloat32(.{ .known = .Q4_K }, &raw, &decoded);
+
+    var squared_error: f32 = 0;
+    for (input, decoded) |reference, actual| {
+        const residual = reference - actual;
+        squared_error += residual * residual;
+    }
+    // The ggml reference scores 16.38 on this block; the old min/max fit
+    // and pre-packing nibble assignment scored 17.64.
+    try std.testing.expect(squared_error <= 16.5);
 }
 
 test "quantize q4_k rejects non-block-sized input" {
