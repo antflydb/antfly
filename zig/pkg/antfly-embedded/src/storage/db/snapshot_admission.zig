@@ -102,6 +102,13 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 
+    /// Try to admit a mutation without waiting on a snapshot capture.
+    pub fn tryAcquireMutation(self: *@This()) ?MutationLease {
+        if (!self.lock.tryLockShared()) return null;
+        _ = self.mutation_revision.fetchAdd(1, .release);
+        return .{ .admission = self };
+    }
+
     pub fn acquireMutationIo(self: *@This(), io: std.Io, cancellation: anytype) !MutationLease {
         try self.lock.lockSharedIo(io, cancellation);
         _ = self.mutation_revision.fetchAdd(1, .release);
