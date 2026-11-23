@@ -1076,7 +1076,7 @@ pub fn resample(allocator: std.mem.Allocator, samples: []const f32, src_rate: u3
 
 /// Resample one logical PCM window kept in two adjacent slices.
 pub fn copyOrResampleParts(allocator: std.mem.Allocator, prefix: []const f32, tail: []const f32, src_rate: u32, dst_rate: u32) ![]f32 {
-    const len = try std.math.add(usize, prefix.len, tail.len);
+    const len = std.math.add(usize, prefix.len, tail.len) catch return error.UnsupportedAudioFormat;
     if (src_rate == 0 or dst_rate == 0 or len == 0) return error.UnsupportedAudioFormat;
     if (src_rate == dst_rate) {
         const out = try allocator.alloc(f32, len);
@@ -1093,7 +1093,9 @@ pub fn copyOrResampleParts(allocator: std.mem.Allocator, prefix: []const f32, ta
 
 fn resampleLinear(allocator: std.mem.Allocator, prefix: []const f32, tail: []const f32, len: usize, src_rate: u32, dst_rate: u32, comptime split: bool) ![]f32 {
     const ratio = @as(f64, @floatFromInt(src_rate)) / @as(f64, @floatFromInt(dst_rate));
-    const out_len: usize = @intFromFloat(@as(f64, @floatFromInt(len)) / ratio);
+    const output_samples = @as(f64, @floatFromInt(len)) / ratio;
+    if (output_samples >= @as(f64, @floatFromInt(@as(u128, std.math.maxInt(usize)) + 1))) return error.UnsupportedAudioFormat;
+    const out_len: usize = @intFromFloat(output_samples);
     const out = try allocator.alloc(f32, out_len);
     errdefer allocator.free(out);
 
