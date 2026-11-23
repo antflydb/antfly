@@ -3110,6 +3110,31 @@ pub const SparseIndex = struct {
         alloc.free(items);
     }
 
+    /// Owns a private catalog root and a separate allocation/counter state.
+    /// Subsequent staged writes on this view see the earlier queued writes.
+    pub fn forkInlineWriter(self: *SparseIndex) !SparseIndex {
+        const original = switch (self.owner) {
+            .native_catalog => |backend| backend,
+            else => return error.InlineSparsePublicationUnsupported,
+        };
+        const backend = try self.alloc.create(native_catalog_backend.Backend);
+        errdefer self.alloc.destroy(backend);
+        backend.* = try original.forkWriterView();
+        errdefer backend.close();
+        return .{
+            .alloc = self.alloc,
+            .store = try backend.runtimeStore(self.alloc, .{}),
+            .owner = .{ .native_catalog = backend },
+            .construction_cancellation = self.construction_cancellation,
+            .chunk_size = self.chunk_size,
+            .next_doc_num = self.next_doc_num,
+            .next_segment_id = self.next_segment_id,
+            .doc_count = self.doc_count,
+            .term_count = self.term_count,
+            .resource_manager = self.resource_manager,
+        };
+    }
+
     /// Builds one small sparse batch's `InlineSparsePublication`, without
     /// touching this index's durable sink (see `native_catalog_backend.
     /// Backend.boundWrite`'s "never talks to sink" note). Returns
@@ -3187,6 +3212,12 @@ pub const SparseIndex = struct {
     /// counter values -- the step after which a synchronous sparse-visible
     /// write's ack may return.
     pub fn installInlineSparsePublication(self: *SparseIndex, publication: *InlineSparsePublication) !void {
+        try self.applyInlinePublicationToView(publication);
+        publication.abort();
+    }
+
+    /// Advances this view using a publication retained by its host ticket.
+    pub fn applyInlinePublicationToView(self: *SparseIndex, publication: *const InlineSparsePublication) !void {
         const backend = switch (self.owner) {
             .native_catalog => |b| b,
             else => return error.InlineSparsePublicationUnsupported,
@@ -3196,8 +3227,6 @@ pub const SparseIndex = struct {
         self.next_segment_id = publication.next_segment_id;
         self.doc_count = publication.doc_count;
         self.term_count = publication.term_count;
-        freeOwnedSparseMutations(self.alloc, publication.mutations);
-        publication.* = undefined;
     }
 
     fn estimateSparseBulkWorkingBytes(writes: []const SparseWrite) u64 {
@@ -7384,6 +7413,42 @@ const NativeCatalogTestSink = struct {
         return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
     }
 };
+
+test "sparse private writer view chains queued postings without serving them" {
+    const alloc = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const path = tmpPath(&buf, "inline-writer-view");
+    defer cleanupTmp(path);
+
+    var test_sink = NativeCatalogTestSink{ .allocator = alloc };
+    defer test_sink.deinit();
+    var index = try SparseIndex.open(alloc, path, .{
+        .backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer index.close();
+    var writer = try index.forkInlineWriter();
+    defer writer.close();
+    const previous_submit_calls = test_sink.submit_calls;
+    const vector: SparseVector = .{ .indices = &.{3}, .values = &.{1} };
+
+    var first = try writer.prepareInlineSparsePublication(&.{.{ .doc_id = "first", .vec = vector }}, &.{});
+    defer first.abort();
+    try writer.applyInlinePublicationToView(&first);
+    var second = try writer.prepareInlineSparsePublication(&.{.{ .doc_id = "second", .vec = vector }}, &.{});
+    defer second.abort();
+    try writer.applyInlinePublicationToView(&second);
+    try std.testing.expectEqual(previous_submit_calls, test_sink.submit_calls);
+    try std.testing.expectEqual(@as(u64, 2), writer.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), index.doc_count);
+
+    const queued = try writer.search(alloc, &vector, 10);
+    defer SparseIndex.freeResults(alloc, queued);
+    const served = try index.search(alloc, &vector, 10);
+    defer SparseIndex.freeResults(alloc, served);
+    try std.testing.expectEqual(@as(usize, 2), queued.len);
+    try std.testing.expectEqual(@as(usize, 0), served.len);
+}
 
 test "sparse inline publication folds one batch into an externally-owned commit and is durable after reopen" {
     const alloc = std.testing.allocator;
