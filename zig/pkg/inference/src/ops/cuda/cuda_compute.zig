@@ -20695,7 +20695,7 @@ fn retainAudioGraphBacking(self: *CudaCompute, bank: *buffer_mod.DeviceBuffer, q
     };
 }
 
-fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: CacheCleanup) anyerror!?CT {
+fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: CacheCleanup, _: bool) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
     self.audio_execution_active = true;
@@ -39166,7 +39166,7 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     compute.capability_profile = .embedding_gemma2;
     compute.embedding_gemma2_policy = .{ .audio_graph = true };
     compute.audio_execution_active = true;
-    try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined, .{}) == null);
+    try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined, .{}, false) == null);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.evictEmbeddingGemma2Caches());
     var plan: @import("audio_execution_plan.zig").Plan = undefined;
     var scope = @import("../../execution/stream_workspace.zig").Scope{ .plan = &plan, .base = 1 };

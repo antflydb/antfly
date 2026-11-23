@@ -13745,13 +13745,14 @@ pub const StagedExecution = struct {
         return .{ .ptr = self, .close_fn = closeFrontendCache };
     }
 
-    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, keys: []const u64, inputs: []const ops.CT) anyerror!void {
-        if (comptime !build_options.enable_metal) return;
+    fn metalAudioScratch(raw: *anyopaque, cb: *const ops.ComputeBackend, keys: []const u64, inputs: []const ops.CT) anyerror!bool {
+        if (comptime !build_options.enable_metal) return false;
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
-        if (!self.active or self.cb.ptr != cb.ptr or self.cb.vtable != cb.vtable or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return;
-        const model = self.model_retention orelse return;
-        const pin = if (model.admission_domain) |*value| value else return;
+        if (!self.active or self.cb.ptr != cb.ptr or self.cb.vtable != cb.vtable or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return false;
+        const model = self.model_retention orelse return false;
+        const pin = if (model.admission_domain) |*value| value else return false;
         const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+        if (!Metal.audioArenaDomainMatches(cb, pin)) return false;
         const Upgrade = @import("audio_schedule.zig").Plan.ArenaRequest;
         var requests: [12]Upgrade = undefined;
         if (keys.len > requests.len) return error.UnsupportedPreparedAudioCache;
@@ -13765,7 +13766,7 @@ pub const StagedExecution = struct {
                 count += 1;
             }
         }
-        if (count == 0) return;
+        if (count == 0) return true;
 
         try pause(self);
         var banks: [12]?Metal.FundedAudioBank = @splat(null);
@@ -13793,11 +13794,12 @@ pub const StagedExecution = struct {
             };
             try acquire(self);
             if (settlement) |err| return err;
-            return;
+            return true;
         };
         for (requests[0..count], banks[0..count]) |request, *value| if (value.*) |*bank| {
             if (try Metal.publishAudioScratch(cb, request, bank)) value.* = null;
         };
+        return true;
     }
 
     fn audioCache(raw: *anyopaque, cb: *const ops.ComputeBackend, request: @import("audio_schedule.zig").AudioRecipe, live_inputs: []const *ops.CT) anyerror!ops.EmbeddingCacheScope {

@@ -1921,7 +1921,7 @@ pub const EmbeddingStageControl = struct {
     video_consumer_fn: ?*const fn (*anyopaque, *const ComputeBackend) anyerror!EmbeddingCacheScope = null,
     image_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingImageCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
     vision_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingVisionCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
-    audio_scratch_fn: ?*const fn (*anyopaque, *const ComputeBackend, []const u64, []const CT) anyerror!void = null,
+    audio_scratch_fn: ?*const fn (*anyopaque, *const ComputeBackend, []const u64, []const CT) anyerror!bool = null,
     audio_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, @import("../execution/audio_schedule.zig").AudioRecipe, []const *CT) anyerror!EmbeddingCacheScope = null,
     /// A fenced ready-work boundary may keep its provider when uncontended.
     yield_ready_fn: ?*const fn (*anyopaque) anyerror!void = null,
@@ -2982,7 +2982,7 @@ pub const ComputeBackend = struct {
         audioSetControl: ?*const fn (ctx: *anyopaque, control: ?InferenceExecutionControl) ?InferenceExecutionControl = null,
         audioStorage: ?*const fn (ctx: *anyopaque, begin: bool) anyerror!bool = null,
         audioPad: ?*const fn (ctx: *anyopaque, input: CT, p: AudioPadParams) anyerror!?CT = null,
-        audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context) anyerror!?CT = null,
+        audioExecution: ?*const fn (ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT = null,
         audioLogMelEnabled: ?*const fn (ctx: *anyopaque) bool = null,
         audioLogMel: ?*const fn (ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT = null,
         audioBatchLayoutsEnabled: ?*const fn (ctx: *anyopaque) bool = null,
@@ -5749,6 +5749,10 @@ pub const ComputeBackend = struct {
     }
 
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
+        return self.audioExecutionWithArenaFunding(key, inputs, context, run, false);
+    }
+
+    pub fn audioExecutionWithArenaFunding(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, defer_arena: bool) !?CT {
         const op = self.vtable.audioExecution orelse return null;
         const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
         defer if (self.vtable.audioSetControl) |set| {
@@ -5756,7 +5760,7 @@ pub const ComputeBackend = struct {
         };
         try self.checkExecutionControl();
         const cleanup = if (self.call_context) |invocation| invocation.cleanup else @import("../execution/cleanup_context.zig").Context{};
-        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, cleanup });
+        const result = try self.observeBackendEntry(.audio_execution, op, .{ self.ptr, key, inputs, context, run, cleanup, defer_arena });
         errdefer if (result) |ct| self.free(ct);
         try self.checkExecutionControl();
         return result;
@@ -7810,7 +7814,7 @@ test "audio execution forwards caller cleanup authority" {
     const Invocation = @import("../execution/invocation_context.zig").Context;
     const Epoch = @import("../execution/retirement_sink.zig").Epoch;
     const Fixture = struct {
-        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: Cleanup) anyerror!?CT {
+        fn execute(raw: *anyopaque, _: u64, _: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, cleanup: Cleanup, _: bool) anyerror!?CT {
             const observed: *Cleanup = @ptrCast(@alignCast(raw));
             observed.* = cleanup;
             return try run(context, &.{});

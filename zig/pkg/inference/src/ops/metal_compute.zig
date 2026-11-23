@@ -22967,9 +22967,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
     const audio_schedule_bank_limit = 64 * 1024 * 1024;
 
-    fn audioTryPrepare(self: *MetalCompute, plan: *audio_tape.Plan) !void {
+    fn audioTryPrepare(self: *MetalCompute, plan: *audio_tape.Plan, defer_arena: bool) !void {
         if (self.provider_impl.audio_schedule_clock < plan.retry_after) return;
         if (plan.prepared) {
+            if (defer_arena) return;
             const request = (try plan.scratchUpgrade(self.provider_impl.audio_schedule_clock, audio_schedule_bank_limit)) orelse return;
             self.audioUpgradeInputWorkspace(plan, request, null) catch |err| {
                 plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
@@ -22981,7 +22982,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             };
             return;
         }
-        self.audioPreparePlan(plan) catch |err| {
+        self.audioPreparePlan(plan, defer_arena) catch |err| {
             if (err != error.AudioScheduleAdmission or !plan.bindings_ready or plan.arena != null) self.audioUnpreparePlan(plan);
             plan.retry_after = self.provider_impl.audio_schedule_clock + plan.retry_delay;
             plan.retry_delay = @min(@as(u8, 64), plan.retry_delay *| 2);
@@ -22990,6 +22991,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 else => return err,
             }
         };
+        if (!plan.prepared) return;
         plan.selection = .{};
         plan.retry_delay = 1;
         if (plan.arena_recipe.workspaceBytes(plan.workspaces.len, plan.count, audio_schedule_bank_limit) != 0 and plan.input_workspace_bytes == 0) plan.retry_after = self.provider_impl.audio_schedule_clock + 1;
@@ -23063,8 +23065,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             node.arena_offset = null;
         }
     }
-    fn audioPreparePlan(self: *MetalCompute, plan: *audio_tape.Plan) !void {
+    fn audioPreparePlan(self: *MetalCompute, plan: *audio_tape.Plan, defer_arena: bool) !void {
         if (!plan.bindings_ready) try self.audioPrepareBindings(plan);
+        if (defer_arena) {
+            if (try plan.initialArena(audio_schedule_bank_limit)) |request| {
+                if (request.bytes != 0) return;
+            }
+        }
         try self.audioPrepareInitialArena(plan, null);
         plan.prepared = true;
     }
@@ -23415,6 +23422,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return .{ .key = schedule_key.finish(), .policy = policy };
     }
 
+    pub fn audioArenaDomainMatches(cb: *const ops.ComputeBackend, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) bool {
+        if (!acceptsEmbeddingStage(cb)) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const cache = if (self.data.tier_cache) |*value| value else return false;
+        self.data.prefetch.lock();
+        defer self.data.prefetch.unlock();
+        return cache.retirementDomainMatches(pin);
+    }
+
     pub fn pendingAudioScratch(cb: *const ops.ComputeBackend, key: u64, inputs: []const CT) !?audio_tape.Plan.ArenaRequest {
         if (!acceptsEmbeddingStage(cb)) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -23467,7 +23483,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return false;
     }
 
-    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, _: @import("../execution/cleanup_context.zig").Context) anyerror!?CT {
+    fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT, _: @import("../execution/cleanup_context.zig").Context, defer_arena: bool) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const selection = audioExecutionSelection(self, key, inputs) orelse return null;
         const p = self.provider_impl;
@@ -23527,7 +23543,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return out;
         }
         if (plan.ready) {
-            try self.audioTryPrepare(plan);
+            try self.audioTryPrepare(plan, defer_arena);
+            if (defer_arena and !plan.prepared) return try run(context, inputs);
             const replay = plan.selection.useReplay();
             var out: CT = undefined;
             const stats = audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_AUDIO_STATS");
@@ -23582,7 +23599,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 plan.retry_after = p.audio_schedule_clock + plan.retry_delay;
                 return out;
             };
-            try self.audioTryPrepare(plan);
+            try self.audioTryPrepare(plan, defer_arena);
         } else {
             plan.nodes = &.{};
             plan.constants = &.{};
@@ -53367,6 +53384,32 @@ test "Metal cold audio bank keeps its admission through an independent SDK retai
     @import("../execution/resource_retirement.zig").pollRetirementChargesCPU();
     try cache.flushReleasedOutsideExecution();
     try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().backend_weight_bytes);
+
+    var outputs: [1]?CT = @splat(null);
+    plan.storage.outputs = &outputs;
+    nodes[0].prepared_slot = 0;
+    nodes[0].arena_offset = 0;
+    nodes[0].output_rows = 1;
+    nodes[0].output_dim = 8;
+    plan.arena_recipe = .{ .outputs_bytes = bytes, .input_workspace_bytes = bytes, .total_bytes = bytes * 2 };
+    plan.bindings_ready = true;
+    try compute.audioTryPrepare(&plan, true);
+    try std.testing.expect(!plan.prepared and plan.arena == null and cache.backend_bytes == 0);
+    const initial = (try plan.pendingArena(0, bytes * 2)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(initial.initial != null);
+    const initial_headers = MetalCompute.persistentTensorBytes(1) + 2 * MetalCompute.persistentTensorBytes(2);
+    var initial_bank = try compute.fundAudioBankOutsideExecution(initial.bytes, .private, initial_headers, &pin);
+    var initial_owned = true;
+    defer if (initial_owned) initial_bank.deinitOutsideExecution();
+    try compute.audioPrepareInitialArena(&plan, &initial_bank);
+    initial_owned = false;
+    try std.testing.expect(plan.arena_charge != null and plan.storage.outputs[0] != null and plan.workspaces[0] != null);
+    try std.testing.expectEqual(@as(usize, 0), plan.storage.backend_bytes);
+    compute.audioUnpreparePlan(&plan);
+    try cache.flushReleasedOutsideExecution();
+    @import("../execution/resource_retirement.zig").pollRetirementChargesCPU();
+    try cache.flushReleasedOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().backend_weight_bytes);
 }
 
 test "embeddinggemma2 Metal audio prepared storage rolls back admission and releases bindings" {
@@ -53533,12 +53576,12 @@ test "embeddinggemma2 Metal compact audio plans recover admission and reuse inte
     try compute.audioFreezePlan(plan);
     try std.testing.expectEqual(@as(usize, 2), plan.nodes.len);
     try std.testing.expect(plan.metadata_bytes < 16384);
-    try compute.audioTryPrepare(plan);
+    try compute.audioTryPrepare(plan, false);
     try std.testing.expect(!plan.prepared);
     try std.testing.expectEqual(plan.metadata_bytes, cache.host_bytes);
     cache.budget.backend_limit_bytes = 1024 * 1024;
     compute.provider_impl.audio_schedule_clock = plan.retry_after;
-    try compute.audioTryPrepare(plan);
+    try compute.audioTryPrepare(plan, false);
     try std.testing.expect(plan.prepared);
     const descriptor = plan.storage.outputs[0].?;
     for (0..3) |_| {
@@ -62358,7 +62401,7 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
     try std.testing.expect(full_bound > output_bound);
     cache.budget.backend_limit_bytes = full_bound + output_bound;
     cache.budget.host_limit_bytes = cache.host_bytes + metal_tensor_mod.device_buffer_ref_bytes + MetalCompute.persistentTensorBytes(1) + MetalCompute.persistentTensorBytes(2);
-    try compute.audioTryPrepare(plan);
+    try compute.audioTryPrepare(plan, false);
     try std.testing.expect(plan.prepared);
     try std.testing.expectEqual(recipe.outputs_bytes, plan.arena_size);
     try std.testing.expectEqual(@as(usize, 0), plan.input_workspace_bytes);
@@ -62380,7 +62423,7 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
         defer cb.decoderRuntimeCancelFrame() catch {};
         const runtime = compute.provider_impl.raw_decode_runtime;
         const before = metal_runtime_mod.runtimeMemorySnapshot(runtime).frame_retained_bytes;
-        try compute.audioTryPrepare(plan);
+        try compute.audioTryPrepare(plan, false);
         try std.testing.expectEqual(before, metal_runtime_mod.runtimeMemorySnapshot(runtime).frame_retained_bytes);
     }
     try std.testing.expectEqual(old_host, cache.host_bytes);
@@ -62391,7 +62434,7 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
     try std.testing.expect(plan.retry_after > compute.provider_impl.audio_schedule_clock);
     cache.budget.host_limit_bytes = 0;
     compute.provider_impl.audio_schedule_clock = plan.retry_after;
-    try compute.audioTryPrepare(plan);
+    try compute.audioTryPrepare(plan, false);
     try std.testing.expect(plan.prepared);
     try std.testing.expectEqual(recipe.outputs_bytes, plan.arena_size);
     try std.testing.expectEqual(recipe.input_workspace_bytes, plan.input_workspace_bytes);

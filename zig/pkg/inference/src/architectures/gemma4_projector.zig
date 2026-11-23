@@ -2201,6 +2201,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame() and !profile_enabled and std.meta.eql(audioHostOps(), AudioHostOps{}) and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
         !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_AUDIO");
     const frame_plan = if (grouped_frames) audio_schedule.audioFramePlan(subsampled.seq_len, cfg.audio_hidden, cfg.intermediate_size) else audio_schedule.AudioFramePlan{};
+    var defer_audio_arena = false;
     if (grouped_frames and audioExecutionEligible(cb, store, cfg, &layer_inputs)) {
         if (cb.embedding_stage) |stage| if (stage.audio_scratch_fn) |prepare| {
             var keys: [12]u64 = undefined;
@@ -2214,7 +2215,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
                 start = end;
             }
             const values = audioExecutionInputs(hidden, &layer_inputs);
-            try prepare(stage.ptr, cb, keys[0..count], &values);
+            defer_audio_arena = try prepare(stage.ptr, cb, keys[0..count], &values);
         };
     }
     const pipelined = grouped_frames and frame_plan.in_flight == 2 and cb.decoderRuntimeSetWhisperPipelinedFrames(true);
@@ -2239,7 +2240,7 @@ fn encodeAudioFeatureCohortResidentWithinStorage(cb: *const ComputeBackend, allo
         try cb.checkExecutionControl();
         const end = if (cohort and cb.kind() == .metal and !profile_enabled and platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null) @min(cfg.block_count, layer + frame_plan.layers) else layer + 1;
         if (cohort and cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame()) frame_active = try cb.decoderRuntimeBeginFrame();
-        const grouped = if (cohort and cb.kind() == .metal) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end) else null;
+        const grouped = if (cohort and cb.kind() == .metal) try tryAudioExecutionRange(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end, defer_audio_arena) else null;
         const next = grouped orelse try runAudioLayers(cb, allocator, store, cfg, hidden, &layer_inputs, layer, end);
         cb.free(hidden);
         hidden = next;
@@ -4793,9 +4794,9 @@ fn runAudioLayers(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
     return state;
 }
 fn tryAudioExecution(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs) !?CT {
-    return tryAudioExecutionRange(cb, a, store, cfg, hidden, inputs, 0, 12);
+    return tryAudioExecutionRange(cb, a, store, cfg, hidden, inputs, 0, 12, false);
 }
-fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize) !?CT {
+fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: AudioConfig, hidden: CT, inputs: *AudioLayerInputs, start: usize, end: usize, defer_arena: bool) !?CT {
     if (!audioExecutionEligible(cb, store, cfg, inputs)) return null;
     const Run = struct {
         cb: *const ComputeBackend,
@@ -4820,7 +4821,7 @@ fn tryAudioExecutionRange(cb: *const ComputeBackend, a: std.mem.Allocator, store
     };
     var run = Run{ .cb = cb, .a = a, .store = store, .cfg = cfg, .inputs = inputs, .start = start, .end = end };
     const values = audioExecutionInputs(hidden, inputs);
-    return cb.audioExecution(audioCacheConfig(cfg).key(inputs.segments, start, end), &values, &run, Run.call);
+    return cb.audioExecutionWithArenaFunding(audioCacheConfig(cfg).key(inputs.segments, start, end), &values, &run, Run.call, defer_arena);
 }
 
 fn audioExecutionEligible(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: AudioConfig, inputs: *const AudioLayerInputs) bool {
