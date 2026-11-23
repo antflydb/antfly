@@ -3573,11 +3573,18 @@ pub const Frame = struct {
             }
         };
         const request = kernels.Invocation{ .residual_add = residual, .attention = attention, .input_generation = self.host_input_generation, .assigned_inputs = if (issue_inputs) &issued_inputs else null, .prepared_route = selected_route, .descriptor = descriptor, .operator_plan = if (kernel.operator_plan) |*plan| plan else null, .inputs = inputs[0..descriptor.input_count] };
-        // A cached canonical Native program already owns its output views and
-        // exact resources. Its bound call below performs all current input,
-        // source/policy, output-authority and alias checks before any write.
-        // Keep the allocation-avoiding probe for generic/copied providers.
-        const probe = !cached or if (comptime @import("build_options").enable_native) !@import("../ops/native_compute.zig").isCanonicalVTable(cb.vtable) else true;
+        // A sealed canonical program already owns its output views and
+        // resources. Its bound call validates the current operands and their
+        // destination before dispatch. Generic/allocating routes still probe.
+        const canonical_native = if (comptime @import("build_options").enable_native)
+            @import("../ops/native_compute.zig").isCanonicalVTable(cb.vtable)
+        else
+            false;
+        const sealed_metal = if (comptime @import("build_options").enable_metal)
+            self.native_program_storage_sealed and selected_route != null and @import("../ops/metal_compute.zig").MetalCompute.isCanonicalVTable(cb.vtable)
+        else
+            false;
+        const probe = !cached or !(canonical_native or sealed_metal);
         if (probe and !try run(cb.ptr, request)) {
             if (selected_route != null) return error.PreparedKernelBindingChanged;
             return null;

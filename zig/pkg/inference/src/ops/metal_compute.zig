@@ -948,7 +948,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn operationAccepts(table: *const ops.ComputeBackend.VTable) bool {
-        return table == &vtable_impl or table == &owned_vtable_impl;
+        return acceptsPhysicalImplementation(table);
     }
     fn operationRecord(raw: *anyopaque, nonce: u64) !operation_owner_mod.Owner.Record.Snapshot {
         const record: *operation_owner_mod.Owner.Record = @ptrCast(@alignCast(raw));
@@ -41421,6 +41421,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.deinitBackend = destroyBackendOp;
         break :blk vt;
     };
+
+    pub fn isCanonicalVTable(table: *const ops.ComputeBackend.VTable) bool {
+        return table == &vtable_impl or table == &owned_vtable_impl;
+    }
 
     fn acceptsPhysicalImplementation(table: *const anyopaque) bool {
         // These tables share context, CT layout and every numerical callback;

@@ -5896,7 +5896,11 @@ const WhisperConstructionObservation = struct {
     fn sampleTemplates(self: *@This(), session: Session) void {
         if (!enabled(session) or session.vtable != &arch_vtable) return;
         const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
-        if (owner.backend_type != .native or owner.arch_config != .whisper) return;
+        if (owner.arch_config != .whisper) return;
+        switch (owner.backend_type) {
+            .native, .metal, .cuda => {},
+            .pjrt, .wasm => return,
+        }
         const stats = owner.dense_decoder_definitions.trySnapshot();
         self.templates = .{ .scope = .model_whisper_cache_lifetime_at_constructor_observation, .phase = .decode_prefix, .availability = if (stats != null) .sampled else .busy, .stats = stats };
     }
@@ -11603,6 +11607,7 @@ test "native incremental actual Metal owned provider preserves source lease and 
     const a = std.testing.allocator;
     const session = try incrementalMetalFixtureSession(a);
     defer session.close();
+    try std.testing.expect(session.configureExecutionDiagnostics(true));
     const control = InferenceExecutionControl{ .native_call_policy = .in_process };
     var features = [_]Tensor{try IncrementalFixture.features(a)};
     defer features[0].deinit();
@@ -11660,6 +11665,10 @@ test "native incremental actual Metal owned provider preserves source lease and 
             std.debug.print("resident Whisper preparation declined: {any}\n", .{observation.program});
             return error.ExpectedPreparedResidentWhisper;
         }
+        try std.testing.expectEqual(.prepared, observation.program.outcome);
+        const templates = observation.templates orelse return error.MissingDefinitionLifetimeStatistics;
+        try std.testing.expectEqual(.decode_prefix, templates.phase);
+        try std.testing.expectEqual(.sampled, templates.availability);
         const decoder_token = decoder.cb.backend.operationToken() orelse return error.ExpectedMetalDecoderOperation;
         var decoder_epoch = (try decoder_token.retainCleanupEpoch()) orelse return error.ExpectedMetalDecoderEpoch;
         defer decoder_epoch.release();
