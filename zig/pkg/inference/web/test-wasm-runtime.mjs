@@ -17,67 +17,16 @@ import fs from 'fs';
 import { createWasmAbi } from './runtime/wasm-abi.js';
 import { resolveWasmPath, wasmBuildHint } from './test-wasm-path.mjs';
 
-export const webgpuStubs = {
-  gpu_is_available: () => 0,
-  gpu_create_buffer: () => 0,
-  gpu_free_buffer: () => {},
-  gpu_upload: () => {},
-  gpu_download: () => {},
-  gpu_copy_buffer_to_buffer: () => {},
-  gpu_matmul: () => {},
-  gpu_matmul_transb: () => {},
-  gpu_add: () => {},
-  gpu_add_broadcast: () => {},
-  gpu_mul: () => {},
-  gpu_sub: () => {},
-  gpu_div: () => {},
-  gpu_less_than: () => {},
-  gpu_where_select: () => {},
-  gpu_neg: () => {},
-  gpu_sqrt: () => {},
-  gpu_rsqrt: () => {},
-  gpu_exp: () => {},
-  gpu_log: () => {},
-  gpu_sin: () => {},
-  gpu_cos: () => {},
-  gpu_tanh: () => {},
-  gpu_abs: () => {},
-  gpu_erf: () => {},
-  gpu_gelu: () => {},
-  gpu_softmax: () => {},
-  gpu_log_softmax: () => {},
-  gpu_reduce_sum_last_dim: () => {},
-  gpu_reduce_max_last_dim: () => {},
-  gpu_reduce_mean_last_dim: () => {},
-  gpu_reduce_sum: () => {},
-  gpu_reduce_max: () => {},
-  gpu_reduce_mean: () => {},
-  gpu_broadcast_in_dim: () => {},
-  gpu_matmul_transb_q4_0: () => {},
-  gpu_matmul_transb_q4_1: () => {},
-  gpu_matmul_transb_q5_0: () => {},
-  gpu_matmul_transb_q5_1: () => {},
-  gpu_matmul_transb_q8_0: () => {},
-  gpu_matmul_transb_q8_1: () => {},
-  gpu_matmul_transb_iq4_nl: () => {},
-  gpu_matmul_transb_iq4_xs: () => {},
-  gpu_matmul_transb_q2_k: () => {},
-  gpu_matmul_transb_q3_k: () => {},
-  gpu_matmul_transb_q4_k: () => {},
-  gpu_matmul_transb_q5_k: () => {},
-  gpu_matmul_transb_q6_k: () => {},
-  gpu_matmul_transb_q8_k: () => {},
-  gpu_matmul_transb_i2_s: () => {},
-  gpu_attention: () => {},
-  gpu_causal_attention: () => {},
-  gpu_gqa_causal_attention: () => {},
-  gpu_gqa_cached_attention: () => {},
-  gpu_gqa_cached_attention_ex: () => {},
-  gpu_write_buffer_at_offset: () => {},
-  gpu_cross_attention: () => {},
-  gpu_rms_norm: () => {},
-  gpu_layer_norm: () => {},
-};
+function unavailableWebgpuImports(module) {
+  const imports = Object.create(null);
+  for (const { module: namespace, name, kind } of WebAssembly.Module.imports(module)) {
+    if (namespace !== 'webgpu' || kind !== 'function') continue;
+    imports[name] = name === 'gpu_is_available' ? () => 0 : () => {
+      throw new Error(`CPU-only WASM test unexpectedly called ${name}`);
+    };
+  }
+  return imports;
+}
 
 export async function instantiateAntflyInferenceWasm(root, options = {}) {
   const { wasmPath, memoryModel } = resolveWasmPath(root, options);
@@ -85,12 +34,12 @@ export async function instantiateAntflyInferenceWasm(root, options = {}) {
     throw new Error(`WASM module not found for ${memoryModel}. ${wasmBuildHint(memoryModel)}`);
   }
 
-  const wasmBytes = fs.readFileSync(wasmPath);
+  const module = await WebAssembly.compile(fs.readFileSync(wasmPath));
   const importObject = {
     env: {},
-    webgpu: options.webgpuStubs ?? webgpuStubs,
+    webgpu: options.webgpuStubs ?? unavailableWebgpuImports(module),
   };
-  const { instance } = await WebAssembly.instantiate(wasmBytes, importObject);
+  const instance = await WebAssembly.instantiate(module, importObject);
   const wasm = instance.exports;
   const abi = createWasmAbi(wasm);
   wasm.init();
