@@ -52622,11 +52622,12 @@ pub const DB = struct {
             db_query_search.resolvedSearchEffort(req.search_effort) < 1 and
             (if (req.cancellation) |token| token.check_fn == null else true) and
             (exec_ctx.max_parallelism orelse 2) >= 2 and ttlDurationNs(self) == 0;
-        const scratch = if (can_overlap) HybridComponents.Budget.reclaimingAllocator(alloc) else alloc;
-        // Only recognized allocator chains can cross threads and refund
-        // discarded speculation. Unknown caller allocators stay on the caller.
-        const reusable = can_overlap and HybridComponents.ownerAllocatorCanOverlap(self.alloc) and
-            (HybridComponents.Budget.reusableHeadroom(scratch) orelse 0) >= HybridComponents.workspace_bytes;
+        const refundable = if (can_overlap) HybridComponents.Budget.reclaimingAllocator(alloc) else alloc;
+        // The coordinator can discard the entire composition, so its own
+        // allocations must refund as well as both component budgets.
+        const reusable = can_overlap and refundable.ptr == alloc.ptr and refundable.vtable == alloc.vtable and
+            HybridComponents.ownerAllocatorCanOverlap(self.alloc) and
+            (HybridComponents.Budget.reusableHeadroom(alloc) orelse 0) >= HybridComponents.workspace_bytes;
         const io = if (can_overlap and reusable) exec_ctx.io orelse self.backend_runtime.io() else null;
         const probe = if (builtin.is_test) test_hybrid_probe else null;
         var hybrid: HybridComponents = .{
@@ -52641,7 +52642,7 @@ pub const DB = struct {
                 .dense = self.core.denseIndex(if (req.dense_queries.len == 1) req.dense_queries[0].index_name else req.index_name),
             } else .{},
             .probe = probe,
-            .component_alloc = .{ .backing = scratch },
+            .component_alloc = .{ .backing = alloc },
         };
         if (io != null) hybrid.cut = hybrid.readCut();
         hybrid.lexical_budget = .{ .backing = hybrid.component_alloc.allocator(), .limit = if (probe) |test_probe| test_probe.workspace_bytes else HybridComponents.workspace_bytes };
@@ -52707,14 +52708,25 @@ pub const DB = struct {
         overlapped: bool = false,
         retry: ?anyerror = null,
         meet_in_retrieval: bool = false,
-        dense_entered: Io.Event = .unset,
+        dense_retrieved: Io.Event = .unset,
         lexical_entered: Io.Event = .unset,
 
-        fn meet(probe: *@This(), io: Io, lexical: bool) !void {
-            const own = if (lexical) &probe.lexical_entered else &probe.dense_entered;
-            const other = if (lexical) &probe.dense_entered else &probe.lexical_entered;
-            own.set(io);
-            try other.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        fn waitForRetrieval(event: *Io.Event) !void {
+            try event.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        }
+
+        fn denseStarting() !?*@This() {
+            if (!builtin.is_test) return null;
+            const probe = test_hybrid_probe orelse return null;
+            if (!probe.meet_in_retrieval) return null;
+            try waitForRetrieval(&probe.lexical_entered);
+            return probe;
+        }
+
+        fn lexicalEntered(raw: *anyopaque) !void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            probe.lexical_entered.set(std.testing.io);
+            try waitForRetrieval(&probe.dense_retrieved);
         }
     };
     threadlocal var test_hybrid_probe: ?*HybridTestProbe = null;
@@ -52836,9 +52848,12 @@ pub const DB = struct {
                 else => return null,
             }
             // Chunk hydration and aggregation can perform long postprocessing
-            // outside the stoppable ranker. Keep those shapes on the caller.
-            if (text.request.include_stored or text.request.aggregations_json.len != 0 or
-                (self.db.core.textIndexIsChunkBacked(a, text.request.index_name) catch return null)) return null;
+            // outside the stoppable ranker. Resolve the same default index as
+            // the ranker, including when multiple text indexes exist.
+            if (text.request.include_stored or text.request.aggregations_json.len != 0) return null;
+            if (self.db.core.textIndexEntry(text.request.index_name)) |entry| {
+                if (self.db.core.textIndexIsChunkBacked(a, entry.config.name) catch return null) return null;
+            }
 
             const dense = components[1];
             const entry = self.db.core.denseIndex(dense.request.index_name) orelse return null;
@@ -53455,8 +53470,15 @@ pub const DB = struct {
             execution_req.exclusion_query_json = "";
         }
         try self.proveTextQueryAccessPaths(if (worker_stop != null) alloc else self.alloc, execution_req.index_name, text_query);
+        const native_search = @import("../../search/search.zig");
         if (builtin.is_test) if (probe) |test_probe| {
-            if (test_probe.meet_in_retrieval) try test_probe.meet(std.testing.io, true);
+            if (test_probe.meet_in_retrieval) native_search.test_execution_probe = .{
+                .ctx = test_probe,
+                .entered = HybridTestProbe.lexicalEntered,
+            };
+        };
+        defer if (builtin.is_test) {
+            if (probe != null and probe.?.meet_in_retrieval) native_search.test_execution_probe = null;
         };
         const metric_name = self.textQueryMetricIndexName(execution_req);
         const start_ns = platform_time.monotonicNs();
@@ -53828,6 +53850,7 @@ pub const DB = struct {
             .ctx = self,
             .is_visible = isVisibleSearchHitCallback,
             .filter_visible_many = if (chunk_backed) filterStoredArtifactCandidatesManyCallback else filterStoredSearchCandidatesManyCallback,
+            .filter_visible_many_controlled = if (!chunk_backed) filterStoredSearchCandidatesManyControlled else null,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -53952,11 +53975,19 @@ pub const DB = struct {
 
     fn speculativeHbcSearch(ctx: ?*anyopaque, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.SearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx.?));
+        const probe = try HybridTestProbe.denseStarting();
+        defer if (builtin.is_test) {
+            if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        };
         return self.core.index_manager.searchDenseEntryWithRequest(entry, req);
     }
 
     fn speculativeHbcSearchProfiled(ctx: ?*anyopaque, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!vectorindex_mod.ProfiledSearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx.?));
+        const probe = try HybridTestProbe.denseStarting();
+        defer if (builtin.is_test) {
+            if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        };
         return self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
     }
 
@@ -54007,6 +54038,14 @@ pub const DB = struct {
             },
             else => return err,
         };
+    }
+
+    fn speculativeExactDenseSearch(ctx: ?*anyopaque, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest) anyerror!dense_exact.SearchOutcome {
+        const probe = try HybridTestProbe.denseStarting();
+        defer if (builtin.is_test) {
+            if (probe) |active| active.dense_retrieved.set(std.testing.io);
+        };
+        return exactDenseSearchCallback(ctx, entry, req);
     }
 
     fn exactDenseSearchCallback(
@@ -54677,9 +54716,6 @@ pub const DB = struct {
         const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
-        if (builtin.is_test and speculative) if (test_hybrid_probe) |probe| {
-            if (probe.meet_in_retrieval) try probe.meet(std.testing.io, false);
-        };
         const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const result = try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
             .filter_candidate_presence = true,
@@ -54705,7 +54741,7 @@ pub const DB = struct {
             .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
             .hbc_search = if (speculative) speculativeHbcSearch else hbcSearchCallback,
             .hbc_search_profiled = if (speculative) speculativeHbcSearchProfiled else hbcSearchProfiledCallback,
-            .exact_dense_search = exactDenseSearchCallback,
+            .exact_dense_search = if (builtin.is_test and speculative) speculativeExactDenseSearch else exactDenseSearchCallback,
             .postprocess = postprocessVectorSearchResultCallback,
         });
         if (bench_profile) {
@@ -57829,7 +57865,7 @@ pub const DB = struct {
             }
         }
         if (candidates.items.len != 0) {
-            const visible = try filterStoredSearchCandidatesMany(self, alloc, candidates.items, false);
+            const visible = try filterStoredSearchCandidatesMany(self, alloc, candidates.items, false, null);
             defer alloc.free(visible);
             for (positions.items, visible) |slot, keep| legacy[slot] = keep;
         }
@@ -62270,20 +62306,29 @@ fn loadDocumentTimestampsManyWithIdentityShape(self: *DB, alloc: Allocator, keys
     return timestamps;
 }
 
-fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit, embedding_presence_name: ?[]const u8) ![]bool {
+fn filterPresentSearchHitsMany(
+    self: *DB,
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+    embedding_presence_name: ?[]const u8,
+    stop: ?*const std.atomic.Value(bool),
+) ![]bool {
+    const control: @import("../../search/query.zig").ExecutionControl = .{ .worker_stop = stop };
+    const batch_limit = 256;
+    try control.check();
     const keep = try alloc.alloc(bool, hits.len);
     errdefer alloc.free(keep);
-    @memset(keep, true);
     if (hits.len == 0) return keep;
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
     const ProbeKey = struct { key: []const u8, hit_index: usize };
-    var pending = std.ArrayListUnmanaged(ProbeKey).empty;
+    const pending = try scratch.alloc(ProbeKey, hits.len);
     // Probe each member's own row. Ancestor hydration may belong to another
     // range; an absent local source/unit is not proof this member is missing.
     for (hits, 0..) |hit, i| {
+        if (i % batch_limit == 0) try control.check();
         // Named vector members resolve their public hit id to the source
         // document/chunk, which may be shared by several embeddings. The
         // artifact reference retains the member's authoritative stored key.
@@ -62293,27 +62338,36 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
             try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
         else
             try encodeStoreLookupKeyAlloc(self, scratch, hit.id);
-        try pending.append(scratch, .{ .key = key, .hit_index = i });
+        pending[i] = .{ .key = key, .hit_index = i };
     }
-    std.mem.sort(ProbeKey, pending.items, {}, struct {
+    std.mem.sort(ProbeKey, pending, {}, struct {
         fn lessThan(_: void, a: ProbeKey, b: ProbeKey) bool {
             return std.mem.order(u8, a.key, b.key) == .lt;
         }
     }.lessThan);
-    const keys = try scratch.alloc([]const u8, pending.items.len);
-    const values = try scratch.alloc(?[]const u8, pending.items.len);
-    @memset(values, null);
-    for (pending.items, 0..) |item, i| keys[i] = item.key;
+    try control.check();
+    const keys = try scratch.alloc([]const u8, pending.len);
+    const batch_size = if (stop != null) @min(batch_limit, keys.len) else keys.len;
+    const values = try scratch.alloc(?[]const u8, batch_size);
+    for (pending, 0..) |item, i| keys[i] = item.key;
     var txn = try self.core.store.beginProbeTxn();
     defer txn.abort();
     // Presence only needs the primary reference, not its decoded vector.
-    try txn.getManySortedPhysical(keys, values);
     var members = @import("artifact_chunk_generation.zig").MemberReader.init(alloc);
     defer members.deinit();
-    for (keys, values) |key, *value| value.* = try members.override(&txn, key, value.*);
-    for (pending.items, values) |item, value| if (value == null) {
-        keep[item.hit_index] = false;
-    };
+    var start: usize = 0;
+    while (start < keys.len) {
+        try control.check();
+        const end = start + @min(batch_size, keys.len - start);
+        const batch_keys = keys[start..end];
+        const batch_values = values[0 .. end - start];
+        try txn.getManySortedPhysical(batch_keys, batch_values);
+        try control.check();
+        for (batch_keys, batch_values, pending[start..end]) |key, value, item| {
+            keep[item.hit_index] = (try members.override(&txn, key, value)) != null;
+        }
+        start = end;
+    }
     return keep;
 }
 
@@ -62437,7 +62491,7 @@ fn filterStoredSearchCandidatesManyCallback(
     alloc: Allocator,
     hits: []const types.SearchHit,
 ) anyerror![]bool {
-    return filterStoredSearchCandidatesMany(ctx, alloc, hits, false);
+    return filterStoredSearchCandidatesMany(ctx, alloc, hits, false, null);
 }
 
 fn filterStoredArtifactCandidatesManyCallback(
@@ -62445,7 +62499,16 @@ fn filterStoredArtifactCandidatesManyCallback(
     alloc: Allocator,
     hits: []const types.SearchHit,
 ) anyerror![]bool {
-    return filterStoredSearchCandidatesMany(ctx, alloc, hits, true);
+    return filterStoredSearchCandidatesMany(ctx, alloc, hits, true, null);
+}
+
+fn filterStoredSearchCandidatesManyControlled(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+    stop: *const std.atomic.Value(bool),
+) anyerror![]bool {
+    return filterStoredSearchCandidatesMany(ctx, alloc, hits, false, stop);
 }
 
 fn filterStoredSearchCandidatesMany(
@@ -62453,9 +62516,10 @@ fn filterStoredSearchCandidatesMany(
     alloc: Allocator,
     hits: []const types.SearchHit,
     artifact_hits: bool,
+    stop: ?*const std.atomic.Value(bool),
 ) anyerror![]bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    const present = try filterPresentSearchHitsMany(self, alloc, hits, null);
+    const present = try filterPresentSearchHitsMany(self, alloc, hits, null, stop);
     errdefer alloc.free(present);
     if (ttlDurationNs(self) == 0) return present;
     const visible = try filterVisibleSearchHitsMany(self, alloc, hits, artifact_hits);
@@ -62475,7 +62539,7 @@ fn filterVectorSearchCandidatesManyCallback(
     hits: []const types.SearchHit,
 ) anyerror![]bool {
     const presence: *const VectorSearchPresenceContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    const present = try filterPresentSearchHitsMany(presence.db, alloc, hits, presence.embedding_presence_name);
+    const present = try filterPresentSearchHitsMany(presence.db, alloc, hits, presence.embedding_presence_name, null);
     errdefer alloc.free(present);
     if (ttlDurationNs(presence.db) == 0) return present;
     const visible = try filterVisibleSearchHitsMany(presence.db, alloc, hits, false);
@@ -102450,7 +102514,7 @@ test "db query drops full text hits whose stored document row was deleted direct
                 .{ .id = remote_key },
                 .{ .id = @constCast("doc:off-shard"), .artifact_ref = embedding_ref },
                 .{ .id = @constCast("doc:b"), .artifact_ref = .{ .document_id = @constCast("doc:b"), .name = @constCast("absent_embedding"), .kind = .embedding } },
-            }, null);
+            }, null, null);
             defer test_alloc.free(keep);
             try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, keep);
             // A single managed vector source uses chunk metadata even when
@@ -102458,7 +102522,7 @@ test "db query drops full text hits whose stored document row was deleted direct
             const single = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
                 .{ .id = remote_key },
                 .{ .id = source_key },
-            }, "remote_dense");
+            }, "remote_dense", null);
             defer test_alloc.free(single);
             try std.testing.expectEqualSlices(bool, &.{ false, true }, single);
         }
@@ -132862,6 +132926,7 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     defer DB.test_hybrid_probe = null;
     var parallel = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
     try std.testing.expect(probe.overlapped);
+    try DB.HybridTestProbe.waitForRetrieval(&probe.dense_retrieved);
     try std.testing.expectEqual(@as(?anyerror, null), probe.retry);
     defer parallel.deinit();
     try std.testing.expectEqual(serial.total_hits, parallel.total_hits);
@@ -132891,6 +132956,34 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     var after_publication = try db.searchWithExecutionContext(alloc, filtered, .{ .max_parallelism = 1 });
     defer after_publication.deinit();
     try std.testing.expectEqualDeep(after_publication.hits, revised.hits);
+
+    {
+        var budget: DB.HybridComponents.Budget = .{ .backing = alloc, .limit = 32 * 1024 * 1024 };
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        probe = .{};
+        var arena_result = try db.searchWithExecutionContext(arena.allocator(), filtered, parallel_context);
+        defer arena_result.deinit();
+        try std.testing.expect(!probe.overlapped);
+        try std.testing.expectEqualDeep(after_publication.hits, arena_result.hits);
+    }
+
+    // Span several physical probe batches and verify that sorted lookup
+    // projects the visibility decisions back to candidate order.
+    {
+        var candidates: [769]types.SearchHit = undefined;
+        var present_id = "doc:a".*;
+        var missing_id = "doc:never-written".*;
+        for (&candidates, 0..) |*hit, i| {
+            hit.* = .{ .id = if (i % 3 == 0) &missing_id else &present_id };
+        }
+        var stop: std.atomic.Value(bool) = .init(false);
+        const visible = try filterStoredSearchCandidatesManyControlled(&db, alloc, &candidates, &stop);
+        defer alloc.free(visible);
+        for (visible, 0..) |keep, i| try std.testing.expectEqual(i % 3 != 0, keep);
+        stop.store(true, .release);
+        try std.testing.expectError(error.Cancelled, filterStoredSearchCandidatesManyControlled(&db, alloc, &candidates, &stop));
+    }
 
     var opaque_allocator = std.testing.FailingAllocator.init(alloc, .{});
     probe = .{};
