@@ -101923,7 +101923,7 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     defer extracted[0].deinit(alloc);
     var precomputed = try prepareGeneratedEnrichments(&db, alloc, .{
         .writes = &.{.{ .key = "doc:a", .value = second_value }},
-    }, &extracted, .all, &.{}, null, null);
+    }, &extracted, .all, &.{}, false, null, null);
     defer precomputed.deinit(alloc);
 
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
