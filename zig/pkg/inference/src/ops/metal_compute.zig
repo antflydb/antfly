@@ -22770,10 +22770,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan.drop_ct = audioDropPersistentCt;
         return @ptrCast(buf);
     }
+    fn audioPlanAllocationBound(self: *MetalCompute, bytes: usize, shared: bool) ?usize {
+        if (bytes == 0) return null;
+        // Shared coefficient banks also support devices without Shared heaps.
+        const bound = if (shared)
+            (std.math.add(usize, bytes, 65535) catch return null) & ~@as(usize, 65535)
+        else
+            physicalStorageReservationBytesOp(self, bytes) catch return null;
+        // Match the cache charge from the actual SDK allocation.
+        return (std.math.add(usize, bound, 16383) catch return null) & ~@as(usize, 16383);
+    }
+
     fn audioPlanBuffer(self: *MetalCompute, plan: *audio_tape.Plan, bytes: usize, shared: bool) !?MetalTensor {
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
-        const admitted = metal_runtime.antfly_metal_audio_allocation_bytes(runtime, bytes, @intFromBool(shared));
-        if (admitted == 0) return null;
+        const admitted = self.audioPlanAllocationBound(bytes, shared) orelse return null;
         const cache = if (self.data.tier_cache) |*v| v else return null;
         const ref_bytes = metal_tensor_mod.device_buffer_ref_bytes;
         self.data.prefetch.lock();
@@ -22797,7 +22807,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var tensor = try MetalTensor.deviceAllocateFreshWithAllocator(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{@intCast(bytes / 4)});
         errdefer self.retireTemporaryWorkspaceValue(&tensor);
         const actual = metal_runtime.antfly_metal_audio_buffer_bytes(tensor.deviceHandle());
-        if (actual > admitted) {
+        if (actual < bytes or actual > admitted) {
             tensor.deinit();
             return null;
         }
@@ -62077,9 +62087,8 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
     }
     try compute.audioFreezePlan(plan);
     const recipe = try plan.arenaLayout();
-    const runtime = compute.provider_impl.raw_decode_runtime.?;
-    const output_bound = metal_runtime_mod.antfly_metal_audio_allocation_bytes(runtime, recipe.outputs_bytes, 0);
-    const full_bound = metal_runtime_mod.antfly_metal_audio_allocation_bytes(runtime, recipe.total_bytes, 0);
+    const output_bound = compute.audioPlanAllocationBound(recipe.outputs_bytes, false) orelse return error.TestUnexpectedResult;
+    const full_bound = compute.audioPlanAllocationBound(recipe.total_bytes, false) orelse return error.TestUnexpectedResult;
     try std.testing.expect(full_bound > output_bound);
     cache.budget.backend_limit_bytes = output_bound;
     try compute.audioTryPrepare(plan);

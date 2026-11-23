@@ -74087,20 +74087,6 @@ void *antfly_metal_standalone_buffer_alloc(void *device_handle, size_t bytes) {
         return buffer ? (__bridge_retained void *)buffer : NULL;
     }
 }
-size_t antfly_metal_audio_allocation_bytes(termite_metal_decode_runtime *r,size_t bytes,int shared) {
-    if(!r || !bytes)return 0;
-    // Shared heaps are unavailable on some supported Intel devices. Reserve
-    // conservatively and verify the actual driver allocation before retaining.
-    size_t n=bytes;
-    if(!shared) {
-        n=antfly_metal_physical_allocation_bytes(r,bytes);
-    } else {
-        if(bytes>SIZE_MAX-65535)return 0;
-        n=(bytes+65535)&~(size_t)65535;
-    }
-    if(n>SIZE_MAX-16383)return 0;
-    return (n+16383)&~(size_t)16383;
-}
 size_t antfly_metal_audio_buffer_bytes(void *handle) {
     return handle ? antfly_audio_buffer_charge((__bridge id<MTLBuffer>)handle) : 0;
 }
