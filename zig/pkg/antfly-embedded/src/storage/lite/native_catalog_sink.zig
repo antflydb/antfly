@@ -253,6 +253,7 @@ pub const Sink = struct {
             .submit = submit,
             .loadAllAlloc = loadAllAlloc,
             .loadOneAlloc = loadOneAlloc,
+            .loadMany = loadMany,
             .loadTipAlloc = loadTipAlloc,
             .resolves = true,
             .loadKeysAlloc = loadKeysAlloc,
@@ -417,6 +418,18 @@ pub const Sink = struct {
             result.appendAssumeCapacity(entry);
         }
         return try result.toOwnedSlice(allocator);
+    }
+
+    fn loadMany(ptr: *anyopaque, allocator: Allocator, scope: []const u8, keys: []const native_catalog_backend.Mutation, values: []?[]const u8) anyerror!void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        var txn = try self.store.beginRead();
+        defer txn.abort();
+        const file = try txn.readFile();
+        for (keys, values) |key, *value| {
+            const durable_key = try durableKeyAlloc(self.allocator, scope, key.namespace, key.key);
+            defer self.allocator.free(durable_key);
+            value.* = try file.getIndexCatalogRecordAtCheckpointAlloc(allocator, durable_key, txn.checkpoint);
+        }
     }
 
     /// One committed record, read from the file at its current tip.

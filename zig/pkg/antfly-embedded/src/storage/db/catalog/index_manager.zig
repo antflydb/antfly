@@ -1616,6 +1616,7 @@ pub const IndexManager = struct {
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
+    text_publication_reopen_required: std.atomic.Value(bool) = .init(false),
     text_merge_scheduler: TextMergeScheduler,
     dense_indexes: std.ArrayListUnmanaged(DenseIndex),
     retired_lsm_owner_stats: std.ArrayListUnmanaged(LsmOwnerStats) = .empty,

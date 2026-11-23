@@ -3597,7 +3597,11 @@ pub const Owner = struct {
 
     pub fn needsOutcomeReconciliation(root: *h.Handle) bool {
         const store = root.owned_lite_backend.?.native_docstore.?;
-        return root.sql_decision_uncertain or store.file.checkpoint_publication_uncertain or store.secret_store_uncertain;
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table| {
+            if (table.*.db.core.index_manager.text_publication_reopen_required.load(.acquire)) return true;
+        }
+        return (root.db_live and root.db.core.index_manager.text_publication_reopen_required.load(.acquire)) or root.sql_decision_uncertain or store.file.checkpoint_publication_uncertain or store.secret_store_uncertain;
     }
 
     fn inheritReclamationTelemetry(destination: anytype, source: anytype) void {

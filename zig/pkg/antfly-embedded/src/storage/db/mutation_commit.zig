@@ -4584,8 +4584,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // undo an already-durable, already-installed publication.
             for (inline_text_publications[0..inline_text_publication_count], 0..) |maybe_prepared, i| {
                 if (maybe_prepared) |prepared| {
-                    prepared.install();
                     inline_text_publications[i] = null;
+                    try prepared.install();
                     // Mirror this index's now-durable progress into the
                     // background worker's own bookkeeping (a safe no-op if
                     // there is no worker for this index, or if it is not

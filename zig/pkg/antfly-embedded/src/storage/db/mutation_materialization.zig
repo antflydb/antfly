@@ -3437,32 +3437,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             /// the level-0 segments to the writer snapshot and marks the
             /// versions this write made dead. Takes the index's apply guard
             /// for just this, not across the commit.
-            pub fn install(self: *InlineTextPublication) void {
+            pub fn install(self: *InlineTextPublication) !void {
+                defer self.finish();
+                errdefer self.index_manager.text_publication_reopen_required.store(true, .release);
                 if (!self.index_locked) {
                     self.apply_guard.relockIndex();
                     self.index_locked = true;
                 }
-                if (self.mutationsAlloc(self.alloc)) |mutations| {
-                    defer self.alloc.free(mutations);
-                    self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations) catch |err| {
-                        std.log.err("inline text publication install: native_catalog mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+
+                const mutations = try self.mutationsAlloc(self.alloc);
+                defer self.alloc.free(mutations);
+                try self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(mutations);
+                try self.entry.persistent.reconcileInlineCommittedMutations(self.resolution.decidedMutations());
+                // Consume every segment, including after a failed install.
+                var install_error: ?anyerror = null;
+                for (self.segments[0..self.segment_count]) |*seg| {
+                    self.entry.persistent.installInlineSegmentPublication(seg) catch |err| {
+                        if (install_error == null) install_error = err;
                     };
-                } else |err| {
-                    std.log.err("inline text publication install: rebuilding mutations failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
                 }
-                self.entry.persistent.applyExternallyCommittedMutationsIfNativeCatalog(self.resolution.decidedMutations()) catch |err| {
-                    std.log.err("inline text publication install: native_catalog mirror sync failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
-                };
-                for (self.segments[0..self.segment_count]) |*seg| self.entry.persistent.installInlineSegmentPublication(seg);
                 self.segment_count = 0;
-                // Durable now: only from here may queries see the deletes.
-                self.resolution.install();
-                // Inline writes publish level-0 segments that only merges
-                // fold away: mark the index for its merge scheduler.
-                self.index_manager.noteInlineTextPublicationSegments(self.entry) catch |err| {
-                    std.log.err("inline text publication install: merge-need check failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
-                };
-                self.finish();
+                try self.resolution.installChecked();
+                try self.index_manager.noteInlineTextPublicationSegments(self.entry);
+                if (install_error) |err| return err;
             }
 
             /// The mutations were never committed (preparation succeeded but

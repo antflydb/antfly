@@ -111,6 +111,8 @@ pub const Sink = struct {
     /// this backend's mirror. With it, the `tip_namespace` records stay out of
     /// the mirror and are always read this way (see `tip_namespace`).
     loadOneAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) anyerror!?[]u8 = null,
+    /// Reads all keys at one durable checkpoint. Results use the supplied arena.
+    loadMany: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8, keys: []const Mutation, values: []?[]const u8) anyerror!void = null,
     /// With `loadOneAlloc`: every committed `tip_namespace` entry of `scope`
     /// (which `loadAllAlloc` leaves out), for removing them all.
     loadTipAlloc: ?*const fn (ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry = null,
@@ -715,6 +717,28 @@ pub const Backend = struct {
     pub fn loadTipEntriesAlloc(self: *const Backend, allocator: Allocator) ![]Entry {
         const load_tip = self.sink.loadTipAlloc orelse return try allocator.alloc(Entry, 0);
         return try load_tip(self.sink.ptr, allocator, self.scope);
+    }
+
+    pub fn loadCommittedValues(self: *Backend, allocator: Allocator, keys: []const Mutation, values: []?[]const u8) !void {
+        std.debug.assert(keys.len == values.len);
+        if (keys.len == 0) return;
+        if (self.sink.loadMany) |load| return load(self.sink.ptr, allocator, self.scope, keys, values);
+        if (self.sink.loadOneAlloc) |load| {
+            for (keys, values) |key, *value| value.* = try load(self.sink.ptr, allocator, self.scope, key.namespace, key.key);
+            return;
+        }
+        var txn = try self.beginRead();
+        defer txn.abort();
+        for (keys, values) |key, *value| {
+            const bytes = txn.get(.{ .name = key.namespace }, key.key) catch |err| switch (err) {
+                error.NotFound => {
+                    value.* = null;
+                    continue;
+                },
+                else => return err,
+            };
+            value.* = try allocator.dupe(u8, bytes);
+        }
     }
 
     pub fn freeEntries(allocator: Allocator, entries: []Entry) void {

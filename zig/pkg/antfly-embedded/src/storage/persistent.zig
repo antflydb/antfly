@@ -2529,6 +2529,32 @@ pub const PersistentIndex = struct {
         }
     }
 
+    /// Completion callbacks may run in reverse commit order. Reload the
+    /// affected records from the durable tip before replacing mirror values.
+    pub fn reconcileInlineCommittedMutations(self: *PersistentIndex, mutations: []const native_catalog_backend.Mutation) !void {
+        if (mutations.len == 0) return;
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.NotNativeCatalogBackend,
+        };
+        errdefer backend.invalidateMirror();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var keys = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        for (mutations) |mutation| {
+            if (std.mem.eql(u8, mutation.namespace orelse "", native_catalog_backend.tip_namespace)) continue;
+            try keys.append(alloc, mutation);
+        }
+        const values = try alloc.alloc(?[]const u8, keys.items.len);
+        try backend.loadCommittedValues(alloc, keys.items, values);
+        for (keys.items, values) |*mutation, value| {
+            mutation.is_delete = value == null;
+            mutation.value = value orelse "";
+        }
+        try backend.applyExternallyCommittedMutations(keys.items);
+    }
+
     /// A small ("inline") segment publication prepared for a
     /// `.native_catalog` index, built OUTSIDE any lock and without
     /// committing anything: `prepareInlineSegmentPublication` below
@@ -2624,12 +2650,11 @@ pub const PersistentIndex = struct {
     /// Runs only after `publication`'s record is durable: adds its segment to
     /// the writer snapshot, after which the write's ack may return. A failure
     /// leaves memory behind the file; the next refresh reloads it.
-    pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) void {
+    pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) !void {
         var deleted = self.inlineDeletionBitmap(publication.copies) catch |err| {
-            std.log.err("full-text level-0 deletion lookup failed seg={d} err={s}", .{ publication.seg_id, @errorName(err) });
             publication.abort(self.alloc);
             self.invalidateNativeCatalogMirror();
-            return;
+            return err;
         };
         defer if (deleted) |*bitmap| bitmap.deinit();
         var replacement = [_]index_mod.ReplacementSegmentData{.{
@@ -2640,10 +2665,9 @@ pub const PersistentIndex = struct {
         publication.copies_arena.deinit();
         publication.* = undefined;
         var prepared = self.writer.prepareSegmentsManyData(&.{}, &replacement) catch |err| {
-            std.log.err("full-text level-0 install failed seg={d} err={s}", .{ replacement[0].id, @errorName(err) });
             replacement[0].data.deinit(self.alloc);
             self.invalidateNativeCatalogMirror();
-            return;
+            return err;
         };
         prepared.publish();
     }
@@ -2651,19 +2675,22 @@ pub const PersistentIndex = struct {
     /// Install can run after a later commit on the same key. Read the
     /// authoritative doc map so the incoming snapshot never exposes that copy.
     fn inlineDeletionBitmap(self: *PersistentIndex, copies: []const VersionedChange) !?roaring.RoaringBitmap {
-        var txn = try self.beginReadMainTxn();
-        defer txn.abort();
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.NotNativeCatalogBackend,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const keys = try alloc.alloc(native_catalog_backend.Mutation, copies.len);
+        const values = try alloc.alloc(?[]const u8, copies.len);
+        for (copies, keys) |copy, *key| key.* = .{ .namespace = native_catalog_backend.tip_namespace, .key = copy.key };
+        try backend.loadCommittedValues(alloc, keys, values);
+
         var bitmap = roaring.RoaringBitmap.init(self.alloc);
         errdefer bitmap.deinit();
-        for (copies, 0..) |copy, local| {
-            const bytes = txn.get(.docmap, copy.key) catch |err| switch (err) {
-                error.NotFound => {
-                    try bitmap.add(@intCast(local));
-                    continue;
-                },
-                else => return err,
-            };
-            if (try DocVersion.decode(bytes) != copy.version) try bitmap.add(@intCast(local));
+        for (copies, values, 0..) |copy, value, local| {
+            if (value == null or try DocVersion.decode(value.?) != copy.version) try bitmap.add(@intCast(local));
         }
         if (bitmap.isEmpty()) {
             bitmap.deinit();
@@ -4511,6 +4538,11 @@ pub const PersistentIndex = struct {
 
         pub fn install(self: *VersionResolution) void {
             self.index.installDeadVersions(self.newly_dead.items);
+        }
+
+        pub fn installChecked(self: *VersionResolution) !void {
+            if (self.newly_dead.items.len == 0) return;
+            try self.index.installDeadVersionsOrError(self.newly_dead.items);
         }
     };
 
@@ -6745,7 +6777,7 @@ test "persistent index merge folds level-0 records into a segment" {
     try test_sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(va));
     const mutations = publication.mutations();
     try InlinePublicationTestSink.submit(&test_sink, "", &mutations, true);
-    pi.installInlineSegmentPublication(&publication);
+    try pi.installInlineSegmentPublication(&publication);
     const other = try buildSimpleSegment(alloc, "doc:b", "beta");
     defer alloc.free(other);
     try pi.indexSegment(other);
@@ -6806,7 +6838,7 @@ test "persistent index publishes an inline write as a level-0 record and reloads
             .native_catalog => |backend| try backend.applyExternallyCommittedMutations(&mutations),
             else => return error.TestUnexpectedResult,
         }
-        pi.installInlineSegmentPublication(&publication);
+        try pi.installInlineSegmentPublication(&publication);
         const snap = pi.writer.acquireSnapshot();
         defer snap.release();
         try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
@@ -6851,7 +6883,7 @@ test "persistent index masks a late level-0 install and clears it on rebuild" {
         try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(DocVersion.deletion(version)));
 
         pi.installDeadVersions(&.{version});
-        pi.installInlineSegmentPublication(&publication);
+        try pi.installInlineSegmentPublication(&publication);
         {
             const snapshot = pi.writer.acquireSnapshot();
             defer snapshot.release();
@@ -6865,6 +6897,40 @@ test "persistent index masks a late level-0 install and clears it on rebuild" {
     const snapshot = reopened.writer.acquireSnapshot();
     defer snapshot.release();
     try std.testing.expectEqual(@as(usize, 0), snapshot.segments.len);
+}
+
+test "persistent index reconciles dead buckets after reverse completion" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var pi = try openVersionedTestIndex(alloc, &sink, path);
+    defer pi.close();
+
+    const first = try DocVersion.of(1, 0);
+    const second = try DocVersion.of(2, 0);
+    const key = deadKey(@intCast(first >> 32));
+    var bitmap = roaring.RoaringBitmap.init(alloc);
+    defer bitmap.deinit();
+    try bitmap.add(@truncate(first));
+    const older_value = try bitmap.toBytes(alloc);
+    defer alloc.free(older_value);
+    try bitmap.add(@truncate(second));
+    const newer_value = try bitmap.toBytes(alloc);
+    defer alloc.free(newer_value);
+    try sink.foreignPut(dead_namespace, &key, newer_value);
+
+    try pi.reconcileInlineCommittedMutations(&.{.{ .namespace = dead_namespace, .key = &key, .value = newer_value }});
+    try pi.reconcileInlineCommittedMutations(&.{.{ .namespace = dead_namespace, .key = &key, .value = older_value }});
+
+    var read = try pi.beginReadMainTxn();
+    defer read.abort();
+    var dead = try DeadVersions.load(alloc, &read);
+    defer dead.deinit();
+    try std.testing.expect(dead.contains(first));
+    try std.testing.expect(dead.contains(second));
 }
 
 test "persistent index prepares a merged seal mutation without committing, and returns null once already covered" {
