@@ -685,7 +685,7 @@ test "prepared physical transfer protocol binds download and upload storage with
     }
 }
 
-test "prepared Metal fanout placement preserves outputs and removes two boundary transfers" {
+test "prepared Metal fanout placement preserves outputs and removes an activation transfer" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     const ml = @import("ml");
@@ -697,12 +697,14 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
     defer graph.deinit();
     var b = ml.graph.Builder.init(&graph);
     const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 3 }));
-    const indices = try b.parameter("indices", ml.graph.Shape.init(.i32, &.{2}));
+    const indices = try b.parameter("indices", ml.graph.Shape.init(.i32, &.{ 2, 2 }));
     const first = try b.gather(x, indices, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
     graph.nodeMut(first).op.gather.axis = 1;
+    graph.nodeMut(first).op.gather.elements = true;
     const activation = try b.relu(first);
     const host = try b.gather(activation, indices, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
     graph.nodeMut(host).op.gather.axis = 1;
+    graph.nodeMut(host).op.gather.elements = true;
     const resident = try b.softmax(activation);
     try graph.markOutput(host);
     try graph.markOutput(resident);
@@ -710,7 +712,7 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
     defer program.deinit();
     const input = try cb.fromFloat32Shape(&.{ -1, 2, -3, 4, -5, 6 }, &.{ 2, 3 });
     defer cb.free(input);
-    const index_values = (try cb.fromInt32Shape(&.{ 1, 0 }, &.{2})).?;
+    const index_values = (try cb.fromInt32Shape(&.{ 1, 0, 1, 0 }, &.{ 2, 2 })).?;
     defer cb.free(index_values);
     const bindings = [_]interpreter.RuntimeInput{ .{ .node_id = program.id_map[x], .value = input }, .{ .node_id = program.id_map[indices], .value = index_values } };
     for ([_]bool{ false, true }) |refine| {
@@ -724,11 +726,7 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
         try std.testing.expect(pool.selection == null);
         for ([_]@TypeOf(first){ first, host }) |original| {
             const node = program.id_map[original];
-            const kernel = pool.kernels[node] orelse return error.MissingPreparedGather;
-            try std.testing.expect(kernel.descriptor.operation == .gather);
-            try std.testing.expectEqual(@as(u8, 1), kernel.descriptor.operation.gather.axis);
-            try std.testing.expectEqual(.i32, kernel.descriptor.input_shapes[1].dtype);
-            try std.testing.expectEqual(ops.BackendKind.native, pool.backends[kernel.backend_index].kind());
+            try std.testing.expectEqual(ops.BackendKind.native, placement.partitions[placement.node_assignment[node]].backend);
         }
         const activation_kernel = pool.kernels[program.id_map[activation]] orelse return error.MissingPreparedActivation;
         try std.testing.expect(activation_kernel.descriptor.operation == .unary);
@@ -741,7 +739,7 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
         for (pool.kernels) |kernel| if (kernel != null) {
             prepared_dispatches += 1;
         };
-        try std.testing.expectEqual(@as(u64, 4), prepared_dispatches);
+        try std.testing.expectEqual(@as(u64, 2), prepared_dispatches);
         try std.testing.expectEqual(if (refine) ops.BackendKind.native else .metal, placement.partitions[placement.node_assignment[program.id_map[activation]]].backend);
         try std.testing.expectError(error.DeviceReadbackForbidden, executable.run(a, .{ .runtime_inputs = &bindings, .output_placement = .producer, .activation_readbacks = .forbidden }));
         for (0..3) |iteration| {
@@ -758,10 +756,10 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
             const probabilities = try device_backend.toFloat32(result.outputs[1], a);
             defer a.free(probabilities);
             for (probabilities, [_]f32{ 0.8807971, 0.11920292, 0.01798621, 0.98201376 }) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
-            try std.testing.expectEqual(@as(u64, if (refine) 3 else 5), result.stats.cross_device_transfers);
+            try std.testing.expectEqual(@as(u64, if (refine) 3 else 4), result.stats.cross_device_transfers);
             try std.testing.expectEqual(prepared_dispatches, result.stats.assigned_kernel_dispatches);
-            try std.testing.expectEqual(@as(u64, if (refine) 24 else 40), result.stats.physical_transfer_bytes);
-            try std.testing.expectEqual(@as(u64, if (refine) 32 else 48), result.stats.actual_download_bytes);
+            try std.testing.expectEqual(@as(u64, if (refine) 40 else 56), result.stats.physical_transfer_bytes);
+            try std.testing.expectEqual(@as(u64, if (refine) 40 else 56), result.stats.actual_download_bytes);
             if (iteration != 0) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
         }
     }

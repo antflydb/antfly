@@ -51,8 +51,8 @@ pub const AssignedTransferDeclines = struct {
     destination_held: u64 = 0,
 
     pub fn merge(self: *@This(), other: @This()) void {
-        inline for (@typeInfo(@This()).@"struct".fields) |field|
-            @field(self.*, field.name) +|= @field(other, field.name);
+        inline for (comptime @import("std").meta.fieldNames(@This())) |name|
+            @field(self.*, name) +|= @field(other, name);
     }
 };
 

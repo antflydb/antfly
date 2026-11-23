@@ -305,6 +305,15 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
     const exec_stats = stats;
     const trace_partitions = tracePartitionsEnabled();
 
+    const BorrowedPartitionInput = struct {
+        node: NodeId,
+        producer_value: CT,
+        producer_device: DeviceId,
+        producer_is_owned_transfer: bool,
+    };
+    var preserved_inputs: std.ArrayList(BorrowedPartitionInput) = .empty;
+    defer preserved_inputs.deinit(allocator);
+
     // Execute each partition in order.
     for (plan.base.partitions, 0..) |part, part_idx| {
         if (options.execution_control) |control| try control.check();
@@ -314,6 +323,22 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
         const cb = dev_entry.backend;
         if (trace_partitions) {
             printPartitionTrace("begin", graph, part, part_idx, dev_id);
+        }
+
+        defer {
+            for (preserved_inputs.items) |input| {
+                if (values[input.node]) |copy| {
+                    // A partition may give the alias an output slot. That slot
+                    // retains ownership after restoring the producer binding.
+                    for (part.node_ids) |local| {
+                        if (values[local] == copy) break;
+                    } else cb.free(copy);
+                }
+                values[input.node] = input.producer_value;
+                value_device[input.node] = input.producer_device;
+                if (!input.producer_is_owned_transfer) _ = owned_runtime_transfers.remove(input.node);
+            }
+            preserved_inputs.clearRetainingCapacity();
         }
 
         // Transfer external inputs from source device to this device.
@@ -340,6 +365,11 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                     );
                 }
                 const runtime_input = rt_map.contains(ext_in.node_id);
+                const final_user = last_use[nid];
+                const preserve_producer = final_user >= count or
+                    (plan.base.node_assignment[final_user] != part_idx and
+                        hasLaterConsumerOnAnotherDevice(plan, part_idx + 1, ext_in.node_id, dev_id));
+                if (preserve_producer) try preserved_inputs.ensureUnusedCapacity(allocator, 1);
                 if (runtime_input) try owned_runtime_transfers.ensureUnusedCapacity(allocator, 1);
                 const planned_transfer = if (options.physical_frame) |frame|
                     try frame.transfer(src_entry.backend, cb, src_val, ext_in.node_id, @intCast(part_idx))
@@ -360,14 +390,18 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
                     ext_in.node_id,
                     src_val,
                 );
-                // Keep the old value alive (other partitions may need it).
-                // Store the transferred copy as an additional ref.
-                // We'll use the transferred value for this partition's nodes.
-                values[nid] = transferred;
-                value_device[nid] = dev_id;
-                if (!source_is_borrowed_runtime_input) {
+                if (preserve_producer) {
+                    preserved_inputs.appendAssumeCapacity(.{
+                        .node = ext_in.node_id,
+                        .producer_value = src_val,
+                        .producer_device = src_dev,
+                        .producer_is_owned_transfer = owned_runtime_transfers.contains(ext_in.node_id),
+                    });
+                } else if (!source_is_borrowed_runtime_input) {
                     src_entry.backend.free(src_val);
                 }
+                values[nid] = transferred;
+                value_device[nid] = dev_id;
                 if (runtime_input) owned_runtime_transfers.putAssumeCapacity(ext_in.node_id, {});
             }
         }
@@ -630,6 +664,18 @@ fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, pla
         .output_devices = output_devices,
         .allocator = allocator,
     };
+}
+
+/// If the remaining consumers all use the current destination, that copy
+/// can become the last owner. Other devices still need the producer value.
+fn hasLaterConsumerOnAnotherDevice(plan: *const DevicePartitionPlan, start: usize, node: NodeId, destination: DeviceId) bool {
+    for (plan.base.partitions[start..], plan.device_assignment[start..]) |partition, device| {
+        if (device == destination) continue;
+        for (partition.external_inputs) |input| {
+            if (input.node_id == node) return true;
+        }
+    }
+    return false;
 }
 
 fn isBorrowedRuntimeInputValue(
@@ -1187,6 +1233,67 @@ test "multi-executor retains inputs when partitions reorder independent consumer
     defer a.free(square_values);
     try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4 }, neg_values);
     try std.testing.expectEqualSlices(f32, &.{ 1, 4, 9, 16 }, square_values);
+}
+
+test "multi-executor preserves a published producer across cross-device fan-out" {
+    const a = std.testing.allocator;
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    var source_ctx = try Context.init(a, .native, std.testing.io);
+    defer source_ctx.deinit(a);
+    var target_ctx = try Context.init(a, .native, std.testing.io);
+    defer target_ctx.deinit(a);
+    const source = source_ctx.computeBackend();
+    const target = target_ctx.computeBackend();
+    var mesh = try DeviceMesh.init(a, &.{
+        .{ .id = 0, .backend = &source, .kind = .native },
+        .{ .id = 1, .backend = &target, .kind = .native },
+    });
+    defer mesh.deinit();
+
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const x = try b.tensorConst(&.{ 1, 2, 3, 4 }, Shape.init(.f32, &.{4}));
+    const negative = try b.neg(x);
+    const square = try b.mul(x, x);
+    for ([_]NodeId{ x, negative, square }) |output| try graph.markOutput(output);
+    const incoming: []const @import("partition.zig").ExternalInput = &.{.{ .node_id = x, .source_partition = 0 }};
+    var parts = [_]Partition{
+        .{ .backend = .native, .node_ids = &.{x}, .external_inputs = &.{} },
+        .{ .backend = .native, .node_ids = &.{negative}, .external_inputs = incoming },
+        .{ .backend = .native, .node_ids = &.{square}, .external_inputs = incoming },
+    };
+    const plan = DevicePartitionPlan{
+        .base = .{ .partitions = &parts, .node_assignment = &.{ 0, 1, 2 }, .node_operator_plans = &.{ null, null, null }, .allocator = a, .owns_executors = false },
+        .device_assignment = &.{ 0, 1, 0 },
+        .allocator = a,
+    };
+    var result = try executeMultiDevice(a, &graph, &plan, &mesh, .{ .collect_partition_stats = true });
+    defer result.deinit(&mesh);
+    try std.testing.expectEqualSlices(DeviceId, &.{ 0, 1, 0 }, result.output_devices);
+    try std.testing.expectEqual(@as(u64, 1), result.stats.cross_device_transfers);
+    const expected = [_][4]f32{ .{ 1, 2, 3, 4 }, .{ -1, -2, -3, -4 }, .{ 1, 4, 9, 16 } };
+    for (result.outputs, result.output_devices, expected) |tensor, device, want| {
+        const values = try mesh.device(device).?.backend.toFloat32(tensor, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &want, values);
+    }
+
+    // With no published source and both consumers on the destination, the
+    // first copy remains the live binding until the final use.
+    _ = graph.outputs.orderedRemove(0);
+    var same_destination = plan;
+    same_destination.device_assignment = &.{ 0, 1, 1 };
+    var reused = try executeMultiDevice(a, &graph, &same_destination, &mesh, .{ .collect_partition_stats = true });
+    defer reused.deinit(&mesh);
+    try std.testing.expectEqualSlices(DeviceId, &.{ 1, 1 }, reused.output_devices);
+    try std.testing.expectEqual(@as(u64, 1), reused.stats.cross_device_transfers);
+    for (reused.outputs, expected[1..]) |tensor, want| {
+        const values = try target.toFloat32(tensor, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &want, values);
+    }
 }
 
 test "transferTensor preserves typed storage without numeric conversion" {
