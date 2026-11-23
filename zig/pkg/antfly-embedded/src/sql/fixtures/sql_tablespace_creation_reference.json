@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL tablespace CREATE with isolated LOCATION fixture",
+  "oracle_location": "owned temporary directory; only LOCATION literal substituted",
+  "id": "sql-0110",
+  "source_entry_sha256": "aca9b96d8ae6a2d1aecc1cd090f62fcdb7fbd557c964fdc0021e41b3c276e261",
+  "sql": "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'",
+  "location": "/var/lib/antfly/fastspace",
+  "command_tag": "CREATE TABLESPACE",
+  "duplicate_sqlstate": "42710",
+  "in_use_sqlstate": "55000",
+  "bound_identity": true,
+  "preserved_on_refusal": true,
+  "rows": [
+    [
+      "00000000-0000-0000-0000-000000000001",
+      "retained"
+    ]
+  ]
+}

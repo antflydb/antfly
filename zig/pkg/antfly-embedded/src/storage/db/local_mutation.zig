@@ -249,6 +249,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const ensureDurableReplicationStartupBarrier = commit.ensureDurableReplicationStartupBarrier;
         pub const failIfIdentityOrdinalExhaustedForNewUpserts = commit.failIfIdentityOrdinalExhaustedForNewUpserts;
         pub const finalizePendingRowPolicyReceiptLocked = commit.finalizePendingRowPolicyReceiptLocked;
+        pub const finalizePendingRowPolicySchemaPairLocked = commit.finalizePendingRowPolicySchemaPairLocked;
         pub const flushDurableReplicationOutboxes = commit.flushDurableReplicationOutboxes;
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
@@ -286,6 +287,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
         pub const resolveClosedLegacyTerminalInternal = commit.resolveClosedLegacyTerminalInternal;
+        pub const resolveExternalTransactionIntents = commit.resolveExternalTransactionIntents;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
         pub const resolveTransactionIntentsInternalScoped = commit.resolveTransactionIntentsInternalScoped;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
@@ -844,6 +846,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
+            pub const finalizePendingRowPolicySchemaPairLocked = Implementation.finalizePendingRowPolicySchemaPairLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
@@ -1004,6 +1007,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
+            pub const finalizePendingRowPolicySchemaPairLocked = Implementation.finalizePendingRowPolicySchemaPairLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;

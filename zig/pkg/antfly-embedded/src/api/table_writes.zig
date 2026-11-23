@@ -143,6 +143,7 @@ pub const BoundTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_request = txnResolveGroupLocalWithRequest,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
@@ -970,6 +971,8 @@ pub const BoundTableWriteSource = struct {
             .row_policy_database = table.row_policy_database,
             .row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds,
             .normalized_graph_rows = table.normalized_graph_rows,
+            .graph_preparation = table.graph_preparation,
+            .trigger_receipts = table.trigger_receipts,
             .writes = table.writes,
             .deletes = table.deletes,
             .transforms = table.transforms,
@@ -1010,7 +1013,7 @@ pub const BoundTableWriteSource = struct {
         const db = try self.activeDb();
         if (table.range_guards.len != 0) return error.SqlStatementSnapshotRequired;
         if (!source_prepared and table.source_producer == .unlabelled) try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
-        const commit_version = begin_timestamp + 1;
+        const commit_version = try distributed_txn.commitVersion(begin_timestamp);
         const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
         defer alloc.free(local_participant);
         const participants = [_][]const u8{local_participant};
@@ -1301,7 +1304,19 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
-        if (context.source_producer != .unlabelled) {
+        if (context.external_decision_owner) |owner| {
+            _ = try (try self.activeDb()).beginExternalTransaction(.{
+                .txn_id = txn_id,
+                .owner = owner,
+                .document_revision_scope = context.document_revision_scope,
+                .sql_locks = context.sql_locks,
+                .begin_timestamp = begin_timestamp,
+                .created_at_ns = nextTxnTimestamp(self.db.backend_runtime.io()),
+                .participants = participants,
+                .coordinator = true,
+                .restore_staging_scope = context.restore_staging_scope,
+            });
+        } else if (context.source_producer != .unlabelled) {
             if (self.owner_group_id) |bound_group| if (bound_group != group_id) return null;
             const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, context.restore_staging_scope, context.restore_staging_plan_id);
             defer alloc.free(local_participant);
@@ -1400,6 +1415,20 @@ pub const BoundTableWriteSource = struct {
             transactions_mod.TxnError.TxnNotFound => if (status != .aborted) return err,
             else => return err,
         };
+    }
+
+    pub fn txnResolveGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: @import("distributed_txn_contract.zig").TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !?void {
+        if (request.external_decision_owner == null) return txnResolveGroupLocalWithCancellation(ptr, alloc, group, table, request.txn_id, request.status, request.commit_version, request.topology_epoch, request.sync_level, cancellation);
+        if (request.restore_staging_scope != null or request.restore_staging_plan_id != null) return error.InvalidBatchRequest;
+        try cancellation.check();
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table)) return null;
+        const db = try self.activeDb();
+        const participant = try distributed_txn.participantIdForGroup(alloc, table, group);
+        defer alloc.free(participant);
+        const retained = try db.transactionRetainsCoordinatorAcknowledgement(request.txn_id);
+        try db.resolveExternalTransaction(.{ .txn_id = request.txn_id, .owner = request.external_decision_owner.?, .status = request.status, .commit_version = request.commit_version, .sync_level = request.sync_level, .visibility_cancellation = cancellation, .resolved_participant = if (retained) null else participant });
+        return {};
     }
 
     pub fn txnStatusGroupLocal(

@@ -145,13 +145,17 @@ pub const Owner = struct {
     /// owner cut. The coordinator captures every owner while all fences are
     /// held, validates the cohort, then releases the fences before row work.
     pub fn captureSnapshot(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, deadline_ns: u64) !registry_mod.Token {
+        return self.captureSnapshotWithGraphs(scope, capture_token, connection, deadline_ns, &.{});
+    }
+    pub fn captureSnapshotWithGraphs(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, deadline_ns: u64, indexes: []const []const u8) !registry_mod.Token {
+        if (indexes.len > 64) return error.InvalidRetainedReadQuery;
         var borrow = try self.registry.borrow(capture_token, scope, .capture, time.monotonicNs());
         defer borrow.deinit();
         const capture_value: *Capture = @ptrCast(@alignCast(borrow.resource.ptr));
         const alloc = self.registry.alloc;
         const owned = try alloc.create(Snapshot);
         errdefer alloc.destroy(owned);
-        owned.* = .{ .alloc = alloc, .snapshot = try capture_value.fence.captureSnapshot(alloc) };
+        owned.* = .{ .alloc = alloc, .snapshot = try capture_value.fence.captureSnapshotWithGraphs(alloc, indexes) };
         errdefer owned.snapshot.deinit();
         try capture_value.fence.validate();
         try borrow.validate(time.monotonicNs());
@@ -185,7 +189,11 @@ pub const Owner = struct {
 
     /// Snapshot gets a separate owned cancellation capsule: releasing the
     /// short mutation capture must not cancel its long-lived paging cursors.
+    pub const Opened = struct { token: registry_mod.Token, text_filter_digest: ?[32]u8, required_indexes_digest: ?[32]u8 };
     pub fn open(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
+        return (try self.openQualified(scope, capture_token, connection, from, to, input, deadline_ns)).token;
+    }
+    pub fn openQualified(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !Opened {
         var borrow = try self.registry.borrow(capture_token, scope, .capture, time.monotonicNs());
         defer borrow.deinit();
         const capture_value: *Capture = @ptrCast(@alignCast(borrow.resource.ptr));
@@ -212,7 +220,50 @@ pub const Owner = struct {
         // one final quorum validation per capture after ALL aliases are open.
         // Repeating quorum rounds per alias would inflate the apply-lock hold.
         try borrow.validate(time.monotonicNs());
-        return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
+        if (query.text_filter) |text| {
+            var expected: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(text.query, &expected, .{});
+            if (owned.view.text_filter_digest == null or !std.mem.eql(u8, &expected, &owned.view.text_filter_digest.?)) return error.UnsupportedSqlExecution;
+        }
+        try types.sql_view_index_requirements.requireDigest(input.required_sql_indexes, owned.view.required_indexes_digest);
+        const token = try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
+        return .{ .token = token, .text_filter_digest = owned.view.text_filter_digest, .required_indexes_digest = owned.view.required_indexes_digest };
+    }
+
+    pub fn graphPage(self: Owner, alloc: std.mem.Allocator, scope: registry_mod.Scope, token: registry_mod.Token, request: @import("antfly_local_sources").storage_statement_read_fence.RetainedGraphRead.Request) !@import("antfly_local_sources").storage_statement_read_fence.RetainedGraphRead.Page {
+        var borrow = try self.registry.borrow(token, scope, .snapshot, time.monotonicNs());
+        defer borrow.deinit();
+        const retained: *Snapshot = @ptrCast(@alignCast(borrow.resource.ptr));
+        var input = request;
+        input.cancellation = CancellationToken.fromAtomic(&retained.cancelled);
+        var page = try retained.snapshot.graphPage(alloc, input);
+        errdefer page.deinit(alloc);
+        try borrow.validate(time.monotonicNs());
+        return page;
+    }
+
+    pub fn openFrozen(self: Owner, scope: registry_mod.Scope, connection: u128, table: []const u8, binding: reads.FrozenBinding, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
+        const route = self.source.route_fence orelse return error.CatalogRouteFenceRequired;
+        if (connection == 0 or scope.table_id != route.table_id or scope.group_id != route.route.group_id or scope.topology_revision != route.topology_epoch or
+            binding.namespace.table_id != scope.table_id or binding.namespace.shard_id != route.route.identity_namespace.shard_id or
+            binding.namespace.range_id != route.route.identity_namespace.range_id)
+            return error.RetainedReadScopeChanged;
+        var query = input.relational_query orelse return error.InvalidRetainedReadQuery;
+        if (query.schema_version) |version| if (version != scope.schema_version) return error.RetainedReadScopeChanged;
+        if (query.index != null or query.auto_index or query.text_filter != null or input.include_range_proofs or input.required_sql_indexes.len != 0) return error.InvalidRetainedReadQuery;
+        query.schema_version = scope.schema_version;
+        const alloc = self.registry.alloc;
+        const cursor = try alloc.create(Cursor);
+        errdefer alloc.destroy(cursor);
+        cursor.* = .{ .alloc = alloc, .view = undefined };
+        var opts = input;
+        opts.relational_query = query;
+        opts.columnar_stats = null;
+        opts.cancellation = CancellationToken.fromAtomic(&cursor.cancelled);
+        opts.execution_deadline_ns = deadline_ns;
+        cursor.view = try self.source.openFrozenRelationalReadGroupLocal(alloc, table, binding, from, to, opts);
+        errdefer cursor.view.deinit();
+        return self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = cursor, .kind = .cursor, .close = Cursor.close, .cancellation = &cursor.cancelled });
     }
 
     pub fn openSnapshot(self: Owner, scope: registry_mod.Scope, snapshot_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
@@ -230,6 +281,7 @@ pub const Owner = struct {
             parsed = try std.json.parseFromSlice(types.RelationalRowQuery, alloc, input.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false });
             break :blk parsed.?.value;
         };
+        if (query.text_filter != null) return error.UnsupportedSqlExecution;
         if (query.schema_version) |version| if (version != scope.schema_version) return error.RetainedReadScopeChanged;
         if (query.index != null or query.auto_index) return error.SqlStatementSnapshotRequired;
         query.schema_version = scope.schema_version;

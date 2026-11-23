@@ -20,6 +20,32 @@
 
 const std = @import("std");
 
+/// Typed comparison shape, independent of physical index generation or
+/// readiness. Prepared query keys and immutable index expressions share it.
+pub const ExpressionKeyIdentity = struct {
+    fingerprint: [32]u8,
+    kind: @import("schema.zig").RelationalColumnType,
+    builtin: ?@import("../common/sql_builtin_type.zig").Type,
+};
+
+/// Transportable access hint. The caller retains its logical residual on both
+/// the READY index and primary fallback paths; this is never a filter/proof.
+pub const ExpressionEqualityHint = struct {
+    identity: ExpressionKeyIdentity,
+    fold_ascii: bool = false,
+    value: std.json.Value,
+};
+
+/// Canonical declaration identity, streamed without an intermediate JSON copy.
+/// This is separate from typed comparison identity and from a physical tuple ID.
+pub fn definitionDigest(definition: RelationalIndexDefinition) ![32]u8 {
+    var hashing = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
+    try std.json.Stringify.value(definition, .{}, &hashing.writer);
+    var result: [32]u8 = undefined;
+    hashing.hasher.final(&result);
+    return result;
+}
+
 /// Store-local immutable physical identity. A catalog revision allocates one
 /// slot per changed/new index; unchanged definitions retain their original ID.
 /// Names remain in the catalog, not in every forward and reverse row key.
@@ -332,6 +358,9 @@ pub const ForeignKeyValidationState = enum(u8) {
 };
 
 pub const ForeignKey = struct {
+    /// Historical parent existence is independent of reverse-reference coverage.
+    /// Mutation preparation always requires live parents, regardless of this bit.
+    not_valid: bool = false,
     name: []const u8,
     child_columns: []const []const u8 = &.{},
     child_period: ?[]const u8 = null,
@@ -352,7 +381,7 @@ pub const UniqueConstraint = struct {
     keys: []const RelationalIndexKey = &.{},
     expressions: []const UniqueExpression = &.{},
     include_columns: []const []const u8 = &.{},
-    without_overlaps_period: ?[]const u8 = null,
+    without_overlaps_column: ?[]const u8 = null,
     nulls_not_distinct: bool = false,
     deferrable: bool = false,
     timing: ForeignKeyTiming = .immediate,
@@ -849,10 +878,34 @@ pub const UniqueExpression = struct {
 pub const UniquePredicateOp = RelationalCheckOp;
 
 pub const UniquePredicate = struct {
-    field: []const u8,
-    op: UniquePredicateOp,
+    /// Exactly one of constant membership or a nonempty field comparison.
+    constant: ?bool = null,
+    field: []const u8 = "",
+    op: UniquePredicateOp = .eq,
     value_json: ?[]const u8 = null,
     collation: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        if (self.constant) |value| {
+            if (self.field.len != 0 or self.op != .eq or self.value_json != null or self.collation != null)
+                return error.WriteFailed; // std.json's custom writer error set; fail closed.
+            try writer.objectField("constant");
+            try writer.write(value);
+        } else {
+            // Retain the exact existing native spelling, including nulls:
+            // unrelated definitions must not acquire new durable digests.
+            try writer.objectField("field");
+            try writer.write(self.field);
+            try writer.objectField("op");
+            try writer.write(self.op);
+            try writer.objectField("value_json");
+            try writer.write(self.value_json);
+            try writer.objectField("collation");
+            try writer.write(self.collation);
+        }
+        try writer.endObject();
+    }
 };
 
 pub const RelationalPeriod = struct {
@@ -873,7 +926,7 @@ pub const PrimaryKey = struct {
     name: ?[]const u8 = null,
     columns: []const []const u8 = &.{},
     include_columns: []const []const u8 = &.{},
-    without_overlaps_period: ?[]const u8 = null,
+    without_overlaps_column: ?[]const u8 = null,
     deferrable: bool = false,
     timing: ForeignKeyTiming = .immediate,
 };

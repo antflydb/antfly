@@ -17,7 +17,7 @@
 //! The fence and plan are durable before graph admission closes; the seal is
 //! recorded only after every pre-fence graph worker snapshot has drained.
 const std = @import("std");
-const topology = @import("relational_integrity_topology_contract.zig");
+const topology = @import("relational/integrity/topology_contract.zig");
 const graph_config = @import("graph_retirement_config.zig");
 
 pub const intent_key = "\x00\x00__metadata__:graph_retirement_intent_v1";
@@ -155,8 +155,8 @@ pub fn status(txn: anytype) !Status {
     const receipt = if (try optional(txn, receipt_key)) |bytes| try Receipt.decode(bytes) else null;
     if (receipt != null and intent == null) return error.InvalidGraphRetirementSeal;
     if (intent) |scope| {
-        const current = try @import("relational_integrity_topology.zig").current(txn);
-        const completed = try @import("relational_integrity_topology.zig").completed(txn);
+        const current = try @import("relational/integrity/topology.zig").current(txn);
+        const completed = try @import("relational/integrity/topology.zig").completed(txn);
         if (!(if (current) |fence| fence.eql(scope.fence) else false) and
             !(if (completed) |fence| fence.eql(scope.fence) else false)) return error.InvalidGraphRetirementScope;
         if (receipt) |sealed| {
@@ -179,9 +179,9 @@ pub fn stageBegin(txn: anytype, scope: Scope) !void {
     if (try optional(txn, intent_key)) |raw| {
         const previous = try Scope.decode(raw);
         if (previous.eql(scope)) return;
-        const completed = (try @import("relational_integrity_topology.zig").completed(txn)) orelse return error.InvalidGraphRetirementScope;
+        const completed = (try @import("relational/integrity/topology.zig").completed(txn)) orelse return error.InvalidGraphRetirementScope;
         if (!completed.eql(previous.fence) or scope.fence.admission_epoch <= previous.fence.admission_epoch or
-            (try @import("relational_integrity_topology.zig").current(txn)) != null) return error.InvalidGraphRetirementScope;
+            (try @import("relational/integrity/topology.zig").current(txn)) != null) return error.InvalidGraphRetirementScope;
         // The prior plan completed and a strictly newer topology begin is
         // staged by the caller in this transaction. Replace both records
         // atomically; a stale receipt must never seal the new generation.
@@ -201,7 +201,7 @@ pub fn stageSealPosition(txn: anytype, scope: Scope, stamp: @import("receipt_pos
     const intent = current.intent orelse return error.InvalidGraphRetirementScope;
     if (!intent.eql(scope)) return error.InvalidGraphRetirementScope;
     if (current.receipt) |previous| return previous;
-    const active = (try @import("relational_integrity_topology.zig").current(txn)) orelse return error.InvalidGraphRetirementScope;
+    const active = (try @import("relational/integrity/topology.zig").current(txn)) orelse return error.InvalidGraphRetirementScope;
     if (!active.eql(scope.fence)) return error.InvalidGraphRetirementScope;
     const encoded_scope = try scope.encode();
     var scope_digest: [32]u8 = undefined;
@@ -221,7 +221,7 @@ pub fn stageCancel(txn: anytype, fence: topology.Fence) !bool {
     // Likewise, a late cancel/abort after a completed cutover must not
     // reopen graph admission on the retired physical owner.
     if ((try optional(txn, receipt_key)) != null) return error.IntegrityTopologyCutoverRequired;
-    const active = (try @import("relational_integrity_topology.zig").current(txn)) orelse return error.IntegrityTopologyCutoverRequired;
+    const active = (try @import("relational/integrity/topology.zig").current(txn)) orelse return error.IntegrityTopologyCutoverRequired;
     if (!active.eql(fence)) return error.IntegrityTopologyChanged;
     try txn.delete(intent_key);
     try txn.delete(receipt_key);
@@ -277,8 +277,8 @@ test "graph retirement late cancel cannot revoke a seal or completed cutover" {
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             if (std.mem.eql(u8, key, intent_key)) return self.scope_bytes;
             if (std.mem.eql(u8, key, receipt_key)) return self.graph_receipt_bytes orelse return error.NotFound;
-            if (std.mem.eql(u8, key, @import("relational_integrity_topology.zig").fence_key)) return self.fence_bytes orelse return error.NotFound;
-            if (std.mem.eql(u8, key, @import("relational_integrity_topology.zig").receipt_key)) return self.completed_bytes orelse return error.NotFound;
+            if (std.mem.eql(u8, key, @import("relational/integrity/topology.zig").fence_key)) return self.fence_bytes orelse return error.NotFound;
+            if (std.mem.eql(u8, key, @import("relational/integrity/topology.zig").receipt_key)) return self.completed_bytes orelse return error.NotFound;
             return error.NotFound;
         }
 

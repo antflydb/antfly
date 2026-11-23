@@ -17,7 +17,7 @@
 //! base64, while identity byte strings use the existing native JSON codec.
 const std = @import("std");
 const publication = @import("artifact_publication.zig");
-const binary = @import("relational_integrity_json.zig");
+const binary = @import("relational/integrity/json.zig");
 const WireMutation = struct { family: publication.Family, key: []const u8, value_base64: ?[]const u8, source_index: u32 };
 const Wire = struct {
     mode: @FieldType(publication.Command, "mode") = .publish,

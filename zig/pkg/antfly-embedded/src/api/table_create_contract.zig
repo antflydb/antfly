@@ -19,6 +19,10 @@
 const std = @import("std");
 
 pub const CreateTableRequest = struct {
+    /// Authenticated SQL/native lifecycle metadata. Public create transports
+    /// reject this field; metadata admission independently joins its boot and
+    /// exact store placement before publishing a native owner.
+    sql_persistence: ?@import("../common/relation_persistence.zig").Descriptor = null,
     tablespace_name: ?[]u8 = null,
     // Omission is a creation policy decision. Persisted table settings keep
     // their legacy default so opening an existing table never migrates it.
@@ -26,6 +30,8 @@ pub const CreateTableRequest = struct {
     num_shards: ?u32 = null,
     description: ?[]u8 = null,
     indexes_json: ?[]u8 = null,
+    /// Private restore metadata; never populated by the public create decoder.
+    sql_native_indexes_json: ?[]u8 = null,
     schema_json: ?[]u8 = null,
     replication_sources_json: ?[]u8 = null,
 
@@ -33,6 +39,7 @@ pub const CreateTableRequest = struct {
         if (self.tablespace_name) |value| alloc.free(value);
         if (self.description) |value| alloc.free(value);
         if (self.indexes_json) |value| alloc.free(value);
+        if (self.sql_native_indexes_json) |value| alloc.free(value);
         if (self.schema_json) |value| alloc.free(value);
         if (self.replication_sources_json) |value| alloc.free(value);
         self.* = undefined;

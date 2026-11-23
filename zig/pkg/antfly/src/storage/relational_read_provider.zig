@@ -22,6 +22,7 @@ const callbacks = @import("antfly_local_sources").runtime_callback_abi;
 const errors = @import("antfly_runtime_abi").error_abi;
 const types = @import("antfly_local_sources").storage_db_types;
 pub const View = @import("antfly_local_sources").storage_relational_read_view.View;
+pub const FrozenBinding = @import("antfly_local_sources").storage_db_relational_frozen_contract.Binding;
 pub const Fence = @import("antfly_local_sources").storage_statement_read_fence.Fence;
 
 pub const Provider = struct {
@@ -32,11 +33,19 @@ pub const Provider = struct {
     pub const VTable = struct {
         open: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, types.ScanOptions) anyerror!View,
         try_fence: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, types.ScanOptions) anyerror!?Fence = null,
+        open_frozen: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, FrozenBinding, []const u8, []const u8, types.ScanOptions) anyerror!View = null,
     };
     const Abi = callbacks.Boundary(VTable);
 
     pub fn open(self: Provider, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: types.ScanOptions) !View {
         return Abi.call("open", self.dispatch, self.vtable.open, .{ self.ptr, alloc, table, from, to, opts });
+    }
+
+    /// Private retained snapshots use an independently verified generation
+    /// binding. An archive view has no mutation or range-proof capabilities.
+    pub fn openFrozen(self: Provider, alloc: std.mem.Allocator, table: []const u8, binding: FrozenBinding, from: []const u8, to: []const u8, opts: types.ScanOptions) !View {
+        const open_frozen = self.vtable.open_frozen orelse return error.SqlStatementSnapshotRequired;
+        return Abi.call("open_frozen", self.dispatch, open_frozen, .{ self.ptr, alloc, table, binding, from, to, opts });
     }
 
     pub fn tryFence(self: Provider, alloc: std.mem.Allocator, table: []const u8, opts: types.ScanOptions) !?Fence {

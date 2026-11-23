@@ -1,0 +1,1640 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SQL with native version predicate witness",
+  "seed_version": 42,
+  "seeds": [
+    {
+      "key": "doc:a",
+      "value": {
+        "title": "Before",
+        "status": "draft",
+        "category": "release",
+        "amount": 12,
+        "enabled": true,
+        "note": "keep-a",
+        "metadata": {
+          "source": "api",
+          "billing": {
+            "plan": "pro"
+          },
+          "flags": [
+            "rated"
+          ]
+        }
+      }
+    },
+    {
+      "key": "doc:b",
+      "value": {
+        "title": "Other",
+        "status": "ready",
+        "category": "other",
+        "amount": 20,
+        "enabled": false,
+        "note": "keep-b",
+        "metadata": {
+          "source": "internal",
+          "billing": {
+            "plan": "free"
+          },
+          "flags": []
+        }
+      }
+    },
+    {
+      "key": "doc:c",
+      "value": {
+        "title": "Untouched",
+        "status": "closed",
+        "category": "other",
+        "amount": 4,
+        "enabled": false,
+        "note": "keep-c",
+        "metadata": {
+          "source": "manual",
+          "flags": []
+        }
+      }
+    }
+  ],
+  "entries": [
+    {
+      "id": "sql-0907",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-0908",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "DELETE",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-0914",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": [
+        {
+          "title": "Launch"
+        }
+      ]
+    },
+    {
+      "id": "sql-0919",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "default": "draft"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 0,
+      "sqlstate": "23505",
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-0931",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": [
+        {
+          "title": "Before"
+        }
+      ]
+    },
+    {
+      "id": "sql-0936",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": [
+        {
+          "title": "Before"
+        }
+      ]
+    },
+    {
+      "id": "sql-0937",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": [
+        {
+          "title": "Before"
+        }
+      ]
+    },
+    {
+      "id": "sql-0942",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 0,
+      "sqlstate": "23505",
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-0944",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 0,
+      "sqlstate": "23505",
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-0945",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "INSERT",
+      "affected": 0,
+      "sqlstate": "23505",
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-1068",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "UPDATE",
+      "affected": 0,
+      "sqlstate": "42P01",
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-1071",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text",
+                  "x-antfly-column-name": "title"
+                },
+                "score": {
+                  "type": "numeric",
+                  "x-antfly-column-name": "score"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-1078",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "UPDATE",
+      "affected": 2,
+      "sqlstate": null,
+      "untouched": [
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Launch",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-1080",
+      "requires_native_session": false,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "UPDATE",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-1105",
+      "requires_native_session": true,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "MERGE",
+      "affected": 3,
+      "sqlstate": null,
+      "untouched": [],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [],
+      "generated_final": []
+    },
+    {
+      "id": "sql-1106",
+      "requires_native_session": true,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "MERGE",
+      "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:a",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-1107",
+      "requires_native_session": true,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "MERGE",
+      "affected": 0,
+      "sqlstate": null,
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    },
+    {
+      "id": "sql-1108",
+      "requires_native_session": true,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "command_tag": "MERGE",
+      "affected": 0,
+      "sqlstate": "42702",
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "columns": [],
+      "column_oids": [],
+      "rows": [],
+      "sql_nulls": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Before",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ],
+      "generated_final": []
+    }
+  ]
+}

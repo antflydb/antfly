@@ -260,6 +260,25 @@ pub fn selectActiveFullTextIndexNameAlloc(
     read_schema_json: []const u8,
     indexes_json: []const u8,
 ) !?[]u8 {
+    return selectPublishedFullTextIndexNameAlloc(alloc, schema_json, read_schema_json, indexes_json, null);
+}
+
+pub fn selectPublishedFullTextIndexNameAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+    physical_index: ?[]const u8,
+) !?[]u8 {
+    if (physical_index) |name| {
+        if (name.len == 0 or name.len > 1024 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidTableIndexMetadata;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidTableIndexMetadata;
+        const config = parsed.value.object.get(name) orelse return error.InvalidTableIndexMetadata;
+        if (!isFullTextIndexConfig(config)) return error.InvalidTableIndexMetadata;
+        return try alloc.dupe(u8, name);
+    }
     const selected_version = if (read_schema_json.len > 0)
         try schemaVersion(read_schema_json)
     else
@@ -310,6 +329,18 @@ pub fn selectFullTextIndexNameForVersionAlloc(
     }
     if (only_full_text_name) |name| return try alloc.dupe(u8, name);
     return null;
+}
+
+/// Only generated names may be retired by schema migration. Selecting a
+/// user-named primary index does not transfer ownership of its declaration.
+pub fn managedGenerationVersion(name: []const u8) ?u32 {
+    if (std.mem.eql(u8, name, "default") or std.mem.eql(u8, name, "full_text_index")) return 0;
+    const prefix = "full_text_index_v";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const digits = name[prefix.len..];
+    if (digits.len == 0 or (digits.len > 1 and digits[0] == '0')) return null;
+    for (digits) |digit| if (!std.ascii.isDigit(digit)) return null;
+    return std.fmt.parseInt(u32, digits, 10) catch null;
 }
 
 pub fn isFullTextIndexConfig(value: std.json.Value) bool {

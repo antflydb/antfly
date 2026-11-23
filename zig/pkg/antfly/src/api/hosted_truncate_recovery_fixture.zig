@@ -21,6 +21,35 @@ const raft = @import("../raft/mod.zig");
 const server_mod = @import("http_server.zig");
 const metadata_runtime = @import("../metadata/runtime.zig");
 
+/// A started HTTP listener or successful metadata read-index is not a ready
+/// relation-name publication. Establish authoritative absence before CREATE;
+/// never replay a mutation to turn startup readiness into a test retry loop.
+pub fn awaitAbsentRelation(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, target: @import("antfly_local_sources").system_catalog_domain.RelationTarget) !void {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const source = server_mod.StatusSource.fromMetadataHttpService(metadata.server.svc);
+    const lookup: domain.ResolveMany = .{ .relations = &.{target} };
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    var pending_error: ?anyerror = null;
+    while (platform.time.monotonicNs() < deadline) {
+        const bytes = source.systemCatalog(alloc, .{ .deadline_ns = deadline }, .{ .resolve_many = lookup }) catch |err| switch (err) {
+            error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => {
+                pending_error = err;
+                try io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        defer alloc.free(bytes);
+        var resolved = try std.json.parseFromSlice(domain.ResolvedMany, alloc, bytes, .{});
+        defer resolved.deinit();
+        try resolved.value.validateRelations(lookup);
+        try std.testing.expect(resolved.value.relations[0] == null);
+        return;
+    }
+    std.debug.print("hosted relation publication timeout relation={s}.{s}.{s} pending={s}\n", .{ target.database, target.namespace, target.name, if (pending_error) |err| @errorName(err) else "none" });
+    return error.CatalogPublicationReadinessTimeout;
+}
+
 /// Public table/index discovery can precede the owner's readable integrity
 /// catalog. Establish the same read-index prerequisite used by seed writes
 /// before issuing a mutation, rather than retrying the mutation itself.

@@ -47,7 +47,14 @@ pub const batch_merge_history_cut_protocol_version: u16 = 56;
 pub const batch_source_drained_bind_protocol_version: u16 = 57;
 /// Version 58 enrolls history after proving retained completions terminal.
 pub const batch_history_reenrollment_protocol_version: u16 = 58;
-pub const batch_protocol_version: u16 = batch_history_reenrollment_protocol_version;
+// Branch SQL owners add separate decoders above the published CDC prefix.
+pub const batch_graph_transaction_protocol_version: u16 = 64;
+pub const batch_coupled_schema_policy_protocol_version: u16 = 65;
+pub const batch_publication_capture_protocol_version: u16 = 67;
+pub const batch_publication_collection_protocol_version: u16 = 68;
+pub const batch_replication_source_prepare_protocol_version: u16 = 69;
+pub const batch_protocol_version: u16 = batch_replication_source_prepare_protocol_version;
+pub const maximum_decodable_batch_protocol_version: u16 = batch_protocol_version;
 pub const batch_split_origin_enrollment_protocol_version: u16 = 54;
 pub const batch_split_history_seed_protocol_version: u16 = 53;
 
@@ -191,6 +198,49 @@ pub const batch_document_revisions_protocol_version: u16 = 27;
 /// Version 26 binds generated vector publications to resolved model revisions
 /// and admits catalog-aware grouped-source activation.
 pub const batch_execution_identity_protocol_version: u16 = 26;
+/// Document retirement binds the exact source definition under the apply
+/// writer and persists a source-only proof without a relational catalog.
+pub const batch_document_retirement_protocol_version: u16 = 66;
+/// Native row/table grants and their frozen 2PC references must be decoded by
+/// every applying replica before the first private lock command is admitted.
+pub const batch_sql_lock_protocol_version: u16 = 63;
+/// Version 62 carries externally decided votes, admission deadlines and
+/// irreversible read activation. Old members must never ignore these fields.
+pub const batch_external_transaction_protocol_version: u16 = 62;
+/// Version 61 admits metadata-authenticated whole-table deletion fencing and
+/// retire-only FK controls under stable row policies. Older replicas must not
+/// ignore that marker or reinterpret it as an ordinary topology operation.
+pub const batch_sql_drop_control_protocol_version: u16 = 61;
+/// Version 59 carries one tagged private-index effect per entry, including
+/// fixed build/verification pages and terminal controls. It does not advertise
+/// complete public index-publication support. Cancellation GC carries fixed
+/// cursor/count or claim-prefix commitments, never borrowed selection pointers.
+pub const batch_index_owner_control_protocol_version: u16 = 59;
+/// Version 60 carries validation-only schema controls. Owner preparation runs
+/// off the progress lane and committed dispatch shares the ordinary apply
+/// boundary. Every applying member still needs the durable activation barrier.
+pub const batch_schema_owner_control_protocol_version: u16 = 60;
+/// Origin-bearing replica snapshots belong to that same all-member barrier.
+/// Do not send a new envelope merely because the local binary can decode it.
+pub const native_snapshot_origin_protocol_version = batch_schema_owner_control_protocol_version;
+pub fn nativeSnapshotOriginEnabled(activated_protocol: u16) bool {
+    return activated_protocol >= native_snapshot_origin_protocol_version;
+}
+
+pub fn graphCapabilityCoupled(data_version: u16, batch_version: u16) bool {
+    return (data_version < 7 or batch_version >= batch_graph_transaction_protocol_version) and
+        (data_version < 8 or batch_version >= batch_coupled_schema_policy_protocol_version);
+}
+
+test "graph capability never treats the decoder ceiling as serving support" {
+    const testing = @import("std").testing;
+    try testing.expect(graphCapabilityCoupled(6, batch_graph_transaction_protocol_version - 1));
+    try testing.expect(!graphCapabilityCoupled(7, batch_graph_transaction_protocol_version - 1));
+    try testing.expect(graphCapabilityCoupled(7, batch_graph_transaction_protocol_version));
+    try testing.expect(!graphCapabilityCoupled(8, batch_coupled_schema_policy_protocol_version - 1));
+    try testing.expect(graphCapabilityCoupled(8, batch_coupled_schema_policy_protocol_version));
+    try testing.expect(maximum_decodable_batch_protocol_version >= batch_protocol_version);
+}
 /// Version 25 carries leader-planned LEANN records (`_leann_record`), which
 /// replicas persist and apply verbatim in log order. Older peers cannot
 /// treat them as empty batches.

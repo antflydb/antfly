@@ -19,6 +19,10 @@ pub const physical_db = struct {};
 pub const selected_db = @import("antfly_local_sources").storage_db_control_root;
 pub const table_reads = @import("api/table_reads.zig");
 pub const table_writes = @import("api/table_writes.zig");
+pub const lake_execution_backend = if (@import("lake_execution_options").shared_lake_execution)
+    @import("api/lake_execution_native_client.zig")
+else
+    @import("api/lake_execution_build_impl.zig");
 pub const local_query = struct {};
 pub const local_write = struct {};
 
