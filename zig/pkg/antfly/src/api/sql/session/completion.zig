@@ -831,7 +831,7 @@ fn recoverLivePublications(server: *server_mod.ApiHttpServer, alloc: std.mem.All
 
 fn recoverLegacyPublications(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, limit: usize, context: operation.RequestContext) !void {
     const store = try registrationStoreControlled(server, context);
-    const page = try store.registrationRecoveryPage(alloc, server.sql_completion_recovery_after, limit);
+    const page = try store.registrationRecoveryPageControlled(alloc, server.sql_completion_recovery_after, limit, context);
     defer alloc.free(page.references);
     var failure: ?anyerror = null;
     for (page.references) |reference| {
