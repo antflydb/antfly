@@ -50427,16 +50427,14 @@ pub const RaftApplyStore = struct {
         for (receipt_work.receipts) |value| try value.session.requireRealm(standalone);
         for (work.records) |value| if (value.identity.session) |session| try session.requireRealm(standalone);
         try context.ensureActive();
-        const prepared_capability_version = ready: {
-            const activation = self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_publication_capture_version) catch |err| switch (err) {
-                error.TableTopologyProtocolUpgradeRequired => break :ready 0,
+        const publication_capture_ready = if (standalone) false else ready: {
+            _ = self.standbyRelationActivationTxn(&txn, group, topology_protocol.sql_publication_capture_version) catch |err| switch (err) {
+                error.TableTopologyProtocolUpgradeRequired => break :ready false,
                 else => return err,
             };
-            break :ready activation.version;
+            break :ready true;
         };
-        const publication_capture_ready = !standalone and prepared_capability_version >= topology_protocol.sql_publication_capture_version;
-        const scope_supersession_ready = prepared_capability_version >= topology_protocol.sql_scope_supersession_lookup_version;
-        return std.json.Stringify.valueAlloc(alloc, PreparedTransactions.Snapshot{ .standalone = standalone, .publication_capture_ready = publication_capture_ready, .scope_supersession_ready = scope_supersession_ready, .catalog_revision = revision, .incarnation = incarnation, .head = try journal.head(a), .active = active, .records = work.records, .receipts = receipt_work.receipts, .outstanding_receipts = outstanding, .next_after = if (request == .receipt_work) receipt_work.next_after else work.next_after }, .{});
+        return std.json.Stringify.valueAlloc(alloc, PreparedTransactions.Snapshot{ .standalone = standalone, .publication_capture_ready = publication_capture_ready, .catalog_revision = revision, .incarnation = incarnation, .head = try journal.head(a), .active = active, .records = work.records, .receipts = receipt_work.receipts, .outstanding_receipts = outstanding, .next_after = if (request == .receipt_work) receipt_work.next_after else work.next_after }, .{});
     }
 
     pub fn sqlAuthorizationRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("../../system_catalog/authorization.zig").Read, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {

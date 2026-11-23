@@ -50,6 +50,7 @@ const Native = struct {
     calls: usize = 0,
     outcome_reads: usize = 0,
     scope_reads: usize = 0,
+    reject_retired_connection: bool = false,
     failure: ?enum { admit, prepare, commit, handoff, ack, cancel } = null,
     fail_before: bool = false,
     block_ack: bool = false,
@@ -112,6 +113,7 @@ const Native = struct {
             },
             .sql_lock_read => |query| blk: {
                 self.scope_reads += 1;
+                if (self.reject_retired_connection and query.retired_connection != null) return error.UnknownField;
                 break :blk self.metadata.sqlLockRead(alloc, group, query, .{ .setting_admin = true });
             },
             .sql_lock_outcome => |request| blk: {
@@ -746,6 +748,15 @@ test "SQL command producer native scoped COMMIT survives every metadata delivery
                         try std.testing.expectEqual(@as(u32, 1), before_ack.value.owner.?.resources);
                         var seal = try std.json.parseFromSlice(transactions.ExternalPreparationSeal, a, bytes.external_preparation.?, .{});
                         defer seal.deinit();
+                        // An old receiver can still serve the plain read, but
+                        // absence without a supersession proof must retain the receipt.
+                        native.reject_retired_connection = true;
+                        const legacy_reads = native.scope_reads;
+                        try std.testing.expectError(error.InvalidSqlBackendResponse, owner.acknowledgeReceipt(region.allocator(), seal.value.identity));
+                        try std.testing.expectEqual(legacy_reads + 2, native.scope_reads);
+                        const legacy_cut = try owner.snapshot(region.allocator(), .{ .operation = operation_id.? });
+                        try std.testing.expectEqual(@as(usize, 1), legacy_cut.receipts.len);
+                        native.reject_retired_connection = false;
                         const reads_before = native.scope_reads;
                         try owner.acknowledgeReceipt(region.allocator(), seal.value.identity);
                         try std.testing.expectEqual(reads_before + 1, native.scope_reads);

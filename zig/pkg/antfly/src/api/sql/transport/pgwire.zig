@@ -5917,7 +5917,12 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
     var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } });
     defer db.close();
     try db.setSchemaJson(a, schema);
-    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"id\":\"row\",\"status\":\"open\"}" }} });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"id\":\"zulu\",\"status\":\"open\"}" },
+        .{ .key = "b", .value = "{\"id\":null,\"status\":\"open\"}" },
+        .{ .key = "c", .value = "{\"id\":\"alpha\",\"status\":\"open\"}" },
+        .{ .key = "d", .value = "{\"id\":\"mike\",\"status\":\"open\"}" },
+    } });
     var ranges = [_]local.common_topology_records.RangeRecord{.{ .table_id = 7, .group_id = 7, .range_id = 1, .start_key = "", .doc_identity_shard_id = 1, .doc_identity_range_id = 1 }};
     var source: Source = .{ .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }}, .reads = .{reads.BoundTableReadSource.init("usage_records", 7, &db, raft.read_gate.alreadyReadSafeBarrier())}, .ranges = &ranges };
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
@@ -5963,7 +5968,7 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
     for ([_][]const u8{
         "SELECT id FROM usage_records",
         "SELECT id FROM usage_records WHERE id IS NOT NULL ORDER BY id",
-    }) |statement| for ([_]bool{ false, true }) |guarded| for ([_]bool{ false, true }, 0..) |change, scenario| {
+    }, 0..) |statement, projection| for ([_]bool{ false, true }) |guarded| for ([_]bool{ false, true }, 0..) |change, scenario| {
         source.catalog_revision = 7;
         source.catalog_stamp_reads.store(0, .monotonic);
         source.catalog_reads.store(0, .monotonic);
@@ -5996,6 +6001,10 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
         defer session.deinit();
         try session.run();
         var frames: Protocol.Cursor = .{ .bytes = output.written() };
+        const expected: []const ?[]const u8 = if (projection == 0)
+            &.{ "zulu", null, "alpha", "mike" }
+        else
+            &.{ "alpha", "mike", "zulu" };
         var rows: usize = 0;
         while (frames.offset < frames.bytes.len) {
             const tag = try frames.int(u8);
@@ -6004,14 +6013,27 @@ test "SQL pgwire native prepared streams validate catalog changes without a redu
                 std.debug.print("prepared protocol error: {s}\n", .{bytes});
                 return error.UnexpectedPreparedQueryError;
             }
-            if (tag == 'D') rows += 1;
+            if (tag == 'D') {
+                try std.testing.expect(rows < expected.len);
+                var row: Protocol.Cursor = .{ .bytes = bytes };
+                try std.testing.expectEqual(@as(u16, 1), try row.int(u16));
+                const len = try row.int(i32);
+                if (expected[rows]) |value| {
+                    try std.testing.expectEqual(@as(i32, @intCast(value.len)), len);
+                    try std.testing.expectEqualStrings(value, try row.take(@intCast(len)));
+                } else {
+                    try std.testing.expectEqual(@as(i32, -1), len);
+                }
+                try std.testing.expectEqual(bytes.len, row.offset);
+                rows += 1;
+            }
         }
-        try std.testing.expectEqual(@as(usize, 1), rows);
+        try std.testing.expectEqual(expected.len, rows);
         try std.testing.expectEqual(@as(usize, if (guarded) 2 else if (change) 4 else 3), source.catalog_stamp_reads.load(.monotonic));
         try std.testing.expectEqual(@as(usize, 1), Frames.admission_attempts);
         const catalog_calls = source.catalog_reads.load(.monotonic);
-        if (!guarded) baseline[scenario] = catalog_calls else if (!change) {
-            try std.testing.expectEqual(baseline[scenario] - 1, catalog_calls);
+        if (!guarded) baseline[scenario] = catalog_calls else {
+            try std.testing.expectEqual(baseline[scenario] - @as(usize, if (change) 3 else 1), catalog_calls);
         }
         std.debug.print("PGWIRE_PREPARED_ADMISSION guarded={} stale={} metadata_calls={d} admissions={d}\n", .{ guarded, change, catalog_calls, Frames.admission_attempts });
     };

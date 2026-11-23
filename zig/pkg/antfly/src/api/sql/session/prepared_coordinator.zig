@@ -750,22 +750,31 @@ pub const Registry = struct {
             .database = identity.database_id,
             .backend = ref.backend,
         };
-        if (anchor.scope_supersession_ready) if (identity.session) |session| {
+        if (identity.session) |session| {
             if (session.connection_id) |id| query.retired_connection = .{ .id = id, .node = session.owner_node_id };
-        };
+        }
         return query;
     }
 
-    fn observeRecoveryScope(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query, session: ?registry.SessionRef) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
+    fn observeRecoveryScope(self: *@This(), a: A, context: local.api_operation.RequestContext, query: @import("../../../system_catalog/lock_authority.zig").Query) !@import("../../../system_catalog/lock_authority.zig").Snapshot {
         const types = @import("../../../system_catalog/lock_authority.zig");
-        const result = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
-        if (result.scope != null or query.retired_connection != null) return result;
-        // During mixed-version rollout the previous decoder supports proof
-        // on demand. Gate the combined request on the advertised capability.
-        const bound = session orelse return result;
-        var proof = query;
-        proof.retired_connection = .{ .id = bound.connection_id orelse return result, .node = bound.owner_node_id };
-        return std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = proof }), .{});
+        const bytes = self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }) catch |err| switch (err) {
+            // Pre-reenrollment metadata may reject the selector at decode or
+            // activation. The plain read can still prove that the scope exists.
+            // A failed proof followed by a missing scope never permits cleanup.
+            error.UnknownField, error.TableTopologyProtocolUpgradeRequired, error.MetadataMutationOutcomeUnknown => fallback: {
+                if (query.retired_connection == null) return err;
+                try context.ensureActive();
+                var plain = query;
+                plain.retired_connection = null;
+                break :fallback try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = plain });
+            },
+            else => return err,
+        };
+        defer a.free(bytes);
+        var result = try std.json.parseFromSliceLeaky(types.Snapshot, a, bytes, .{ .allocate = .alloc_always });
+        if (result.scope != null) result.superseded = null;
+        return result;
     }
 
     /// Unadmitted SQL may already hold transaction locks. Native cleanup must
@@ -781,7 +790,7 @@ pub const Registry = struct {
         context.sql_completion = null;
         context.sql_completion_submission = null;
         const query = scopeRecoveryQuery(anchor, seal.identity, ref);
-        const before = try self.observeRecoveryScope(a, context, query, seal.identity.session);
+        const before = try self.observeRecoveryScope(a, context, query);
         const scope = before.scope orelse return if (before.superseded == true) true else error.InvalidSqlBackendResponse;
         if (scope.next_command > ref.command.sequence or scope.transaction == null) return true;
         if (!std.meta.eql(scope.transaction, @as(?types.scopes.Transaction, .{ .id = seal.identity.txn_id }))) return error.ExternalTransactionDecisionChanged;
@@ -794,7 +803,7 @@ pub const Registry = struct {
         _ = try result.result();
         self.anchor = null;
         // One bounded cleanup quantum, then yield to the existing supervisor.
-        const after = try self.observeRecoveryScope(a, context, query, seal.identity.session);
+        const after = try self.observeRecoveryScope(a, context, query);
         return after.superseded == true or after.scope != null and after.scope.?.transaction == null;
     }
 
@@ -810,7 +819,7 @@ pub const Registry = struct {
         var context = self.context;
         context.setting_admin = true;
         const query = scopeRecoveryQuery(anchor, identity, ref);
-        const before = try self.observeRecoveryScope(a, context, query, identity.session);
+        const before = try self.observeRecoveryScope(a, context, query);
         const scope = before.scope orelse return if (before.superseded == true) true else error.InvalidSqlBackendResponse;
         // A completed sealed command is a permanent cleanup witness, even if
         // later transactions have replaced the single recent release marker.
@@ -829,7 +838,7 @@ pub const Registry = struct {
         _ = try result.result();
         self.server.sql_lock_work_pending.store(true, .release);
         self.anchor = null; // Scope progress advances the shared admission head.
-        const after = try self.observeRecoveryScope(a, context, query, identity.session);
+        const after = try self.observeRecoveryScope(a, context, query);
         return after.superseded == true or after.scope != null and after.scope.?.transaction == null and std.meta.eql(after.scope.?.released_transaction, @as(?types.scopes.Transaction, expected));
     }
     pub fn acknowledgeReceipt(self: *@This(), a: A, identity: registry.Identity) !void {
