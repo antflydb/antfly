@@ -6569,7 +6569,13 @@ pub const HBCIndex = struct {
         var txn = try store.beginRead();
         defer txn.abort();
         const metadata = IndexMetadata.decode(try txn.get(.meta, meta_key));
-        return initOwnedRuntime(self.alloc, self.cache_path, self.config, opened, store, metadata);
+        // A writer view only needs a small routing cache for its queued
+        // inserts. The serving cache remains sized for its query workload.
+        var config = self.config;
+        config.max_cached_nodes = @min(config.max_cached_nodes, 64);
+        config.max_cached_vectors = 0;
+        config.max_cached_metadata = 0;
+        return initOwnedRuntime(self.alloc, self.cache_path, config, opened, store, metadata);
     }
 
     fn initOwnedRuntime(alloc: Allocator, path: []const u8, config: HBCConfig, opened: EnvOwner, store: vectorindex_store.NamespaceStore, metadata: IndexMetadata) !HBCIndex {
