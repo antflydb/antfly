@@ -12953,7 +12953,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
             return error.MissingOwnedPayloadWitness;
         },
     }
-    try std.testing.expect(compute.packed_projection_entries != null);
+    try std.testing.expect(compute.projectionPackCache().entries != null);
     try std.testing.expect(!metal.hasActiveFrame(compute.provider_impl.raw_decode_runtime) and !metal.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
     const after = controller.snapshot();
     try std.testing.expect(after.backend_weight_bytes > before.backend_weight_bytes);
@@ -13024,6 +13024,13 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
         const dense = @import("../execution/dense_decoder_backend.zig");
         const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
         try std.testing.expect(try dense.hasPackedQkv(&target.cb, request.slots, width));
+        {
+            var receiver = try MetalCompute.initBorrowingSharedProvider(a, compute.data, std.testing.io, .{});
+            defer receiver.deinit();
+            const receiving = receiver.computeBackend();
+            try std.testing.expect(receiving.operationToken() == null);
+            try std.testing.expect(try dense.hasPackedQkv(&receiving, request.slots, width));
+        }
         var source_scope = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .managed);
         defer source_scope.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
         const token = source_scope.token() orelse return error.ExpectedExplicitEngineOperation;
@@ -13040,7 +13047,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
     // Compatibility and assigned calls consume exactly the same physical
     // packed payload. The ordinary callback retains its original selector.
     if (comptime !with_bias) {
-        const cached = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
+        const cached = compute.projectionPackCache().entries orelse return error.MissingPackedProjectionEntry;
         const current_runtime = compute.provider_impl.raw_decode_runtime;
         try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, cached.owner.entry));
         const resident = try target.cb.ensureDeviceResidentOwned(try target.cb.fromFloat32Shape(&values, &.{ rows, width }));
@@ -13110,7 +13117,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
         }
     }
     if (comptime with_bias) {
-        const cached = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
+        const cached = compute.projectionPackCache().entries orelse return error.MissingPackedProjectionEntry;
         const current_runtime = compute.provider_impl.raw_decode_runtime.?;
         const packed_entry = metal.PackedProjectionEntry{ .runtime = current_runtime, .handle = cached.owner.entry, .request = request };
         var sink = try session.model_lifetime.?.retainRetirementSink();
@@ -13158,16 +13165,16 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
             try std.testing.expect(target.cb.vtable.kernels.?.ownedPayloadServices.?.region.?(target.cb.ptr, &regions.items[0]));
             const warm = regions.dependency orelse return error.MissingPreparedProjectionDependency;
             try std.testing.expect(warm.vtable.matches(warm.context));
-            const saved = compute.packed_projection_entries;
-            compute.packed_projection_entries = null;
-            defer compute.packed_projection_entries = saved;
+            const saved = compute.projectionPackCache().entries;
+            compute.projectionPackCache().entries = null;
+            defer compute.projectionPackCache().entries = saved;
             try std.testing.expect(!warm.vtable.matches(warm.context));
             var cold_regions = (try target.cb.vtable.kernels.?.prepareRegionRoutes.?(target.cb.ptr, query)) orelse return error.MissingPreparedProjectionRegion;
             defer cold_regions.deinit();
             try std.testing.expectEqual(@as(usize, 0), cold_regions.items.len);
             const cold = cold_regions.dependency orelse return error.MissingPreparedProjectionDependency;
             try std.testing.expect(cold.vtable.matches(cold.context));
-            compute.packed_projection_entries = saved;
+            compute.projectionPackCache().entries = saved;
             try std.testing.expect(!cold.vtable.matches(cold.context));
         }
         var operation = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .managed);
@@ -13234,7 +13241,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
     }
     if (comptime count == 3) {
         const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
-        const qkv = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
+        const qkv = compute.projectionPackCache().entries orelse return error.MissingPackedProjectionEntry;
         // A pair shares the QKV lead slot and two source bindings, but owns
         // separate roots and a separate compatibility alias.
         var pair = request;
@@ -13244,7 +13251,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
         pair.declarations[2] = 0;
         pair.widths[2] = 0;
         try MetalCompute.prepareProjectionPackOutsideExecution(&target.cb, target.executable.graph, pair, &pin, .{ .outside_execution = true });
-        const packed_pair = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
+        const packed_pair = compute.projectionPackCache().entries orelse return error.MissingPackedProjectionEntry;
         try std.testing.expect(packed_pair != qkv);
         const current_runtime = compute.provider_impl.raw_decode_runtime;
         try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, qkv.owner.entry));

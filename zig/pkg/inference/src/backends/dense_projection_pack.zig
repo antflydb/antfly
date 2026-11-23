@@ -84,6 +84,17 @@ pub const Request = struct {
     }
 };
 
+pub const Cache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: ?*Entry = null,
+
+    pub const Entry = struct {
+        request: Request,
+        owner: *Owner,
+        next: ?*Entry,
+    };
+};
+
 /// One independently charged immutable native packed entry. The actual C
 /// entry owns both SDK roots. The shared Charge's witnesses own the SAME cache
 /// token until BOTH SDK roots die, independently of provider/model lifetime.

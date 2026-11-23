@@ -2059,7 +2059,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     deberta_embedding_ln_bias_device_cache: ?MetalTensor = null,
     zero_bias_cache: std.AutoHashMapUnmanaged(usize, []f32) = .empty,
     packed_projection_mutex: std.atomic.Mutex = .unlocked,
-    packed_projection_entries: ?*PackedProjectionEntry = null,
+    local_projection_packs: ProjectionPack.Cache = .{},
     packed_projection_profile: ?*DenseProjectionProfile = null,
     static_transpose_cache: std.AutoHashMapUnmanaged(StaticTransposeKey, MetalTensor) = .empty,
     dynamic_linear_slots: std.AutoHashMapUnmanaged(DynamicLinearSlotKey, CachedPreparedSlot) = .empty,
@@ -7169,7 +7169,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (self.reader_epoch_suspended) @import("antfly_platform").inference_process_supervisor.restartWorker();
         if (self.embedding_stage_suspended) return;
         const owns_provider = self.ownsProviderCleanup();
-        self.clearProjectionPacksWithCleanup(current);
+        clearProjectionPacksWithCleanup(self.data, self.provider_impl, &self.local_projection_packs, current);
         // The borrowing constructor does not configure these provider-global
         // resources. Setters require their owning Engine/provider lifetime.
         if (!owns_provider and (self.lighton_batch_attention or self.lighton_activation_pool_enabled or self.require_f32_linears)) @import("antfly_platform").inference_process_supervisor.restartWorker();
@@ -12577,7 +12577,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             platform.sync.lockYielding(&self.packed_projection_mutex);
             defer self.packed_projection_mutex.unlock();
             if (self.packed_projection_profile != null) return error.QueueFull;
-            const found = self.packedProjection(request);
+            const cache = self.projectionPackCache();
+            platform.sync.lockYielding(&cache.mutex);
+            defer cache.mutex.unlock();
+            const found = self.packedProjection(cache, request);
             if (found) |owner| _ = owner.retain();
             break :blk found;
         };
@@ -13146,11 +13149,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     const ProjectionPack = @import("../backends/dense_projection_pack.zig");
     extern fn antfly_metal_packed_projection_release_owner(entry: *anyopaque) callconv(.c) void;
-    const PackedProjectionEntry = struct {
-        request: ProjectionPack.Request,
-        owner: *ProjectionPack.Owner,
-        next: ?*PackedProjectionEntry,
-    };
+    const PackedProjectionEntry = ProjectionPack.Cache.Entry;
+
+    pub fn projectionPackCache(self: *MetalCompute) *ProjectionPack.Cache {
+        if (!self.owned_native_provider and self.data.shared_metal_native_provider == self.provider_impl) return &self.data.metal_projection_packs;
+        return &self.local_projection_packs;
+    }
 
     /// Cold metadata only. No ensure, upload, supplier or SDK allocation. The
     /// immutable source owner supplies original CT identities; live prepared
@@ -13256,9 +13260,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Funding ran outside all execution gates. Another cold caller may
         // have published this exact request in the meantime. Recheck under
         // the real source/index and creator-map exclusion before any packing.
-        platform.sync.lockYielding(&self.packed_projection_mutex);
-        const already_published = self.packedProjection(request) != null;
-        self.packed_projection_mutex.unlock();
+        const cache = self.projectionPackCache();
+        platform.sync.lockYielding(&cache.mutex);
+        const already_published = self.packedProjection(cache, request) != null;
+        cache.mutex.unlock();
         if (already_published) return;
         if (funded.published or funded.data != self.data or funded.provider != self.provider_impl or !std.meta.eql(funded.layout, try request.layout())) return error.PreparedPackedProjectionChanged;
         const entry = try metal_runtime.PackedProjectionEntry.create(self.provider_impl.raw_decode_runtime, request, funded.roots);
@@ -13270,10 +13275,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         owner.init(funded.data.allocator, entry.handle, funded.charge, antfly_metal_packed_projection_release_owner);
         if (metal_runtime.antfly_metal_packed_projection_publish(self.provider_impl.raw_decode_runtime, entry.handle, owner) != 0) return error.PackedProjectionPublicationFailed;
         node.* = .{ .request = request, .owner = owner, .next = null };
-        platform.sync.lockYielding(&self.packed_projection_mutex);
-        node.next = self.packed_projection_entries;
-        self.packed_projection_entries = node;
-        self.packed_projection_mutex.unlock();
+        platform.sync.lockYielding(&cache.mutex);
+        node.next = cache.entries;
+        cache.entries = node;
+        cache.mutex.unlock();
         funded.published = true;
     }
 
@@ -13289,9 +13294,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var metadata = try operation_mod.enter(cb.*, graph, null, .metadata);
             defer metadata.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
             if (metadata.token() == null) return error.PreparedMetadataAuthorityUnavailable;
-            platform.sync.lockYielding(&self.packed_projection_mutex);
-            defer self.packed_projection_mutex.unlock();
-            break :blk self.packedProjection(request) != null;
+            const cache = self.projectionPackCache();
+            platform.sync.lockYielding(&cache.mutex);
+            defer cache.mutex.unlock();
+            break :blk self.packedProjection(cache, request) != null;
         };
         if (existing) return;
         // Remove only stale-generation entries. Readers independently retain
@@ -13411,8 +13417,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 owner.releaseWithCleanup(.{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
             }
         }
-        platform.sync.lockYielding(&self.packed_projection_mutex);
-        var link = &self.packed_projection_entries;
+        const pack_cache = self.projectionPackCache();
+        platform.sync.lockYielding(&pack_cache.mutex);
+        var link = &pack_cache.entries;
         while (link.*) |entry| {
             if (metal_runtime.antfly_metal_packed_projection_matches(self.provider_impl.raw_decode_runtime, entry.owner.entry) != 0 or
                 metal_runtime.antfly_metal_packed_projection_is_cached(self.provider_impl.raw_decode_runtime, entry.owner.entry) != 0)
@@ -13428,23 +13435,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, layout.weight_bytes + layout.bias_bytes);
             }
         }
-        self.packed_projection_mutex.unlock();
+        pack_cache.mutex.unlock();
         // Slot/source reads finish under the real metadata gate; SDK/native
         // and final cache owner retirement happens only after that gate closes.
         try metadata.finish();
         self.data.prefetch.unlock();
         residency_locked = false;
-    }
-
-    fn borrowedProjectionPackSource(self: *MetalCompute) ?*MetalCompute {
-        const token = self.engine_borrowed_operation orelse return null;
-        if (token.vtable != &operation_vtable) return null;
-        const current = currentEngineOperation(self) orelse return null;
-        const record = operationRecord(current.context, current.nonce) catch return null;
-        if (!acceptsPhysicalImplementation(record.source.table)) return null;
-        const source: *MetalCompute = @ptrCast(@alignCast(record.source.context));
-        if (source == self or source.data != self.data or source.provider_impl != self.provider_impl) return null;
-        return source;
     }
 
     const LockedProjectionPack = struct {
@@ -13460,13 +13456,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// until SDK encoding establishes its independent use of the pack.
     fn lockInstalledProjectionPack(self: *MetalCompute, request: ProjectionPack.Request) ?LockedProjectionPack {
         if (request.count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return null;
-        for ([_]?*MetalCompute{ self, self.borrowedProjectionPackSource() }) |candidate| {
-            const cache_owner = candidate orelse continue;
-            const mutex = &cache_owner.packed_projection_mutex;
-            platform.sync.lockYielding(mutex);
-            if (cache_owner.packedProjection(request)) |owner| return .{ .mutex = mutex, .owner = owner };
-            mutex.unlock();
-        }
+        const cache = self.projectionPackCache();
+        platform.sync.lockYielding(&cache.mutex);
+        if (self.packedProjection(cache, request)) |owner| return .{ .mutex = &cache.mutex, .owner = owner };
+        cache.mutex.unlock();
         return null;
     }
 
@@ -13476,25 +13469,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return true;
     }
 
-    fn packedProjection(self: *MetalCompute, request: ProjectionPack.Request) ?*ProjectionPack.Owner {
-        var current = self.packed_projection_entries;
+    fn packedProjection(self: *MetalCompute, cache: *const ProjectionPack.Cache, request: ProjectionPack.Request) ?*ProjectionPack.Owner {
+        var current = cache.entries;
         while (current) |entry| : (current = entry.next) {
             if (std.meta.eql(entry.request, request) and metal_runtime.antfly_metal_packed_projection_matches(self.provider_impl.raw_decode_runtime, entry.owner.entry) != 0) return entry.owner;
         }
         return null;
     }
 
-    fn clearProjectionPacksWithCleanup(self: *MetalCompute, current: @import("../execution/cleanup_context.zig").Context) void {
-        while (self.packed_projection_entries) |entry| {
+    fn clearProjectionPacksWithCleanup(data: *WeightStore, provider: *MetalNativeProvider, packs: *ProjectionPack.Cache, current: @import("../execution/cleanup_context.zig").Context) void {
+        while (packs.entries) |entry| {
             tryFinalProjectionRetirement(entry.owner, current);
-            if (metal_runtime.antfly_metal_packed_projection_forget(self.provider_impl.raw_decode_runtime, entry.owner.entry) != 0) platform.inference_process_supervisor.restartWorker();
-            self.packed_projection_entries = entry.next;
+            if (metal_runtime.antfly_metal_packed_projection_forget(provider.raw_decode_runtime, entry.owner.entry) != 0) platform.inference_process_supervisor.restartWorker();
+            packs.entries = entry.next;
             const layout = entry.request.layout() catch platform.inference_process_supervisor.restartWorker();
-            if (self.data.tier_cache) |*cache| {
+            if (data.tier_cache) |*cache| {
                 cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, layout.weight_bytes + layout.bias_bytes);
             }
             const owner = entry.owner;
-            self.data.allocator.destroy(entry);
+            data.allocator.destroy(entry);
             owner.releaseWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         }
     }
@@ -42283,6 +42276,7 @@ pub fn deinitSharedNativeProviderWithCleanup(data: *WeightStore, current: @impor
         owner.destroy();
         data.laya_resident = null;
     }
+    MetalCompute.clearProjectionPacksWithCleanup(data, provider, &data.metal_projection_packs, current);
     provider.deinitOwnedWithCleanup(current);
     std.heap.c_allocator.destroy(provider);
     data.shared_metal_native_provider = null;
@@ -58413,7 +58407,7 @@ test "Metal private borrowed engine authority survives backend copies but cannot
     var nested = try MetalCompute.initBorrowingSharedProvider(a, owner.data, null, .{});
     defer nested.deinit();
     try nested.adoptEngineBorrowedOperation(token);
-    try std.testing.expectEqual(owner, nested.borrowedProjectionPackSource().?);
+    try std.testing.expectEqual(owner.projectionPackCache(), nested.projectionPackCache());
     try std.testing.expectError(error.BackendOperationConsumed, nested.adoptEngineBorrowedOperation(token));
     var copied = nested.computeBackend();
     const input = try auditDeviceTensor(owner, &backend, &.{ 3, 5 }, &.{2});
@@ -58435,7 +58429,6 @@ test "Metal private borrowed engine authority survives backend copies but cannot
     try std.testing.expectError(error.BackendOperationInactive, token.validate(.{ .implementation = .{ .context = &nested, .table = copied.vtable }, .program = null, .mode = .managed }));
     nested.embedding_stage_suspended = false;
     try std.testing.expect(copied.operationToken() == null);
-    try std.testing.expect(nested.borrowedProjectionPackSource() == null);
     try std.testing.expect(backend.operationToken() == null);
     nested.finishEngineOperation();
     try std.testing.expect(nested.engine_borrowed_operation == null);
