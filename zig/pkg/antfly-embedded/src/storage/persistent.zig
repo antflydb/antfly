@@ -2233,11 +2233,17 @@ pub const PersistentIndex = struct {
         defer self.unlockStorage();
         var read = try self.beginReadMainTxn();
         defer read.abort();
+        var changed_dead = std.AutoHashMapUnmanaged(u32, ?[]const u8).empty;
+        var dead_tip: DeadVersions = .{ .alloc = alloc };
+        defer dead_tip.deinit();
         var newly_dead = std.ArrayListUnmanaged(u64).empty;
         for (keys.items) |key| {
-            if (key.is_delete or !std.mem.eql(u8, key.namespace.?, dead_namespace)) continue;
+            if (!std.mem.eql(u8, key.namespace.?, dead_namespace)) continue;
             if (key.key.len != 4) return error.InvalidDeadVersions;
-            const high = @as(u64, std.mem.readInt(u32, key.key[0..4], .big)) << 32;
+            const bucket = std.mem.readInt(u32, key.key[0..4], .big);
+            try changed_dead.put(alloc, bucket, if (key.is_delete) null else key.value);
+            if (key.is_delete) continue;
+            const high = @as(u64, bucket) << 32;
             const previous = read.get(.dead, key.key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
@@ -2287,8 +2293,10 @@ pub const PersistentIndex = struct {
             const bytes = if (isL0SegmentId(segment_id)) key.value else regular_segment_bytes.get(segment_id) orelse return error.UnsupportedRefresh;
             try additions.ensureUnusedCapacity(alloc, 1);
             try bitmaps.ensureUnusedCapacity(alloc, 1);
-            const copies = try segmentCopiesAlloc(alloc, bytes);
-            const bitmap = try self.inlineDeletionBitmap(copies);
+            var reader = try segment_mod.SegmentReader.init(alloc, bytes);
+            defer reader.deinit();
+            const versions = try reader.docVersionsAlloc(alloc);
+            const bitmap = try self.peerDeletionBitmap(&read, &dead_tip, &changed_dead, reader.doc_count, versions);
             errdefer if (bitmap) |value| {
                 var owned = value;
                 owned.deinit();
@@ -2311,6 +2319,41 @@ pub const PersistentIndex = struct {
             if (key.is_delete or !std.mem.eql(u8, key.namespace.?, runtimeNamespace(.meta).name.?) or !std.mem.eql(u8, key.key, meta_next_seg_id)) continue;
             self.writer.next_segment_id = @max(self.writer.next_segment_id, try decodeNextSegmentId(key.value));
         }
+    }
+
+    fn peerDeletionBitmap(
+        self: *PersistentIndex,
+        read: *MainTxn,
+        dead: *DeadVersions,
+        changed: *const std.AutoHashMapUnmanaged(u32, ?[]const u8),
+        count: u32,
+        versions: ?[]const u64,
+    ) !?roaring.RoaringBitmap {
+        var bitmap = roaring.RoaringBitmap.init(self.alloc);
+        errdefer bitmap.deinit();
+        for (0..count) |local| {
+            const version = if (versions) |column| column[local] else 0;
+            if (version == 0) {
+                try bitmap.add(@intCast(local));
+                continue;
+            }
+            const high: u32 = @intCast(version >> 32);
+            const slot = try dead.sets.getOrPut(dead.alloc, high);
+            if (!slot.found_existing) {
+                errdefer _ = dead.sets.remove(high);
+                const prior = if (changed.get(high)) |value| value else read.get(.dead, &deadKey(high)) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                slot.value_ptr.* = if (prior) |value| try roaring.RoaringBitmap.fromBytes(dead.alloc, value) else roaring.RoaringBitmap.init(dead.alloc);
+            }
+            if (slot.value_ptr.contains(@truncate(version))) try bitmap.add(@intCast(local));
+        }
+        if (bitmap.isEmpty()) {
+            bitmap.deinit();
+            return null;
+        }
+        return bitmap;
     }
 
     /// Brings this process's view up to the index as committed, after

@@ -282,6 +282,7 @@ pub const View = struct {
 pub const Queued = struct {
     ptr: *anyopaque,
     validate: *const fn (*anyopaque) anyerror!void,
+    apply: ?*const fn (*anyopaque, View) anyerror!void = null,
     reject: *const fn (*anyopaque) void,
     complete: *const fn (*anyopaque, anyerror!u64) void,
 };
@@ -415,6 +416,13 @@ pub const List = struct {
         for (self.items[0..self.len]) |p| if (p.queued) |queued| try queued.validate(queued.ptr);
     }
 
+    fn applyQueued(ptr: *anyopaque, view: View) anyerror!void {
+        const self: *List = @ptrCast(@alignCast(ptr));
+        for (self.items[0..self.len]) |p| {
+            if (p.queued) |queued| if (queued.apply) |apply| try apply(queued.ptr, view);
+        }
+    }
+
     fn rejectQueued(ptr: *anyopaque) void {
         const self: *List = @ptrCast(@alignCast(ptr));
         for (self.items[0..self.len]) |p| if (p.queued) |queued| queued.reject(queued.ptr);
@@ -442,7 +450,7 @@ pub const List = struct {
             .reset = reset,
             .observe = observe,
             .stage = stage,
-            .queued = if (queued) .{ .ptr = self, .validate = validateQueued, .reject = rejectQueued, .complete = completeQueued } else null,
+            .queued = if (queued) .{ .ptr = self, .validate = validateQueued, .apply = applyQueued, .reject = rejectQueued, .complete = completeQueued } else null,
         };
     }
 };

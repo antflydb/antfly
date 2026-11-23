@@ -7790,6 +7790,26 @@ pub const Txn = struct {
         index_catalog_delete_prefix: ?[]const u8 = null,
         queued: ?@import("../commit_participant.zig").Queued = null,
 
+        prefix: []const u8 = "",
+
+        const ApplyView = struct {
+            alloc: Allocator,
+            file: *native.NativeFile,
+            prefix: []const u8,
+
+            fn physicalKey(self: *ApplyView, key: []const u8) ![]const u8 {
+                return if (self.prefix.len == 0) key else try std.mem.concat(self.alloc, u8, &.{ self.prefix, key });
+            }
+
+            pub fn get(self: *ApplyView, key: []const u8) ![]const u8 {
+                return (try self.file.getDocumentAlloc(self.alloc, try self.physicalKey(key))) orelse error.NotFound;
+            }
+
+            pub fn put(self: *ApplyView, key: []const u8, value: []const u8) !void {
+                try self.file.putDocument(try self.physicalKey(key), value);
+            }
+        };
+
         fn complete(ptr: *anyopaque, outcome: anyerror!u64) void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             const queued = context.queued.?;
@@ -7806,6 +7826,13 @@ pub const Txn = struct {
             errdefer if (context.queued) |queued| queued.reject(queued.ptr);
             if (context.queued) |queued| try queued.validate(queued.ptr);
             try file.putDocumentBatch(context.mutations);
+            if (context.queued) |queued| if (queued.apply) |apply_member| {
+                var arena = std.heap.ArenaAllocator.init(context.allocator);
+                defer arena.deinit();
+                var view: ApplyView = .{ .alloc = arena.allocator(), .file = file, .prefix = context.prefix };
+                try apply_member(queued.ptr, @import("../commit_participant.zig").View.from(&view));
+            };
+
             for (context.index_resolvers) |scoped| try @import("native_catalog_sink.zig").applyResolver(context.allocator, file, scoped.scope, scoped.resolver);
             if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
             if (context.index_catalog_delete_prefix) |prefix| try file.deleteIndexCatalogPrefix(prefix, null);
@@ -7945,7 +7972,7 @@ pub const Txn = struct {
         // `StagedCommit.wait()`/`abort()`, both of which run after the
         // group's `apply` callback has already consumed it, mirroring how
         // `mutations` above borrows `self.pending`'s own buffers.
-        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .allocator = allocator, .index_resolvers = self.index_catalog_resolvers.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix, .queued = self.queued_participant };
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items, .allocator = allocator, .index_resolvers = self.index_catalog_resolvers.items, .index_catalog_delete_prefix = self.index_catalog_delete_prefix, .queued = self.queued_participant, .prefix = self.prefix };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();

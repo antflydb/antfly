@@ -3853,8 +3853,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const InlineCoveragePlan = struct {
             marker_key: []u8,
             produced_counter_key: []u8,
-            produced_counter_value: [8]u8,
-            previous_counter: ?struct { key: []u8, value: [8]u8 } = null,
+            produced_count_at_prepare: u64,
+            previous_counter: ?struct { outcome: DerivedCoverageOutcome, key: []u8, count_at_prepare: u64 } = null,
 
             fn deinit(self: *const InlineCoveragePlan, alloc: Allocator) void {
                 alloc.free(self.marker_key);
@@ -3862,10 +3862,35 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (self.previous_counter) |pc| alloc.free(pc.key);
             }
 
+            fn countAtTip(view: commit_participant.View, key: []const u8, fallback: u64) !u64 {
+                const bytes = view.get(key) catch |err| switch (err) {
+                    error.NotFound => return fallback,
+                    else => return err,
+                };
+                return internal_keys.decodeDerivedCoverageOutcomeCount(bytes);
+            }
+
             fn stage(self: *const InlineCoveragePlan, view: commit_participant.View) !void {
+                const marker = view.get(self.marker_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (marker) |value| {
+                    const previous = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+                    if (previous == .produced) return;
+                    const counter = self.previous_counter orelse return error.QueuedDependencyRejected;
+                    if (counter.outcome != previous) return error.QueuedDependencyRejected;
+                    const count = try countAtTip(view, counter.key, counter.count_at_prepare);
+                    if (count == 0) return error.InvalidDerivedCoverageCounter;
+                    var stored: [8]u8 = undefined;
+                    _ = internal_keys.encodeDerivedCoverageOutcomeCount(&stored, count - 1);
+                    try view.putReplay(counter.key, &stored);
+                }
+                const count = try countAtTip(view, self.produced_counter_key, self.produced_count_at_prepare);
+                var stored: [8]u8 = undefined;
+                _ = internal_keys.encodeDerivedCoverageOutcomeCount(&stored, count +| 1);
+                try view.putReplay(self.produced_counter_key, &stored);
                 try view.putReplay(self.marker_key, @tagName(DerivedCoverageOutcome.produced));
-                try view.putReplay(self.produced_counter_key, &self.produced_counter_value);
-                if (self.previous_counter) |pc| try view.putReplay(pc.key, &pc.value);
             }
         };
 
@@ -3910,16 +3935,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     existing_outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
                 }
             }
-            if (existing_outcome == DerivedCoverageOutcome.produced) {
-                alloc.free(marker_key);
-                return null;
-            }
-
             const produced_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(DerivedCoverageOutcome.produced));
             errdefer alloc.free(produced_key);
             var previous_key: ?[]u8 = null;
             errdefer if (previous_key) |k| alloc.free(k);
-            if (existing_outcome) |prev| {
+            if (existing_outcome != null and existing_outcome.? != .produced) {
+                const prev = existing_outcome.?;
                 previous_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(prev));
             }
 
@@ -3952,23 +3973,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 previous_count = try scanDerivedCoverageOutcomeFromStore(alloc, store, index_name, generation, @tagName(existing_outcome.?));
             }
 
-            if (existing_outcome != null) {
-                if (previous_count == 0) return error.InvalidDerivedCoverageCounter;
-                previous_count -= 1;
-            }
-            produced_count +|= 1;
-
             var plan: InlineCoveragePlan = .{
                 .marker_key = marker_key,
                 .produced_counter_key = produced_key,
-                .produced_counter_value = undefined,
-                .previous_counter = null,
+                .produced_count_at_prepare = produced_count,
             };
-            _ = internal_keys.encodeDerivedCoverageOutcomeCount(&plan.produced_counter_value, produced_count);
             if (previous_key) |pk| {
-                var previous_value: [8]u8 = undefined;
-                _ = internal_keys.encodeDerivedCoverageOutcomeCount(&previous_value, previous_count);
-                plan.previous_counter = .{ .key = pk, .value = previous_value };
+                plan.previous_counter = .{ .outcome = existing_outcome.?, .key = pk, .count_at_prepare = previous_count };
             }
             return plan;
         }
@@ -4034,6 +4045,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const mutations = self.publication.pendingMutations();
                 if (mutations.len != 0) try view.putIndexCatalog(self.scope, mutations);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            fn applyQueued(ptr: *anyopaque, view: commit_participant.View) anyerror!void {
+                const self: *InlineSparsePublication = @ptrCast(@alignCast(ptr));
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
@@ -4067,7 +4082,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .reset = reset,
                     .observe = observe,
                     .stage = stage,
-                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
+                    .queued = .{ .ptr = self, .validate = validate, .apply = applyQueued, .reject = reject, .complete = complete },
                 };
             }
 
@@ -4271,6 +4286,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
+            }
+
+            fn applyQueued(ptr: *anyopaque, view: commit_participant.View) anyerror!void {
+                const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
@@ -4304,7 +4323,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .reset = reset,
                     .observe = observe,
                     .stage = stage,
-                    .queued = .{ .ptr = self, .validate = validate, .reject = reject, .complete = complete },
+                    .queued = .{ .ptr = self, .validate = validate, .apply = applyQueued, .reject = reject, .complete = complete },
                 };
             }
 
