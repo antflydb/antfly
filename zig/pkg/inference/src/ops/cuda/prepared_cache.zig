@@ -533,7 +533,7 @@ pub const Funding = struct {
                 if (entry.miss and !std.meta.eql(entry.amounts, value.amounts())) return error.InvalidPreparedCacheAmount;
             },
             .external_prefill => |value| {
-                if (value.kind == .recurrent or value.kind == .recurrent_existing and (entry.miss or value.device_bytes != 0 or value.host_bytes != 0 or value.geometry_hash != 0) or entry.miss and !std.meta.eql(entry.amounts, value.amounts())) return error.InvalidPreparedCacheAmount;
+                if (value.kind != .attention or entry.miss and !std.meta.eql(entry.amounts, value.amounts())) return error.InvalidPreparedCacheAmount;
             },
             else => return error.UnsupportedPreparedCacheWorkload,
         };
@@ -1418,29 +1418,6 @@ fn derivedWeightFundingOomCase(a: std.mem.Allocator) !void {
 test "CUDA derived weight cold reservation unwinds all metadata OOM and exact original tokens" {
     try derivedWeightFundingOomCase(std.testing.allocator);
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, derivedWeightFundingOomCase, .{});
-}
-
-test "external recurrent existing-only custody prepares a shell without new backing admission" {
-    const owner = try domain.Domain.create();
-    defer owner.release();
-    var original = try owner.controller.tryAcquire(.gpu, .{ .backend_limit_bytes = 64 }, .{ .backend_scratch_bytes = 64 }, false);
-    defer original.release();
-    const requests = [_]Request{
-        .{ .external_prefill = .{ .kind = .recurrent_existing, .library_identity = 1, .geometry_hash = 0, .device_bytes = 0 } },
-        .{ .ocr_retention = .{ .cache_bytes = 0, .deferred_bytes = 0, .pressure_step = @bitSizeOf(usize) } },
-    };
-    const funding = try Funding.create(.{ .requests = &requests });
-    defer funding.finishOutsideExecution();
-    funding.entries[0].upgrade_raw = true;
-    funding.admission = .{ .controller = &owner.controller, .limits = .{ .backend_limit_bytes = 64 }, .check_live_memory = false };
-    funding.state = .snapped;
-    const before = owner.controller.snapshot();
-    const pin = owner.pin();
-    defer pin.release();
-    try funding.fundLightOnOutsideExecution(&pin);
-    try std.testing.expect(funding.entries[0].upgrade.owner != null);
-    try std.testing.expect(funding.entries[0].lease == null and !funding.entries[0].miss);
-    try std.testing.expectEqualDeep(before, owner.controller.snapshot());
 }
 
 fn audioLearningFundingOomCase(a: std.mem.Allocator) !void {

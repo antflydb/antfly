@@ -3085,25 +3085,12 @@ pub const CudaCompute = struct {
     /// unused potential storage is only a READY token, never SDK/cache credit.
     pub fn appendExternalPrefillWorkload(self: *const CudaCompute, config: ?gpt_model.Config, builder: *@import("prepared_cache.zig").Builder) !void {
         if (self.capability_profile != .lightonocr3) return;
-        const owner = if (self.lighton_recurrent.bf16_prefill) |*value| value else return;
-        try builder.add(.{ .external_prefill = .{ .kind = .recurrent_existing, .library_identity = @intFromPtr(owner.workspace), .geometry_hash = 0, .device_bytes = 0 } });
         const request = self.externalAttentionRequest() orelse return;
         const cfg = config orelse return;
         if (!((cfg.num_attention_heads == 8 and cfg.effectiveKVHeads() == 2) or (cfg.num_attention_heads == 16 and cfg.effectiveKVHeads() == 4)) or cfg.headDim() != 256) return;
         try builder.add(.{ .external_prefill = request });
     }
-    fn externalPrefillRawSnapshot(self: *const CudaCompute, request: @import("prefill_workspace.zig").Request) @import("recurrent_prefill.zig").Module.QuotaSnapshot {
-        const owner = &self.lighton_recurrent.bf16_prefill.?;
-        if (request.kind == .recurrent_existing) return owner.quotaSnapshot();
-        const value = owner.attention.?.storageSnapshot();
-        return .{ .raw_quota = value.raw_quota, .controller = value.controller, .closing = value.closing };
-    }
     fn externalPrefillHeaderMiss(self: *const CudaCompute, request: @import("prefill_workspace.zig").Request, desired: ?@import("video_cache_budget.zig").Admission) !bool {
-        if (request.kind == .recurrent_existing) {
-            const owner = if (self.lighton_recurrent.bf16_prefill) |*value| value else return error.PreparedCachePlanChanged;
-            if (request.library_identity != @intFromPtr(owner.workspace) or request.geometry_hash != 0 or request.device_bytes != 0 or request.host_bytes != 0 or owner.quotaSnapshot().closing) return error.PreparedCachePlanChanged;
-            return false; // existing quota only; never grants a storage allocation
-        }
         const expected = self.externalAttentionRequest() orelse return error.PreparedCachePlanChanged;
         if (!std.meta.eql(request, expected)) return error.PreparedCachePlanChanged;
         const snapshot = self.lighton_recurrent.bf16_prefill.?.attention.?.storageSnapshot();
@@ -3179,7 +3166,6 @@ pub const CudaCompute = struct {
             if (request == .derived_weight) if (self.derivedWeightQuota(request.derived_weight)) |quota| {
                 if (quota.* == .raw) return true;
             };
-            if (request == .external_prefill and self.externalPrefillRawSnapshot(request.external_prefill).raw_quota) return true;
         }
         return false;
     }
@@ -3204,12 +3190,6 @@ pub const CudaCompute = struct {
             }
             if (entry.request == .external_prefill) {
                 if (miss) try funding.noteMiss(index, entry.request.external_prefill.amounts(), 0);
-                const snapshot = self.externalPrefillRawSnapshot(entry.request.external_prefill);
-                if (snapshot.raw_quota) {
-                    const actual_policy = desired orelse return error.MissingCacheRetirementDomain;
-                    if (snapshot.controller != actual_policy.controller) return error.ForeignAdmissionDomain;
-                    funding.entries[index].upgrade_raw = true;
-                }
                 continue;
             }
             if (entry.request == .auxiliary) {
@@ -3307,38 +3287,6 @@ pub const CudaCompute = struct {
         expected.lockConstantMetadata();
         defer expected.unlockConstantMetadata();
         for (funding.entries) |*entry| if (entry.upgrade_raw) {
-            if (entry.request == .external_prefill) {
-                if (entry.request.external_prefill.kind == .recurrent_existing) {
-                    const owner = &expected.lighton_recurrent.bf16_prefill.?;
-                    while (!owner.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
-                    defer owner.metadata_mutex.unlock();
-                    if (owner.quota == .raw) {
-                        const pin = funding.domain_pin orelse return error.MissingCacheRetirementDomain;
-                        if (entry.upgrade.owner == null or !std.meta.eql(owner.quota.raw.amounts, @import("../../runtime/tier/memory.zig").AdmissionAmounts{ .backend_scratch_bytes = owner.scratch.len })) return error.PreparedCachePlanChanged;
-                        if (owner.quota.raw.controller != pin.controller()) return error.ForeignAdmissionDomain;
-                        var original: ?@import("../../runtime/tier/memory.zig").AdmissionLease = owner.quota.raw;
-                        var held_pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = pin.retain();
-                        errdefer if (held_pin) |owned| owned.release();
-                        owner.quota = try CacheQuota.arm(&entry.upgrade, &original, &held_pin);
-                    }
-                    entry.upgrade_raw = false;
-                    continue;
-                }
-                const fast = &expected.lighton_recurrent.bf16_prefill.?.attention.?;
-                while (!fast.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
-                defer fast.metadata_mutex.unlock();
-                if (fast.quota == .raw) {
-                    const pin = funding.domain_pin orelse return error.MissingCacheRetirementDomain;
-                    if (entry.upgrade.owner == null or !std.meta.eql(fast.quota.raw.amounts, entry.request.external_prefill.amounts())) return error.PreparedCachePlanChanged;
-                    if (fast.quota.raw.controller != pin.controller()) return error.ForeignAdmissionDomain;
-                    var original: ?@import("../../runtime/tier/memory.zig").AdmissionLease = fast.quota.raw;
-                    var held_pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = pin.retain();
-                    errdefer if (held_pin) |owned| owned.release();
-                    fast.quota = try CacheQuota.arm(&entry.upgrade, &original, &held_pin);
-                }
-                entry.upgrade_raw = false;
-                continue;
-            }
             const quota = if (entry.request == .derived_weight) expected.derivedWeightQuota(entry.request.derived_weight) orelse return error.PreparedCachePlanChanged else expected.auxiliaryQuota(entry.request.auxiliary.kind);
             if (quota.* == .raw) {
                 const derived = entry.request == .derived_weight;
@@ -4016,7 +3964,7 @@ pub const CudaCompute = struct {
         if (self.capability_profile != .lightonocr3 or self.lazy_host_store != null or self.resident_training_cache or self.lighton_recurrent.bf16_prefill == null) return .unavailable;
         if (phase.cold != null or phase.bound) return error.InvalidPreparedCacheState;
         const owner = &self.lighton_recurrent.bf16_prefill.?;
-        if (phase.descriptor.packet_count == 0 and !phase.descriptor.attention and owner.quota != .raw and (owner.attention == null or owner.attention.?.quota != .raw)) {
+        if (phase.descriptor.packet_count == 0 and !phase.descriptor.attention) {
             // Pure decode cannot invoke either optional prefill operation.
             // No SDK capture query, heap metadata or supplier on this path.
             owner.managed = true;
@@ -4030,10 +3978,6 @@ pub const CudaCompute = struct {
         phase.expected_compute = @intFromPtr(self);
         phase.admission = self.ctx.video_cache_budget.admission;
         phase.old = self.externalPrefillSnapshot();
-        if (phase.old.recurrent_quota == .raw or phase.old.attention_quota == .raw) {
-            phase.mode = .upgrade;
-            return .outside;
-        }
         if (phase.declined) {
             owner.managed = true;
             owner.managed_decline = true;
@@ -4107,21 +4051,6 @@ pub const CudaCompute = struct {
                 phase.mode = .none;
                 return false;
             },
-            .upgrade => {
-                while (!owner.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
-                var recurrent_locked = true;
-                defer if (recurrent_locked) owner.metadata_mutex.unlock();
-                if (owner.attention) |*attention| {
-                    while (!attention.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
-                    defer attention.metadata_mutex.unlock();
-                    try phase.installUpgrades(&owner.quota, &attention.quota);
-                } else try phase.installUpgrades(&owner.quota, null);
-                owner.metadata_mutex.unlock();
-                recurrent_locked = false;
-                try phase.close(current);
-                phase.mode = .none;
-                return false;
-            },
             .fund => {
                 try phase.bindFunding(current);
                 errdefer phase.close(current) catch platform.inference_process_supervisor.restartWorker();
@@ -4135,7 +4064,6 @@ pub const CudaCompute = struct {
                     switch (role.kind) {
                         .recurrent => _ = try owner.reservePrepared(&self.ctx, &lease, role, current),
                         .attention => try owner.attention.?.reservePrepared(&self.ctx, &lease, role, current),
-                        .recurrent_existing => return error.UnsupportedPreparedCacheWorkload,
                     }
                 }
                 self.external_prefill_preparations += 1;
@@ -45071,17 +44999,12 @@ test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across 
     const before = compute.ctx.device_allocations.snapshot().live;
     try std.testing.expectError(error.RecurrentPrefillColdPreparationRequired, prefill.reserveForExecution(&compute.ctx, 1024));
     if (prefill.attention) |*attention| try std.testing.expectError(error.RecurrentPrefillColdPreparationRequired, attention.reserveForExecution(&compute.ctx));
-    try std.testing.expectError(error.ResourceLimitExceeded, prefill.reserve(&compute.ctx, 1024));
     try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 0), prefill.calls);
-    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 1024;
-    compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 1024;
-    const full = try prefill.reserve(&compute.ctx, 1024);
-    const reused = try prefill.reserve(&compute.ctx, 512);
-    try std.testing.expectError(error.RecurrentPrefillColdPreparationRequired, prefill.reserveForExecution(&compute.ctx, 512));
+    compute.ctx.video_cache_budget.admission = null;
+    const full = try prefill.reserveForExecution(&compute.ctx, 1024);
+    const reused = try prefill.reserveForExecution(&compute.ctx, 512);
     try std.testing.expectEqual(full.ptr, reused.ptr);
-    try std.testing.expectEqual(@as(usize, 1024), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(before + 1024, compute.ctx.device_allocations.snapshot().live);
     try prefill.clearWorkspace(&compute.ctx);
     try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
@@ -45173,7 +45096,7 @@ test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and 
     for (actual) |value| try std.testing.expectEqual(@as(f32, 1), value);
 }
 
-test "LightOnOCR3 CUDA optional paged prefill owner admits host and GPU bytes before allocating and drains on clear" {
+test "LightOnOCR3 CUDA optional paged prefill owner declines unprepared admission and wraps unadmitted staging" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const memory = @import("../../runtime/tier/memory.zig");
     const module = @import("paged_prefill_attention.zig");
@@ -45195,22 +45118,16 @@ test "LightOnOCR3 CUDA optional paged prefill owner admits host and GPU bytes be
         .scratch_limit_bytes = gpu_bytes + host_bytes,
     }, .check_live_memory = false };
     const before = compute.ctx.device_allocations.snapshot().live;
-    try std.testing.expectError(error.ResourceLimitExceeded, owner.reserve(&compute.ctx));
+    try std.testing.expectError(error.RecurrentPrefillColdPreparationRequired, owner.reserveForExecution(&compute.ctx));
     try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
-    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = gpu_bytes;
-    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = host_bytes - 1;
-    try std.testing.expectError(error.ResourceLimitExceeded, owner.reserve(&compute.ctx));
-    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
-    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = host_bytes;
-    try owner.reserve(&compute.ctx);
+    compute.ctx.video_cache_budget.admission = null;
+    try owner.reserveForExecution(&compute.ctx);
     const first = owner.device.ptr;
-    try owner.reserve(&compute.ctx);
+    try owner.reserveForExecution(&compute.ctx);
     try std.testing.expectEqual(first, owner.device.ptr);
     try std.testing.expectEqual(before + gpu_bytes, compute.ctx.device_allocations.snapshot().live);
-    try std.testing.expectEqual(@as(usize, gpu_bytes), controller.snapshot().backend_scratch_bytes);
-    try std.testing.expectEqual(@as(usize, host_bytes), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     // Reuse every pinned slot repeatedly while GPU readers remain queued.
     // Independent D2D snapshots catch overwrites of an earlier DMA source.
     const turns = 3 * module.metadata_slots + 5;
@@ -57268,16 +57185,14 @@ test "CUDA derived BF16 input and gate-up caches cold fund exact sources before 
     try derivedWeightColdCase(true);
 }
 
-test "CUDA optional recurrent prefill actual DSO cold geometry funds real retained SDK storage outside Model and warm raw upgrade preserves addresses" {
+test "CUDA optional recurrent prefill actual DSO cold geometry funds real retained SDK storage outside Model and reuses funded addresses" {
     const CacheFunding = @import("prepared_cache.zig");
     if (comptime !cuda_enabled) return error.SkipZigTest;
     const path = platform.env.getenv("ANTFLY_UNIFIED_CUDA_PREFILL_GEOMETRY_LIBRARY") orelse return error.SkipZigTest;
     const F = @import("prefill_phase.zig");
     const S = @import("../../backends/session.zig").Session;
     const Sink = @import("../../execution/retirement_sink.zig");
-    for ([_]u8{ 0, 1, 2 }) |case| {
-        const raw_warm = case != 0;
-        const replace_policy = case == 2;
+    for ([_]bool{ false, true }) |replace_policy| {
         const domain = try @import("../../runtime/tier/admission_domain.zig").Domain.create();
         defer domain.release();
         var gate: std.atomic.Mutex = .unlocked;
@@ -57337,13 +57252,6 @@ test "CUDA optional recurrent prefill actual DSO cold geometry funds real retain
         const actual_bytes = try owner.coldWorkspaceBytes(&descriptor.packets[0]);
         try std.testing.expect(actual_bytes > 0);
         const before = compute.ctx.device_allocations.snapshot();
-        if (raw_warm) {
-            _ = try owner.reserve(&compute.ctx, actual_bytes); // explicit legacy outside contract
-            if (owner.attention) |*attention| try attention.reserve(&compute.ctx);
-            try std.testing.expect(owner.quota == .raw);
-        }
-        const raw_ptr = owner.scratch.ptr;
-        const raw_attention = if (owner.attention) |*attention| attention.device.ptr else 0;
         // Exercise the SAME fixed-attention cold Header inventory used by
         // non-Executor NativeGenerationPipeline requests. It prepares potential
         // backing outside gates; the exact actual producer consumes it below.
@@ -57353,14 +57261,14 @@ test "CUDA optional recurrent prefill actual DSO cold geometry funds real retain
         defer if (header_funding) |value| value.finishOutsideExecution();
         if (owner.attention != null) {
             compute.constant_policy = compute.ctx.video_cache_budget.admission;
-            var request_slots: [3]CacheFunding.Request = undefined;
+            var request_slots: [2]CacheFunding.Request = undefined;
             var builder: CacheFunding.Builder = .{ .storage = &request_slots };
             var cfg: gpt_model.Config = .{ .hidden_size = 1024, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256 };
             try compute.appendExternalPrefillWorkload(cfg, &builder);
-            try std.testing.expectEqual(@as(usize, 2), builder.len);
+            try std.testing.expectEqual(@as(usize, 1), builder.len);
             cfg.attention_head_dim = 32;
             try compute.appendExternalPrefillWorkload(cfg, &builder); // unsupported adds nothing
-            try std.testing.expectEqual(@as(usize, 2), builder.len);
+            try std.testing.expectEqual(@as(usize, 1), builder.len);
             try builder.add(try compute.lightOnRetentionRequest(header_desired, @bitSizeOf(usize)));
             const value = try CacheFunding.Funding.create(builder.workload());
             header_funding = value;
@@ -57379,17 +57287,14 @@ test "CUDA optional recurrent prefill actual DSO cold geometry funds real retain
             try std.testing.expect(gate.tryLock());
             var held = true;
             defer if (held) gate.unlock();
-            var requests: [3]CacheFunding.Request = undefined;
+            var requests: [2]CacheFunding.Request = undefined;
             for (value.entries, 0..) |entry, index| requests[index] = entry.request;
             try CudaCompute.beginLightOnNormFunding(&compute, .{ .requests = &requests }, value, &a, header_desired);
             var bound = true;
             defer if (bound) CudaCompute.unbindCacheFunding(&cb, &compute, value);
-            if (raw_warm) try std.testing.expect(owner.quota == .prepared);
             if (replace_policy) try compute.configureEmbeddingGemma2AdmissionWithCleanup(header_desired, .{ .boundary = &a });
             try compute.prepareExternalAttentionFromBoundFunding();
             try std.testing.expect(owner.attention.?.quota == .prepared);
-            if (raw_warm and !replace_policy) try std.testing.expect(owner.quota == .prepared);
-            if (raw_warm and !replace_policy) try std.testing.expectEqual(raw_attention, owner.attention.?.device.ptr);
             CudaCompute.unbindCacheFunding(&cb, &compute, value);
             bound = false;
             gate.unlock();
@@ -57423,10 +57328,6 @@ test "CUDA optional recurrent prefill actual DSO cold geometry funds real retain
         }
         try std.testing.expect(complete and phase.cold == null and !phase.bound);
         try std.testing.expect(owner.quota == .prepared and owner.scratch.ptr != 0 and owner.scratch.len == actual_bytes);
-        if (raw_warm and !replace_policy) {
-            try std.testing.expectEqual(raw_ptr, owner.scratch.ptr);
-            if (owner.attention) |*attention| try std.testing.expectEqual(raw_attention, attention.device.ptr);
-        }
         publication.finish();
         const paid = domain.controller.snapshot();
         const device_after = compute.ctx.device_allocations.snapshot();

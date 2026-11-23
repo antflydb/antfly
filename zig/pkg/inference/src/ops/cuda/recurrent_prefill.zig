@@ -19,7 +19,6 @@ const std = @import("std");
 const driver = @import("driver.zig");
 const context = @import("context.zig");
 const buffer = @import("buffer.zig");
-const memory = @import("../../runtime/tier/memory.zig");
 const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 const Quota = @import("cache_quota.zig").Quota;
 
@@ -46,14 +45,6 @@ pub const Module = struct {
     calls: usize = 0,
     workspace_peak: usize = 0,
 
-    pub const QuotaSnapshot = struct { raw_quota: bool, controller: ?*memory.AdmissionController, closing: bool };
-    /// Values only. Never borrow the mutable prepared Charge or SDK address.
-    pub fn quotaSnapshot(self: *const Module) QuotaSnapshot {
-        const mutable = @constCast(self);
-        while (!mutable.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
-        defer mutable.metadata_mutex.unlock();
-        return .{ .raw_quota = self.quota == .raw, .controller = if (self.quota.peek()) |lease| lease.controller else null, .closing = self.closing };
-    }
     fn markClosing(self: *Module) void {
         while (!self.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.metadata_mutex.unlock();
@@ -160,12 +151,10 @@ pub const Module = struct {
             if (owned.controller != policy.controller or owned.amounts.backend_scratch_bytes != self.scratch.len) return error.PreparedCacheAmountChanged;
             return self.scratch;
         }
-        return self.reserve(ctx, bytes);
+        return self.reserveUnadmitted(ctx, bytes);
     }
 
-    /// Legacy explicit-outside entry. Suppliers and quota discharge remain
-    /// outside the metadata lock; exact publication is revalidated afterward.
-    pub fn reserve(self: *Module, ctx: *context.CudaContext, bytes: usize) !buffer.DeviceBuffer {
+    fn reserveUnadmitted(self: *Module, ctx: *context.CudaContext, bytes: usize) !buffer.DeviceBuffer {
         if (self.closing) return error.RecurrentPrefillClosing;
         if (bytes == 0) return .{};
         if (self.managed_decline) return error.RecurrentPrefillColdPreparationRequired;
@@ -173,17 +162,10 @@ pub const Module = struct {
         if (self.scratch.len >= bytes) return self.scratch;
         if (self.managed or self.quota == .prepared) return error.RecurrentPrefillColdPreparationRequired;
         try self.clearRecurrentWorkspace(ctx);
-        var lease: ?memory.AdmissionLease = null;
-        defer if (lease) |*active| active.release();
-        if (ctx.video_cache_budget.admission) |policy| {
-            lease = try policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = bytes }, policy.check_live_memory);
-        }
         while (!self.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
         var locked = true;
         defer if (locked) self.metadata_mutex.unlock();
         if (self.closing or self.failed or self.scratch.ptr != 0 or self.quota.hasLease()) return error.InvalidPreparedCacheState;
-        self.quota = Quota.fromRawAdmission(lease);
-        lease = null;
         self.failed = true;
         self.scratch = buffer.DeviceBuffer.alloc(ctx, bytes) catch |err| {
             self.metadata_mutex.unlock();
