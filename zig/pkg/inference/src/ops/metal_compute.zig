@@ -12435,14 +12435,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 outputs[index] = try self.tensor(output.tensor);
                 const owner: *PreparedDenseLinear = @ptrCast(@alignCast(self.linears[index].context));
                 slots[index] = owner.slot;
-                if (outputs[index].isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
                 const assigned = output.authority orelse return error.InvalidPhysicalStorageAuthority;
-                const lease = outputs[index].physicalLease() orelse return error.InvalidPhysicalStorageAuthority;
-                if (lease.backend.ptr != @as(*anyopaque, @ptrCast(self.compute)) or !acceptsPhysicalImplementation(lease.backend.vtable) or
-                    !lease.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region)) return error.InvalidPhysicalStorageAuthority;
-                const base = toBuf(lease.tensor).metal_tensor orelse return error.InvalidPhysicalStorageAuthority;
-                const offset = try std.math.add(usize, base.deviceByteOffset(), assigned.region.byte_offset);
-                if (outputs[index].deviceHandle() != base.deviceHandle() or outputs[index].deviceByteOffset() != offset or outputs[index].deviceByteLen() != assigned.slot.writable_bytes) return error.InvalidPhysicalStorageAuthority;
+                try self.compute.validateProjectionOutput(outputs[index], assigned);
                 for (outputs[0..index]) |previous| {
                     if (previous.deviceHandle() == outputs[index].deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(previous.deviceByteOffset()), previous.deviceByteLen(), @intCast(outputs[index].deviceByteOffset()), outputs[index].deviceByteLen())) return error.InvalidAssignedAlias;
                 }
@@ -13158,6 +13152,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
         const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
         if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
+        if (descriptor.operation == .linear and request.prepared_route != null) {
+            const prepared: *const PreparedDenseLinear = @ptrCast(@alignCast(request.prepared_route.?.context));
+            const assigned = request.assigned_output orelse return error.InvalidPhysicalStorageAuthority;
+            const planned = prepared.output_slot;
+            if (assigned.slot.node != planned.node or assigned.slot.epoch != planned.epoch or assigned.slot.allocation != planned.allocation or
+                assigned.slot.writable_bytes != planned.writable_bytes or !assigned.slot.logical.eq(planned.logical)) return error.InvalidPhysicalStorageAuthority;
+            try self.validateProjectionOutput(out_tensor, assigned.*);
+        }
         if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or dense_attention) {
             for (request.inputs) |source| {
                 const tensor = toBuf(source).metal_tensor.?;
@@ -40344,6 +40346,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return tensor;
     }
 
+    fn validateProjectionOutput(self: *MetalCompute, output: MetalTensor, assigned: @import("../execution/kernel_route.zig").AssignedOutput) !void {
+        if (output.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+        const lease = output.physicalLease() orelse return error.InvalidPhysicalStorageAuthority;
+        if (lease.backend.ptr != @as(*anyopaque, @ptrCast(self)) or !acceptsPhysicalImplementation(lease.backend.vtable) or
+            !lease.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region)) return error.InvalidPhysicalStorageAuthority;
+        const base = toBuf(lease.tensor).metal_tensor orelse return error.InvalidPhysicalStorageAuthority;
+        const offset = try std.math.add(usize, base.deviceByteOffset(), assigned.region.byte_offset);
+        if (output.deviceHandle() != base.deviceHandle() or output.deviceByteOffset() != offset or output.deviceByteLen() != assigned.slot.writable_bytes) return error.InvalidPhysicalStorageAuthority;
+    }
+
     fn projectionRangesOverlap(left: MetalTensor, right: MetalTensor) bool {
         return left.deviceHandle() == right.deviceHandle() and
             kernel_geometry.byteRangesOverlap(@intCast(left.deviceByteOffset()), left.deviceByteLen(), @intCast(right.deviceByteOffset()), right.deviceByteLen());
@@ -55853,10 +55865,17 @@ const PreparedDenseRegionFixture = struct {
                 defer assigned.deinit();
                 try assigned.validate(.{ .inputs = &facts, .output = request.output });
                 try scope.finish();
-                const destination = (try cb.allocUninitF32Shape(&.{ 1, 64 })) orelse return error.MissingPhysicalStorage;
+                const slot = request.output;
+                const lease = (try ops.physical_storage.Lease.create(a, cb, slot.writable_bytes)) orelse return error.MissingPhysicalStorage;
+                defer lease.release();
+                try lease.bindAllocationSlot(slot.allocation, slot.epoch, slot.writable_bytes);
+                const authority = route.AssignedOutput{ .slot = slot, .region = try lease.writableRegion(slot.allocation, slot.epoch, slot.writable_bytes) };
+                const destination = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = &.{ 1, 64 } })) orelse return error.MissingPhysicalStorage;
                 defer cb.free(destination);
                 const run = cb.vtable.kernels.?.runAssignedKernel.?;
                 var invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .inputs = values[0..3], .output = destination, .prepared_route = &assigned };
+                try std.testing.expectError(error.InvalidPhysicalStorageAuthority, run(cb.ptr, invocation));
+                invocation.assigned_output = &authority;
                 invocation.inputs = &.{ values[0], values[3], values[2] };
                 try std.testing.expectError(error.PreparedKernelBindingChanged, run(cb.ptr, invocation));
                 invocation.inputs = values[0..3];
