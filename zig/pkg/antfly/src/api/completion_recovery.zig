@@ -1159,6 +1159,12 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     changed_fence.catalog_revision = 11;
     try std.testing.expect(changed_fence.topology_epoch != source_fence.topology_epoch);
 
+    const pending_record = fake.state;
+    fake.state = committed_record;
+    try std.testing.expect(!try reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
+    try std.testing.expectEqual(.committed, fake.state.status);
+    fake.state = pending_record;
+
     try std.testing.expectError(error.SourcePendingWork, reclaim_admission.retireDisplacedDelivery(&service, a, manifest, changed_fence, .{}));
     try std.testing.expectEqual(.aborted, fake.state.status);
     try std.testing.expect(!fake.resolved[0] and fake.resolved[1] and fake.state.acknowledgments_pending);

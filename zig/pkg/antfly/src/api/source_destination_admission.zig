@@ -315,7 +315,7 @@ pub const Admission = struct {
             !std.meta.eql(decision.record.source_purpose, @as(?source.Digest, manifest.checkpoint.purpose)) or
             decision.record.begin_timestamp != manifest.begin_timestamp)
             return error.SourceTransactionIdentityConflict;
-        if (decision.record.status == .committed) return error.SourcePendingWork;
+        if (decision.record.status == .committed) return false;
 
         const admission = decision.admission.admission;
         const coordinator = try admission.coordinatorMember();
