@@ -65277,6 +65277,23 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
     );
 }
 
+static int termite_metal_encode_compressed_span_keys(
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLComputePipelineState> pipeline,
+    id<MTLBuffer> input, size_t input_offset,
+    id<MTLBuffer> output, size_t output_offset,
+    const termite_metal_encode_key_params *params,
+    MTLSize grid, MTLSize group
+) {
+    id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+    if (encoder == nil) return -11;
+    antfly_metal_set_compute_pipeline(encoder, pipeline);
+    termite_metal_bind_two_buffers(encoder, input, input_offset, output, output_offset, params, sizeof(*params));
+    antfly_metal_dispatch_threads(encoder, grid, group);
+    [encoder endEncoding];
+    return 0;
+}
+
 static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_key_slot(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -65336,17 +65353,12 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         .key_row_bytes = (uint32_t)key_row_bytes,
         .base_key_row_bytes = (uint32_t)base_key_row_bytes,
     };
-    id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-    if (params_buffer == nil) return -10;
-
-    id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-    if (encoder == nil) return -11;
-    antfly_metal_set_compute_pipeline(encoder, (pipeline));
-    termite_metal_bind_three_buffers_only(encoder, k_buffer, 0, runtime->attention_span_encoded_key_buffers[slot], (suffix_start * key_row_bytes), params_buffer, 0);
     const size_t residual_bytes = (num_kv_heads * 32u + 7u) / 8u;
     const size_t work_items = format == 0u ? suffix_tokens * base_key_row_bytes : suffix_tokens * (base_key_row_bytes + residual_bytes);
-    antfly_metal_dispatch_threads(encoder, MTLSizeMake(work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, work_items), 1, 1));
-    [encoder endEncoding];
+    const int rc = termite_metal_encode_compressed_span_keys(command_buffer, pipeline, k_buffer, 0,
+        runtime->attention_span_encoded_key_buffers[slot], suffix_start * key_row_bytes, &params,
+        MTLSizeMake(work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, work_items), 1, 1));
+    if (rc != 0) return rc;
 
     termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_ATTENTION_SPAN);
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
@@ -65457,17 +65469,10 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
             .key_row_bytes = (uint32_t)key_row_bytes,
             .base_key_row_bytes = (uint32_t)base_key_row_bytes,
         };
-        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (params_buffer == nil) return -10;
-
-        id<MTLComputeCommandEncoder> k_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (k_encoder == nil) return -11;
-        antfly_metal_set_compute_pipeline(k_encoder, (pipeline));
-        [k_encoder setBuffer:k_buffer offset:k_offset atIndex:0];
-        [k_encoder setBuffer:runtime->attention_span_encoded_key_buffers[slot] offset:(suffix_start * key_row_bytes) atIndex:1];
-        [k_encoder setBuffer:params_buffer offset:0 atIndex:2];
-        antfly_metal_dispatch_threads(k_encoder, MTLSizeMake(tg_size, suffix_tokens * num_kv_heads, 1), MTLSizeMake(tg_size, 1, 1));
-        [k_encoder endEncoding];
+        const int rc = termite_metal_encode_compressed_span_keys(command_buffer, pipeline, k_buffer, k_offset,
+            runtime->attention_span_encoded_key_buffers[slot], suffix_start * key_row_bytes, &params,
+            MTLSizeMake(tg_size, suffix_tokens * num_kv_heads, 1), MTLSizeMake(tg_size, 1, 1));
+        if (rc != 0) return rc;
 
         // Values: raw f32 blit matching the polar4/turbo3 path.
         termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_ATTENTION_SPAN);
@@ -65513,17 +65518,12 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
             .key_row_bytes = (uint32_t)key_row_bytes,
             .base_key_row_bytes = (uint32_t)base_key_row_bytes,
         };
-        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
-        if (params_buffer == nil) return -10;
-
-        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (encoder == nil) return -11;
-        antfly_metal_set_compute_pipeline(encoder, (pipeline));
-        termite_metal_bind_three_buffers_only(encoder, k_buffer, k_offset, runtime->attention_span_encoded_key_buffers[slot], (suffix_start * key_row_bytes), params_buffer, 0);
         const size_t residual_bytes = (num_kv_heads * 32u + 7u) / 8u;
         const size_t work_items = format == 0u ? suffix_tokens * base_key_row_bytes : suffix_tokens * (base_key_row_bytes + residual_bytes);
-        antfly_metal_dispatch_threads(encoder, MTLSizeMake(work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, work_items), 1, 1));
-        [encoder endEncoding];
+        const int rc = termite_metal_encode_compressed_span_keys(command_buffer, pipeline, k_buffer, k_offset,
+            runtime->attention_span_encoded_key_buffers[slot], suffix_start * key_row_bytes, &params,
+            MTLSizeMake(work_items, 1, 1), MTLSizeMake(termite_metal_thread_width(pipeline, work_items), 1, 1));
+        if (rc != 0) return rc;
 
         termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_ATTENTION_SPAN);
         id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
