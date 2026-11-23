@@ -34,6 +34,14 @@ pub fn available(cb: *const ops.ComputeBackend) bool {
     return services(cb) != null;
 }
 
+pub fn lookupWeight(cb: *const ops.ComputeBackend, name: []const u8) !ops.CT {
+    const selected = services(cb) orelse return error.UnsupportedDenseSchedule;
+    return switch (selected.weight_access) {
+        .shared => cb.getWeight(name),
+        .acquired => cb.acquireWeight(name),
+    };
+}
+
 pub fn heldWeight(cb: *const ops.ComputeBackend, model: *const anyopaque, value: ops.CT, name: ?[]const u8) !Plane {
     const selected = services(cb) orelse return error.UnsupportedDenseSchedule;
     return selected.heldWeightF32(cb.ptr, model, value, name);
@@ -55,6 +63,7 @@ test "dense services reject foreign tables before model tensor or context access
     std.mem.doNotOptimizeAway(&copied);
     const cb = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expect(!available(&cb));
+    try std.testing.expectError(error.UnsupportedDenseSchedule, lookupWeight(&cb, "not-a-weight"));
     try std.testing.expectError(error.UnsupportedDenseSchedule, heldWeight(&cb, @ptrFromInt(16), @ptrFromInt(16), "not-a-weight"));
     try std.testing.expectError(error.UnsupportedDenseSchedule, projectionInto(&cb, undefined, &.{}, @ptrFromInt(16), .query));
 }

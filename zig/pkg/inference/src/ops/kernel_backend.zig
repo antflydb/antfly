@@ -35,6 +35,7 @@ pub const OwnedPayloadServices = struct {
 pub const ProjectionMode = enum { query, apply };
 pub const DenseDecoderServices = struct {
     available: *const fn (*anyopaque) bool,
+    weight_access: enum { shared, acquired } = .shared,
     heldWeightF32: *const fn (*anyopaque, *const anyopaque, CT, ?[]const u8) anyerror!@import("../execution/storage_ownership.zig").Plane,
     projectionInto: *const fn (*anyopaque, *const kernel_descriptor.Descriptor, []const CT, CT, ProjectionMode) anyerror!bool,
 };

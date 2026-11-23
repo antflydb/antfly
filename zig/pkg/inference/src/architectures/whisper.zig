@@ -821,15 +821,14 @@ const WeightFetcher = struct {
     cold: ?NativeColdWeights = null,
 
     fn prepareCold(self: *WeightFetcher, name: []const u8) !void {
-        if (comptime !@import("build_options").enable_native) return;
         const source = self.cold orelse return;
-        if (self.cb.kind() == .cuda) {
-            // CUDA's original acquired cache handle pins stable headers and
-            // payload before Frame construction. Named current-source proof
-            // follows acquisition; never reinterpret a GPU owner as Native.
+        if (self.cb.kind() != .native) {
+            // The provider owns cold residency and proves the source after
+            // lookup. Native typed preparation requires Native ownership.
             if (!dense_backend.available(self.cb)) return error.UnsupportedDenseSchedule;
             return;
         }
+        if (comptime !@import("build_options").enable_native) return error.UnsupportedDenseSchedule;
         const Native = @import("../ops/native_compute.zig").NativeCompute;
         if (source.domain) |pin| {
             if (try Native.prepareTypedWeightOutsideExecution(self.cb, source.expected_data, name, pin)) return;
@@ -842,29 +841,32 @@ const WeightFetcher = struct {
         if (query.shape) |shape| if (shape.dtype != .f32 or query.quantized != null) return error.UnsupportedDenseSchedule;
     }
 
-    fn fetch(self: *WeightFetcher, name: []const u8) !CT {
-        try self.prepareCold(name);
-        const tensor = if (self.cold != null and self.cb.kind() == .cuda) try self.cb.acquireWeight(name) else try self.cb.getWeight(name);
+    fn lookup(self: *WeightFetcher, name: []const u8) !CT {
+        if (self.cold != null) return dense_backend.lookupWeight(self.cb, name);
+        return self.cb.getWeight(name);
+    }
+
+    fn record(self: *WeightFetcher, name: []const u8, tensor: CT) !CT {
         errdefer self.cb.free(tensor);
         if (self.cold) |source| {
-            if (self.cb.kind() == .cuda) _ = try dense_backend.heldWeight(self.cb, source.expected_data, tensor, name);
+            if (self.cb.kind() != .native) _ = try dense_backend.heldWeight(self.cb, source.expected_data, tensor, name);
         }
         try self.handles.append(self.allocator, tensor);
         return tensor;
     }
 
+    fn fetch(self: *WeightFetcher, name: []const u8) !CT {
+        try self.prepareCold(name);
+        return self.record(name, try self.lookup(name));
+    }
+
     fn fetchOptional(self: *WeightFetcher, name: []const u8) !?CT {
         try self.prepareCold(name);
-        const tensor = (if (self.cold != null and self.cb.kind() == .cuda) self.cb.acquireWeight(name) else self.cb.getWeight(name)) catch |err| switch (err) {
+        const tensor = self.lookup(name) catch |err| switch (err) {
             error.MissingWeight, error.WeightNotFound => return null,
             else => return err,
         };
-        errdefer self.cb.free(tensor);
-        if (self.cold) |source| {
-            if (self.cb.kind() == .cuda) _ = try dense_backend.heldWeight(self.cb, source.expected_data, tensor, name);
-        }
-        try self.handles.append(self.allocator, tensor);
-        return tensor;
+        return try self.record(name, tensor);
     }
 
     fn linear(self: *WeightFetcher, layer: usize, proj: []const u8, buf: *[256]u8) !Linear {

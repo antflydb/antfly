@@ -39343,6 +39343,7 @@ fn cudaDenseDecoderProjectionIntoOp(ctx: *anyopaque, descriptor: *const ops.kern
 
 const cuda_dense_decoder_services = @import("../kernel_backend.zig").DenseDecoderServices{
     .available = cudaDenseDecoderAvailableOp,
+    .weight_access = .acquired,
     .heldWeightF32 = cudaDenseDecoderHeldWeightF32Op,
     .projectionInto = cudaDenseDecoderProjectionIntoOp,
 };
