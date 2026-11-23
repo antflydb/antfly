@@ -5976,27 +5976,19 @@ pub const SessionRegistry = struct {
     pub fn inspectTerminalHttpCommit(self: *SessionRegistry, alloc: std.mem.Allocator, guard: Mutation, extra_req: ?*const OwnedTransactionCommitRequest, terminal: *?TerminalCommit, context: RoutingContext, admission: *@import("antfly_local_sources").common_request_admission.RequestAdmission) !?OwnedTransactionCommitRequest {
         if (self.durableMissIsAuthoritative()) {
             const durable = self.durable.?;
-            const store = switch (durable.backend) {
-                .runtime => |store| store,
-                .docstore => return null, // Shared authoritative stores use the runtime adapter.
+            return switch (durable.backend) {
+                .docstore => |store| result: {
+                    try context.ensureActive();
+                    var read = try store.beginReadTxn();
+                    defer read.abort();
+                    break :result try inspectTerminalHttpCommitTxn(durable, &read, alloc, guard, extra_req, terminal, context, admission);
+                },
+                .runtime => |store| result: {
+                    var read = try durable.beginRoutingRead(store, context);
+                    defer read.abort();
+                    break :result try inspectTerminalHttpCommitTxn(durable, &read, alloc, guard, extra_req, terminal, context, admission);
+                },
             };
-            var read = try durable.beginRoutingRead(store, context);
-            defer read.abort();
-            const key = try makeSessionKey(alloc, guard.id);
-            defer alloc.free(key);
-            const terminal_hint = try probeHttpTerminal(&read, alloc, key);
-            if (terminal_hint == false) return null;
-            var permit = admission.tryAcquireLease() orelse {
-                // A legacy record without a header can still use the normal
-                // execution path, which validates the complete record.
-                if (terminal_hint == null) return null;
-                return error.SqlWriteCapacityUnavailable;
-            };
-            defer permit.release();
-            try context.ensureActive();
-            var session = (try durable.loadSessionTxn(&read, guard.id)) orelse return null;
-            defer session.deinit(durable.alloc);
-            return terminalHttpCommitFromSession(alloc, guard, session, extra_req, terminal, context, if (alloc.ptr == durable.alloc.ptr and alloc.vtable == durable.alloc.vtable) &session.staged else null);
         }
         const stripe = self.sessionLock(guard.id);
         try stripe.lockControlled(context);
@@ -6006,7 +5998,25 @@ pub const SessionRegistry = struct {
         return terminalHttpCommitFromSession(alloc, guard, view.session, extra_req, terminal, context, null);
     }
 
-    fn probeHttpTerminal(read: *backend_erased.ReadTxn, alloc: std.mem.Allocator, key: []const u8) !?bool {
+    fn inspectTerminalHttpCommitTxn(durable: *DurableSessionStore, read: anytype, alloc: std.mem.Allocator, guard: Mutation, extra_req: ?*const OwnedTransactionCommitRequest, terminal: *?TerminalCommit, context: RoutingContext, admission: *@import("antfly_local_sources").common_request_admission.RequestAdmission) !?OwnedTransactionCommitRequest {
+        const key = try makeSessionKey(alloc, guard.id);
+        defer alloc.free(key);
+        const terminal_hint = try probeHttpTerminal(read, alloc, key);
+        if (terminal_hint == false) return null;
+        var permit = admission.tryAcquireLease() orelse {
+            // Legacy records can still use the serialized execution path.
+            if (terminal_hint == null) return null;
+            return error.SqlWriteCapacityUnavailable;
+        };
+        defer permit.release();
+        try context.ensureActive();
+        var session = (try durable.loadSessionTxn(read, guard.id)) orelse return null;
+        defer session.deinit(durable.alloc);
+        const same_allocator = alloc.ptr == durable.alloc.ptr and alloc.vtable == durable.alloc.vtable;
+        return terminalHttpCommitFromSession(alloc, guard, session, extra_req, terminal, context, if (same_allocator) &session.staged else null);
+    }
+
+    fn probeHttpTerminal(read: anytype, alloc: std.mem.Allocator, key: []const u8) !?bool {
         var scope = read.openReadScope(alloc) catch |err| switch (err) {
             error.Unsupported => return null,
             else => return err,
