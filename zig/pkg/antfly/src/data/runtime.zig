@@ -34809,6 +34809,7 @@ const RemoteMetadataSource = struct {
                     continue;
                 };
                 self.noteMetadataAuthoritySuccess(index);
+                if (request.sql_scope_supersession_ready) |ready| ready.* = read.sql_scope_supersession_ready;
                 return read.body;
             }
             if (terminal_error) |err| return err;
