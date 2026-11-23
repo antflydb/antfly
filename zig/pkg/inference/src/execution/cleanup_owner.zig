@@ -60,16 +60,19 @@ pub const Owner = struct {
     pub fn beginAdmitted(session: Session) !Owner {
         if (session.run_admission == null) return .{};
         const retained = (try session.retainRetirementSink()) orelse return .{};
-        return beginRetained(session, retained);
+        return beginRetained(session.backend(), retained);
     }
     /// Explicit resident invocation: the actual outer caller owns its gate
     /// even for a custom/raw Session with no admission or ModelLifetime.
     /// Reserve independent pure metadata before preparation and gate acquisition.
     pub fn beginResident(session: Session) !Owner {
         const retained = (try session.retainRetirementSink()) orelse try sink.Ref.create();
-        return beginRetained(session, retained);
+        return beginRetained(session.backend(), retained);
     }
-    fn beginRetained(session: Session, owned: sink.Ref) !Owner {
+    pub fn beginResidentModel(backend: @import("../backends/backends.zig").BackendType, model: *Session.ModelLifetime) !Owner {
+        return beginRetained(backend, try model.retainRetirementSink());
+    }
+    fn beginRetained(backend: @import("../backends/backends.zig").BackendType, owned: sink.Ref) !Owner {
         var retained = owned;
         errdefer retained.release();
         var guard = try retained.enter();
@@ -79,7 +82,7 @@ pub const Owner = struct {
             var retained_cleanup_epoch = retained_epoch;
             retained_cleanup_epoch.release();
         }
-        const prepared = if (session.backend() == .metal) try @import("retirement_finish_holder.zig").Holder.prepare() else null;
+        const prepared = if (backend == .metal) try @import("retirement_finish_holder.zig").Holder.prepare() else null;
         return .{ .retained_sink = retained, .guard = guard, .owned_epoch = retained_epoch, .prepared_finish = prepared };
     }
     pub fn epoch(self: *const Owner) ?*const sink.Epoch {
