@@ -5515,7 +5515,7 @@ noinline fn validateFreshPreparedRouteFacts(target: *ImportedOnnxSession, routes
     try routes.validateWithClaims(facts.inputs, claims);
 }
 
-fn importedTypedHostIngress(backend_type: BackendType, comptime Index: type, comptime axis: u8) !void {
+fn importedTypedHostIngress(comptime backend_type: BackendType, comptime Index: type, comptime axis: u8) !void {
     const a = std.testing.allocator;
     if (backend_type == .cuda) {
         var probe = @import("compute_context.zig").BackendContext.init(a, .cuda, null) catch |err| switch (@as(anyerror, err)) {

@@ -397,7 +397,7 @@ pub const Decoder = struct {
         if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].data.len % @sizeOf(f32) != 0 or
             !outputs[0].isAlignedFor(f32)) return error.InvalidResidentDecoderOutput;
         const output = &outputs[0];
-        if (output.owns_data and output.data_alignment == .of(f32) and
+        if (output.owns_data and output.data_alignment == std.mem.Alignment.of(f32) and
             output.allocator.ptr == a.ptr and output.allocator.vtable == a.vtable)
         {
             output.owns_data = false;
