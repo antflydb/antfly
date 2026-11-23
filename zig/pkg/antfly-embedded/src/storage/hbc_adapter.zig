@@ -9530,6 +9530,26 @@ pub const HBCIndex = struct {
             errdefer index.metadata = previous_metadata;
             try index.installExperimentalPostingReadGenerationReplacing(next, self.parent);
             self.next = null;
+            // A retained root may have populated serving caches before the
+            // peer committed. Evict only the IDs changed by a WAL suffix.
+            if (next.parent == null) {
+                index.clearAllCaches();
+            } else {
+                var changed = next.values.keyIterator();
+                while (changed.next()) |key| {
+                    const id = experimentalPostingValueKeyId(key.*);
+                    switch (experimentalPostingValueKeyKind(key.*) catch unreachable) {
+                        .base, .posting_state, .node_range => index.invalidateNodeCache(id),
+                        .quantized_checkpoint => index.invalidateQuantizedCache(id),
+                        .vector_leaf => index.invalidateVectorCache(id),
+                        .vector_metadata => {
+                            index.invalidateVectorCache(id);
+                            index.invalidateMetadataCache(id);
+                        },
+                        else => {},
+                    }
+                }
+            }
             index.finishPublishedSearchStateRefresh();
             index.closeExperimentalPostingWalWriter();
             index.discardExperimentalPostingDeltaBaseState();
