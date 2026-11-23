@@ -100,7 +100,12 @@ const ReplayInput = struct { node: NodeId, shape: ml.graph.Shape, allocation: ?b
 const ReplayOutput = struct { node: NodeId, allocation: buffers.AllocationId, shape: ml.graph.Shape, byte_offset: usize = 0 };
 const ReplayBindingState = struct { weight: ?CT = null, supplied: bool = false, host_direct: bool = false };
 
-const TransferPlan = struct { shape: ml.graph.Shape, backend_index: usize, allocation: buffers.AllocationId };
+const TransferPlan = struct {
+    shape: ml.graph.Shape,
+    backend_index: usize,
+    allocation: buffers.AllocationId,
+    usage: storage.Usage = .ordinary,
+};
 
 /// Move-only exclusive claim. The specialization/cache owner must outlive this
 /// token. Claiming performs no GPU work or admission; consuming it happens only
@@ -302,7 +307,7 @@ pub const Pool = struct {
         @memset(transfers, null);
         for (plan.transfers, 0..) |edge, edge_index| {
             const download = edge.target_backend == .native and edge.source_backend != .native;
-            const upload = edge.target_backend == .cuda and edge.source_backend == .native;
+            const upload = edge.source_backend == .native and (edge.target_backend == .cuda or edge.target_backend == .metal);
             if (!download and !upload) continue;
             const shape = graph.node(edge.source_node).output_shape;
             const elements = shape.numElements() orelse continue;
@@ -312,8 +317,15 @@ pub const Pool = struct {
                 const functions = backend.vtable.kernels orelse continue;
                 if (functions.physicalTensorView == null) continue;
                 if (download and backend.vtable.hostFloat32Write == null) continue;
-                if (upload and backend.vtable.kernels.?.writePhysicalFloat32 == null) continue;
-                transfers[edge_index] = .{ .shape = shape, .backend_index = index, .allocation = edge.allocation };
+                if (upload and functions.writePhysicalFloat32 == null) continue;
+                const usage: storage.Usage = if (backend.kind() == .metal) shared: {
+                    if (!functions.accepts(backend.vtable)) continue;
+                    const requirements = functions.hostInputRequirements orelse continue;
+                    const ingress_plan = (try requirements(backend.ptr, shape)) orelse continue;
+                    if (ingress_plan.bytes != edge.byte_size or ingress_plan.host_bytes != 0 or ingress_plan.host_backing_bytes != 0) continue;
+                    break :shared .host_input;
+                } else .ordinary;
+                transfers[edge_index] = .{ .shape = shape, .backend_index = index, .allocation = edge.allocation, .usage = usage };
                 count += 1;
                 break;
             }
@@ -791,7 +803,7 @@ pub const Pool = struct {
             };
             if (installed.workspace_bytes != 0) try self.addStorageRequirement(seen, installed.backend_index, installed.workspace_allocation, &amounts);
         }
-        for (self.transfers) |maybe| if (maybe) |transfer| try self.addStorageRequirement(seen, transfer.backend_index, transfer.allocation, &amounts);
+        for (self.transfers) |maybe| if (maybe) |transfer| try self.addStorageRequirementForUsage(seen, transfer.backend_index, transfer.allocation, transfer.usage, &amounts);
         if (self.literal_store) |store| {
             for (store.literals, 0..) |literal, literal_index| if (self.selection == null or self.literalEnabled(literal_index)) {
                 try self.addStorageRequirement(seen, literal.backend_index, literal.allocation, &amounts);
@@ -819,6 +831,11 @@ pub const Pool = struct {
     }
 
     fn addStorageRequirement(self: *Pool, seen: []usize, index: usize, id: buffers.AllocationId, amounts: *@import("../runtime/tier/memory.zig").AdmissionAmounts) !void {
+        const allocation = self.plan.allocationById(id) orelse return error.InactivePhysicalAllocation;
+        return self.addStorageRequirementForUsage(seen, index, id, if (allocation.kind == .input_binding) .host_input else .ordinary, amounts);
+    }
+
+    fn addStorageRequirementForUsage(self: *Pool, seen: []usize, index: usize, id: buffers.AllocationId, usage: storage.Usage, amounts: *@import("../runtime/tier/memory.zig").AdmissionAmounts) !void {
         if (id == buffers.invalid_allocation or id >= seen.len) return error.InvalidPhysicalAllocation;
         if (seen[id] != 0) return;
         const allocation = (self.plan.allocationById(id) orelse return error.InactivePhysicalAllocation).*;
@@ -827,7 +844,7 @@ pub const Pool = struct {
         const bytes: usize = @intCast(allocation.byte_size);
         const functions = backend.vtable.kernels orelse return error.InvalidPhysicalAllocation;
         _ = functions;
-        const bound = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = bytes, .usage = if (allocation.kind == .input_binding) .host_input else .ordinary, .admitted = true });
+        const bound = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = bytes, .usage = usage, .admitted = true });
         if (bound < bytes) return error.InvalidPhysicalStorageReservation;
         seen[id] = bound;
         switch (backend.kind()) {
@@ -3057,6 +3074,11 @@ pub const Frame = struct {
     }
 
     fn storageFor(self: *Frame, cb: *const ops.ComputeBackend, backend_index: usize, allocation_id: buffers.AllocationId) !?*storage.Lease {
+        const allocation = self.pool.plan.allocationById(allocation_id) orelse return error.InactivePhysicalAllocation;
+        return self.storageForUsage(cb, backend_index, allocation_id, if (allocation.kind == .input_binding) .host_input else .ordinary);
+    }
+
+    fn storageForUsage(self: *Frame, cb: *const ops.ComputeBackend, backend_index: usize, allocation_id: buffers.AllocationId, usage: storage.Usage) !?*storage.Lease {
         if (allocation_id >= self.storages.len or backend_index >= self.pool.backends.len or self.pool.plan.allocationById(allocation_id) == null) return error.InactivePhysicalAllocation;
         if (self.storages[allocation_id] == null) {
             if (self.native_program_storage_sealed) return error.UnpreparedNativeProgramStorage;
@@ -3064,7 +3086,7 @@ pub const Frame = struct {
                 if (cb.vtable.kernels.?.createPhysicalCompletion) |make_completion| self.completions[backend_index] = try make_completion(cb.ptr);
             }
             const bytes: usize = @intCast(self.pool.plan.allocations[allocation_id].byte_size);
-            self.storages[allocation_id] = (try self.allocateStorage(cb.*, bytes, if (self.pool.plan.allocations[allocation_id].kind == .workspace) .workspace else .activation, if (self.pool.plan.allocations[allocation_id].kind == .input_binding) .host_input else .ordinary)) orelse return null;
+            self.storages[allocation_id] = (try self.allocateStorage(cb.*, bytes, if (self.pool.plan.allocations[allocation_id].kind == .workspace) .workspace else .activation, usage)) orelse return null;
             self.stats.allocations += 1;
             self.stats.allocated_bytes += bytes;
         } else self.stats.reused_allocations += 1;
@@ -3278,12 +3300,15 @@ pub const Frame = struct {
         const selected = self.pool.backends[binding.backend_index];
         if (selected.ptr != target.ptr or selected.vtable != target.vtable) return null;
         const count: usize = @intCast(binding.shape.numElements().?);
-        const result = if (target.kind() == .cuda) upload: {
+        const result = if (target.kind() == .cuda or target.kind() == .metal) upload: {
             if (source.kind() != .native) return null;
             const host = (try source.hostFloat32Read(value)) orelse return null;
             if (host.len != count) return error.InvalidPhysicalTransferSize;
+            const allocation = (try self.storageForUsage(target, binding.backend_index, binding.allocation, binding.usage)) orelse return null;
+            // Shared storage is CPU-writable, so a retained view must keep the
+            // old payload intact. The ordinary copy path can fund a new value.
+            if (binding.usage == .host_input and !allocation.unique()) return null;
             self.invalidateManagedTerminalEvidence();
-            const allocation = (try self.storageFor(target, binding.backend_index, binding.allocation)) orelse return null;
             const output = try self.viewForShape(target, allocation, binding.shape);
             errdefer target.free(output);
             try target.vtable.kernels.?.writePhysicalFloat32.?(target.ptr, output, host);
@@ -5237,4 +5262,106 @@ test "declared host workspace rejects inconsistent targets before opaque decoder
 test "Native optional host borrow preflight refuses integer and nonborrowable facts before opaque coverage" {
     try ineligibleBorrowPreflightCase(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ineligibleBorrowPreflightCase, .{});
+}
+
+test "Native to Metal partition transfer uses its assigned Shared destination" {
+    const build_options = @import("build_options");
+    const metal_runtime = @import("../backends/metal_runtime.zig");
+    if (!build_options.enable_metal or !metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const contexts = @import("../backends/compute_context.zig");
+    var host_context = try contexts.BackendContext.init(allocator, .native, std.testing.io);
+    defer host_context.deinit(allocator);
+    var metal_context = try contexts.BackendContext.init(allocator, .metal, std.testing.io);
+    defer metal_context.deinit(allocator);
+    const host = host_context.computeBackend();
+    const metal = metal_context.computeBackend();
+
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const input_node = try builder.parameter("input", shape);
+    const boundary = try builder.neg(input_node);
+    const result_node = try builder.gelu(boundary);
+    try graph.markOutput(result_node);
+    const partitioning = @import("../graph/partition.zig");
+    const onlyGelu = struct {
+        fn supports(op: ml.graph.OpCode) bool {
+            return op == .fused_gelu;
+        }
+    }.supports;
+    var partitions = try partitioning.partition(allocator, &graph, &.{
+        .{ .backend = .metal, .priority = 10, .supports = &onlyGelu },
+        .{ .backend = .native, .priority = 0, .supports = &partitioning.supportsAll },
+    });
+    defer partitions.deinit();
+    var plan = try buffers.build(allocator, &graph, &partitions, .{});
+    defer plan.deinit();
+
+    const target_partition = partitions.node_assignment[result_node];
+    const index = plan.transfer_index.get(buffers.transferKey(boundary, target_partition)) orelse return error.MissingPhysicalTransfer;
+    const pool = (try Pool.create(allocator, &graph, &plan, &.{ &host, &metal }, &.{ null, null, null })) orelse return error.MissingPhysicalTransfer;
+    defer pool.deinit();
+    const binding = pool.transfers[index] orelse return error.MissingPhysicalTransfer;
+    try std.testing.expectEqual(storage.Usage.host_input, binding.usage);
+
+    const frame = try Frame.create(pool);
+    defer frame.deinit();
+    const values = [_]f32{ -2, 3, -5, 7 };
+    const source = try host.fromFloat32Shape(&values, &.{4});
+    defer host.free(source);
+    var observed = @import("runtime_observation.zig").Scope.init();
+    defer observed.deinit();
+    const result = (try frame.transfer(&host, &metal, source, boundary, target_partition)) orelse return error.MissingPhysicalTransfer;
+    defer metal.free(result);
+    const counters = observed.snapshot();
+    try std.testing.expectEqual(@as(u64, 0), counters.metal_command_submissions);
+    try std.testing.expectEqual(@as(u64, 0), counters.metal_command_waits);
+    try std.testing.expectEqual(@as(u64, 1), frame.stats.transfers);
+    try std.testing.expectEqual(@as(u64, @sizeOf(@TypeOf(values))), frame.stats.transfer_bytes);
+    try std.testing.expectEqual(storage.Usage.host_input, frame.storages[binding.allocation].?.usage);
+
+    const changed = try host.fromFloat32Shape(&.{ 1, 1, 1, 1 }, &.{4});
+    defer host.free(changed);
+    try std.testing.expect((try frame.transfer(&host, &metal, changed, boundary, target_partition)) == null);
+    try std.testing.expectEqual(@as(u64, 1), frame.stats.transfers);
+
+    const got = try metal.toFloat32(result, allocator);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(f32, &values, got);
+
+    const multi = @import("../graph/multi_executor.zig");
+    const devices = @import("../graph/device_mesh.zig");
+    const assignment = try allocator.alloc(devices.DeviceId, partitions.partitions.len);
+    defer allocator.free(assignment);
+    for (partitions.partitions, assignment) |part, *device| device.* = if (part.backend == .metal) 1 else 0;
+    const placement = multi.DevicePartitionPlan{ .base = partitions, .device_assignment = assignment, .allocator = allocator };
+    var mesh = try devices.DeviceMesh.init(allocator, &.{
+        .{ .id = 0, .backend = &host, .kind = .native },
+        .{ .id = 1, .backend = &metal, .kind = .metal },
+    });
+    defer mesh.deinit();
+    const invocation = try Frame.create(pool);
+    defer invocation.deinit();
+    try invocation.begin();
+    var executed = try multi.executeMultiDevice(allocator, &graph, &placement, &mesh, .{
+        .runtime_inputs = &.{.{ .node_id = input_node, .value = source }},
+        .physical_frame = invocation,
+    });
+    defer executed.deinit(&mesh);
+    const stats = try invocation.finish();
+    try std.testing.expectEqual(@as(u64, 1), stats.transfers);
+    try std.testing.expectEqual(@as(u64, @sizeOf(@TypeOf(values))), stats.transfer_bytes);
+    try std.testing.expectEqual(@as(devices.DeviceId, 1), executed.output_devices[0]);
+
+    const negated = try host.neg(source);
+    defer host.free(negated);
+    const expected_tensor = try host.gelu(negated);
+    defer host.free(expected_tensor);
+    const expected = try host.toFloat32(expected_tensor, allocator);
+    defer allocator.free(expected);
+    const actual = try metal.toFloat32(executed.outputs[0], allocator);
+    defer allocator.free(actual);
+    for (expected, actual) |want, found| try std.testing.expectApproxEqAbs(want, found, 0.0001);
 }
