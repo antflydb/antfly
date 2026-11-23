@@ -12932,11 +12932,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer if (!transferred) DenseProjectionRegion.deinit(owner);
         @memcpy(owner.nodes[0..covered_count], covered[0..covered_count]);
         owner.inputs[0] = semantic.input;
-        var actual = expected;
-        actual.widths = @splat(0);
-        actual.slots = @splat(0);
-        actual.generations = @splat(0);
-        actual.declarations = @splat(0);
+        var members: [3]ProjectionPackSlot = undefined;
         for (semantic.linears[0..semantic.count], 0..) |descriptor, index| {
             const weight = semantic.weights[index];
             if (request.node_facts[weight] != .tensor) return null;
@@ -12959,12 +12955,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             owner.outputs[index] = .{ .node = output_node, .logical = descriptor.output_shape, .bytes = bytes };
             const prepared: *PreparedDenseLinear = @ptrCast(@alignCast(owner.linears[index].context));
-            actual.widths[index] = descriptor.operation.linear.out_dim;
-            actual.slots[index] = prepared.slot;
-            actual.generations[index] = metal_runtime.antfly_metal_prepared_binding_generation(self.provider_impl.raw_decode_runtime, .linear, prepared.slot);
-            actual.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, prepared.slot);
+            members[index] = .{ .geometry = descriptor.operation.linear, .slot = prepared.slot };
         }
-        if (!owner.slotsSupported() or !std.meta.eql(actual, expected)) return null;
+        const actual = self.projectionPackRequest(members[0..semantic.count]) orelse return null;
+        if (!std.meta.eql(actual, expected)) return null;
         owner.packed_request = expected;
         owner.scratch_bytes = try (try expected.layout()).outputBytes(semantic.linears[0].operation.linear.rows);
         const items = try request.allocator.alloc(region.Owned, 1);
@@ -13098,14 +13092,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 continue;
             }
             if (first.operation.linear.rows > 1) {
-                var pack = ProjectionPack.Request{ .count = @intCast(count), .slots = @splat(0), .generations = @splat(0), .declarations = @splat(0), .width = first.operation.linear.in_dim, .widths = @splat(0) };
-                for (owner.linears[0..count], 0..) |linear, index| {
+                var pack_slots: [3]ProjectionPackSlot = undefined;
+                for (owner.linears[0..count], pack_slots[0..count]) |linear, *member| {
                     const prepared: *PreparedDenseLinear = @ptrCast(@alignCast(linear.context));
-                    pack.slots[index] = prepared.slot;
-                    pack.widths[index] = prepared.descriptor.operation.linear.out_dim;
-                    pack.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, prepared.slot);
-                    pack.generations[index] = metal_runtime.antfly_metal_prepared_binding_generation(self.provider_impl.raw_decode_runtime, .linear, prepared.slot);
+                    member.* = .{ .slot = prepared.slot, .geometry = prepared.descriptor.operation.linear };
                 }
+                const pack = self.projectionPackRequest(pack_slots[0..count]) orelse {
+                    cursor += 1;
+                    continue;
+                };
                 const available = self.hasInstalledProjectionPack(pack);
                 try packs.append(request.allocator, .{ .request = pack, .available = available });
                 if (!available) {
@@ -13175,7 +13170,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const semantic = ops.kernel_descriptor.metalProjectionHead(graph) orelse return null;
         const count = semantic.count;
         if (count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return null;
-        var request = ProjectionPack.Request{ .count = @intCast(count), .slots = @splat(0), .generations = @splat(0), .declarations = @splat(0), .width = 0, .widths = @splat(0) };
+        var members: [3]ProjectionPackSlot = undefined;
         for (semantic.linears[0..count], 0..) |descriptor, index| {
             const linear = descriptor.operation.linear;
             if (linear.rows <= 1) return null;
@@ -13188,15 +13183,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             } else null;
             const key = self.assignedDenseLinearKey(linear, source.value, bias) orelse return null;
             const slot = self.assignedDenseLinearSlot(key) orelse return null;
-            if (metal_runtime.termite_metal_decode_runtime_linear_slot_dtype(self.provider_impl.raw_decode_runtime, slot) != @backingInt(metal_runtime.DenseLinearSlotDtype.f32)) return null;
-            request.width = linear.in_dim;
-            request.widths[index] = linear.out_dim;
-            request.slots[index] = slot;
-            request.generations[index] = metal_runtime.antfly_metal_prepared_binding_generation(self.provider_impl.raw_decode_runtime, .linear, slot);
-            request.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, slot);
+            members[index] = .{ .slot = slot, .geometry = linear };
+        }
+        const request = self.projectionPackRequest(members[0..count]) orelse return null;
+        if (metal_runtime.antfly_metal_projection_pack_available(self.provider_impl.raw_decode_runtime, request.count, &request.slots, request.width, &request.widths) == 0) return null;
+        return request;
+    }
+
+    const ProjectionPackSlot = struct { slot: usize, geometry: ops.kernel_descriptor.Linear };
+
+    // Cold funding and shared-frame selection use the same exact slot
+    // generations and declarations. Row count belongs to the dispatch plan.
+    fn projectionPackRequest(self: *MetalCompute, members: []const ProjectionPackSlot) ?ProjectionPack.Request {
+        if (members.len < 2 or members.len > 3) return null;
+        const width = members[0].geometry.in_dim;
+        var request = ProjectionPack.Request{ .count = @intCast(members.len), .slots = @splat(0), .generations = @splat(0), .declarations = @splat(0), .width = width, .widths = @splat(0) };
+        for (members, 0..) |member, index| {
+            if (member.geometry.in_dim != width or
+                metal_runtime.termite_metal_decode_runtime_linear_slot_dtype(self.provider_impl.raw_decode_runtime, member.slot) != @backingInt(metal_runtime.DenseLinearSlotDtype.f32)) return null;
+            request.slots[index] = member.slot;
+            request.widths[index] = member.geometry.out_dim;
+            request.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, member.slot);
+            request.generations[index] = metal_runtime.antfly_metal_prepared_binding_generation(self.provider_impl.raw_decode_runtime, .linear, member.slot);
         }
         _ = request.layout() catch return null;
-        if (metal_runtime.antfly_metal_projection_pack_available(self.provider_impl.raw_decode_runtime, request.count, &request.slots, request.width, &request.widths) == 0) return null;
         return request;
     }
 
