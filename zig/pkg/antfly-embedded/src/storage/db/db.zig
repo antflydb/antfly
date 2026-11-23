@@ -124922,6 +124922,31 @@ test "db search marks a truncated fused candidate union as a lower bound" {
     try std.testing.expectEqual(types.TotalHitsRelation.exact, full_window.total_hits_relation);
 }
 
+test "db hybrid search visibility reuses the memory probe across batches" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{ .primary_backend = .{ .mem = .{} }, .start_index_workers = false });
+    defer db.close();
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:present", .value = "{}" }} });
+    var candidates: [257]types.SearchHit = undefined;
+    var present = "doc:present".*;
+    var missing = "doc:absent".*;
+    for (&candidates, 0..) |*hit, i| {
+        hit.* = .{ .id = if (i % 2 == 0) &present else &missing };
+    }
+
+    var txn = try db.core.store.beginProbeTxn();
+    defer txn.abort();
+    try std.testing.expect(try txn.releasePhysicalProbeResults());
+
+    const stop: std.atomic.Value(bool) = .init(false);
+    const visible = try filterStoredSearchCandidatesManyControlled(&db, alloc, &candidates, &stop);
+    defer alloc.free(visible);
+    for (visible, 0..) |keep, i| try std.testing.expectEqual(i % 2 == 0, keep);
+}
+
 test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     const alloc = std.testing.allocator;
 
