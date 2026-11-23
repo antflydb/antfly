@@ -15438,8 +15438,13 @@ pub const ApiHttpServer = struct {
         executor: @import("../common/http/io_http_executor.zig").IoHttpExecutor,
     };
 
+    pub fn hasSessionForwardTransport(self: *const ApiHttpServer) bool {
+        return self.cfg.session_executor != null or self.cfg.admitted_sql_peer_executor != null or self.cfg.sql_peer_transport_config != null;
+    }
+
     pub fn sqlPeerExecutor(self: *ApiHttpServer, borrow: @import("antfly_runtime_abi").io_abi.Borrow) !http_common.RequestExecutor {
-        const config = self.cfg.sql_peer_transport_config orelse return self.cfg.admitted_sql_peer_executor orelse error.SqlPeerUnavailable;
+        if (self.cfg.admitted_sql_peer_executor) |executor| return executor;
+        const config = self.cfg.sql_peer_transport_config orelse return error.SqlPeerUnavailable;
         platform_sync.lockYielding(&self.sql_peer_transport_mutex);
         defer self.sql_peer_transport_mutex.unlock();
         if (self.sql_peer_transport == null) {

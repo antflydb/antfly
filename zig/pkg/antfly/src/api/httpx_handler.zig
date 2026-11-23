@@ -2289,7 +2289,7 @@ pub const AntflyApiHandler = struct {
     ) !?httpx.Response {
         if (ctx.request.method == .GET or ctx.header("X-Antfly-SQL-Fence") == null)
             return self.forwardResolvedTransactionSession(ctx, txn_id, body, .lookup, null);
-        if (self.api_server.cfg.session_router == null or self.api_server.cfg.session_executor == null) return null;
+        if (self.api_server.cfg.session_router == null or !self.api_server.hasSessionForwardTransport()) return null;
         const owner = self.runDurableSQLRouting(ctx.io, ApiHttpServer.sessionRoutingOwner, .{ self.api_server, txn_id, operationContext(ctx, null) }) catch |err| switch (err) {
             error.SqlWriteCapacityUnavailable => return try sqlRoutingOverloadedResponse(ctx),
             error.DeadlineExceeded => return try sqlForwardDeadlineResponse(ctx),
@@ -2333,7 +2333,7 @@ pub const AntflyApiHandler = struct {
         };
         var response = (if (owner == .resolved) routed: {
             const router = self.api_server.cfg.session_router orelse return null;
-            if (self.api_server.cfg.session_executor == null) return null;
+            if (!self.api_server.hasSessionForwardTransport()) return null;
             const node = owner.resolved orelse if (self.api_server.txn_sessions.durableMissIsAuthoritative()) return null else transactions_api.sessionOwnerNodeId(txn_id);
             if (node == 0 or node == router.localNodeId()) return null;
             if (isSqlPeerHop(ctx)) return try sqlOwnerChangedResponse(ctx);
@@ -8879,7 +8879,7 @@ pub const AntflyApiHandler = struct {
             }
         }
         if (handles[2]) |encoded| {
-            if (resolved.handles[2].? != local or (server.cfg.session_router != null and server.cfg.session_executor != null)) {
+            if (resolved.handles[2].? != local or (server.cfg.session_router != null and server.hasSessionForwardTransport())) {
                 const id = try distributed_txn.parseTxnIdHex(encoded);
                 resolved.session = try server.sessionRoutingOwner(id, context);
                 if (resolved.session) |node| resolved.handles[2] = node;
@@ -9321,7 +9321,7 @@ pub const AntflyApiHandler = struct {
             if (seal_shared_issuer and (self.api_server.txn_sessions.durable_scope != .cluster_shared or self.api_server.localSessionNodeId() == 0))
                 return ctx.status(409).text("SQL completion issuer fence requires a shared store and a routed issuer");
             if (seal_legacy_pins and !seal_shared_issuer and (self.api_server.cfg.deployment_mode != .standalone or
-                self.api_server.txn_sessions.durable_scope != .node_local or self.api_server.cfg.session_executor != null or
+                self.api_server.txn_sessions.durable_scope != .node_local or self.api_server.hasSessionForwardTransport() or
                 self.api_server.cfg.hot_standby_mutation_policy_source != null or !self.api_server.mutationBackgroundExecutionPermitted()))
                 return ctx.status(409).text("SQL completion fence requires an exclusive standalone store");
             const encoded = (try ctx.body()) orelse return ctx.status(400).text("missing completion witness");
@@ -9466,7 +9466,7 @@ pub const AntflyApiHandler = struct {
             const owner = @import("sql/execution/resource_routing.zig").owner(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL handle" });
             owners.handles[i] = owner;
             if (i == 2) {
-                resolve = resolve or owner != local or (self.api_server.cfg.session_router != null and self.api_server.cfg.session_executor != null);
+                resolve = resolve or owner != local or (self.api_server.cfg.session_router != null and self.api_server.hasSessionForwardTransport());
             } else if (owner != local and self.api_server.txn_sessions.durable != null) resolve = true;
         };
         if (mode == .statement and prepared_id == null and connection_handle == null and
