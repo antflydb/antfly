@@ -7555,7 +7555,9 @@ pub const NativeFile = struct {
         var header_bytes: [header_size]u8 = undefined;
         try readHeaderExactAt(file, io, &header_bytes);
         var header = try decodeHeader(&header_bytes);
-        const file_size = (try file.stat(io)).size;
+        const file_stat = try file.stat(io);
+        if (!opts.read_only and file_stat.nlink > 1) return error.HardLinkedDatabase;
+        const file_size = file_stat.size;
         header.checkpoints = loadCheckpointSlots(file, io, header.page_size, file_size);
         // Only a writer (not a read-only probe) may truncate a rejected
         // fallback candidate's tail away.
@@ -23570,6 +23572,8 @@ pub const NativeFile = struct {
             const named = try storage_file_identity.nativePathIdentity(source);
             const live_named = try storage_file_identity.nativePathIdentity(destination);
             if (!std.meta.eql(named, prepared_entry.identity) or !std.meta.eql(live_named, live_identity)) return error.FileBusy;
+            try rejectHardLinkedWriterPath(io, source);
+            try rejectHardLinkedWriterPath(io, destination);
             try renameFilePath(io, source, destination);
             inode_lock.installRebindLocked(prepared_entry, binding.?);
             binding = null;
@@ -24067,6 +24071,8 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
         .mode = if (writer) .read_write else .read_only,
     });
     const held = try @import("path_lock_wait.zig").lockUntil(file, io, if (writer) .exclusive else .shared, deadline_ns);
+    errdefer held.close(io);
+    if (writer) try rejectHardLinkedWriterPath(io, path);
     const registration = if (writer) registerOwnSidecarLock(io, held) else null;
     return .{ .io_impl = undefined, .borrowed_io = io, .file = held, .sidecar_registration = registration };
 }
@@ -24507,6 +24513,14 @@ fn createDataFile(io: std.Io, path: []const u8, opts: CreateDataFileOptions) !st
     });
 }
 
+fn rejectHardLinkedWriterPath(io: std.Io, path: []const u8) !void {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.nlink > 1) return error.HardLinkedDatabase;
+}
+
 fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFile {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
@@ -24514,7 +24528,11 @@ fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFi
         .mode = .read_write,
         .lock = .exclusive,
         .lock_nonblocking = true,
-    })) |existing| return .{ .file = existing } else |err| {
+    })) |existing| {
+        errdefer existing.close(io);
+        try rejectHardLinkedWriterPath(io, path);
+        return .{ .file = existing };
+    } else |err| {
         if (err != error.FileNotFound) return err;
     }
     // Readers of sidecar-free snapshots hold this inode shared. Exclude them
@@ -24529,6 +24547,7 @@ fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFi
         else => return err,
     };
     defer if (data) |held| held.close(io);
+    if (data) |held| if ((try held.stat(io)).nlink > 1) return error.HardLinkedDatabase;
     const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
@@ -35394,6 +35413,27 @@ test "issue1431 ordinary coordinated reader retains allocator metadata" {
     try std.testing.expect((try writer.allocatorStats()).?.reused_pages >= reused);
     try std.testing.expect((try snapshot.checkAtFileSizeWithCancel(captured_size, null)).valid);
     try std.testing.expect((try writer.check()).valid);
+}
+
+test "lite native rejects writer admission through either name of a hard-linked database" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "writer-hardlink.aflite");
+    defer allocator.free(path);
+    const alias = try testPath(allocator, tmp, "writer-alias.aflite");
+    defer allocator.free(alias);
+    {
+        var original = try NativeFile.create(allocator, path);
+        defer original.close();
+    }
+    try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+    try std.testing.expectError(error.HardLinkedDatabase, NativeFile.openWithIo(allocator, io, path, .{}));
+    try std.testing.expectError(error.HardLinkedDatabase, NativeFile.openWithIo(allocator, io, alias, .{ .externally_locked = true }));
+    try std.testing.expectError(error.HardLinkedDatabase, lockWriterPathWithIo(allocator, io, alias));
+    var reader = try NativeFile.openWithIo(allocator, io, alias, .{ .read_only = true });
+    reader.close();
 }
 
 test "lite reader epoch aliases hardlink snapshot preserves original data" {

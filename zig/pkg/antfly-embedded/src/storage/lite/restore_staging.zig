@@ -1189,7 +1189,9 @@ test "lite portable restore stages and publishes beside a symlink target" {
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(io, &root_buffer);
     const root = root_buffer[0..root_len];
-    const destination = try std.fs.path.join(allocator, &.{ root, "destination", "restore.aflite" });
+    var long_basename: [237]u8 = @splat('a');
+    @memcpy(long_basename[230..], ".aflite");
+    const destination = try std.fs.path.join(allocator, &.{ root, "destination", &long_basename });
     defer allocator.free(destination);
     const alias = try std.fs.path.join(allocator, &.{ root, "alias.aflite" });
     defer allocator.free(alias);

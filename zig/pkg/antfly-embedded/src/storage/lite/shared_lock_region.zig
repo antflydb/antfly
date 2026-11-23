@@ -751,14 +751,21 @@ fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool
             }
         }
     }
-    const has_reserve = unidentified_by_device.contains(device);
     fd_registry_mutex.unlock(io);
-    if (has_reserve and !attempted_repair.*) {
+    const pending = reserveDescriptor(io, device, region_path, path_identity, waiter) catch |err| retry: {
+        const quarantined_path = switch (err) {
+            error.DescriptorQuarantined => region_path,
+            error.DescriptorReserveFull => null,
+            else => |e| return e,
+        };
+        if (attempted_repair.*) return error.RegionUnavailable;
         attempted_repair.* = true;
-        resolveUnidentifiedDescriptors(io, device);
-    }
-
-    const pending = try reserveDescriptor(io, device, region_path, path_identity, waiter);
+        resolveUnidentifiedDescriptors(io, device, quarantined_path);
+        break :retry reserveDescriptor(io, device, region_path, path_identity, waiter) catch |retry_err| switch (retry_err) {
+            error.DescriptorQuarantined, error.DescriptorReserveFull => return error.RegionUnavailable,
+            else => |e| return e,
+        };
+    };
     // If another opener created the file after stat, sample the actual
     // inode again before we open a second fd that would have to be retained.
     const missing = path_identity == null;
@@ -791,7 +798,7 @@ fn acquireProcessFdOnce(io: Io, region_path: []const u8, attempted_repair: *bool
     return RegionError.RegionUnavailable;
 }
 
-fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_identity.NativeFileIdentity, waiter: ?*AdmissionWaiter) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath })!*FdEntry {
+fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_identity.NativeFileIdentity, waiter: ?*AdmissionWaiter) (RegionError || error{ DescriptorOpening, ResampleDescriptorPath, DescriptorQuarantined, DescriptorReserveFull })!*FdEntry {
     const page = std.heap.page_allocator;
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
@@ -807,7 +814,7 @@ fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_iden
         for (bucket) |slot| {
             const entry = slot orelse continue;
             if (std.mem.eql(u8, entry.unresolved_path.?, path)) {
-                if (entry.fd != -1) return error.RegionUnavailable;
+                if (entry.fd != -1) return error.DescriptorQuarantined;
                 try linkAdmissionWaiter(waiter, device, path);
                 return error.DescriptorOpening;
             }
@@ -815,7 +822,7 @@ fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_iden
             opening = opening or entry.fd == -1;
         }
         if (occupied == bucket.len) {
-            if (!opening) return error.RegionUnavailable;
+            if (!opening) return error.DescriptorReserveFull;
             try linkAdmissionWaiter(waiter, device, null);
             return error.DescriptorOpening;
         }
@@ -893,7 +900,7 @@ fn retainSpareDescriptor(entry: *FdEntry, spare: *FdEntry) void {
     entry.spare_descriptors = spare;
 }
 
-fn resolveUnidentifiedDescriptors(io: Io, device: u64) void {
+fn resolveUnidentifiedDescriptors(io: Io, device: u64, path: ?[]const u8) void {
     for (0..max_unidentified_descriptors) |i| {
         fd_registry_mutex.lockUncancelable(io);
         const pending = if (unidentified_by_device.getPtr(device)) |bucket| bucket[i] else null;
@@ -902,6 +909,12 @@ fn resolveUnidentifiedDescriptors(io: Io, device: u64) void {
             continue;
         }
         const entry = pending.?;
+        if (path) |name| {
+            if (!std.mem.eql(u8, name, entry.unresolved_path.?)) {
+                fd_registry_mutex.unlock(io);
+                continue;
+            }
+        }
         entry.probing_identity = true;
         fd_registry_mutex.unlock(io);
 
@@ -947,22 +960,21 @@ fn closeSpareDescriptors(head: ?*FdEntry) void {
 }
 
 fn discardInactiveDescriptors() void {
-    var buckets = unidentified_by_device.valueIterator();
-    while (buckets.next()) |bucket| {
-        for (bucket) |*slot| {
+    var devices = unidentified_by_device.iterator();
+    while (devices.next()) |device| {
+        var remains = false;
+        for (device.value_ptr) |*slot| {
             const entry = slot.* orelse continue;
-            if (entry.probing_identity) continue;
+            if (entry.probing_identity) {
+                remains = true;
+                continue;
+            }
+            wakeAdmissionWaiters(device.key_ptr.*, entry.unresolved_path.?);
             std.heap.page_allocator.free(entry.unresolved_path.?);
             closeSpareDescriptors(entry);
             slot.* = null;
         }
-    }
-    // In-flight opens and probes keep their reservations until they finish.
-    var devices = unidentified_by_device.iterator();
-    while (devices.next()) |device| {
-        for (device.value_ptr) |slot| {
-            if (slot != null) break;
-        } else unidentified_by_device.removeByPtr(device.key_ptr);
+        if (!remains) unidentified_by_device.removeByPtr(device.key_ptr);
     }
 }
 
@@ -3770,6 +3782,24 @@ test "shared lock region: descriptor waiters wake only for their path or device 
         try std.testing.expectEqual(@as(u32, 0), other_path.ready.load(.acquire));
         try std.testing.expectEqual(@as(u32, 0), other_device.ready.load(.acquire));
     }
+}
+
+test "shared lock region: discarding quarantined descriptors wakes capacity waiters" {
+    const io = std.testing.io;
+    var waiter: AdmissionWaiter = .{};
+    const device = 1;
+    const pending = try reserveDescriptor(io, device, "discard", null, null);
+    {
+        fd_registry_mutex.lockUncancelable(io);
+        defer fd_registry_mutex.unlock(io);
+        pending_opens -= 1;
+        pending.probing_identity = false;
+        try linkAdmissionWaiter(&waiter, device, null);
+        discardInactiveDescriptors();
+    }
+    defer unlinkAdmissionWaiter(io, &waiter);
+    try std.testing.expectEqual(@as(u32, 1), waiter.ready.load(.acquire));
+    try std.testing.expect(!unidentified_by_device.contains(device));
 }
 
 test "shared lock region: descriptor reserves are independent per device" {
