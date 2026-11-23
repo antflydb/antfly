@@ -3167,3 +3167,65 @@ test "lake SQL bounded window profiles selected small chunks avoid separate head
     }
     try std.testing.expectEqual(calls[1] + 1, calls[0]);
 }
+
+test "lake SQL typed composite batching measures projected Parquet bytes" {
+    const a = std.testing.allocator;
+    var tenant: [1024]i64 = undefined;
+    var time: [1024]i64 = undefined;
+    var payload: [1024]i64 = undefined;
+    for (&tenant, &time, &payload, 0..) |*key, *ts, *value, i| {
+        key.* = @intCast(i / 512);
+        ts.* = @as(i64, @intCast(i % 512)) * std.time.us_per_s;
+        value.* = @intCast(i);
+    }
+    const data = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{
+        .{ .column_id = "tenant", .values = &tenant, .field_id = 1, .page_rows = 128, .write_statistics = true },
+        .{ .column_id = "observed", .values = &time, .field_id = 2, .converted_type = 10, .page_rows = 128, .write_statistics = true },
+        .{ .column_id = "payload", .values = &payload, .field_id = 3, .page_rows = 128 },
+    });
+    defer a.free(data);
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populateData(a, 1, data);
+    defer lake.deinit(a);
+    lake.table.columns = &.{
+        .{ .name = "tenant", .path = "tenant", .type = .integer },
+        .{ .name = "observed", .path = "observed", .type = .datetime },
+        .{ .name = "payload", .path = "payload", .type = .integer },
+    };
+    const first: std.json.Value = .{ .string = "1970-01-01T00:00:05Z" };
+    const last: std.json.Value = .{ .string = "1970-01-01T00:00:12Z" };
+    const keys: []const []const u8 = &.{ "tenant", "observed" };
+    const fields: []const []const u8 = &.{ "tenant", "observed", "payload" };
+    const scan = struct {
+        fn count(alloc: Allocator, fixture: *TestLake, columns: []const []const u8, conditions: []const catalog.Condition) !usize {
+            const cursor = try openPinned(alloc, fixture.table, .{ .fields = columns, .conditions = conditions, .limit = 4 }, .{}, &fixture.source);
+            defer cursor.close(cursor.ptr);
+            var seen: usize = 0;
+            while (true) {
+                const page = try cursor.next(cursor.ptr, alloc, 4);
+                defer page.deinit();
+                seen += page.rows.len;
+                if (page.after == null) return seen;
+            }
+        }
+    };
+    for ([_]std.json.Value{ first, last }) |key| {
+        try std.testing.expectEqual(@as(usize, 1), try scan.count(a, &lake, fields, &.{
+            .{ .column = "tenant", .op = .eq, .value = .{ .integer = 0 } },
+            .{ .column = "observed", .op = .eq, .value = key },
+        }));
+    }
+    const point_bytes = lake.meter.bytes;
+    const range: []const catalog.Condition = &.{
+        .{ .column = "tenant", .op = .eq, .value = .{ .integer = 0 } },
+        .{ .column = "observed", .op = .gte, .value = first },
+        .{ .column = "observed", .op = .lte, .value = last },
+    };
+    try std.testing.expectEqual(@as(usize, 8), try scan.count(a, &lake, fields, range));
+    const batch_bytes = lake.meter.bytes - point_bytes;
+    try std.testing.expectEqual(@as(usize, 8), try scan.count(a, &lake, keys, range));
+    const keys_bytes = lake.meter.bytes - point_bytes - batch_bytes;
+    std.debug.print("typed composite scan bytes: points={d} (2 cursors), rows={d} (1 cursor), keys={d} (1 cursor)\n", .{ point_bytes, batch_bytes, keys_bytes });
+    try std.testing.expect(batch_bytes < point_bytes);
+    try std.testing.expect(keys_bytes < batch_bytes);
+}

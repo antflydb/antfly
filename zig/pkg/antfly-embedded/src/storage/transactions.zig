@@ -5791,6 +5791,26 @@ pub fn fenceUnadmittedSourceAttempt(a: Allocator, txn: anytype, root: source_sco
     return source_scope.Store.fenceCoordinatorUnenlisted(a, txn, root, reference);
 }
 
+/// A planned transfer may replace a fully drained ABORT. Keep the terminal
+/// decision and require its exact scope plus the persisted native token fence.
+pub fn fenceSettledSourceAttempt(a: Allocator, txn: anytype, root: source_scope.Basis, reference: source_scope.Reference, id: TxnId) !u64 {
+    if (std.mem.allEqual(u8, &id, 0)) return error.InvalidSourceAdmission;
+    const key = makeRecordKey(id);
+    const raw = txn.get(&key) catch |err| switch (@as(anyerror, err)) {
+        error.NotFound => return source_scope.Store.fenceCoordinatorUnenlisted(a, txn, root, reference),
+        else => return err,
+    };
+    const record = try decodeRecord(raw);
+    if (record.status != .aborted or !record.coordinator_known or !record.coordinator or
+        !record.intents_resolved_known or !record.intents_resolved) return error.SourceOutcomeUnresolved;
+    if (!std.meta.eql(record.source_scope, @as(?source_scope.Reference, reference))) return error.SourceTransactionIdentityConflict;
+    if (try TxnManager.hasUnresolvedParticipantsInRead(a, txn, id)) return error.SourceOutcomeUnresolved;
+    const scoped = try source_scope.Store.requireRecord(a, txn, root, reference.domain);
+    if (!std.meta.eql(scoped.spec.checkpoint_owner, root) or scoped.closed_through_token < reference.token or
+        scoped.last_committed_sequence >= reference.sequence) return error.SourceOutcomeUnresolved;
+    return scoped.closed_through_token;
+}
+
 pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_wire.zig").Record {
     const record = try decodeRecord(raw);
     if (!record.coordinator_known or !record.coordinator or !record.retain_terminal_known or !record.prepared_known or (record.status != .pending and !record.intents_resolved_known)) return error.InvalidTxnRecord;
@@ -10512,6 +10532,7 @@ test "transaction source purpose scoped reference survives restart and fences st
             var fence = try store.beginWriteTxn();
             defer fence.abort();
             try std.testing.expectError(error.SourceOutcomeUnresolved, fenceUnadmittedSourceAttempt(a, &fence, root, scope, id));
+            try std.testing.expectError(error.SourceOutcomeUnresolved, fenceSettledSourceAttempt(a, &fence, root, scope, id));
         }
         try mgr.initTransactionWithCompletionAdmission(admission, 10_000, 2_000, true, extra);
         try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithCompletionAdmission(admission, 10_000, 1_000, true, .{ .source_purpose = purpose }));
@@ -10581,6 +10602,18 @@ test "transaction source purpose scoped reference survives restart and fences st
         defer a.free(raw);
         try std.testing.expectEqualDeep(scope, (try decodeRecord(raw)).source_scope.?);
         try std.testing.expectEqual(TxnStatus.aborted, (try decodeRecord(raw)).status);
+        {
+            var probe = try store.beginWriteTxn();
+            defer probe.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, fenceSettledSourceAttempt(a, &probe, root, scope, id));
+        }
+        try mgr.markParticipantResolved(id, members[0].locator);
+        {
+            var proof = try store.beginWriteTxn();
+            defer proof.abort();
+            try std.testing.expectError(error.SourceOutcomeUnresolved, fenceUnadmittedSourceAttempt(a, &proof, root, scope, id));
+            try std.testing.expectEqual(scope.token, try fenceSettledSourceAttempt(a, &proof, root, scope, id));
+        }
         var other_spec = spec;
         other_spec.source_id = @splat(45);
         other_spec.binding = @splat(46);

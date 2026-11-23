@@ -298,6 +298,31 @@ pub const State = struct {
     retired_reservation_digest: Digest = @splat(0),
     artifact_control: ?@import("source_artifact_control.zig").State = null,
     checkpoint_authority: ?source_contract.checkpoint_authority.Spec = null,
+    checkpoint_transfer_merge_id: ?u64 = null,
+    checkpoint_transfer_target: ?checkpoint_authority.Spec = null,
+    checkpoint_preparation: ?checkpoint_authority.Preparation = null,
+    checkpoint_install_receipt: ?@import("antfly_local_sources").storage_source_scope.CheckpointInstallReceipt = null,
+    pub fn checkpointTransferDrained(self: State) bool {
+        const ledger = self.artifact_control orelse return false;
+        return self.scope_fencing and !self.closing and !self.retired and self.outstanding.len == 0 and
+            self.superseded_payload == null and self.accepted.sequence == self.committed.sequence and
+            ledger.current == null and (self.pending == null or self.pending_no_admission_receipt != null);
+    }
+    fn requireCheckpointDrain(self: State, transfer: @FieldType(checkpoint_authority.Preparation, "transfer")) !void {
+        const actor = self.scope orelse return error.SourceBindingConflict;
+        if (!self.checkpointTransferDrained()) return error.SourcePendingWork;
+        const ledger = self.artifact_control.?;
+        const donor = transfer.donor;
+        if (donor.spec.actor_table_id != actor.table_id or !std.meta.eql(donor.spec.source_id, actor.source_id) or
+            donor.spec.generation != actor.generation or !std.meta.eql(donor.spec.binding, actor.identity()) or
+            donor.last_committed_sequence != self.committed.sequence or donor.closed_through_token > ledger.next_token)
+            return error.SourceCheckpointConflict;
+        if (transfer.handoff().checkpoint) |bytes| {
+            const head = try @import("antfly_local_sources").storage_source_checkpoint.Head.decode(bytes);
+            if (!std.mem.eql(u8, head.checkpoint, self.committed.checkpoint)) return error.SourceCheckpointConflict;
+        }
+    }
+
     pub fn reportedStreamFailure(self: State) ?StreamFailure {
         if (self.stream_failure) |failure| return failure;
         if (self.completion_stalled_at_ms) |observed|
@@ -405,6 +430,26 @@ pub const State = struct {
                 if (pending.artifact == null or !std.mem.eql(u8, &reclaimed.reservation, &pending.identity(self.scope.?)) or !std.meta.eql(reclaimed.spec, pending.artifact.?)) return error.InvalidSourceControl;
             }
         } else if (self.pending) |pending| if (pending.artifact != null) return error.InvalidSourceControl;
+        if (self.checkpoint_transfer_merge_id == 0 or (self.checkpoint_transfer_merge_id != null and self.checkpoint_transfer_target == null)) return error.InvalidSourceControl;
+        if (self.checkpoint_transfer_target) |target| {
+            const prior = self.checkpoint_authority orelse return error.InvalidSourceControl;
+            if (!self.scope_fencing or self.closing or self.retired) return error.InvalidSourceControl;
+            try prior.requireSuccessor(target);
+        }
+        if (self.checkpoint_preparation) |preparation| {
+            const target = self.checkpoint_transfer_target orelse return error.InvalidSourceControl;
+            if (!target.sameAuthority(preparation.successor)) return error.SourceBindingConflict;
+            const prior = self.checkpoint_authority orelse return error.InvalidSourceControl;
+            try preparation.requirePrior(prior);
+            try self.requireCheckpointDrain(preparation.transfer);
+        }
+        if (self.checkpoint_install_receipt) |receipt| {
+            try receipt.validate();
+            const authority = self.checkpoint_authority orelse return error.InvalidSourceControl;
+            const native = @import("antfly_local_sources").storage_source_scope;
+            if (!std.meta.eql(receipt.successor, try native.Basis.fromOwner(authority.owner)))
+                return error.InvalidSourceControl;
+        }
         if (self.payload_cleanup_cursor) |cursor| {
             if (!text(cursor, max_payload_cleanup_cursor_bytes, false)) return error.InvalidSourceControl;
             if (self.superseded_payload == null) {
@@ -521,6 +566,9 @@ pub const Mutation = union(enum) {
     certify_native_snapshot_pages: ScopedSnapshotCut,
     configure: Scope,
     bind_checkpoint: checkpoint_authority.Spec,
+    begin_checkpoint_transfer: checkpoint_authority.TransferIntent,
+    prepare_checkpoint_successor: checkpoint_authority.Preparation,
+    adopt_checkpoint_successor: checkpoint_authority.Adoption,
     fence_checkpoint: struct { authority_digest: Digest, proof: Digest },
     reserve: Reservation,
     /// The adapter proves old routes cannot admit a delayed original attempt.
@@ -566,6 +614,9 @@ pub const Mutation = union(enum) {
             .certify_native_bootstrap => |checkpoint| if (!text(checkpoint, 1024, false)) return error.InvalidSourceControl,
             .certify_native_snapshot_pages => |cut| if (!text(cut.provider_checkpoint, 1024, false) or !nonzero(cut.first_page)) return error.InvalidSourceControl,
             .configure, .reseed => |scope| try scope.validate(),
+            .begin_checkpoint_transfer => |target| try target.validate(),
+            .prepare_checkpoint_successor => |preparation| try preparation.validate(),
+            .adopt_checkpoint_successor => |adoption| try adoption.validate(),
             .bind_checkpoint => |authority| {
                 try authority.validate();
                 if (authority.retirement != null) return error.InvalidSourceControl;
@@ -597,6 +648,10 @@ pub const Mutation = union(enum) {
     pub fn apply(self: Mutation, a: A, state: State) !State {
         try self.validate();
         try state.validate();
+        if (state.checkpoint_transfer_target != null) switch (self) {
+            .reserve, .replan, .close, .retire, .reject_and_retire => return error.SourcePendingWork,
+            else => {},
+        };
         var next = try state.advance();
         switch (self) {
             .observe_completion_wait, .observe_completion_stall, .observe_qualified_completion_stall => |observed| {
@@ -684,6 +739,50 @@ pub const Mutation = union(enum) {
                 if (state.artifact_control) |ledger| if (ledger.current != null) return error.SourcePendingWork;
                 next.checkpoint_authority = authority;
                 next.artifact_control = state.artifact_control orelse .{};
+            },
+            .begin_checkpoint_transfer => |transfer| {
+                const target = transfer.target;
+                const prior = state.checkpoint_authority orelse return error.SourceBindingConflict;
+                if (!state.scope_fencing or state.closing or state.retired) return error.SourceBindingConflict;
+                if (state.pending) |pending| {
+                    if (!pending.retain_payload) return error.SourcePendingWork;
+                }
+                try prior.requireSuccessor(target);
+                if (state.checkpoint_transfer_target) |existing| {
+                    if (!existing.sameAuthority(target) or state.checkpoint_transfer_merge_id != transfer.online_merge_id) return error.SourceBindingConflict;
+                    return state;
+                }
+                next.checkpoint_transfer_target = target;
+                next.checkpoint_transfer_merge_id = transfer.online_merge_id;
+            },
+            .prepare_checkpoint_successor => |preparation| {
+                const target = state.checkpoint_transfer_target orelse return error.SourcePendingWork;
+                if (!target.sameAuthority(preparation.successor)) return error.SourceBindingConflict;
+                const prior = state.checkpoint_authority orelse return error.SourceBindingConflict;
+                try preparation.requirePrior(prior);
+                try state.requireCheckpointDrain(preparation.transfer);
+                if (state.checkpoint_preparation) |existing| {
+                    if (!existing.matches(preparation)) return error.SourceBindingConflict;
+                    return state;
+                }
+                next.checkpoint_preparation = preparation;
+            },
+            .adopt_checkpoint_successor => |adoption| {
+                const prior = state.checkpoint_authority orelse return error.SourceBindingConflict;
+                if (prior.sameAuthority(adoption.successor)) {
+                    if (!std.meta.eql(state.checkpoint_install_receipt, @as(?@TypeOf(adoption.installed), adoption.installed)))
+                        return error.SourceBindingConflict;
+                    return state;
+                }
+                const prepared = state.checkpoint_preparation orelse return error.SourcePendingWork;
+                if (!prepared.matches(.{ .successor = adoption.successor, .transfer = adoption.transfer })) return error.SourceBindingConflict;
+                try adoption.requireTransfer(a, prior);
+                try state.requireCheckpointDrain(adoption.transfer);
+                next.checkpoint_preparation = null;
+                next.checkpoint_transfer_target = null;
+                next.checkpoint_transfer_merge_id = null;
+                next.checkpoint_authority = adoption.successor;
+                next.checkpoint_install_receipt = adoption.installed;
             },
             .fence_checkpoint => |fence| {
                 const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
@@ -1629,7 +1728,7 @@ test "source control replans only proven unadmitted delivery while retaining log
 fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest") or std.mem.eql(u8, name, "retain_payload") or std.mem.eql(u8, name, "completion_wait_independent")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page") or std.mem.eql(u8, name, "payload_cleanup_cursor") or std.mem.eql(u8, name, "superseded_payload") or std.mem.eql(u8, name, "pending_no_admission_receipt") or std.mem.eql(u8, name, "stream_failure") or std.mem.eql(u8, name, "completion_wait_since_ms") or std.mem.eql(u8, name, "completion_stalled_at_ms")) @field(value, name) != null else true;
+        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing") or std.mem.eql(u8, name, "manifest_retention") or std.mem.eql(u8, name, "retain_manifest") or std.mem.eql(u8, name, "retain_payload") or std.mem.eql(u8, name, "completion_wait_independent")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority") or std.mem.eql(u8, name, "checkpoint_transfer_merge_id") or std.mem.eql(u8, name, "checkpoint_transfer_target") or std.mem.eql(u8, name, "checkpoint_preparation") or std.mem.eql(u8, name, "checkpoint_install_receipt") or std.mem.eql(u8, name, "native_bootstrap_checkpoint") or std.mem.eql(u8, name, "native_bootstrap_first_page") or std.mem.eql(u8, name, "payload_cleanup_cursor") or std.mem.eql(u8, name, "superseded_payload") or std.mem.eql(u8, name, "pending_no_admission_receipt") or std.mem.eql(u8, name, "stream_failure") or std.mem.eql(u8, name, "completion_wait_since_ms") or std.mem.eql(u8, name, "completion_stalled_at_ms")) @field(value, name) != null else true;
         if (include) {
             try stream.objectField(name);
             try stream.write(@field(value, name));
@@ -1648,6 +1747,7 @@ pub fn requiredProtocol(mutation: Mutation) u16 {
         .certify_native_bootstrap => native_bootstrap_protocol_version,
         .certify_native_snapshot_pages => scoped_snapshot_protocol_version,
         .bind_checkpoint, .fence_checkpoint => checkpoint_authority.protocol_version,
+        .begin_checkpoint_transfer, .prepare_checkpoint_successor, .adopt_checkpoint_successor => checkpoint_authority.successor_protocol_version,
         .reserve => |reservation| if (reservation.retain_payload) retained_payload_protocol_version else if (reservation.retain_manifest) manifest_protocol_version else if (reservation.artifact != null) artifact_control.protocol_version else protocol_version,
         .replan => |plan| if (plan.retain_payload) retained_payload_protocol_version else if (plan.retain_manifest) manifest_protocol_version else if (plan.artifact != null) artifact_control.protocol_version else protocol_version,
         .fence_unsealed_delivery_attempt, .fence_delivery_attempt, .reclaim_superseded_payload, .checkpoint_payload_cleanup, .discard_fenced_pending => retained_payload_protocol_version,
@@ -2162,4 +2262,62 @@ test "source control retained manifests survive acceptance without profile downg
     state = try discard.apply(ca, state);
     try std.testing.expect(state.closing and !state.retired and state.pending == null and state.payload_cleanup_cursor == null);
     try std.testing.expectEqual(@as(u64, 1), state.committed.sequence);
+}
+
+test "source control checkpoint successor preparation survives reload and fences conflicting adoption" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const actor: Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    const prior: checkpoint_authority.Spec = .{ .binding = actor.identity(), .table_name = "checkpoint", .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 17, .topology_epoch = 99 } };
+    var state = try (Mutation{ .configure = actor }).apply(ca, .{});
+    state = try (Mutation{ .bind_checkpoint = prior }).apply(ca, state);
+    state = try (Mutation{ .enable_scope_fencing = {} }).apply(ca, state);
+
+    const native = @import("antfly_local_sources").storage_source_scope;
+    const original = try native.Basis.fromOwner(prior.owner);
+    const donor: native.Record = .{
+        .spec = .{ .actor_table_id = actor.table_id, .source_id = actor.source_id, .generation = actor.generation, .binding = prior.binding, .checkpoint_owner = original },
+        .bound_metadata_index = 10,
+        .close_metadata_index = 11,
+        .closed_at = .{ .term = 2, .index = 20 },
+        .phase = .closed,
+    };
+    var successor = prior;
+    successor.owner.group_id += 1;
+    successor.owner.namespace = @splat(2);
+    successor.owner.topology_epoch = 12;
+    const prepare: Mutation = .{ .prepare_checkpoint_successor = .{ .successor = successor, .transfer = .{ .donor = donor, .bytes = null } } };
+    const adoption: Mutation = .{ .adopt_checkpoint_successor = .{
+        .previous = prior.digest(),
+        .successor = successor,
+        .transfer = prepare.prepare_checkpoint_successor.transfer,
+        .installed = .{
+            .handoff_digest = try prepare.prepare_checkpoint_successor.transfer.handoff().digest(ca),
+            .donor = original,
+            .successor = try native.Basis.fromOwner(successor.owner),
+            .domain = donor.spec.domain(),
+            .authorization = .{ .group_id = original.metadata_group_id, .incarnation = original.metadata_incarnation, .index = 12 },
+            .applied = .{ .term = 1, .index = 6 },
+        },
+    } };
+    try std.testing.expectError(error.SourcePendingWork, adoption.apply(ca, state));
+    try std.testing.expectError(error.SourcePendingWork, prepare.apply(ca, state));
+    state = try (Mutation{ .begin_checkpoint_transfer = .{ .target = successor } }).apply(ca, state);
+    try std.testing.expect(state.checkpointTransferDrained());
+    state = try prepare.apply(ca, state);
+    const encoded = try encode(ca, state);
+    var decoded = try parse(a, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(state.revision, (try prepare.apply(ca, decoded.value)).revision);
+    try std.testing.expectError(error.SourcePendingWork, (Mutation{ .close = {} }).apply(ca, decoded.value));
+    var conflicting = adoption;
+    conflicting.adopt_checkpoint_successor.installed.handoff_digest[0] ^= 1;
+    try std.testing.expectError(error.SourceBindingConflict, conflicting.apply(ca, decoded.value));
+    state = try adoption.apply(ca, decoded.value);
+    try std.testing.expect(state.checkpoint_authority.?.sameAuthority(successor));
+    try std.testing.expect(state.checkpoint_preparation == null);
+    try std.testing.expectEqual(adoption.adopt_checkpoint_successor.installed, state.checkpoint_install_receipt.?);
+    try std.testing.expectEqual(state.revision, (try adoption.apply(ca, state)).revision);
 }

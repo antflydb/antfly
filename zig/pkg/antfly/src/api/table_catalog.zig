@@ -2150,7 +2150,10 @@ pub fn validateTransactionTopologyStableSnapshot(
 pub fn onlineMergeAllowsTransactions(transition: metadata_transition_state.MergeTransitionRecord) bool {
     const online = transition.online orelse return false;
     switch (online.phase) {
-        .admit, .publish, .snapshot, .tail => {},
+        // Entering release atomically publishes the receiver range and removes
+        // the donor range. New transactions can use the published epoch while
+        // the donor finishes cleanup.
+        .admit, .publish, .snapshot, .tail, .release => {},
         else => return false,
     }
     // The exception belongs to an authenticated admitted merge attempt, not
@@ -4307,6 +4310,19 @@ fn consumerTests() type {
                 if (phase == .cancelled) merges[0].phase = .rolled_back;
                 try merges[0].online.?.validateRecord(merges[0]);
                 switch (phase) {
+                    .release => {
+                        var published = [_]metadata_table_manager.RangeRecord{ranges[1]};
+                        published[0].start_key = ranges[0].start_key;
+                        snapshot.ranges = &published;
+                        defer snapshot.ranges = &ranges;
+
+                        try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch));
+                        var routing = (try transactionRoutingSnapshot(std.testing.allocator, source, "rows")).?;
+                        defer routing.deinit(std.testing.allocator);
+                        try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", routing.topology_epoch);
+                        try std.testing.expectEqual(@as(?u64, 3), routing.resolveGroupForKey("a"));
+                        try std.testing.expectEqual(@as(?u64, 3), routing.resolveGroupForKey("z"));
+                    },
                     .admit, .publish, .snapshot, .tail, .complete, .cancelled => {
                         try validateTransactionTopologyStable(source, "rows");
                         try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);

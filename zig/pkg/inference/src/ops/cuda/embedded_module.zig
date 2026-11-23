@@ -20,8 +20,11 @@ const std = @import("std");
 const context = @import("context.zig");
 const driver = @import("driver.zig");
 
-pub fn EmbeddedModule(comptime image: [:0]const u8, comptime entries: anytype) type {
-    return Module(image, entries);
+pub const ImageProvider = fn () [:0]const u8;
+
+/// Pass a named provider so code generation never embeds PTX in a type name.
+pub fn EmbeddedModule(comptime get_image: ImageProvider, comptime entries: anytype) type {
+    return Module(get_image, entries);
 }
 
 /// Architecture selection stays in the caller; the owner shares lookup and retirement.
@@ -29,7 +32,7 @@ pub fn SelectedModule(comptime entries: anytype) type {
     return Module(null, entries);
 }
 
-fn Module(comptime image: ?[:0]const u8, comptime entries: anytype) type {
+fn Module(comptime get_image: ?ImageProvider, comptime entries: anytype) type {
     const enum_entries = @TypeOf(entries) == type;
     const fields = if (enum_entries) @typeInfo(entries).@"enum".field_names else @typeInfo(@TypeOf(entries)).@"struct".field_names;
     comptime {
@@ -64,7 +67,8 @@ fn Module(comptime image: ?[:0]const u8, comptime entries: anytype) type {
 
         /// Initialize a fixed image after the caller selected its context.
         pub fn initCurrent(self: *Self, api: anytype) !void {
-            try self.loadCurrent(api, comptime image orelse @compileError("selected images require loadCurrent"));
+            const image = comptime get_image orelse @compileError("selected images require loadCurrent");
+            try self.loadCurrent(api, comptime image());
         }
 
         /// Caller has selected the context. Success adds no context/driver calls
@@ -106,6 +110,14 @@ pub const Image = struct { image: [:0]const u8, entry: [:0]const u8 };
 /// Resolve a fixed offline profile at compile time; no serving-time catalog lookup.
 pub fn profile(comptime spec: anytype) Image {
     return .{ .image = @field(@import("generated/standalone_images.zig").images, spec.file), .entry = spec.entry };
+}
+
+pub fn profileImage(comptime spec: anytype) ImageProvider {
+    return struct {
+        fn get() [:0]const u8 {
+            return comptime profile(spec).image;
+        }
+    }.get;
 }
 
 pub fn EmbeddedPrograms(comptime descriptors: anytype) type {
@@ -220,7 +232,12 @@ test "embedded CUDA program publishes all entries atomically and retries failed 
     Mock.fail_load = true;
     Mock.fail_lookup = true;
     var api: Mock = .{};
-    var program: EmbeddedModule("image", .{ .first = "first", .second = "second" }) = .{};
+    const fixture = struct {
+        fn image() [:0]const u8 {
+            return "image";
+        }
+    };
+    var program: EmbeddedModule(fixture.image, .{ .first = "first", .second = "second" }) = .{};
     try std.testing.expectError(error.MockDriverFailure, program.initCurrent(&api));
     try std.testing.expectEqual(@as(usize, 0), Mock.unloads);
     Mock.fail_load = false;

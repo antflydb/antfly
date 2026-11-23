@@ -30621,11 +30621,14 @@ pub const DB = struct {
             command_version: u8,
 
             pub fn fenceUnadmittedAttempt(gate: @This(), writer: anytype, basis: control.scope.Basis, attempt: control.FenceAttempt) !void {
-                _ = try transactions_mod.fenceUnadmittedSourceAttempt(gate.alloc, writer, basis, attempt.reference, attempt.transaction_id);
+                _ = if (gate.command_version == 4)
+                    try transactions_mod.fenceSettledSourceAttempt(gate.alloc, writer, basis, attempt.reference, attempt.transaction_id)
+                else
+                    try transactions_mod.fenceUnadmittedSourceAttempt(gate.alloc, writer, basis, attempt.reference, attempt.transaction_id);
             }
 
             pub fn requireLegacyDrained(gate: @This(), writer: anytype, basis: control.scope.Basis) !void {
-                if (gate.command_version != 2) return error.SourcePendingWork;
+                if (gate.command_version != 2 and gate.command_version != 4) return error.SourcePendingWork;
                 try transactions_mod.TxnManager.requireLegacyDrainedInWriter(gate.alloc, writer, basis);
             }
         };

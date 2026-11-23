@@ -120,7 +120,6 @@ pub const Manifest = struct {
     }
     pub fn cleanupTransfer(self: Manifest, fence: @import("../metadata/api.zig").CatalogRouteFence, ports: Ports) !@import("source_plan_delivery.zig").Transfer {
         try self.validate();
-        if (fence.topology_epoch < self.owner.topology_epoch) return error.TopologyChanged;
         var routed = self.owner;
         routed.topology_epoch = fence.topology_epoch;
         try @import("source_owner_scope.zig").requireFence(routed, fence);
@@ -376,10 +375,10 @@ test "completion frozen plan source destination manifest owns exact admission an
     wrong_fence.route.group_id += 1;
     try std.testing.expectError(error.InvalidCatalogRouteFence, parsed.value.load(a, record, wrong_fence, ports, .{}));
     try std.testing.expectEqual(parsed.value.artifact.chunk_hashes.len, native.chunk_reads);
-    var newer_fence = fence;
-    newer_fence.topology_epoch += 1;
-    try std.testing.expectError(error.InvalidCatalogRouteFence, parsed.value.transfer(newer_fence, ports));
-    const cleaner = try parsed.value.cleanupTransfer(newer_fence, ports);
+    var refreshed_fence = fence;
+    refreshed_fence.topology_epoch -= 1;
+    try std.testing.expectError(error.InvalidCatalogRouteFence, parsed.value.transfer(refreshed_fence, ports));
+    const cleaner = try parsed.value.cleanupTransfer(refreshed_fence, ports);
     var retired_record = record;
     retired_record.phase = .garbage;
     retired_record.retirement = @splat(11);

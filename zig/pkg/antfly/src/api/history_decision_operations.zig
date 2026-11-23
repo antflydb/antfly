@@ -41,7 +41,7 @@ pub const Request = struct {
         std.mem.writeInt(u64, namespace[8..16], fence.route.identity_namespace.shard_id, .big);
         std.mem.writeInt(u64, namespace[16..24], fence.route.identity_namespace.range_id, .big);
         if (self.owner.metadata_group_id != fence.metadata_group_id or !std.mem.eql(u8, &self.owner.metadata_incarnation, &incarnation) or
-            !std.mem.eql(u8, &self.owner.namespace, &namespace) or self.owner.group_id != fence.route.group_id or self.owner.topology_epoch > fence.topology_epoch) return error.TopologyChanged;
+            !std.mem.eql(u8, &self.owner.namespace, &namespace) or self.owner.group_id != fence.route.group_id) return error.TopologyChanged;
     }
     pub fn binding(self: Request) wire.Query {
         return .{ .version = self.version, .owner = self.owner, .transaction_id = self.transaction_id, .minimum_applied_index = self.minimum_applied_index };

@@ -22,6 +22,7 @@ pub const wire = local.storage_source_scope_ordered;
 const completion = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
 pub const required_protocol_version = @import("../common/data_raft_protocol.zig").batch_source_scope_control_protocol_version;
 pub fn requiredProtocol(command: wire.control.Command) u16 {
+    if (command.version == 4) return @import("../common/data_raft_protocol.zig").batch_source_checkpoint_install_protocol_version;
     if (command.version == 3) return @import("../common/data_raft_protocol.zig").batch_source_attempt_fence_protocol_version;
     return if (command.version == 2)
         @import("../common/data_raft_protocol.zig").batch_source_drained_bind_protocol_version
@@ -134,4 +135,18 @@ test "source scope entry requires activation and complete immutable owner bindin
     try std.testing.expectEqualDeep(drained, drain_apply.source_scope_control.value());
     drained.source_scope_control.intent.action = .close;
     try std.testing.expectError(error.InvalidSourceAdmission, encode(a, drained, drain_protocol));
+
+    var handoff = entry;
+    handoff.source_scope_control.version = 4;
+    handoff.source_scope_control.intent.action = .close_checkpoint;
+    const handoff_protocol = requiredProtocol(handoff.source_scope_control);
+    try std.testing.expect(handoff_protocol > drain_protocol);
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, handoff, handoff_protocol));
+    handoff.protocol = handoff_protocol;
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, handoff, handoff_protocol - 1));
+    const handoff_bytes = try encode(a, handoff, handoff_protocol);
+    defer a.free(handoff_bytes);
+    var handoff_apply = try @import("raft_batch.zig").decodeForApply(a, handoff_bytes);
+    defer handoff_apply.deinit(a);
+    try std.testing.expectEqualDeep(handoff, handoff_apply.source_scope_control.value());
 }

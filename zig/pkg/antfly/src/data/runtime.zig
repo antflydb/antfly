@@ -2759,7 +2759,31 @@ fn batchMutatesDocuments(req: antfly.db.types.BatchRequest) bool {
         req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.transaction != null;
 }
 
+fn onlineMergeMaintenanceScope(req: antfly.db.types.BatchRequest) ?@import("antfly_local_sources").storage_db_online_source_contract.Scope {
+    const command = req.online_source orelse return null;
+    if (command != .release and command != .reclaim) return null;
+    @import("antfly_local_sources").storage_db_online_source_contract.validateRequest(req) catch return null;
+    // The wire codec resolves the document version mode and allocates
+    // its own empty slices. Compare the semantic shape of the control.
+    var shape = req;
+    shape.document_version_scheme = .admit_current;
+    const isolated: antfly.db.types.BatchRequest = .{ .online_source = command };
+    inline for (@typeInfo(antfly.db.types.BatchRequest).@"struct".field_names) |name| {
+        const field = @field(shape, name);
+        switch (@typeInfo(@TypeOf(field))) {
+            .pointer => |pointer| {
+                if (pointer.size == .slice and field.len == 0) @field(shape, name) = @field(isolated, name);
+            },
+            else => {},
+        }
+    }
+    return if (std.meta.eql(shape, isolated)) command.scope() else null;
+}
+
 fn needsDenseRepairWritePreflight(req: antfly.db.types.BatchRequest) bool {
+    // The published donor has no serving route. These isolated controls use
+    // its retained physical descriptor and the exact scope at ordered apply.
+    if (onlineMergeMaintenanceScope(req) != null) return false;
     // Policy install controls must progress while their schema/policy gate
     // deliberately defers ordinary writers. This exemption is only pressure
     // admission: private metadata authorization and exact ordered apply remain.
@@ -13268,7 +13292,10 @@ pub const DataServer = struct {
             // catalog read when a retired source became cold. Its ReadIndex
             // has already established local authority; prepare that one owner
             // on the durable control lane and leave the caller's debt pending.
-            if (err == error.CatalogRoutingUnavailable and request.operation != .artifact)
+            if (request.operation != .artifact and switch (err) {
+                error.CatalogRoutingUnavailable, error.StorageReadTemporarilyUnavailable => true,
+                else => false,
+            })
                 self.requestRetainedOwnerWarmup(group_id, table_name) catch |warm_err|
                     std.log.warn("retained owner warmup admission deferred group_id={} err={s}", .{ group_id, @errorName(warm_err) });
             return err;
@@ -18049,6 +18076,8 @@ pub const DataServer = struct {
                         const owner_source = try self.ensureKernelOwnerSource();
                         storage_owner_descriptor = if (route.initial_child_bootstrap) |bootstrap|
                             try owner_source.loadInitialChildDescriptor(alloc, group_id, table_name, bootstrap)
+                        else if (onlineMergeMaintenanceScope(req)) |scope|
+                            try owner_source.loadOnlineMergeMaintenanceDescriptor(alloc, group_id, table_name, scope)
                         else if (completion_command)
                             try owner_source.loadCompletionDescriptor(alloc, group_id, table_name, completion_context)
                         else
@@ -18072,7 +18101,7 @@ pub const DataServer = struct {
                 // A certificate is independently validated at apply against
                 // original retained resolution evidence. Rebind only the
                 // live route check and keep its original owner in the command.
-                if (req.transaction.? == .publish_completion and route.write_route_fence.?.topology_epoch > owner.topology_epoch)
+                if (req.transaction.? == .publish_completion)
                     owner.topology_epoch = route.write_route_fence.?.topology_epoch;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try @import("../api/completion_owner_admission.zig").require(alloc, admission_source.catalog, table_name, route.write_route_fence.?, storage_owner_descriptor.?.view(), owner, completion_context);
@@ -30515,7 +30544,19 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         rollback_accept.merge_checkpoint.?.kind = .accept;
         rollback_accept.merge_checkpoint.?.page_source.?.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
         try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(rollback_accept));
-        try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{ .online_source = .{ .release = bound } }));
+        const release: antfly.db.types.BatchRequest = .{ .online_source = .{ .release = bound } };
+        try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(release));
+        const batch = @import("antfly_local_sources").api_internal_batch;
+        for ([_]antfly.db.types.BatchRequest{ release, .{ .online_source = .{ .reclaim = .{ .scope = bound } } } }) |request| {
+            const encoded = try batch.encodeBatchRequest(alloc, request);
+            defer alloc.free(encoded);
+            var decoded = try batch.parseInternalBatchRequest(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try std.testing.expect(!needsDenseRepairWritePreflight(decoded.req));
+        }
+        var mixed_release = release;
+        mixed_release.writes = &.{.{ .key = "doc:new", .value = "{}" }};
+        try std.testing.expect(needsDenseRepairWritePreflight(mixed_release));
         try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{}));
         const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
         const catalogs: inventory.Catalogs = .{};
@@ -35793,7 +35834,8 @@ fn remoteTableLifecycleMatches(
     return switch (expected) {
         .present => {
             const record = table orelse return false;
-            return remoteTableRangesReady(snapshot, record.table_id);
+            // Object tables commit catalog definitions without native placement.
+            return record.storage.engine == .object or remoteTableRangesReady(snapshot, record.table_id);
         },
         .absent => table == null,
     };

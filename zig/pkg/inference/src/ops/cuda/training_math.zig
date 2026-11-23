@@ -30,7 +30,11 @@ pub fn artifactHash() [32]u8 {
     return hash;
 }
 
-const Program = @import("embedded_module.zig").EmbeddedModule(ptx, .{
+fn moduleImage() [:0]const u8 {
+    return ptx;
+}
+
+const Program = @import("embedded_module.zig").EmbeddedModule(moduleImage, .{
     .gelu = "termite_gliner25_gelu_f32_cuda128",
     .silu = "termite_gliner25_silu_f32_cuda128",
     .norm_chunks = "termite_gliner25_norm_chunks_v1",

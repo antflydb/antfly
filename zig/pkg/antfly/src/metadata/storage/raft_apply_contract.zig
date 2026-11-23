@@ -561,6 +561,7 @@ pub const CatalogProjectionRequest = union(enum) {
     changefeed_maintenance: struct { now: u64, after: ?feed.Id },
     changefeed_pressure: struct { now: u64, after: ?feed.Id },
     source_control: struct { table_id: u64, source_id: [32]u8 },
+    source_checkpoint_actors: struct { owner_group: u64, after: ?@import("../source_legacy_intake.zig").CheckpointActor },
     legacy_source_intake: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
     native_source_recovery_scope: struct { table_id: u64, ordinal: u32, definition: [32]u8 },
     capture_source_scope: @import("../source_scope_capture.zig").Query,

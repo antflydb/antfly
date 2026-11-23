@@ -40,6 +40,19 @@ pub fn openSnapshot(a: std.mem.Allocator, table: catalog.Table, snapshot_id: i64
     return openWithCache(a, pinned, scan, context, settings, null, settings.io);
 }
 
+// Iceberg WAL timestamps carry epoch microseconds. SQL cursor predicates
+// and stored cursor cells use signed epoch nanoseconds.
+fn walKeyOperand(a: std.mem.Allocator, column: catalog.Column, raw: std.json.Value) !std.json.Value {
+    if (column.type != .datetime) return raw;
+    const micros: i64 = switch (raw) {
+        .integer => |value| value,
+        .number_string => |value| std.fmt.parseInt(i64, value, 10) catch return error.InvalidLakeKey,
+        else => return error.InvalidLakeKey,
+    };
+    const nanos = @as(i128, micros) * std.time.ns_per_us;
+    return if (std.math.cast(i64, nanos)) |value| .{ .integer = value } else .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{nanos}) };
+}
+
 /// Read a unique key from a particular committed snapshot using Iceberg's data
 /// and delete plans. The caller supplies catalog-owned metadata and a table
 /// schema valid at the requested snapshot.
@@ -67,7 +80,7 @@ pub fn lookupSnapshotRow(
     for (keys, conditions) |name, *condition| {
         const value = key.object.get(name) orelse return error.InvalidLakeKey;
         if (value == .null) return error.InvalidLakeKey;
-        condition.* = .{ .column = name, .op = .eq, .value = value };
+        condition.* = .{ .column = name, .op = .eq, .value = try walKeyOperand(scratch, try table.column(name), value) };
     }
     const cursor = try openSnapshot(a, table, snapshot_id, metadata, .{ .fields = fields, .conditions = conditions, .limit = 2 }, context, options);
     defer cursor.close(cursor.ptr);
@@ -104,6 +117,14 @@ pub fn lookupSnapshotRows(
         try lookupTypedRows(a, table, snapshot_id, metadata, keys, requested, keys_only, context, options);
 }
 
+fn freeLookupRows(a: std.mem.Allocator, rows: []?std.json.Value) void {
+    const deinit = @import("antfly_local_sources").api_json_helpers.deinitJsonValue;
+    for (rows) |*row| {
+        if (row.*) |*image| deinit(a, image);
+    }
+    a.free(rows);
+}
+
 fn lookupDynamicRows(
     a: std.mem.Allocator,
     table: catalog.Table,
@@ -118,10 +139,7 @@ fn lookupDynamicRows(
     const sources = @import("antfly_local_sources");
     const Datum = sources.sql_scalar.Datum;
     const dynamic = sources.sql_dynamic_filter;
-    const result = try a.alloc(?std.json.Value, requested.len);
-    @memset(result, null);
-    if (requested.len == 0) return result;
-
+    if (requested.len == 0) return try a.alloc(?std.json.Value, 0);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -162,6 +180,10 @@ fn lookupDynamicRows(
     defer cursor.close(cursor.ptr);
     const apply = cursor.set_dynamic_filter orelse return null;
     if (!try apply(cursor.ptr, filter)) return null;
+    const result = try a.alloc(?std.json.Value, requested.len);
+    @memset(result, null);
+    var complete = false;
+    defer if (!complete) freeLookupRows(a, result);
     const json = @import("../metadata/changefeed_json.zig");
     var retained_bytes: u64 = 0;
     while (true) {
@@ -178,6 +200,7 @@ fn lookupDynamicRows(
         }
         if (page.after == null) break;
     }
+    complete = true;
     return result;
 }
 
@@ -213,14 +236,14 @@ fn lookupTypedRows(
         for (columns, entry.*, 0..) |column, *datum, col| {
             const raw = item.row.object.get(column.name) orelse return error.InvalidLakeKey;
             if (raw == .null) return error.InvalidLakeKey;
-            const value = try values.conditionValue(scratch, raw, column);
+            const value = try values.conditionValue(scratch, try walKeyOperand(scratch, column, raw), column);
             datum.* = try values.comparisonDatum(scratch, scalar.Datum.fromJson(value), column);
             const lower = &ranges[col * 2];
             const upper = &ranges[col * 2 + 1];
             if (index == 0 or try scalar.compareDatums(datum.*, lower.operand.?) == .lt)
-                lower.* = .{ .column = column.name, .op = .gte, .value = raw, .operand = datum.* };
+                lower.* = .{ .column = column.name, .op = .gte, .value = value, .operand = datum.* };
             if (index == 0 or try scalar.compareDatums(datum.*, upper.operand.?) == .gt)
-                upper.* = .{ .column = column.name, .op = .lte, .value = raw, .operand = datum.* };
+                upper.* = .{ .column = column.name, .op = .lte, .value = value, .operand = datum.* };
         }
         const hash = (try hashKey(entry.*)) orelse return error.InvalidLakeKey;
         const bucket = try heads.getOrPut(hash);
@@ -229,6 +252,7 @@ fn lookupTypedRows(
     }
     const result = try a.alloc(?std.json.Value, requested.len);
     @memset(result, null);
+    errdefer freeLookupRows(a, result);
     if (requested.len == 0) return result;
     const fields = if (keys_only) keys else all: {
         const names = try scratch.alloc([]const u8, table.columns.len);
@@ -255,19 +279,15 @@ fn lookupTypedRows(
             }
             const hash = (try hashKey(tuple)) orelse continue;
             var candidate = heads.get(hash);
-            var image: ?std.json.Value = null;
             while (candidate) |index| : (candidate = links[index]) {
                 for (tuple, entries[index]) |left, right| {
                     if (try scalar.compareDatums(left, right) != .eq) break;
                 } else {
                     if (result[index] != null) return error.InvalidLakeKey;
-                    if (image == null) {
-                        retained_bytes +|= try json.size(row.value);
-                        if (retained_bytes > @import("../metadata/changefeed_delivery.zig").max_page_bytes)
-                            return error.IcebergChangefeedImageBudgetExceeded;
-                        image = try sources.api_json_helpers.cloneJsonValue(a, row.value);
-                    }
-                    result[index] = image;
+                    retained_bytes +|= try json.size(row.value);
+                    if (retained_bytes > @import("../metadata/changefeed_delivery.zig").max_page_bytes)
+                        return error.IcebergChangefeedImageBudgetExceeded;
+                    result[index] = try sources.api_json_helpers.cloneJsonValue(a, row.value);
                 }
             }
         }

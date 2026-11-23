@@ -1407,6 +1407,17 @@ pub const RaftApplyStore = struct {
         return self.catalogProjection([]u8, a, group_id, .{ .source_control = .{ .table_id = table_id, .source_id = source_id } });
     }
 
+    pub fn sourceCheckpointActors(self: *RaftApplyStore, group_id: u64, owner_group: u64, after: ?@import("../metadata/source_legacy_intake.zig").CheckpointActor) !@import("../metadata/source_legacy_intake.zig").CheckpointPage {
+        const index = @import("../metadata/source_legacy_intake.zig");
+        const actors = try self.catalogProjection([]index.CheckpointActor, self.alloc, group_id, .{ .source_checkpoint_actors = .{ .owner_group = owner_group, .after = after } });
+        defer self.alloc.free(actors);
+        var page: index.CheckpointPage = .{};
+        if (actors.len > page.actors.len) return error.InvalidSourceControl;
+        @memcpy(page.actors[0..actors.len], actors);
+        page.len = actors.len;
+        return page;
+    }
+
     pub fn legacyReplicationSourceIntakeAllowed(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source.Digest) !bool {
         return self.catalogProjection(bool, a, group_id, .{ .legacy_source_intake = .{ .table_id = table_id, .ordinal = ordinal, .definition = definition } });
     }

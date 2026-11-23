@@ -41,6 +41,10 @@ pub const Pending = struct {
     plan_digest: control.Digest,
     artifact_plan_digest: control.Digest,
 };
+const PreparedInstall = struct {
+    owner: @FieldType(native_control.Intent, "owner"),
+    transfer: native_control.InstallCheckpoint,
+};
 pub const Snapshot = struct {
     cut: native.MetadataCut,
     spec: native.Spec,
@@ -51,11 +55,20 @@ pub const Snapshot = struct {
     pending: ?Pending = null,
     native_bootstrap_certified: bool = false,
     pending_fenceable: bool = false,
+    checkpoint_transfer: bool = false,
+    checkpoint_adopted: bool = false,
+    checkpoint_donor_close_ready: bool = false,
+    prepared_install: ?PreparedInstall = null,
     pub fn jsonStringify(self: Snapshot, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Snapshot).@"struct".field_names) |name| {
-            const boolean_flag = comptime std.mem.eql(u8, name, "native_bootstrap_certified") or std.mem.eql(u8, name, "pending_fenceable");
-            const include = if (comptime boolean_flag) @field(self, name) else true;
+            const boolean_flag = comptime std.mem.eql(u8, name, "native_bootstrap_certified") or std.mem.eql(u8, name, "pending_fenceable") or std.mem.eql(u8, name, "checkpoint_transfer") or std.mem.eql(u8, name, "checkpoint_adopted") or std.mem.eql(u8, name, "checkpoint_donor_close_ready");
+            const include = if (comptime boolean_flag)
+                @field(self, name)
+            else if (comptime std.mem.eql(u8, name, "prepared_install"))
+                self.prepared_install != null
+            else
+                true;
             if (include) {
                 try stream.objectField(name);
                 try stream.write(@field(self, name));
@@ -64,11 +77,26 @@ pub const Snapshot = struct {
         try stream.endObject();
     }
     pub fn authorize(self: Snapshot, intent: native_control.Intent) !native_control.Command {
-        try self.requireBinding(intent.spec);
+        try intent.validate();
+        if (intent.action != .install_checkpoint) try self.requireBinding(intent.spec);
         switch (intent.action) {
             .bind => try self.requireBind(),
             .close => try self.requireClose(),
+            .close_checkpoint => {
+                if (self.phase != .active or !self.checkpoint_donor_close_ready or !self.live_definition or
+                    !std.meta.eql(try native.Basis.fromOwner(intent.owner), self.spec.checkpoint_owner))
+                    return error.SourceBindingConflict;
+            },
             .drop => try self.requireDrop(),
+            .install_checkpoint => |install| {
+                const prepared = self.prepared_install orelse return error.SourceBindingConflict;
+                var qualified = prepared.owner;
+                qualified.topology_epoch = intent.owner.topology_epoch;
+                if (self.phase != .active or !self.live_definition or
+                    !std.meta.eql(self.spec, install.donor.spec) or
+                    !std.meta.eql(qualified, intent.owner) or !std.meta.eql(prepared.transfer, install))
+                    return error.SourceBindingConflict;
+            },
             .fence_attempt => |attempt| {
                 const expected = self.pending orelse return error.SourcePendingWork;
                 if (!self.pending_fenceable or !std.meta.eql(attempt.reference, expected.reference) or
@@ -77,7 +105,12 @@ pub const Snapshot = struct {
             },
         }
         const result: native_control.Command = .{
-            .version = if (intent.action == .fence_attempt) 3 else if (intent.action == .bind and self.native_bootstrap_certified) 2 else 1,
+            .version = switch (intent.action) {
+                .install_checkpoint, .close_checkpoint => 4,
+                .fence_attempt => if (self.checkpoint_transfer) 4 else 3,
+                .bind => if (self.checkpoint_adopted) 4 else if (self.native_bootstrap_certified) 2 else 1,
+                else => 1,
+            },
             .intent = intent,
             .metadata_cut = self.cut,
         };
@@ -92,7 +125,7 @@ pub const Snapshot = struct {
         if (!std.meta.eql(self.spec, expected)) return error.SourceBindingConflict;
     }
     pub fn requireBind(self: Snapshot) !void {
-        if (self.phase != .active or !self.live_definition) return error.SourceBindingConflict;
+        if (self.phase != .active or !self.live_definition or self.checkpoint_transfer) return error.SourceBindingConflict;
     }
     pub fn requireClose(self: Snapshot) !void {
         if (self.phase == .active) return error.SourceBindingConflict;
@@ -128,7 +161,13 @@ pub fn capture(a: A, query: Query, applied_index: u64, incarnation: [32]u8, deco
     const pending_fenceable = decoder_version >= control.retained_payload_protocol_version and
         state.pending != null and state.pending.?.retain_payload and
         state.artifact_control.?.current != null and state.artifact_control.?.current.?.phase == .sealed;
-    return .{ .cut = .{ .group_id = query.metadata_group_id, .incarnation = incarnation, .index = applied_index }, .spec = spec, .phase = if (state.retired) .retired else if (state.closing) .closing else .active, .actor_revision = state.revision, .live_definition = if (definition) |value| std.meta.eql(value, source.definition) else false, .checkpoint_table = try a.dupe(u8, authority.table_name), .pending = pending, .native_bootstrap_certified = state.native_bootstrap_checkpoint != null, .pending_fenceable = pending_fenceable };
+    const checkpoint_transfer = state.checkpoint_transfer_target != null;
+    if ((checkpoint_transfer or state.checkpoint_install_receipt != null) and decoder_version < control.checkpoint_authority.successor_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
+    const prepared_install: ?PreparedInstall = if (state.checkpoint_preparation) |prepared| blk: {
+        if (decoder_version < control.checkpoint_authority.successor_protocol_version) return error.TableTopologyProtocolUpgradeRequired;
+        break :blk .{ .owner = prepared.successor.owner, .transfer = prepared.transfer };
+    } else null;
+    return .{ .cut = .{ .group_id = query.metadata_group_id, .incarnation = incarnation, .index = applied_index }, .spec = spec, .phase = if (state.retired) .retired else if (state.closing) .closing else .active, .actor_revision = state.revision, .live_definition = if (definition) |value| std.meta.eql(value, source.definition) else false, .checkpoint_table = try a.dupe(u8, authority.table_name), .pending = pending, .native_bootstrap_certified = state.native_bootstrap_checkpoint != null, .pending_fenceable = pending_fenceable, .checkpoint_transfer = checkpoint_transfer, .checkpoint_adopted = state.checkpoint_install_receipt != null, .checkpoint_donor_close_ready = checkpoint_transfer and state.checkpointTransferDrained(), .prepared_install = prepared_install };
 }
 
 pub fn readOnService(svc: anytype, a: A, query: Query, request: anytype) !Snapshot {

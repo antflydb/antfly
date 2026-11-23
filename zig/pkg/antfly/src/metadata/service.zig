@@ -2953,6 +2953,10 @@ pub fn compareAndSetOnlineMerge(service: anytype, previous: @import("online_merg
     defer arena.deinit();
     const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s };
     const context = try onlineMergeContext(service, arena.allocator(), previous, request);
+    if (comptime @TypeOf(service) == *MetadataHttpService) {
+        if (previous.phase == .tail and next.phase == .freeze and
+            !try service.prepareOnlineMergeSourceCheckpoints(arena.allocator(), context.record, request)) return false;
+    }
     const proposal = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_set_online_merge = .{
         .expected = previous,
         .next = next,
@@ -12200,7 +12204,8 @@ pub const MetadataHttpService = struct {
 
     pub fn admitFreshNativeReplicationBootstrap(self: *MetadataHttpService, deadline_ns: ?u64) !void {
         try ensureCdcWorkPermit(self);
-        _ = try self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = deadline_ns }, @import("source_control.zig").scoped_snapshot_protocol_version);
+        if (self.cdc_payload_store == null) return error.SourcePayloadStorageUnavailable;
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(.{ .deadline_ns = deadline_ns }, @import("source_control.zig").retained_payload_protocol_version);
     }
 
     pub fn commitNativeReplicationSnapshotPage(
@@ -12362,6 +12367,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn beginLegacyReplicationHandover(self: *MetadataHttpService, a: std.mem.Allocator, tables: []const metadata_table_manager.TableRecord, index_allocator: std.mem.Allocator, producer_counts: *?@import("source_control.zig").ProducerCounts, table: metadata_table_manager.TableRecord, record: metadata_table_manager.ReplicationSourceStatusRecord, deadline_ns: ?u64) !bool {
+        // Keep the legacy writer eligible until its successor can retain a plan.
+        if (self.cdc_payload_store == null) return false;
         if (!try metadata_replication_backfill.legacyHandoverEligible(a, table, record, self.destination_authorizer)) return false;
         const control = @import("source_control.zig");
         const context: api_operation.RequestContext = .{ .deadline_ns = deadline_ns };
@@ -12369,7 +12376,7 @@ pub const MetadataHttpService = struct {
         if (producer_counts.* == null)
             producer_counts.* = try control.nativeProducerCounts(index_allocator, a, tables, context);
         if (producer_counts.*.?.get(table.name) != 1) return false;
-        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.scoped_stream_lifecycle_protocol_version);
+        _ = try self.ensureTableTopologyProtocolReadyWithContext(context, control.retained_payload_protocol_version);
         try self.advanceNativeReplicationActor(a, table, record, control.legacyHandoverCheckpoint(record).?, context);
         return true;
     }
@@ -12674,6 +12681,157 @@ pub const MetadataHttpService = struct {
         };
     }
 
+    fn prepareOnlineMergeSourceCheckpoints(self: *MetadataHttpService, a: std.mem.Allocator, merge: transition_state.MergeTransitionRecord, context: api_operation.RequestContext) !bool {
+        const control = @import("source_control.zig");
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var after: ?metadata_storage.raft_apply_store.RaftApplyStore.SourceCheckpointActor = null;
+        while (true) {
+            try context.ensureActive();
+            const page = try store.sourceCheckpointActors(self.metadata_group_id, merge.donor_group_id, after);
+            for (page.items()) |actor| {
+                var scratch = std.heap.ArenaAllocator.init(a);
+                defer scratch.deinit();
+                const temporary = scratch.allocator();
+                const raw = try store.getSourceControl(temporary, self.metadata_group_id, actor.table_id, actor.source_id);
+                const state = (try control.parse(temporary, raw)).value;
+                const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
+                if (authority.owner.group_id != merge.donor_group_id) return false;
+                if (state.checkpoint_transfer_target) |target| {
+                    if (target.owner.group_id != merge.receiver_group_id or state.checkpoint_transfer_merge_id != merge.transition_id) return error.SourceBindingConflict;
+                    if (state.checkpoint_preparation == null) return false;
+                    continue;
+                }
+                const binding = state.scope orelse return error.SourceBindingConflict;
+                const table = (try store.getTable(temporary, self.metadata_group_id, actor.table_id)) orelse return error.SourceBindingConflict;
+                const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+                var router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+                var hosted: @import("../api/hosted_completion.zig").Hosted = .{
+                    .catalog = catalog,
+                    .router = router.router(),
+                    .executor = self.raft.host.http_host.request_executor,
+                    .secret = self.internal_service_secret,
+                    .issuer = self.internal_service_issuer,
+                    .provision_policy = true,
+                };
+                var routing = (try api_table_catalog.authoritativeTableRoutingSnapshot(temporary, catalog, authority.table_name, context.deadline_ns)) orelse return error.TopologyChanged;
+                defer routing.deinit(temporary);
+                const receiver = for (routing.ranges) |range| {
+                    if (range.group_id == merge.receiver_group_id) break range;
+                } else return error.TopologyChanged;
+                const route = routing.resolveRouteForKey(receiver.start_key) orelse return error.TopologyChanged;
+                const current = (try hosted.coordinator().owners.read(
+                    temporary,
+                    routing.fenceForRoute(route),
+                    authority.table_name,
+                    .{ .version = 1, .expected_table_binding = authority.owner.table_binding },
+                    context,
+                )).owner;
+                var target = authority;
+                target.owner = current;
+                try control.mutateOnService(self, temporary, .{
+                    .table_id = actor.table_id,
+                    .source_id = actor.source_id,
+                    .expected_revision = state.revision,
+                    .expected_binding = binding.identity(),
+                    .expected_catalog_digest = control.digest(table.replication_sources_json),
+                    .mutation = .{ .begin_checkpoint_transfer = .{ .target = target, .online_merge_id = merge.transition_id } },
+                }, context);
+                return false;
+            }
+            if (page.len < page.actors.len) return true;
+            after = page.items()[page.len - 1];
+        }
+    }
+
+    fn advanceCheckpointOwnership(self: *MetadataHttpService, a: std.mem.Allocator, state: @import("source_control.zig").State, catalog_digest: [32]u8, catalog: api_table_catalog.CatalogSource, admission: @import("../api/source_destination_admission.zig").Admission, context: api_operation.RequestContext) !void {
+        const control = @import("source_control.zig");
+        const native = @import("antfly_local_sources").storage_source_scope_control;
+        const scope = state.scope orelse return error.SourceBindingConflict;
+        const donor = state.checkpoint_authority orelse return error.SourceBindingConflict;
+        const target = state.checkpoint_transfer_target orelse return error.SourceBindingConflict;
+        if (!state.checkpointTransferDrained()) return error.SourcePendingWork;
+        var snapshot = try @import("source_scope_capture.zig").readOnService(self, a, .{
+            .metadata_group_id = donor.owner.metadata_group_id,
+            .metadata_incarnation = donor.owner.metadata_incarnation,
+            .actor_table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .minimum_applied_index = 1,
+        }, context);
+        defer snapshot.deinit(a);
+        if (snapshot.actor_revision != state.revision) return error.SourcePendingWork;
+
+        const authority = if (state.checkpoint_preparation == null) donor else target;
+        var routing = (try api_table_catalog.authoritativeTableRoutingSnapshot(a, catalog, authority.table_name, context.deadline_ns)) orelse return error.TopologyChanged;
+        defer routing.deinit(a);
+        if (state.checkpoint_preparation != null) {
+            // Preparation hands publication back to the merge driver. The
+            // source worker resumes after the donor route disappears.
+            for (routing.ranges) |range| {
+                if (range.group_id == donor.owner.group_id) return;
+            }
+        }
+        const owner_range = for (routing.ranges) |range| {
+            if (range.group_id == authority.owner.group_id) break range;
+        } else return error.TopologyChanged;
+        const route = routing.resolveRouteForKey(owner_range.start_key) orelse return error.TopologyChanged;
+        const fence = routing.fenceForRoute(route);
+        const owner = (admission.coordinator.owners.read(a, fence, authority.table_name, .{
+            .version = 1,
+            .expected_table_binding = authority.owner.table_binding,
+        }, context) catch |err| {
+            std.log.debug("source checkpoint owner observation failed table={s} group={d} installing={} err={s}", .{ authority.table_name, authority.owner.group_id, state.checkpoint_preparation != null, @errorName(err) });
+            return err;
+        }).owner;
+        try authority.requireOwner(owner);
+        var intent: native.Intent = .{
+            .version = 1,
+            .owner = owner,
+            .spec = snapshot.spec,
+            .minimum_metadata_index = snapshot.cut.index,
+            .action = .close_checkpoint,
+        };
+        const mutation: control.Mutation = if (state.checkpoint_preparation) |prepared| adopt: {
+            var successor = target;
+            successor.owner = owner;
+            if (!target.samePhysicalAuthority(successor)) return error.TopologyChanged;
+            intent.spec.checkpoint_owner = try native.scope.Basis.fromOwner(owner);
+            intent.action = .{ .install_checkpoint = prepared.transfer };
+            const receipt = admission.installCheckpoint(a, fence, target.table_name, intent, context) catch |err| {
+                std.log.debug("source checkpoint install failed table={s} group={d} err={s}", .{ target.table_name, owner.group_id, @errorName(err) });
+                return err;
+            };
+            const adoption: control.checkpoint_authority.Adoption = .{
+                .previous = donor.digest(),
+                .successor = successor,
+                .transfer = prepared.transfer,
+                .installed = receipt,
+            };
+            try adoption.requireTransfer(a, donor);
+            break :adopt .{ .adopt_checkpoint_successor = adoption };
+        } else prepare: {
+            try admission.requireScope(a, fence, donor.table_name, intent, context);
+            const reads = admission.scope_reads orelse return error.ChangefeedCapabilityUnsupported;
+            const query: native.Query = .{
+                .version = 1,
+                .owner = owner,
+                .domain = intent.spec.domain(),
+                .minimum_applied_index = 1,
+                .checkpoint_evidence = .donor,
+            };
+            const observed = try reads.read(a, fence, donor.table_name, query, context);
+            try observed.validate(query);
+            break :prepare .{ .prepare_checkpoint_successor = .{ .successor = target, .transfer = observed.checkpoint_donor.? } };
+        };
+        try control.mutateOnService(self, a, .{
+            .table_id = scope.table_id,
+            .source_id = scope.source_id,
+            .expected_revision = state.revision,
+            .expected_binding = scope.identity(),
+            .expected_catalog_digest = catalog_digest,
+            .mutation = mutation,
+        }, context);
+    }
+
     fn advanceScopedReplicationSource(self: *MetadataHttpService, a: std.mem.Allocator, runner: *metadata_replication_backfill.StreamingReplicationRunner, table: metadata_table_manager.TableRecord, ordinal: u32, state: @import("source_control.zig").State, catalog: api_table_catalog.CatalogSource, hosted: *@import("../api/hosted_completion.zig").Hosted, context: api_operation.RequestContext) !void {
         const control = @import("source_control.zig");
         const scope = state.scope orelse return error.SourceBindingConflict;
@@ -12683,7 +12841,7 @@ pub const MetadataHttpService = struct {
         if (state.artifact_control.?.current) |record| {
             try ensureCdcWorkPermit(self);
             try @import("../api/source_destination_completion.zig").recover(self, admission, a, state, control.digest(table.replication_sources_json), context);
-            if (record.phase != .reserved or state.closing) return;
+            if (record.phase != .reserved or state.closing or state.checkpoint_transfer_target != null) return;
             const after = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
             defer a.free(after);
             var latest = try control.parse(a, after);
@@ -12696,6 +12854,10 @@ pub const MetadataHttpService = struct {
         if (state.closing) {
             try self.retireNativeReplicationSourceRoots(a, catalog, admission, table, state, context);
             return;
+        }
+        if (state.checkpoint_transfer_target != null) {
+            try ensureCdcWorkPermit(self);
+            return self.advanceCheckpointOwnership(a, state, control.digest(table.replication_sources_json), catalog, admission, context);
         }
         const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, scope.table_id, ordinal)) orelse return;
         defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
@@ -12731,7 +12893,10 @@ pub const MetadataHttpService = struct {
         } else null;
         defer if (snapshot) |*captured| captured.deinit(a);
         if (state.stream_failure) |failure| if (failure.terminal) return;
-        try runner.stageScopedStream(self, admission, table, source_status, state, snapshot, context);
+        runner.stageScopedStream(self, admission, table, source_status, state, snapshot, context) catch |err| {
+            std.log.debug("source stream stage failed table={s} replacement={} err={s}", .{ table.name, state.pending_no_admission_receipt != null, @errorName(err) });
+            return err;
+        };
         if (state.stream_failure != null) {
             const latest_raw = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
             defer a.free(latest_raw);
@@ -14001,12 +14166,20 @@ pub const MetadataHttpService = struct {
         return try self.raft.observeMergeTransition(transition_id);
     }
 
+    fn requireOrdinaryMergeSafe(ptr: *anyopaque, record: transition_state.MergeTransitionRecord) !void {
+        const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        if ((try store.sourceCheckpointActors(self.metadata_group_id, record.donor_group_id, null)).len != 0)
+            return error.SourcePendingWork;
+    }
+
     fn stepTransitions(self: *MetadataHttpService) !raft_transition_service.TransitionStepResult {
         self.transition_mutex.lockUncancelable(std.Options.debug_io);
         defer self.transition_mutex.unlock(std.Options.debug_io);
-        if (self.online_merge_runtime) |runtime| if (self.raft.transition_svc) |*transitions| {
-            transitions.online_driver = runtime.driver;
-        };
+        if (self.raft.transition_svc) |*transitions| {
+            if (self.online_merge_runtime) |runtime| transitions.online_driver = runtime.driver;
+            transitions.ordinary_merge_guard = .{ .ptr = self, .require = requireOrdinaryMergeSafe };
+        }
         defer self.publishTransitionMetricsLocked();
         return try self.raft.stepTransitions();
     }

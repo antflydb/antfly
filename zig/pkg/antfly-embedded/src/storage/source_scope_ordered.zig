@@ -100,12 +100,26 @@ pub fn fingerprint(a: A, command: control.Command) !scope.Digest {
 }
 fn validateApplied(command: control.Command, entry: scope.Cut, observed: control.Observation) !void {
     try observed.validate(.{ .version = 1, .owner = command.intent.owner, .domain = command.intent.spec.domain(), .minimum_applied_index = entry.index });
-    if (!std.meta.eql(observed.cut, entry) or !observed.header.strict or observed.header.metadata_floor < command.metadata_cut.index) return error.SourceAdmissionCorrupt;
+    if (!std.meta.eql(observed.cut, entry) or !observed.header.strict or (command.intent.action != .install_checkpoint and observed.header.metadata_floor < command.metadata_cut.index)) return error.SourceAdmissionCorrupt;
     if (observed.record) |record| {
         if (!std.meta.eql(record.spec, command.intent.spec)) return error.SourceAdmissionCorrupt;
     }
+    if ((command.intent.action == .install_checkpoint) != (observed.checkpoint_install != null)) return error.SourceAdmissionCorrupt;
     switch (command.intent.action) {
         .bind => if (observed.record == null or observed.record.?.phase != .active) return error.SourceAdmissionCorrupt,
+        .install_checkpoint => |install| {
+            const record = observed.record orelse return error.SourceAdmissionCorrupt;
+            const receipt = observed.checkpoint_install.?;
+            if (!std.meta.eql(receipt.donor, install.donor.spec.checkpoint_owner) or
+                receipt.authorization.index <= install.donor.close_metadata_index or
+                receipt.authorization.index > command.metadata_cut.index or
+                record.bound_metadata_index != receipt.authorization.index or
+                record.last_committed_sequence < install.donor.last_committed_sequence or
+                record.last_committed_token < install.donor.last_committed_token or
+                record.closed_through_token < install.donor.closed_through_token)
+                return error.SourceAdmissionCorrupt;
+        },
+        .close_checkpoint => if (observed.record == null or observed.record.?.phase == .active) return error.SourceAdmissionCorrupt,
         .close => if (observed.record != null and observed.record.?.phase == .active) return error.SourceAdmissionCorrupt,
         .drop => if (observed.record != null) return error.SourceAdmissionCorrupt,
         .fence_attempt => |attempt| {
@@ -271,4 +285,63 @@ test "ordered scope boundary codecs reject wrong applied identity and malformed 
     const invalid = try std.json.Stringify.valueAlloc(a, future, .{});
     defer a.free(invalid);
     try std.testing.expectError(error.InvalidSourceAdmission, decodeRecovery(a, invalid));
+}
+
+test "ordered checkpoint install preserves the original native receipt across requalification" {
+    const a = std.testing.allocator;
+    const Gate = struct {
+        pub fn requireLegacyDrained(_: @This(), _: anytype, _: scope.Basis) !void {}
+    };
+    const gate: Gate = .{};
+    var donor: TestTxn = .{};
+    defer donor.deinit();
+    var command = fixture();
+    command.version = 4;
+    command.intent.action = .close_checkpoint;
+    command.metadata_cut.index += 1;
+    const closed = try control.apply(a, &donor, gate, command, .{ .term = 1, .index = 21 });
+    try std.testing.expectEqual(@as(u64, 0), closed.record.?.bound_metadata_index);
+    const captured = try control.observe(a, &donor, .{
+        .version = 1,
+        .owner = command.intent.owner,
+        .domain = command.intent.spec.domain(),
+        .minimum_applied_index = 21,
+        .checkpoint_evidence = .donor,
+    }, closed.cut);
+
+    var successor: TestTxn = .{};
+    defer successor.deinit();
+    command.version = 4;
+    command.intent.owner.group_id += 1;
+    command.intent.owner.namespace = @splat(2);
+    command.intent.spec.checkpoint_owner = try scope.Basis.fromOwner(command.intent.owner);
+    command.metadata_cut.index += 1;
+    command.intent.action = .{ .install_checkpoint = captured.checkpoint_donor.? };
+    const bytes = try control.encodeCommand(a, command);
+    defer a.free(bytes);
+    command = try control.decodeCommand(a, bytes);
+
+    const entry: scope.Cut = .{ .term = 2, .index = 30 };
+    const first = try control.apply(a, &successor, gate, command, entry);
+    try stage(a, &successor, command, entry, .{ .applied = first });
+    try std.testing.expectEqualDeep(first, (try replay(a, &successor, command, entry)).applied);
+    command.metadata_cut.index += 1;
+    const retry_entry: scope.Cut = .{ .term = 3, .index = 31 };
+    const retry = try control.apply(a, &successor, gate, command, retry_entry);
+    try stage(a, &successor, command, retry_entry, .{ .applied = retry });
+    const receipt = (try scope.Store.readCheckpointInstall(a, &successor, first.domain)).?;
+    try std.testing.expectEqual(receipt, first.checkpoint_install.?);
+    try std.testing.expectEqual(receipt, retry.checkpoint_install.?);
+    const recovered = try control.observe(a, &successor, .{
+        .version = 1,
+        .owner = command.intent.owner,
+        .domain = command.intent.spec.domain(),
+        .minimum_applied_index = retry_entry.index,
+        .checkpoint_evidence = .successor,
+    }, retry_entry);
+    try std.testing.expectEqual(receipt, recovered.checkpoint_install.?);
+    try std.testing.expectEqual(entry, receipt.applied);
+    var forged = retry;
+    forged.checkpoint_install.?.applied = .{ .term = retry_entry.term, .index = retry_entry.index + 1 };
+    try std.testing.expectError(error.SourceAdmissionCorrupt, stage(a, &successor, command, retry_entry, .{ .applied = forged }));
 }

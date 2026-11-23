@@ -165,7 +165,7 @@ pub const Transfer = struct {
     }
 };
 
-test "source plan HTTP delivery resumes lost replies from retained bytes and gates reclamation" {
+test "completion frozen plan HTTP delivery resumes lost replies from retained bytes and gates reclamation" {
     const a = std.testing.allocator;
     const Fake = struct {
         txn: storage.test_support.Txn = .{},
@@ -202,11 +202,37 @@ test "source plan HTTP delivery resumes lost replies from retained bytes and gat
             return .{ .observation = try observe(ptr, alloc, fence, table, .{ .version = 1, .source_owner = request.source_owner, .query = request.request.query }, context), .bytes = try storage.readSealedChunkAlloc(alloc, &self.txn, request.request.query.root, request.request.query.spec.?, request.request.seal, request.request.ordinal) };
         }
     };
-    for ([_]@FieldType(wire.native.Command, "action"){ .begin, .chunk, .seal }) |lost| {
+    const Action = @FieldType(wire.native.Command, "action");
+    const Interruption = struct { lost: Action, move_owner: bool };
+    for ([_]Interruption{
+        .{ .lost = .begin, .move_owner = false },
+        .{ .lost = .chunk, .move_owner = false },
+        .{ .lost = .seal, .move_owner = false },
+        .{ .lost = .begin, .move_owner = true },
+        .{ .lost = .chunk, .move_owner = true },
+        .{ .lost = .seal, .move_owner = true },
+    }) |interruption| {
+        const lost = interruption.lost;
         var fixture = try wire.test_support.Fixture.init();
+        const frame = try a.alloc(u8, storage.chunk_bytes + 128);
+        defer a.free(frame);
+        @memset(frame, 255);
+        @memcpy(frame[0..fixture.frame.len], &fixture.frame);
+        const plan_digest = try storage.frozenDigest(frame);
+        @memcpy(frame[32..64], &plan_digest);
+        var checksum: storage.Digest = undefined;
+        std.crypto.hash.sha2.Sha256.hash(frame, &checksum, .{});
+        const chunk_digests = [_]storage.Digest{
+            storage.chunkDigest(0, frame[0..storage.chunk_bytes]),
+            storage.chunkDigest(1, frame[storage.chunk_bytes..]),
+        };
         var fake: Fake = .{ .lose = lost };
         defer fake.txn.deinit();
-        const spec = try fixture.spec();
+        var spec = try fixture.spec();
+        spec.bytes = frame.len;
+        spec.checksum = checksum;
+        spec.plan_digest = plan_digest;
+        spec.chunk_hashes = &chunk_digests;
         const transfer: Transfer = .{ .owner = fixture.source_owner, .fence = .{ .metadata_group_id = 1, .metadata_incarnation = fixture.source_owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } }, .table = "docs", .spec = spec, .controls = .{ .ptr = &fake, .execute_fn = Fake.execute }, .observations = .{ .ptr = &fake, .read_fn = Fake.observe }, .chunks = .{ .ptr = &fake, .read_fn = Fake.read } };
         var record: ledger.Record = .{ .reservation = @splat(4), .spec = .{ .namespace = spec.namespace, .binding = spec.binding, .domain = spec.domain, .attempt = spec.attempt, .bytes = spec.bytes, .checksum = spec.checksum, .plan_digest = spec.plan_digest } };
         try std.testing.expectError(error.SourceControlConflict, transfer.reclaim(a, record, .{}));
@@ -216,37 +242,64 @@ test "source plan HTTP delivery resumes lost replies from retained bytes and gat
         try std.testing.expectError(error.InvalidSourceControl, transfer.reclaim(a, invalid, .{}));
         var expired = transfer;
         expired.fence.admission_deadline_ns = 0;
-        try std.testing.expectError(error.DeadlineExceeded, expired.seal(a, record, &fixture.frame, .{}));
+        try std.testing.expectError(error.DeadlineExceeded, expired.seal(a, record, frame, .{}));
         try std.testing.expectEqual(@as(usize, 0), fake.calls);
-        try std.testing.expectError(error.SourceOutcomeUnresolved, transfer.seal(a, record, &fixture.frame, .{}));
+        try std.testing.expectError(error.SourceOutcomeUnresolved, transfer.seal(a, record, frame, .{}));
         try std.testing.expectEqual(@as(usize, switch (lost) {
             .begin => 1,
             .chunk => 2,
-            .seal => 3,
+            .seal => 4,
             else => unreachable,
         }), fake.calls);
+        if (interruption.move_owner) {
+            var garbage = record;
+            garbage.phase = .garbage;
+            garbage.retirement = @splat(8);
+            var cleanup = transfer;
+            cleanup.fence.topology_epoch = 2;
+            fake.lose = .fence;
+            try std.testing.expectError(error.SourceOutcomeUnresolved, cleanup.reclaim(a, garbage, .{}));
+            try std.testing.expectError(error.SourceReceiptExpired, transfer.seal(a, record, frame, .{}));
+            fake.lose = .reclaim;
+            try std.testing.expectError(error.SourceOutcomeUnresolved, cleanup.reclaim(a, garbage, .{}));
+            const proof = (try cleanup.reclaim(a, garbage, .{})).?;
+            try std.testing.expectEqual(proof, (try cleanup.reclaim(a, garbage, .{})).?);
+            const quota = try storage.readQuota(&fake.txn, try wire.entry.rootFor(transfer.owner));
+            try std.testing.expectEqual(@as(u16, 0), quota.active);
+            try std.testing.expectEqual(@as(u64, 0), quota.reserved);
+            continue;
+        }
         const before_recovery = fake.calls;
         const recovered_seal = try transfer.recoverSeal(a, record, .{});
         try std.testing.expectEqual(before_recovery, fake.calls);
         try std.testing.expectEqual(lost == .seal, recovered_seal != null);
-        const stamp = try transfer.seal(a, record, &fixture.frame, .{});
-        try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        const stamp = try transfer.seal(a, record, frame, .{});
+        try std.testing.expectEqual(@as(usize, 4), fake.calls);
         try std.testing.expectEqual(stamp, (try transfer.recoverSeal(a, record, .{})).?);
-        try std.testing.expectEqual(@as(usize, 3), fake.calls);
-        try std.testing.expectEqual(stamp, try transfer.seal(a, record, &fixture.frame, .{}));
-        try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        try std.testing.expectEqual(@as(usize, 4), fake.calls);
+        try std.testing.expectEqual(stamp, try transfer.seal(a, record, frame, .{}));
+        try std.testing.expectEqual(@as(usize, 4), fake.calls);
         record.phase = .sealed;
         record.stamp = stamp;
         const owned = try transfer.load(a, record, .{});
         defer a.free(owned);
-        try std.testing.expectEqualSlices(u8, &fixture.frame, owned);
+        try std.testing.expectEqualSlices(u8, frame, owned);
         var wrong = record;
         wrong.spec.checksum[0] ^= 1;
         try std.testing.expectError(error.SourcePayloadConflict, transfer.load(a, wrong, .{}));
         try std.testing.expectError(error.SourceControlConflict, transfer.reclaim(a, record, .{}));
         record.phase = .garbage;
         record.retirement = @splat(8);
-        try std.testing.expect((try transfer.reclaim(a, record, .{})) != null);
-        try std.testing.expectEqualSlices(u8, &fixture.frame, owned);
+        var cleanup = transfer;
+        cleanup.fence.topology_epoch = 2;
+        try std.testing.expect((try cleanup.reclaim(a, record, .{})) != null);
+        const quota = try storage.readQuota(&fake.txn, try wire.entry.rootFor(transfer.owner));
+        try std.testing.expectEqual(@as(u16, 0), quota.active);
+        try std.testing.expectEqual(@as(u64, 0), quota.reserved);
+        record.phase = .reserved;
+        record.stamp = null;
+        record.retirement = null;
+        try std.testing.expectError(error.SourceReceiptExpired, transfer.seal(a, record, frame, .{}));
+        try std.testing.expectEqualSlices(u8, frame, owned);
     }
 }

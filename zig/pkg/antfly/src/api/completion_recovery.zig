@@ -108,6 +108,37 @@ pub const Recovery = struct {
         try self.participants.acknowledgeRetainedCoordinator(a, job.owner, fence, job.coordinator_locator, job.transaction_id, context);
     }
 
+    /// The source caller holds the durable metadata commit and the exact
+    /// native checkpoint receipt. Release the coordinator's retention lease
+    /// before removing the manifest that proves which transaction owns it.
+    pub fn releaseSource(self: Recovery, a: A, owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, expected: SourceExpectation, original: Context) !void {
+        try expected.validate();
+        var scope = try publication_ops.Scope.init(fence, original);
+        const context = scope.context();
+        try self.checkpoint(context);
+        const query: decision_ops.Request = .{ .version = 1, .owner = owner, .transaction_id = transaction_id, .minimum_applied_index = 1 };
+        var observed = try self.decisions.read(a, fence, table, query, context);
+        defer observed.deinit();
+        try observed.value.validate(query.binding());
+        const decision = observed.value.decision orelse return;
+        if (!std.mem.eql(u8, &decision.admission.digest, &expected.admission_digest) or
+            decision.record.begin_timestamp != expected.begin_timestamp or
+            !std.meta.eql(decision.record.source_scope, @as(?local.storage_source_scope.Reference, expected.scope)) or
+            !std.meta.eql(decision.record.source_purpose, @as(?[32]u8, expected.purpose)))
+            return error.SourceTransactionIdentityConflict;
+        if (decision.record.status != .committed or decision.record.commit_version != expected.commit_version)
+            return error.SourceOutcomeUnresolved;
+        // acknowledgments_pending deliberately excludes the coordinator's
+        // retained lease once every follower is resolved. Release that lease
+        // explicitly. The native acknowledgment is idempotent.
+        if (!decision.record.retain_terminal) return;
+        const member = try decision.admission.admission.coordinatorMember();
+        var routed = owner;
+        routed.topology_epoch = fence.topology_epoch;
+        try self.checkpoint(context);
+        try self.participants.acknowledgeRetainedCoordinator(a, routed, fence, member.locator, transaction_id, context);
+    }
+
     fn runBound(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, job: ?local.storage_history_recovery_wire.Request, source_expected: ?SourceExpectation, original: Context) !Outcome {
         var scope = try publication_ops.Scope.init(coordinator_fence, original);
         const context = scope.context();
@@ -265,7 +296,7 @@ fn routeRetainedOwnerAtEpoch(session: *catalog_api.RoutingSession, owner: comple
     const snapshot = session.snapshot.value;
     if (snapshot.metadata_group_id != owner.metadata_group_id or snapshot.metadata_incarnation == null or !std.mem.eql(u8, &snapshot.metadata_incarnation.?, &owner.metadata_incarnation)) return error.TopologyChanged;
     const view = try session.tableRoutingView(locator.table_name, budget);
-    if (view.table_id != std.mem.readInt(u64, owner.namespace[0..8], .big) or (if (cleanup) view.topology_epoch < owner.topology_epoch else view.topology_epoch != owner.topology_epoch)) return error.TopologyChanged;
+    if (view.table_id != std.mem.readInt(u64, owner.namespace[0..8], .big) or (!cleanup and view.topology_epoch != owner.topology_epoch)) return error.TopologyChanged;
     const table = snapshot.tables[session.table_id_indexes.get(view.table_id) orelse return error.TopologyChanged];
     if (table.storage.engine != .local or table.routing_storage_binding == null) return error.ChangefeedCapabilityUnsupported;
     if (!std.mem.eql(u8, &@import("../metadata/changefeed_control.zig").tableBinding(table), &owner.table_binding)) return error.TopologyChanged;
@@ -854,6 +885,21 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(resolutions_before_bound, fake.resolves);
     try std.testing.expectEqual(publications_before_bound, fake.publishes);
     fake.state = committed_record;
+    fake.state.retain_terminal = true;
+    fake.state.acknowledgments_pending = true;
+    fake.expect_coordinator_release = true;
+    const before_source_release = fake.acknowledgments;
+    wrong_source = expected;
+    wrong_source.scope.token += 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, recovery.releaseSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, wrong_source, .{}));
+    try std.testing.expectEqual(before_source_release, fake.acknowledgments);
+    try recovery.releaseSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, expected, .{});
+    try std.testing.expectEqual(before_source_release + 1, fake.acknowledgments);
+    fake.state.acknowledgments_pending = false;
+    try recovery.releaseSource(a, owners[1], newer_source_fence, "docs", admission.transaction_id, expected, .{});
+    try std.testing.expectEqual(before_source_release + 2, fake.acknowledgments);
+    fake.expect_coordinator_release = false;
+    fake.state = committed_record;
     fake.resolved = .{ true, false };
     fake.published = .{ false, false };
     const destination = @import("source_destination_plan.zig");
@@ -887,8 +933,18 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     const sealed_actor = actor_state;
     actor_state = try (source_control.Mutation{ .accept = .{ .reservation_digest = reservation_id, .receipt = accepted_source.receipt } }).apply(actor_alloc, actor_state);
     const completing: @import("source_destination_completion.zig").Completion = .{ .recovery = recovery };
-    try std.testing.expectEqual(.complete, try completing.run(a, actor_state, accepted_source.receipt, source_fence, .{}));
-    try std.testing.expectEqual(@as(u64, 0), actor_state.committed.sequence);
+    const saved_actor = try source_control.encode(a, actor_state);
+    defer a.free(saved_actor);
+    var restarted_actor = try source_control.parse(a, saved_actor);
+    defer restarted_actor.deinit();
+    var after_split = source_fence;
+    after_split.topology_epoch -%= 1;
+    const original_begins = fake.begins;
+    const original_prepares = fake.prepares;
+    try std.testing.expectEqual(.complete, try completing.run(a, restarted_actor.value, restarted_actor.value.accepted.reference, after_split, .{}));
+    try std.testing.expectEqual(original_begins, fake.begins);
+    try std.testing.expectEqual(original_prepares, fake.prepares);
+    try std.testing.expectEqual(@as(u64, 0), restarted_actor.value.committed.sequence);
     try std.testing.expectEqual(resolutions_before_bound + 1, fake.resolves);
     try std.testing.expectEqual(publications_before_bound + 2, fake.publishes);
 
@@ -985,9 +1041,27 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     journal.lose_reply = true;
     const source_input: @import("../metadata/source_delivery.zig").Input = .{ .batch_id = "batch", .checkpoint = "lsn:1", .payload_digest = @splat(40), .accepted_at_ns = 50 };
     const effects: []const @import("distributed_txn.zig").TableCommitRequest = &.{.{ .table_name = "docs", .deletes = &.{"z"} }};
+    try std.testing.expectError(error.SourcePayloadStorageUnavailable, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), source_input, effects, null, .{}));
+    try std.testing.expect(journal.state.pending == null);
+    var spool_root = std.testing.tmpDir(.{});
+    defer spool_root.cleanup();
+    const spool_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cdc-reservation", .{spool_root.sub_path});
+    defer a.free(spool_path);
+    var spool = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, spool_path);
+    defer spool.deinit();
+    const initialized_spool = try spool.spoolArtifactStore(.none);
+    var shared_spool = try spool.sharedSpoolArtifactStore(initialized_spool.namespace_identity.?, .none);
+    reclaim_admission.retained_payload_store = shared_spool;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), source_input, effects, null, .{}));
     try std.testing.expectEqual(@as(usize, 0), artifact_probe.begins);
     const original = journal.state.pending.?;
+    try std.testing.expect(original.retain_payload);
+    var saved_manifest = try @import("source_destination_plan.zig").parse(a, original.delivery_manifest, original.plan_digest);
+    defer saved_manifest.deinit();
+    const reference = saved_manifest.value.retained_payload orelse return error.TestUnexpectedResult;
+    const original_bytes = try reference.load(&shared_spool, a, .none);
+    defer a.free(original_bytes);
+    try std.testing.expectEqualSlices(u8, &saved_manifest.value.artifact.checksum, &source_control.digest(original_bytes));
     var retry = source_input;
     retry.accepted_at_ns = 99;
     try std.testing.expectError(error.SourceOutcomeUnresolved, source_completion.stage(&journal, reclaim_admission, a, actor_scope, @splat(32), retry, effects, null, .{}));

@@ -22,18 +22,22 @@ case interrupts all advertised owner Raft links while leaving processes alive.
 """
 
 import json
+import subprocess
 import threading
 import time
 from collections import deque
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote
 
 import pytest
 import requests
 import test_backup_restore as backups
+import test_cdc as cdc
 from helpers import PhaseTimings, wait_until
 
 three_by_three_backup_cluster = backups.three_by_three_backup_cluster
+pg_cdc_source = cdc.pg_cdc_source
 
 
 def wait_for_constraint_activation(cluster, session, table, *, timeout_s=90):
@@ -156,9 +160,20 @@ def parse_owner_control(body, path):
     if (
         isinstance(control, list)
         and len(control) == 2
-        and control[0] in ("row-semantics-batch-v1", "document-revisions-batch-v1")
+        and isinstance(control[0], str)
+        and isinstance(control[1], dict)
     ):
-        control = control[1]
+        tag, payload = control
+        if tag in (
+            "row-semantics-batch-v1",
+            "row-semantics-batch-v2",
+            "row-semantics-batch-v3",
+            "row-semantics-batch-v4",
+            "document-revisions-batch-v1",
+            "prepared-enrichments-batch-v1",
+            "exact-prepare-batch-v1",
+        ):
+            control = payload
     if not isinstance(control, dict):
         return {}
     control["_fault_path"] = path
@@ -674,10 +689,142 @@ def test_fault_proxy_tick_override_handles_cli_defaults(explicit):
         assert command[command.index(option) + 1] == "50"
 
 
+class CdcUploadFault(OwnerLinkFault):
+    def __init__(self, window):
+        super().__init__(window)
+        self.armed = False
+        self.original = None
+        self.merge_permitted = False
+        self.acceptance_upload = None
+        self.committed_transactions = {}
+        self.reclaimed = threading.Event()
+        self.replacement = None
+
+    @staticmethod
+    def wire_bytes(value):
+        return bytes(value) if isinstance(value, list) else value.encode()
+
+    @classmethod
+    def upload_token(cls, body):
+        attempt = cls.wire_bytes(body["command"]["spec"]["attempt"])
+        return int.from_bytes(attempt[:8], "big")
+
+    @staticmethod
+    def upload(body):
+        if not body.get("_fault_path", "").endswith("/source-plan/control-v1"):
+            return None
+        if body.get("operation") != "submit":
+            return None
+        return body["command"]
+
+    def block(self, index, body):
+        command = self.upload(body)
+        with self.lock:
+            if self.healed or not self.armed:
+                return False
+            if self.original is not None and not self.merge_permitted:
+                source = body.get("_online_source", {})
+                if isinstance(source, dict) and "admit" in source:
+                    return True
+            transaction = body.get("_transaction", {})
+            phase = transaction.get("phase")
+            path = body.get("_fault_path", "")
+            if self.window == "cdc_accepted":
+                if self.acceptance_upload is None:
+                    return False
+                if phase == "publish_completion_v1" and transaction[
+                    "txn_id"
+                ] in self.committed_transactions.get(
+                    self.upload_token(self.acceptance_upload), ()
+                ):
+                    # The original coordinator committed its native checkpoint
+                    # before any participant can publish this certificate.
+                    self.original = self.acceptance_upload
+                    self.reply_dropped.set()
+                    return True
+                return False
+            if self.original is None:
+                return False
+            donor = self.original["_fault_path"].rsplit("/source-plan/", 1)[0]
+            if path.startswith(donor + "/") and (
+                path.endswith("/txn-begin") or phase == "begin_source_scope_v1"
+            ):
+                return True
+            if command is None:
+                return False
+            if (
+                command["spec"]["attempt"]
+                != self.original["command"]["spec"]["attempt"]
+            ):
+                return False
+            return command["action"] in ("begin", "chunk", "seal")
+
+    def drop_reply(self, index, body):
+        command = self.upload(body)
+        with self.lock:
+            if (
+                not self.armed
+                or self.healed
+                or self.original is not None
+                or command is None
+                or not body.get("_upload_applied")
+            ):
+                return False
+            if command["action"] != self.window.removeprefix("cdc_"):
+                return False
+            if len(command["spec"]["chunk_hashes"]) < 2:
+                return False
+            if self.window == "cdc_chunk" and command["ordinal"] != 0:
+                return False
+            self.original = body
+            self.reply_dropped.set()
+            return True
+
+    def observe_response(self, index, body, response):
+        super().observe_response(index, body, response)
+        if response.status_code != 200:
+            return
+        if body.get("_fault_path", "").endswith("/history/decision-v1"):
+            decision = response.json().get("decision") or {}
+            record = decision.get("record") or {}
+            with self.lock:
+                if (
+                    self.armed
+                    and record.get("status") == "committed"
+                    and record.get("source_scope")
+                ):
+                    token = int(record["source_scope"]["token"])
+                    identity = self.wire_bytes(body["transaction_id"]).hex()
+                    self.committed_transactions.setdefault(token, set()).add(identity)
+        command = self.upload(body)
+        if command is None:
+            return
+        applied = (response.json().get("outcome") or {}).get("applied")
+        if applied is None:
+            return
+        body["_upload_applied"] = True
+        with self.lock:
+            if self.original is None:
+                if (
+                    self.armed
+                    and command["action"] == "begin"
+                    and len(command["spec"]["chunk_hashes"]) > 1
+                ):
+                    self.acceptance_upload = body
+                return
+            old = self.original["command"]["spec"]["attempt"]
+            if command["action"] == "reclaim" and command["spec"]["attempt"] == old:
+                if applied.get("reclamation") is not None:
+                    self.reclaimed.set()
+            if command["action"] == "begin" and command["spec"]["attempt"] != old:
+                self.replacement = body
+
+
 @pytest.fixture
 def owner_link_fault(request, monkeypatch):
-    fault = OwnerLinkFault(request.param)
-    proxy_raft = request.node.callspec.params["crash"] == "raft_quorum"
+    fault_type = CdcUploadFault if request.param.startswith("cdc_") else OwnerLinkFault
+    fault = fault_type(request.param)
+    proxy_raft = request.node.callspec.params.get("crash") == "raft_quorum"
     upstreams = [None] * 6
 
     def handler(index):
@@ -701,6 +848,11 @@ def owner_link_fault(request, monkeypatch):
                     # Test-only metadata: the original wire bytes below
                     # are forwarded unchanged to the actual owner.
                     control = parse_owner_control(body, self.path)
+                    if isinstance(fault, CdcUploadFault) and fault.upload(control):
+                        control["_replay_target"] = (
+                            index,
+                            self.headers.get("X-Antfly-Catalog-Route-Fence"),
+                        )
                 raft_blocked = index >= 3 and fault.raft_cut.is_set()
                 if index < 3:
                     fault.observe_request(control)
@@ -819,6 +971,285 @@ def owner_link_fault(request, monkeypatch):
 @pytest.fixture
 def faulted_merge_cluster(owner_link_fault, three_by_three_backup_cluster):
     return three_by_three_backup_cluster
+
+
+@pytest.fixture
+def cdc_merge_cluster(request, monkeypatch, tmp_path, owner_link_fault, pg_cdc_source):
+    original = backups.ThreeByThreeBackupCluster._write_config
+
+    def configure(cluster):
+        original(cluster)
+        directory = tmp_path / "replication-spool"
+        directory.mkdir()
+        namespace = subprocess.check_output(
+            [cluster.binary, "storage", "provision-pgwire-spool", str(directory)],
+            text=True,
+            timeout=10,
+        ).strip()
+        config = json.loads(cluster.config_path.read_text())
+        config["pgwire"] = {
+            "replication_spool": {"directory": str(directory), "namespace": namespace}
+        }
+        cluster.config_path.write_text(json.dumps(config))
+
+    monkeypatch.setattr(backups.ThreeByThreeBackupCluster, "_write_config", configure)
+    return request.getfixturevalue("three_by_three_backup_cluster")
+
+
+@pytest.mark.parametrize(
+    "owner_link_fault",
+    ["cdc_begin", "cdc_chunk", "cdc_seal", "cdc_accepted"],
+    indirect=True,
+)
+def test_native_cdc_upload_survives_checkpoint_owner_merge(
+    cdc_merge_cluster, pg_cdc_source, owner_link_fault
+):
+    cluster = cdc_merge_cluster
+    fault = owner_link_fault
+    table = f"cdc_merge_{time.time_ns()}"
+    provider = pg_cdc_source["table_name"]
+    source = {
+        "type": "postgres",
+        "dsn": cdc._pg_dsn(),
+        "postgres_table": provider,
+        "key_template": "id",
+        "slot_name": pg_cdc_source["slot_name"],
+        "publication_name": pg_cdc_source["publication_name"],
+        "require_exact_cutover": True,
+    }
+    with requests.Session() as session:
+        session.headers["Connection"] = "close"
+        backups._create_cluster_table_when_admitted(
+            cluster, session, table, {"num_shards": 3, "replication_sources": [source]}
+        )
+        table_id = cluster.table_ids[table]
+        assert wait_until(
+            lambda: cluster.fully_replicated_topology(table), timeout_s=90
+        ), cluster.debug_logs()
+
+        def snapshot():
+            leader = cluster.metadata_stable_leader_id(timeout_s=10)
+            return cluster.metadata_snapshot(leader - 1, request_timeout_s=3)
+
+        def checkpoint():
+            for status in snapshot().get("replication_source_statuses", []):
+                if int(status["table_id"]) == table_id:
+                    return status.get("accepted_stream_checkpoint")
+            return None
+
+        before = wait_until(checkpoint, timeout_s=120, interval_s=0.5)
+        assert before, cluster.debug_logs()
+
+        # The bootstrap's final cleanup must finish before the proxy arms.
+        def current_document(key):
+            for url in cluster.data_api_urls:
+                document = backups._lookup_doc_from_url(
+                    session, url, table, key, timeout_s=3
+                )
+                if document is not None:
+                    return document
+            return None
+
+        assert wait_until(lambda: current_document("user-1"), timeout_s=45), (
+            cluster.debug_logs()
+        )
+        with fault.lock:
+            fault.armed = True
+        cdc._run_psql(f"""
+            INSERT INTO {provider} (id, name, tier)
+            SELECT 'fault-' || i, repeat('x', 280000), 'gold'
+            FROM generate_series(1, 6) AS i
+        """)
+        assert fault.reply_dropped.wait(90), cluster.debug_logs()
+        owner = fault.original["source_owner"]
+        donor = int(owner["group_id"])
+        view = snapshot()
+        ranges = sorted(
+            (row for row in view["ranges"] if int(row["table_id"]) == table_id),
+            key=lambda row: row["start_key"],
+        )
+        donor_index = next(
+            i for i, row in enumerate(ranges) if int(row["group_id"]) == donor
+        )
+        receiver = int(
+            ranges[
+                donor_index + 1 if donor_index + 1 < len(ranges) else donor_index - 1
+            ]["group_id"]
+        )
+        physical = next(
+            row["name"] for row in view["tables"] if int(row["table_id"]) == table_id
+        )
+        next_route = cluster.metadata_stable_leader_id(timeout_s=30) - 1
+
+        def submit_merge(remaining):
+            nonlocal next_route
+            route = next_route % len(cluster.metadata_admin_urls)
+            next_route += 1
+            return session.post(
+                f"{cluster.metadata_admin_urls[route]}/internal/v1/tables/{quote(physical, safe='')}/merge",
+                headers=backups.internal_service_headers(),
+                json={
+                    "donor_group_id": donor,
+                    "receiver_group_id": receiver,
+                    "allow_doc_identity_reassignment": True,
+                },
+                timeout=min(20, remaining),
+            )
+
+        def observe_merge(remaining):
+            nonlocal next_route
+            route = next_route % len(cluster.metadata_admin_urls)
+            next_route += 1
+            observed = cluster.metadata_snapshot(
+                route, request_timeout_s=min(2, remaining)
+            )
+            return any(
+                int(merge["donor_group_id"]) == donor
+                and int(merge["receiver_group_id"]) == receiver
+                for merge in observed["merge_transitions"]
+            )
+
+        backups._admit_metadata_transition(submit_merge, observe_merge, timeout_s=45)
+        leader = cluster.metadata_stable_leader_id(timeout_s=20) - 1
+        cluster.metadata_procs[leader].kill()
+        cluster.metadata_procs[leader].wait(timeout=10)
+        cluster.restart_crashed_node(metadata=True, index=leader)
+        with fault.lock:
+            fault.merge_permitted = True
+        if fault.window == "cdc_accepted":
+
+            def draining():
+                return any(
+                    int(merge["donor_group_id"]) == donor
+                    and int(merge["receiver_group_id"]) == receiver
+                    and (merge.get("online") or {}).get("phase") == "tail"
+                    for merge in snapshot()["merge_transitions"]
+                )
+
+            assert wait_until(draining, timeout_s=90, interval_s=0.5), (
+                f"{fault.failed_responses()}\n{cluster.debug_logs()}"
+            )
+            fault.heal()
+
+        def cutover():
+            routes = {
+                int(row["group_id"])
+                for row in snapshot()["ranges"]
+                if int(row["table_id"]) == table_id
+            }
+            return donor not in routes and receiver in routes
+
+        assert wait_until(cutover, timeout_s=120, interval_s=0.5), (
+            f"{fault.failed_responses()}\n{cluster.debug_logs()}"
+        )
+        assert fault.reclaimed.wait(60), cluster.debug_logs()
+        after = wait_until(
+            lambda: value if (value := checkpoint()) and value != before else None,
+            timeout_s=90,
+        )
+        assert after, cluster.debug_logs()
+        for i in range(1, 7):
+            assert wait_until(lambda: current_document(f"fault-{i}"), timeout_s=10) == {
+                "id": f"fault-{i}",
+                "name": "x" * 280000,
+                "tier": "gold",
+            }
+        if fault.window != "cdc_accepted":
+            replacement = fault.replacement
+            assert replacement is not None, cluster.debug_logs()
+            assert int(replacement["source_owner"]["group_id"]) == receiver
+            assert (
+                replacement["command"]["spec"]["domain"]
+                == fault.original["command"]["spec"]["domain"]
+            )
+        else:
+            assert fault.replacement is None, cluster.debug_logs()
+        # Bypass the fault proxy to replay the old worker's exact command
+        # against the original store with its original route authorization.
+        donor_index, stale_fence = fault.original["_replay_target"]
+        assert stale_fence is not None
+        stale_request = {
+            key: value
+            for key, value in fault.original.items()
+            if not key.startswith("_")
+        }
+        stale_headers = backups.internal_service_headers() | {
+            "X-Antfly-Catalog-Route-Fence": stale_fence,
+            "X-Antfly-Catalog-Route-Deadline-Ms": "1000",
+        }
+
+        def merge_finished():
+            state = snapshot()
+            for merge in state["merge_transitions"]:
+                if (
+                    int(merge["donor_group_id"]) == donor
+                    and int(merge["receiver_group_id"]) == receiver
+                ):
+                    return merge["phase"] == "finalized"
+            # Metadata can collect the terminal transition before this poll.
+            # Cutover and reclamation have already been observed, so require
+            # the retired donor's placement to be gone as well.
+            return all(
+                int(placement["record"]["group_id"]) != donor
+                for placement in state["placement_intents"]
+            )
+
+        def stale_worker_rejected():
+            response = session.post(
+                cluster.data_urls[donor_index] + fault.original["_fault_path"],
+                headers=stale_headers,
+                json=stale_request,
+                timeout=3,
+            )
+            assert response.status_code in (409, 503), response.text
+            # The owner can already be retired by the time this replay
+            # arrives. Its durable reclamation receipt was observed above.
+            return response.status_code == 409 or merge_finished()
+
+        assert wait_until(stale_worker_rejected, timeout_s=20), cluster.debug_logs()
+        assert checkpoint() == after
+        with fault.lock:
+            original_token = fault.upload_token(fault.original)
+            original_commits = fault.committed_transactions.get(original_token, set())
+            if fault.window == "cdc_accepted":
+                assert len(original_commits) == 1, fault.committed_transactions
+            else:
+                assert not original_commits, fault.committed_transactions
+                replacement_token = fault.upload_token(replacement)
+                assert (
+                    len(fault.committed_transactions.get(replacement_token, ())) == 1
+                ), fault.committed_transactions
+        cdc._run_psql(f"""
+            INSERT INTO {provider} (id, name, tier)
+            VALUES ('after-cutover', 'continued', 'gold')
+        """)
+        assert wait_until(lambda: current_document("after-cutover"), timeout_s=30) == {
+            "id": "after-cutover",
+            "name": "continued",
+            "tier": "gold",
+        }
+        assert wait_until(
+            lambda: (current := checkpoint()) and current != after, timeout_s=30
+        ), cluster.debug_logs()
+
+        if not wait_until(merge_finished, timeout_s=60):
+            state = snapshot()
+            donor_placements = [
+                placement
+                for placement in state["placement_intents"]
+                if int(placement["record"]["group_id"]) == donor
+            ]
+            donor_reports = [
+                (store["store_id"], store["health_class"], report)
+                for store in state["stores"]
+                for report in store.get("group_statuses") or []
+                if int(report["group_id"]) == donor
+            ]
+            pytest.fail(
+                f"Donor placements: {donor_placements}\n"
+                f"Donor Raft reports: {donor_reports}\n"
+                f"Owner failures: {fault.failed_responses()}\n{cluster.debug_logs()}"
+            )
 
 
 @pytest.mark.parametrize(

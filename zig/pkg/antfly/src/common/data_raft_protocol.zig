@@ -55,7 +55,8 @@ pub const batch_publication_collection_protocol_version: u16 = 68;
 pub const batch_replication_source_prepare_protocol_version: u16 = 69;
 /// Version 70 orders CDC attempt retirement against the original native BEGIN.
 pub const batch_source_attempt_fence_protocol_version: u16 = 70;
-pub const batch_protocol_version: u16 = batch_source_attempt_fence_protocol_version;
+pub const batch_source_checkpoint_install_protocol_version: u16 = 71;
+pub const batch_protocol_version: u16 = batch_source_checkpoint_install_protocol_version;
 pub const maximum_decodable_batch_protocol_version: u16 = batch_protocol_version;
 pub const batch_split_origin_enrollment_protocol_version: u16 = 54;
 pub const batch_split_history_seed_protocol_version: u16 = 53;

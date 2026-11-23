@@ -116,7 +116,7 @@ pub const Admission = struct {
         const observed = try reads.read(a, fence, table, query, context);
         try observed.validate(query);
         if (try scopeReached(observed, intent)) return;
-        if (intent.action == .bind) try self.requireProducerClosure(a, fence, table, intent.owner, context);
+        if (intent.action == .bind or intent.action == .close_checkpoint) try self.requireProducerClosure(a, fence, table, intent.owner, context);
         const input: @import("source_scope_control_operations.zig").wire.Request = .{
             .version = 1,
             .request_id = try requestNonce(a),
@@ -126,8 +126,12 @@ pub const Admission = struct {
         const result = try controls.execute(a, fence, table, input, context);
         try result.validate(input, try input.digest(a));
         if (!result.confirmed()) return error.SourceOutcomeUnresolved;
-        const expected_version: u8 = if (intent.action == .bind) 2 else 1;
-        if (result.command.?.version != expected_version) return error.SourceBindingConflict;
+        const expected_version: u8 = switch (intent.action) {
+            .bind => 2,
+            .close_checkpoint => 4,
+            else => 1,
+        };
+        if (result.command.?.version != expected_version and !(intent.action == .bind and result.command.?.version == 4)) return error.SourceBindingConflict;
         switch (result.outcome.?) {
             .applied => |applied| if (!try scopeReached(applied, intent)) return error.SourceOutcomeUnresolved,
             .rejected => |rejection| switch (rejection) {
@@ -136,6 +140,39 @@ pub const Admission = struct {
             },
             .superseded => unreachable,
         }
+    }
+
+    pub fn installCheckpoint(self: Admission, a: A, fence: metadata.CatalogRouteFence, table: []const u8, intent: local.storage_source_scope_control.Intent, context: Context) !local.storage_source_scope.CheckpointInstallReceipt {
+        if (intent.action != .install_checkpoint) return error.InvalidSourceAdmission;
+        try intent.validate();
+        const reads = self.scope_reads orelse return error.ChangefeedCapabilityUnsupported;
+        const controls = self.scope_controls orelse return error.ChangefeedCapabilityUnsupported;
+        const query: local.storage_source_scope_control.Query = .{
+            .version = 1,
+            .owner = intent.owner,
+            .domain = intent.spec.domain(),
+            .minimum_applied_index = 1,
+            .checkpoint_evidence = .successor,
+        };
+        const prior = reads.read(a, fence, table, query, context) catch |err| switch (err) {
+            error.SourceOutcomeUnresolved, error.ReadUnavailable => null,
+            else => return err,
+        };
+        if (prior) |observed| {
+            try observed.validate(query);
+            return observed.checkpoint_install.?;
+        }
+        try self.requireProducerClosure(a, fence, table, intent.owner, context);
+        const wire = @import("source_scope_control_operations.zig").wire;
+        const input: wire.Request = .{ .version = 1, .request_id = try requestNonce(a), .operation = .submit, .intent = intent };
+        const result = try controls.execute(a, fence, table, input, context);
+        try result.validate(input, try input.digest(a));
+        if (!result.confirmed()) return error.SourceOutcomeUnresolved;
+        return switch (result.outcome.?) {
+            .applied => |observation| observation.checkpoint_install orelse error.SourceOutcomeUnresolved,
+            .rejected => |rejection| rejection.asError(),
+            .superseded => error.SourceOutcomeUnresolved,
+        };
     }
 
     pub fn dropClosedScope(self: Admission, a: A, fence: metadata.CatalogRouteFence, table: []const u8, closing: local.storage_source_scope_control.Intent, context: Context) !void {
@@ -159,11 +196,16 @@ pub const Admission = struct {
 
     fn scopeReached(observed: local.storage_source_scope_control.Observation, intent: local.storage_source_scope_control.Intent) !bool {
         if (observed.record) |record| {
-            if (!std.meta.eql(record.spec, intent.spec)) return error.SourceBindingConflict;
+            if (!std.meta.eql(record.spec, intent.spec)) {
+                var refreshed = record.spec;
+                refreshed.checkpoint_owner = intent.spec.checkpoint_owner;
+                if (intent.action == .bind and std.meta.eql(refreshed, intent.spec)) return false;
+                return error.SourceBindingConflict;
+            }
             return switch (intent.action) {
                 .bind => if (record.phase == .active) true else error.SourceBindingConflict,
-                .fence_attempt => return error.InvalidSourceAdmission,
-                .close => switch (record.phase) {
+                .fence_attempt, .install_checkpoint => return error.InvalidSourceAdmission,
+                .close, .close_checkpoint => switch (record.phase) {
                     .active => false,
                     .closing => error.SourcePendingWork,
                     .closed => true,
@@ -176,7 +218,7 @@ pub const Admission = struct {
                     false,
             };
         }
-        return intent.action != .bind and intent.action != .fence_attempt and observed.header.strict and
+        return intent.action != .bind and intent.action != .fence_attempt and intent.action != .install_checkpoint and intent.action != .close_checkpoint and observed.header.strict and
             observed.header.metadata_floor >= intent.minimum_metadata_index;
     }
 
@@ -189,7 +231,6 @@ pub const Admission = struct {
         const spec = (try @import("../metadata/source_scope_binding.zig").spec(state)) orelse return error.SourceBindingConflict;
         const id = pending.identity(binding);
         var routed = manifest.owner;
-        if (fence.topology_epoch < routed.topology_epoch) return error.TopologyChanged;
         routed.topology_epoch = fence.topology_epoch;
         const wire = @import("source_scope_control_operations.zig").wire;
         const request: wire.Request = .{
@@ -245,7 +286,7 @@ pub const Admission = struct {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
         try context.ensureActive();
-        if (state.closing) return error.SourcePendingWork;
+        if (state.closing or state.checkpoint_transfer_target != null) return error.SourcePendingWork;
         var grant = try grantFromState(a, state);
         defer grant.deinit();
         const native = try self.admit(a, &grant, fence, context);
@@ -254,6 +295,32 @@ pub const Admission = struct {
         try context.ensureActive();
         return result;
     }
+    pub fn resumeEnlistedDelivery(self: Admission, a: A, state: source.State, fence: metadata.CatalogRouteFence, context: Context) !@import("../metadata/source_delivery.zig").Acceptance {
+        var grant = try grantFromState(a, state);
+        defer grant.deinit();
+        const manifest = grant.manifest.value;
+        const request: @import("history_decision_operations.zig").Request = .{
+            .version = 1,
+            .owner = manifest.owner,
+            .transaction_id = manifest.transaction_id,
+            .minimum_applied_index = 1,
+        };
+        var observed = try self.coordinator.recovery.decisions.read(a, fence, manifest.checkpoint_authority.table_name, request, context);
+        defer observed.deinit();
+        try observed.value.validate(request.binding());
+        const decision = observed.value.decision orelse return error.SourceOutcomeUnresolved;
+        if (!std.meta.eql(decision.admission.digest, manifest.admission_digest) or
+            !std.meta.eql(decision.record.source_scope, @as(?local.storage_source_scope.Reference, manifest.source_scope)) or
+            !std.meta.eql(decision.record.source_purpose, @as(?source.Digest, manifest.checkpoint.purpose)) or
+            decision.record.begin_timestamp != manifest.begin_timestamp)
+            return error.SourceTransactionIdentityConflict;
+        if (decision.record.status == .aborted) return error.SourceOutcomeUnresolved;
+        if (decision.record.status == .committed and decision.record.commit_version != manifest.commit_version)
+            return error.SourceTransactionIdentityConflict;
+        const accepted = try self.admit(a, &grant, fence, context);
+        return @import("source_destination_receipt.zig").accept(a, state, accepted);
+    }
+
     pub fn resolve(self: Admission, a: A, grant: *const Grant, fence: metadata.CatalogRouteFence, original: Context) !?Accepted {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();

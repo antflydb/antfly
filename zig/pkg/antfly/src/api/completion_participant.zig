@@ -95,7 +95,7 @@ pub const Port = struct {
         const owner = member.routed_owner orelse return error.ChangefeedCapabilityUnsupported;
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
         var routed = owner;
-        if (phase == .publish and decision.record.source_scope != null and fence.topology_epoch > routed.topology_epoch)
+        if (phase == .publish and decision.record.source_scope != null)
             routed.topology_epoch = fence.topology_epoch;
         try validateParticipantFence(routed, locator.group_id, fence);
         var parsed: ?std.json.Parsed(completion.Envelope) = null;
@@ -137,7 +137,7 @@ pub const Port = struct {
         const coordinator = try admission.coordinatorMember();
         const locator = local.api_local_transaction_contract.parseParticipantRef(coordinator.locator) orelse return error.InvalidParticipant;
         var routed = owner;
-        if (decision.record.status == .committed and decision.record.source_scope != null and fence.topology_epoch > routed.topology_epoch)
+        if (decision.record.status == .committed and decision.record.source_scope != null)
             routed.topology_epoch = fence.topology_epoch;
         try validateParticipantFence(routed, locator.group_id, fence);
         var pending: [64][]const u8 = undefined;

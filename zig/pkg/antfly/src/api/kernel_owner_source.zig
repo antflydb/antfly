@@ -2658,7 +2658,6 @@ pub const ProvisionedKernelOwnerSource = struct {
         } else try request.validate();
         var expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal or kind == .legacy_inventory) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
         if (comptime kind == .checkpoint) {
-            if (fence.topology_epoch < expected.topology_epoch) return error.TopologyChanged;
             expected.topology_epoch = fence.topology_epoch;
         }
         const group = fence.route.group_id;
@@ -2866,7 +2865,6 @@ pub const ProvisionedKernelOwnerSource = struct {
         const requested_owner = if (comptime kind == .publication or kind == .admission or kind == .decision) routed: {
             var current = request.owner;
             if (comptime kind == .publication or kind == .decision) {
-                if (current.topology_epoch > fence.topology_epoch) return error.TopologyChanged;
                 current.topology_epoch = fence.topology_epoch;
             }
             break :routed current;
@@ -3530,6 +3528,53 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer descriptor.deinit(self.alloc);
         var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, descriptor.readControls(.{}));
         defer lease.deinit();
+    }
+
+    /// Capture the donor's physical descriptor for a private Raft cleanup.
+    /// The source command's exact retention scope is checked at ordered apply.
+    pub fn loadOnlineMergeMaintenanceDescriptor(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope,
+    ) !LoadedDescriptor {
+        try scope.validate();
+        if (scope.authority != .raft or scope.fence.owner_group_id != group_id) return error.OnlineSourceScopeChanged;
+        var lease = self.acquirePreparedOwner(group_id, table_name) catch |err| switch (err) {
+            error.StorageOwnerAdmissionPending => return error.StorageReadTemporarilyUnavailable,
+            else => return err,
+        };
+        defer lease.deinit();
+        const entry = lease.entry;
+        const namespace = scope.fence.namespace;
+        if (entry.identity.table_id != namespace.table_id or entry.identity.shard_id != namespace.shard_id or entry.identity.range_id != namespace.range_id)
+            return error.OnlineSourceScopeChanged;
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        errdefer alloc.free(path);
+        const schema_json = try alloc.dupe(u8, entry.schema_json);
+        errdefer alloc.free(schema_json);
+        const indexes_json = try alloc.dupe(u8, entry.indexes_json);
+        errdefer alloc.free(indexes_json);
+        const initial_range = try descriptor_contract.cloneInitialRange(alloc, entry.initial_range);
+        errdefer descriptor_contract.freeInitialRange(alloc, initial_range);
+        const restore = if (entry.restore) |value| try value.clone(alloc) else null;
+        errdefer if (restore) |value| {
+            var owned = value;
+            owned.deinit(alloc);
+        };
+        const bootstrap = if (entry.initial_child_bootstrap_json.len == 0) null else try alloc.dupe(u8, entry.initial_child_bootstrap_json);
+        return .{
+            .path = path,
+            .schema_json = schema_json,
+            .indexes_json = indexes_json,
+            .table_storage = entry.table_storage,
+            .generation = entry.generation,
+            .initial_range = initial_range,
+            .identity = entry.identity,
+            .restore = restore,
+            .initial_child_bootstrap_json = bootstrap,
+        };
     }
 
     /// Apply the latest catalog schema/index contract to the already-resident

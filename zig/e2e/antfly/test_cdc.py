@@ -540,8 +540,38 @@ def _metadata_table_id(stateful_api, table_name: str) -> int | None:
     return None
 
 
+def _cdc_artifact_config(artifacts, base_dir, *, deployment_mode):
+    return {
+        "deployment_mode": deployment_mode,
+        "storage": {
+            "engine": "local",
+            "local": {"base_dir": str(base_dir)},
+            "artifacts": {"connection": "cdc-artifacts", "bucket": "antfly"},
+        },
+        "connections": {
+            "cdc-artifacts": {
+                "kind": "external_io",
+                "capabilities": ["storage.primary"],
+                "external_io": {
+                    "protocol": "s3",
+                    "endpoint": artifacts.endpoint,
+                    "use_ssl": False,
+                    "addressing_style": "path",
+                    "region": "us-east-1",
+                    "buckets": ["antfly"],
+                    "credentials": {
+                        "source": "static",
+                        "access_key_id": "fixture",
+                        "secret_access_key": "fixture",
+                    },
+                },
+            }
+        },
+    }
+
+
 @pytest.fixture(scope="function", params=["cluster", "standalone"])
-def cdc_stateful_api(request, pg_cdc_source):
+def cdc_stateful_api(request, pg_cdc_source, tmp_path):
     # Keep the provider fixture alive until after the managed server stops so
     # its exact-cutover slots are inactive and can be removed deterministically.
     del pg_cdc_source
@@ -561,7 +591,26 @@ def cdc_stateful_api(request, pg_cdc_source):
         if mode == "standalone":
             server = StandaloneAntflyServer(binary, "127.0.0.1", port)
         else:
-            server = StatefulAntflyServer(binary, "127.0.0.1", port)
+            spool = tmp_path / "replication-spool"
+            spool.mkdir()
+            namespace = subprocess.check_output(
+                [binary, "storage", "provision-pgwire-spool", str(spool)],
+                text=True,
+                timeout=10,
+            ).strip()
+            server = StatefulAntflyServer(
+                binary,
+                "127.0.0.1",
+                port,
+                metadata_config={
+                    "pgwire": {
+                        "replication_spool": {
+                            "directory": str(spool),
+                            "namespace": namespace,
+                        }
+                    }
+                },
+            )
         base_url = server.url
         if default_root is None and os.path.basename(binary) == "antfly":
             default_root = ANTFLY_PUBLIC_API_ROOT
@@ -3395,15 +3444,19 @@ def test_public_changefeed_multiple_tables_use_independent_row_filters():
         server.stop()
 
 
-def _changefeed_call(client, method, url, **options):
-    deadline = time.monotonic() + 30
+def _changefeed_call(client, method, url, *, timeout=15, **options):
+    deadline = time.monotonic() + max(30, timeout)
     while True:
-        reply = client.request(method, url, timeout=15, **options)
+        reply = client.request(method, url, timeout=timeout, **options)
         retryable = reply.status_code == 503 or (
             reply.status_code == 409 and "changefeed_retry_required" in reply.text
         )
         if not retryable or time.monotonic() >= deadline:
-            reply.raise_for_status()
+            try:
+                reply.raise_for_status()
+            except requests.HTTPError as exc:
+                exc.add_note(reply.text[:2048])
+                raise
             return reply
         time.sleep(0.2)
 
@@ -3510,9 +3563,43 @@ def test_public_changefeed_projects_exact_before_and_after_predicates():
         server.stop()
 
 
-def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(tmp_path):
+@pytest.mark.parametrize("deployment", ["standalone", "raft"])
+def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(
+    tmp_path, request, deployment
+):
+    from test_secrets import TableObjectStorage
+
+    artifacts = TableObjectStorage()
+    request.addfinalizer(artifacts.close)
+
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
-    server = StatefulAntflyServer(binary, "127.0.0.1", 0, auth_enabled=True)
+    if deployment == "standalone":
+        config_path = tmp_path / "standalone.json"
+        config_path.write_text(
+            json.dumps(
+                _cdc_artifact_config(
+                    artifacts, tmp_path / "native", deployment_mode="standalone"
+                )
+            ),
+            encoding="utf-8",
+        )
+        server = StandaloneAntflyServer(
+            binary, "127.0.0.1", 0, pgwire=True, config_path=config_path
+        )
+    else:
+        server = StatefulAntflyServer(
+            binary,
+            "127.0.0.1",
+            0,
+            auth_enabled=True,
+            metadata_config=_cdc_artifact_config(
+                artifacts, tmp_path / "metadata", deployment_mode="distributed"
+            ),
+            data_config=_cdc_artifact_config(
+                artifacts, tmp_path / "data", deployment_mode="distributed"
+            ),
+        )
+    failed = True
     try:
         with requests.Session() as client:
             client.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
@@ -3525,6 +3612,7 @@ def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(tmp
                 client,
                 "POST",
                 table,
+                timeout=40,
                 json={
                     "storage": {"engine": "object"},
                     "schema": {
@@ -3536,7 +3624,12 @@ def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(tmp
                                 "schema": {
                                     "type": "object",
                                     "properties": {
-                                        name: {"type": "string"} for name in columns
+                                        name: {
+                                            "type": "integer"
+                                            if name == "observed_at"
+                                            else "string"
+                                        }
+                                        for name in columns
                                     },
                                     "required": list(columns),
                                     "additionalProperties": False,
@@ -3574,8 +3667,8 @@ def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(tmp
                     },
                 },
             )
-            early = "2025-01-01T00:00:00Z"
-            late = "2025-01-02T00:00:00Z"
+            early = 1_735_689_600_000_000
+            late = 1_735_776_000_000_000
 
             def write(checkpoint, changes, previous=None):
                 payload = {
@@ -3624,6 +3717,9 @@ def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(tmp
                     },
                 ).json()
                 subscriptions[projection] = (f"{feeds}/{feed['id']}", feed["cursor"])
+            if deployment == "standalone":
+                server.pause(crash=True)
+                server.resume()
             write(
                 "updated",
                 [
@@ -3679,8 +3775,13 @@ def test_iceberg_changefeed_projects_typed_composite_key_updates_and_deletes(tmp
                 assert projected[key].get("after") is None
             for path, _ in subscriptions.values():
                 _changefeed_call(client, "DELETE", path)
+    except Exception as exc:
+        exc.add_note(server.debug_logs())
+        raise
+    else:
+        failed = False
     finally:
-        server.stop()
+        server.stop(test_failed=failed)
 
 
 def test_public_changefeed_bootstraps_and_streams_native_sql_rows():

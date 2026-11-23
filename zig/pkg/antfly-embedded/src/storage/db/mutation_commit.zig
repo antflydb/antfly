@@ -1247,12 +1247,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // admission identity; it is not ordinary/legacy row inference.
                 const policy = @import("../source_producer_policy.zig");
                 const row_producer = try policy.rowProducer(req.source_producer, opts.source_producer);
+                // Ordered split/merge copies materialize existing effects.
+                // Their scope and receipts are validated below before the
+                // primary write, independently of legacy producer fencing.
+                const ordered_topology = opts.ordered_apply_receipt != null and
+                    (req.split_replication != null or req.split_checkpoint != null or
+                        req.merge_replication != null or req.merge_checkpoint != null);
                 const producer = if (opts.transaction_resolution != null and opts.transaction_resolution.?.source_scope != null) scoped: {
                     if (row_producer != .unlabelled and row_producer != .scoped_source) return error.SourceTransactionIdentityConflict;
                     break :scoped policy.Producer.scoped_source;
                 } else ordinary: {
                     if (row_producer == .scoped_source) return error.InvalidSourceAdmission;
-                    break :ordinary row_producer;
+                    break :ordinary if (ordered_topology and row_producer == .unlabelled) policy.Producer.ordinary else row_producer;
                 };
                 if (opts.transaction_resolution != null and opts.transaction_resolution.?.legacy_terminal != null) {
                     const resolution = opts.transaction_resolution.?;

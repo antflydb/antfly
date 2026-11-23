@@ -13424,7 +13424,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "19";
+const derived_catalog_index_version = "20";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -20122,6 +20122,7 @@ pub const RaftApplyStore = struct {
             // invalidate if the accepted receiver emitted a structural change.
             .apply_sql_relation_boot => |bytes| !self.standaloneSqlRelationProjectionNeutral(bytes) or outcomeChangesCatalog(outcome.projection_signals.items),
             .apply_sql_prepared_transaction => |bytes| @import("../schema_reader_wire.zig").requiresSqlPreparedCatalogCompletion(bytes) and outcomeChangesCatalog(outcome.projection_signals.items),
+            .apply_changefeed_control => false,
             .apply_transaction_sessions, .apply_sql_lock_scope, .apply_sql_graph_preparation, .apply_sql_sequence_counter, .complete_relational_index_source, .accept_relational_index_delivery, .apply_store_root_enrollment, .update_sql_selinux_authority => false,
             else => true,
         });
@@ -33190,6 +33191,15 @@ pub const RaftApplyStore = struct {
         }
         return @import("../source_legacy_intake.zig").indexedAllowed(&txn, group_id, table_id, ordinal, definition);
     }
+    pub const SourceCheckpointActorPage = @import("../source_legacy_intake.zig").CheckpointPage;
+    pub const SourceCheckpointActor = @import("../source_legacy_intake.zig").CheckpointActor;
+
+    pub fn sourceCheckpointActors(self: *RaftApplyStore, group_id: u64, owner_group: u64, after: ?SourceCheckpointActor) !SourceCheckpointActorPage {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        return @import("../source_legacy_intake.zig").checkpointActors(&txn, group_id, owner_group, after);
+    }
+
     pub fn nativeSourceRecoveryScope(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !?source_control.Scope {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
@@ -33260,6 +33270,27 @@ pub const RaftApplyStore = struct {
         return capture.capture(a, query, applied, incarnation, activation.value.version, state.value, table.replication_sources_json);
     }
 
+    fn checkpointOwnerCanActivateTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, owner: u64) !bool {
+        var prefix_buffer: [192]u8 = undefined;
+        const prefix = try ownerMergePrefix(&prefix_buffer, group, owner);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (entry.value.len != 9) return error.InvalidDerivedCatalogIndex;
+            if (entry.value[8] != 1) continue;
+            const id = std.mem.readInt(u64, entry.value[0..8], .little);
+            var key: [160]u8 = undefined;
+            const raw = (try stagingGet(txn, try mergeTransitionKeyForGroup(&key, group, id))) orelse return error.InvalidDerivedCatalogIndex;
+            const transition = try decodeMergeTransitionRecord(a, raw);
+            if (transition.online == null) return false;
+            if (transition.online.?.phase != .admit and transition.online.?.phase != .publish and transition.online.?.phase != .snapshot)
+                return false;
+        }
+        return true;
+    }
+
     fn applySourceControlTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         var parsed_write = try source_control.parseWrite(self.alloc, bytes);
         defer parsed_write.deinit();
@@ -33286,7 +33317,7 @@ pub const RaftApplyStore = struct {
             if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
         } else if ((write.mutation != .configure and write.mutation != .begin_legacy_handover) or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
         switch (write.mutation) {
-            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover, .observe_stream_failure, .observe_qualified_stream_failure, .observe_completion_wait, .observe_completion_stall, .observe_qualified_completion_stall => {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .begin_checkpoint_transfer, .prepare_checkpoint_successor, .adopt_checkpoint_successor, .enable_scope_fencing, .certify_native_bootstrap, .certify_native_snapshot_pages, .begin_legacy_handover, .observe_stream_failure, .observe_qualified_stream_failure, .observe_completion_wait, .observe_completion_stall, .observe_qualified_completion_stall => {
                 const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return,
@@ -33299,6 +33330,9 @@ pub const RaftApplyStore = struct {
         }
         const new_authority = switch (write.mutation) {
             .bind_checkpoint => |authority| authority,
+            .begin_checkpoint_transfer => |transfer| transfer.target,
+            .prepare_checkpoint_successor => |preparation| preparation.successor,
+            .adopt_checkpoint_successor => |adoption| adoption.successor,
             .begin_legacy_handover => |handover| handover.authority,
             else => null,
         };
@@ -33307,6 +33341,42 @@ pub const RaftApplyStore = struct {
             var incarnation_buffer: [160]u8 = undefined;
             const incarnation_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&incarnation_buffer, group_id))) orelse return;
             if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation, &authority.owner.metadata_incarnation)) return;
+        }
+        const activating = switch (write.mutation) {
+            .begin_legacy_handover, .adopt_checkpoint_successor => new_authority,
+            .enable_scope_fencing => if (state.scope_fencing) null else state.checkpoint_authority,
+            else => null,
+        };
+        if (activating) |authority| {
+            if (!try checkpointOwnerCanActivateTxn(a, txn, group_id, authority.owner.group_id)) return;
+        }
+        if (write.mutation == .begin_checkpoint_transfer) {
+            const transfer = write.mutation.begin_checkpoint_transfer;
+            if (transfer.online_merge_id) |merge_id| {
+                const donor = state.checkpoint_authority orelse return;
+                var merge_buffer: [160]u8 = undefined;
+                const merge_raw = (try stagingGet(txn, try mergeTransitionKeyForGroup(&merge_buffer, group_id, merge_id))) orelse return;
+                const merge = try decodeMergeTransitionRecord(a, merge_raw);
+                const online = merge.online orelse return;
+                if (merge.rollback_reason != null or online.phase != .tail or
+                    merge.donor_group_id != donor.owner.group_id or merge.receiver_group_id != transfer.target.owner.group_id) return;
+            }
+        }
+        if (write.mutation == .adopt_checkpoint_successor) {
+            const successor = new_authority.?;
+            const namespace = successor.owner.namespace;
+            const table_id = std.mem.readInt(u64, namespace[0..8], .big);
+            var route_buffer: [192]u8 = undefined;
+            const destination_raw = (try stagingGet(txn, try tableKeyForGroup(&route_buffer, group_id, table_id))) orelse return;
+            const destination = try decodeTableRecord(a, destination_raw);
+            if (destination.table_id != table_id or destination.storage.engine != .local or
+                !std.mem.eql(u8, destination.name, successor.table_name) or
+                !std.meta.eql(changefeed_control.tableBinding(destination), successor.owner.table_binding)) return;
+            const range_raw = (try stagingGet(txn, try rangeKeyForGroup(&route_buffer, group_id, successor.owner.group_id))) orelse return;
+            const range = try decodeRangeRecord(a, range_raw);
+            if (range.group_id != successor.owner.group_id or range.table_id != table_id or
+                metadata_table_manager.rangeDocIdentityShardId(range) != std.mem.readInt(u64, namespace[8..16], .big) or
+                metadata_table_manager.rangeDocIdentityRangeId(range) != std.mem.readInt(u64, namespace[16..24], .big)) return;
         }
         var handover_key_buffer: [224]u8 = undefined;
         var handover_status: ?metadata.ReplicationSourceStatusRecord = null;
@@ -52922,6 +52992,44 @@ pub const RaftApplyStore = struct {
         self.notifyCommittedTransition(.{ .upsert_merge = replacement });
     }
 
+    fn mergeSourceCheckpointsReadyTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: metadata.MergeTransitionRecord) !bool {
+        const index = @import("../source_legacy_intake.zig");
+        var after: ?index.CheckpointActor = null;
+        while (true) {
+            const page = try index.checkpointActors(txn, group, record.donor_group_id, after);
+            for (page.items()) |actor| {
+                var key: [256]u8 = undefined;
+                const raw = (try stagingGet(txn, try source_control.keyForGroup(&key, group, actor.table_id, actor.source_id))) orelse return error.InvalidSourceControl;
+                var parsed = try source_control.parse(a, raw);
+                defer parsed.deinit();
+                const state = parsed.value;
+                const authority = state.checkpoint_authority orelse return error.InvalidSourceControl;
+                if (authority.owner.group_id != record.donor_group_id) return error.InvalidSourceControl;
+                const prepared = state.checkpoint_preparation orelse return false;
+                if (state.checkpoint_transfer_merge_id != record.transition_id or prepared.successor.owner.group_id != record.receiver_group_id) return false;
+            }
+            if (page.len < page.actors.len) return true;
+            after = page.items()[page.len - 1];
+        }
+    }
+
+    fn mergeHasCheckpointTransferTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, record: metadata.MergeTransitionRecord) !bool {
+        const index = @import("../source_legacy_intake.zig");
+        var after: ?index.CheckpointActor = null;
+        while (true) {
+            const page = try index.checkpointActors(txn, group, record.donor_group_id, after);
+            for (page.items()) |actor| {
+                var key: [256]u8 = undefined;
+                const raw = (try stagingGet(txn, try source_control.keyForGroup(&key, group, actor.table_id, actor.source_id))) orelse return error.InvalidSourceControl;
+                var parsed = try source_control.parse(a, raw);
+                defer parsed.deinit();
+                if (parsed.value.checkpoint_transfer_merge_id == record.transition_id) return true;
+            }
+            if (page.len < page.actors.len) return false;
+            after = page.items()[page.len - 1];
+        }
+    }
+
     fn applyOnlineMergeUpdateTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, update: OnlineMergeUpdate) anyerror!void {
         var key_buf: [160]u8 = undefined;
         const key = try mergeTransitionKeyForGroup(&key_buf, group_id, update.expected.scope.fence.transition_id);
@@ -52943,6 +53051,7 @@ pub const RaftApplyStore = struct {
         if (update.next.phase == .complete) replacement.phase = .finalized;
         if (update.next.phase == .cancelled) replacement.phase = .rolled_back;
         if (!mergeTransitionUpdateAllowed(current, replacement)) return;
+        if (update.next.phase == .cancel_receiver and try mergeHasCheckpointTransferTxn(self.alloc, txn, group_id, current)) return;
         if (update.publish_cutover) {
             if (try backupCohortLocksTableTxn(txn, group_id, current.table_contract.table_id) or try restoreStagingLocksTableTxn(txn, group_id, current.table_contract.table_id)) return;
             var donor_buf: [160]u8 = undefined;
@@ -52960,6 +53069,9 @@ pub const RaftApplyStore = struct {
             const bounds = update.cutover_bounds.?;
             const actual = OnlineMergeCutoverBounds.fromRanges(.{ .start = receiver.start_key, .end = receiver.end_key orelse "" }, .{ .start = merged.start_key, .end = merged.end_key orelse "" });
             if (!std.meta.eql(bounds, actual)) return;
+            // The donor route disappears below. Require each checkpoint
+            // actor's closed donor bytes before making either range change.
+            if (!try mergeSourceCheckpointsReadyTxn(self.alloc, txn, group_id, current)) return;
             // Both existing range handlers maintain table/range indexes and
             // generation fences in this SAME transaction as the online CAS.
             try self.applyTransitionCommandTxn(txn, group_id, .{ .upsert_range = merged });
@@ -52984,6 +53096,11 @@ pub const RaftApplyStore = struct {
             defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, existing);
             if (!allow_online_change) if (existing.online) |previous| if (record.online == null or !previous.eql(record.online.?)) return;
             if (!mergeTransitionUpdateAllowed(existing, record)) return;
+            // Closing an original CDC coordinator is irreversible. Both the
+            // first transfer intent and a cancellation request compare this
+            // durable merge row in the same Raft writer.
+            if (existing.online != null and existing.rollback_reason == null and record.rollback_reason != null and
+                try mergeHasCheckpointTransferTxn(self.alloc, txn, group_id, existing)) return;
             existing_active = !transitionPhaseTerminal(existing.phase);
         } else if (!try self.mergeTransitionAdmissionMatchesTxn(
             txn,
@@ -64008,6 +64125,51 @@ test "metadata raft apply store online merge phases persist exact attempt and re
         const range_denied = (try store.getMergeTransition(alloc, 21, record.transition_id)).?;
         defer metadata_table_manager.freeMergeTransitionRecord(alloc, range_denied);
         try std.testing.expect(range_denied.online.?.eql(state));
+
+        const incarnation = "11111111111111111111111111111111".*;
+        const actor: source_control.Scope = .{ .table_id = record.table_contract.table_id, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+        const prior: source_control.checkpoint_authority.Spec = .{ .binding = actor.identity(), .table_name = "docs", .owner = .{ .metadata_group_id = 21, .metadata_incarnation = incarnation, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 31, .topology_epoch = 99 } };
+        var successor = prior;
+        successor.owner.namespace = @splat(2);
+        successor.owner.group_id = 30;
+        const scope_native = @import("antfly_local_sources").storage_source_scope;
+        const native_donor: scope_native.Record = .{
+            .spec = .{ .actor_table_id = actor.table_id, .source_id = actor.source_id, .generation = actor.generation, .binding = actor.identity(), .checkpoint_owner = try scope_native.Basis.fromOwner(prior.owner) },
+            .phase = .closed,
+            .bound_metadata_index = 5,
+            .close_metadata_index = 6,
+            .closed_at = .{ .term = 1, .index = 8 },
+        };
+        var actor_state: source_control.State = .{
+            .scope = actor,
+            .revision = 1,
+            .scope_fencing = true,
+            .checkpoint_authority = prior,
+            .artifact_control = .{},
+            .checkpoint_transfer_target = successor,
+            .checkpoint_transfer_merge_id = record.transition_id,
+        };
+        var actor_buffer: [256]u8 = undefined;
+        const actor_key = try source_control.keyForGroup(&actor_buffer, 21, actor.table_id, actor.source_id);
+        {
+            var writer = try store.store.beginWriteTxn();
+            errdefer writer.abort();
+            const bytes_no_capture = try source_control.encode(alloc, actor_state);
+            defer alloc.free(bytes_no_capture);
+            try writer.put(actor_key, bytes_no_capture);
+            try @import("../source_legacy_intake.zig").indexTransition(&writer, 21, .{}, actor_state);
+            try writer.commit();
+        }
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = cutover });
+        const retained_donor = (try store.getRange(alloc, 21, 31)).?;
+        defer metadata_table_manager.freeRange(alloc, retained_donor);
+        const unchanged_receiver = (try store.getRange(alloc, 21, 30)).?;
+        defer metadata_table_manager.freeRange(alloc, unchanged_receiver);
+        try std.testing.expectEqualStrings("doc:m", unchanged_receiver.end_key.?);
+        actor_state.checkpoint_preparation = .{ .successor = successor, .transfer = .{ .donor = native_donor, .bytes = null } };
+        const captured_actor = try source_control.encode(alloc, actor_state);
+        defer alloc.free(captured_actor);
+        try store.store.put(actor_key, captured_actor);
         try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = cutover });
         try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = cutover });
         try std.testing.expect((try store.getRange(alloc, 21, 31)) == null);

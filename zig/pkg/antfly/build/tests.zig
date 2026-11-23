@@ -481,7 +481,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_source_delivery_tests = b.addRunArtifact(source_delivery_tests);
     const source_control_storage_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "metadata source control", "metadata raft apply store snapshot key registry covers every durable projection class" },
+        .filters = &.{ "metadata source control", "metadata raft apply store snapshot key registry covers every durable projection class", "metadata raft apply store online merge phases persist exact attempt" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const source_control_service_tests = b.addTest(.{

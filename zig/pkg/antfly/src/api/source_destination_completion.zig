@@ -35,7 +35,6 @@ pub const Completion = struct {
         if (state.pending != null) return error.SourcePendingWork;
         const manifest = bound.retained.manifest.value;
         var routed = manifest.owner;
-        if (fence.topology_epoch < routed.topology_epoch) return error.TopologyChanged;
         routed.topology_epoch = fence.topology_epoch;
         try @import("source_owner_scope.zig").requireFence(routed, fence);
         const result = try self.recovery.runSource(a, manifest.owner, fence, manifest.checkpoint_authority.table_name, manifest.transaction_id, .{ .admission_digest = manifest.admission_digest, .scope = manifest.source_scope, .purpose = manifest.checkpoint.purpose, .begin_timestamp = manifest.begin_timestamp, .commit_version = manifest.commit_version }, context);
@@ -107,27 +106,12 @@ pub fn recover(
         var grant = try @import("source_destination_admission.zig").Grant.init(a, binding, pending, record);
         defer grant.deinit();
         const manifest = grant.manifest.value;
+        if (current.checkpoint_transfer_target != null) {
+            if (!pending.retain_payload) return error.SourcePendingWork;
+            return settleOriginalAttempt(svc, admission, a, current, catalog_digest, manifest, context);
+        }
         const fence = retainedRoute(admission.coordinator.recovery, a, manifest, context) catch |err| switch (err) {
-            error.TopologyChanged => {
-                if (record.phase == .reserved and pending.retain_payload)
-                    return mutate(svc, a, binding, catalog_digest, current, .{ .fence_unsealed_delivery_attempt = record.reservation }, context);
-                if (record.phase != .sealed) return err;
-                const observed_fence = try retainedRouteMode(admission.coordinator.recovery, a, manifest, context, true);
-                const existing = (try admission.resolveDelivery(a, current, observed_fence, context)) orelse {
-                    if (!pending.retain_payload) return error.SourceOutcomeUnresolved;
-                    const proof = try admission.fenceUnadmittedAttempt(a, current, manifest, observed_fence, context);
-                    defer a.free(proof);
-                    return mutate(svc, a, binding, catalog_digest, current, .{ .fence_delivery_attempt = .{
-                        .reservation_digest = record.reservation,
-                        .no_admission_receipt = proof,
-                    } }, context);
-                };
-                defer a.free(existing.receipt);
-                return mutate(svc, a, binding, catalog_digest, current, .{ .accept = .{
-                    .reservation_digest = existing.reservation_digest,
-                    .receipt = existing.receipt,
-                } }, context);
-            },
+            error.TopologyChanged => return settleOriginalAttempt(svc, admission, a, current, catalog_digest, manifest, context),
             else => return err,
         };
         if (record.phase == .reserved) {
@@ -149,7 +133,12 @@ pub fn recover(
         const acceptance = if (current.closing)
             (try admission.resolveDelivery(a, current, fence, context)) orelse return
         else
-            try admission.admitDelivery(a, current, fence, context);
+            admission.admitDelivery(a, current, fence, context) catch |err| switch (err) {
+                // A participant can move while the checkpoint owner's
+                // routing epoch stays unchanged. Settle on the coordinator.
+                error.TopologyChanged => return settleOriginalAttempt(svc, admission, a, current, catalog_digest, manifest, context),
+                else => return err,
+            };
         defer a.free(acceptance.receipt);
         return mutate(svc, a, binding, catalog_digest, current, .{ .accept = .{
             .reservation_digest = acceptance.reservation_digest,
@@ -193,7 +182,15 @@ pub fn recover(
         } }, context);
     }
     if (record.phase == .garbage) {
-        const fence = try retainedRouteMode(admission.coordinator.recovery, a, manifest, context, true);
+        const worker = admission.coordinator.recovery;
+        const fence = try retainedRouteMode(worker, a, manifest, context, true);
+        try worker.releaseSource(a, manifest.owner, fence, manifest.checkpoint_authority.table_name, manifest.transaction_id, .{
+            .admission_digest = manifest.admission_digest,
+            .scope = manifest.source_scope,
+            .purpose = manifest.checkpoint.purpose,
+            .begin_timestamp = manifest.begin_timestamp,
+            .commit_version = manifest.commit_version,
+        }, context);
         const transfer = try manifest.cleanupTransfer(fence, admission.artifacts);
         const proof = (try transfer.reclaim(a, record, context)) orelse return;
         if (manifest.retained_payload) |reference| {
@@ -210,6 +207,51 @@ pub fn recover(
             .proof = proof,
         } }, context);
     }
+}
+
+fn settleOriginalAttempt(
+    svc: anytype,
+    admission: @import("source_destination_admission.zig").Admission,
+    a: std.mem.Allocator,
+    state: source.State,
+    catalog_digest: source.Digest,
+    manifest: @import("source_destination_plan.zig").Manifest,
+    context: Context,
+) !void {
+    const binding = state.scope.?;
+    const pending = state.pending.?;
+    const record = state.artifact_control.?.current.?;
+    if (record.phase == .reserved and pending.retain_payload)
+        return mutate(svc, a, binding, catalog_digest, state, .{ .fence_unsealed_delivery_attempt = record.reservation }, context);
+    if (record.phase != .sealed) return error.TopologyChanged;
+    const fence = try retainedRouteMode(admission.coordinator.recovery, a, manifest, context, true);
+    if (try admission.resolveDelivery(a, state, fence, context)) |accepted| {
+        defer a.free(accepted.receipt);
+        return mutate(svc, a, binding, catalog_digest, state, .{ .accept = .{
+            .reservation_digest = accepted.reservation_digest,
+            .receipt = accepted.receipt,
+        } }, context);
+    }
+    if (!pending.retain_payload) return error.SourceOutcomeUnresolved;
+    const proof = admission.fenceUnadmittedAttempt(a, state, manifest, fence, context) catch |err| switch (err) {
+        error.SourcePendingWork, error.SourceOutcomeUnresolved => {
+            if (state.checkpoint_transfer_target == null) return err;
+            // On a planned cutover the original lease is still published.
+            // A previously ordered BEGIN must finish under that same plan.
+            const accepted = try admission.resumeEnlistedDelivery(a, state, fence, context);
+            defer a.free(accepted.receipt);
+            return mutate(svc, a, binding, catalog_digest, state, .{ .accept = .{
+                .reservation_digest = accepted.reservation_digest,
+                .receipt = accepted.receipt,
+            } }, context);
+        },
+        else => return err,
+    };
+    defer a.free(proof);
+    return mutate(svc, a, binding, catalog_digest, state, .{ .fence_delivery_attempt = .{
+        .reservation_digest = record.reservation,
+        .no_admission_receipt = proof,
+    } }, context);
 }
 
 fn reclaim(svc: anytype, a: std.mem.Allocator, state: source.State, catalog_digest: source.Digest, transfer: @import("source_plan_delivery.zig").Transfer, context: Context) !void {
@@ -323,7 +365,28 @@ pub fn stage(
     snapshot: ?@import("../metadata/source_scope_capture.zig").Snapshot,
     context: Context,
 ) !void {
-    return stageBound(svc, admission, a, binding, catalog_digest, input, tables, snapshot, null, context);
+    stageBound(svc, admission, a, binding, catalog_digest, input, tables, snapshot, null, context) catch |err| switch (err) {
+        error.SourceRetainedPlanRequired => {
+            const raw = try source.readOnService(svc, a, binding.table_id, binding.source_id, context);
+            defer a.free(raw);
+            var state = try source.parse(a, raw);
+            defer state.deinit();
+            if (!std.meta.eql(state.value.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;
+            const pending = state.value.pending orelse return error.SourcePendingWork;
+            const logical: source.LogicalInput = .{
+                .source_sequence = pending.sequence,
+                .batch_id = input.batch_id,
+                .checkpoint = input.checkpoint,
+                .expected_checkpoint = input.expected_checkpoint,
+                .payload_digest = input.payload_digest,
+                .accepted_at_ns = pending.accepted_at_ns,
+            };
+            if (!std.meta.eql(try pending.inputFingerprint(binding), try source.inputFingerprint(binding, logical)))
+                return error.SourcePayloadConflict;
+            return replanRetained(svc, admission, a, state.value, catalog_digest, snapshot, context);
+        },
+        else => return err,
+    };
 }
 
 fn stageBound(
@@ -345,6 +408,7 @@ fn stageBound(
     const current = state.value;
     if (!current.scope_fencing or current.closing or current.retired or
         !std.meta.eql(current.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;
+    if (current.checkpoint_transfer_target != null) return error.SourcePendingWork;
     const authority = current.checkpoint_authority orelse return error.SourceBindingConflict;
     const ledger = current.artifact_control orelse return error.SourceBindingConflict;
     const previous: ?[]const u8 = if (current.accepted.sequence == 0) null else current.accepted.checkpoint;
@@ -379,6 +443,7 @@ fn stageBound(
     if (std.mem.allEqual(u8, &txn_id, 0)) txn_id[15] = 1;
     if (current.pending) |pending| {
         if (!std.meta.eql(try pending.inputFingerprint(binding), purpose)) return error.SourcePayloadConflict;
+        if (replanning and retained_bindings == null) return error.SourceRetainedPlanRequired;
         if (!replanning) {
             const record = ledger.current orelse return error.SourcePendingWork;
             switch (record.phase) {
@@ -452,12 +517,9 @@ fn stageBound(
     const commit_version = std.math.add(u64, accepted_at, 1) catch return error.InvalidTxnRecord;
     var frozen = try @import("source_destination_plan.zig").Frozen.init(a, &prepared.plan, authority, quota, commit_version);
     defer frozen.deinit();
-    if (replanning and admission.retained_payload_store == null) return error.SourcePayloadStorageUnavailable;
-    if (admission.retained_payload_store) |configured| {
-        _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, source.retained_payload_protocol_version);
-        var store = configured;
-        try frozen.retain(&store, context);
-    }
+    var retained = admission.retained_payload_store orelse return error.SourcePayloadStorageUnavailable;
+    _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, source.retained_payload_protocol_version);
+    try frozen.retain(&retained, context);
     const plan = try frozen.manifest.deliveryPlan(a, frozen.encoded_manifest);
     const mutation: source.Mutation = if (replanning) .{ .replan = .{
         .reservation_digest = original_id.?,
@@ -481,7 +543,7 @@ fn stageBound(
         .delivery_manifest = plan.manifest,
         .artifact = plan.artifact,
         .retain_manifest = true,
-        .retain_payload = frozen.manifest.retained_payload != null,
+        .retain_payload = true,
     } };
     try mutate(svc, a, binding, catalog_digest, current, mutation, context);
 
@@ -491,6 +553,7 @@ fn stageBound(
     defer reserved.deinit();
     if (reserved.value.closing or reserved.value.retired or
         !std.meta.eql(reserved.value.scope, @as(?source.Scope, binding))) return error.SourceBindingConflict;
+    if (reserved.value.checkpoint_transfer_target != null) return error.SourcePendingWork;
     const pending = reserved.value.pending orelse return error.SourceOutcomeUnresolved;
     const record = reserved.value.artifact_control.?.current orelse return error.SourceOutcomeUnresolved;
     if (!std.meta.eql(pending.plan_digest, plan.digest) or !std.meta.eql(record.reservation, pending.identity(binding)))

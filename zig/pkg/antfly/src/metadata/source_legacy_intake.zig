@@ -90,6 +90,72 @@ fn writeIndex(txn: anytype, group: u64, scope: control.Scope, kind: Lookup, by_d
     }
 }
 
+pub const CheckpointActor = struct {
+    table_id: u64,
+    source_id: control.Digest,
+};
+pub const CheckpointPage = struct {
+    actors: [32]CheckpointActor = undefined,
+    len: usize = 0,
+
+    pub fn items(self: *const CheckpointPage) []const CheckpointActor {
+        return self.actors[0..self.len];
+    }
+};
+
+fn checkpointPrefix(buffer: []u8, group: u64, owner_group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata_derived__:source_scope:{d}:checkpoint:{d}:", .{ group, owner_group });
+}
+
+fn checkpointKey(buffer: []u8, group: u64, owner_group: u64, actor: CheckpointActor) ![]const u8 {
+    const prefix = try checkpointPrefix(buffer, group, owner_group);
+    if (buffer.len - prefix.len < 40) return error.NoSpaceLeft;
+    std.mem.writeInt(u64, buffer[prefix.len..][0..8], actor.table_id, .big);
+    @memcpy(buffer[prefix.len..][8..40], &actor.source_id);
+    return buffer[0 .. prefix.len + 40];
+}
+
+fn writeCheckpointIndex(txn: anytype, group: u64, owner_group: u64, scope: control.Scope, add: bool) !void {
+    var buffer: [160]u8 = undefined;
+    const key = try checkpointKey(&buffer, group, owner_group, .{ .table_id = scope.table_id, .source_id = scope.source_id });
+    if (add) return txn.put(key, "");
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+
+pub fn checkpointActors(txn: anytype, group: u64, owner_group: u64, after: ?CheckpointActor) !CheckpointPage {
+    if (group == 0 or owner_group == 0) return error.InvalidSourceControl;
+    var prefix_buffer: [160]u8 = undefined;
+    const prefix = try checkpointPrefix(&prefix_buffer, group, owner_group);
+    var after_buffer: [161]u8 = undefined;
+    const seek = if (after) |actor| next: {
+        const key = try checkpointKey(&after_buffer, group, owner_group, actor);
+        after_buffer[key.len] = 0;
+        break :next after_buffer[0 .. key.len + 1];
+    } else prefix;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var page: CheckpointPage = .{};
+    var row = try cursor.seekAtOrAfter(seek);
+    while (row) |entry| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+        const suffix = entry.key[prefix.len..];
+        if (suffix.len != 40 or entry.value.len != 0) return error.InvalidSourceControl;
+        const actor: CheckpointActor = .{ .table_id = std.mem.readInt(u64, suffix[0..8], .big), .source_id = suffix[8..40].* };
+        if (actor.table_id == 0 or std.mem.allEqual(u8, &actor.source_id, 0)) return error.InvalidSourceControl;
+        page.actors[page.len] = actor;
+        page.len += 1;
+        if (page.len == page.actors.len) break;
+    }
+    return page;
+}
+
+fn checkpointGroup(state: control.State) ?u64 {
+    return if (live(state)) state.checkpoint_authority.?.owner.group_id else null;
+}
+
 pub fn indexTransition(txn: anytype, group: u64, before: control.State, after: control.State) !void {
     const same_scope = std.meta.eql(before.scope, after.scope);
     if (!same_scope) {
@@ -102,6 +168,12 @@ pub fn indexTransition(txn: anytype, group: u64, before: control.State, after: c
             try writeIndex(txn, group, scope, .legacy_gate, true, true);
         }
     }
+    const before_owner = checkpointGroup(before);
+    const after_owner = checkpointGroup(after);
+    if (!same_scope or before_owner != after_owner) {
+        if (before_owner) |owner| try writeCheckpointIndex(txn, group, owner, before.scope.?, false);
+        if (after_owner) |owner| try writeCheckpointIndex(txn, group, owner, after.scope.?, true);
+    }
     if (!same_scope or live(before) != live(after)) {
         if (live(before)) try writeIndex(txn, group, before.scope.?, .recovery, false, false);
         if (live(after)) try writeIndex(txn, group, after.scope.?, .recovery, false, true);
@@ -113,7 +185,7 @@ pub fn rebuild(a: std.mem.Allocator, txn: anytype, group: u64) !void {
     const prefix = try std.fmt.bufPrint(&prefix_buffer, "\x00\x00__metadata__:source_control:{d}:state:", .{group});
     var resume_buffer: [257]u8 = undefined;
     var seek_key: []const u8 = prefix;
-    const Candidate = struct { scope: control.Scope, recoverable: bool };
+    const Candidate = struct { scope: control.Scope, owner_group: ?u64 };
     var page: [128]Candidate = undefined;
     while (true) {
         var count: usize = 0;
@@ -131,7 +203,7 @@ pub fn rebuild(a: std.mem.Allocator, txn: anytype, group: u64) !void {
                     var expected: [256]u8 = undefined;
                     if (!std.mem.eql(u8, entry.key, try control.keyForGroup(&expected, group, scope.table_id, scope.source_id)))
                         return error.InvalidSourceControl;
-                    page[count] = .{ .scope = scope, .recoverable = live(parsed.value) };
+                    page[count] = .{ .scope = scope, .owner_group = checkpointGroup(parsed.value) };
                     count += 1;
                 }
                 scanned += 1;
@@ -149,7 +221,10 @@ pub fn rebuild(a: std.mem.Allocator, txn: anytype, group: u64) !void {
         for (page[0..count]) |entry| {
             try writeIndex(txn, group, entry.scope, .legacy_gate, false, true);
             try writeIndex(txn, group, entry.scope, .legacy_gate, true, true);
-            if (entry.recoverable) try writeIndex(txn, group, entry.scope, .recovery, false, true);
+            if (entry.owner_group) |owner| {
+                try writeIndex(txn, group, entry.scope, .recovery, false, true);
+                try writeCheckpointIndex(txn, group, owner, entry.scope, true);
+            }
         }
         if (exhausted) return;
     }

@@ -36,14 +36,14 @@ pub const Scope = struct {
         return initWithEpoch(a, group, table, owner, false, context);
     }
 
-    pub fn initWithEpoch(a: A, group: u64, table: []const u8, owner: Owner, allow_newer_epoch: bool, context: operation.RequestContext) !Scope {
+    pub fn initWithEpoch(a: A, group: u64, table: []const u8, owner: Owner, allow_refreshed_epoch: bool, context: operation.RequestContext) !Scope {
         try context.ensureActive();
         if (group == 0 or table.len == 0 or table.len > 1024 or context.catalog_route_fence_json.len == 0 or context.catalog_route_fence_json.len > 16384) return error.InvalidCatalogRouteFence;
         var parsed = try std.json.parseFromSlice(metadata.CatalogRouteFence, a, context.catalog_route_fence_json, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
         errdefer parsed.deinit();
         var fence = parsed.value;
         var routed = owner;
-        if (allow_newer_epoch and fence.topology_epoch >= owner.topology_epoch)
+        if (allow_refreshed_epoch)
             routed.topology_epoch = fence.topology_epoch;
         try requireFence(routed, fence);
         if (fence.route.group_id != group) return error.InvalidCatalogRouteFence;

@@ -14,6 +14,21 @@ authenticated commit hooks, and managed archive publication is described in
 It builds on this subsystem's canonical apply, metadata ownership, and durable
 checkpoint contracts; it does not imply those additional source APIs exist today.
 
+## Recoverable native CDC intake
+
+For native CDC intake with exact cutover or automatic handoff, configure the
+same provisioned replication spool on every metadata node that can lead the
+catalog. Run `antfly storage provision-pgwire-spool DIRECTORY` on the shared
+mount, then set `pgwire.replication_spool.directory` and
+`pgwire.replication_spool.namespace` in those nodes' config. The intake worker
+uses the spool even when the pgwire listener is disabled.
+
+Keep the payload and fencing inventory on the same mount. The filesystem must
+support cross-node advisory locking, atomic rename, and durable file and
+directory synchronization. The metadata worker writes the frozen delivery
+before it reserves the destination upload. A successor can then inspect the
+original attempt and recover without rereading provider rows.
+
 ## Outbound PostgreSQL logical replication
 
 A native data node can serve a configured Antfly publication over pgwire. The

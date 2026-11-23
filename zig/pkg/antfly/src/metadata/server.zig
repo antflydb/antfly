@@ -134,6 +134,8 @@ const MetadataSessions = struct {
     }
 };
 
+const CdcPayloadFiles = @import("../serverless/artifacts/fs_store.zig").FsStore;
+
 pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
@@ -148,6 +150,7 @@ pub const MetadataServer = struct {
     owned_kernel_owner_source: ?*MetadataKernelOwnerSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_sessions: ?*MetadataSessions = null,
+    owned_cdc_payload_files: ?*CdcPayloadFiles = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
     http_observer_lease: ?@import("antfly_local_sources").storage_background_runtime.BackendRuntime.WorkerLease = null,
     owned_http_runtime: ?*httpx.HttpRuntime = null,
@@ -175,6 +178,11 @@ pub const MetadataServer = struct {
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
         var service_cfg = cfg.service;
+        var owned_cdc_payload_files: ?*CdcPayloadFiles = null;
+        errdefer if (owned_cdc_payload_files) |files| {
+            files.deinit();
+            alloc.destroy(files);
+        };
         if (service_cfg.cdc_payload_store == null) {
             const retention = @import("../api/source_payload_retention.zig");
             for ([_]?retention.Store{ cfg.api_server_cfg.pgwire_spool_store, cfg.api_server_cfg.document_artifact_store }) |candidate| {
@@ -184,6 +192,18 @@ pub const MetadataServer = struct {
                         break;
                     }
                 }
+            }
+            if (service_cfg.cdc_payload_store == null) {
+                const wire = if (cfg.api_server_cfg.node_config) |node| node.pgwire else null;
+                if (wire) |pgwire| if (pgwire.replication_spool) |spool| {
+                    const files = try alloc.create(CdcPayloadFiles);
+                    files.* = CdcPayloadFiles.initExisting(alloc, spool.directory) catch |err| {
+                        alloc.destroy(files);
+                        return err;
+                    };
+                    owned_cdc_payload_files = files;
+                    service_cfg.cdc_payload_store = try files.sharedSpoolArtifactStore(spool.namespace, .{});
+                };
             }
         }
         service_cfg.internal_service_secret = cfg.api_server_cfg.internal_service_secret;
@@ -509,6 +529,7 @@ pub const MetadataServer = struct {
             .owned_kernel_owner_source = owned_kernel_owner_source,
             .owned_public_http_server = owned_public_http_server,
             .owned_sessions = owned_sessions,
+            .owned_cdc_payload_files = owned_cdc_payload_files,
             .owned_admin_mux = owned_admin_mux,
             .http_observer_lease = http_observer_lease,
             .owned_http_runtime = owned_http_runtime,
@@ -577,6 +598,10 @@ pub const MetadataServer = struct {
         self.control_loop.deinit();
         self.svc.deinit();
         self.alloc.destroy(self.svc);
+        if (self.owned_cdc_payload_files) |files| {
+            files.deinit();
+            self.alloc.destroy(files);
+        }
         if (self.owned_hosted_shard_db) |hosted_db| self.alloc.destroy(hosted_db);
         if (self.owned_hosted_shard_ops) |hosted_ops| self.alloc.destroy(hosted_ops);
         self.* = undefined;

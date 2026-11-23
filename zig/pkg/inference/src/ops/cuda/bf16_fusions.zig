@@ -18,7 +18,7 @@ const driver = @import("driver.zig");
 
 // Native export names remain the compatibility ABI of the qualified PTX.
 const catalog = @import("../../tile/cuda_standalone.zig");
-const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profile(catalog.activation_bf16).image, catalog.activation_bf16_entries);
+const Program = @import("embedded_module.zig").EmbeddedModule(@import("embedded_module.zig").profileImage(catalog.activation_bf16), catalog.activation_bf16_entries);
 
 pub const Module = struct {
     program: Program = .{},

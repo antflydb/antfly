@@ -391,7 +391,8 @@ pub const iceberg_acceptance_status_version: u16 = 132;
 /// Version 138 persists scoped PostgreSQL stream health within the actor revision.
 /// Versions 251–253 track scoped completion wait, stall, and failure provenance.
 /// Version 254 binds route-independent payload retention to a source reservation.
-pub const current_version: u16 = @import("source_control.zig").retained_payload_protocol_version;
+/// Version 255 adopts an installed checkpoint on a topology successor.
+pub const current_version: u16 = @import("source_checkpoint_authority.zig").successor_protocol_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

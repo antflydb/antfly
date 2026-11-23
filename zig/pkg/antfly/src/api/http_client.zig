@@ -4045,7 +4045,6 @@ pub const ApiHttpClient = struct {
         if (comptime kind == .control) try input.validate(self.alloc) else try input.validate();
         var owner = if (kind == .scope or kind == .producer_closure or kind == .producer_control or kind == .legacy_terminal) input.owner else if (kind == .scope_control) input.owner() else if (kind == .control) try input.routedOwner(fence.topology_epoch) else input.source_owner;
         if (comptime kind == .checkpoint) {
-            if (fence.topology_epoch < owner.topology_epoch) return error.InvalidCatalogRouteFence;
             owner.topology_epoch = fence.topology_epoch;
         }
         const identity = fence.route.identity_namespace;

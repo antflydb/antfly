@@ -26,7 +26,62 @@ pub const FenceAttempt = struct {
     transaction_id: [16]u8,
     reservation: scope.Digest,
 };
-pub const Action = union(enum) { bind: void, close: void, drop: scope.Cut, fence_attempt: FenceAttempt };
+pub const CheckpointBytes = struct {
+    const capacity = @import("source_checkpoint.zig").max_record_bytes;
+    const encoded_capacity = std.base64.standard.Encoder.calcSize(capacity);
+    bytes: [capacity]u8 = @splat(0),
+    len: usize = 0,
+
+    pub fn fromSlice(raw: []const u8) !CheckpointBytes {
+        if (raw.len == 0 or raw.len > capacity) return error.InvalidSourceAdmission;
+        var result: CheckpointBytes = .{ .len = raw.len };
+        @memcpy(result.bytes[0..raw.len], raw);
+        return result;
+    }
+
+    pub fn slice(self: *const CheckpointBytes) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn jsonStringify(self: CheckpointBytes, stream: anytype) !void {
+        var buffer: [encoded_capacity]u8 = undefined;
+        try stream.write(std.base64.standard.Encoder.encode(&buffer, self.slice()));
+    }
+
+    pub fn jsonParse(a: A, source: anytype, options: std.json.ParseOptions) !CheckpointBytes {
+        return fromEncoded(try std.json.innerParse([]const u8, a, source, options));
+    }
+
+    pub fn jsonParseFromValue(a: A, value: std.json.Value, options: std.json.ParseOptions) !CheckpointBytes {
+        return fromEncoded(try std.json.innerParseFromValue([]const u8, a, value, options));
+    }
+
+    fn fromEncoded(encoded: []const u8) !CheckpointBytes {
+        if (encoded.len == 0 or encoded.len > encoded_capacity) return error.InvalidCharacter;
+        const len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidCharacter;
+        if (len == 0 or len > capacity) return error.InvalidCharacter;
+        var result: CheckpointBytes = .{ .len = len };
+        std.base64.standard.Decoder.decode(result.bytes[0..len], encoded) catch return error.InvalidCharacter;
+        return result;
+    }
+};
+pub const InstallCheckpoint = struct {
+    donor: scope.Record,
+    bytes: ?CheckpointBytes,
+
+    pub fn validate(self: *const InstallCheckpoint) !void {
+        if (self.bytes) |*bytes| {
+            if (bytes.len == 0 or bytes.len > CheckpointBytes.capacity or !std.mem.allEqual(u8, bytes.bytes[bytes.len..], 0))
+                return error.InvalidSourceAdmission;
+        }
+        try self.handoff().validate();
+    }
+
+    pub fn handoff(self: *const InstallCheckpoint) scope.CheckpointHandoff {
+        return .{ .donor = self.donor, .checkpoint = if (self.bytes) |*bytes| bytes.slice() else null };
+    }
+};
+pub const Action = union(enum) { bind: void, close: void, drop: scope.Cut, fence_attempt: FenceAttempt, close_checkpoint: void, install_checkpoint: InstallCheckpoint };
 pub const Intent = struct {
     version: u8,
     owner: completion.RoutedOwner,
@@ -38,6 +93,17 @@ pub const Intent = struct {
         try self.spec.validate();
         if (self.version != 1 or self.minimum_metadata_index == 0 or self.owner.metadata_group_id != self.spec.checkpoint_owner.metadata_group_id or !std.meta.eql(self.owner.metadata_incarnation, self.spec.checkpoint_owner.metadata_incarnation)) return error.InvalidSourceAdmission;
         if (self.action == .drop and (self.action.drop.term == 0 or self.action.drop.index == 0)) return error.InvalidSourceAdmission;
+        if (self.action == .close_checkpoint and !std.meta.eql(try scope.Basis.fromOwner(self.owner), self.spec.checkpoint_owner))
+            return error.InvalidSourceAdmission;
+        if (self.action == .install_checkpoint) {
+            const install = &self.action.install_checkpoint;
+            try install.validate();
+            const root = try scope.Basis.fromOwner(self.owner);
+            var successor = install.donor.spec;
+            successor.checkpoint_owner = root;
+            if (!std.meta.eql(successor, self.spec) or std.meta.eql(root, install.donor.spec.checkpoint_owner))
+                return error.InvalidSourceAdmission;
+        }
         if (self.action == .fence_attempt) {
             const attempt = self.action.fence_attempt;
             try attempt.reference.validate();
@@ -56,9 +122,10 @@ pub const Command = struct {
     pub fn validate(self: Command) !void {
         try self.intent.validate();
         const valid_version = switch (self.version) {
-            1 => self.intent.action != .fence_attempt,
+            1 => self.intent.action != .fence_attempt and self.intent.action != .install_checkpoint and self.intent.action != .close_checkpoint,
             2 => self.intent.action == .bind,
             3 => self.intent.action == .fence_attempt,
+            4 => self.intent.action == .bind or self.intent.action == .close_checkpoint or self.intent.action == .fence_attempt or (self.intent.action == .install_checkpoint and self.metadata_cut.index > self.intent.action.install_checkpoint.donor.close_metadata_index),
             else => false,
         };
         if (!valid_version or self.metadata_cut.index < self.intent.minimum_metadata_index or self.metadata_cut.group_id != self.intent.owner.metadata_group_id or !std.meta.eql(self.metadata_cut.incarnation, self.intent.owner.metadata_incarnation)) return error.InvalidSourceAdmission;
@@ -69,6 +136,19 @@ pub const Query = struct {
     owner: completion.RoutedOwner,
     domain: scope.Digest,
     minimum_applied_index: u64,
+    checkpoint_evidence: ?enum { donor, successor } = null,
+
+    pub fn jsonStringify(self: Query, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Query).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "checkpoint_evidence") or self.checkpoint_evidence != null) {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
+
     pub fn validate(self: Query) !void {
         try self.owner.validate();
         if (self.version != 1 or self.minimum_applied_index == 0 or std.mem.allEqual(u8, &self.domain, 0)) return error.InvalidSourceAdmission;
@@ -81,10 +161,49 @@ pub const Observation = struct {
     cut: scope.Cut,
     header: scope.Header,
     record: ?scope.Record,
+    checkpoint_install: ?scope.CheckpointInstallReceipt = null,
+    checkpoint_donor: ?InstallCheckpoint = null,
+
+    pub fn jsonStringify(self: Observation, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Observation).@"struct".field_names) |name| {
+            const evidence = comptime std.mem.eql(u8, name, "checkpoint_install") or std.mem.eql(u8, name, "checkpoint_donor");
+            const include = if (comptime evidence)
+                @field(self, name) != null
+            else
+                @TypeOf(@field(self, name)) != ?scope.Record or stream.options.emit_null_optional_fields or self.record != null;
+            if (include) {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
     pub fn validate(self: Observation, query: Query) !void {
         try query.validate();
         if (self.version != 1 or !std.meta.eql(self.owner, query.owner) or !std.meta.eql(self.domain, query.domain) or self.cut.term == 0 or self.cut.index < query.minimum_applied_index or !std.meta.eql(self.header.root, try scope.Basis.fromOwner(query.owner))) return error.SourceAdmissionCorrupt;
         try self.header.validate();
+        if ((query.checkpoint_evidence == .donor) != (self.checkpoint_donor != null) or
+            (query.checkpoint_evidence == .successor and self.checkpoint_install == null) or
+            (self.checkpoint_donor != null and self.checkpoint_install != null)) return error.SourceAdmissionCorrupt;
+        if (self.checkpoint_donor) |capture| {
+            try capture.validate();
+            if (self.record == null or !std.meta.eql(self.record.?, capture.donor) or
+                !std.meta.eql(capture.donor.spec.checkpoint_owner, self.header.root) or
+                capture.donor.closed_at.?.index > self.cut.index or
+                (capture.donor.closed_at.?.index == self.cut.index and capture.donor.closed_at.?.term != self.cut.term))
+                return error.SourceAdmissionCorrupt;
+        }
+
+        if (self.checkpoint_install) |install| {
+            try install.validate();
+            const record = self.record orelse return error.SourceAdmissionCorrupt;
+            if (!std.meta.eql(install.domain, self.domain) or !std.meta.eql(install.successor, self.header.root) or
+                !std.meta.eql(install.successor, record.spec.checkpoint_owner) or install.applied.index > self.cut.index or
+                (install.applied.index == self.cut.index and install.applied.term != self.cut.term) or
+                install.authorization.index > self.header.metadata_floor)
+                return error.SourceAdmissionCorrupt;
+        }
         if (self.record) |record| {
             try record.validate();
             if (!self.header.strict or self.header.domains == 0 or !std.meta.eql(record.spec.domain(), query.domain) or record.spec.checkpoint_owner.metadata_group_id != self.owner.metadata_group_id or !std.meta.eql(record.spec.checkpoint_owner.metadata_incarnation, self.owner.metadata_incarnation)) return error.SourceAdmissionCorrupt;
@@ -97,7 +216,16 @@ pub const Observation = struct {
 pub fn observe(a: A, txn: anytype, query: Query, applied: scope.Cut) !Observation {
     try query.validate();
     const root = try scope.Basis.fromOwner(query.owner);
-    const result: Observation = .{ .version = 1, .owner = query.owner, .domain = query.domain, .cut = applied, .header = try scope.Store.readHeader(a, txn, root), .record = try scope.Store.readRecord(a, txn, query.domain) };
+    var result: Observation = .{ .version = 1, .owner = query.owner, .domain = query.domain, .cut = applied, .header = try scope.Store.readHeader(a, txn, root), .record = try scope.Store.readRecord(a, txn, query.domain) };
+    if (query.checkpoint_evidence) |evidence| switch (evidence) {
+        .donor => {
+            const record = result.record orelse return error.SourceOutcomeUnresolved;
+            const handoff = try scope.Store.captureCheckpointHandoff(a, txn, root, record.spec, record.last_committed_sequence, null);
+            defer if (handoff.checkpoint) |raw| a.free(raw);
+            result.checkpoint_donor = .{ .donor = handoff.donor, .bytes = if (handoff.checkpoint) |raw| try CheckpointBytes.fromSlice(raw) else null };
+        },
+        .successor => result.checkpoint_install = (try scope.Store.readCheckpointInstall(a, txn, query.domain)) orelse return error.SourceOutcomeUnresolved,
+    };
     try result.validate(query);
     return result;
 }
@@ -114,8 +242,14 @@ pub fn apply(a: A, txn: anytype, gate: anytype, command: Command, applied: scope
     // Closure on an absent scope also enables strict admission. It needs the
     // same legacy handover as first binding; otherwise old workers could write.
     if (!header.strict) try gate.requireLegacyDrained(txn, root);
+    var checkpoint_install: ?scope.CheckpointInstallReceipt = null;
     switch (intent.action) {
-        .bind => _ = try scope.Store.bind(a, txn, root, intent.spec, command.metadata_cut),
+        .bind => _ = if (command.version == 4)
+            try scope.Store.bindAfterCheckpointTransfer(a, txn, root, intent.spec, command.metadata_cut)
+        else
+            try scope.Store.bind(a, txn, root, intent.spec, command.metadata_cut),
+        .close_checkpoint => try scope.Store.closeCheckpointForTransfer(a, txn, root, intent.spec, command.metadata_cut, applied),
+        .install_checkpoint => |*install| checkpoint_install = try scope.Store.installCheckpointHandoff(a, txn, root, install.handoff(), command.metadata_cut, applied),
         .close => {
             if (try scope.Store.readRecord(a, txn, intent.spec.domain()) != null) {
                 _ = try scope.Store.close(a, txn, root, intent.spec.domain(), intent.spec, command.metadata_cut, applied);
@@ -140,7 +274,11 @@ pub fn apply(a: A, txn: anytype, gate: anytype, command: Command, applied: scope
             try scope.Store.drop(a, txn, root, intent.spec.domain(), command.metadata_cut, intent.spec.generation, closed_at);
         },
     }
-    return observe(a, txn, .{ .version = 1, .owner = intent.owner, .domain = intent.spec.domain(), .minimum_applied_index = applied.index }, applied);
+    const query: Query = .{ .version = 1, .owner = intent.owner, .domain = intent.spec.domain(), .minimum_applied_index = applied.index };
+    var result = try observe(a, txn, query, applied);
+    result.checkpoint_install = checkpoint_install;
+    try result.validate(query);
+    return result;
 }
 pub fn decodeCommand(a: A, bytes: []const u8) !Command {
     if (bytes.len == 0 or bytes.len > max_bytes) return error.InvalidSourceAdmission;

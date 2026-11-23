@@ -2759,6 +2759,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.getSourceControl(a, group_id, input.table_id, input.source_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .source_checkpoint_actors => |input| {
+                    const page = handle.store.sourceCheckpointActors(group_id, input.owner_group, input.after) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, page.items());
+                },
                 .legacy_source_intake => |input| {
                     const value = handle.store.legacyReplicationSourceIntakeAllowed(a, group_id, input.table_id, input.ordinal, input.definition) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
