@@ -539,7 +539,6 @@
       "command": [
         "zig",
         "build",
-        "antfly-api-sql-using-lifecycle-test",
         "sql-test",
         "-Doptimize=Debug",
         "-Dtest-filter=SQL temporal cast",
@@ -567,12 +566,25 @@
       "command": [
         "zig",
         "build",
-        "antfly-api-sql-using-lifecycle-test",
         "antfly-sql-using-transform-test",
         "antfly-checks-catalog-identity-test",
         "sql-test",
         "-Doptimize=Debug",
         "-Dtest-filter=SQL USING rewrite identity",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-using-mounted-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-using-lifecycle-test",
+        "-Dtest-filter=mounted SQL original USING conversions",
+        "-Dtest-filter=SQL parity timestamp comparison",
+        "-Dtest-filter=SQL rewrite response retains",
+        "-Doptimize=Debug",
         "-j1"
       ],
       "cwd": "zig",
@@ -20186,7 +20198,7 @@
         {
           "path": "zig/pkg/antfly/src/api/sql/testing/lifecycle/sql_schema_lifecycle_integration_test.zig",
           "test": "mounted SQL original USING conversions transform historical rows preserve future writes and recover cold owners",
-          "gate": "sql-qualified-temporal-cast-admission-native-debug"
+          "gate": "sql-qualified-using-mounted-debug"
         },
         {
           "path": "zig/pkg/antfly-embedded/src/sql/scalar.zig",
@@ -20208,7 +20220,7 @@
         {
           "path": "zig/pkg/antfly/src/api/sql/testing/lifecycle/sql_schema_lifecycle_integration_test.zig",
           "test": "mounted SQL original USING conversions transform historical rows preserve future writes and recover cold owners",
-          "gate": "sql-qualified-using-rewrite-native-debug"
+          "gate": "sql-qualified-using-mounted-debug"
         },
         {
           "path": "zig/pkg/antfly-embedded/src/storage/db/relational/schema_change/rewrite_staging_test.zig",
@@ -20235,7 +20247,7 @@
         {
           "path": "zig/pkg/antfly/src/api/sql/testing/lifecycle/sql_schema_lifecycle_integration_test.zig",
           "test": "mounted SQL original USING conversions transform historical rows preserve future writes and recover cold owners",
-          "gate": "sql-qualified-using-rewrite-native-debug"
+          "gate": "sql-qualified-using-mounted-debug"
         },
         {
           "path": "zig/pkg/antfly-embedded/src/storage/db/relational/rows/row_transform_test.zig",

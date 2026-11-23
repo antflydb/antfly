@@ -68,7 +68,7 @@ pub const Store = struct {
         for (row.values) |value| bytes +|= try operators.datumBytes(value);
         if (self.pending.items.len != 0) {
             const window = @min(64 * 1024, self.file.manager.max_record_bytes / 4);
-            const available = @import("memory_budget.zig").headroom(self.a) orelse window * 4;
+            const available = @import("memory_budget.zig").headroom(self.a) orelse std.math.maxInt(usize);
             if (self.pending.items.len >= 64 or bytes > @min(window, available / 4) -| self.bytes) try self.flush();
         }
         const a = self.arena.allocator();
