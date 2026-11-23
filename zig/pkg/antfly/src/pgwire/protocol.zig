@@ -1603,10 +1603,11 @@ pub const Session = struct {
                     const sql = std.mem.trim(u8, statement, " \t\r\n");
                     const clear_path = std.ascii.eqlIgnoreCase(sql, "SELECT pg_catalog.set_config('search_path', '', false);");
                     const directory_mode = std.ascii.eqlIgnoreCase(sql, "SHOW data_directory_mode");
-                    if (self.replication != null and self.status == .idle and (clear_path or directory_mode)) {
-                        const owner = self.replication orelse return error.UnsupportedReplicationMode;
-                        const request_value = self.request(statement, &.{}, &.{});
-                        try owner.authorizeRequest(arena.allocator(), request_value, null);
+                    if ((self.replication != null or self.logical != null) and self.status == .idle and (clear_path or directory_mode)) {
+                        // These commands expose only connection-local settings.
+                        // Both logical backends have authorized startup.
+                        if (self.replication) |owner|
+                            try owner.authorizeRequest(arena.allocator(), self.request(statement, &.{}, &.{}), null);
                         if (clear_path) self.namespace_setting = .{};
                         const result: backend.Result = if (clear_path) .{
                             .columns = &.{.{ .name = "set_config", .type = .string }},

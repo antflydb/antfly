@@ -5052,6 +5052,8 @@ test "pgwire logical walsender authenticates before CopyBoth and serializes feed
     var input = std.Io.Writer.Allocating.init(a);
     defer input.deinit();
     try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "SELECT pg_catalog.set_config('search_path', '', false);\x00");
+    try frame(&input.writer, 'Q', "SHOW data_directory_mode\x00");
     try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
     try frame(&input.writer, 'Q', "START_REPLICATION SLOT testslot LOGICAL 0/1 (proto_version '1', publication_names 'p')\x00");
     try frame(&input.writer, 'd', "feedback");
@@ -5066,6 +5068,10 @@ test "pgwire logical walsender authenticates before CopyBoth and serializes feed
         try session.run();
     }
     try std.testing.expectEqual(@as(usize, 2), fixture.actions);
+    try std.testing.expectEqual(@as(usize, 0), fixture.mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "set_config\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "data_directory_mode\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "0700") != null);
     try std.testing.expect(fixture.stopped and fixture.closed);
     const messages = try tags(a, output.written());
     defer a.free(messages);
