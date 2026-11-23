@@ -23606,9 +23606,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var bias_shape: [1]i64 = undefined;
         const bias = try self.borrowedZeroBiasBuf(&bias_view, &bias_shape, out_dim);
         const slot = (try self.ensureDynamicLinearSlot(weight, bias, in_dim, out_dim)) orelse return false;
-        if (!try decoderRuntimeApplyLinearIntoOp(ctx, &.{ .slot = slot, .input = input, .in_dim = in_dim, .out_dim = out_dim }, output)) return false;
-        tensor.invalidateHostMirror();
-        return true;
+        return decoderRuntimeApplyLinearIntoOp(ctx, &.{ .slot = slot, .input = input, .in_dim = in_dim, .out_dim = out_dim }, output);
     }
 
     fn linearNoBiasOpWithPlannedDispatch(
@@ -40381,23 +40379,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn denseDecoderProjectionInto(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor, inputs: []const CT, destination: CT, mode: @import("kernel_backend.zig").ProjectionMode) !bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!denseDecoderAvailable(ctx) or descriptor.operation != .linear or !supportsAssignedDescriptor(descriptor)) return false;
+        if (!denseDecoderAvailable(ctx) or descriptor.operation != .linear) return false;
         const dims = descriptor.operation.linear;
         if (inputs.len != descriptor.input_count or inputs.len != (if (dims.bias) @as(usize, 3) else 2)) return false;
+        var matrix_descriptor = descriptor.*;
+        const input_shape = descriptor.input_shapes[0];
+        if (input_shape.rank() == 3 and input_shape.dim(0) == 1) {
+            matrix_descriptor.input_shapes[0] = ml.graph.Shape.init(input_shape.dtype, input_shape.dims[1..3]);
+        }
+        if (!supportsAssignedDescriptor(&matrix_descriptor)) return false;
         const output = (try self.projectionDestination(destination)) orelse return false;
         for (inputs, descriptor.input_shapes[0..inputs.len]) |value, shape| {
             const tensor = denseDeviceF32(value) orelse return false;
             if (tensor.device.?.ref.runtime != output.device.?.ref.runtime or projectionRangesOverlap(tensor, output.*) or tensor.ndim() != shape.rank()) return false;
             for (tensor.shape(), shape.dims[0..shape.rank()]) |actual, logical| if (actual != logical) return false;
+            const elements = std.math.cast(usize, shape.numElements() orelse return false) orelse return false;
+            const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return false;
+            if (bytes != tensor.deviceByteLen()) return false;
         }
-        const input = denseDeviceF32(inputs[0]).?;
-        if (!sameDenseProjectionShape(input, dims.rows, dims.in_dim) or !sameDenseProjectionShape(output.*, dims.rows, dims.out_dim)) return false;
+        var input = denseDeviceF32(inputs[0]).?;
+        if (!sameDenseProjectionShape(output.*, dims.rows, dims.out_dim)) return false;
         const slot = self.assignedLinearSlot(.{ .descriptor = descriptor, .inputs = inputs, .output = null }) orelse return false;
         switch (metal_runtime.termite_metal_decode_runtime_linear_slot_dtype(self.provider_impl.raw_decode_runtime, slot)) {
             @backingInt(metal_runtime.DenseLinearSlotDtype.f32), @backingInt(metal_runtime.DenseLinearSlotDtype.f32_mps) => {},
             else => return false,
         }
         if (mode == .query) return true;
+        if (input_shape.rank() == 3) {
+            // This stack header borrows the original contiguous device span.
+            // Neither the backing nor its allocation is copied or released.
+            input.shape_len = 2;
+            input.shape_buf[0] = input.shape_buf[1];
+            input.shape_buf[1] = input.shape_buf[2];
+        }
         if (!try metal_runtime.decoderRuntimeApplyLinearDeviceInto(self.provider_impl, slot, input, dims.rows, dims.in_dim, dims.out_dim, output.*)) return error.PreparedDenseProjectionChanged;
         output.invalidateHostMirror();
         return true;
@@ -55995,6 +56009,14 @@ const PreparedDenseRegionFixture = struct {
                 try std.testing.expect(!try services.projectionInto(&cb, &descriptor, values[0..3], values[0], .query));
                 try std.testing.expect(try services.projectionInto(&cb, &descriptor, values[0..3], destination, .query));
                 try std.testing.expect(try services.projectionInto(&cb, &descriptor, values[0..3], destination, .apply));
+                const encoder = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&data, &.{ 1, 1, 64 }));
+                defer cb.free(encoder);
+                var cross_descriptor = descriptor;
+                cross_descriptor.input_shapes[0] = ml.graph.Shape.init(.f32, &.{ 1, 1, 64 });
+                const cross_inputs = [_]CT{ encoder, values[1], values[2] };
+                try std.testing.expect(!try services.projectionInto(&cb, &cross_descriptor, values[0..3], destination, .query));
+                try std.testing.expect(try services.projectionInto(&cb, &cross_descriptor, &cross_inputs, destination, .query));
+                try std.testing.expect(try services.projectionInto(&cb, &cross_descriptor, &cross_inputs, destination, .apply));
                 const actual = try cb.toFloat32(destination, a);
                 defer a.free(actual);
                 for (actual, expected[0]) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
