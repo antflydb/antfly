@@ -15562,6 +15562,8 @@ test "Qwen explicit cleanup refuses absent authority before backend or model acc
     // A decode context without a private program uses the same explicit
     // operation requirement, without consulting the poisoned callback table.
     const no_program = DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 0 };
+    try std.testing.expectError(error.BackendCleanupAuthorityRequired, applyAttentionWithCleanup(&backend, undefined, undefined, undefined, undefined, 0, 0, 0, 0, 0, 0, 0, false, &no_program, &boundary_without_operation));
+    try std.testing.expectError(error.BackendCleanupAuthorityRequired, reshape2dOwnedWithCleanup(&backend, std.testing.allocator, undefined, 0, 0, &no_program, &boundary_without_operation));
     try std.testing.expectError(error.BackendCleanupAuthorityRequired, validateDecoderForwardCleanup(&backend, &boundary_without_operation, &no_program));
     // The ordinary caller without an explicit cleanup stays a no-op here.
     try validateDecoderForwardCleanup(&backend, null, &no_program);
