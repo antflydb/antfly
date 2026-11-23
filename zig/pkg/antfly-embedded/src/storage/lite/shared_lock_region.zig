@@ -604,6 +604,8 @@ const FdEntry = struct {
     spare_descriptors: ?*FdEntry = null,
     unresolved_path: ?[]u8 = null,
     probing_identity: bool = false,
+    retry_identity_after_ns: u64 = 0,
+    identity_retry_delay_ns: u64 = 25 * std.time.ns_per_ms,
     /// Liveness slot indices *this process* has already claimed through
     /// some `Region` handle sharing this entry. `fcntl` locks are
     /// process-scoped, not per-claim: a second same-process attempt to
@@ -800,29 +802,43 @@ fn reserveDescriptor(io: Io, device: u64, path: []const u8, identity: ?file_iden
 
     if (unidentified_by_device.getPtr(device)) |bucket| {
         var active_probe = false;
-        var recoverable: ?usize = null;
         var occupied: usize = 0;
         for (bucket, 0..) |slot, i| {
             const entry = slot orelse continue;
             if (std.mem.eql(u8, entry.unresolved_path.?, path)) {
                 if (!entry.probing_identity) {
                     const attempts = attempted_repair orelse return error.RegionUnavailable;
-                    if (attempts[i]) return error.RegionUnavailable;
+                    if (attempts[i] or entry.retry_identity_after_ns > antfly_platform.time.monotonicNs()) return error.RegionUnavailable;
                     try startDescriptorRecovery(device, entry);
-                    attempts[i] = true;
                 }
+                if (entry.fd != -1) if (attempted_repair) |attempts| {
+                    attempts[i] = true;
+                };
                 try linkAdmissionWaiter(waiter, device, path);
                 return error.DescriptorOpening;
             }
             occupied += 1;
             active_probe = active_probe or entry.probing_identity;
-            if (!entry.probing_identity and attempted_repair != null and !attempted_repair.?[i] and recoverable == null) recoverable = i;
         }
         if (occupied == bucket.len) {
-            if (recoverable) |i| {
-                try startDescriptorRecovery(device, bucket[i].?);
-                attempted_repair.?[i] = true;
-            } else if (!active_probe) return error.RegionUnavailable;
+            if (attempted_repair) |attempts| {
+                const now = antfly_platform.time.monotonicNs();
+                var candidate: ?usize = null;
+                for (bucket, 0..) |slot, i| {
+                    const entry = slot.?;
+                    if (entry.probing_identity) {
+                        if (entry.fd != -1) attempts[i] = true;
+                    } else if (!attempts[i] and entry.retry_identity_after_ns <= now and candidate == null) {
+                        candidate = i;
+                    }
+                }
+                if (candidate) |i| {
+                    try startDescriptorRecovery(device, bucket[i].?);
+                    attempts[i] = true;
+                    active_probe = true;
+                }
+            }
+            if (!active_probe) return error.RegionUnavailable;
             try linkAdmissionWaiter(waiter, device, null);
             return error.DescriptorOpening;
         }
@@ -924,6 +940,8 @@ fn recoverDescriptor(device: u64, entry: *FdEntry) void {
     fd_registry_mutex.lockUncancelable(io);
     defer fd_registry_mutex.unlock(io);
     if (identity == null and fd_registry.count() != 0) {
+        entry.retry_identity_after_ns = antfly_platform.time.monotonicNs() +| entry.identity_retry_delay_ns;
+        entry.identity_retry_delay_ns = @min(entry.identity_retry_delay_ns * 2, std.time.ns_per_s);
         entry.probing_identity = false;
         wakeAdmissionWaiters(device, entry.unresolved_path.?);
         return;
@@ -3758,10 +3776,16 @@ test "shared lock region: identity failures are isolated to the unresolved path"
         if (entry != null) break i;
     } else return error.MissingSpareDescriptor;
     const pending = bucket[pending_slot].?;
+    try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, retry_path));
+    const failed_delay = pending.identity_retry_delay_ns;
+    try std.testing.expect(failed_delay > 25 * std.time.ns_per_ms);
+    // Keep this probe in cooldown even on a heavily loaded test machine.
+    pending.retry_identity_after_ns = std.math.maxInt(u64);
     for (0..3) |_| {
         try std.testing.expectError(error.RegionUnavailable, acquireProcessFd(io, retry_path));
         try std.testing.expect(unidentified_by_device.get(device).?[pending_slot] == pending);
     }
+    try std.testing.expectEqual(failed_delay, pending.identity_retry_delay_ns);
     try std.testing.expectEqual(@as(usize, 1), unidentified_by_device.count());
 
     const cached = try acquireProcessFd(io, first_path);
@@ -3773,6 +3797,7 @@ test "shared lock region: identity failures are isolated to the unresolved path"
     defer releaseProcessFd(io, unrelated);
     try std.testing.expect(unidentified_by_device.get(device).?[pending_slot] == pending);
     test_fail_specific_process_fd.store(-1, .release);
+    pending.retry_identity_after_ns = 0;
     const recovered = try acquireProcessFd(io, retry_path);
     defer releaseProcessFd(io, recovered);
     try std.testing.expect(!unidentified_by_device.contains(device));
