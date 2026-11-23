@@ -2367,10 +2367,29 @@ test "Metal compressed cyclic append writes only the newest physical rows" {
     try std.testing.expectEqual(info.encoded_key_capacity, unchanged.encoded_key_capacity);
     try std.testing.expectEqual(info.v_capacity, unchanged.v_capacity);
 
+    {
+        var growth = @import("../execution/runtime_observation.zig").Scope.init();
+        defer growth.deinit();
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_decode_runtime_reserve_attention_span_slot_buffers(
+            metal,
+            binding.slot,
+            @backingInt(owner.format),
+            2 * ring_tokens,
+            info.key_row_bytes,
+            width,
+        ));
+        const counters = growth.snapshot();
+        try std.testing.expectEqual(@as(u64, 1), counters.metal_command_submissions);
+        try std.testing.expectEqual(@as(u64, 1), counters.metal_command_waits);
+    }
+    const grown = try owner.slotInfo(binding.slot);
+    try std.testing.expect(info.encoded_key_handle != grown.encoded_key_handle);
+    try std.testing.expect(info.v_handle != grown.v_handle);
+
     var physical_values: [ring_tokens][width]f32 = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, info.v_handle, 0, &physical_values, @sizeOf(@TypeOf(physical_values))));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, grown.v_handle, 0, &physical_values, @sizeOf(@TypeOf(physical_values))));
     var physical_keys: [ring_tokens][width + @sizeOf(f32)]u8 = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, info.encoded_key_handle, 0, &physical_keys, @sizeOf(@TypeOf(physical_keys))));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime.termite_metal_buffer_download(metal, grown.encoded_key_handle, 0, &physical_keys, @sizeOf(@TypeOf(physical_keys))));
     for (physical_values, physical_keys, [_]f32{ 5, 6, 7, 4 }) |values, keys, expected| {
         for (values) |value| try std.testing.expectEqual(expected, value);
         const scale: f32 = @bitCast(std.mem.readInt(u32, keys[0..4], .little));

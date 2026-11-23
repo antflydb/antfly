@@ -39073,55 +39073,6 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
     }
 }
 
-// Copy an old (smaller) buffer's contents into its grown replacement.
-//
-// When the frame's planned compute encoder is OPEN, opening a blit encoder on
-// the same command buffer is illegal (two open encoders) and corrupts the
-// planned encoder — the next [encoder setComputePipelineState:] on it crashes
-// inside the AGX driver. This was the MTP speculative-decode k=2 segfault: the
-// donated-KV span buffer grew mid-frame inside the paged KV seed encode, whose
-// caller holds the open planned encoder. In that case encode the copy as a
-// compute dispatch on the SAME planned encoder (ordering + hazards handled by
-// the planned-range tracker). Without an open planned encoder the original
-// blit path is legal and preserved.
-static int termite_metal_decode_runtime_copy_grown_buffer(
-    termite_metal_decode_runtime *runtime,
-    id<MTLBuffer> old_buffer,
-    id<MTLBuffer> new_buffer,
-    size_t old_capacity,
-    int failure_code
-) {
-    if (runtime->active_frame_cb != nil && runtime->active_planned_compute_encoder != nil) {
-        if (runtime->copy_bytes_pipeline == nil || old_capacity > UINT32_MAX) return failure_code;
-        termite_metal_planned_encoder_range accesses[2];
-        if (termite_metal_planned_range_make(old_buffer, 0, old_capacity, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], failure_code) != 0 ||
-            termite_metal_planned_range_make(new_buffer, 0, old_capacity, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[1], failure_code) != 0 ||
-            termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 2, failure_code) != 0)
-        {
-            return failure_code;
-        }
-        // The runtime's reference to old_buffer is replaced by the caller; the
-        // frame must keep it alive until the copy executes at frame drain.
-        if (termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0) return failure_code;
-        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-        const uint32_t count = (uint32_t)old_capacity;
-        antfly_metal_set_compute_pipeline(encoder, (runtime->copy_bytes_pipeline));
-        termite_metal_bind_two_buffers(encoder, old_buffer, 0, new_buffer, 0, &count, sizeof(count));
-        antfly_metal_dispatch_threads(encoder, MTLSizeMake(old_capacity, 1, 1), MTLSizeMake(termite_metal_thread_width(runtime->copy_bytes_pipeline, old_capacity), 1, 1));
-        return 0;
-    }
-    bool frame_owned = false;
-    id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
-    if (command_buffer == nil) return failure_code;
-    if (!frame_owned && termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0) return failure_code;
-    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
-    if (blit == nil) return failure_code;
-    [blit copyFromBuffer:old_buffer sourceOffset:0 toBuffer:new_buffer destinationOffset:0 size:old_capacity];
-    [blit endEncoding];
-    if (termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, failure_code) != 0) return failure_code;
-    return 0;
-}
-
 static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -39132,30 +39083,73 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
     if (encoded_bytes == 0 || v_bytes == 0) return -2;
     @autoreleasepool {
         if (encoded_bytes > runtime->attention_span_encoded_key_capacities[slot] ||
-            runtime->attention_span_encoded_key_buffers[slot] == nil)
+            v_bytes > runtime->attention_span_v_capacities[slot] ||
+            runtime->attention_span_encoded_key_buffers[slot] == nil || runtime->attention_span_v_buffers[slot] == nil)
         {
-            id<MTLBuffer> old_buffer = runtime->attention_span_encoded_key_buffers[slot];
-            const size_t old_capacity = runtime->attention_span_encoded_key_capacities[slot];
-            id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:encoded_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
-            if (buffer == nil) return -5;
-            if (old_buffer != nil && old_capacity > 0) {
-                if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -10) != 0) return -10;
+            id<MTLBuffer> old_buffers[2] = { runtime->attention_span_encoded_key_buffers[slot], runtime->attention_span_v_buffers[slot] };
+            const size_t old_sizes[2] = { runtime->attention_span_encoded_key_capacities[slot], runtime->attention_span_v_capacities[slot] };
+            const size_t requested[2] = { encoded_bytes, v_bytes };
+            id<MTLBuffer> new_buffers[2] = { old_buffers[0], old_buffers[1] };
+            size_t new_sizes[2] = { old_sizes[0], old_sizes[1] };
+            size_t copy_bytes[2] = { 0, 0 };
+            for (size_t plane = 0; plane < 2; ++plane) {
+                if (old_buffers[plane] != nil && old_sizes[plane] >= requested[plane]) continue;
+                new_buffers[plane] = antfly_observe_metal_buffer([runtime->device newBufferWithLength:requested[plane] options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+                if (new_buffers[plane] == nil) return plane == 0 ? -5 : -6;
+                new_sizes[plane] = requested[plane];
+                if (old_buffers[plane] != nil) copy_bytes[plane] = old_sizes[plane];
             }
-            runtime->attention_span_encoded_key_buffers[slot] = buffer;
-            runtime->attention_span_encoded_key_capacities[slot] = encoded_bytes;
-        }
-        if (v_bytes > runtime->attention_span_v_capacities[slot] ||
-            runtime->attention_span_v_buffers[slot] == nil)
-        {
-            id<MTLBuffer> old_buffer = runtime->attention_span_v_buffers[slot];
-            const size_t old_capacity = runtime->attention_span_v_capacities[slot];
-            id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:v_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
-            if (buffer == nil) return -6;
-            if (old_buffer != nil && old_capacity > 0) {
-                if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -14) != 0) return -14;
+            if (copy_bytes[0] != 0 || copy_bytes[1] != 0) {
+                // An open planned compute encoder cannot share its command buffer
+                // with a blit encoder. Order both copies within that same scope.
+                if (runtime->active_frame_cb != nil && runtime->active_planned_compute_encoder != nil) {
+                    id<MTLComputePipelineState> pipeline = runtime->copy_bytes_pipeline;
+                    if (pipeline == nil) return -10;
+                    termite_metal_planned_encoder_range accesses[4];
+                    size_t access_count = 0;
+                    for (size_t plane = 0; plane < 2; ++plane) {
+                        const size_t bytes = copy_bytes[plane];
+                        if (bytes == 0) continue;
+                        if (bytes > UINT32_MAX ||
+                            termite_metal_planned_range_make(old_buffers[plane], 0, bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[access_count], -10) != 0 ||
+                            termite_metal_planned_range_make(new_buffers[plane], 0, bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[access_count + 1], -10) != 0 ||
+                            termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffers[plane]) != 0)
+                            return -10;
+                        access_count += 2;
+                    }
+                    if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, access_count, -10) != 0) return -10;
+                    id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+                    antfly_metal_set_compute_pipeline(encoder, pipeline);
+                    for (size_t plane = 0; plane < 2; ++plane) {
+                        const uint32_t count = (uint32_t)copy_bytes[plane];
+                        if (count == 0) continue;
+                        termite_metal_bind_two_buffers(encoder, old_buffers[plane], 0, new_buffers[plane], 0, &count, sizeof(count));
+                        antfly_metal_dispatch_threads(encoder, MTLSizeMake(count, 1, 1),
+                            MTLSizeMake(termite_metal_thread_width(pipeline, count), 1, 1));
+                    }
+                } else {
+                    bool frame_owned = false;
+                    id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+                    if (command_buffer == nil) return -10;
+                    if (!frame_owned) {
+                        for (size_t plane = 0; plane < 2; ++plane)
+                            if (copy_bytes[plane] != 0 && termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffers[plane]) != 0)
+                                return -10;
+                    }
+                    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
+                    if (blit == nil) return -10;
+                    for (size_t plane = 0; plane < 2; ++plane) {
+                        if (copy_bytes[plane] == 0) continue;
+                        [blit copyFromBuffer:old_buffers[plane] sourceOffset:0 toBuffer:new_buffers[plane] destinationOffset:0 size:copy_bytes[plane]];
+                    }
+                    [blit endEncoding];
+                    if (termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10) != 0) return -10;
+                }
             }
-            runtime->attention_span_v_buffers[slot] = buffer;
-            runtime->attention_span_v_capacities[slot] = v_bytes;
+            runtime->attention_span_encoded_key_buffers[slot] = new_buffers[0];
+            runtime->attention_span_v_buffers[slot] = new_buffers[1];
+            runtime->attention_span_encoded_key_capacities[slot] = new_sizes[0];
+            runtime->attention_span_v_capacities[slot] = new_sizes[1];
         }
         if (slot == 0) {
             runtime->attention_span_encoded_key_buffer = runtime->attention_span_encoded_key_buffers[0];
