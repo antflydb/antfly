@@ -2905,18 +2905,11 @@ pub const NativeGenerationPipeline = struct {
         var append_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = null;
         defer if (append_plan) |*plan| plan.deinit(self.allocator);
         if (appended_tokens > 0) {
-            const admitted = config.prefill_chunk_plan orelse return error.InvalidPrefillChunkPlan;
-            try admitted.validate();
-            if (admitted.prompt_tokens != tokens.len) return error.InvalidPrefillChunkPlan;
-            // Full-prompt admission already bounds logical-position workspace.
-            // Replan only the suffix, never increasing chunk or scratch bounds.
-            append_plan = try runtime.scheduler.native_generate.PrefillChunkPlan.init(
+            append_plan = try decoder_checkpoint.planRestoredSuffix(
                 self.allocator,
-                appended_tokens,
-                @min(admitted.max_chunk_rows, 256),
-                admitted.max_scratch_bytes,
-                admitted.fairness,
-                .fixed_ceiling,
+                config.prefill_chunk_plan,
+                tokens.len,
+                restored_tokens,
             );
             append_config.prefill_chunk_plan = append_plan.?;
             append_config.prefill_chunk_size = append_plan.?.max_chunk_rows;
@@ -3808,18 +3801,17 @@ pub const NativeGenerationPipeline = struct {
             if (compiled_prefix) |*prefix| self.compiled_media_prefix = prefix;
         }
         if (self.usesPjrtSession()) {
-            const capacity = @min(try std.math.add(usize, seq_len, max_tokens), self.gpt_config.max_position_embeddings);
-            const resident_decoder = @import("../execution/resident_decoder.zig");
-            const cache_candidate = try resident_decoder.select(self.session.?, self.pjrt_decoder_cache);
-            const whole_prefill = if (cache_candidate) whole: {
-                break :whole if (compiled_prefix) |*prefix| try prefix.cachedAdmission(seq_len, self.gpt_config.max_position_embeddings) else null;
-            } else null;
-            compiled_decoder = try resident_decoder.Decoder.initForRequest(self.allocator, self.session.?, self.pjrt_decoder_cache, .{ .limit = capacity, .prompt_rows = seq_len, .max_tokens = max_tokens, .query_rows = config.prefill_chunk_size, .whole_prefill = whole_prefill }, self.execution_control);
-            if (compiled_decoder == null and config.prefill_chunk_size != 0) {
-                if (compiled_prefix) |*prefix| {
-                    if (try prefix.ordinaryRows(seq_len, self.session.?) > config.prefill_chunk_size) return error.UnsupportedCompiledMediaPrefillChunking;
-                }
-            }
+            compiled_decoder = try @import("../execution/media_prefix.zig").prepareDecoder(
+                self.allocator,
+                self.session.?,
+                self.pjrt_decoder_cache,
+                if (compiled_prefix) |*prefix| prefix else null,
+                seq_len,
+                max_tokens,
+                self.gpt_config.max_position_embeddings,
+                config.prefill_chunk_size,
+                self.execution_control,
+            );
             if (compiled_decoder) |*decoder| {
                 self.compiled_decoder = decoder;
                 self.pjrt_decoder_cache_used = true;

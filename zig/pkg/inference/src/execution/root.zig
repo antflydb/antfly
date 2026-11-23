@@ -173,5 +173,6 @@ test {
 test {
     _ = @import("gemma4_native_plan.zig");
     _ = @import("resident_decoder.zig");
+    _ = @import("media_prefix.zig");
     _ = @import("decoder_checkpoint.zig");
 }

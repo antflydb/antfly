@@ -20,6 +20,41 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 const Session = @import("../backends/session.zig").Session;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
+const resident_decoder = @import("resident_decoder.zig");
+
+/// Admit cached or ordinary compiled prefill against the physical query
+/// bound of the selected route, including any media padding.
+pub fn prepareDecoder(
+    allocator: std.mem.Allocator,
+    session: Session,
+    requested_cache: ?bool,
+    prefix: ?*const Prefix,
+    prompt_rows: usize,
+    max_tokens: usize,
+    max_positions: usize,
+    query_rows: usize,
+    control: ?Control,
+) !?resident_decoder.Decoder {
+    const capacity = @min(try std.math.add(usize, prompt_rows, max_tokens), max_positions);
+    const cache_candidate = try resident_decoder.select(session, requested_cache);
+    const whole_prefill = if (cache_candidate) whole: {
+        break :whole if (prefix) |media| try media.cachedAdmission(prompt_rows, max_positions) else null;
+    } else null;
+    const decoder = try resident_decoder.Decoder.initForRequest(allocator, session, requested_cache, .{
+        .limit = capacity,
+        .prompt_rows = prompt_rows,
+        .max_tokens = max_tokens,
+        .query_rows = query_rows,
+        .whole_prefill = whole_prefill,
+    }, control);
+    if (decoder == null and query_rows != 0) {
+        if (prefix) |media| {
+            if (try media.ordinaryRows(prompt_rows, session) > query_rows) return error.UnsupportedCompiledMediaPrefillChunking;
+        }
+    }
+    return decoder;
+}
+
 pub const Prefix = struct {
     embeddings: Tensor,
     /// Zero preserves exact-shape execution; opt-in buckets bound padding.
@@ -101,14 +136,14 @@ pub const Prefix = struct {
         return .{ .prefix_rows = prefix_rows, .pad_embeddings = pad_embeddings, .staging_bytes = try add(usize, staging, metadata), .input_bytes = input };
     }
 
-    pub fn cachedAdmission(self: *const Prefix, prompt_rows: usize, maximum: usize) !@import("resident_decoder.zig").Decoder.WholePrefill {
+    fn cachedAdmission(self: *const Prefix, prompt_rows: usize, maximum: usize) !@import("resident_decoder.zig").Decoder.WholePrefill {
         const rows = try @import("resident_decoder.zig").prefillRowsFor(prompt_rows, maximum);
         const planned = try self.layout(prompt_rows, rows, true);
         return .{ .rows = rows, .input_bytes = planned.input_bytes, .host_staging_bytes = planned.staging_bytes };
     }
 
     /// The admission check and execution use the same physical query shape.
-    pub fn ordinaryRows(self: *const Prefix, prompt_rows: usize, session: Session) !usize {
+    fn ordinaryRows(self: *const Prefix, prompt_rows: usize, session: Session) !usize {
         if (self.bucket_rows > 256 or prompt_rows == 0) return error.InvalidInputShape;
         if (self.bucket_rows == 0) return prompt_rows;
         const cfg = @import("../architectures/session_factory.zig").getGptConfig(session) orelse return error.InvalidPreparedPrompt;
@@ -209,4 +244,14 @@ test "media prefix cached admission includes padded embeddings positions PLE vis
     var invalid = prefix;
     invalid.ple_ids = ids[0..2];
     try std.testing.expectError(error.InvalidPreparedPrompt, invalid.cachedAdmission(3, 1024));
+}
+
+test "media prefix admission enforces the padded ordinary query bound" {
+    const allocator = std.testing.allocator;
+    const config: @import("../models/gpt.zig").Config = .{ .max_position_embeddings = 32 };
+    // With caching disabled the planner reads only the model contract.
+    const session = Session{ .ptr = undefined, .vtable = undefined, .model_contract = .{ .decoder_config = &config } };
+    const prefix = Prefix{ .embeddings = undefined, .bucket_rows = 4 };
+    try std.testing.expectError(error.UnsupportedCompiledMediaPrefillChunking, prepareDecoder(allocator, session, false, &prefix, 3, 1, 32, 3, null));
+    try std.testing.expect((try prepareDecoder(allocator, session, false, &prefix, 3, 1, 32, 4, null)) == null);
 }

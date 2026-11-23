@@ -33,6 +33,31 @@ const decoder_forward = @import("decoder_forward.zig");
 const mtpProfileTimestamp = decoder_forward.profileTimestamp;
 const mtpProfileElapsedNs = decoder_forward.profileElapsedNs;
 const cudaReplayLastLogitsEnabled = decoder_forward.cudaReplayLastLogitsEnabled;
+
+const PrefillChunkPlan = runtime.scheduler.native_generate.PrefillChunkPlan;
+
+/// Full-prompt admission funds the logical-position workspace. The restored
+/// route retiles only the unprocessed suffix within that same budget.
+pub fn planRestoredSuffix(
+    allocator: std.mem.Allocator,
+    admitted_plan: ?PrefillChunkPlan,
+    prompt_tokens: usize,
+    restored_tokens: usize,
+) !PrefillChunkPlan {
+    const admitted = admitted_plan orelse return error.InvalidPrefillChunkPlan;
+    try admitted.validate();
+    if (admitted.prompt_tokens != prompt_tokens or restored_tokens >= prompt_tokens)
+        return error.InvalidPrefillChunkPlan;
+    return PrefillChunkPlan.init(
+        allocator,
+        prompt_tokens - restored_tokens,
+        @min(admitted.max_chunk_rows, 256),
+        admitted.max_scratch_bytes,
+        admitted.fairness,
+        .fixed_ceiling,
+    );
+}
+
 const writeF32LeFile = @import("../util/c_file.zig").writeF32LeFile;
 
 pub const Context = struct {
@@ -1297,4 +1322,22 @@ test "checkpoint shadow queries reject typed automatic replay before reading sou
     // No KV/allocator callback is permitted before the replay exclusion.
     var source: NativeDecodeState = undefined;
     try std.testing.expectError(error.UnsupportedCompactionQueryReplay, executor.collectAttentionMatchQueries(&.{ 1, 2 }, &source, .{}));
+}
+
+test "checkpoint suffix admission preserves the funded scratch and fairness bounds" {
+    const allocator = std.testing.allocator;
+    var admitted = try PrefillChunkPlan.init(allocator, 1024, 512, 4096, .shared, .balanced_candidate);
+    defer admitted.deinit(allocator);
+
+    var suffix = try planRestoredSuffix(allocator, admitted, 1024, 752);
+    defer suffix.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 272), suffix.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 256), suffix.max_chunk_rows);
+    try std.testing.expectEqual(admitted.max_scratch_bytes, suffix.max_scratch_bytes);
+    try std.testing.expectEqual(admitted.fairness, suffix.fairness);
+    try std.testing.expectEqual(@as(usize, 2), suffix.chunks.len);
+    try std.testing.expectEqual(@as(usize, 16), suffix.chunks[1].rows);
+    try std.testing.expectEqual(.prefer_quantized, suffix.chunks[1].weight_route_hint);
+    try std.testing.expectError(error.InvalidPrefillChunkPlan, planRestoredSuffix(allocator, admitted, 1023, 752));
+    try std.testing.expectError(error.InvalidPrefillChunkPlan, planRestoredSuffix(allocator, admitted, 1024, 1024));
 }
