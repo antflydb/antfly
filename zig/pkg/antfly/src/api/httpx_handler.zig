@@ -9096,7 +9096,6 @@ pub const AntflyApiHandler = struct {
                 login_timeout = @intCast(entry.value.integer);
             }
         }
-        const cancellation = requestCancellation(ctx);
         const connection: @import("sql/session/connection_record.zig").Record = .{
             .id = connection_id,
             .wire_epoch = try self.api_server.sql_connection_admission.executionInstance(self.api_server.embedding_provider_runtime.io),
@@ -9110,7 +9109,7 @@ pub const AntflyApiHandler = struct {
             .principal_instance = try http_server_mod.sqlPrincipalInstance(self.api_server, identity),
             .statement_timeout_ms = login_timeout,
         };
-        try self.runDurableSQLRouting(ctx.io, createLocalSQLConnection, .{ &self.api_server.txn_sessions, store, connection, now_ms, &cancellation }) catch |err| return sqlConnectionError(ctx, err);
+        try self.runDurableSQLRouting(ctx.io, createLocalSQLConnection, .{ &self.api_server.txn_sessions, store, connection, now_ms, operationContext(ctx, identity) }) catch |err| return sqlConnectionError(ctx, err);
         var native: @import("sql/session/command_execution.zig").Native = .{ .server = self.api_server, .context = operationContext(ctx, identity) };
         var native_controller: ?@import("sql/session/command_execution.zig").Controller = null;
         // Cover errors through response construction as well as enrollment.
@@ -9129,8 +9128,8 @@ pub const AntflyApiHandler = struct {
         return ctx.status(200).json(.{ .connection_id = &connection_id, .owner_node_id = owner, .expires_at_ms = now_ms +| @import("sql/session/connection_record.zig").ttl_ms, .database = parsed.value.database, .namespace = parsed.value.namespace });
     }
 
-    fn createLocalSQLConnection(registry: *transactions_api.SessionRegistry, store: *transactions_api.DurableSessionStore, connection: @import("sql/session/connection_record.zig").Record, now_ms: u64, cancellation: *const http_common.RequestCancellation) !void {
-        try cancellation.token().check();
+    fn createLocalSQLConnection(registry: *transactions_api.SessionRegistry, store: *transactions_api.DurableSessionStore, connection: @import("sql/session/connection_record.zig").Record, now_ms: u64, control: operation_contract.RequestContext) !void {
+        try control.ensureActive();
         try @import("sql/session/connections.zig").create(store, registry, connection, now_ms);
     }
 

@@ -121,8 +121,9 @@ const MetadataSessions = struct {
     }
     fn readControlled(ptr: *anyopaque, alloc: std.mem.Allocator, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLinearizableReadWithContext(context);
-        try context.ensureActive();
+        const request = try context.platformDeadline();
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
         const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
         return projected.openSessionRead(alloc, svc.metadata_group_id);
     }
