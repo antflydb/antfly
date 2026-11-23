@@ -6140,21 +6140,18 @@ pub const HBCIndex = struct {
         };
     }
 
-    pub fn runLsmMaintenanceStepBestEffort(self: *HBCIndex) !bool {
+    pub fn readyLsmMaintenanceScoreBestEffort(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
-            .lsm => |handle| blk: {
-                // An open HBC publication session suppresses compaction and
-                // ordinary flush work, but never a due WAL resource/durability
-                // checkpoint. Backend bulk-mode maintenance is pressure-only.
-                if (self.shouldSuppressRoutineMaintenance()) {
-                    const due = if (handle.backend.nextMaintenanceWakeDelayNsBestEffort()) |delay_ns|
-                        delay_ns == 0
-                    else
-                        false;
-                    if (!due) break :blk false;
-                }
-                break :blk try handle.backend.runMaintenanceStepBestEffort();
-            },
+            .lsm => |handle| handle.backend.readyMaintenanceScoreBestEffort(false),
+            .native, .native_catalog => 0,
+        };
+    }
+
+    pub fn runLsmMaintenanceStepBestEffort(self: *HBCIndex, due_only: bool) !bool {
+        return switch (self.env_owner) {
+            // An open HBC publication session suppresses routine work while
+            // allowing due resource and durability checkpoints.
+            .lsm => |handle| try handle.backend.runReadyMaintenanceStepBestEffort(due_only or self.shouldSuppressRoutineMaintenance()),
             .native, .native_catalog => false,
         };
     }

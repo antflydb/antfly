@@ -10154,6 +10154,18 @@ pub const IndexManager = struct {
         return delay_ns;
     }
 
+    pub fn hasReadyLsmMaintenanceWorkBestEffort(self: *IndexManager) bool {
+        if (!self.catalog_mutex.tryLockShared()) return false;
+        defer self.catalog_mutex.unlockShared();
+        for (self.text_indexes.items) |*entry| {
+            if (entry.persistent.readyLsmMaintenanceScoreBestEffort(false) != 0) return true;
+        }
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.readyLsmMaintenanceScoreBestEffort() != 0) return true;
+        }
+        return false;
+    }
+
     pub fn refreshLsmMaintenanceDebtHint(self: *IndexManager) void {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
@@ -10921,25 +10933,17 @@ pub const IndexManager = struct {
 
     fn runLsmObsoleteReclaimDueUnlocked(self: *IndexManager, comptime best_effort: bool) !bool {
         for (self.text_indexes.items) |*entry| {
-            if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                if (delay_ns == 0) {
-                    const progressed = if (best_effort)
-                        try entry.persistent.runLsmMaintenanceStepBestEffort()
-                    else
-                        try entry.persistent.runLsmMaintenanceStep();
-                    if (progressed) return true;
-                }
+            if (best_effort) {
+                if (try entry.persistent.runLsmMaintenanceStepBestEffort(true)) return true;
+            } else if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort() == @as(?u64, 0)) {
+                if (try entry.persistent.runLsmMaintenanceStep()) return true;
             }
         }
         for (self.dense_indexes.items) |*entry| {
-            if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
-                if (delay_ns == 0) {
-                    const progressed = if (best_effort)
-                        try entry.index.runLsmMaintenanceStepBestEffort()
-                    else
-                        try entry.index.runLsmMaintenanceStep();
-                    if (progressed) return true;
-                }
+            if (best_effort) {
+                if (try entry.index.runLsmMaintenanceStepBestEffort(true)) return true;
+            } else if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort() == @as(?u64, 0)) {
+                if (try entry.index.runLsmMaintenanceStep()) return true;
             }
         }
         return false;
@@ -10999,8 +11003,7 @@ pub const IndexManager = struct {
         var best_score: u64 = 0;
 
         for (self.text_indexes.items, 0..) |*entry, i| {
-            const raw_score = entry.persistent.lsmMaintenanceDebtHint();
-            const score = if (raw_score != 0) raw_score else if (entry.persistent.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
+            const score = entry.persistent.readyLsmMaintenanceScoreBestEffort(false);
             if (score > best_score) {
                 best_score = score;
                 best_kind = .text;
@@ -11008,8 +11011,7 @@ pub const IndexManager = struct {
             }
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
-            const raw_score = entry.index.lsmMaintenanceDebtHint();
-            const score = if (raw_score != 0) raw_score else if (entry.index.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| if (delay_ns == 0) @as(u64, 1) else @as(u64, 0) else @as(u64, 0);
+            const score = entry.index.readyLsmMaintenanceScoreBestEffort();
             if (score > best_score) {
                 best_score = score;
                 best_kind = .dense;
@@ -11020,8 +11022,8 @@ pub const IndexManager = struct {
         if (best_score == 0) return false;
         return switch (best_kind) {
             .none => false,
-            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStepBestEffort(),
-            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStepBestEffort(),
+            .text => try self.text_indexes.items[best_index].persistent.runLsmMaintenanceStepBestEffort(false),
+            .dense => try self.dense_indexes.items[best_index].index.runLsmMaintenanceStepBestEffort(false),
         };
     }
 
