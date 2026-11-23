@@ -7727,7 +7727,7 @@ pub const DB = struct {
         _ = try db.runLsmMaintenanceUntilIdle();
         db.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         try std.testing.expect(!db.source_pin_cleanup.due(monotonicTimeNs()));
-        try std.testing.expect(!backend.hasReadyMaintenanceWorkBestEffort());
+        try std.testing.expect(backend.readyMaintenanceScoreBestEffort(false) == 0);
 
         const revision = db.core.snapshot_replay_admission.quietRevision().?;
         try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
@@ -7781,6 +7781,49 @@ pub const DB = struct {
             try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(alloc, obsolete, 1024));
             try std.testing.expectEqual(@as(?u64, revision + i + 1), db.core.snapshot_replay_admission.quietRevision());
         }
+    }
+
+    test "db lsm maintenance skips a busy secondary index with cached debt" {
+        const alloc = std.testing.allocator;
+        var directory = try TestDirectory.init("busy-index-maintenance");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{
+            .start_optional_runtimes = false,
+            .start_index_workers = false,
+            .executor = .{ .backend = .manual },
+        });
+        defer db.close();
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        _ = try db.runLsmMaintenanceUntilIdle();
+        db.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+        db.core.index_manager.refreshLsmMaintenanceDebtHint();
+        try std.testing.expect(!db.source_pin_cleanup.due(monotonicTimeNs()));
+        try std.testing.expect(!db.core.primary_store_owner.hasReadyLsmMaintenanceWorkBestEffort());
+        try std.testing.expect(!db.core.index_manager.hasReadyLsmMaintenanceWorkBestEffort());
+
+        const text = db.core.textIndexEntry("text").?.persistent;
+        const backend = switch (text.main_store_owner) {
+            .lsm => |handle| handle.backend,
+            else => return error.TestUnexpectedResult,
+        };
+        const revision = db.core.snapshot_replay_admission.quietRevision().?;
+        backend.notePotentialMaintenanceDebt();
+        try std.testing.expect(db.core.index_manager.hasReadyLsmMaintenanceWorkBestEffort());
+        {
+            try std.testing.expect(text.storage_mu.tryLock());
+            defer text.storage_mu.unlock(std.testing.io);
+            try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+            try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+        }
+        {
+            try std.testing.expect(backend.mu.tryLock());
+            defer backend.mu.unlock();
+            try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+            try std.testing.expectEqual(@as(?u64, revision), db.core.snapshot_replay_admission.quietRevision());
+        }
+        try std.testing.expect(!try db.runLsmMaintenanceStepBestEffort());
+        try std.testing.expectEqual(@as(?u64, revision + 1), db.core.snapshot_replay_admission.quietRevision());
+        try std.testing.expectEqual(@as(u64, 0), backend.maintenanceDebtHint());
     }
 
     test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {

@@ -3332,10 +3332,10 @@ pub const Backend = struct {
 
     /// Keep the readiness recheck, attempt, and any stale-debt refresh in
     /// the same lock acquisition. Contention never falls through to scoring.
-    pub fn runReadyMaintenanceStepBestEffort(self: *Backend) !bool {
+    pub fn runReadyMaintenanceStepBestEffort(self: *Backend, due_only: bool) !bool {
         if (!self.mu.tryLock()) return false;
         defer self.unlockWithReclamation();
-        if (!self.maintenanceWorkReadyLocked()) return false;
+        if (self.readyMaintenanceScoreLocked(due_only) == 0) return false;
         const progressed = try self.runMaintenanceStepLocked(false);
         if (!progressed and self.maintenanceDebtHint() != 0) {
             _ = self.refreshCachedMaintenanceHintLocked();
@@ -8939,14 +8939,17 @@ pub const Backend = struct {
         return self.nextMaintenanceWakeDelayNsLocked();
     }
 
-    pub fn hasReadyMaintenanceWorkBestEffort(self: *Backend) bool {
-        if (!self.mu.tryLock()) return false;
+    pub fn readyMaintenanceScoreBestEffort(self: *Backend, due_only: bool) u64 {
+        if (!self.mu.tryLock()) return 0;
         defer self.mu.unlock();
-        return self.maintenanceWorkReadyLocked();
+        return self.readyMaintenanceScoreLocked(due_only);
     }
 
-    fn maintenanceWorkReadyLocked(self: *Backend) bool {
-        return self.maintenanceDebtHint() != 0 or self.nextMaintenanceWakeDelayNsLocked() == @as(?u64, 0);
+    fn readyMaintenanceScoreLocked(self: *Backend, due_only: bool) u64 {
+        const debt = self.maintenanceDebtHint();
+        if (!due_only and debt != 0) return debt;
+        if (self.nextMaintenanceWakeDelayNsLocked() != @as(?u64, 0)) return 0;
+        return @max(1, debt);
     }
 
     fn nextMaintenanceWakeDelayNsLocked(self: *Backend) ?u64 {
