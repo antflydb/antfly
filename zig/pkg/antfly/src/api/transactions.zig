@@ -2775,7 +2775,7 @@ pub const DurableSessionStore = struct {
         if (std.mem.eql(u8, current, &reference)) try txn.delete(key);
     }
 
-    fn registrationMutationTxn(self: *DurableSessionStore, txn: anytype, action: RegistrationMutation) ![16]u8 {
+    fn registrationMutationTxn(self: *DurableSessionStore, txn: anytype, action: RegistrationMutation, context: RoutingContext) ![16]u8 {
         if (self.registration_recovery_before == null)
             self.registration_recovery_before = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).next;
         switch (action) {
@@ -2816,9 +2816,15 @@ pub const DurableSessionStore = struct {
                     try self.registrationOutboxFor(reference).put(txn, self.alloc, reference, .{ .outcome = value.outcome, .prepared = true, .execution_admitted = true, .phase = .registered, .observation = if (value.observe_only) true else null, .joined = value.publish_observation });
                 }
                 if (!value.observe_only and (value.prepared or value.unpublished)) {
-                    // Longer than the maximum forwarded execution budget. The
-                    // durable phase CAS arbitrates late publish versus recovery.
-                    try outbox.stagePublication(txn, reference, platform_time.realtimeNs() +| 15 * std.time.ns_per_min);
+                    // Use the caller's remaining budget when present. Requests
+                    // without a deadline receive a finite publication lease.
+                    // The durable phase CAS arbitrates publish versus recovery.
+                    const default_ttl = 15 * std.time.ns_per_min;
+                    const ttl = if (try context.remainingTimeoutMs()) |remaining_ms|
+                        @min(default_ttl, @as(u64, remaining_ms) * std.time.ns_per_ms)
+                    else
+                        default_ttl;
+                    try outbox.stagePublication(txn, reference, platform_time.realtimeNs() +| ttl);
                 }
                 if (observation_key) |key| try txn.put(key, &reference);
                 return reference;
@@ -2904,7 +2910,7 @@ pub const DurableSessionStore = struct {
             .docstore => |store| blk: {
                 var txn = try store.beginWriteTxn();
                 errdefer txn.abort();
-                const reference = try self.registrationMutationTxn(&txn, action);
+                const reference = try self.registrationMutationTxn(&txn, action, context);
                 try context.ensureActive();
                 try txn.commit();
                 break :blk reference;
@@ -2912,7 +2918,7 @@ pub const DurableSessionStore = struct {
             .runtime => |store| blk: {
                 var txn = if (self.routing_access) |access| try access.write(store.allocator, context) else try store.beginWrite();
                 errdefer txn.abort();
-                const reference = try self.registrationMutationTxn(&txn, action);
+                const reference = try self.registrationMutationTxn(&txn, action, context);
                 try context.ensureActive();
                 try txn.commit();
                 break :blk reference;
