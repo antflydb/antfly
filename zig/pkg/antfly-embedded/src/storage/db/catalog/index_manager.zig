@@ -17431,6 +17431,10 @@ pub const IndexManager = struct {
                 else => return .reopen,
             };
             defer prepared.deinit();
+            // Certificate readers must never validate the old proof against
+            // the new serving generation.
+            self.lockAtomicWithBackoff(&entry.serving_certificate_mutex);
+            defer entry.serving_certificate_mutex.unlock();
             try prepared.publish();
             entry.verified_serving_certificate = null;
             return .refreshed;
@@ -17518,6 +17522,7 @@ pub const IndexManager = struct {
         const entry = self.sparseIndex(name) orelse return .reopen;
         self.lockAtomicWithBackoff(entry.apply_mutex);
         defer entry.apply_mutex.unlock();
+        if (entry.inline_writer.pending != 0) return .reopen;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const delta = try readScopeDelta(arena.allocator(), file, scope, keys);
