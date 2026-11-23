@@ -785,7 +785,17 @@ pub const Registry = struct {
         context.setting_admin = true;
         const query: types.Query = .{ .incarnation = anchor.incarnation, .standalone = anchor.standalone, .actor = .{ .session_user = .bootstrap, .credential = "" }, .database = identity.database_id, .backend = ref.backend };
         const before = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = query }), .{});
-        const scope = before.scope orelse return error.InvalidSqlBackendResponse;
+        const scope = before.scope orelse {
+            const session = identity.session orelse return error.InvalidSqlBackendResponse;
+            var proof_query = query;
+            proof_query.retired_connection = .{
+                .id = session.connection_id orelse return error.InvalidSqlBackendResponse,
+                .node = session.owner_node_id,
+            };
+            const proof = try std.json.parseFromSliceLeaky(types.Snapshot, a, try self.server.source.systemCatalog(a, context, .{ .sql_lock_read = proof_query }), .{});
+            if (proof.superseded != true) return error.InvalidSqlBackendResponse;
+            return true;
+        };
         // A completed sealed command is a permanent cleanup witness, even if
         // later transactions have replaced the single recent release marker.
         if (scope.next_command > ref.command.sequence) return true;

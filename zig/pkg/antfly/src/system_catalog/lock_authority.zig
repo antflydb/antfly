@@ -84,6 +84,7 @@ pub const Request = struct {
         try writer.endObject();
     }
     pub fn requiredDecoderVersion(self: Request) u16 {
+        if (self.operation == .register and self.operation.register.replaces != null) return @import("../metadata/topology_protocol.zig").sql_idle_session_reenrollment_version;
         if (self.abandoned_private != null) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
         if (self.operation == .native_retire) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
         if (self.scope_retirement != null) return @import("../metadata/topology_protocol.zig").sql_scope_retirement_version;
@@ -567,6 +568,7 @@ pub const Query = struct {
     actor: prepared.Actor,
     database: u64,
     backend: ?locks.Backend = null,
+    retired_connection: ?struct { id: [32]u8, node: u64 } = null,
     failed_root: ?struct { transaction: [16]u8, command: scopes.Command, nonce: [16]u8 } = null,
     work: ?struct { observed_at_ms: u64, after: ?scopes.Work = null, wrap: bool = false } = null,
     effect: ?scopes.ledger.Effect = null,
@@ -583,7 +585,9 @@ pub const Query = struct {
     pub fn jsonStringify(self: Query, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Query).@"struct".field_names) |field| {
-            if (!std.mem.eql(u8, field, "failed_root") or self.failed_root != null) {
+            if ((!std.mem.eql(u8, field, "failed_root") or self.failed_root != null) and
+                (!std.mem.eql(u8, field, "retired_connection") or self.retired_connection != null))
+            {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
             }
@@ -591,11 +595,13 @@ pub const Query = struct {
         try writer.endObject();
     }
     pub fn requiredDecoderVersion(self: Query) u16 {
+        if (self.retired_connection != null) return @import("../metadata/topology_protocol.zig").sql_idle_session_reenrollment_version;
         if (self.abandoned_private != null) return @import("../metadata/topology_protocol.zig").sql_relation_persistence_version;
         return if (self.database_work != null) @import("../metadata/topology_protocol.zig").sql_scope_retirement_version else decoder_version;
     }
     pub fn validate(self: Query) !void {
         try self.actor.validate();
+        if (self.retired_connection != null and (self.backend == null or self.actor.session_user.kind != .bootstrap or self.actor.current_role != null)) return error.Forbidden;
         const selectors = @as(u8, @intFromBool(self.backend != null)) + @as(u8, @intFromBool(self.work != null)) + @as(u8, @intFromBool(self.discovery != null)) + @as(u8, @intFromBool(self.notification_work != null)) + @as(u8, @intFromBool(self.database_work != null)) + @as(u8, @intFromBool(self.abandoned_private != null));
         if (selectors != 1 or (self.backend != null and std.mem.allEqual(u8, &self.incarnation, 0))) return error.InvalidCatalogMutation;
         if (self.abandoned_private) |selection| {
@@ -641,6 +647,8 @@ pub const Query = struct {
     }
 };
 pub const Snapshot = struct {
+    superseded: ?bool = null,
+    idle_session_reenrollment: ?bool = null,
     abandoned_private: ?@import("../metadata/abandoned_temporary_retirement.zig").Work = null,
     database_after: ?locks.Backend = null,
     notification_binding: ?@import("sql_notifications.zig").Binding = null,
@@ -663,7 +671,7 @@ pub const Snapshot = struct {
     pub fn jsonStringify(self: Snapshot, writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
-            if (comptime std.mem.eql(u8, field, "abandoned_private") or std.mem.eql(u8, field, "database_after") or std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding") or std.mem.eql(u8, field, "failed_root_verified")) {
+            if (comptime std.mem.eql(u8, field, "superseded") or std.mem.eql(u8, field, "idle_session_reenrollment") or std.mem.eql(u8, field, "abandoned_private") or std.mem.eql(u8, field, "database_after") or std.mem.eql(u8, field, "notifications") or std.mem.eql(u8, field, "notification_work") or std.mem.eql(u8, field, "notification_binding") or std.mem.eql(u8, field, "failed_root_verified")) {
                 if (@field(self, field)) |page| {
                     try writer.objectField(field);
                     try writer.write(page);
