@@ -34790,6 +34790,12 @@ const RemoteMetadataSource = struct {
                     @max(1, remaining_ns / std.time.ns_per_ms),
                 ));
                 const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
+                    // The coordinator can retry this optional selector as a
+                    // plain read. Preserve its remaining budget for that read.
+                    if (input == .sql_lock_read and input.sql_lock_read.retired_connection != null) switch (err) {
+                        error.UnsupportedOperation, error.TableTopologyProtocolUpgradeRequired => return err,
+                        else => {},
+                    };
                     switch (err) {
                         error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.UnsupportedNativeIndexOwner, error.CatalogPublicationProofPending, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
@@ -42740,6 +42746,97 @@ fn consumerTests() type {
             fake = .{ .unavailable = std.math.maxInt(usize), .cancel = &cancellation };
             try std.testing.expectError(error.Canceled, source.readSystemCatalog(alloc, .{ .cancellation = cancellation.token() }, .snapshot));
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        }
+
+        test "system catalog remote recovery preserves plain fallback budget after selector rejection" {
+            const alloc = std.testing.allocator;
+            const Http = antfly.common.http;
+            const Call = @import("../system_catalog/server_call.zig").Call;
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            const Fake = struct {
+                clock: *VoprIo,
+                rejection: u16,
+                calls: usize = 0,
+                slow_calls: usize = 0,
+
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (std.mem.startsWith(u8, request.uri, "http://slow.invalid/")) {
+                        self.slow_calls += 1;
+                        try self.clock.advance(@as(u64, request.timeout_ms.?) * std.time.ns_per_ms);
+                        return error.Timeout;
+                    }
+                    self.calls += 1;
+                    const call = try std.json.parseFromSlice(Call, a, request.body, .{});
+                    defer call.deinit();
+                    switch (self.calls) {
+                        1 => try std.testing.expect(call.value == .sql_prepared_read),
+                        2 => {
+                            try std.testing.expect(call.value == .sql_lock_read and call.value.sql_lock_read.retired_connection != null);
+                            try self.clock.advance(250 * std.time.ns_per_ms);
+                            return .{ .status = self.rejection, .body = try a.dupe(u8, if (self.rejection == 400) "invalid catalog request" else "TableTopologyProtocolUpgradeRequired") };
+                        },
+                        3 => {
+                            try std.testing.expect(call.value == .sql_lock_read and call.value.sql_lock_read.retired_connection == null);
+                            try std.testing.expectEqual(@as(u32, 750), request.timeout_ms.?);
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
+                    const names = [_][]const u8{ "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation", antfly.metadata_http_client.MetadataHttpClient.sql_scope_supersession_header };
+                    const values = [_][]const u8{ "9", "11111111111111111111111111111111", "1" };
+                    const headers = try a.alloc(Http.Header, if (self.calls == 1) 3 else 2);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (headers[0..initialized]) |header| {
+                            a.free(header.name);
+                            a.free(header.value);
+                        }
+                        a.free(headers);
+                    }
+                    for (headers, names[0..headers.len], values[0..headers.len]) |*header, name, value| {
+                        const owned_name = try a.dupe(u8, name);
+                        errdefer a.free(owned_name);
+                        header.* = .{ .name = owned_name, .value = try a.dupe(u8, value) };
+                        initialized += 1;
+                    }
+                    return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+                }
+            };
+            for ([_]u16{ 400, 426 }) |rejection| {
+                var clock = try VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+                defer clock.deinit();
+                const io = clock.io();
+                var fake: Fake = .{ .clock = &clock, .rejection = rejection };
+                var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://leader.invalid", "http://slow.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, io);
+                defer source.deinit();
+                source.setting_authority_secret = "scope-recovery-test-secret";
+                source.setting_authority_issuer = "scope-recovery-test";
+                const context: antfly.public_api.operation.RequestContext = .{
+                    .deadline_ns = source.awakeNs() + std.time.ns_per_s,
+                    .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+                    .setting_admin = true,
+                };
+                var ready = false;
+                var prepared_context = context;
+                prepared_context.sql_scope_supersession_ready = &ready;
+                alloc.free(try RemoteMetadataSource.remoteSystemCatalog(&source, alloc, prepared_context, .{ .sql_prepared_read = .{ .operation = @splat(1) } }));
+                try std.testing.expect(ready);
+                var lock: Call = .{ .sql_lock_read = .{
+                    .incarnation = @splat(0x11),
+                    .standalone = false,
+                    .actor = .{ .session_user = .bootstrap, .credential = "" },
+                    .database = 1,
+                    .backend = .{ .incarnation = @splat(0x11), .id = @splat(2), .fence = 1 },
+                    .retired_connection = .{ .id = @splat('a'), .node = 1 },
+                } };
+                try std.testing.expectError(if (rejection == 400) error.UnsupportedOperation else error.TableTopologyProtocolUpgradeRequired, RemoteMetadataSource.remoteSystemCatalog(&source, alloc, context, lock));
+                lock.sql_lock_read.retired_connection = null;
+                const body = try RemoteMetadataSource.remoteSystemCatalog(&source, alloc, context, lock);
+                defer alloc.free(body);
+                try std.testing.expectEqualStrings("null", body);
+                try std.testing.expectEqual(@as(usize, 3), fake.calls);
+                try std.testing.expectEqual(@as(usize, 0), fake.slow_calls);
+            }
         }
 
         test "system catalog remote reads spend one caller budget across bounded RPC attempts" {
