@@ -2327,6 +2327,19 @@ pub fn decoderRuntimeEmbedAbsolutePosition(self: anytype, request: anytype, stat
 
 pub const EmbeddingTableIdentity = struct { value: u64, revision: u64 };
 
+extern fn antfly_metal_retain_embedding_f32_value(runtime: *RawMetalDecodeRuntime, rows: usize, dim: usize, bytes: usize, value: u64, revision: u64, offset: *usize) ?*anyopaque;
+
+/// The caller holds the provider's operation or metadata gate. A hit borrows
+/// cached data by retaining its physical buffer, independently of eviction.
+pub fn retainPreparedEmbeddingF32(runtime: *RawMetalDecodeRuntime, key: EmbeddingTableIdentity, rows: usize, dim: usize) !?MetalTensor {
+    const shape = [_]i32{ std.math.cast(i32, rows) orelse return error.InvalidTensorShape, std.math.cast(i32, dim) orelse return error.InvalidTensorShape };
+    const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, dim), @sizeOf(f32));
+    var offset: usize = 0;
+    const handle = antfly_metal_retain_embedding_f32_value(runtime, rows, dim, bytes, key.value, key.revision, &offset) orelse return null;
+    return MetalTensor.deviceRetainedExternal(@ptrCast(runtime), handle, offset, bytes, &shape);
+}
+
+
 pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -51795,6 +51808,11 @@ test "Metal semantic embedding cache separates actual values revisions and raw c
         }
     };
     try Check.run(&provider, &values, .{ .value = first, .revision = 0 }, &.{ 5, 6, 7, 8 });
+    const runtime = provider.raw_decode_runtime.?;
+    var held = (try retainPreparedEmbeddingF32(runtime, .{ .value = first, .revision = 0 }, 2, 4)) orelse return error.MissingSemanticEmbedding;
+    defer held.deinit();
+    try std.testing.expect((try retainPreparedEmbeddingF32(runtime, .{ .value = first, .revision = 1 }, 2, 4)) == null);
+    try std.testing.expect((try retainPreparedEmbeddingF32(runtime, .{ .value = first, .revision = 0 }, 4, 2)) == null);
     // A second descriptor/address denotes the SAME immutable checkpoint value.
     try Check.run(&provider, &moved, .{ .value = first, .revision = 0 }, &.{ 5, 6, 7, 8 });
     values = .{ 11, 12, 13, 14, 15, 16, 17, 18 };
@@ -51811,6 +51829,13 @@ test "Metal semantic embedding cache separates actual values revisions and raw c
     defer host.deinit();
     try std.testing.expectEqualSlices(f32, &.{ 35, 36, 37, 38 }, try tensorHostSlice(&host));
     try std.testing.expect((try decoderRuntimeEmbeddingLookup(&provider, .{ .weight = raw_table, .model_identity = @as(?EmbeddingTableIdentity, null), .ids = &[_]i64{1}, .total = 1, .dim = 4 })) == null);
+    for (2..14) |revision| {
+        try Check.run(&provider, &values, .{ .value = second, .revision = @intCast(revision) }, &.{ 35, 36, 37, 38 });
+    }
+    try std.testing.expect((try retainPreparedEmbeddingF32(runtime, .{ .value = first, .revision = 0 }, 2, 4)) == null);
+    var saved = try held.readView();
+    defer saved.deinit();
+    try std.testing.expectEqualSlices(f32, &moved, try tensorHostSlice(&saved));
 }
 
 test "Metal model raw16 embedding cache separates F16 BF16 and revisions" {

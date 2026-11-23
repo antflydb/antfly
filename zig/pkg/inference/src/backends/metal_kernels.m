@@ -33947,7 +33947,7 @@ static bool antfly_metal_embedding_source_matches(
     return value_identity != 0 || (entry->source_id == source_id && entry->source_offset == source_offset);
 }
 
-static bool antfly_metal_select_embedding_cache_source(
+static const termite_metal_embedding_table_cache_entry *antfly_metal_find_embedding_cache_source(
     termite_metal_decode_runtime *runtime,
     uintptr_t source_id,
     size_t source_offset,
@@ -33957,23 +33957,51 @@ static bool antfly_metal_select_embedding_cache_source(
     uint64_t value_identity, uint64_t value_revision, uint32_t source_format
 ) {
     for (size_t slot = 0; slot < TERMITE_METAL_GENERIC_EMBEDDING_CACHE_CAPACITY; ++slot) {
-        termite_metal_embedding_table_cache_entry *entry = &runtime->generic_embedding_cache[slot];
+        const termite_metal_embedding_table_cache_entry *entry = &runtime->generic_embedding_cache[slot];
         if (entry->buffer != nil &&
             antfly_metal_embedding_source_matches(entry, source_id, source_offset, value_identity, value_revision, source_format) &&
-            entry->rows == rows &&
-            entry->dim == dim &&
-            entry->bytes == bytes) {
-            runtime->generic_embedding_table_buffer = entry->buffer;
-            runtime->generic_embedding_buffer_offset = entry->buffer_offset;
-            runtime->generic_embedding_table_bytes = entry->bytes;
-            runtime->generic_embedding_rows = entry->rows;
-            runtime->generic_embedding_dim = entry->dim;
-            runtime->generic_embedding_source_id = entry->source_id;
-            runtime->generic_embedding_source_offset = entry->source_offset;
-            return true;
-        }
+            entry->rows == rows && entry->dim == dim && entry->bytes == bytes) return entry;
     }
-    return false;
+    return NULL;
+}
+
+static bool antfly_metal_select_embedding_cache_source(
+    termite_metal_decode_runtime *runtime,
+    uintptr_t source_id,
+    size_t source_offset,
+    size_t rows,
+    size_t dim,
+    size_t bytes,
+    uint64_t value_identity, uint64_t value_revision, uint32_t source_format
+) {
+    const termite_metal_embedding_table_cache_entry *entry = antfly_metal_find_embedding_cache_source(
+        runtime, source_id, source_offset, rows, dim, bytes, value_identity, value_revision, source_format
+    );
+    if (entry == NULL) return false;
+    runtime->generic_embedding_table_buffer = entry->buffer;
+    runtime->generic_embedding_buffer_offset = entry->buffer_offset;
+    runtime->generic_embedding_table_bytes = entry->bytes;
+    runtime->generic_embedding_rows = entry->rows;
+    runtime->generic_embedding_dim = entry->dim;
+    runtime->generic_embedding_source_id = entry->source_id;
+    runtime->generic_embedding_source_offset = entry->source_offset;
+    return true;
+}
+
+void *antfly_metal_retain_embedding_f32_value(
+    termite_metal_decode_runtime *runtime, size_t rows, size_t dim, size_t bytes,
+    uint64_t value_identity, uint64_t value_revision, size_t *offset
+) {
+    if (runtime == NULL || value_identity == 0 || offset == NULL || rows == 0 || dim == 0 ||
+        rows > SIZE_MAX / dim || rows * dim > SIZE_MAX / sizeof(float) ||
+        rows * dim * sizeof(float) != bytes) return NULL;
+    const termite_metal_embedding_table_cache_entry *entry = antfly_metal_find_embedding_cache_source(
+        runtime, 0, 0, rows, dim, bytes, value_identity, value_revision, 1
+    );
+    if (entry == NULL || entry->buffer_offset > entry->buffer.length ||
+        bytes > entry->buffer.length - entry->buffer_offset) return NULL;
+    *offset = entry->buffer_offset;
+    return (__bridge_retained void *)entry->buffer;
 }
 
 static bool termite_metal_decode_runtime_select_embedding_cache(
