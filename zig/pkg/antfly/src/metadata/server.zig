@@ -105,9 +105,11 @@ const MetadataSessions = struct {
     fn create(alloc: std.mem.Allocator, svc: *service.MetadataHttpService) !*@This() {
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
-        self.adapter = .{ .host = .{ .ptr = svc, .read = read, .term = term, .propose = propose }, .group = svc.metadata_group_id };
+        self.adapter = .{ .host = .{ .ptr = svc, .read = read, .controlled_read = readControlled, .term = term, .propose = propose }, .group = svc.metadata_group_id };
         self.store = self.adapter.runtime(alloc);
         self.durable = @import("../api/transactions.zig").DurableSessionStore.initRuntime(alloc, &self.store);
+        const Adapter = @import("transaction_session_store.zig").Store;
+        self.durable.routing_access = .{ .ptr = &self.adapter, .vtable = &.{ .read = Adapter.readControlled, .write = Adapter.writeControlled } };
         return self;
     }
     fn destroy(self: *@This(), alloc: std.mem.Allocator) void {
@@ -115,22 +117,23 @@ const MetadataSessions = struct {
         alloc.destroy(self);
     }
     fn read(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
+        return readControlled(ptr, alloc, .{});
+    }
+    fn readControlled(ptr: *anyopaque, alloc: std.mem.Allocator, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLinearizableReadWithContext(.{});
+        const request = try context.platformDeadline();
+        try svc.ensureSessionLinearizableRead(request);
+        try request.ensureActive();
         const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
         return projected.openSessionRead(alloc, svc.metadata_group_id);
     }
-    fn term(ptr: *anyopaque) ?u64 {
+    fn term(ptr: *anyopaque, context: @import("antfly_local_sources").api_operation.RequestContext) !?u64 {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        return svc.localMetadataLeadershipTerm();
+        return svc.localSessionLeadershipTerm(context);
     }
-    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64, submitted: *bool) !bool {
+    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64, submitted: *bool, context: @import("antfly_local_sources").api_operation.RequestContext) !bool {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        const receipt = try svc.proposeSessionCommandObserved(bytes, expected_term, submitted);
-        const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
-        var txn = try projected.openSessionRead(svc.alloc, svc.metadata_group_id);
-        defer txn.abort();
-        return @import("transaction_session_record.zig").readApplyResult(&txn, svc.alloc, svc.metadata_group_id, receipt.term, receipt.index);
+        return svc.proposeSessionCommandObserved(bytes, expected_term, submitted, context);
     }
 };
 
@@ -409,7 +412,10 @@ pub const MetadataServer = struct {
             // writes. An API caller need not inject a test-only executor to
             // make remote restore work. Explicit host overrides stay intact.
             if (api_server_cfg.session_router == null) api_server_cfg.session_router = metadataSessionRouter(svc);
-            if (api_server_cfg.session_executor == null) api_server_cfg.session_executor = svc.raft.host.http_host.request_executor;
+            if (api_server_cfg.session_executor == null) {
+                api_server_cfg.session_executor = svc.raft.host.http_host.request_executor;
+                if (svc.raft.host.http_host.executor) |executor| api_server_cfg.configureDefaultSqlPeerTransport(executor.cfg);
+            }
             api_server_cfg.prepared_transaction_group_id = svc.metadata_group_id;
             api_server_cfg.prepared_transaction_leadership = .{
                 .ptr = svc,
@@ -1552,11 +1558,7 @@ fn metadataStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, gr
 
 fn metadataStoreRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const stores = try svc.listProjectedStores(svc.alloc);
-    defer svc.freeProjectedStores(svc.alloc, stores);
-    const store = storeForNode(stores, node_id) orelse return null;
-    if (store.api_url.len == 0) return null;
-    return try alloc.dupe(u8, store.api_url);
+    return svc.projectedStoreEndpoint(alloc, node_id);
 }
 
 fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: api_table_router.RouteBudget) !?[]u8 {

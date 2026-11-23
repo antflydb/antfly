@@ -10005,6 +10005,35 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
                 .merge_transitions = @constCast((&[_]@import("../metadata/transition_state.zig").MergeTransitionRecord{})[0..]),
             };
         }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const domain = @import("antfly_local_sources").system_catalog_domain;
+            if (call == .resolve) {
+                try std.testing.expectEqualStrings("docs", call.resolve.table);
+                return std.json.Stringify.valueAlloc(alloc, domain.ResolvedTable{ .table_id = 7, .name = "docs" }, .{});
+            }
+            if (call == .write_validation) {
+                try std.testing.expectEqualStrings("docs", call.write_validation);
+                return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/projection.zig").WriteValidation{ .schema_json = "" }, .{});
+            }
+            if (call != .resolve_many) return error.UnexpectedCatalogCall;
+            const request = call.resolve_many;
+            const tables = try alloc.alloc(?domain.ResolvedTable, request.targets.len);
+            defer alloc.free(tables);
+            for (request.targets, tables) |target, *table| {
+                try std.testing.expectEqualStrings("docs", target.table);
+                table.* = .{ .table_id = 7, .name = "docs" };
+            }
+            const resolved = try alloc.alloc(?[]const u8, request.storage_names.len);
+            defer alloc.free(resolved);
+            for (request.storage_names, resolved) |name, *logical| {
+                try std.testing.expectEqualStrings("docs", name);
+                logical.* = "docs";
+            }
+            const bindings = try alloc.alloc(?domain.ResolvedTable, if (request.include_storage_bindings) resolved.len else 0);
+            defer alloc.free(bindings);
+            for (bindings) |*binding| binding.* = .{ .table_id = 7, .name = "docs" };
+            return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 1, .tables = tables, .logical_names = resolved, .storage_tables = bindings }, .{});
+        }
         fn freeSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
@@ -10038,7 +10067,7 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
     native_vtable.commit_transaction_with_id_with_cancellation = Capture.stable;
     native_source.vtable = &native_vtable;
     var status_context: u8 = 0;
-    var server = http_server.ApiHttpServer.init(a, .{ .internal_service_secret = "producer-native-http-secret" }, .{ .ptr = &status_context, .vtable = &.{ .status = StatusSource.status, .admin_snapshot = StatusSource.snapshot, .free_admin_snapshot = StatusSource.freeSnapshot } }, null, native_source);
+    var server = http_server.ApiHttpServer.init(a, .{ .internal_service_secret = "producer-native-http-secret" }, .{ .ptr = &status_context, .vtable = &.{ .status = StatusSource.status, .admin_snapshot = StatusSource.snapshot, .free_admin_snapshot = StatusSource.freeSnapshot, .system_catalog = StatusSource.catalog } }, null, native_source);
     defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(a, &server);
     defer listener.deinit();
