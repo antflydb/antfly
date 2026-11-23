@@ -3234,6 +3234,7 @@ pub const DB = struct {
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
     executor: *derived_executor_mod.Executor,
+    lite_backlog_reconciled_through: u64 = 0,
     start_index_workers: bool,
     start_independent_maintenance: bool = true,
     graph_metric_idle_maintenance: OpenOptions.GraphMetricIdleMaintenanceMode,
@@ -40115,6 +40116,46 @@ pub const DB = struct {
             std.log.err("failed to restart enrichment runtime after committed index deletion index={s} err={s}", .{ name, @errorName(restart_err) });
         };
         return removed;
+    }
+
+    /// Adopt replay and identity state while the Lite owner holds writer
+    /// admission for the already refreshed serving cut.
+    pub fn adoptLiteWriterCut(self: *DB) !bool {
+        if (!self.core.tryLockApplyExclusive()) return false;
+        defer self.core.unlockApplyExclusive();
+        const sequence = try self.core.store.adoptWriterReplayCut();
+        const summary = try doc_identity.visibilitySummaryFromStore(self.core.store);
+        if (self.executor.hasWorkers()) {
+            try self.executor.failIfUnhealthy();
+            const indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (indexes) |entry| self.alloc.free(@constCast(entry.name));
+                self.alloc.free(indexes);
+            }
+            var minimum = sequence;
+            for (indexes) |entry| {
+                if (self.executor.appliedSequence(entry.name) == null) continue;
+                const applied = try self.core.loadAppliedSequence(self.alloc, entry.name);
+                if (sequence != 0 and applied > sequence) return false;
+                if (!self.executor.adoptDurableProgress(entry.name, applied)) return false;
+                minimum = @min(minimum, applied);
+            }
+            self.executor.releaseBacklogThrough(minimum);
+            const accounted = @max(minimum, self.lite_backlog_reconciled_through);
+            if (accounted < sequence) {
+                const Track = struct {
+                    fn record(executor: *derived_executor_mod.Executor, replay_sequence: u64, payload: []const u8) !void {
+                        try executor.trackBacklogBytes(replay_sequence, payload.len);
+                    }
+                };
+                try self.core.store.forEachReplayFrom(accounted + 1, self.executor, Track.record);
+            }
+            self.lite_backlog_reconciled_through = sequence;
+        }
+        self.core.identity_visibility.summary = summary;
+        self.core.identity_visibility.clearLive();
+        self.core.identity_visibility.clearNonvisible();
+        return true;
     }
 
     fn refreshManagedIndexWorkersLocked(self: *DB) !void {

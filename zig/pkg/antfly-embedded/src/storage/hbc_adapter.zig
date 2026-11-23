@@ -2660,6 +2660,8 @@ const ExperimentalPostingReadState = struct {
     alloc: Allocator,
     covered_source_sequence: u64,
     wal_generation: u64,
+    peer_checkpoint: ?vectorindex_posting_wal.Checkpoint = null,
+    peer_last_batch: ?u64 = null,
     /// One complete base followed by ordered immutable replacement deltas.
     /// Readers search deltas newest-first and then the mmap-friendly base.
     retained_segments: []posting_segment_store_mod.RetainedSegment,
@@ -3385,7 +3387,7 @@ const ExperimentalPostingReadState = struct {
         try self.replaceMaterialized(posting_id, kind, .{ .bytes = value_bytes, .owned = true });
     }
 
-    fn materializeWal(self: *ExperimentalPostingReadState, wal: *const posting_segment_store_mod.RecoveredWal) !void {
+    fn materializeWal(self: anytype, wal: *const posting_segment_store_mod.RecoveredWal) !void {
         for (wal.replay.records.items) |record| switch (record.kind) {
             .base, .quantized_checkpoint, .posting_state, .node_range, .vector_leaf, .vector_metadata, .index_metadata, .row_chunk => try self.setBorrowed(record.posting_id, record.kind, record.payload),
             .mutation => {
@@ -3850,6 +3852,9 @@ const ExperimentalPostingReadGeneration = struct {
     /// derived batches may commit at the same source sequence.
     wal_generation: @import("antfly_platform").atomic.Value(u64),
     wal_committed_bytes: @import("antfly_platform").atomic.Value(u64),
+    // Zero denotes a boundary with no WAL batch. Read and replace under
+    // index mutation admission along with the durable cursor.
+    peer_last_batch: std.atomic.Value(u64) = .init(0),
     /// Query-visible topology owned by this exact immutable posting
     /// generation. It is initialized before publication and never changes.
     search_view: SearchViewToken = .{},
@@ -3884,6 +3889,7 @@ const ExperimentalPostingReadGeneration = struct {
             .covered_source_sequence = .init(state.covered_source_sequence),
             .wal_generation = .init(state.wal_generation),
             .wal_committed_bytes = .init(state.wal_committed_bytes),
+            .peer_last_batch = .init(state.peer_last_batch orelse 0),
             .scan_admission = state.scan_admission,
             .row_debt_deadline_ns = state.row_debt_deadline_ns,
             .root = state,
@@ -4123,6 +4129,39 @@ const ExperimentalPostingReadGeneration = struct {
         const result = try self.values.getOrPut(self.alloc, experimentalPostingValueKey(posting_id, kind));
         std.debug.assert(!result.found_existing);
         result.value_ptr.* = blob;
+    }
+
+    // Full replay can borrow the WAL buffer. An overlay owns only its
+    // changed values and must keep them after the suffix buffer is freed.
+    fn setBorrowed(self: *ExperimentalPostingReadGeneration, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, bytes: ?[]const u8) !void {
+        const blob = if (bytes) |payload| try ExperimentalPostingValueBlob.createCopy(self.alloc, payload) else null;
+        errdefer if (blob) |owned| owned.release();
+        const entry = try self.values.getOrPut(self.alloc, experimentalPostingValueKey(posting_id, kind));
+        if (entry.found_existing) if (entry.value_ptr.*) |previous| previous.release();
+        entry.value_ptr.* = blob;
+    }
+
+    fn setOwned(self: *ExperimentalPostingReadGeneration, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, bytes: []u8) !void {
+        defer self.alloc.free(bytes);
+        try self.setBorrowed(posting_id, kind, bytes);
+    }
+
+    fn replaySuffix(
+        self: *ExperimentalPostingReadGeneration,
+        suffix: *const posting_segment_store_mod.RecoveredWal,
+        dims: usize,
+        use_quantization: bool,
+    ) !void {
+        try ExperimentalPostingReadState.materializeWal(self, suffix);
+        var changed = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer changed.deinit(self.alloc);
+        var keys = self.values.keyIterator();
+        while (keys.next()) |key| {
+            if (experimentalPostingKindAffectsLeafScan(try experimentalPostingValueKeyKind(key.*)))
+                try changed.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
+        }
+        var leaves = changed.keyIterator();
+        while (leaves.next()) |id| try self.observeChangedLeafAdmission(id.*, dims, use_quantization);
     }
 
     fn observeChangedLeafAdmission(
@@ -9327,6 +9366,7 @@ pub const HBCIndex = struct {
             newest.wal_generation.load(.acquire),
             newest.wal_committed_bytes.load(.acquire),
         );
+        replacement.peer_last_batch.store(newest.peer_last_batch.load(.acquire), .release);
         var replacement_owned = true;
         errdefer if (replacement_owned) replacement.release();
         replacement.values = merged;
@@ -9375,6 +9415,7 @@ pub const HBCIndex = struct {
             lockAtomic(&self.experimental_posting_read_generation_mu);
             defer self.experimental_posting_read_generation_mu.unlock();
             if (self.experimental_posting_read_generation != parent) return error.PostingWalConcurrentWriter;
+            parent.peer_last_batch.store(posting_store.last_committed_batch orelse 0, .release);
             parent.advanceDurableBoundary(
                 covered_source_sequence,
                 durable_wal_generation,
@@ -9399,6 +9440,7 @@ pub const HBCIndex = struct {
             durable_wal_bytes,
         );
         errdefer generation.release();
+        generation.peer_last_batch.store(posting_store.last_committed_batch orelse 0, .release);
         try generation.values.ensureTotalCapacity(self.alloc, @intCast(touched_keys.len));
         for (touched_keys) |key| {
             const posting_id = experimentalPostingValueKeyId(key);
@@ -9447,6 +9489,129 @@ pub const HBCIndex = struct {
         try self.installExperimentalPostingReadGenerationReplacing(generation, parent);
         self.finishPublishedSearchStateRefresh();
         publishing = false;
+    }
+
+    pub fn ownsPeerPostingDirectory(self: *const HBCIndex, path: []const u8) bool {
+        const backend = switch (self.env_owner) {
+            .native => |backend| backend,
+            else => return false,
+        };
+        const root = backend.root_dir;
+        return std.mem.startsWith(u8, path, root) and
+            std.mem.eql(u8, path[root.len..], "/posting-segments");
+    }
+
+    pub const PreparedPeerPostingRefresh = struct {
+        index: *HBCIndex,
+        parent: *ExperimentalPostingReadGeneration,
+        next: ?*ExperimentalPostingReadGeneration = null,
+        metadata: ?IndexMetadata = null,
+
+        pub fn deinit(self: *@This()) void {
+            if (self.next) |next| next.release();
+            self.parent.release();
+            self.* = undefined;
+        }
+
+        /// The caller holds index apply admission and the runtime's query
+        /// admission until the document mapping cut is installed as well.
+        pub fn publish(self: *@This()) !void {
+            const next = self.next orelse return;
+            const index = self.index;
+            const flight = try index.preparePublishedSearchStateCommit();
+            var flight_owned = true;
+            defer if (flight_owned) index.releasePublishedSearchStateFlightRef(flight);
+            try index.beginPublishedSearchStateRefreshIo();
+            errdefer index.abortPublishedSearchStateRefresh();
+            index.markPublishedSearchStateCommittingWithFlight(flight);
+            flight_owned = false;
+            const previous_metadata = index.metadata;
+            index.metadata = self.metadata.?;
+            errdefer index.metadata = previous_metadata;
+            try index.installExperimentalPostingReadGenerationReplacing(next, self.parent);
+            self.next = null;
+            index.finishPublishedSearchStateRefresh();
+            index.closeExperimentalPostingWalWriter();
+            index.discardExperimentalPostingDeltaBaseState();
+        }
+    };
+
+    /// Capture a peer's append-only WAL suffix against the same Lite cut
+    /// used by document mappings. Load a new root when CURRENT changes.
+    pub fn preparePeerPostingSuffix(
+        self: *HBCIndex,
+        file: *@import("lite/native.zig").NativeFile,
+        cut: @import("lite/native.zig").CheckpointSlot,
+        maximum_source_sequence: u64,
+    ) !PreparedPeerPostingRefresh {
+        if (self.env_owner != .native or !self.experimentalPostingWalAuthoritative() or
+            self.experimental_posting_capture_enabled or self.experimentalPostingCheckpointBuildPresent())
+            return error.UnsupportedRefresh;
+        const parent = self.retainCurrentExperimentalPostingReadGeneration() orelse return error.UnsupportedRefresh;
+        errdefer parent.release();
+        const root = experimentalPostingRootState(parent) orelse return error.UnsupportedRefresh;
+        const covered = parent.covered_source_sequence.load(.acquire);
+        const committed_bytes = parent.wal_committed_bytes.load(.acquire);
+        const last_batch = parent.peer_last_batch.load(.acquire);
+        const root_dir = try std.fs.path.join(self.alloc, &.{ self.env_owner.native.root_dir, "posting-segments" });
+        defer self.alloc.free(root_dir);
+        var selected: ?posting_segment_store_mod.RecoveredWal = null;
+        if (root.peer_checkpoint) |checkpoint| {
+            if (parent.wal_generation.load(.acquire) == checkpoint.wal_generation and
+                (committed_bytes == 0 or last_batch != 0))
+            {
+                selected = try posting_segment_store_mod.readCommittedWalSuffixAtLiteCheckpoint(
+                    self.alloc,
+                    file,
+                    cut,
+                    root_dir,
+                    checkpoint,
+                    committed_bytes,
+                    if (last_batch == 0) null else last_batch,
+                    covered,
+                );
+            }
+        }
+        var suffix = selected orelse {
+            const opened = try posting_segment_store_mod.openAtLiteCheckpoint(self.alloc, self.env_owner.native.storage, file, cut, root_dir);
+            const state = try self.loadExperimentalPostingStateFromOpened(opened, null);
+            var state_owned = true;
+            errdefer if (state_owned) {
+                state.deinit();
+                self.alloc.destroy(state);
+            };
+            if (state.covered_source_sequence < covered or state.covered_source_sequence > maximum_source_sequence)
+                return error.PostingCheckpointSequenceMismatch;
+            const next = try ExperimentalPostingReadGeneration.createRoot(self.alloc, state);
+            state_owned = false;
+            errdefer next.release();
+            return .{
+                .index = self,
+                .parent = parent,
+                .next = next,
+                .metadata = try self.metadataFromExperimentalPostingGeneration(next),
+            };
+        };
+        const checkpoint = root.peer_checkpoint.?;
+        defer suffix.deinit();
+        if (suffix.replay.covered_source_sequence > maximum_source_sequence) return error.PostingCheckpointSequenceMismatch;
+        if (suffix.bytes.len == 0) return .{ .index = self, .parent = parent };
+        const next = try ExperimentalPostingReadGeneration.createOverlay(
+            self.alloc,
+            parent,
+            suffix.replay.covered_source_sequence,
+            checkpoint.wal_generation,
+            committed_bytes + suffix.bytes.len,
+        );
+        errdefer next.release();
+        next.peer_last_batch.store(suffix.replay.last_committed_batch orelse 0, .release);
+        try next.replaySuffix(&suffix, self.metadata.dims, self.metadata.use_quantization);
+        return .{
+            .index = self,
+            .parent = parent,
+            .next = next,
+            .metadata = try self.metadataFromExperimentalPostingGeneration(next),
+        };
     }
 
     fn decodeExperimentalPostingMetadata(self: *const HBCIndex, encoded: []const u8) !IndexMetadata {
@@ -12876,6 +13041,8 @@ pub const HBCIndex = struct {
             .alloc = alloc,
             .covered_source_sequence = if (replay_wal) opened.store.covered_source_sequence else opened.store.checkpoint.?.covered_source_sequence,
             .wal_generation = opened.store.wal_generation,
+            .peer_checkpoint = opened.store.checkpoint,
+            .peer_last_batch = wal.replay.last_committed_batch,
             .retained_segments = opened.segments,
             .segments = segments,
             .vector_directory = vector_directory,
@@ -26165,6 +26332,38 @@ test "posting WAL recovery reconstructs patch bases without pinning the serving 
     try state.materializeWal(&wal);
     try std.testing.expectEqualSlices(u8, &final, (try state.value(41, .base)).?);
     try std.testing.expectEqual(@as(u64, 0), state.patch_cache_accounting.current());
+}
+
+test "posting WAL suffix replaces values without modifying retained readers" {
+    const alloc = std.testing.allocator;
+    const base = try buildTestExperimentalPostingSegment(alloc, 41, .vector_metadata, 1, "old");
+    defer alloc.free(base);
+    const state = try createTestExperimentalPostingReadState(alloc, &.{base});
+    const parent = try ExperimentalPostingReadGeneration.createRoot(alloc, state);
+    defer parent.release();
+
+    var writer = vectorindex_posting_wal.Writer.initAfterCommitted(alloc, 1, 1);
+    defer writer.deinit();
+    try writer.append(.vector_metadata, 2, 41, 2, "first");
+    try writer.append(.vector_metadata, 2, 41, 2, "second");
+    try writer.commit(2, 2);
+    const next = try ExperimentalPostingReadGeneration.createOverlay(alloc, parent, 2, 1, writer.bytes().len);
+    defer next.release();
+    {
+        const bytes = try alloc.dupe(u8, writer.bytes());
+        var suffix: posting_segment_store_mod.RecoveredWal = .{
+            .alloc = alloc,
+            .bytes = bytes,
+            .replay = vectorindex_posting_wal.Replay.parseCommittedSuffix(alloc, bytes, 1, 1) catch |err| {
+                alloc.free(bytes);
+                return err;
+            },
+        };
+        defer suffix.deinit();
+        try next.replaySuffix(&suffix, 2, false);
+    }
+    try std.testing.expectEqualStrings("old", (try parent.value(41, .vector_metadata)).?);
+    try std.testing.expectEqualStrings("second", (try next.value(41, .vector_metadata)).?);
 }
 
 test "posting capture value leases release reconstructed patches at transaction end" {

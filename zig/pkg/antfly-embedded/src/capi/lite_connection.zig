@@ -2541,6 +2541,16 @@ pub const Owner = struct {
         return self.refreshImpl(true);
     }
 
+    fn promotePeerReadRuntime(self: *Owner, root: *h.Handle) !bool {
+        if (self.options.open_mode != .writer or root.maintenance_references != 0) return false;
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        if (!try store.prepareWriterFromReadCut(root.lite_runtime_sequence)) return false;
+        if (root.db_live and !try root.db.adoptLiteWriterCut()) return false;
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table| if (!try table.*.db.adoptLiteWriterCut()) return false;
+        return true;
+    }
+
     fn rememberRedoRecoveryCursor(self: *Owner, candidate: native.RedoRecoveryCursor) void {
         if (self.redo_recovery_cursor) |saved| {
             if (std.meta.eql(saved.identity, candidate.identity) and
@@ -2555,8 +2565,6 @@ pub const Owner = struct {
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
-            // A read refreshed this runtime in place; a write must not use it.
-            if (!fast_only and self.writer_reopen_pending) self.foreground_runtime_stale = true;
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const maintenance_references_clear = current.maintenance_references == 0 or
                 (current == self.maintenance_turn_root and current.maintenance_references == 1);
@@ -2567,12 +2575,23 @@ pub const Owner = struct {
             if (can_reuse and current.lane_pins.load(.acquire) == 0) {
                 if (file.redoRecoveryCursor()) |cursor| self.rememberRedoRecoveryCursor(cursor);
                 if (try file.unchangedProtectedRedoTip(h.handleLockIo())) |identity| {
-                    self.reader_coordinator.observeCurrent(identity, file.headerFingerprint());
-                    if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
-                        try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
-                    return current;
+                    if (!fast_only and self.writer_reopen_pending) {
+                        if (self.promotePeerReadRuntime(current) catch false) {
+                            self.writer_reopen_pending = false;
+                            current.lite_refresh_adoption_epoch = file.adoptionEpoch();
+                        } else {
+                            self.foreground_runtime_stale = true;
+                        }
+                    }
+                    if (!self.foreground_runtime_stale) {
+                        self.reader_coordinator.observeCurrent(identity, file.headerFingerprint());
+                        if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
+                            try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+                        return current;
+                    }
                 }
             }
+            if (!fast_only and self.writer_reopen_pending) self.foreground_runtime_stale = true;
             var recovered_probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{
                 .read_only = true,
                 .internal_reader = true,
@@ -2652,22 +2671,23 @@ pub const Owner = struct {
                 current.lite_runtime_sequence = @max(current.lite_runtime_sequence, probe.committedSequence());
                 return current;
             }
-            // Other processes' redo-only commits that changed document rows
-            // and full-text index records: a read catches this runtime up in
-            // place, without the writer lease. Writes still reopen: the
-            // runtime's free-page allocator and replay-sequence caches never
-            // saw those commits (`writer_reopen_pending`).
-            if (fast_only and !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and
+            // A lease-free read can adopt a proven redo-only peer cut.
+            // The next writer must reconcile its private state under the
+            // writer lease before reusing this runtime.
+            if (fast_only and !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and current.lane_pins.load(.acquire) == 0 and maintenance_references_clear and same_inode and
                 !needsOutcomeReconciliation(current) and file.redo != null and
-                (refreshInPlace(current, file, probe) catch |err| {
+                (self.refreshInPlace(current, file, probe) catch |err| {
                     // An earlier scope may already have installed its delta.
                     self.foreground_runtime_stale = true;
                     return err;
                 }))
             {
+                current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header) catch |err| {
+                    self.foreground_runtime_stale = true;
+                    return err;
+                };
                 if (comptime h.builtin.is_test) _ = self.test_in_place_refresh_count.fetchAdd(1, .release);
                 self.writer_reopen_pending = true;
-                try current.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(probe.header);
                 for (self.connections.items) |connection| {
                     for (connection.table_handles.items) |id| {
                         const child, const slot = api.handleRegistry().enter(id) orelse continue;
@@ -2932,15 +2952,9 @@ pub const Owner = struct {
             a.redo_folded_through == b.redo_folded_through;
     }
 
-    /// lite-index-write-path.md "Cross-process refresh": catches `root` up
-    /// with commits other processes made since it last did, when those are
-    /// redo-only and changed only what a runtime reads through the file
-    /// (document rows, the replay journal, per-write metadata) or versioned
-    /// full-text index records, which each owning index reloads from the
-    /// tip. False, with nothing but the shared overlay advanced, when
-    /// anything else changed (schema, catalogs, index definitions, other
-    /// index kinds, a fold): the caller reopens.
-    fn refreshInPlace(root: *h.Handle, file: *native.NativeFile, probe: *native.NativeFile) !bool {
+    /// Apply a retained redo suffix while the owner excludes query and writer
+    /// admission. A failed partial installation retires the runtime.
+    fn refreshInPlace(self: *Owner, root: *h.Handle, file: *native.NativeFile, probe: *native.NativeFile) !bool {
         if (!in_place_refresh_enabled) return false;
         const redo = if (file.redo) |*r| r else return false;
         // Retain the prior serving checkpoint for the duration of the delta.
@@ -2983,28 +2997,27 @@ pub const Owner = struct {
             defer freeKeys(changed);
             for (changed) |key| if (!routineMetadataKey(key)) return false;
         }
-        {
-            const changed = shared.changedKeysBetweenAlloc(alloc, io, @backingInt(Root.documents), since, through, origin) catch |err| switch (err) {
-                error.ReadSnapshotReclaimed => return false,
-                else => return err,
-            };
-            defer freeKeys(changed);
-            for (changed) |key| {
-                if (routineDocumentKey(key)) continue;
-                if (!try refreshDenseMapping(root, key)) return false;
-            }
-        }
         const Catalog = @import("../storage/native_catalog_backend.zig");
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
+        var posting_dirs: std.StringArrayHashMapUnmanaged(void) = .empty;
         var scopes = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(Catalog.Mutation)).empty;
-        const changed = shared.changedKeysBetweenAlloc(scratch, io, @backingInt(Root.index), since, through, origin) catch |err| switch (err) {
+        const changed_index_keys = shared.changedKeysBetweenAlloc(scratch, io, @backingInt(Root.index), since, through, origin) catch |err| switch (err) {
             error.ReadSnapshotReclaimed => return false,
             else => return err,
         };
-        for (changed) |key| {
-            const scope = nativeCatalogScopeOf(key) orelse return false;
+        for (changed_index_keys) |key| {
+            const scope = nativeCatalogScopeOf(key) orelse {
+                const directory = std.fs.path.dirname(key) orelse return false;
+                if (!std.mem.eql(u8, std.fs.path.basename(directory), "posting-segments")) return false;
+                const name = std.fs.path.basename(key);
+                if (!std.mem.eql(u8, name, "CURRENT") and
+                    !(std.mem.startsWith(u8, name, "wal-") and std.mem.endsWith(u8, name, ".afpw")) and
+                    !(std.mem.startsWith(u8, name, "segment-") and std.mem.endsWith(u8, name, ".afps"))) return false;
+                try posting_dirs.put(scratch, directory, {});
+                continue;
+            };
             const record = key["\x00ncat/".len + scope.len + 1 ..];
             const separator = std.mem.indexOfScalar(u8, record, 0) orelse return false;
             const slot = try scopes.getOrPut(scratch, scope);
@@ -3013,6 +3026,24 @@ pub const Owner = struct {
                 .namespace = if (separator == 0) null else record[0..separator],
                 .key = record[separator + 1 ..],
             });
+        }
+        var installed = false;
+        defer if (!installed) {
+            self.foreground_runtime_stale = true;
+        };
+        {
+            const changed = shared.changedKeysBetweenAlloc(alloc, io, @backingInt(Root.documents), since, through, origin) catch |err| switch (err) {
+                error.ReadSnapshotReclaimed => return false,
+                else => return err,
+            };
+            defer freeKeys(changed);
+            for (changed) |key| {
+                if (routineDocumentKey(key)) continue;
+                if (!try refreshDenseMapping(root, key, posting_dirs.keys())) return false;
+            }
+        }
+        for (posting_dirs.keys()) |directory| {
+            if (!try refreshPeerPostingDirectory(root, probe, directory, scratch)) return false;
         }
         for (scopes.keys()) |scope| {
             var refreshed = root.db_live and switch (try root.db.core.index_manager.refreshIndexScopeFromTip(scope, &scopes, probe)) {
@@ -3031,6 +3062,21 @@ pub const Owner = struct {
             }
             if (!refreshed) return false;
         }
+        if (root.db_live and !invalidatePeerVisibility(&root.db)) return false;
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table| {
+            if (!invalidatePeerVisibility(&table.*.db)) return false;
+        }
+        installed = true;
+        return true;
+    }
+
+    fn invalidatePeerVisibility(db: *h.db_mod.DB) bool {
+        if (!db.core.tryLockApplyExclusive()) return false;
+        defer db.core.unlockApplyExclusive();
+        db.core.identity_visibility.summary = null;
+        db.core.identity_visibility.clearLive();
+        db.core.identity_visibility.clearNonvisible();
         return true;
     }
 
@@ -3055,7 +3101,45 @@ pub const Owner = struct {
             std.mem.eql(u8, key, "\x00AFCERT/allocator-v1");
     }
 
-    fn refreshDenseMapping(root: *h.Handle, physical: []const u8) !bool {
+    fn refreshPeerPostingDirectory(root: *h.Handle, file: *native.NativeFile, directory: []const u8, scratch: std.mem.Allocator) !bool {
+        if (root.db_live) switch (try root.db.core.index_manager.refreshPeerPostingDirectory(directory, file, try peerSourceSequence(file, "", scratch))) {
+            .refreshed => return true,
+            .reopen => return false,
+            .not_loaded => {},
+        };
+        var tables = root.embedded_tables.valueIterator();
+        while (tables.next()) |table| {
+            const db = &table.*.db;
+            const prefix = try std.fmt.allocPrint(scratch, "\x02db/embedded/tables/{d}\x00", .{db.core.identity_namespace.table_id});
+            switch (try db.core.index_manager.refreshPeerPostingDirectory(directory, file, try peerSourceSequence(file, prefix, scratch))) {
+                .refreshed => return true,
+                .reopen => return false,
+                .not_loaded => {},
+            }
+        }
+        return false;
+    }
+
+    fn peerSourceSequence(file: *native.NativeFile, prefix: []const u8, scratch: std.mem.Allocator) !u64 {
+        const Cut = struct {
+            file: *native.NativeFile,
+            prefix: []const u8,
+            scratch: std.mem.Allocator,
+
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                const physical = if (self.prefix.len == 0) key else try std.mem.concat(self.scratch, u8, &.{ self.prefix, key });
+                return (try self.file.getDocumentAtCheckpointAlloc(self.scratch, self.file.activeCheckpoint(), physical)) orelse error.NotFound;
+            }
+        };
+        var cut: Cut = .{ .file = file, .prefix = prefix, .scratch = scratch };
+        const next = @import("../storage/replay_journal_format.zig").getNextSequence(&cut) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        return std.mem.readInt(u64, &next, .little) -| 1;
+    }
+
+    fn refreshDenseMapping(root: *h.Handle, physical: []const u8, posting_dirs: []const []const u8) !bool {
         const table_prefix = "\x02db/embedded/tables/";
         var database: ?*h.db_mod.DB = if (root.db_live) &root.db else null;
         var key = physical;
@@ -3071,7 +3155,7 @@ pub const Owner = struct {
         const manager = (database orelse return false).core.index_manager;
         const Manager = @TypeOf(manager.*);
         if (!std.mem.startsWith(u8, key, Manager.dense_refresh_mapping_prefix)) return false;
-        return manager.refreshDenseMappingKey(key);
+        return manager.refreshDenseMappingKey(key, posting_dirs);
     }
 
     /// Document-root keys an ordinary write changes, under a table's
@@ -8982,8 +9066,175 @@ test "capi native separate writer processes refresh full-text in place" {
     try std.testing.expect(owner.current.? == runtime_before);
     // This runtime still writes, and its write supersedes the child's.
     try Search.write(id, "doc-0", "parentagain");
+    try std.testing.expect(owner.current.? == runtime_before);
     try std.testing.expect(try Search.found(id, "parentagain", "\"doc-0\""));
     try std.testing.expect(!try Search.found(id, "childwrote6", "\"doc-0\""));
+}
+
+test "capi Lite physical v2 peer ANN refresh reuses the writer and survives cold reopen" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("xproc-dense-v2");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(h.handleLockIo(), tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const options: api.LiteResolvedOpenOptions = .{ .profile = .native, .busy_timeout_ms = 10_000 };
+    {
+        const setup = try open(path, options, true);
+        const setup_id = try api.publishHandle(setup);
+        defer api.antfly_db_close(setup_id);
+        var deleted = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(setup_id, .fromSlice("full_text_index_v0"), &deleted));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(setup_id, .fromSlice(
+            \\{"name":"vec","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":8,\"external\":true,\"metric\":\"l2_squared\"}"}
+        )));
+        try setup.lite_connection.?.owner.current.?.db.core.index_manager.installEmptyLiteDenseV2Fixture("vec");
+    }
+    const Dense = struct {
+        fn stopMaintenance(owner: *Owner) void {
+            owner.stopping.store(true, .release);
+            owner.wake.set(h.handleLockIo());
+            if (owner.worker) |worker| worker.join();
+            owner.worker = null;
+            owner.stopping.store(false, .release);
+        }
+
+        fn releaseWithoutFold(owner: *Owner) void {
+            if (owner.writer_lane.takeParkedForLocalPeer()) |release| {
+                var owned = release;
+                WriterLane.finishLocalPeerRelease(&owned);
+            }
+        }
+
+        fn write(handle: anytype, key: []const u8, vector: []const u8) !void {
+            var request: [512]u8 = undefined;
+            const json = try std.fmt.bufPrint(
+                &request,
+                "{{\"inserts\":{{\"{s}\":{{\"_embeddings\":{{\"vec\":{s}}}}}}},\"sync_level\":\"full_index\"}}",
+                .{ key, vector },
+            );
+            var response: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&response);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(handle, .fromSlice(json), &response));
+        }
+
+        fn replacePostingCheckpoint(root: *h.Handle) !void {
+            const allocator = std.heap.page_allocator;
+            const manager = root.db.core.index_manager;
+            const storage = manager.generation_storage orelse return error.MissingStorageBackend;
+            const index_path = try manager.activeIndexPath("vec");
+            defer manager.alloc.free(index_path);
+            const current = try std.fs.path.join(allocator, &.{ index_path, "posting-segments", "CURRENT" });
+            defer allocator.free(current);
+            const before = try storage.readFileAlloc(allocator, current, 4096);
+            defer allocator.free(before);
+            const sequence = try root.db.core.loadAppliedSequence(allocator, "vec");
+            try std.testing.expect(try manager.finalizeNativePostingGenerationAtStableTip("vec", sequence, .{ .flatten = true }));
+            const after = try storage.readFileAlloc(allocator, current, 4096);
+            defer allocator.free(after);
+            try std.testing.expect(!std.mem.eql(u8, before, after));
+        }
+
+        fn foldRedo(root: *h.Handle) !void {
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            const before = store.file.activeCheckpoint().redo_folded_through;
+            try store.checkpointRedoLog();
+            try std.testing.expect(store.file.activeCheckpoint().redo_folded_through > before);
+        }
+
+        const PeerMode = enum { append, replace_posting_checkpoint, fold_redo };
+
+        fn peerWrite(child_path: []const u8, opts: api.LiteResolvedOpenOptions, key: []const u8, vector: []const u8, mode: PeerMode) !void {
+            var fds: [2]std.c.fd_t = undefined;
+            try std.testing.expectEqual(0, std.c.pipe(&fds));
+            const pid = std.c.fork();
+            if (pid == 0) {
+                _ = std.posix.system.close(fds[0]);
+                var report: [1]u8 = .{1};
+                run_child: {
+                    const child = open(child_path, opts, false) catch break :run_child;
+                    const owner = child.lite_connection.?.owner;
+                    stopMaintenance(owner);
+                    const id = api.publishHandle(child) catch break :run_child;
+                    write(id, key, vector) catch break :run_child;
+                    const root = owner.current.?;
+                    const operation: anyerror!void = switch (mode) {
+                        .append => {},
+                        .replace_posting_checkpoint => replacePostingCheckpoint(root),
+                        .fold_redo => foldRedo(root),
+                    };
+                    operation catch |err| {
+                        std.debug.print("dense peer {s}: {s}\n", .{ @tagName(mode), @errorName(err) });
+                        break :run_child;
+                    };
+                    releaseWithoutFold(owner);
+                    report[0] = 0;
+                }
+                _ = std.c.write(fds[1], &report, report.len);
+                xprocParkForever();
+            }
+            _ = std.posix.system.close(fds[1]);
+            defer _ = std.posix.system.close(fds[0]);
+            try std.testing.expect(pid > 0);
+            defer {
+                _ = std.c.kill(pid, std.c.SIG.KILL);
+                _ = std.c.waitpid(pid, null, 0);
+            }
+            var report: [1]u8 = undefined;
+            try xprocReadBounded(fds[0], &report, 600_000);
+            try std.testing.expectEqual(@as(u8, 0), report[0]);
+        }
+
+        fn expectHit(handle: anytype, quoted_key: []const u8, vector: []const u8) !void {
+            var request: [256]u8 = undefined;
+            const json = try std.fmt.bufPrint(&request, "{{\"embeddings\":{{\"vec\":{s}}},\"indexes\":[\"vec\"],\"limit\":1}}", .{vector});
+            var response: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free_zero(&response);
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_search_json(handle, .fromSlice(json), &response));
+            try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], quoted_key) != null);
+        }
+    };
+    const wrapper = try open(path, options, false);
+    const owner = wrapper.lite_connection.?.owner;
+    Dense.stopMaintenance(owner);
+    const id = try api.publishHandle(wrapper);
+    var parent_open = true;
+    defer if (parent_open) api.antfly_db_close(id);
+    try Dense.write(id, "seed", "[8,0,0,0,0,0,0,0]");
+    const runtime_before = owner.current.?;
+    try std.testing.expect(runtime_before.db.core.index_manager.densePostingWalAuthoritativeByName("vec"));
+    const count_before = owner.test_in_place_refresh_count.load(.acquire);
+    Dense.releaseWithoutFold(owner);
+
+    try Dense.peerWrite(path, options, "peer", "[0,8,0,0,0,0,0,0]", .append);
+    try Dense.expectHit(id, "\"peer\"", "[0,8,0,0,0,0,0,0]");
+    try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > count_before);
+    try std.testing.expect(owner.current.? == runtime_before);
+    try Dense.write(id, "parent", "[0,0,8,0,0,0,0,0]");
+    try std.testing.expect(owner.current.? == runtime_before);
+    Dense.releaseWithoutFold(owner);
+    const before_replacement = owner.test_in_place_refresh_count.load(.acquire);
+    try Dense.peerWrite(path, options, "replacement", "[0,0,0,8,0,0,0,0]", .replace_posting_checkpoint);
+    try Dense.expectHit(id, "\"replacement\"", "[0,0,0,8,0,0,0,0]");
+    try std.testing.expect(owner.test_in_place_refresh_count.load(.acquire) > before_replacement);
+    try std.testing.expect(owner.current.? == runtime_before);
+
+    // The previous search installed a read cut. Folding after that cut
+    // requires writer admission to validate a new cut before appending.
+    try Dense.peerWrite(path, options, "folded", "[0,0,0,0,8,0,0,0]", .fold_redo);
+    try Dense.write(id, "after-fold", "[0,0,0,0,0,8,0,0]");
+    api.antfly_db_close(id);
+    parent_open = false;
+
+    const reopened = try open(path, options, false);
+    const reopened_id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(reopened_id);
+    try Dense.expectHit(reopened_id, "\"peer\"", "[0,8,0,0,0,0,0,0]");
+    try Dense.expectHit(reopened_id, "\"parent\"", "[0,0,8,0,0,0,0,0]");
+    try Dense.expectHit(reopened_id, "\"replacement\"", "[0,0,0,8,0,0,0,0]");
+    try Dense.expectHit(reopened_id, "\"folded\"", "[0,0,0,0,8,0,0,0]");
+    try Dense.expectHit(reopened_id, "\"after-fold\"", "[0,0,0,0,0,8,0,0]");
 }
 
 // perf/lwa-xproc-writers item 4: a cold-opened writer whose opportunistic

@@ -80,6 +80,15 @@ pub const Tracker = struct {
 
     pub fn track(self: *Tracker, alloc: Allocator, sequence: u64, bytes: u64) !void {
         if (self.resource_manager == null) return;
+        if (sequence <= self.released_through) return;
+        var start: usize = 0;
+        var end = self.entries.items.len;
+        while (start < end) {
+            const mid = start + (end - start) / 2;
+            const existing = self.entries.items[mid].sequence;
+            if (existing == sequence) return;
+            if (existing < sequence) start = mid + 1 else end = mid;
+        }
         const retained_bytes = retainedCharge(bytes);
         if (self.overflow_first_sequence != null) {
             self.overflow_last_sequence = @max(self.overflow_last_sequence, sequence);

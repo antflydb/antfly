@@ -7412,6 +7412,7 @@ pub const IndexManager = struct {
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
             .native_catalog_sink = self.dense_main_native_catalog_sink,
+            .require_native_posting_authority = entry.native_physical_v2,
         });
         errdefer entry.index.close();
 
@@ -17385,7 +17386,7 @@ pub const IndexManager = struct {
 
     pub const dense_refresh_mapping_prefix = "\x00\x00__metadata__:dense2:";
 
-    pub fn refreshDenseMappingKey(self: *IndexManager, key: []const u8) !bool {
+    pub fn refreshDenseMappingKey(self: *IndexManager, key: []const u8, posting_dirs: []const []const u8) !bool {
         const start = dense_refresh_mapping_prefix.len;
         const end = internal_keys.findComponentTerminator(key, start) orelse return false;
         const kind_end = internal_keys.findComponentTerminator(key, end + 2) orelse return false;
@@ -17396,7 +17397,13 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const entry = self.denseIndex(name) orelse return false;
-        if (entry.index.nativeCatalogScope() == null or entry.native_physical_v2) return false;
+        if (entry.native_physical_v2) {
+            if (!entry.index.experimentalPostingWalAuthoritative()) return false;
+            const paired = for (posting_dirs) |dir| {
+                if (entry.index.ownsPeerPostingDirectory(dir)) break true;
+            } else false;
+            if (!paired) return false;
+        } else if (entry.index.nativeCatalogScope() == null) return false;
         self.lockAtomicWithBackoff(entry.apply_mutex);
         defer entry.apply_mutex.unlock();
         if (entry.inline_writer.pending != 0) return false;
@@ -17409,6 +17416,26 @@ pub const IndexManager = struct {
         } else if (!std.mem.eql(u8, kind, "doc") and !std.mem.eql(u8, kind, "vector") and
             !std.mem.eql(u8, kind, "ordinal_member") and !std.mem.eql(u8, kind, "next_id")) return false;
         return true;
+    }
+
+    pub fn refreshPeerPostingDirectory(self: *IndexManager, directory: []const u8, file: *RefreshFile, source_sequence: u64) !ScopeRefresh {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.native_physical_v2 or !entry.index.ownsPeerPostingDirectory(directory)) continue;
+            self.lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+            if (entry.inline_writer.pending != 0) return .reopen;
+            var prepared = entry.index.preparePeerPostingSuffix(file, file.activeCheckpoint(), source_sequence) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return .reopen,
+            };
+            defer prepared.deinit();
+            try prepared.publish();
+            entry.verified_serving_certificate = null;
+            return .refreshed;
+        }
+        return .not_loaded;
     }
 
     /// Refreshes the loaded index whose native-catalog scope is `scope`
@@ -23590,6 +23617,64 @@ pub const IndexManager = struct {
         fs_paths.syncDirPortable(self.checkpointIo(), self.base_path) catch {};
     }
 
+    /// Build and import an empty, certified generation through the ordinary
+    /// physical-v2 producer. Lite's default index creation uses catalog KV.
+    pub fn installEmptyLiteDenseV2Fixture(self: *IndexManager, name: []const u8) !void {
+        if (!builtin.is_test) return error.Unsupported;
+        const storage = self.generation_storage orelse return error.MissingStorageBackend;
+        const cfg = (self.get(name) orelse return error.IndexNotFound).*;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const host_path = try std.fmt.allocPrintSentinel(self.alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+        defer self.alloc.free(host_path);
+        var host_store = try docstore_mod.DocStore.open(self.alloc, host_path, .{});
+        defer host_store.close();
+        var host = try IndexManager.init(self.alloc, host_path);
+        defer host.deinit();
+        host.updateRange(.{ .start = "", .end = "" });
+        try host.addManaged(&host_store, cfg, null);
+        if (!host.densePostingWalAuthoritativeByName(name)) return error.InvalidHbcNativeAuthority;
+        const original = try host.activeIndexPath(name);
+        defer self.alloc.free(original);
+
+        const relative = try std.fmt.allocPrint(self.alloc, ".repair-shadow-lite-fixture/indexes/{s}", .{name});
+        defer self.alloc.free(relative);
+        const target = try std.fs.path.join(self.alloc, &.{ self.base_path, relative });
+        defer self.alloc.free(target);
+        const original_postings = try std.fs.path.join(self.alloc, &.{ original, "posting-segments" });
+        defer self.alloc.free(original_postings);
+        const target_postings = try std.fs.path.join(self.alloc, &.{ target, "posting-segments" });
+        defer self.alloc.free(target_postings);
+        try storage.createDirPath(target_postings);
+        const io = self.checkpointIo();
+        var dir = try std.Io.Dir.cwd().openDir(io, original_postings, .{ .iterate = true });
+        defer dir.close(io);
+        var entries = dir.iterate();
+        while (try entries.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            const bytes = try dir.readFileAlloc(io, entry.name, self.alloc, .limited(16 * 1024 * 1024));
+            defer self.alloc.free(bytes);
+            const destination = try std.fs.path.join(self.alloc, &.{ target_postings, entry.name });
+            defer self.alloc.free(destination);
+            try storage.writeFileAbsolute(destination, bytes);
+            try storage.syncFileContentsAbsolute(destination);
+        }
+        try storage.syncParentAbsolute(target_postings);
+        try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+            self.generation_storage,
+            self.alloc,
+            target,
+            1,
+            name,
+            types.indexConfigHash(cfg),
+            0,
+            .dense_native_v2,
+        );
+        const canonical = try self.indexPath(name);
+        defer self.alloc.free(canonical);
+        try self.writeActiveIndexRootPointer(canonical, relative);
+    }
+
     fn saveDenseBackfillAppliedSequence(
         self: *IndexManager,
         store: *docstore_mod.DocStore,
@@ -24941,6 +25026,7 @@ pub const IndexManager = struct {
                     .root_generation = self.lsm_root_generation,
                     .native_catalog_sink = self.dense_main_native_catalog_sink,
                     .retain_native_posting_startup_snapshot = dense_cfg.leann == null,
+                    .require_native_posting_authority = native_physical_v2,
                 });
                 index_open = true;
                 index.setIo(self.io);

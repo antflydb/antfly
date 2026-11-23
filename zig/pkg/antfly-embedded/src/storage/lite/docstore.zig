@@ -4356,6 +4356,16 @@ pub const Store = struct {
         self.publishReadCheckpointAssumeLocked();
     }
 
+    pub fn prepareWriterFromReadCut(self: *Store, sequence: u64) !bool {
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        if (self.secret_store_uncertain or self.write_target != null) return false;
+        if (!try self.file.prepareWriterFromReadCut(sequence)) return false;
+        self.assessment_cache = null;
+        self.publishReadCheckpointAssumeLocked();
+        return true;
+    }
+
     pub fn backendStore(self: *Store) NativeBackendStore {
         return NativeBackendStore.init(self);
     }

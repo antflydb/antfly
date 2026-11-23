@@ -461,7 +461,36 @@ pub const Replay = struct {
     covered_source_sequence: u64 = 0,
 
     pub fn parse(alloc: Allocator, bytes: []const u8) !Replay {
-        var replay: Replay = .{ .alloc = alloc };
+        return parseFromBoundary(alloc, bytes, null, 0);
+    }
+
+    pub const commit_frame_len = frame_header_len;
+
+    /// Verify the retained cursor belongs to the WAL captured at the peer cut.
+    pub fn verifyCommitBoundary(bytes: []const u8, batch: u64, covered_sequence: u64) !void {
+        const decoded = (try decodeFrame(bytes)) orelse return error.InvalidPostingWalCommit;
+        const record = decoded.record;
+        if (decoded.frame_len != bytes.len or record.kind != .commit or
+            record.posting_id != 0 or record.payload.len != 0 or
+            record.batch_id != batch or record.source_sequence != covered_sequence)
+            return error.InvalidPostingWalCommit;
+    }
+
+    /// Parse the bytes following an already verified commit boundary.
+    /// Byte counts in the result are relative to the supplied suffix.
+    pub fn parseCommittedSuffix(alloc: Allocator, bytes: []const u8, last_batch: ?u64, covered_sequence: u64) !Replay {
+        var replay = try parseFromBoundary(alloc, bytes, last_batch, covered_sequence);
+        errdefer replay.deinit();
+        if (replay.committed_bytes != bytes.len) return error.PostingWalUncommittedTail;
+        return replay;
+    }
+
+    fn parseFromBoundary(alloc: Allocator, bytes: []const u8, last_batch: ?u64, covered_sequence: u64) !Replay {
+        var replay: Replay = .{
+            .alloc = alloc,
+            .last_committed_batch = last_batch,
+            .covered_source_sequence = covered_sequence,
+        };
         errdefer replay.deinit();
 
         var offset: usize = 0;
@@ -899,6 +928,24 @@ pub const Checkpoint = struct {
         return checkpoint;
     }
 };
+
+test "posting WAL validates a committed suffix against its retained boundary" {
+    const alloc = std.testing.allocator;
+    var writer = Writer.initAfterCommitted(alloc, 10, 100);
+    defer writer.deinit();
+    try writer.append(.mutation, 11, 7, 101, "new");
+    try writer.commit(11, 101);
+
+    const bytes = writer.bytes();
+    var suffix = try Replay.parseCommittedSuffix(alloc, bytes, 10, 100);
+    defer suffix.deinit();
+    try std.testing.expectEqual(@as(?u64, 11), suffix.last_committed_batch);
+    try std.testing.expectEqual(@as(u64, 101), suffix.covered_source_sequence);
+    try std.testing.expectEqual(@as(usize, 1), suffix.records.items.len);
+    try std.testing.expectError(error.OutOfOrderPostingWalBatch, Replay.parseCommittedSuffix(alloc, bytes, 11, 100));
+    try std.testing.expectError(error.OutOfOrderPostingWalSequence, Replay.parseCommittedSuffix(alloc, bytes, 10, 102));
+    try std.testing.expectError(error.PostingWalUncommittedTail, Replay.parseCommittedSuffix(alloc, bytes[0 .. bytes.len - 1], 10, 100));
+}
 
 pub fn testCommittedBatchesReplayInOrder() !void {
     const alloc = std.testing.allocator;

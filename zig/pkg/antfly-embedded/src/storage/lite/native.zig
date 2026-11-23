@@ -10210,6 +10210,30 @@ pub const NativeFile = struct {
         return std.meta.eql(other.dataIdentity(), @as(?inode_lock.FileIdentity, identity));
     }
 
+    /// The caller holds the path writer lease and serializes Store commits.
+    /// Prove the read cut still names the durable tip before adopting its
+    /// append cursor. Reload allocator state through ordinary admission.
+    pub fn prepareWriterFromReadCut(self: *NativeFile, sequence: u64) !bool {
+        const redo = if (self.redo) |*state| state else return false;
+        if (self.read_only or self.forwarding_only or self.transaction_header != null or
+            self.durable_header != null or redo.pending_log_reset != null or
+            self.checkpoint_publication_uncertain or self.redo_frontier_uncertain)
+            return false;
+        if (self.committedSequence() != sequence or
+            (try self.unchangedProtectedRedoTip(self.runtimeIo())) == null) return false;
+
+        const before = self.activeCheckpoint();
+        try self.refreshIfWriterBaseStale(true);
+        try self.resyncRedoTailUnderAuthority();
+        if (self.committedSequence() != sequence or !std.meta.eql(before, self.activeCheckpoint())) return false;
+
+        self.invalidateLedger();
+        self.free_pages_verified = false;
+        self.allocator_verification_base = null;
+        self.redo_reservation_release_pending = null;
+        return true;
+    }
+
     /// A lightweight serving-runtime probe. It can establish equality
     /// with a view already verified by this handle. New or ambiguous
     /// disk state goes through the ordinary recovery path.
@@ -41109,6 +41133,26 @@ test "lite redo idle recovery prefers the mirrored frontier to an older regionle
     defer reader.close();
     try expectRedoDocument(&reader, "one", "regionless");
     try expectRedoDocument(&reader, "two", "mapped");
+}
+
+test "lite writer cut promotion refuses a superseded redo sequence" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-writer-promotion.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithRedoLog(a, io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.putDocument("before", "one");
+    const sequence = writer.committedSequence();
+    try std.testing.expect(try writer.prepareWriterFromReadCut(sequence));
+    try writer.putDocument("after", "two");
+    try std.testing.expect(!try writer.prepareWriterFromReadCut(sequence));
+    var cold = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
+    defer cold.close();
+    try expectRedoDocument(&cold, "before", "one");
+    try expectRedoDocument(&cold, "after", "two");
 }
 
 test "lite redo readers recover a newer disk frontier after mapped publication stops" {

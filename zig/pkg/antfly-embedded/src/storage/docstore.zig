@@ -3803,6 +3803,17 @@ pub const DocStore = struct {
         _ = self.query_generation_revision.fetchAdd(1, .acq_rel);
     }
 
+    /// Reconcile this store's replay admission after writer authority has
+    /// verified the peer cut. Keep the local reservation counter monotonic.
+    pub fn adoptWriterReplayCut(self: *DocStore) !u64 {
+        self.revalidateAdoptedState();
+        var txn = try self.beginProbeTxn();
+        defer txn.abort();
+        const sequence = try self.lastReplaySequenceFromTxn(&txn, 0);
+        if (sequence != 0) self.observeCommittedReplaySequence(sequence);
+        return sequence;
+    }
+
     pub fn reserveNextReplaySequence(self: *DocStore, fallback_next: u64) u64 {
         self.revalidateAdoptedState();
         while (true) {
