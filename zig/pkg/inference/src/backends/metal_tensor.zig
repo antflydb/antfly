@@ -904,6 +904,12 @@ pub const MetalTensor = struct {
         return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, true, .f32);
     }
 
+    /// A cold bank is still owned by the caller while its views are prepared.
+    /// Encoding, rather than allocation, retains it for the consuming frame.
+    pub fn deviceAllocateUnpublishedBank(allocator: std.mem.Allocator, runtime: *anyopaque, byte_len: usize, mode: StorageMode, dims: []const i32) !MetalTensor {
+        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, true, .f32, false, false);
+    }
+
     /// Allocate physical storage without converting or narrowing the dtype.
     pub fn deviceAllocateTyped(allocator: std.mem.Allocator, runtime: *anyopaque, dtype: DType, mode: StorageMode, dims: []const i32) !MetalTensor {
         var count: usize = 1;
@@ -924,7 +930,7 @@ pub const MetalTensor = struct {
         dims: []const i32,
         admitted: bool,
     ) !MetalTensor {
-        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, true, .f32, admitted);
+        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, true, .f32, admitted, true);
     }
 
     fn deviceAllocateChecked(
@@ -936,7 +942,7 @@ pub const MetalTensor = struct {
         fresh: bool,
         dtype: DType,
     ) !MetalTensor {
-        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, fresh, dtype, false);
+        return deviceAllocateCheckedImpl(allocator, runtime, byte_len, mode, dims, fresh, dtype, false, true);
     }
 
     fn deviceAllocateCheckedImpl(
@@ -948,6 +954,7 @@ pub const MetalTensor = struct {
         fresh: bool,
         dtype: DType,
         admitted: bool,
+        retain_in_active_frame: bool,
     ) !MetalTensor {
         if (dims.len > max_dims) return error.InvalidTensorShape;
         var elements: usize = 1;
@@ -976,6 +983,7 @@ pub const MetalTensor = struct {
             .ref_count = .init(1),
             .released = false,
             .release_on_drop = true,
+            .recycle_on_drop = retain_in_active_frame,
             .retirement_witnessed = .init(admitted),
             .workspace_reference = registerWorkspaceReference(handle, true),
             .allocator = allocator,
@@ -983,7 +991,7 @@ pub const MetalTensor = struct {
         var result = deviceView(ref, 0, byte_len, dims, dtype);
         noteDeviceOwnedCreate(handle, byte_len, dims);
         errdefer result.deinit();
-        try result.retainForActiveFrame();
+        if (retain_in_active_frame) try result.retainForActiveFrame();
         return result;
     }
 

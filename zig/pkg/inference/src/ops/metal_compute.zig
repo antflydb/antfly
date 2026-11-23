@@ -22804,7 +22804,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             cache.noteRelease(.host, ref_bytes);
             self.data.prefetch.unlock();
         };
-        var tensor = try MetalTensor.deviceAllocateFreshWithAllocator(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{@intCast(bytes / 4)});
+        var tensor = try MetalTensor.deviceAllocateUnpublishedBank(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{@intCast(bytes / 4)});
         errdefer self.retireTemporaryWorkspaceValue(&tensor);
         const actual = metal_runtime.antfly_metal_audio_buffer_bytes(tensor.deviceHandle());
         if (actual < bytes or actual > admitted) {
@@ -62108,7 +62108,14 @@ test "Metal audio optional clamp scratch preserves a fitting output bank and fun
     // The staged owner must retire only its own delta, never the old bank.
     cache.budget.host_limit_bytes = old_host + metal_tensor_mod.device_buffer_ref_bytes;
     compute.provider_impl.audio_schedule_clock = plan.retry_after;
-    try compute.audioTryPrepare(plan);
+    {
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer cb.decoderRuntimeCancelFrame() catch {};
+        const runtime = compute.provider_impl.raw_decode_runtime;
+        const before = metal_runtime_mod.runtimeMemorySnapshot(runtime).frame_retained_bytes;
+        try compute.audioTryPrepare(plan);
+        try std.testing.expectEqual(before, metal_runtime_mod.runtimeMemorySnapshot(runtime).frame_retained_bytes);
+    }
     try std.testing.expectEqual(old_host, cache.host_bytes);
     try std.testing.expectEqual(old_backend, cache.backend_bytes);
     try std.testing.expectEqual(old_output, plan.outputs[0].?);
