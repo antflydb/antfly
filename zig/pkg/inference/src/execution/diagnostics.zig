@@ -251,6 +251,8 @@ pub const Capture = struct {
     diagnostics: *const Diagnostics,
     previous: ?*Capture = null,
     latest: ?Snapshot = null,
+    stage_placement: ?StagePlacement = null,
+    decoder_route: ?DecoderRoute = null,
     include_programs: bool = false,
     last_program_owner: ?usize = null,
     pub fn begin(self: *Capture, diagnostics: *const Diagnostics) void {
@@ -284,11 +286,21 @@ pub const Capture = struct {
         std.debug.assert(active_capture == self);
         active_capture = self.previous;
         if (self.include_programs) program_observation_depth -= 1;
-        return self.latest;
+        if (self.stage_placement == null and self.decoder_route == null) return self.latest;
+        var snapshot = self.latest orelse return null;
+        snapshot.stage_placement = self.stage_placement;
+        snapshot.decoder_route = self.decoder_route;
+        return snapshot.owned();
     }
     fn published(diagnostics: *const Diagnostics, value: Snapshot) void {
         var current = active_capture;
         while (current) |capture| : (current = capture.previous) if (capture.diagnostics == diagnostics or capture.last_program_owner == @intFromPtr(diagnostics)) {
+            if (value.stage_placement) |placement| capture.stage_placement = placement;
+            if (value.decoder_route) |route| capture.decoder_route = route;
+            // Cold routing can follow encoder execution in the same request.
+            // Keep the numerical snapshot and merge the decisions at finish.
+            const route_only = value.scope == .session_preparation and (value.stage_placement != null or value.decoder_route != null);
+            if (route_only and capture.latest != null and capture.latest.?.scope != .session_preparation) continue;
             capture.latest = value;
         };
     }
@@ -547,4 +559,35 @@ test "program callback capture preserves comptime arguments error unwinding and 
     root_owner.configure(false);
     try std.testing.expectEqual(@as(u8, 9), try root_owner.callProgram(&child, .{ .fixed = .{} }, Probe.run, .{ &child, &counters, false }));
     try std.testing.expect(root_owner.snapshot() == null and child.snapshot() == null);
+}
+
+test "invocation capture preserves route metadata alongside later program counters" {
+    var owner = Diagnostics{};
+    var program = Diagnostics{};
+    var unrelated = Diagnostics{};
+    var capture: Capture = undefined;
+    capture.beginPrograms(&owner, true);
+    owner.publish(.{ .scope = .session_preparation, .stage_placement = .{ .source_backend = .native, .destination_backend = .native, .reason = .resident_pair } });
+    unrelated.publish(.{ .stage_placement = .{ .source_backend = .native, .destination_backend = .cuda, .reason = .foreign_context } });
+    program.publishProgram(.{ .execution = .{ .assigned_kernel_dispatches = 3 } });
+    owner.publish(.{ .scope = .session_preparation, .decoder_route = .{
+        .selected = .full_prefix,
+        .backend = .native,
+        .encoder_storage = .resident,
+        .cache_custody = .none,
+        .native_allowed = false,
+        .merged_allowed = false,
+        .compiled_cache_requested = null,
+        .expected_initial_query_rows = null,
+        .requested_rows = .final_available,
+    } });
+    const captured = capture.finish().?;
+    try std.testing.expectEqual(StagePlacement.Reason.resident_pair, captured.report.?.stage_placement.?.reason);
+    try std.testing.expectEqual(DecoderRoute.Selection.full_prefix, captured.report.?.decoder_route.?.selected);
+    try std.testing.expectEqual(@as(u64, 3), captured.execution.?.assigned_kernel_dispatches);
+
+    capture.beginPrograms(&owner, true);
+    program.publishProgram(.{ .execution = .{ .assigned_kernel_dispatches = 1 } });
+    const next = capture.finish().?;
+    try std.testing.expect(next.report.?.stage_placement == null and next.report.?.decoder_route == null);
 }
