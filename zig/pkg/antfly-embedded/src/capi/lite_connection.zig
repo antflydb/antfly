@@ -42,6 +42,7 @@ const StoreLease = @typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort
 const RuntimeStore = @FieldType(StoreLease, "store");
 const SourceRead = @typeInfo(@typeInfo(std.meta.Child(@FieldType(RuntimeStore.VTable, "begin_read"))).@"fn".return_type.?).error_union.payload;
 const keys = @import("../storage/internal_keys.zig");
+const text_merge_runtime = @import("../storage/db/maintenance/text_merge_runtime.zig");
 const ProducerLease = @FieldType(@FieldType(EnrichmentRuntime, "ownership"), "lease");
 const NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@FieldType(h.Handle, "owned_lite_backend")), "native_docstore")));
 const WriterAdmission = std.meta.Child(@FieldType(NativeStore, "writer_admission"));
@@ -1572,11 +1573,18 @@ pub const WriterLane = struct {
     /// applies derived work, and that work can host a maintenance turn which
     /// borrows the lane again on the same thread. It runs under the outer
     /// checkout: waiting would wait on this thread's own return.
+    /// Also true on an assisted text merge's thread when the holder is the
+    /// producer it runs for (`text_merge_runtime.assisting_producer`): that
+    /// producer waits on the merge holding this lane, and a merge commit
+    /// waiting for the lane instead could only end by timing out.
     fn heldByCurrentThread(self: *WriterLane) bool {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.checked_out and self.holder == std.Thread.getCurrentId();
+        if (!self.checked_out) return false;
+        if (self.holder == std.Thread.getCurrentId()) return true;
+        const producer = text_merge_runtime.assisting_producer orelse return false;
+        return self.holder == producer;
     }
 
     /// `PathWriterLock.ReturnTo.give_back` for the synthetic lease a nested

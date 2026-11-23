@@ -3633,7 +3633,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // correctly forces catch-up (including the gap) before
                     // this write's own ack returns.
                     if (inline_executor_has_workers) {
-                        const worker_applied = S.ownerField(self, "executor").*.appliedSequence(target_name) orelse 0;
+                        var worker_applied = S.ownerField(self, "executor").*.appliedSequence(target_name) orelse 0;
+                        // Behind only by records with no full-text work (other
+                        // processes' inline publications drop their hint, and
+                        // unindexed writes never carry it): skip them rather
+                        // than send this write to a catch-up that has nothing
+                        // to apply. Across processes the worker is otherwise
+                        // always behind, and every write took the slow path.
+                        if (worker_applied != 0 and worker_applied + 1 < sequence) {
+                            const pending = S.ownerField(self, "core").*.store.replayHintRecordBetween(.full_text, worker_applied, sequence - 1) catch null;
+                            if (pending == false and
+                                S.ownerField(self, "executor").*.fastForwardAppliedSequence(target_name, worker_applied, sequence - 1))
+                                worker_applied = sequence - 1;
+                        }
                         // `worker_applied == 0` together with the contiguity
                         // check below (`worker_applied + 1 == sequence`)
                         // means `sequence == 1`: the very first write this
@@ -3665,6 +3677,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         S.ownerField(self, "core").*.index_manager,
                         materialized_derived_batch.?,
                         index_ref,
+                        if (S.ownerField(self, "text_merge_runtime").*) |runtime|
+                            (if (runtime.config.enabled) runtime.config.max_pending_segments else 0)
+                        else
+                            0,
                     ) catch continue;
                     // Own a copy of the name now: `target_name` aliases
                     // `sync_targets.full_text_indexes`, whose "filter once"

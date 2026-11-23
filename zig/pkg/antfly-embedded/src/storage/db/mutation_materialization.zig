@@ -3531,6 +3531,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             index_manager: *index_manager_mod.IndexManager,
             batch: derived_types.DerivedBatch,
             index_ref: index_manager_mod.ManagedIndexRef,
+            max_pending_segments: u64,
         ) !*InlineTextPublication {
             if (index_ref.kind != .full_text) return error.InlineTextPublicationUnsupported;
 
@@ -3545,6 +3546,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer index_manager.catalog_mutex.unlockShared();
                 const precheck_entry = index_manager.textIndexEntry(index_ref.name) orelse return error.InlineTextPublicationUnsupported;
                 if (precheck_entry.persistent.main_backend != .native_catalog) return error.InlineTextPublicationUnsupported;
+                // Inline writes take no merge admission and drive no merges.
+                // At the merge runtime's limit, leave this write to the
+                // replay path: its admission assists a merge (Lite runs no
+                // merge worker), which bounds the level-0 segments every
+                // query and reopen visits.
+                if (max_pending_segments != 0) {
+                    const snap = precheck_entry.persistent.acquireSnapshot();
+                    defer snap.release();
+                    if (snap.segments.len >= max_pending_segments) return error.InlineTextPublicationUnsupported;
+                }
             }
 
             var publication_context = try index_manager.acquireTextPublicationContext(alloc, index_ref.name);

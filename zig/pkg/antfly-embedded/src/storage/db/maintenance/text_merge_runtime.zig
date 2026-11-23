@@ -22,6 +22,13 @@ const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
+
+/// The producer thread an assisted merge on this thread runs for. That
+/// producer is blocked on the merge until it finishes or is drained, so the
+/// merge may use what the producer holds: Lite lends it the producer's
+/// writer lease, which its commit needs and the producer cannot release
+/// mid-batch.
+pub threadlocal var assisting_producer: ?std.Thread.Id = null;
 const storage_io_mod = @import("../../lsm_backend/storage_io.zig");
 
 pub const Config = struct {
@@ -431,8 +438,12 @@ const PlatformTextMergeRuntime = struct {
         next: ?*AssistedMerge = null,
         done: Io.Event = .unset,
         result: anyerror!bool = undefined,
+        producer: std.Thread.Id,
 
         fn run(self: *@This()) void {
+            const previous = assisting_producer;
+            assisting_producer = self.producer;
+            defer assisting_producer = previous;
             self.result = self.runtime.runOnceTask();
             self.done.set(self.io);
         }
@@ -467,7 +478,7 @@ const PlatformTextMergeRuntime = struct {
                 previous.release();
             }
             const work = try self.alloc.create(AssistedMerge);
-            work.* = .{ .runtime = self, .alloc = self.alloc, .io = io, .next = self.assisted_merges };
+            work.* = .{ .runtime = self, .alloc = self.alloc, .io = io, .next = self.assisted_merges, .producer = std.Thread.getCurrentId() };
             (if (builtin.is_test and test_force_concurrency_unavailable.load(.acquire))
                 @as(anyerror!void, error.ConcurrencyUnavailable)
             else
