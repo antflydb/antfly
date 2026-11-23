@@ -2847,7 +2847,7 @@ pub const CudaCompute = struct {
         if (self.capability_profile != .lightonocr3) return null;
         return switch (kind) {
             .pinned_input_host => unreachable,
-            .burst_readback_host => if (!cudaPinnedScalarDownloadsDisabled() or self.lighton_burst_readback.quota == .raw)
+            .burst_readback_host => if (!cudaPinnedScalarDownloadsDisabled())
                 .{ .auxiliary = .{ .kind = kind, .device_bytes = 0, .host_bytes = @import("burst_readback.zig").capacity } }
             else
                 null,
@@ -3674,7 +3674,7 @@ pub const CudaCompute = struct {
             const pending = if (self.ctx.video_cache_budget.admission != null)
                 if (try self.acquireBurstReadbackSlot()) |slot| try slot.beginPrepared(&self.ctx, source, bytes) else null
             else
-                try self.lighton_burst_readback.begin(&self.ctx, source, bytes);
+                try self.lighton_burst_readback.beginUnadmitted(&self.ctx, source, bytes);
             if (pending != null) {
                 if (burst.steps == 1) self.lighton_packed_async_downloads += 1 else self.lighton_async_burst_downloads += 1;
                 self.stats.d2h_bytes += count * @sizeOf(u32);
@@ -45489,7 +45489,7 @@ test "LightOnOCR3 CUDA canonical GDN GEMM preserves exact rows and output bounds
         try std.testing.expect(blas.canonical_gdn_plans > 0);
     }
 }
-test "LightOnOCR3 CUDA burst readback retains admission source and unique pending ownership across reuse and cancellation" {
+test "LightOnOCR3 CUDA burst readback retains source and unique pending ownership across reuse and cancellation" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const readback = @import("burst_readback.zig");
     const memory = @import("../../runtime/tier/memory.zig");
@@ -45502,24 +45502,24 @@ test "LightOnOCR3 CUDA burst readback retains admission source and unique pendin
     }, .check_live_memory = false };
     defer compute.ctx.video_cache_budget.admission = null;
     const slot = &compute.lighton_burst_readback;
-    defer slot.deinit(&compute.ctx);
+    defer slot.clear(&compute.ctx) catch unreachable;
     var source = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, readback.capacity + 256);
     defer source.free(&compute.ctx);
-    try std.testing.expect((try slot.begin(&compute.ctx, source, readback.capacity)) == null);
+    try std.testing.expect((try slot.beginUnadmitted(&compute.ctx, source, readback.capacity)) == null);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     try std.testing.expect(slot.host.ptr == null and slot.event == null and !slot.busy);
-    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = readback.capacity;
+    compute.ctx.video_cache_budget.admission = null;
     var values: [readback.capacity / 4 + 64]u32 = undefined;
     for (&values, 0..) |*value, i| value.* = @intCast(i * 31 + 7);
     try source.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
-    try std.testing.expect((try slot.begin(&compute.ctx, source, readback.capacity + 1)) == null);
-    try std.testing.expect((try slot.begin(&compute.ctx, source, 0)) == null);
-    try std.testing.expectError(error.InvalidShape, slot.begin(&compute.ctx, .{}, 4));
-    var pending = (try slot.begin(&compute.ctx, source, readback.capacity)) orelse return error.UnsupportedOperation;
-    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
-    try std.testing.expect((try slot.begin(&compute.ctx, source, 4)) == null);
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.configureEmbeddingGemma2Admission(null));
-    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
+    try std.testing.expect((try slot.beginUnadmitted(&compute.ctx, source, readback.capacity + 1)) == null);
+    try std.testing.expect((try slot.beginUnadmitted(&compute.ctx, source, 0)) == null);
+    try std.testing.expectError(error.InvalidShape, slot.beginUnadmitted(&compute.ctx, .{}, 4));
+    var pending = (try slot.beginUnadmitted(&compute.ctx, source, readback.capacity)) orelse return error.UnsupportedOperation;
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expect((try slot.beginUnadmitted(&compute.ctx, source, 4)) == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.detachAuxiliaryCacheData(.{ .outside_execution = true }));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     var got: [readback.capacity / 4 + 64]u32 = @splat(0xdeadbeef);
     try std.testing.expectError(error.InvalidCudaState, pending.copy(std.mem.sliceAsBytes(got[32..][0 .. readback.capacity / 4])));
     // A following independent phase may reuse source storage, but the prior
@@ -45533,30 +45533,30 @@ test "LightOnOCR3 CUDA burst readback retains admission source and unique pendin
     var stale = pending;
     pending.deinit();
     const retained = slot.host.ptr;
-    var second = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    var second = (try slot.beginUnadmitted(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
     try std.testing.expectEqual(retained, slot.host.ptr);
-    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     try std.testing.expectError(error.InvalidCudaState, stale.copy(std.mem.sliceAsBytes(got[0 .. readback.capacity / 4])));
     stale.deinit();
     try std.testing.expect(slot.busy);
     // Cancellation before wait drains before releasing the unique slot.
     second.deinit();
     try std.testing.expect(!slot.busy);
-    var third = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    var third = (try slot.beginUnadmitted(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
     try third.wait();
     try third.copy(std.mem.sliceAsBytes(got[0..1]));
     try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -91))), got[0]);
     third.deinit();
     try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
-    try std.testing.expect((try slot.begin(&compute.ctx, source, 4)) == null);
+    try std.testing.expect((try slot.beginUnadmitted(&compute.ctx, source, 4)) == null);
     const graph = try compute.ctx.endStreamCapture();
     compute.ctx.destroyGraph(graph);
-    try compute.configureEmbeddingGemma2Admission(null);
+    try slot.clear(&compute.ctx);
     try std.testing.expect(slot.host.ptr == null and slot.event == null and !slot.busy);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
-    // Policy retirement must not reset generations and revive a copied old
+    // Slot retirement must not reset generations and revive a copied old
     // Pending value when a new host allocation starts its first read.
-    var fourth = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    var fourth = (try slot.beginUnadmitted(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
     stale.deinit();
     try std.testing.expect(slot.busy);
     try std.testing.expectError(error.InvalidCudaState, stale.copy(std.mem.sliceAsBytes(got[0 .. readback.capacity / 4])));
@@ -57012,78 +57012,6 @@ test "CUDA burst readback cold quota warm event reuse optional denial and checke
     guard.finish();
     try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
     try std.testing.expect(!probe.held);
-}
-
-test "CUDA burst readback raw physical slot upgrades SAME lease before managed current B retirement" {
-    if (comptime !cuda_enabled) return error.SkipZigTest;
-    const CacheFunding = @import("prepared_cache.zig");
-    const Readback = @import("burst_readback.zig");
-    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
-    const Sink = @import("../../execution/retirement_sink.zig");
-    const domain = try Domain.create();
-    defer domain.release();
-    const pin = domain.pin();
-    defer pin.release();
-    var compute = try CudaCompute.testing.init(std.testing.allocator);
-    defer compute.deinit();
-    compute.capability_profile = .lightonocr3;
-    compute.ocr_pinned_metadata_enabled = false;
-    compute.ocr_pinned_inputs_enabled = false;
-    compute.lighton_cached_mrope_enabled = false;
-    compute.lighton_bf16_decode_outputs = false;
-    compute.lighton_bf16_projection_outputs = false;
-    const desired: @import("video_cache_budget.zig").Admission = .{ .controller = &domain.controller, .limits = .{ .host_limit_bytes = Readback.capacity }, .check_live_memory = false };
-    try compute.configureEmbeddingGemma2Admission(desired);
-    var source = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4);
-    defer source.free(&compute.ctx);
-    const value = [_]u32{71};
-    try source.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&value));
-    const slot = &compute.lighton_burst_readback;
-    var pending = (try slot.begin(&compute.ctx, source, 4)).?;
-    try pending.wait();
-    pending.deinit();
-    const host = slot.host.ptr;
-    const event = slot.event;
-    const original = slot.quota.peek().?;
-    try std.testing.expect(slot.quota == .raw);
-    var requests: [CacheFunding.Auxiliary.count + 1]CacheFunding.Request = undefined;
-    var builder: CacheFunding.Builder = .{ .storage = &requests };
-    // Materialized raw custody is inventoried even with scalar download
-    // optimization disabled: this is a quota-shell upgrade, never new credit.
-    try compute.appendAuxiliaryCacheWorkload(&builder);
-    try std.testing.expectEqual(@as(usize, 1), builder.len);
-    try std.testing.expectEqual(CacheFunding.Auxiliary.Kind.burst_readback_host, requests[0].auxiliary.kind);
-    try builder.add(try compute.lightOnRetentionRequest(desired, @bitSizeOf(usize)));
-    const work = builder.workload();
-    const cold = try CacheFunding.Funding.create(work);
-    defer cold.finishOutsideExecution();
-    try compute.snapshotLightOnNormFunding(cold, desired);
-    try cold.fundLightOnOutsideExecution(&pin);
-    try std.testing.expectEqual(Readback.capacity, domain.controller.snapshot().host_scratch_bytes);
-    try std.testing.expect(cold.entries[0].upgrade_raw and !cold.entries[0].miss);
-    var sink = try Sink.Ref.create();
-    defer sink.release();
-    var guard = try sink.enter();
-    defer guard.finish();
-    var epoch = try guard.retainEpoch();
-    defer epoch.release();
-    const cb = compute.computeBackend();
-    try CudaCompute.beginLightOnNormFunding(&compute, work, cold, &epoch, desired);
-    var bound = true;
-    defer if (bound) CudaCompute.unbindCacheFunding(&cb, &compute, cold);
-    try std.testing.expect(slot.quota == .prepared);
-    try std.testing.expectEqualDeep(original, slot.quota.peek().?);
-    try std.testing.expectEqual(host, slot.host.ptr);
-    try std.testing.expectEqual(event, slot.event);
-    try std.testing.expectError(error.CacheRetirementCleanupAuthorityRequired, slot.clear(&compute.ctx));
-    try std.testing.expectEqual(host, slot.host.ptr);
-    try std.testing.expectEqual(event, slot.event);
-    try slot.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch });
-    try std.testing.expectEqual(Readback.capacity, domain.controller.snapshot().host_scratch_bytes);
-    CudaCompute.unbindCacheFunding(&cb, &compute, cold);
-    bound = false;
-    guard.finish();
-    try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().host_scratch_bytes);
 }
 
 test "CUDA generic paged attention reads authoritative unequal reserved PAGE tables with stable warm allocations" {
