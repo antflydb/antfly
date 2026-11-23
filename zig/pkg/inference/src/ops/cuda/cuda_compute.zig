@@ -23512,6 +23512,18 @@ fn primSliceOp(ctx: *anyopaque, input_ct: CT, starts_raw: []const i64, limits_ra
         output_count = try checkedMul(output_count, @intCast(slice.size));
     }
     if (input_count != input.elem_count) return error.InvalidShape;
+    // Use the same affine span as prepared aliases. Retain only an owner
+    // with an explicit lifetime; transient slot inputs keep the copy path.
+    if ((input.owned_by_tensor or input.physical_lease != null) and output_count < input_count) view: {
+        const span = @import("../slice_plan.zig").Plan.init(input.shape, starts_raw[0..rank], limits_raw[0..rank], strides_raw[0..rank], output_shape) catch break :view;
+        if (!span.contiguous() or span.count != output_count) break :view;
+        const base = std.math.cast(usize, span.base) orelse return error.InvalidShape;
+        const offset = try checkedMul(base, @sizeOf(f32));
+        const bytes = try checkedMul(output_count, @sizeOf(f32));
+        if (offset > input.buffer.len or bytes > input.buffer.len - offset) return error.InvalidShape;
+        const ptr = try std.math.add(u64, input.buffer.ptr, offset);
+        return makeRetainedTensorView(self, input, .{ .ptr = ptr, .len = bytes, .borrowed = true }, output_shape, output_count);
+    }
     var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
     try self.kernels.launchPrimitiveSliceF32(
@@ -49134,7 +49146,13 @@ test "CUDA failed physical bank free preserves device ledger serving quota shape
 fn materializesOutputOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     if (descriptor.output_shape.dtype != .f32) return false;
     return switch (descriptor.operation) {
-        .transpose, .broadcast, .slice => true,
+        .transpose, .broadcast => true,
+        .slice => |map| blk: {
+            const input = descriptor.input_shapes[0];
+            const output = descriptor.output_shape;
+            const span = map.plan(input, output) catch break :blk true;
+            break :blk !span.contiguous() or (span.base == 0 and input.eq(output));
+        },
         else => false,
     };
 }
@@ -53457,6 +53475,17 @@ test "CUDA bounded activation slice retains the exact planned source range" {
     const actual = try cb.toFloat32(result.outputs[0], a);
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, actual);
+    const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    var source_live = true;
+    defer if (source_live) cb.free(source);
+    const eager = try primSliceOp(cb.ptr, source, &.{ 1, 0 }, &.{ 3, 2 }, &.{ 1, 1 }, &.{ 3, 2 });
+    defer cb.free(eager);
+    try std.testing.expectEqual(tensorFromCt(source).buffer.ptr + 2 * @sizeOf(f32), tensorFromCt(eager).buffer.ptr);
+    cb.free(source);
+    source_live = false;
+    const retained = try cb.toFloat32(eager, a);
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, retained);
 }
 
 test "complete CUDA activation aliases retain full spans under exact caps held output and capture" {
