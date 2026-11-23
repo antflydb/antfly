@@ -13092,6 +13092,46 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
             for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
         }
     }
+    if (comptime with_bias) {
+        const cached = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
+        const current_runtime = compute.provider_impl.raw_decode_runtime.?;
+        const packed_entry = metal.PackedProjectionEntry{ .runtime = current_runtime, .handle = cached.owner.entry, .request = request };
+        var sink = try session.model_lifetime.?.retainRetirementSink();
+        defer sink.release();
+        var guard = try sink.enter();
+        defer guard.finish();
+        var operation = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .managed);
+        defer operation.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        try std.testing.expect(try operation.bindCleanupEpoch(&guard.epoch));
+        const tensor_mod = @import("../backends/metal_tensor.zig");
+        var source = try tensor_mod.MetalTensor.deviceAllocate(current_runtime, rows * width * @sizeOf(f32), .shared, &.{ rows, width });
+        defer source.deinit();
+        try source.uploadBytes(std.mem.sliceAsBytes(&values));
+        var outputs: [count]tensor_mod.MetalTensor = undefined;
+        var initialized: usize = 0;
+        defer for (outputs[0..initialized]) |*output| output.deinit();
+        for (&outputs) |*output| {
+            output.* = try tensor_mod.MetalTensor.deviceAllocate(current_runtime, rows * width * @sizeOf(f32), .private, &.{ rows, width });
+            initialized += 1;
+        }
+        var scratch = try tensor_mod.MetalTensor.deviceAllocate(current_runtime, rows * width * count * @sizeOf(f32), .private, &.{ rows, width * count });
+        defer scratch.deinit();
+        try std.testing.expect(try target.cb.decoderRuntimeBeginFrame());
+        var active = true;
+        defer if (active) target.cb.decoderRuntimeCancelFrame() catch platform.inference_process_supervisor.restartWorker();
+        const recording = try metal.DenseFrameRecording.retainActive(current_runtime);
+        defer recording.release();
+        for (0..2) |_| try packed_entry.encodeAssigned(recording, source, rows, &outputs, scratch);
+        try std.testing.expect(metal.hasActiveFrame(current_runtime) and !metal.hasSubmittedFrame(current_runtime));
+        try target.cb.decoderRuntimeSubmitAndWaitFrame();
+        active = false;
+        try std.testing.expectError(error.AssignedDenseFrameChanged, packed_entry.encodeAssigned(recording, source, rows, &outputs, scratch));
+        try operation.finish();
+        for (&outputs, 0..) |*output, index| {
+            const actual = try output.toHostSlice();
+            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)) + (if (index == 0) bias_value else 0), got, 0.0001);
+        }
+    }
     // An unused pre-entry Claim owns only exact metadata/pins. Wrong graphs
     // and copied backend tables refuse before opaque/SDK access; cancellation
     // drains only its own newly opened empty frame.

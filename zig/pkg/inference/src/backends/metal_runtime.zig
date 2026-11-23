@@ -20305,6 +20305,27 @@ pub const FrameError = error{
 /// Private frame custody for an already exclusive managed operation. The
 /// retained exact command buffer prevents a later frame from reusing its ID.
 /// This owner never adopts an ambient recording or submitted frame.
+/// A retained reference to the active, recording command. Its holder may
+/// encode work while the caller owns submission, cancellation and completion.
+pub const DenseFrameRecording = struct {
+    runtime: *RawMetalDecodeRuntime,
+    command: *anyopaque,
+
+    pub fn retainActive(runtime: *RawMetalDecodeRuntime) !DenseFrameRecording {
+        const command = antfly_metal_retain_active_frame(runtime) orelse return error.AssignedDenseFrameCustodyUnavailable;
+        return .{ .runtime = runtime, .command = command };
+    }
+
+    pub fn release(self: DenseFrameRecording) void {
+        antfly_metal_release_owned_frame(self.command);
+    }
+
+    fn validate(self: DenseFrameRecording, runtime: *RawMetalDecodeRuntime) !void {
+        if (self.runtime != runtime or antfly_metal_owned_frame_matches(runtime, self.command, 1) == 0)
+            return error.AssignedDenseFrameChanged;
+    }
+};
+
 pub const AssignedDenseFrame = struct {
     runtime: *RawMetalDecodeRuntime,
     command: ?*anyopaque,
@@ -50991,7 +51012,15 @@ pub const PackedProjectionEntry = struct {
     /// The prepared selection already committed. No decline/replay is legal
     /// after entering the original native packed matmul/split body.
     pub fn applyAssigned(self: *const PackedProjectionEntry, frame: *const AssignedDenseFrame, input: MetalTensor, rows: usize, outputs: []const MetalTensor, workspace: MetalTensor) !void {
-        try frame.validate(self.runtime);
+        if (frame.phase != .recording) return error.AssignedDenseFrameChanged;
+        const command = frame.command orelse return error.AssignedDenseFrameChanged;
+        return self.encodeAssigned(.{ .runtime = frame.runtime, .command = command }, input, rows, outputs, workspace);
+    }
+
+    /// The managed operation remains responsible for the immutable pack use
+    /// and its cleanup epoch. The caller's recording owns command submission.
+    pub fn encodeAssigned(self: *const PackedProjectionEntry, recording: DenseFrameRecording, input: MetalTensor, rows: usize, outputs: []const MetalTensor, workspace: MetalTensor) !void {
+        try recording.validate(self.runtime);
         if (!self.matches(self.runtime) or rows <= 1 or outputs.len != self.request.count) return error.PreparedPackedProjectionChanged;
         const layout = try self.request.layout();
         if (!denseRegionShape(input, rows, layout.width) or !assignedWorkspaceFits(workspace, rows, layout.total_width)) return error.PreparedPackedProjectionChanged;
