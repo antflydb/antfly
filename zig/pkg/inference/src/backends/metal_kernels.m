@@ -42705,6 +42705,18 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
     }
 }
 
+// The short F32 tile schedule uses the receiving output directly. Keep
+// vendor/MPS and reduced-format schedules under their own workspace owners.
+int antfly_metal_dense_linear_direct_rows_ready(termite_metal_decode_runtime *runtime, size_t slot, size_t rows) {
+    return runtime != NULL && rows > 1 && rows < 128 &&
+        antfly_metal_linear_slot_prepared(runtime, slot) != 0 &&
+        runtime->linear_weight_dtypes[slot] == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 &&
+        !runtime->linear_glide_tensor_ops[slot] && !runtime->lighton_vision_mpp_required &&
+        runtime->linear_multi_row_pipeline != nil && runtime->linear_multi_row_reduce_pipeline != nil &&
+        runtime->linear_bf16_multi_row_pipeline != nil && runtime->linear_bf16_multi_row_reduce_pipeline != nil &&
+        runtime->linear_f16_multi_row_pipeline != nil && runtime->linear_f16_multi_row_reduce_pipeline != nil;
+}
+
 static int termite_metal_decode_runtime_encode_linear_multi_row_device(
     termite_metal_decode_runtime *runtime,
     size_t slot,

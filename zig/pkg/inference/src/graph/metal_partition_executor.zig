@@ -1630,11 +1630,10 @@ pub const MetalPartitionExecutor = struct {
             // that use a different owner than a standalone destination kernel.
             // Regular RoPE descriptors derive positions in the shared kernel;
             // the route separately verifies its exact specialized pipeline.
+            // Projection selection likewise pins the concrete slot and
+            // validates its schedule before assigning any destination.
             const descriptor = ops_mod.kernel_descriptor.lower(graph, id);
             if (descriptor) |value| switch (value.operation) {
-                // A single row is eligible only if cold selection later
-                // pins its concrete parameter slot and proves full storage.
-                .linear => |linear| if (linear.rows != 1) return false,
                 .gather => {
                     // The selected route requires checked host indices. Keep
                     // the tuned gather-after-bias owner for composite graphs.

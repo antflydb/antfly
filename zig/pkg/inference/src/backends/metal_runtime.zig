@@ -28324,6 +28324,8 @@ pub fn decoderRuntimeApplyAudioLinearInto(
     return applyDenseLinearInto(false, self, slot, input, rows, in_dim, out_dim, output);
 }
 
+pub extern fn antfly_metal_dense_linear_direct_rows_ready(runtime: ?*RawMetalDecodeRuntime, slot: usize, rows: usize) c_int;
+
 pub fn decoderRuntimeApplyLinearDeviceInto(
     self: anytype,
     slot: usize,

@@ -12307,7 +12307,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         fn supported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
             const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-            return descriptor.operation == .linear and descriptor.operation.linear.rows == 1 and self.audio_capture == null and
+            return descriptor.operation == .linear and self.audio_capture == null and
                 self.provider_impl.hasDecoderRuntime() and supportsAssignedDescriptor(descriptor);
         }
         fn supportedRegion(raw: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
@@ -12344,22 +12344,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return facts[0..bindings.len];
         }
         fn prepare(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable) !?route.Owned {
-            return prepareWith(compute, request, table, supported);
+            return prepareWith(compute, request, table, supported, true);
         }
         fn prepareRegion(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable) !?route.Owned {
-            return prepareWith(compute, request, table, supportedRegion);
+            return prepareWith(compute, request, table, supportedRegion, false);
         }
-        fn prepareWith(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable, comptime supported_fn: *const fn (*anyopaque, *const ops.kernel_descriptor.Descriptor) bool) !?route.Owned {
+        fn prepareWith(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable, comptime supported_fn: *const fn (*anyopaque, *const ops.kernel_descriptor.Descriptor) bool, comptime direct: bool) !?route.Owned {
             if (comptime !build_options.enable_metal) return null;
             const key = bindingKey(compute, request.descriptor, request.inputs) orelse return null;
             const slot = compute.assignedDenseLinearSlot(key) orelse return null;
+            if (direct and !directRowsReady(compute, slot, request.descriptor.operation.linear)) return null;
             var facts: [3]route.Binding = undefined;
             var host_planes: [2]@import("../execution/storage_ownership.zig").Plane = undefined;
             var checked = request;
             checked.inputs = directInputs(compute, request.descriptor, request.inputs, &facts, &host_planes) orelse return null;
-            var direct = (try @import("../execution/assigned_kernel_route.zig").prepare(.{ .ptr = compute, .vtable = table }, checked, supported_fn)) orelse return null;
+            var checked_route = (try @import("../execution/assigned_kernel_route.zig").prepare(.{ .ptr = compute, .vtable = table }, checked, supported_fn)) orelse return null;
             var committed = false;
-            defer if (!committed) direct.deinit();
+            defer if (!committed) checked_route.deinit();
             const owner = try request.allocator.create(PreparedDenseLinear);
             defer if (!committed) request.allocator.destroy(owner);
             const index_held = compute.ownsMetadataIndex();
@@ -12383,14 +12384,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 else => return err,
             };
             var output_slot = request.output;
-            output_slot.writable_bytes = direct.requirements.primary_bytes;
+            output_slot.writable_bytes = checked_route.requirements.primary_bytes;
             var host_sources: [2]?CT = @splat(null);
             for (checked.inputs[1..], request.inputs[1..], 0..) |fact, original, index| {
                 if (fact == .resident) host_sources[index] = original.tensor.value;
             }
-            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = output_slot, .slot = slot, .key = key, .host_sources = host_sources, .payload = payload, .declaration = declaration };
+            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = checked_route, .descriptor = request.descriptor.*, .output_slot = output_slot, .slot = slot, .key = key, .host_sources = host_sources, .payload = payload, .declaration = declaration };
             committed = true;
-            return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .output_plane_metadata = .assigned_dense, .vtable = &vtable };
+            return .{ .context = owner, .implementation = checked_route.implementation, .key = checked_route.key, .requirements = checked_route.requirements, .output_plane_metadata = .assigned_dense, .vtable = &vtable };
         }
         fn matches(raw: *anyopaque, request: route.Validate) bool {
             const self: *PreparedDenseLinear = @ptrCast(@alignCast(raw));
@@ -12411,6 +12412,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 acceptsPhysicalImplementation(tensor.implementation.table) and
                 self.host_sources[index - 1] == tensor.value and self.pinValid();
         }
+        fn directRowsReady(compute: *MetalCompute, slot: usize, linear: ops.kernel_descriptor.Linear) bool {
+            return linear.rows == 1 or metal_runtime.antfly_metal_dense_linear_direct_rows_ready(compute.provider_impl.raw_decode_runtime, slot, linear.rows) != 0;
+        }
         fn pinValid(self: *const PreparedDenseLinear) bool {
             if (comptime !build_options.enable_metal) return false;
             return self.declaration.valid() and (if (self.payload) |pin| pin.valid() else true);
@@ -12423,7 +12427,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try @import("../execution/assigned_kernel_route.zig").validateDescriptor(&self.direct, request.descriptor);
             const linear = request.descriptor.operation.linear;
             const key = compute.assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return error.PreparedKernelBindingChanged;
-            if (!std.meta.eql(key, self.key) or request.auxiliaries.len != 0) return error.PreparedKernelBindingChanged;
+            if (!std.meta.eql(key, self.key) or request.auxiliaries.len != 0 or !directRowsReady(compute, self.slot, linear)) return error.PreparedKernelBindingChanged;
             return self.slot;
         }
         fn matchesInputs(self: *PreparedDenseLinear, inputs: []const route.Binding) bool {
@@ -12434,7 +12438,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         fn belongs(compute: *MetalCompute, owned: *const route.Owned) bool {
             const self: *PreparedDenseLinear = @ptrCast(@alignCast(owned.context));
-            return self.compute == compute and supported(compute, &self.descriptor);
+            return self.compute == compute and supported(compute, &self.descriptor) and directRowsReady(compute, self.slot, self.descriptor.operation.linear);
         }
         fn deinit(raw: *anyopaque) void {
             const self: *PreparedDenseLinear = @ptrCast(@alignCast(raw));
@@ -56737,6 +56741,30 @@ const PreparedDenseRegionFixture = struct {
             defer reference.free(product);
             expected[index] = try reference.toFloat32(product, a);
             compared += 1;
+        }
+        {
+            const rows = 3;
+            var matrix: [rows * 64]f32 = undefined;
+            for (0..rows) |row| for (0..64) |column| {
+                matrix[row * 64 + column] = x[column] + @as(f32, @floatFromInt(row)) * 0.025;
+            };
+            const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&matrix, &.{ rows, 64 }));
+            defer cb.free(input);
+            const reference_input = try reference.fromFloat32Shape(&matrix, &.{ rows, 64 });
+            defer reference.free(reference_input);
+            const weight = try reference.getWeight("q");
+            defer reference.free(weight);
+            const output = try reference.linearNoBias(reference_input, weight, rows, 64, 64);
+            defer reference.free(output);
+            const wanted = try reference.toFloat32(output, a);
+            defer a.free(wanted);
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const activation = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, 64 }));
+            const parameter = try builder.parameter("q", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+            try graph.markOutput(try builder.linearNoBias(activation, parameter, rows, 64, 64));
+            try runInstalled(cb, &graph, &.{ activation, parameter }, &.{ input, values[1] }, &.{wanted}, false, false);
         }
         const activation_peer = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&x, &.{ 1, 64 }));
         defer cb.free(activation_peer);
