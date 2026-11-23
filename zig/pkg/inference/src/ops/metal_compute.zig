@@ -40351,6 +40351,70 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    fn denseDecoderAvailable(ctx: *anyopaque) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.audio_capture == null and self.provider_impl.hasDecoderRuntime();
+    }
+
+    fn denseDecoderHeldWeight(ctx: *anyopaque, model: *const anyopaque, value: CT, name: ?[]const u8) !@import("../execution/storage_ownership.zig").Plane {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != model) return error.ForeignDenseWeightModel;
+        if (!denseDecoderAvailable(ctx)) return error.UnsupportedDenseSchedule;
+        const buffer = toBuf(value);
+        const full_name = buffer.weight_handle_name orelse return error.DenseWeightPreparationChanged;
+        if (buffer.weight_handle_refs == 0 or self.weight_handles.get(full_name) != value) return error.DenseWeightPreparationChanged;
+        if (name) |expected| {
+            const prefix = self.data.prefix;
+            const local = if (prefix.len == 0) full_name else local: {
+                if (full_name.len <= prefix.len or full_name[prefix.len] != '.' or !std.mem.startsWith(u8, full_name, prefix)) return error.DenseWeightRoleChanged;
+                break :local full_name[prefix.len + 1 ..];
+            };
+            if (!std.mem.eql(u8, expected, local)) return error.DenseWeightRoleChanged;
+        }
+        const dimensions = buffer.logical_shape orelse return error.UnsupportedDenseSchedule;
+        if (dimensions.len > ml.graph.shape.max_rank) return error.UnsupportedDenseSchedule;
+        const backend = ops.ComputeBackend{ .ptr = self, .vtable = &vtable_impl };
+        const binding = @import("../execution/kernel_route.zig").Binding{ .tensor = .{ .implementation = .{ .context = ctx, .table = backend.vtable }, .value = value } };
+        if (!try ownedPayloadInput(ctx, binding, ml.graph.Shape.init(.f32, dimensions))) return error.UnsupportedDenseSchedule;
+        return @import("../execution/dense_decoder_schedule.zig").residentPlane(&backend, value);
+    }
+
+    fn denseDecoderProjectionInto(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor, inputs: []const CT, destination: CT, mode: @import("kernel_backend.zig").ProjectionMode) !bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!denseDecoderAvailable(ctx) or descriptor.operation != .linear or !supportsAssignedDescriptor(descriptor)) return false;
+        const dims = descriptor.operation.linear;
+        if (inputs.len != descriptor.input_count or inputs.len != (if (dims.bias) @as(usize, 3) else 2)) return false;
+        const output = (try self.projectionDestination(destination)) orelse return false;
+        for (inputs, descriptor.input_shapes[0..inputs.len]) |value, shape| {
+            const tensor = denseDeviceF32(value) orelse return false;
+            if (tensor.device.?.ref.runtime != output.device.?.ref.runtime or projectionRangesOverlap(tensor, output.*) or tensor.ndim() != shape.rank()) return false;
+            for (tensor.shape(), shape.dims[0..shape.rank()]) |actual, logical| if (actual != logical) return false;
+        }
+        const input = denseDeviceF32(inputs[0]).?;
+        if (!sameDenseProjectionShape(input, dims.rows, dims.in_dim) or !sameDenseProjectionShape(output.*, dims.rows, dims.out_dim)) return false;
+        const slot = self.assignedLinearSlot(.{ .descriptor = descriptor, .inputs = inputs, .output = null }) orelse return false;
+        switch (metal_runtime.termite_metal_decode_runtime_linear_slot_dtype(self.provider_impl.raw_decode_runtime, slot)) {
+            @backingInt(metal_runtime.DenseLinearSlotDtype.f32), @backingInt(metal_runtime.DenseLinearSlotDtype.f32_mps) => {},
+            else => return false,
+        }
+        if (mode == .query) return true;
+        if (!try metal_runtime.decoderRuntimeApplyLinearDeviceInto(self.provider_impl, slot, input, dims.rows, dims.in_dim, dims.out_dim, output.*)) return error.PreparedDenseProjectionChanged;
+        output.invalidateHostMirror();
+        return true;
+    }
+
+    fn sameDenseProjectionShape(value: MetalTensor, rows: usize, columns: usize) bool {
+        const r = std.math.cast(i32, rows) orelse return false;
+        const c = std.math.cast(i32, columns) orelse return false;
+        return value.ndim() == 2 and value.dim(0) == r and value.dim(1) == c;
+    }
+
+    const dense_decoder_services: @import("kernel_backend.zig").DenseDecoderServices = .{
+        .available = denseDecoderAvailable,
+        .heldWeightF32 = denseDecoderHeldWeight,
+        .projectionInto = denseDecoderProjectionInto,
+    };
+
     fn projectionDestination(self: *MetalCompute, value: CT) !?*MetalTensor {
         const buffer = toBuf(value);
         if (buffer.integer_storage or buffer.lazy_multiply != null or hasHostView(buffer) or bufHasAnyQuantizedStorage(buffer)) return null;
@@ -40870,7 +40934,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return (descriptor.operation == .slice or descriptor.operation == .broadcast) and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .denseDecoder = &dense_decoder_services, .ownedPayloadServices = &owned_payload_services, .retainImmutableTensor = retainImmutableTensorOp, .standaloneOutputBytes = standaloneOutputBytesOp, .pooledOutputStorage = pooledOutputStorageOp, .gatherDeviceRows = gatherDeviceRowsOp, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .regionRoutesInOrdinaryFrame = true, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .assignedKernelWorkspace = assignedKernelWorkspaceOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -55925,6 +55989,12 @@ const PreparedDenseRegionFixture = struct {
                 try std.testing.expectError(error.PreparedKernelBindingChanged, run(cb.ptr, invocation));
                 invocation.inputs = values[0..3];
                 try std.testing.expect(try run(cb.ptr, invocation));
+                const services = @import("../execution/dense_decoder_backend.zig");
+                try std.testing.expect(services.available(&cb));
+                try std.testing.expectError(error.ForeignDenseWeightModel, services.heldWeight(&cb, @ptrFromInt(16), @ptrFromInt(16), "q"));
+                try std.testing.expect(!try services.projectionInto(&cb, &descriptor, values[0..3], values[0], .query));
+                try std.testing.expect(try services.projectionInto(&cb, &descriptor, values[0..3], destination, .query));
+                try std.testing.expect(try services.projectionInto(&cb, &descriptor, values[0..3], destination, .apply));
                 const actual = try cb.toFloat32(destination, a);
                 defer a.free(actual);
                 for (actual, expected[0]) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
