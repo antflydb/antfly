@@ -22782,28 +22782,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return wrapMetalPersistentTensor(tensor);
     }
 
-    /// Reserve all views before allocating their bank. The ordinary bank
-    /// helper owns the separate SDK payload and root-reference reservation.
+    /// Reserve the SDK payload, root reference and all views together.
     fn metalAudioArenaBank(self: *MetalCompute, owner: *PreparedTensorStorage, bytes: usize, wrapper_bytes: usize) !?MetalTensor {
-        const cache = if (self.data.tier_cache) |*value| value else return null;
-        const host_bytes = try std.math.add(usize, owner.host_bytes, wrapper_bytes);
-        {
-            self.data.prefetch.lock();
-            defer self.data.prefetch.unlock();
-            cache.reserve(.host, wrapper_bytes) catch return null;
-        }
-        var committed = false;
-        defer if (!committed) {
-            self.data.prefetch.lock();
-            defer self.data.prefetch.unlock();
-            cache.noteRelease(.host, wrapper_bytes);
-        };
-        owner.host_bytes = host_bytes;
-        defer if (!committed) {
-            owner.host_bytes -= wrapper_bytes;
-        };
-        const bank = (try self.metalPersistentBuffer(owner, bytes, false)) orelse return null;
-        committed = true;
+        const bank = (try self.allocateMetalPersistentBank(owner, bytes, false, wrapper_bytes)) orelse return null;
         owner.drop_ct = dropMetalPersistentTensor;
         return bank;
     }
@@ -22824,19 +22805,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn metalPersistentBuffer(self: *MetalCompute, storage_owner: *PreparedTensorStorage, bytes: usize, shared: bool) !?MetalTensor {
+        return self.allocateMetalPersistentBank(storage_owner, bytes, shared, 0);
+    }
+
+    fn allocateMetalPersistentBank(self: *MetalCompute, storage_owner: *PreparedTensorStorage, bytes: usize, shared: bool, wrapper_bytes: usize) !?MetalTensor {
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         if (bytes % @sizeOf(f32) != 0) return null;
         const elements = std.math.cast(i32, bytes / @sizeOf(f32)) orelse return null;
         const admitted = self.audioPlanAllocationBound(bytes, shared) orelse return null;
         const cache = if (self.data.tier_cache) |*v| v else return null;
-        const ref_bytes = metal_tensor_mod.device_buffer_ref_bytes;
+        const host_reservation = try std.math.add(usize, metal_tensor_mod.device_buffer_ref_bytes, wrapper_bytes);
+        const host_total = try std.math.add(usize, storage_owner.host_bytes, host_reservation);
         self.data.prefetch.lock();
-        cache.reserve(.host, ref_bytes) catch {
+        cache.reserve(.host, host_reservation) catch {
             self.data.prefetch.unlock();
             return null;
         };
         cache.reserve(.backend, admitted) catch {
-            cache.noteRelease(.host, ref_bytes);
+            cache.noteRelease(.host, host_reservation);
             self.data.prefetch.unlock();
             return null;
         };
@@ -22845,7 +22831,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer if (!committed) {
             self.data.prefetch.lock();
             cache.noteRelease(.backend, admitted);
-            cache.noteRelease(.host, ref_bytes);
+            cache.noteRelease(.host, host_reservation);
             self.data.prefetch.unlock();
         };
         var tensor = try MetalTensor.deviceAllocateUnpublishedBank(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{elements});
@@ -22863,7 +22849,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         cache.noteRelease(.backend, admitted - actual);
         self.data.prefetch.unlock();
         storage_owner.backend_bytes += actual;
-        storage_owner.host_bytes += ref_bytes;
+        storage_owner.host_bytes = host_total;
         committed = true;
         return tensor;
     }
