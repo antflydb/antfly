@@ -4284,12 +4284,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     try view.putIndexCatalog(self.scope, converted);
                 }
-                try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
                 _ = try apply_state.contributeProgressTxn(view, self.progress);
             }
 
             fn applyQueued(ptr: *anyopaque, view: commit_participant.View) anyerror!void {
                 const self: *InlineDensePublication = @ptrCast(@alignCast(ptr));
+                try self.index_manager.writeDenseVectorMappingForInlinePublicationTxn(view, self.index_name, self.doc_key, self.vector_id, self.vector);
                 if (self.coverage_plan) |*plan| try plan.stage(view);
             }
 
@@ -4415,6 +4415,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try queue.validate();
             if (queue.view == null) queue.start(try entry.index.forkInlineWriter());
             errdefer queue.discardIdle();
+            const queued_owner = queue.view.?.getMetadata(assignment.vector_id) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (queued_owner) |owner| {
+                defer queue.view.?.alloc.free(owner);
+                if (!std.mem.eql(u8, owner, write.doc_key)) return error.InlineDensePublicationUnsupported;
+            }
             var staged = queue.view.?.insertWithMetadataStaged(assignment.vector_id, write.vector, write.doc_key) catch |err| switch (err) {
                 error.StagedPublicationUnsupported => return error.InlineDensePublicationUnsupported,
                 else => return err,

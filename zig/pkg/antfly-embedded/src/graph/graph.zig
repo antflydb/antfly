@@ -8550,20 +8550,55 @@ pub const GraphIndex = struct {
     }
 
     pub fn applyInlinePublicationToServing(self: *GraphIndex, publication: *const InlineEdgePublication) !void {
+        try self.publishCatalogDelta(publication.forward_mutations, publication.reverse_mutations, publication.counters);
+    }
+
+    pub fn refreshCatalogDelta(self: *GraphIndex, forward: []const native_catalog_backend.Mutation, reverse: []const native_catalog_backend.Mutation) !void {
+        if (self.outgoing_owner != .native_catalog or self.reverse_owner != .native_catalog) return error.UnsupportedRefresh;
+        var counters = self.committedStats();
+        var has_contributor_writes = false;
+        for (reverse) |mutation| {
+            if (mutation.namespace != null) continue;
+            const key = mutation.key;
+            if (std.mem.eql(u8, key, maintenance.ownership_key) or std.mem.eql(u8, key, maintenance.range_key) or
+                std.mem.eql(u8, key, maintenance.counters_key)) return error.UnsupportedRefresh;
+            if (!mutation.is_delete and (std.mem.startsWith(u8, key, edge_contribution_prefix) or
+                std.mem.startsWith(u8, key, relationship_contribution_prefix))) has_contributor_writes = true;
+            const field: *u64 = if (std.mem.eql(u8, key, graph_edge_count_key))
+                &counters.edge_count
+            else if (std.mem.eql(u8, key, graph_node_count_key))
+                &counters.node_count
+            else if (std.mem.eql(u8, key, graph_edge_generation_key))
+                &counters.edge_generation
+            else {
+                if (std.mem.eql(u8, key, "meta:relationship_ids:v1")) {
+                    if (!mutation.is_delete and mutation.value.len != 8) return error.UnsupportedRefresh;
+                    counters.has_relationship_ids = !mutation.is_delete and std.mem.readInt(u64, mutation.value[0..8], .little) != 0;
+                }
+                continue;
+            };
+            if (!mutation.is_delete and mutation.value.len != 8) return error.UnsupportedRefresh;
+            field.* = if (mutation.is_delete) 0 else std.mem.readInt(u64, mutation.value[0..8], .little);
+        }
+        try self.publishCatalogDelta(forward, reverse, counters);
+        if (has_contributor_writes) self.contributor_ordering_enabled.store(true, .release);
+    }
+
+    fn publishCatalogDelta(self: *GraphIndex, forward_mutations: []const native_catalog_backend.Mutation, reverse_mutations: []const native_catalog_backend.Mutation, counters: Stats) !void {
         const forward = self.outgoing_owner.native_catalog;
         const reverse = self.reverse_owner.native_catalog;
         errdefer {
             forward.invalidateMirror();
             reverse.invalidateMirror();
         }
-        var next_forward = try forward.prepareExternalMirror(publication.forward_mutations);
+        var next_forward = try forward.prepareExternalMirror(forward_mutations);
         defer next_forward.deinit();
-        var next_reverse = try reverse.prepareExternalMirror(publication.reverse_mutations);
+        var next_reverse = try reverse.prepareExternalMirror(reverse_mutations);
         defer next_reverse.deinit();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         next_forward.publish();
         next_reverse.publish();
-        self.publishCountersLocked(publication.counters);
+        self.publishCountersLocked(counters);
         self.ownership_mutex.unlock();
     }
 
@@ -22206,6 +22241,16 @@ test "graph private writer view advances both catalogs without serving queued ed
     const served = try graph.getEdges(alloc, "a", "rel", .out);
     defer GraphIndex.freeEdges(alloc, served);
     try std.testing.expectEqual(@as(usize, 0), served.len);
+    try graph.refreshCatalogDelta(first.forwardMutations(), first.reverseMutations());
+    try std.testing.expectEqual(first.counters, graph.committedStats());
+    for ([_]struct { key: []const u8, direction: EdgeDirection }{
+        .{ .key = "a", .direction = .out },
+        .{ .key = "b", .direction = .in },
+    }) |probe| {
+        const edges = try graph.getEdges(alloc, probe.key, "rel", probe.direction);
+        defer GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
 }
 
 test "graph inline edge publication stages mutations without touching the sink, then installs durably via an external fold-in" {

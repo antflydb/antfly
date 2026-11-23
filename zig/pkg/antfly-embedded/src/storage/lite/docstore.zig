@@ -3506,15 +3506,7 @@ pub const Store = struct {
         result.file.retirement_work_pages = opts.reclamation.retirement_work_pages;
         result.file.reserve_retirement_capacity = true;
         result.file.vacuum_target_indexed = opts.reclamation.page_reuse;
-        if (opts.require_versioned_text and !opts.read_only and !result.file.header.versioned_text_required) {
-            var workspace = try result.reserveGenerationWorkspace();
-            defer workspace.deinit();
-            const limit = workspace.options.max_storage_bytes;
-            result.file.vacuum_workspace_limit = if (limit == 0) null else limit;
-            defer result.file.vacuum_workspace_limit = null;
-            result.file.redo_log_budget_bytes = opts.reclamation.max_storage_bytes;
-            try result.file.requireVersionedTextFormat();
-        }
+        if (opts.require_versioned_text and !opts.read_only) try result.file.requireVersionedTextFormat();
         if (!opts.read_only and !opts.externally_locked) {
             if (opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
                 _ = try result.vacuumWithCancel(null);

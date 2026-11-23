@@ -17367,10 +17367,55 @@ pub const IndexManager = struct {
         not_loaded,
     };
 
+    pub const ScopeChanges = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(native_catalog_backend.Mutation));
+    const RefreshFile = @import("../../lite/native.zig").NativeFile;
+
+    fn readScopeDelta(alloc: Allocator, file: *RefreshFile, scope: []const u8, keys: []const native_catalog_backend.Mutation) ![]native_catalog_backend.Mutation {
+        const sink = @import("../../lite/native_catalog_sink.zig");
+        const delta = try alloc.dupe(native_catalog_backend.Mutation, keys);
+        const checkpoint = file.activeCheckpoint();
+        for (delta) |*mutation| {
+            const key = try sink.durableKeyAlloc(alloc, scope, mutation.namespace, mutation.key);
+            const value = try file.getIndexCatalogRecordAtCheckpointAlloc(alloc, key, checkpoint);
+            mutation.is_delete = value == null;
+            mutation.value = value orelse "";
+        }
+        return delta;
+    }
+
+    pub const dense_refresh_mapping_prefix = "\x00\x00__metadata__:dense2:";
+
+    pub fn refreshDenseMappingKey(self: *IndexManager, key: []const u8) !bool {
+        const start = dense_refresh_mapping_prefix.len;
+        const end = internal_keys.findComponentTerminator(key, start) orelse return false;
+        const kind_end = internal_keys.findComponentTerminator(key, end + 2) orelse return false;
+        const name = try internal_keys.decodeBodyAlloc(self.alloc, key[start..end]);
+        defer self.alloc.free(name);
+        const kind = key[end + 2 .. kind_end];
+        const suffix = key[kind_end + 2 ..];
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.denseIndex(name) orelse return false;
+        if (entry.index.nativeCatalogScope() == null or entry.native_physical_v2) return false;
+        self.lockAtomicWithBackoff(entry.apply_mutex);
+        defer entry.apply_mutex.unlock();
+        if (entry.inline_writer.pending != 0) return false;
+        if (std.mem.eql(u8, kind, "ordinal")) {
+            if (suffix.len != 4) return false;
+            _ = entry.ordinal_vector_ids.remove(std.mem.readInt(u32, suffix[0..4], .big));
+        } else if (std.mem.eql(u8, kind, "vector_ordinal")) {
+            if (suffix.len != 8) return false;
+            _ = entry.vector_ordinals.remove(std.mem.readInt(u64, suffix[0..8], .big));
+        } else if (!std.mem.eql(u8, kind, "doc") and !std.mem.eql(u8, kind, "vector") and
+            !std.mem.eql(u8, kind, "ordinal_member") and !std.mem.eql(u8, kind, "next_id")) return false;
+        return true;
+    }
+
     /// Refreshes the loaded index whose native-catalog scope is `scope`
-    /// from the file, under that index's apply guard. Versioned full-text
-    /// and sparse indexes refresh in place; other kinds reopen.
-    pub fn refreshIndexScopeFromTip(self: *IndexManager, scope: []const u8, keys: []const @import("../../native_catalog_backend.zig").Mutation) !ScopeRefresh {
+    /// from the file, under that index's apply guard. Unsupported formats
+    /// and generation transitions reopen.
+    pub fn refreshIndexScopeFromTip(self: *IndexManager, scope: []const u8, changes: *const ScopeChanges, file: *RefreshFile) !ScopeRefresh {
+        const keys = changes.get(scope).?.items;
         const name = name: {
             self.catalog_mutex.lockShared();
             defer self.catalog_mutex.unlockShared();
@@ -17386,6 +17431,44 @@ pub const IndexManager = struct {
                 const name = try self.alloc.dupe(u8, entry.config.name);
                 defer self.alloc.free(name);
                 return self.refreshSparseIndexFromTipCatalogLocked(name, keys);
+            }
+            for (self.graph_indexes.items) |*entry| {
+                const forward = entry.index.forwardCatalogScope() orelse continue;
+                const reverse = entry.index.reverseCatalogScope() orelse continue;
+                const outgoing = std.mem.eql(u8, scope, forward);
+                if (!outgoing and !std.mem.eql(u8, scope, reverse)) continue;
+                const forward_keys = if (changes.get(forward)) |items| items.items else &.{};
+                if (!outgoing and forward_keys.len != 0) return .refreshed;
+                const reverse_keys = if (changes.get(reverse)) |items| items.items else &.{};
+                self.lockAtomicWithBackoff(entry.apply_mutex);
+                defer entry.apply_mutex.unlock();
+                if (entry.inline_writer.pending != 0) return .reopen;
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const alloc = arena.allocator();
+                const forward_delta = try readScopeDelta(alloc, file, forward, forward_keys);
+                const reverse_delta = try readScopeDelta(alloc, file, reverse, reverse_keys);
+                entry.index.refreshCatalogDelta(forward_delta, reverse_delta) catch |err| switch (err) {
+                    error.UnsupportedRefresh => return .reopen,
+                    else => return err,
+                };
+                entry.invalidateNeighborSource();
+                return .refreshed;
+            }
+            for (self.dense_indexes.items) |*entry| {
+                const owned = entry.index.nativeCatalogScope() orelse continue;
+                if (!std.mem.eql(u8, owned, scope)) continue;
+                self.lockAtomicWithBackoff(entry.apply_mutex);
+                defer entry.apply_mutex.unlock();
+                if (entry.inline_writer.pending != 0 or entry.native_physical_v2) return .reopen;
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const delta = try readScopeDelta(arena.allocator(), file, scope, keys);
+                entry.index.refreshCatalogDelta(delta) catch |err| switch (err) {
+                    error.UnsupportedRefresh => return .reopen,
+                    else => return err,
+                };
+                return .refreshed;
             }
             return .not_loaded;
         };
@@ -35679,6 +35762,13 @@ pub const IndexManager = struct {
         vector_id: u64,
         vector: []const f32,
     ) !void {
+        if (try self.lookupDenseDocKeyByVectorIdTxn(txn, index_name, vector_id)) |owner| {
+            defer self.alloc.free(owner);
+            if (!std.mem.eql(u8, owner, doc_key)) return error.QueuedDependencyRejected;
+        }
+        if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |mapped_id| {
+            if (mapped_id != vector_id) return error.QueuedDependencyRejected;
+        }
         try self.writeDenseVectorMappingTxn(txn, index_name, doc_key, null, vector_id, denseVectorFingerprint(vector));
     }
 

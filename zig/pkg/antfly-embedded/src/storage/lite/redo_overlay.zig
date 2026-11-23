@@ -310,8 +310,9 @@ pub const SharedRedoOverlay = struct {
     reclaimed_through: u64 = 0,
     // Keys borrow the maps. Reclaim and rollback remove records before
     // freeing a key. Old prefixes are compacted in batches.
-    changes: std.ArrayListUnmanaged(Change) = .empty,
-    changes_start: usize = 0,
+    // Local appends can be ahead of incoming replay. Keep independent
+    // sorted runs so replay never moves the pending local suffix.
+    changes: [2]ChangeHistory = @splat(.{}),
     /// Every currently live reader's pinned sequence, across every
     /// `NativeFile`/`ReadGeneration` referencing this overlay -- the
     /// in-process half of `minimumPinnedSequence`, unified here so an
@@ -347,28 +348,54 @@ pub const SharedRedoOverlay = struct {
 
     const Change = struct { sequence: u64, key: []const u8, origin: u32, root: u8 };
 
-    fn changeEnd(self: *const SharedRedoOverlay, sequence: u64) usize {
-        var start = self.changes_start;
-        var end = self.changes.items.len;
-        while (start < end) {
-            const middle = start + (end - start) / 2;
-            if (self.changes.items[middle].sequence <= sequence) start = middle + 1 else end = middle;
+    const ChangeHistory = struct {
+        entries: std.ArrayListUnmanaged(Change) = .empty,
+        start: usize = 0,
+
+        fn end(self: *const ChangeHistory, sequence: u64) usize {
+            var first = self.start;
+            var last = self.entries.items.len;
+            while (first < last) {
+                const middle = first + (last - first) / 2;
+                if (self.entries.items[middle].sequence <= sequence) first = middle + 1 else last = middle;
+            }
+            return first;
         }
-        return start;
+
+        fn after(self: *const ChangeHistory, sequence: u64) []const Change {
+            return self.entries.items[self.end(sequence)..];
+        }
+
+        fn appendAssumeCapacity(self: *ChangeHistory, change: Change) void {
+            if (self.entries.items.len == self.start or self.entries.items[self.entries.items.len - 1].sequence <= change.sequence) {
+                self.entries.appendAssumeCapacity(change);
+            } else {
+                self.entries.insertAssumeCapacity(self.end(change.sequence), change);
+            }
+        }
+
+        fn reclaim(self: *ChangeHistory, floor: u64) void {
+            self.start = self.end(floor);
+            if (self.start < self.entries.items.len - self.start) return;
+            const retained = self.entries.items[self.start..];
+            std.mem.copyForwards(Change, self.entries.items[0..retained.len], retained);
+            self.entries.items.len = retained.len;
+            self.start = 0;
+        }
+    };
+
+    fn changeHistory(self: *SharedRedoOverlay, origin: u32) *ChangeHistory {
+        return &self.changes[@intFromBool(origin == 0)];
     }
 
     fn addChangeAssumeCapacity(self: *SharedRedoOverlay, change: Change) void {
         if (change.sequence <= self.reclaimed_through) return;
-        const index = if (self.changes.items.len == self.changes_start or self.changes.items[self.changes.items.len - 1].sequence <= change.sequence)
-            self.changes.items.len
-        else
-            self.changeEnd(change.sequence);
-        self.changes.insertAssumeCapacity(index, change);
+        self.changeHistory(change.origin).appendAssumeCapacity(change);
     }
 
     pub fn deinit(self: *SharedRedoOverlay, _: Allocator) void {
         const allocator = owned_allocator;
-        self.changes.deinit(allocator);
+        for (&self.changes) |*history| history.entries.deinit(allocator);
         var scopes = self.scope_latest.keyIterator();
         while (scopes.next()) |scope| allocator.free(scope.*);
         self.scope_latest.deinit(allocator);
@@ -717,7 +744,7 @@ pub const SharedRedoOverlay = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const track_change = sequence > self.reclaimed_through;
-        if (track_change) try self.changes.ensureUnusedCapacity(allocator, 1);
+        if (track_change) try self.changeHistory(origin).entries.ensureUnusedCapacity(allocator, 1);
         self.noteScopeLocked(root, key, sequence, is_delete);
         const node = try self.entry_pool.create(allocator);
         errdefer self.entry_pool.destroy(node);
@@ -770,13 +797,14 @@ pub const SharedRedoOverlay = struct {
         defer self.mutex.unlock(io);
         const slot = self.maps[root].getPtr(key) orelse return;
         const node = slot.*;
-        var index = self.changeEnd(node.sequence);
-        while (index > self.changes_start) {
+        const history = self.changeHistory(node.origin);
+        var index = history.end(node.sequence);
+        while (index > history.start) {
             index -= 1;
-            const change = self.changes.items[index];
+            const change = history.entries.items[index];
             if (change.sequence != node.sequence) break;
             if (change.root == root and change.origin == node.origin and std.mem.eql(u8, change.key, key)) {
-                _ = self.changes.orderedRemove(index);
+                _ = history.entries.orderedRemove(index);
                 break;
             }
         }
@@ -814,7 +842,9 @@ pub const SharedRedoOverlay = struct {
         defer self.mutex.unlock(io);
 
         const allocator = owned_allocator;
-        self.changes.items.len = if (from == 0) self.changes_start else self.changeEnd(from - 1);
+        for (&self.changes) |*history| {
+            history.entries.items.len = if (from == 0) history.start else history.end(from - 1);
+        }
         for (&self.maps, 0..) |*map, root| {
             var entries = map.iterator();
             while (entries.next()) |entry| {
@@ -1167,8 +1197,8 @@ pub const SharedRedoOverlay = struct {
     pub fn hasSiblingVersionsAfter(self: *SharedRedoOverlay, io: std.Io, min_sequence_exclusive: u64, own_origin: u32) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        for (self.changes.items[self.changeEnd(min_sequence_exclusive)..]) |change| {
-            if (change.origin != 0 and change.origin != own_origin) return true;
+        for (self.changeHistory(1).after(min_sequence_exclusive)) |change| {
+            if (change.origin != own_origin) return true;
         }
         return false;
     }
@@ -1190,12 +1220,14 @@ pub const SharedRedoOverlay = struct {
         }
         var seen = std.StringHashMapUnmanaged(void).empty;
         defer seen.deinit(allocator);
-        for (self.changes.items[self.changeEnd(min_sequence_exclusive)..]) |change| {
-            if (change.root != root or (change.origin != 0 and change.origin == own_origin)) continue;
-            const slot = try seen.getOrPut(allocator, change.key);
-            if (slot.found_existing) continue;
-            try list.ensureUnusedCapacity(allocator, 1);
-            list.appendAssumeCapacity(try allocator.dupe(u8, change.key));
+        for (&self.changes) |*history| {
+            for (history.after(min_sequence_exclusive)) |change| {
+                if (change.root != root or (change.origin != 0 and change.origin == own_origin)) continue;
+                const slot = try seen.getOrPut(allocator, change.key);
+                if (slot.found_existing) continue;
+                try list.ensureUnusedCapacity(allocator, 1);
+                list.appendAssumeCapacity(try allocator.dupe(u8, change.key));
+            }
         }
         return try list.toOwnedSlice(allocator);
     }
@@ -1357,13 +1389,7 @@ pub const SharedRedoOverlay = struct {
         const min_pin = self.minPinLocked();
         const floor = @min(self.durable_checkpoint_sequence, min_pin orelse self.durable_checkpoint_sequence);
         self.reclaimed_through = @max(self.reclaimed_through, floor);
-        self.changes_start = self.changeEnd(self.reclaimed_through);
-        if (self.changes_start >= self.changes.items.len - self.changes_start) {
-            const retained = self.changes.items[self.changes_start..];
-            std.mem.copyForwards(Change, self.changes.items[0..retained.len], retained);
-            self.changes.items.len = retained.len;
-            self.changes_start = 0;
-        }
+        for (&self.changes) |*history| history.reclaim(self.reclaimed_through);
         for (&self.maps, 0..) |*map, root_index| {
             const root: u8 = @intCast(root_index);
             // Collected rather than removed mid-iteration: this map's
@@ -1538,7 +1564,7 @@ pub const SharedRedoOverlay = struct {
                     continue;
                 };
                 if (newer) |above| {
-                    if (sequence > self.reclaimed_through) try self.changes.ensureUnusedCapacity(allocator, 1);
+                    if (sequence > self.reclaimed_through) try self.changeHistory(0).entries.ensureUnusedCapacity(allocator, 1);
                     const node = try self.entry_pool.create(allocator);
                     node.* = decoded;
                     node.older = cursor;
@@ -1549,7 +1575,7 @@ pub const SharedRedoOverlay = struct {
                     continue;
                 }
             }
-            if (sequence > self.reclaimed_through) try self.changes.ensureUnusedCapacity(allocator, 1);
+            if (sequence > self.reclaimed_through) try self.changeHistory(0).entries.ensureUnusedCapacity(allocator, 1);
             const node = try self.entry_pool.create(allocator);
             errdefer self.entry_pool.destroy(node);
             node.* = decoded;

@@ -2929,9 +2929,17 @@ pub const Owner = struct {
     /// tip. False, with nothing but the shared overlay advanced, when
     /// anything else changed (schema, catalogs, index definitions, other
     /// index kinds, a fold): the caller reopens.
-    fn refreshInPlace(root: *h.Handle, file: *native.NativeFile, probe: *const native.NativeFile) !bool {
+    fn refreshInPlace(root: *h.Handle, file: *native.NativeFile, probe: *native.NativeFile) !bool {
         if (!in_place_refresh_enabled) return false;
         const redo = if (file.redo) |*r| r else return false;
+        // Retain the prior serving checkpoint for the duration of the delta.
+        // Its reader registration also fences reclamation while reading the
+        // probe's newer roots on the same inode.
+        var retained = root.owned_lite_backend.?.native_docstore.?.beginRead() catch |err| switch (err) {
+            error.ReadSnapshotReclaimed => return false,
+            else => return err,
+        };
+        defer retained.abort();
         const since = root.lite_runtime_sequence;
         const folded_before = redo.checkpoint_sequence;
         try file.refreshCrossProcessRedoOverlay();
@@ -2940,7 +2948,7 @@ pub const Owner = struct {
         // A slot another writer published without a fold is only visible
         // to a fresh open.
         if (probe.activeCheckpoint().page_count > file.activeCheckpoint().page_count) return false;
-        if (file.committedSequence() < probe.committedSequence()) return false;
+        if (file.committedSequence() != probe.committedSequence()) return false;
         const io = file.runtime();
         const shared = redo.shared;
         // A reclaim past `since` may have dropped versions this must see.
@@ -2965,7 +2973,10 @@ pub const Owner = struct {
                 else => return err,
             };
             defer freeKeys(changed);
-            for (changed) |key| if (!routineDocumentKey(key)) return false;
+            for (changed) |key| {
+                if (routineDocumentKey(key)) continue;
+                if (!try refreshDenseMapping(root, key)) return false;
+            }
         }
         const Catalog = @import("../storage/native_catalog_backend.zig");
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2987,8 +2998,8 @@ pub const Owner = struct {
                 .key = record[separator + 1 ..],
             });
         }
-        for (scopes.keys(), scopes.values()) |scope, scope_keys| {
-            var refreshed = switch (try root.db.core.index_manager.refreshIndexScopeFromTip(scope, scope_keys.items)) {
+        for (scopes.keys()) |scope| {
+            var refreshed = root.db_live and switch (try root.db.core.index_manager.refreshIndexScopeFromTip(scope, &scopes, probe)) {
                 .refreshed => true,
                 .reopen => return false,
                 .not_loaded => false,
@@ -2996,7 +3007,7 @@ pub const Owner = struct {
             var tables = root.embedded_tables.valueIterator();
             while (!refreshed) {
                 const table = tables.next() orelse break;
-                refreshed = switch (try table.*.db.core.index_manager.refreshIndexScopeFromTip(scope, scope_keys.items)) {
+                refreshed = switch (try table.*.db.core.index_manager.refreshIndexScopeFromTip(scope, &scopes, probe)) {
                     .refreshed => true,
                     .reopen => return false,
                     .not_loaded => false,
@@ -3026,6 +3037,25 @@ pub const Owner = struct {
         return std.mem.startsWith(u8, key, native.NativeFile.artifact_lease_key_prefix) or
             std.mem.eql(u8, key, "\x00AFREDO/reservation-v1") or
             std.mem.eql(u8, key, "\x00AFCERT/allocator-v1");
+    }
+
+    fn refreshDenseMapping(root: *h.Handle, physical: []const u8) !bool {
+        const table_prefix = "\x02db/embedded/tables/";
+        var database: ?*h.db_mod.DB = if (root.db_live) &root.db else null;
+        var key = physical;
+        if (std.mem.startsWith(u8, key, table_prefix)) {
+            const end = std.mem.indexOfScalarPos(u8, key, table_prefix.len, 0) orelse return false;
+            const id = std.fmt.parseInt(u64, key[table_prefix.len..end], 10) catch return false;
+            var tables = root.embedded_tables.valueIterator();
+            database = while (tables.next()) |table| {
+                if (table.*.db.core.identity_namespace.table_id == id) break &table.*.db;
+            } else return false;
+            key = key[end + 1 ..];
+        }
+        const manager = (database orelse return false).core.index_manager;
+        const Manager = @TypeOf(manager.*);
+        if (!std.mem.startsWith(u8, key, Manager.dense_refresh_mapping_prefix)) return false;
+        return manager.refreshDenseMappingKey(key);
     }
 
     /// Document-root keys an ordinary write changes, under a table's

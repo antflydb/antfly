@@ -4753,10 +4753,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return err;
                 };
             }
-            if (indexed_lane_yielded) {
-                const hook = opts.writer_lane_release_before_wait.?;
-                try hook.resume_after_indexed_wait.?(hook.ptr);
-            }
             // WS4 phase 2: the primary commit is durable now, and every
             // inline text publication's mutations rode in that SAME
             // native transaction (commit_participant.List.stage ran
@@ -4828,6 +4824,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             snapshot_mutation.release();
+            // The inline publications retain shared catalog guards until
+            // cleanup. DDL may already own the lane and be waiting for them.
+            if (indexed_lane_yielded) {
+                const hook = opts.writer_lane_release_before_wait.?;
+                try hook.resume_after_indexed_wait.?(hook.ptr);
+            }
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
                 applyCommittedBatchToShadowOrdered(self, materialized_derived_batch.?, ticket);

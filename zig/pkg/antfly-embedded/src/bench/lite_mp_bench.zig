@@ -201,10 +201,11 @@ fn runWorker(path: [:0]const u8, cfg: Config, indexed: bool, worker: usize) Work
         const slot = sequence % cfg.slots;
         const t = token(&token_buf, worker, sequence);
         var vector_buf: [160]u8 = undefined;
+        const dense = denseSequenceComponents(sequence);
         const embeddings: []const u8 = if (!indexed) "" else switch (cfg.index) {
             .text => "",
             .sparse => std.fmt.bufPrint(&vector_buf, ",\"_embeddings\":{{\"vec\":{{\"indices\":[{d},{d}],\"values\":[1.0,0.5]}}}}", .{ worker * 1000 + slot, sparseSequenceDim(sequence) }) catch unreachable,
-            .dense => std.fmt.bufPrint(&vector_buf, ",\"_embeddings\":{{\"vec\":[{d},1,0,0,0,0,0,{d}]}}", .{ worker + 1, sequence % 13 }) catch unreachable,
+            .dense => std.fmt.bufPrint(&vector_buf, ",\"_embeddings\":{{\"vec\":[{d},1,0,0,{d},{d},{d},{d}]}}", .{ worker + 1, dense[0], dense[1], dense[2], dense[3] }) catch unreachable,
         };
         const request = std.fmt.bufPrint(&request_buf, "{{\"inserts\":{{\"w{d}-{d}\":{{\"text\":\"{s}\"{s}}}}},\"sync_level\":\"{s}\"}}", .{ worker, slot, t, embeddings, sync_level }) catch unreachable;
         const code = batch(handle, request);
@@ -349,6 +350,37 @@ fn responseHasKey(handle: ?*anyopaque, query: []const u8, key: []const u8) !bool
     return std.mem.indexOf(u8, response.ptr.?[0..response.len], quoted) != null;
 }
 
+fn denseSequenceComponents(sequence: u64) [4]u16 {
+    return .{ @truncate(sequence), @truncate(sequence >> 16), @truncate(sequence >> 32), @truncate(sequence >> 48) };
+}
+
+fn verifyDense(handle: ?*anyopaque, worker: usize, slot: usize, sequence: u64, out: *Verification) !void {
+    var key_buf: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "w{d}-{d}", .{ worker, slot });
+    var query_buf: [512]u8 = undefined;
+    const dense = denseSequenceComponents(sequence);
+    const query = try std.fmt.bufPrint(&query_buf, "{{\"embeddings\":{{\"vec\":[{d},1,0,0,{d},{d},{d},{d}]}},\"indexes\":[\"vec\"],\"filter_query\":{{\"doc_id\":[\"{s}\"]}},\"limit\":2}}", .{ worker + 1, dense[0], dense[1], dense[2], dense[3], key });
+    var response: c.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&response);
+    if (api.antfly_db_search_json(handle, .fromSlice(query), &response) != .ok) return error.SearchFailed;
+    const Hit = struct { _id: []const u8, _distance: ?f64 = null };
+    const Result = struct {
+        responses: []struct { hits: ?struct { hits: ?[]Hit = null } = null },
+    };
+    const parsed = try std.json.parseFromSlice(Result, std.heap.page_allocator, response.ptr.?[0..response.len], .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var count: usize = 0;
+    var exact = false;
+    if (parsed.value.responses.len != 1) return error.InvalidSearchResponse;
+    const hits = if (parsed.value.responses[0].hits) |group| group.hits orelse &.{} else &.{};
+    for (hits) |hit| {
+        if (!std.mem.eql(u8, hit._id, key)) continue;
+        count += 1;
+        if (hit._distance) |distance| exact = exact or @abs(distance) < 0.001;
+    }
+    if (count == 0) out.missing += 1 else if (count != 1 or !exact) out.stale += 1;
+}
+
 fn verify(path: [:0]const u8, cfg: Config, indexed: bool, results: []const WorkerResult) !Verification {
     var out: Verification = .{};
     const handle = try openHandle(path, cfg.busy_timeout_ms);
@@ -362,23 +394,11 @@ fn verify(path: [:0]const u8, cfg: Config, indexed: bool, results: []const Worke
     }
     if (!indexed) return out;
     if (cfg.index == .dense) {
-        // Every key is a single vector: a stale copy shows up as the key
-        // appearing twice in a query that returns them all.
-        var response: c.Buffer = .{};
-        defer api.antfly_buffer_free_zero(&response);
-        const query = "{\"embeddings\":{\"vec\":[1,1,0,0,0,0,0,0]},\"indexes\":[\"vec\"],\"limit\":1024}";
-        if (api.antfly_db_search_json(handle, .fromSlice(query), &response) != .ok) {
-            out.searches_failed += 1;
-            return out;
-        }
-        const body = response.ptr.?[0..response.len];
-        var key_buf: [32]u8 = undefined;
         for (results, 0..) |result, worker| for (0..cfg.slots) |slot| {
             if (result.last[slot] == 0) continue;
-            const key = try std.fmt.bufPrint(&key_buf, "\"w{d}-{d}\"", .{ worker, slot });
-            const count = std.mem.count(u8, body, key);
-            if (count == 0) out.missing += 1;
-            if (count > 1) out.stale += 1;
+            verifyDense(handle, worker, slot, result.last[slot] - 1, &out) catch {
+                out.searches_failed += 1;
+            };
         };
         return out;
     }

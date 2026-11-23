@@ -20021,6 +20021,43 @@ pub const HBCIndex = struct {
         self.finishPublishedSearchStateRefresh();
     }
 
+    pub fn refreshCatalogDelta(self: *HBCIndex, mutations: []const native_catalog_backend.Mutation) !void {
+        if (self.env_owner != .native_catalog or self.experimentalPostingWalAuthoritative() or self.generationRepairPending()) return error.UnsupportedRefresh;
+        var metadata = self.metadata;
+        for (mutations) |mutation| {
+            const namespace = mutation.namespace orelse return error.UnsupportedRefresh;
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?)) {
+                if (!std.mem.eql(u8, mutation.key, meta_key) or mutation.is_delete or !IndexMetadata.isSupportedEncodedLen(mutation.value.len)) return error.UnsupportedRefresh;
+                const next = IndexMetadata.decode(mutation.value);
+                if (next.version != metadata.version or next.dims != metadata.dims or next.metric != metadata.metric or
+                    next.branching_factor != metadata.branching_factor or next.leaf_size != metadata.leaf_size or
+                    next.use_quantization != metadata.use_quantization or next.quantizer_seed != metadata.quantizer_seed or
+                    next.quantization_bits != metadata.quantization_bits) return error.UnsupportedRefresh;
+                metadata = next;
+            }
+        }
+        try self.beginPublishedSearchStateRefreshIo();
+        errdefer self.abortPublishedSearchStateRefresh();
+        try self.markPublishedSearchStateCommitting();
+        try self.env_owner.native_catalog.applyExternallyCommittedMutations(mutations);
+        for (mutations) |mutation| {
+            const namespace = mutation.namespace.?;
+            if (std.mem.eql(u8, namespace, runtimeNamespace(.nodes).name.?)) {
+                if (decodeNodeKey(mutation.key)) |node| self.invalidateNodeCache(node.id);
+            } else if (std.mem.eql(u8, namespace, runtimeNamespace(.quant).name.?)) {
+                if (decodeQuantizedNodeId(mutation.key)) |node_id| self.invalidateQuantizedCache(node_id);
+            } else if (std.mem.eql(u8, namespace, runtimeNamespace(.vecs).name.?)) {
+                if (decodeVectorDerivedKey(mutation.key)) |decoded| {
+                    if (decoded.kind == .vector_metadata) self.invalidateMetadataCache(decoded.vector_id);
+                } else if (isRawVectorKey(mutation.key)) {
+                    self.invalidateVectorCache(std.mem.readInt(u64, mutation.key[2..10], .big));
+                }
+            }
+        }
+        self.metadata = metadata;
+        self.finishPublishedSearchStateRefresh();
+    }
+
     /// `staged.mutations` were never committed durably. Restores this
     /// index's in-memory metadata to what it was before
     /// `insertWithMetadataStaged`/`deleteStaged` and releases

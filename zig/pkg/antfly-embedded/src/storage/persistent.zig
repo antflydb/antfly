@@ -2197,7 +2197,6 @@ pub const PersistentIndex = struct {
     /// segment additions and retirements made by a merge.
     pub fn refreshChangedFromTip(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !void {
         if (!self.versioned or self.inline_in_flight.load(.acquire) != 0) return error.UnsupportedRefresh;
-        if (self.read_only) return self.refreshFromTip();
         const backend = switch (self.main_store_owner) {
             .native_catalog => |backend| backend,
             else => return error.UnsupportedRefresh,
@@ -2211,6 +2210,7 @@ pub const PersistentIndex = struct {
             if (std.mem.eql(u8, namespace, native_catalog_backend.tip_namespace)) continue;
             if (!std.mem.eql(u8, namespace, dead_namespace) and
                 !std.mem.eql(u8, namespace, l0_namespace) and
+                !std.mem.eql(u8, namespace, runtimeNamespace(.deletions).name.?) and
                 !std.mem.eql(u8, namespace, runtimeNamespace(.segments).name.?) and
                 !std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?))
                 return self.refreshFromTip();
@@ -2225,6 +2225,10 @@ pub const PersistentIndex = struct {
                 const bytes = value orelse return error.UnsupportedRefresh;
                 if (bytes.len != 4 or std.mem.readInt(u32, bytes[0..4], .little) != text_storage_format_versions) return error.UnsupportedRefresh;
             }
+            // Versioned segments derive liveness from the dead set. Merge
+            // and reset still emit tombstones for legacy deletion bitmaps.
+            if (value != null and std.mem.eql(u8, key.namespace.?, runtimeNamespace(.deletions).name.?))
+                return self.refreshFromTip();
             key.is_delete = value == null;
             key.value = value orelse "";
         }
@@ -9584,6 +9588,7 @@ test "persistent index applies peer level-0, merge and rebuild deltas" {
         .{ .namespace = l0_namespace, .key = &old_key },
         .{ .namespace = l0_namespace, .key = &new_key },
         .{ .namespace = dead_namespace, .key = &dead_key },
+        .{ .namespace = "deletions", .key = &old_key },
         .{ .namespace = "segments", .key = &merged_key },
         .{ .namespace = "meta", .key = &active_key },
     });

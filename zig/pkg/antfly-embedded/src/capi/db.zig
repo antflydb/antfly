@@ -11222,8 +11222,45 @@ fn testWriterLaneDurabilityWait(indexed: bool) !void {
     // free carries no priority-inversion risk the way it would have under
     // the old per-call retain/handoff design.
     const gate_mutex_free = LockProbe.acquirable(&connection.gate.mutex);
+    const CatalogChange = struct {
+        handle: ?*anyopaque,
+        code: capi.ErrorCode = .invalid_argument,
+
+        fn run(self: *@This()) void {
+            self.code = antfly_db_add_index_json(self.handle, .fromSlice(
+                "{\"name\":\"concurrent_text\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+            ));
+        }
+    };
+    var change: CatalogChange = .{ .handle = handle };
+    const catalog_thread = if (indexed and probe.hook_seen)
+        std.Thread.spawn(.{}, CatalogChange.run, .{&change}) catch |err| {
+            probe.proceed.set(handleLockIo());
+            thread.join();
+            return err;
+        }
+    else
+        null;
+    var catalog_entered = false;
+    if (catalog_thread != null) {
+        // The catalog call must own connection admission before the writer
+        // resumes, so the test exercises the former reversed lock order.
+        for (0..1000) |_| {
+            if (!connection.mutex.tryLock()) {
+                catalog_entered = true;
+                break;
+            }
+            connection.mutex.unlock(handleLockIo());
+            handleLockIo().sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
     probe.proceed.set(handleLockIo());
     thread.join();
+    if (catalog_thread) |worker| {
+        worker.join();
+        try std.testing.expect(catalog_entered);
+        try std.testing.expectEqual(capi.ErrorCode.ok, change.code);
+    }
 
     try std.testing.expect(probe.hook_seen);
     try std.testing.expect(connection_mutex_free);
