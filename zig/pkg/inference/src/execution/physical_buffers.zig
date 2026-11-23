@@ -1071,6 +1071,16 @@ pub const Pool = struct {
             output.readable_bytes == bytes and output.byte_offset <= root_bytes and bytes <= root_bytes - output.byte_offset;
     }
 
+    pub fn hasUniqueProvider(self: *const Pool, kind: ops.BackendKind) bool {
+        var found = false;
+        for (self.backends) |backend| {
+            if (backend.kind() != kind) continue;
+            if (found) return false;
+            found = true;
+        }
+        return found;
+    }
+
     /// Check that every cross-provider edge binds a dedicated destination
     /// bank and can read the selected producer without materializing storage
     /// outside the physical plan. Executing an admitted schedule also requires
@@ -1078,12 +1088,18 @@ pub const Pool = struct {
     pub fn attestsOwnedTransfers(self: *const Pool, reachable: []const bool) bool {
         const selected = if (self.selection) |*value| value else return false;
         if (self.transfers.len == 0 or self.transfers.len != self.plan.transfers.len or self.transfers.len != selected.transfer_planes.len) return false;
+        var has_copy = false;
         for (self.plan.transfers, self.transfers, selected.transfer_planes, 0..) |edge, recipe, plane, index| {
-            const transfer_plan = recipe orelse return false;
-            const destination = plane orelse return false;
             if (edge.source_node >= reachable.len or !reachable[edge.source_node] or
                 edge.source_partition >= edge.target_partition or
                 self.plan.transfer_index.get(buffers.transferKey(edge.source_node, edge.target_partition)) != index) return false;
+            if (edge.source_backend == edge.target_backend) {
+                if (recipe != null or plane != null or !self.hasUniqueProvider(edge.source_backend)) return false;
+                continue;
+            }
+            const transfer_plan = recipe orelse return false;
+            const destination = plane orelse return false;
+            has_copy = true;
             if (transfer_plan.source_backend_index >= self.backends.len or transfer_plan.backend_index >= self.backends.len) return false;
             const source = self.backends[transfer_plan.source_backend_index];
             const target = self.backends[transfer_plan.backend_index];
@@ -1108,7 +1124,7 @@ pub const Pool = struct {
                 .runtime_input => return false,
             }
         }
-        return true;
+        return has_copy;
     }
 
     pub fn completeOwnedPayload(self: *const Pool) ?@import("owned_coverage.zig").Complete {
@@ -5527,7 +5543,7 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     const upload = try builder.reshape(producer, ml.graph.Shape.init(.f32, &.{ 2, 2 }));
     const on_device = try builder.absOp(upload);
     const download = try builder.reshape(on_device, shape);
-    const on_host = try builder.neg(download);
+    const on_host = try builder.add(download, literal);
     const output = try builder.absOp(on_host);
     try graph.markOutput(output);
     const reached = try @import("../graph/interpreter.zig").computeReachable(a, &graph);
@@ -5540,7 +5556,7 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     var parts = [_]partition.Partition{
         .{ .backend = .native, .node_ids = &.{ literal, producer, upload }, .external_inputs = &.{}, .executor = native_executor },
         .{ .backend = target_kind, .node_ids = &.{ on_device, download }, .external_inputs = &.{.{ .node_id = upload, .source_partition = 0 }} },
-        .{ .backend = .native, .node_ids = &.{on_host}, .external_inputs = &.{.{ .node_id = download, .source_partition = 1 }}, .executor = native_executor },
+        .{ .backend = .native, .node_ids = &.{on_host}, .external_inputs = &.{ .{ .node_id = download, .source_partition = 1 }, .{ .node_id = literal, .source_partition = 0 } }, .executor = native_executor },
         .{ .backend = target_kind, .node_ids = &.{output}, .external_inputs = &.{.{ .node_id = on_host, .source_partition = 2 }} },
     };
     const placement: partition.PartitionPlan = .{
@@ -5566,6 +5582,9 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     const routes = (try root.prepareRoutes(&.{})) orelse return error.MissingPreparedKernelRoute;
     defer routes.release();
     try std.testing.expect(routes.pool.attestsOwnedTransfers(reached));
+    const retained = routes.pool.plan.transfer_index.get(buffers.transferKey(literal, 2)) orelse return error.MissingPartitionDependency;
+    try std.testing.expect(routes.pool.transfers[retained] == null);
+    try std.testing.expect(routes.pool.selection.?.transfer_planes[retained] == null);
     {
         const destination = &routes.pool.selection.?.transfer_planes[0].?;
         const original = destination.*;
@@ -5604,7 +5623,7 @@ fn mixedOwnedTransferCase(comptime target_kind: ops.BackendKind) !void {
     try std.testing.expectEqualSlices(device.DeviceId, &.{0}, actual.output_devices);
     const values = try target.toFloat32(actual.outputs[0], a);
     defer a.free(values);
-    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 0, 6, 0 }, values);
 }
 
 test "Metal to Native partition transfer preserves a held download" {

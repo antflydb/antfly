@@ -315,6 +315,11 @@ pub const Selection = struct {
         if (self.transfer_planes.len == 0) return retained;
         const slot = pool.plan.slotForNode(consumer) orelse return retained;
         const index = pool.plan.transfer_index.get(@import("../graph/buffer_plan.zig").transferKey(source, slot.partition_index)) orelse return retained;
+        if (index >= pool.plan.transfers.len) return .{ .value = .unknown, .witnessed = false };
+        const edge = pool.plan.transfers[index];
+        // Placement between partitions on the same provider preserves
+        // the producer's backing and its selected representation.
+        if (edge.source_backend == edge.target_backend and pool.hasUniqueProvider(edge.source_backend)) return retained;
         if (index >= self.transfer_planes.len or self.transfer_planes[index] == null) return .{ .value = .unknown, .witnessed = false };
         const plane: *const [1]ownership.Plane = @ptrCast(&self.transfer_planes[index].?);
         return .{ .value = .{ .planned = .{ .logical = plane[0].descriptor.shape, .planes = plane } }, .witnessed = false };

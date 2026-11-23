@@ -2864,6 +2864,7 @@ fn attestOwnedDeviceSchedule(
             if (edge.source_node != input.node_id or edge.source_partition != input.source_partition or
                 edge.target_partition != partition_index or edge.target_backend != part.backend or
                 edge.source_backend != plan.base.partitions[input.source_partition].backend) return false;
+            if (edge.source_backend == edge.target_backend and plan.device_assignment[input.source_partition] != device_id) return false;
             transfer_ordinal += 1;
         }
         if (!active) continue;
