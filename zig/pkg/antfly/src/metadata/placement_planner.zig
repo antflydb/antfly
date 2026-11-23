@@ -190,6 +190,11 @@ pub const PlacementPlanner = struct {
 
         for (ranges.items) |range| {
             const table = findTable(tables.items, range.table_id) orelse return error.UnknownTable;
+            // Native-local owners are pinned by the enrolled Boot/descriptor,
+            // not members of a DataRaft replica set. A heartbeat or generic
+            // balancing policy must never relocate a volatile generation.
+            if (table.sql_persistence != null) continue;
+
             const replica_count = @min(@as(usize, table.desired_replica_count), countEligibleCandidates(candidate_node_ids, candidate_domains, table.placement_role));
             if (replica_count == 0) continue;
             const has_current_group = findCurrentIntent(current_intents, range.group_id, null) != null;

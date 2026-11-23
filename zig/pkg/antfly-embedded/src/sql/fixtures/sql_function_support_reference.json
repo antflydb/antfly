@@ -1,0 +1,70 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL exact SUPPORT catalog admission",
+  "original": {
+    "id": "sql-0394",
+    "source_entry_sha256": "7328e207061be717e0fff28c21e8e7b48fd2404e02a4b11c0b8ec45049de1cda",
+    "sql": "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support",
+    "sqlstate": "42883"
+  },
+  "bootstrap": [
+    "CREATE FUNCTION support_sentinel() RETURNS text LANGUAGE sql AS $$SELECT 'kept'$$"
+  ],
+  "setup": [
+    "CREATE FUNCTION audit_support(text) RETURNS text LANGUAGE sql AS $$SELECT lower($1)$$",
+    "CREATE SCHEMA helper_scope",
+    "CREATE FUNCTION helper_scope.audit_support(text) RETURNS text LANGUAGE sql AS $$SELECT lower($1)$$"
+  ],
+  "probes": [
+    {
+      "sql": "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support",
+      "sqlstate": "42883"
+    },
+    {
+      "sql": "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support AS $$BEGIN RETURN NEW; END$$",
+      "sqlstate": "42883"
+    },
+    {
+      "sql": "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT helper_scope.audit_support",
+      "sqlstate": "42883"
+    },
+    {
+      "sql": "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT helper_scope.absent_support",
+      "sqlstate": "42883"
+    },
+    {
+      "sql": "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT absent_scope.audit_support",
+      "sqlstate": "42883"
+    }
+  ],
+  "query": "SELECT support_sentinel() AS sentinel,audit_support('KePt') AS value,helper_scope.audit_support('AlSo KePt') AS qualified_value",
+  "output": {
+    "columns": [
+      "sentinel",
+      "value",
+      "qualified_value"
+    ],
+    "column_oids": [
+      25,
+      25,
+      25
+    ],
+    "rows": [
+      [
+        "kept",
+        "kept",
+        "also kept"
+      ]
+    ],
+    "sql_nulls": [
+      [
+        false,
+        false,
+        false
+      ]
+    ]
+  },
+  "target_absent": true,
+  "preserved_on_refusal": true,
+  "search_path": "helper_scope,public"
+}

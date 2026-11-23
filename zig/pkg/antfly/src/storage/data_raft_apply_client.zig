@@ -39,6 +39,9 @@ pub const AppliedDataBatch = struct {
 
 pub const RaftApplyStore = struct {
     native_snapshot_delegate: ?@import("../raft/native_snapshot_delegate.zig").Delegate = null,
+    /// Retain the same immutable construction contract sent to the owner so
+    /// the compiled projection adapter cannot lose its second-store requirement.
+    native_source_delegate: bool = false,
     handle: ?*anyopaque,
 
     pub fn init(_: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
@@ -50,7 +53,7 @@ pub const RaftApplyStore = struct {
             .context = cfg.context,
             .root_dir = .fromSlice(cfg.root_dir),
         }, &handle));
-        return .{ .handle = handle orelse return error.StorageKernelFailure };
+        return .{ .handle = handle orelse return error.StorageKernelFailure, .native_source_delegate = cfg.native_source_delegate };
     }
 
     pub fn deinit(self: *RaftApplyStore) void {
@@ -130,6 +133,27 @@ pub const RaftApplyStore = struct {
             &version,
         ));
         return version;
+    }
+
+    pub const CommittedEntry = struct {
+        buffer: abi.OwnedBytes,
+        pub fn bytes(self: *const @This()) []const u8 {
+            return self.buffer.slice();
+        }
+        pub fn deinit(self: *@This()) void {
+            abi.antfly_storage_owner_buffer_destroy(&self.buffer);
+            self.* = undefined;
+        }
+    };
+
+    /// Own the raw kernel buffer directly; no second large transport copy or
+    /// JSON/base64 expansion. Control executors release it after preparation.
+    pub fn committedNormalEntry(self: *RaftApplyStore, group_id: u64, term: u64, index: u64, max_bytes: usize) !CommittedEntry {
+        if (group_id == 0 or term == 0 or index == 0 or max_bytes == 0 or max_bytes > projection_wire.max_committed_entry_bytes) return error.InvalidDataApplyBatch;
+        var response = try self.projection(.{ .kind = .committed_normal_entry, .group_id = group_id, .after_sequence = index, .through_sequence = term, .max_bytes = max_bytes });
+        errdefer abi.antfly_storage_owner_buffer_destroy(&response);
+        if (response.len > max_bytes or (response.len != 0 and response.ptr == null)) return error.InvalidDataApplyBatch;
+        return .{ .buffer = response };
     }
 
     pub fn observeSplitControl(
@@ -410,10 +434,12 @@ pub const RaftApplyStore = struct {
         pub const MaterializedFile = struct {
             path: []u8,
             size: u64,
+            application_manifest: []u8 = &.{},
 
             pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
                 std.Io.Dir.cwd().deleteFile(std.Options.debug_io, self.path) catch {};
                 alloc.free(self.path);
+                alloc.free(self.application_manifest);
                 self.* = undefined;
             }
         };
@@ -422,12 +448,20 @@ pub const RaftApplyStore = struct {
             var result: abi.DataApplyPreparedSnapshotResult = .{};
             try statusToError(abi.antfly_data_apply_prepared_snapshot_materialize(self.handle, &result));
             defer abi.antfly_storage_owner_buffer_destroy(&result.path);
+            defer abi.antfly_storage_owner_buffer_destroy(&result.application_manifest);
             if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+            if (result.application_manifest.len > @import("raft_engine").runtime.storage_iface.SnapshotArtifact.max_application_manifest_bytes or
+                (result.application_manifest.len != 0 and result.application_manifest.ptr == null)) return error.InvalidSnapshot;
             const path = alloc.dupe(u8, result.path.slice()) catch |err| {
                 std.Io.Dir.cwd().deleteFile(std.Options.debug_io, result.path.slice()) catch {};
                 return err;
             };
-            return .{ .path = path, .size = result.size };
+            errdefer alloc.free(path);
+            const manifest = alloc.dupe(u8, result.application_manifest.slice()) catch |err| {
+                std.Io.Dir.cwd().deleteFile(std.Options.debug_io, result.path.slice()) catch {};
+                return err;
+            };
+            return .{ .path = path, .size = result.size, .application_manifest = manifest };
         }
 
         pub fn cancel(self: *PreparedSnapshot) void {

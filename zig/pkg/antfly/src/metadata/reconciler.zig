@@ -1045,6 +1045,7 @@ pub const Reconciler = struct {
         var planning_conclusive = true;
 
         for (current.tables) |table| {
+            if (table.sql_persistence != null) continue;
             if (remaining_cluster_budget == 0) break;
 
             var table_budget = per_table_limit;

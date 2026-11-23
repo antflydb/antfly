@@ -27,14 +27,41 @@ pub const TransactionOptions = struct {
     mode: ?sql_session.ReadMode = null,
 };
 
-pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
+pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange, enumeration, bytea, void };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
 pub const Column = struct {
+    defaulted: bool = false,
     name: []const u8,
     type: Type,
+    temporal_kind: ?@import("antfly_local_sources").sql_temporal_value.Kind = null,
     element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
     numeric_modifier: ?@import("antfly_local_sources").sql_scalar.NumericModifier = null,
+    domain_view: ?*const @import("antfly_local_sources").sql_catalog.domain_values.View = null,
+    enum_view: ?*const @import("antfly_local_sources").sql_scalar.EnumValues.View = null,
 };
+/// Metadata survives producer/statement retirement; views are immutable and
+/// deduplicated inside the caller's owning arena.
+pub fn cloneColumnsLeaky(a: std.mem.Allocator, input: []const Column) ![]Column {
+    const output = try a.dupe(Column, input);
+    var views: std.AutoHashMapUnmanaged(*const @import("antfly_local_sources").sql_scalar.EnumValues.View, *const @import("antfly_local_sources").sql_scalar.EnumValues.View) = .empty;
+    var domains: @import("antfly_local_sources").sql_scalar.DomainViews = .empty;
+    for (output) |*column| {
+        column.name = try a.dupe(u8, column.name);
+        column.domain_view = try @import("antfly_local_sources").sql_scalar.ownDomainView(a, &domains, column.domain_view);
+        column.enum_view = try @import("antfly_local_sources").sql_scalar.ownEnumView(a, &views, column.enum_view);
+    }
+    return output;
+}
+/// Physical output identity shared by prepared plans, stream pages and cursor
+/// spools. Names may change under cached-plan rebinding; wire types may not.
+pub fn sameColumnType(a: Column, b: Column) bool {
+    return a.type == b.type and a.element_type == b.element_type and
+        (a.type != .datetime or (a.temporal_kind orelse .timestamp_tz) == (b.temporal_kind orelse .timestamp_tz)) and
+        @import("antfly_local_sources").sql_scalar.NumericModifier.eql(a.numeric_modifier, b.numeric_modifier) and
+        @import("antfly_local_sources").sql_scalar.sameEnumDomain(a.enum_view, b.enum_view) and
+        @import("antfly_local_sources").sql_scalar.sameDomain(a.domain_view, b.domain_view);
+}
+
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 
 pub const Identity = struct {
@@ -43,13 +70,26 @@ pub const Identity = struct {
     release: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
+pub const SelinuxIngress = @import("antfly_local_sources").system_catalog_domain.security_labels.KernelRelabel.Ingress;
+
 pub const CursorCapture = enum { none, if_select, require_select };
 
 pub const Request = struct {
+    /// Borrowed from the accepted transport for this request only.
+    selinux_ingress: ?SelinuxIngress = null,
+    backend_pid: i32 = 0,
     capture_cursor_authority: CursorCapture = .none,
     completion: ?*@import("completion.zig").Completion = null,
     completion_allocator: ?std.mem.Allocator = null,
     statement: []const u8,
+    /// Internal ingress intent: preserve PostgreSQL COPY/RLS admission on every batch.
+    copy_input: bool = false,
+    copy_freeze_admission: bool = false,
+    copy_has_active_cursor: bool = false,
+    copy_source_statement: ?[]const u8 = null,
+    copy_source_inputs: []const @import("antfly_local_sources").sql_parameter_frame.Input = &.{},
+    copy_source_descriptors: []const Parameter = &.{},
+    statement_instant: ?@import("antfly_local_sources").sql_statement_clock.Instant = null,
     /// Reclaiming allocator sharing the connection cap. Result envelopes use
     /// the describe/execute arena; backend-owned execution scratch/results can
     /// release memory independently instead of nesting under that arena.
@@ -58,6 +98,8 @@ pub const Request = struct {
     parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
     parameter_owner: ?@import("antfly_local_sources").sql_parameter_frame.PayloadLease = null,
     parameter_types: []const Type = &.{},
+    /// Raw PostgreSQL OIDs are resolved by the authenticated backend before binding.
+    parameter_oids: []const u32 = &.{},
     parameter_descriptors: []const Parameter = &.{},
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
@@ -84,6 +126,8 @@ pub const Request = struct {
     /// before returning so later statements can reuse the connection budget.
     read_receipt_budget: ?*@import("antfly_local_sources").sql_read_requirements.WaitBudget = null,
     setting_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
+    sequence_state: ?@import("antfly_local_sources").sql_sequence_session.Borrowed = null,
+    setting_baseline: ?[]const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = null,
 
     pub fn check(self: Request) !void {
         try self.io.checkCancel();
@@ -94,7 +138,11 @@ pub const Request = struct {
 };
 
 /// Fixed-size storage survives error unwinding and per-statement arenas.
+pub const notices = @import("antfly_local_sources").sql_notices;
+pub const Notice = notices.Notice;
 pub const Diagnostic = struct {
+    notice_allocator: ?std.mem.Allocator = null,
+    notices_buffer: ?*notices.Buffer = null,
     code: ?[5]u8 = null,
     message: [256]u8 = undefined,
     message_len: u16 = 0,
@@ -103,6 +151,29 @@ pub const Diagnostic = struct {
     /// Authoritative session state after a statement failure (for example a
     /// COMMIT conflict ends the transaction, unlike an ordinary failed query).
     transaction_status: ?TransactionStatus = null,
+
+    pub fn clearNotices(self: *Diagnostic) void {
+        if (self.notices_buffer) |buffer| self.notice_allocator.?.destroy(buffer);
+        self.notices_buffer = null;
+    }
+    pub fn reserveNotices(raw: *anyopaque, count: usize, bytes: usize) !void {
+        const self: *Diagnostic = @ptrCast(@alignCast(raw));
+        const a = self.notice_allocator orelse return error.InvalidSqlBackendResponse;
+        if (self.notices_buffer == null) {
+            self.notices_buffer = try a.create(notices.Buffer);
+            self.notices_buffer.?.* = .{};
+        }
+        try self.notices_buffer.?.reserve(count, bytes);
+    }
+    pub fn emitNotice(raw: *anyopaque, notice: notices.Notice) !void {
+        const self: *Diagnostic = @ptrCast(@alignCast(raw));
+        const a = self.notice_allocator orelse return error.InvalidSqlBackendResponse;
+        if (self.notices_buffer == null) {
+            self.notices_buffer = try a.create(notices.Buffer);
+            self.notices_buffer.?.* = .{};
+        }
+        try self.notices_buffer.?.append(notice);
+    }
 
     pub fn set(self: *Diagnostic, code: []const u8, message: []const u8, transaction_id: ?[32]u8, retryable: ?bool) void {
         std.debug.assert(code.len == 5);
@@ -134,6 +205,11 @@ pub const CursorAuthority = struct {
     validate: *const fn (*anyopaque, std.mem.Allocator, Identity, Request, bool) anyerror!void,
 };
 pub const Description = struct {
+    /// Authoritative binder approval for DECLARE's query body. Result columns
+    /// alone cannot distinguish SELECT from a mutation with RETURNING.
+    cursor_readable: bool = false,
+    copy_out: ?@import("antfly_local_sources").sql_ast.CopyOptions = null,
+    copy_in: ?CopyInput = null,
     is_select: bool = false,
     stamp: ?DescriptionStamp = null,
     columns: []const Column = &.{},
@@ -141,6 +217,14 @@ pub const Description = struct {
     parameter_descriptors: []const Parameter = &.{},
     binding_guard: ?[]const u8 = null,
     setting_epoch: ?u64 = null,
+};
+
+pub const CopyInput = struct {
+    freeze_admitted: bool = false,
+    source_statement: ?[]const u8 = null,
+    table: @import("antfly_local_sources").sql_ast.Name,
+    columns: []const Column,
+    options: @import("antfly_local_sources").sql_ast.CopyOptions,
 };
 
 pub const Result = struct {
@@ -153,12 +237,14 @@ pub const Result = struct {
     /// cells directly; scroll/hold stores clone only at their ownership edge.
     cells: ?Cells = null,
     rows_affected: u64 = 0,
+    notices: []const Notice = &.{},
     command_tag: []const u8,
     session_id: ?[]const u8 = null,
     continuation: ?[]const u8 = null,
     transaction_status: TransactionStatus = .idle,
     mutation_outcome: ?MutationOutcome = null,
     ddl_receipt_json: ?[]const u8 = null,
+    catalog_receipt_json: ?[]const u8 = null,
     transaction_id: ?[32]u8 = null,
     /// Optional zero-copy owner for native result arenas. Released before the
     /// enclosing caller arena; its allocations still use the caller's budget.
@@ -205,8 +291,9 @@ pub const Result = struct {
 };
 
 pub const Cell = struct {
-    /// Canonical JSONB bytes owned by the result lease. JSON null remains a
-    /// non-NULL value; ordinary scalars keep their existing representation.
+    /// Encoded JSON owned by the result lease; pgwire normalizes SQL JSONB
+    /// output rather than assuming API JSON is PostgreSQL canonical text.
+    /// JSON null remains a non-NULL value.
     json_bytes: ?[]const u8 = null,
     /// Validated immutable tokens borrow the result lease; pgwire streams them
     /// directly into DataRow frames without an intermediate JSON string.
@@ -215,6 +302,9 @@ pub const Cell = struct {
     sql_null: bool,
     array: ?*const @import("antfly_local_sources").sql_array_value.Value = null,
     numeric: ?*const @import("antfly_local_sources").sql_numeric_value.Value = null,
+    range: ?*const @import("antfly_local_sources").sql_range_value.Value = null,
+    enumeration: ?*const @import("antfly_local_sources").sql_scalar.EnumValues.Value = null,
+    bytea: ?[]const u8 = null,
 };
 pub const Cells = struct {
     context: *anyopaque,
@@ -240,6 +330,11 @@ pub const Backend = struct {
 
     pub const VTable = struct {
         native_parameters: bool = false,
+        open_replication: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("logical_replication_frontend.zig").Port = null,
+        start_connection: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
+        discard_connection: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
+        has_notifications: ?*const fn (*anyopaque, Identity) bool = null,
+        notifications: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, @import("antfly_local_sources").sql_ast.notifications.DeliveryControl) anyerror!@import("antfly_local_sources").sql_ast.notifications.Page = null,
         // Called even when a deployment permits anonymous access. The backend
         // alone decides whether credentials authorize a principal; a startup
         // username/database never itself grants access.
@@ -292,6 +387,7 @@ pub const Backend = struct {
 /// Result pages must be released before close or detach: native page arenas
 /// may borrow the stream's shared memory admission and retained column metadata.
 pub const ReadStream = struct {
+    copy_out: ?@import("antfly_local_sources").sql_ast.CopyOptions = null,
     context: *anyopaque,
     columns: []const Column,
     next: *const fn (*anyopaque, std.mem.Allocator, Request, u32) anyerror!StreamPage,

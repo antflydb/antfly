@@ -2703,7 +2703,7 @@ test "backup preflight relational rows use archived schema for active media fiel
     defer @import("../schema.zig").freeSchema(a, runtime);
     const encoded = try @import("../schema.zig").serializeSchema(a, runtime);
     defer a.free(encoded);
-    const row = try @import("../db/relational_store.zig").encodeValueForSchemaAlloc(a, "{\"media\":\"http://[0:0:0:0:0:0:0:1]:8888/source\"}", runtime);
+    const row = try @import("../db/relational/rows/store.zig").encodeValueForSchemaAlloc(a, "{\"media\":\"http://[0:0:0:0:0:0:0:1]:8888/source\"}", runtime);
     defer a.free(row);
     const key = try internal_keys.relationalRowKeyAlloc(a, "row:late");
     defer a.free(key);

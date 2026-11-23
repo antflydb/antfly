@@ -25,12 +25,36 @@ const frames = @import("parameter_frame.zig");
 const A = std.mem.Allocator;
 
 pub const Invocation = struct {
+    named_type_resolver: ?scalar.NamedTypeResolver = null,
+    named_types: std.StringHashMapUnmanaged(scalar.Type) = .empty,
+
+    routine_resolver: ?@import("routine_bindings.zig").Resolver = null,
+    sequence_resolver: ?@import("sequence_effects.zig").Resolver = null,
     allocator: A,
     descriptors: []scalar.Type,
     fallbacks: []const ?ast.ColumnType = &.{},
     contracts: std.ArrayList(Contract) = .empty,
     frame: ?frames.Frame = null,
     phase: enum { binding, prepared, retired } = .binding,
+
+    fn cachedNamedType(raw: *anyopaque, _: A, name: ast.Name) !scalar.Type {
+        const self: *Invocation = @ptrCast(@alignCast(raw));
+        return self.resolveNamedType(name);
+    }
+    pub fn resolveNamedType(self: *Invocation, name: ast.Name) !scalar.Type {
+        const resolver = self.named_type_resolver orelse return error.SqlNamedTypeNotFound;
+        const key = try std.json.Stringify.valueAlloc(self.allocator, name, .{});
+        if (self.named_types.get(key)) |bound| {
+            self.allocator.free(key);
+            return bound;
+        }
+        errdefer self.allocator.free(key);
+        if (self.named_types.count() >= 256) return error.SqlProgramLimitExceeded;
+        const bound = try resolver.resolve(resolver.ptr, self.allocator, name);
+        try scalar.validateParameterType(bound);
+        try self.named_types.put(self.allocator, key, bound);
+        return bound;
+    }
 
     const Contract = struct { instructions: []const scalar.Instruction, descriptors: []const scalar.Type };
 
@@ -65,12 +89,21 @@ pub const Invocation = struct {
             try scalar.validateParameterType(hint);
             if (hint.kind == null) continue;
             if (descriptor.kind) |kind| {
-                if (kind != hint.kind or (descriptor.element_type != null and hint.element_type != null and descriptor.element_type != hint.element_type) or descriptor.nullable != hint.nullable) return error.ConflictingSqlParameterTypes;
+                if (kind != hint.kind or (descriptor.element_type != null and hint.element_type != null and descriptor.element_type != hint.element_type) or descriptor.nullable != hint.nullable or (kind == .datetime and (descriptor.temporal_kind orelse .timestamp_tz) != (hint.temporal_kind orelse .timestamp_tz))) return error.ConflictingSqlParameterTypes;
             }
             if (self.phase != .binding) {
-                if (!std.meta.eql(descriptor.*, hint)) return error.ConflictingSqlParameterTypes;
+                if (!scalar.sameParameterType(descriptor.*, hint)) return error.ConflictingSqlParameterTypes;
             } else {
                 descriptor.kind = hint.kind;
+                if (descriptor.enum_view != null and hint.enum_view != null) {
+                    descriptor.enum_view = (scalar.comparisonDomain(descriptor.*, hint) catch return error.ConflictingSqlParameterTypes).enum_view;
+                } else if (hint.enum_view != null) descriptor.enum_view = hint.enum_view;
+                if (hint.domainView()) |view| {
+                    if (descriptor.domainView() != null and !scalar.sameDomain(descriptor.domainView(), view)) return error.ConflictingSqlParameterTypes;
+                    descriptor.domain_binding = &view.type_binding;
+                    descriptor.numeric_modifier = hint.numeric_modifier;
+                }
+                descriptor.temporal_kind = hint.temporal_kind;
                 if (hint.element_type != null) descriptor.element_type = hint.element_type;
                 descriptor.nullable = hint.nullable;
             }
@@ -81,6 +114,10 @@ pub const Invocation = struct {
         if (self.phase != .binding) return error.InvalidSqlParameters;
         try self.mergeCoarse(coarse);
         var local_limits = limits;
+        local_limits.routines = local_limits.routines orelse self.routine_resolver;
+        // Keep the invocation as the sole named-type cache even while the
+        // parameter inference pass intentionally suppresses program registration.
+        local_limits.named_types = .{ .ptr = self, .resolve = cachedNamedType };
         local_limits.invocation = null;
         const changed = try scalar.inferTypedParametersExpected(a, expression, columns, self.descriptors, expected, local_limits);
         for (coarse, self.descriptors[0..coarse.len]) |*kind, descriptor| kind.* = descriptor.kind;
@@ -99,9 +136,11 @@ pub const Invocation = struct {
             if (descriptor.kind == null) return error.UnknownSqlParameterType;
             try scalar.validateParameterType(descriptor);
             const prior = self.descriptors[slot];
-            if (prior.kind != null and (prior.kind != descriptor.kind or (prior.element_type != null and prior.element_type != descriptor.element_type) or prior.nullable != descriptor.nullable)) return error.ConflictingSqlParameterTypes;
+            if (prior.kind != null and (prior.kind != descriptor.kind or (prior.element_type != null and prior.element_type != descriptor.element_type) or prior.nullable != descriptor.nullable or (prior.kind == .datetime and (prior.temporal_kind orelse .timestamp_tz) != (descriptor.temporal_kind orelse .timestamp_tz)))) return error.ConflictingSqlParameterTypes;
+            if (prior.enum_view != null and !scalar.sameEnumDomain(prior.enum_view, descriptor.enum_view)) return error.ConflictingSqlParameterTypes;
+            if (prior.domainView() != null and !scalar.sameDomain(prior.domainView(), descriptor.domainView())) return error.ConflictingSqlParameterTypes;
             if (self.frame != null) {
-                if (!std.meta.eql(prior, descriptor)) return error.ConflictingSqlParameterTypes;
+                if (!scalar.sameParameterType(prior, descriptor)) return error.ConflictingSqlParameterTypes;
             } else self.descriptors[slot] = descriptor;
         }
         if (self.frame == null) try self.contracts.append(self.allocator, .{ .instructions = program.instructions, .descriptors = program.parameter_descriptors });
@@ -137,8 +176,7 @@ pub const Invocation = struct {
             // execution transport's logical type instead of forcing a numeric
             // unused argument through a text decoder. Describe stays unknown.
             if (descriptor.kind == null) descriptor.* = .{ .kind = if (index < self.fallbacks.len) self.fallbacks[index] orelse .string else .string };
-            try scalar.validateParameterType(descriptor.*);
-            if (descriptor.kind != .datetime and descriptor.element_type == null) descriptor.element_type = try scalar.parameterElementType(descriptor.*);
+            descriptor.* = try scalar.normalizeParameterType(descriptor.*);
         }
     }
 
@@ -157,7 +195,7 @@ pub const Invocation = struct {
             if (instruction.operation != .parameter) continue;
             const slot = instruction.operation.parameter;
             if (slot >= frame.descriptors.len or slot >= contract.descriptors.len) return error.InvalidSqlParameters;
-            if (!std.meta.eql(frame.descriptors[slot], contract.descriptors[slot])) return error.ConflictingSqlParameterTypes;
+            if (!scalar.sameParameterType(frame.descriptors[slot], contract.descriptors[slot])) return error.ConflictingSqlParameterTypes;
         };
     }
 

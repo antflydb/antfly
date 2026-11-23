@@ -97,6 +97,15 @@ and document mode share this mechanism. Non-filesystem and logical-only primary
 backends fail with an explicit capability error; there is no silent full-corpus
 copy under the write fence.
 
+Native manifest V6 also records the source physical-root incarnation, actual
+stored namespace and source authority, native/Raft clock facts, and physical
+digests of schema-control metadata. These bounded point reads share the primary
+capture fence; they add no corpus scan. Shared document/relational restore checks
+them against the imported image before publishing a fresh destination root.
+Existing V5 and released V3 manifests remain readable without acquiring missing
+provenance. Provenance is not a root-adoption grant: metadata must authenticate
+the exact artifact and current owner before allowing replacement-root progress.
+
 After every handle is journaled, cohort write fences can be released.
 `DB.exportBackupCohort` reopens only the named seal, verifies the inventory and
 file identities, and streams files through the existing native backup receipt

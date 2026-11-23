@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "postgres_version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+  "id": "sql-1457",
+  "source_entry_sha256": "6f1dacdc2b1959ca46998d9c24c9ff5dd226ca7c9833a0bcf27501d4b69fbddd",
+  "scope": "Original setup diagnostic plus explicitly adapted valid PostgreSQL range/UUID temporal arbiter witnesses; not temporal DO UPDATE implementation.",
+  "original_setup": "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));",
+  "original_setup_sqlstate": "42601",
+  "create": "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, valid_time numrange NOT NULL DEFAULT '[5,15)', CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS))",
+  "seed": "INSERT INTO prices VALUES ('00000000-0000-0000-0000-000000000001','sku:a',0,10,10,'[0,10)')",
+  "defaults_create": "CREATE TABLE temporal_defaults(id UUID DEFAULT 'A0EEBC999C0B4EF8BB6D6BB9BD380A11' PRIMARY KEY,valid_num NUMRANGE DEFAULT '[5,15)',valid_date DATERANGE DEFAULT '[2026-01-01,2026-01-04)')",
+  "defaults_row": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|[5,15)|[2026-01-01,2026-01-04)",
+  "original": "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('p2', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price",
+  "original_sqlstate": "22P02",
+  "valid_typed": "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('00000000-0000-0000-0000-000000000002', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price",
+  "valid_typed_sqlstate": "42809",
+  "unchanged_row": "00000000-0000-0000-0000-000000000001|sku:a|[0,10)|10",
+  "cold_original_sqlstate": "22P02",
+  "cold_valid_typed_sqlstate": "42809"
+}

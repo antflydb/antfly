@@ -15,8 +15,8 @@
 
 //! Immutable backup pin identity and control messages, with no filesystem or
 //! physical database dependency. The seal owner implements these commands.
-const topology = @import("relational_integrity_topology_contract.zig");
-const json = @import("relational_integrity_json.zig");
+const topology = @import("relational/integrity/topology_contract.zig");
+const json = @import("relational/integrity/json.zig");
 
 pub const Handle = struct {
     fence: topology.Fence,

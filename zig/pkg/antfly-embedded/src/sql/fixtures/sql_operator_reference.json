@@ -1,0 +1,546 @@
+{
+  "format": 1,
+  "reference": "PostgreSQL 18 operators and function identity",
+  "before": [
+    {
+      "sql": "CREATE TABLE operator_rows(id integer PRIMARY KEY,left_value text,right_value text)",
+      "command_tag": "CREATE TABLE",
+      "notices": []
+    },
+    {
+      "sql": "INSERT INTO operator_rows VALUES(1,'One','one'),(2,'two','two'),(3,NULL,'three')",
+      "command_tag": "INSERT 0 3",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION text_eq(text,text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$SELECT $1=$2$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)",
+      "id": "sql-0133",
+      "source_entry_sha256": "9bd970b9117a43d28b6e5d1a59cc9a8b390cc4ce32ff86ed047ead74d1c4da18",
+      "command_tag": "CREATE OPERATOR",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,left_value===right_value AS same FROM operator_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "same"
+        ],
+        "column_oids": [
+          23,
+          16
+        ],
+        "rows": [
+          [
+            1,
+            false
+          ],
+          [
+            2,
+            true
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT 'one' OPERATOR(public.===) 'one' AS same,NULL::text===NULL::text AS absent",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "same",
+          "absent"
+        ],
+        "column_oids": [
+          16,
+          16
+        ],
+        "rows": [
+          [
+            true,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION int_ne(integer,integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$SELECT $1<>$2$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE OPERATOR ===(FUNCTION=int_ne,LEFTARG=integer,RIGHTARG=integer)",
+      "command_tag": "CREATE OPERATOR",
+      "notices": []
+    },
+    {
+      "sql": "SELECT 1===2 AS different,1===1 AS same,'x'::text==='x'::text AS text_same",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "different",
+          "same",
+          "text_same"
+        ],
+        "column_oids": [
+          16,
+          16,
+          16
+        ],
+        "rows": [
+          [
+            true,
+            false,
+            true
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION \"===\"(text,text) RETURNS boolean LANGUAGE sql AS $$SELECT false$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "SELECT 'x'==='x' AS operator_result,\"===\"('x','x') AS function_result",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "operator_result",
+          "function_result"
+        ],
+        "column_oids": [
+          16,
+          16
+        ],
+        "rows": [
+          [
+            true,
+            false
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE OR REPLACE FUNCTION text_eq(text,text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$SELECT lower($1)=lower($2)$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,left_value===right_value AS same FROM operator_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "same"
+        ],
+        "column_oids": [
+          23,
+          16
+        ],
+        "rows": [
+          [
+            1,
+            true
+          ],
+          [
+            2,
+            true
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "UPDATE operator_rows SET right_value='changed' WHERE left_value===right_value RETURNING id,right_value",
+      "command_tag": "UPDATE 2",
+      "output": {
+        "columns": [
+          "id",
+          "right_value"
+        ],
+        "column_oids": [
+          23,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "changed"
+          ],
+          [
+            2,
+            "changed"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT id,left_value,right_value FROM operator_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "left_value",
+          "right_value"
+        ],
+        "column_oids": [
+          23,
+          25,
+          25
+        ],
+        "rows": [
+          [
+            1,
+            "One",
+            "changed"
+          ],
+          [
+            2,
+            "two",
+            "changed"
+          ],
+          [
+            3,
+            null,
+            "three"
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            false,
+            false
+          ],
+          [
+            false,
+            true,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)",
+      "sqlstate": "42723",
+      "notices": []
+    },
+    {
+      "sql": "DROP FUNCTION text_eq(text,text)",
+      "sqlstate": "2BP01",
+      "notices": []
+    },
+    {
+      "sql": "CREATE SCHEMA operator_tools",
+      "command_tag": "CREATE SCHEMA",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION operator_tools.equal_text(text,text) RETURNS boolean LANGUAGE sql AS $$SELECT $1=$2$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "CREATE OPERATOR public.===(FUNCTION=text_eq,LEFTARG=text,RIGHTARG=text)",
+      "sqlstate": "42723",
+      "notices": []
+    },
+    {
+      "sql": "CREATE OPERATOR public.==!(FUNCTION=operator_tools.equal_text,LEFTARG=text,RIGHTARG=text)",
+      "command_tag": "CREATE OPERATOR",
+      "notices": []
+    },
+    {
+      "sql": "ALTER SCHEMA operator_tools RENAME TO operator_renamed",
+      "command_tag": "ALTER SCHEMA",
+      "notices": []
+    },
+    {
+      "sql": "SELECT 'x' OPERATOR(public.==!) 'x' AS same",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "same"
+        ],
+        "column_oids": [
+          16
+        ],
+        "rows": [
+          [
+            true
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "cold": [
+    {
+      "sql": "SELECT id,left_value===right_value AS same FROM operator_rows ORDER BY id",
+      "command_tag": "SELECT 3",
+      "output": {
+        "columns": [
+          "id",
+          "same"
+        ],
+        "column_oids": [
+          23,
+          16
+        ],
+        "rows": [
+          [
+            1,
+            false
+          ],
+          [
+            2,
+            false
+          ],
+          [
+            3,
+            null
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            false
+          ],
+          [
+            false,
+            true
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "SELECT 1===2 AS different,'x'::text==='x'::text AS same,'x' OPERATOR(public.==!) 'x' AS renamed_same",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "different",
+          "same",
+          "renamed_same"
+        ],
+        "column_oids": [
+          16,
+          16,
+          16
+        ],
+        "rows": [
+          [
+            true,
+            true,
+            true
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ],
+  "after": [
+    {
+      "sql": "DROP OPERATOR === (text, text)",
+      "id": "sql-0134",
+      "source_entry_sha256": "40935720e4843ff3975f50c105fbe3bac76a4a614f33ae953ac04bd75e072144",
+      "command_tag": "DROP OPERATOR",
+      "notices": []
+    },
+    {
+      "sql": "SELECT 'x'::text==='x'::text AS missing",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "SELECT 1===2 AS retained_overload",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "retained_overload"
+        ],
+        "column_oids": [
+          16
+        ],
+        "rows": [
+          [
+            true
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    },
+    {
+      "sql": "DROP OPERATOR IF EXISTS === (text, text)",
+      "id": "sql-0135",
+      "source_entry_sha256": "4c87b1f5e518b3ed3737995266727c120318d2ffda9da81baef88340e9e3ad12",
+      "command_tag": "DROP OPERATOR",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "operator === does not exist, skipping"
+        }
+      ]
+    },
+    {
+      "sql": "CREATE OPERATOR ===(FUNCTION=text_eq,LEFTARG=text,RIGHTARG=text)",
+      "command_tag": "CREATE OPERATOR",
+      "notices": []
+    },
+    {
+      "sql": "DROP FUNCTION text_eq(text,text) CASCADE",
+      "command_tag": "DROP FUNCTION",
+      "notices": [
+        {
+          "code": "00000",
+          "message": "drop cascades to operator ===(text,text)"
+        }
+      ]
+    },
+    {
+      "sql": "SELECT 'x'::text==='x'::text AS missing_after_cascade",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "CREATE FUNCTION text_eq(text,text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$SELECT $1<>$2$$",
+      "command_tag": "CREATE FUNCTION",
+      "notices": []
+    },
+    {
+      "sql": "SELECT 'x'::text==='x'::text AS name_reuse_does_not_retarget",
+      "sqlstate": "42883",
+      "notices": []
+    },
+    {
+      "sql": "CREATE OPERATOR ===(FUNCTION=text_eq,LEFTARG=text,RIGHTARG=text)",
+      "command_tag": "CREATE OPERATOR",
+      "notices": []
+    },
+    {
+      "sql": "SELECT 'x'::text==='x'::text AS fresh_identity",
+      "command_tag": "SELECT 1",
+      "output": {
+        "columns": [
+          "fresh_identity"
+        ],
+        "column_oids": [
+          16
+        ],
+        "rows": [
+          [
+            false
+          ]
+        ],
+        "sql_nulls": [
+          [
+            false
+          ]
+        ]
+      },
+      "notices": []
+    }
+  ]
+}
