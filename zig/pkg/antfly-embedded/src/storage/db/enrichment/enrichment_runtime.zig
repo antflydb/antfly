@@ -98,7 +98,7 @@ const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi 
 else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
-const relational_store = @import("../relational_store.zig");
+const relational_store = @import("../relational/rows/store.zig");
 
 var activity_epoch_salt = @import("antfly_platform").atomic.Value(u64).init(1);
 

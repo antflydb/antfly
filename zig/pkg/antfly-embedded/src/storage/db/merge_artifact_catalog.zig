@@ -24,7 +24,7 @@ pub const Record = struct {
     donor_group_id: u64,
     receiver_group_id: u64,
     receiver_namespace: @import("doc_identity_namespace.zig").Namespace,
-    attempt: @import("relational_integrity_handoff_contract.zig").MergeCopyAttempt,
+    attempt: @import("relational/integrity/handoff_contract.zig").MergeCopyAttempt,
     source: pages.Source,
     catalogs: inventory.Catalogs,
 

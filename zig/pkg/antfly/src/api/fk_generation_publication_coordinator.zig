@@ -47,14 +47,17 @@ fn childWithoutReceipt(value: publication.Publication, receipts: []const publica
 }
 
 fn parentWithoutReceipt(value: publication.Publication, receipts: []const publication.Receipt, action: owner.Action) ?Target {
-    for (value.plan.parents) |parent| for (parent.ranges) |range| {
-        if (!contains(receipts, range.group_id)) return .{ .parent = .{
-            .table_name = parent.table.name,
-            .table_id = parent.table.table_id,
-            .group_id = range.group_id,
-            .action = action,
-        } };
-    };
+    for (value.plan.parents) |parent| {
+        if (value.phase == .acknowledging_reference_coverage and !value.plan.needsParentCoverage(parent)) continue;
+        for (parent.ranges) |range| {
+            if (!contains(receipts, range.group_id)) return .{ .parent = .{
+                .table_name = parent.table.name,
+                .table_id = parent.table.table_id,
+                .group_id = range.group_id,
+                .action = action,
+            } };
+        }
+    }
     return null;
 }
 
@@ -64,6 +67,7 @@ pub fn next(value: publication.Publication) !?Target {
         .staging_parents => parentWithoutReceipt(value, value.parent_staged, .stage) orelse error.GenerationPublicationChanged,
         .activating_parents => parentWithoutReceipt(value, value.parent_activated, .activate) orelse error.GenerationPublicationChanged,
         .acknowledging_parents => parentWithoutReceipt(value, value.parent_acknowledged, .acknowledge) orelse error.GenerationPublicationChanged,
+        .acknowledging_reference_coverage => parentWithoutReceipt(value, value.parent_coverage_acknowledged, .acknowledge) orelse error.GenerationPublicationChanged,
         .publishing_child => .publish_child,
         .installing_child => childWithoutReceipt(value, value.child_installed, .install) orelse error.GenerationPublicationChanged,
         .canceling => parentWithoutReceipt(value, value.parent_canceled, .cancel) orelse

@@ -48,8 +48,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 43 includes the fenced PostgreSQL publication metadata port.
 // Version 44 includes the pgwire publication scope for native startup.
 // Version 45 adds the artifact history read provider to API configuration.
-// Version 46 transfers request-forward lane reservations and SQL peer configuration.
-// Version 47 adds controlled session-store routing access.
+// Version 46 combines CDC capabilities with SQL native relation and shutdown contracts.
+// Version 47 adds request-forward lane reservations, peer configuration and controlled session-store routing access.
 pub const abi_version: u32 = 47;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
@@ -255,6 +255,9 @@ pub const FunctionTable = extern struct {
     handler_destroy: *const fn (*anyopaque) callconv(.c) void,
     inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
+    query_population_job: *const fn (*const CallContext) callconv(.c) Status,
+    authorize_sql_lock: *const fn (*const CallContext) callconv(.c) Status,
+    drain_sql_connections: *const fn (*const CallContext) callconv(.c) Status,
     lake_stream_owner_options: *const fn (*const CallContext) callconv(.c) Status,
 };
 
@@ -281,7 +284,7 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
-        required = @max(required, functionTableFieldEnd("handler_destroy"));
+        required = @max(required, functionTableFieldEnd("drain_sql_connections"));
     if (required_capabilities & Capability.route_manifest != 0)
         required = @max(required, functionTableFieldEnd("handler_route_manifest"));
     if (required_capabilities & Capability.inference_admission_stats != 0)
@@ -312,6 +315,13 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     const std = @import("std");
     try std.testing.expect(validContext(CallContext, abi_version, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, abi_version - 1, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 29, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 30, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 31, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 32, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 33, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 34, @sizeOf(CallContext)));
+    try std.testing.expect(!validContext(CallContext, 35, @sizeOf(CallContext)));
     try std.testing.expect(!validContext(CallContext, abi_version, @sizeOf(CallContext) - 1));
 
     var table: FunctionTable = undefined;
@@ -319,6 +329,12 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     table.struct_size = @sizeOf(FunctionTable);
     table.capabilities = Capability.core;
     try std.testing.expect(validFunctionTable(&table, Capability.core));
+    table.abi_version = abi_version - 1; // API35 lacks the fixed native maintenance callback.
+    try std.testing.expect(!validFunctionTable(&table, Capability.core));
+    table.abi_version = abi_version;
+    table.struct_size = functionTableFieldEnd("authorize_sql_lock");
+    try std.testing.expect(!validFunctionTable(&table, Capability.core));
+    table.struct_size = @sizeOf(FunctionTable);
     try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
     try std.testing.expect(!validFunctionTable(&table, Capability.inference_admission_stats));
     try std.testing.expect(!validFunctionTable(&table, Capability.internal_service_ingress));

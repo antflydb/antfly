@@ -180,7 +180,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
     }
     // Native reducers can share one encoded cohort across materializations.
     // Every declaration's proof covers every input captured in that cohort.
-    var schemas = @import("sql_schema_cache.zig").Cache.init(a);
+    var schemas = @import("sql/execution/schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
     const sql_table = try schemas.resolve(source.context.io orelse return error.InvalidLogicalRowIdentity, ca, table.schema_json, table.table_id, table.name);
     const Aggregate = struct { name: []const u8, configuration: []const u8, recipe: local.sql_aggregate_materialization.Recipe, reusable: bool };

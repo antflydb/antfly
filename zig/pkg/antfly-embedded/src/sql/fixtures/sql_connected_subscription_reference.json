@@ -1,0 +1,93 @@
+{
+  "reference": "PostgreSQL 18+ owned publisher and subscriber",
+  "entries": [
+    {
+      "id": "sql-0119",
+      "sql": "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub",
+      "command_tag": "CREATE SUBSCRIPTION",
+      "initial_rows": [
+        [
+          1,
+          "initial"
+        ]
+      ],
+      "streamed_rows": [
+        [
+          1,
+          "streamed"
+        ],
+        [
+          2,
+          "second"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0122",
+      "sql": "ALTER SUBSCRIPTION usage_sub DISABLE",
+      "command_tag": "ALTER SUBSCRIPTION",
+      "enabled": false
+    },
+    {
+      "id": "sql-0123",
+      "sql": "ALTER SUBSCRIPTION usage_sub ENABLE",
+      "command_tag": "ALTER SUBSCRIPTION",
+      "caught_up_rows": [
+        [
+          1,
+          "streamed"
+        ],
+        [
+          2,
+          "second"
+        ],
+        [
+          3,
+          "paused"
+        ]
+      ],
+      "after_delete_rows": [
+        [
+          1,
+          "streamed"
+        ],
+        [
+          3,
+          "paused"
+        ]
+      ]
+    },
+    {
+      "id": "sql-0124",
+      "sql": "DROP SUBSCRIPTION usage_sub",
+      "command_tag": "DROP SUBSCRIPTION",
+      "slot_count": 0
+    },
+    {
+      "id": "sql-0125",
+      "sql": "DROP SUBSCRIPTION IF EXISTS usage_sub",
+      "command_tag": "DROP SUBSCRIPTION"
+    },
+    {
+      "id": "sql-0121",
+      "sql": "CREATE SUBSCRIPTION usage_sub_multi CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub, usage_audit_pub",
+      "command_tag": "CREATE SUBSCRIPTION",
+      "records": [
+        [
+          1,
+          "streamed"
+        ],
+        [
+          3,
+          "paused"
+        ]
+      ],
+      "events": [
+        [
+          9,
+          "audit"
+        ]
+      ]
+    }
+  ]
+}

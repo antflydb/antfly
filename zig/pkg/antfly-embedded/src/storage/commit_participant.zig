@@ -278,6 +278,8 @@ pub const View = struct {
 
 pub const Participant = struct {
     ptr: *anyopaque,
+    /// Request a real source position for a control-only commit.
+    stage_control_on_empty: bool = false,
     /// Fallible accounting covers physical mutations, including stamps staged
     /// by the host and private metadata staged by this participant.
     charge: ?*const fn (*anyopaque, []const u8, ?[]const u8) anyerror!void = null,
@@ -345,7 +347,10 @@ pub const List = struct {
     /// every other `Participant` implementation in this tree keeps a
     /// pointer back into its own owning value.
     pub fn participant(self: *List) Participant {
-        return .{ .ptr = self, .reset = reset, .observe = observe, .stage = stage };
+        const control = for (self.items[0..self.len]) |item| {
+            if (item.stage_control_on_empty) break true;
+        } else false;
+        return .{ .ptr = self, .stage_control_on_empty = control, .reset = reset, .observe = observe, .stage = stage };
     }
 };
 

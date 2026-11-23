@@ -18,7 +18,7 @@
 //! evaluation owner; missing intermediate steps do not allocate or create gaps.
 const std = @import("std");
 const Json = std.json.Value;
-const arrays = @import("array_value.zig");
+const arrays = @import("array/value.zig");
 const Work = @import("json_order.zig").Budget;
 const Memory = @import("memory_budget.zig");
 const Frame = struct { parent: Json, key: []const u8, slot: usize = 0, insert: bool = false };

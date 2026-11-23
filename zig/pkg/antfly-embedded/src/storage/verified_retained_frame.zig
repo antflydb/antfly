@@ -85,7 +85,7 @@ pub const Frame = struct {
         value_offset: u32 = 0,
 
         pub fn isIntegrity(self: Effect) bool {
-            return @import("db/relational_integrity_contract.zig").isKey(self.key);
+            return @import("db/relational/integrity/contract.zig").isKey(self.key);
         }
 
         pub fn valueAlloc(self: Effect, alloc: std.mem.Allocator) !?[]const u8 {
@@ -123,7 +123,7 @@ pub const Frame = struct {
             const key = try alloc.alloc(u8, effect.key_len);
             errdefer alloc.free(key);
             if (try view.readAt(effect.key_offset, key, self.frame.chunk_cache.?) != key.len) return error.RetainedEffectsCorrupt;
-            const integrity = @import("db/relational_integrity_contract.zig");
+            const integrity = @import("db/relational/integrity/contract.zig");
             if (integrity.isKey(key)) {
                 _ = try integrity.parseKey(key);
                 if (effect.timestamp != 0) return error.RetainedEffectsCorrupt;

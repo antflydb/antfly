@@ -1,0 +1,464 @@
+{
+  "source_case": "sql-0854",
+  "source_sha256": "52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6",
+  "original_sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10",
+  "projection_contract": "literal metadata.plan keyword; JSON string or SQL NULL; other leaf types 42804",
+  "index_policy_scope": "not modeled by PostgreSQL; native managed-index custody qualification is separate",
+  "postgres_version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+  "warm": [
+    {
+      "case": "string",
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ]
+    },
+    {
+      "case": "other_string",
+      "rows": []
+    },
+    {
+      "case": "literal_dotted_key",
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ]
+    },
+    {
+      "case": "missing",
+      "rows": []
+    },
+    {
+      "case": "missing_child",
+      "rows": []
+    },
+    {
+      "case": "null_parent",
+      "rows": []
+    },
+    {
+      "case": "scalar_parent",
+      "rows": []
+    },
+    {
+      "case": "json_null",
+      "rows": []
+    },
+    {
+      "case": "number",
+      "sqlstate": "42804",
+      "demands": [
+        {
+          "sql": "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT COALESCE('kept',plan) FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view",
+          "sqlstate": "42804"
+        },
+        {
+          "sql": "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view",
+          "sqlstate": "42804"
+        }
+      ]
+    },
+    {
+      "case": "object",
+      "sqlstate": "42804",
+      "demands": [
+        {
+          "sql": "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT COALESCE('kept',plan) FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view",
+          "sqlstate": "42804"
+        },
+        {
+          "sql": "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view",
+          "sqlstate": "42804"
+        }
+      ]
+    },
+    {
+      "case": "array",
+      "sqlstate": "42804",
+      "demands": [
+        {
+          "sql": "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT COALESCE('kept',plan) FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view",
+          "sqlstate": "42804"
+        },
+        {
+          "sql": "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view",
+          "sqlstate": "42804"
+        }
+      ]
+    },
+    {
+      "case": "boolean",
+      "sqlstate": "42804",
+      "demands": [
+        {
+          "sql": "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT COALESCE('kept',plan) FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view",
+          "sqlstate": "42804"
+        },
+        {
+          "sql": "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view",
+          "sqlstate": "42804"
+        }
+      ]
+    }
+  ],
+  "cold": [
+    {
+      "case": "string",
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ]
+    },
+    {
+      "case": "other_string",
+      "rows": []
+    },
+    {
+      "case": "literal_dotted_key",
+      "rows": [
+        [
+          "doc:a",
+          "pro"
+        ]
+      ]
+    },
+    {
+      "case": "missing",
+      "rows": []
+    },
+    {
+      "case": "missing_child",
+      "rows": []
+    },
+    {
+      "case": "null_parent",
+      "rows": []
+    },
+    {
+      "case": "scalar_parent",
+      "rows": []
+    },
+    {
+      "case": "json_null",
+      "rows": []
+    },
+    {
+      "case": "number",
+      "sqlstate": "42804",
+      "demands": [
+        {
+          "sql": "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT COALESCE('kept',plan) FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view",
+          "sqlstate": "42804"
+        },
+        {
+          "sql": "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view",
+          "sqlstate": "42804"
+        }
+      ]
+    },
+    {
+      "case": "object",
+      "sqlstate": "42804",
+      "demands": [
+        {
+          "sql": "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT COALESCE('kept',plan) FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view",
+          "sqlstate": "42804"
+        },
+        {
+          "sql": "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view",
+          "sqlstate": "42804"
+        }
+      ]
+    },
+    {
+      "case": "array",
+      "sqlstate": "42804",
+      "demands": [
+        {
+          "sql": "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT COALESCE('kept',plan) FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view",
+          "sqlstate": "42804"
+        },
+        {
+          "sql": "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view",
+          "sqlstate": "42804"
+        }
+      ]
+    },
+    {
+      "case": "boolean",
+      "sqlstate": "42804",
+      "demands": [
+        {
+          "sql": "SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT COALESCE('kept',plan) FROM support_view",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "WITH q AS (SELECT _id,plan FROM support_view) SELECT CASE WHEN _id='doc:a' THEN 'kept' ELSE plan END FROM q",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN a._id='doc:a' THEN 'kept' ELSE b.plan END FROM support_view a JOIN support_view b ON a._id=b._id",
+          "rows": [
+            [
+              "kept"
+            ]
+          ]
+        },
+        {
+          "sql": "SELECT CASE WHEN _id='never' THEN 'kept' ELSE plan END FROM support_view",
+          "sqlstate": "42804"
+        },
+        {
+          "sql": "SELECT COALESCE(CAST(NULL AS TEXT),plan) FROM support_view",
+          "sqlstate": "42804"
+        }
+      ]
+    }
+  ]
+}

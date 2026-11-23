@@ -54,7 +54,7 @@ pub const Build = struct {
     prior_ordering_keys: ?tree.Ref = null,
     ordering_edits: ?*@import("lake_index_page_mutations.zig").Mutations = null,
     store: stores.ArtifactStore,
-    schemas: @import("sql_schema_cache.zig").Cache,
+    schemas: @import("sql/execution/schema_cache.zig").Cache,
     table: local.sql_catalog.Table = undefined,
     context: local.serverless_query_lake_read_context.Context,
     token: Token,
