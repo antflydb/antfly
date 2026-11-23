@@ -30,6 +30,18 @@ pub const Registration = struct {
     connection: [32]u8,
     nonce: [16]u8,
     standalone: bool,
+    replaces: ?locks.Backend = null,
+    pub fn jsonStringify(self: Registration, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Registration).@"struct".field_names) |field| {
+            if (!(comptime std.mem.eql(u8, field, "replaces")) or self.replaces != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: Registration, ns: ledger.Namespace) !void {
         try self.lease.validate(ns);
         if (self.group != ns.group) return error.InvalidLockOwner;
@@ -632,7 +644,12 @@ pub fn register(backing: A, txn: anytype, ns: ledger.Namespace, registration: Re
         if (prior.state != .active) return error.LockOwnerBusy;
         return;
     }
-    if (try connection(a, txn, ns, registration.lease.node, registration.connection) != null) return error.LockOwnerChanged;
+    if (try connection(a, txn, ns, registration.lease.node, registration.connection)) |prior| {
+        const expected = registration.replaces orelse return error.LockOwnerChanged;
+        if (!prior.registration.lease.backend.eql(expected) or prior.state != .retired or
+            prior.registration.lease.database != registration.lease.database or
+            !std.mem.eql(u8, &prior.registration.lease.principal, &registration.lease.principal)) return error.LockOwnerChanged;
+    } else if (registration.replaces != null) return error.LockOwnerChanged;
     const active = try count(txn, ns);
     if (active == max_active) return error.LockLimitExceeded;
     const database_active = try databaseCount(txn, ns, registration.lease.database);

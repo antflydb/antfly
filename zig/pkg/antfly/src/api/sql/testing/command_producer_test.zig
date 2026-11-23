@@ -40,6 +40,7 @@ const Native = struct {
     index: u64 = 100,
     serial: u64 = 1000,
     expiry_ms: u64 = 1000,
+    connection_expiry_ms: ?u64 = null,
     database: []const u8 = "main",
     principal: []const u8 = "alice",
     wire_epoch: ?[16]u8 = null,
@@ -181,9 +182,9 @@ fn setup(metadata: *storage.RaftApplyStore, source: *transactions.DurableSession
     try metadata.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
     const node: u64 = if (standalone) 0 else 9;
     const created_at_ms = if (native.expiry_ms == 1000) 1 else native.expiry_ms - 60000;
-    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .wire_epoch = native.wire_epoch, .durable_http = native.durable_http, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
+    _ = try connections.mutate(source, .{ .create = .{ .id = connection, .wire_epoch = native.wire_epoch, .durable_http = native.durable_http, .principal = native.principal, .owner_node_id = node, .expires_at_ms = native.connection_expiry_ms orelse native.expiry_ms, .database = native.database, .namespace = "public" } }, native.principal, node, created_at_ms);
     const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = node, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = native.expiry_ms }, .connection = connection, .nonce = id(3), .standalone = standalone };
-    try producer.create(source, native.principal, registration, actor, instance, try native.head(), native.nonce(), created_at_ms);
+    try producer.create(source, native.principal, registration, actor, instance, try native.head(), native.nonce(), created_at_ms, 0);
 }
 fn begin(native: *Native, source: *transactions.DurableSessionStore, serial: u64) !producer.Ticket {
     var owned = (try producer.load(source, a, connection)).?;
@@ -368,7 +369,7 @@ test "SQL command producer native connection GC retains uncertain owners and nat
     // rather than another growing local tombstone family, rejects resurrection.
     _ = try connections.mutate(&source, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = 0, .expires_at_ms = 3000, .database = "main", .namespace = "public" } }, "alice", 0, 2001);
     const replacement: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(500), .fence = 1 }, .database = 1, .node = 0, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = 3000 }, .connection = connection, .nonce = id(501), .standalone = true };
-    try producer.create(&source, "alice", replacement, actor, instance, try native.head(), native.nonce(), 2001);
+    try producer.create(&source, "alice", replacement, actor, instance, try native.head(), native.nonce(), 2001, 0);
     for (0..8) |_| {
         var current = (try producer.load(&source, a, connection)).?;
         defer current.deinit();
@@ -440,7 +441,7 @@ test "SQL command producer native providers must prove transaction-wide shared w
     unsupported.write_serialization = .unsupported;
     var store = transactions.DurableSessionStore.initRuntime(a, &unsupported);
     const registration: authority.scopes.Registration = .{ .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, .database = 1, .node = 0, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = 1000 }, .connection = connection, .nonce = id(3), .standalone = true };
-    try std.testing.expectError(error.SqlConnectionUnavailable, producer.create(&store, "alice", registration, actor, instance, 0, id(4), 1));
+    try std.testing.expectError(error.SqlConnectionUnavailable, producer.create(&store, "alice", registration, actor, instance, 0, id(4), 1, 0));
     try std.testing.expect((try producer.load(&store, a, connection)) == null);
     const work = try producer.scanWork(&store, a, null, 1);
     defer a.free(work.ids);
@@ -451,7 +452,7 @@ test "SQL command producer native providers must prove transaction-wide shared w
     var supported = transactions.DurableSessionStore.initRuntime(a, &runtime);
     try std.testing.expect(supported.supportsSharedMutations());
     _ = try connections.mutate(&supported, .{ .create = .{ .id = connection, .principal = "alice", .owner_node_id = 0, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", 0, 1);
-    try producer.create(&supported, "alice", registration, actor, instance, 0, id(4), 1);
+    try producer.create(&supported, "alice", registration, actor, instance, 0, id(4), 1, 0);
     try std.testing.expectEqual(.registering, try phase(&supported));
 }
 
@@ -1149,7 +1150,7 @@ test "SQL command producer native advisory contention avoids journal churn and h
             registration.lease.backend.id = id(50);
             registration.nonce = native.nonce();
             _ = try connections.mutate(&source, .{ .create = .{ .id = key_b, .principal = "alice", .owner_node_id = registration.lease.node, .expires_at_ms = 1000, .database = "main", .namespace = "public" } }, "alice", registration.lease.node, 1);
-            try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), 1);
+            try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), 1, 0);
         }
         try driveConnection(&native, &source, key_b, .idle);
         const frame_a = try beginConnection(&native, &source, connection);
@@ -1647,6 +1648,50 @@ const IngressRuntime = struct {
         return .{ .ptr = self, .now_ms = now, .nonce = nonce, .active = active, .pause = pause };
     }
 };
+
+test "SQL command producer native cold restart reenrolls an idle durable HTTP connection" {
+    const execution = @import("../session/command_execution.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/idle-http-restart", .{tmp.sub_path});
+    defer a.free(path);
+    var metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer metadata.deinit();
+    var source = transactions.DurableSessionStore.init(a, &metadata.store);
+    var native: Native = .{ .metadata = &metadata, .wire_epoch = instance, .durable_http = true, .connection_expiry_ms = 3600001, .database = "default" };
+    try setup(&metadata, &source, true, &native);
+    try native.until(&source, .idle, 2);
+    var original = (try producer.load(&source, a, connection)).?;
+    defer original.deinit();
+
+    metadata.deinit();
+    metadata = try storage.RaftApplyStore.init(a, .{ .root_dir = path });
+    source = transactions.DurableSessionStore.init(a, &metadata.store);
+    var hooks: IngressRuntime = .{ .native = &native, .now_ms = native.expiry_ms + 1 };
+    const owner: execution.Controller = .{
+        .store = &source,
+        .connection = connection,
+        .principal = "alice",
+        .actor = actor,
+        .instance = id(999),
+        .node = 0,
+        .standalone = true,
+        .port = .{ .ptr = &hooks, .call = IngressRuntime.call },
+        .runtime = hooks.runtime(),
+    };
+    try owner.enroll(a, native.database);
+    var successor = (try producer.load(&source, a, connection)).?;
+    defer successor.deinit();
+    try std.testing.expectEqual(.idle, successor.value.phase);
+    try std.testing.expect(!successor.value.registration.lease.backend.eql(original.value.registration.lease.backend));
+    try std.testing.expect(successor.value.registration.replaces.?.eql(original.value.registration.lease.backend));
+    var old_cut = try native.port().snapshot(a, original.value);
+    defer old_cut.deinit();
+    try std.testing.expectEqual(.retired, old_cut.value.scope.?.state);
+    var command = try owner.take(a, @splat(42));
+    try std.testing.expect(command.fence.backend.eql(successor.value.registration.lease.backend));
+    try command.finish(a);
+}
 
 test "SQL command producer native ingress discovers one database enrolls exact owners and never reissues a body" {
     const execution = @import("../session/command_execution.zig");
@@ -2299,7 +2344,7 @@ test "SQL command producer native upkeep progresses with exhausted request concu
         last = key;
         _ = try connections.mutate(&source, .{ .create = .{ .id = key, .principal = "alice", .owner_node_id = 0, .expires_at_ms = initial_expiry, .database = "default", .namespace = "public" } }, "alice", 0, initial_expiry - 30000);
         const registration: authority.scopes.Registration = .{ .connection = key, .nonce = native.nonce(), .standalone = true, .lease = .{ .backend = .{ .incarnation = @splat(0x11), .id = id(ordinal + 500), .fence = 1 }, .database = 1, .node = 0, .principal = try authority.principalDigest(a, .bootstrap), .expires_at_ms = initial_expiry } };
-        try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), initial_expiry - 30000);
+        try producer.create(&source, "alice", registration, actor, instance, try native.head(), native.nonce(), initial_expiry - 30000, 0);
     }
     var runtime = try local.storage_db_selected_root.db.background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
     defer runtime.deinit();

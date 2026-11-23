@@ -79,6 +79,8 @@ pub const Request = struct {
     selinux_ingress: ?SelinuxIngress = null,
     backend_pid: i32 = 0,
     capture_cursor_authority: CursorCapture = .none,
+    /// Borrowed wire contract for a prepared SELECT's synchronous admission.
+    expected_stream_columns: ?[]const Column = null,
     completion: ?*@import("completion.zig").Completion = null,
     completion_allocator: ?std.mem.Allocator = null,
     statement: []const u8,
@@ -432,6 +434,9 @@ pub const Backend = struct {
         /// shape before execution. Each page is independently owned; release it
         /// before the next pull or closing the stream. Never use for mutations.
         open_stream: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!?ReadStream = null,
+        /// Stream admission checks the bound catalog identity, settings and
+        /// authorization. The caller verifies the wire columns before output.
+        guarded_select_stream: bool = false,
         // Disconnect/termination must abandon any transaction session owned by
         // the connection. This callback must not commit it or perform retries.
         disconnect: *const fn (*anyopaque, Identity, ?[]const u8) void,

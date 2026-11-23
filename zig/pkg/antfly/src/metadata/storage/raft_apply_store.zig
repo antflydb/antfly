@@ -49284,7 +49284,7 @@ pub const RaftApplyStore = struct {
             const database = (try view.lookup(.database, 0, name)) orelse return error.DatabaseNotFound;
             const journal: SqlLocks.outcomes.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .group = group, .incarnation = incarnation };
             try context.ensureActive();
-            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
+            return std.json.Stringify.valueAlloc(alloc, SqlLocks.Snapshot{ .idle_session_reenrollment = if (activation.version >= topology_protocol.sql_idle_session_reenrollment_version) true else null, .notification_capable = activation.version >= topology_protocol.sql_notifications_version, .group = group, .incarnation = incarnation, .standalone = standalone, .head = try journal.head(a), .scope = null, .owner = null, .next_work = null, .database_id = database.id }, .{});
         }
         const ns: SqlLocks.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = incarnation };
         const item: ?SqlLocks.scopes.WorkItem = if (query.work) |work| blk: {

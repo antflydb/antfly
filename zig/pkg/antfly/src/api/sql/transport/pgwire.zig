@@ -1598,6 +1598,7 @@ pub const Adapter = struct {
         .import_snapshot = importSnapshot,
         .set_transaction_options = setTransactionOptions,
         .open_stream = openStream,
+        .guarded_select_stream = true,
         .disconnect = disconnect,
         .completion_safe = completionSafe,
         .pin_completion = pinCompletion,
@@ -2537,6 +2538,7 @@ const OwnedRead = struct {
         // Statement, parameter and binding-guard data are portal-owned. Keep a
         // private request capsule so I/O borrows point to a stable address.
         self.authority = .{ .server = server, .credential = credential, .identity = &self.identity, .request = request };
+        self.authority.request.expected_stream_columns = null;
         self.authority.request.statement = try arena.dupe(u8, request.statement);
         self.authority.request.database = try arena.dupe(u8, request.database orelse "default");
         self.authority.request.namespace = try arena.dupe(u8, request.namespace orelse "public");
@@ -2597,7 +2599,7 @@ const OwnedRead = struct {
         stream_backend.setting_capture = try self.guarded.settingCapture(arena, &self.native_adapter, plan.compiled());
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
-        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision, .lease_epoch = tenure };
+        var opening: CursorAdmission = .{ .out = arena, .adapter = adapter, .native = &self.native_adapter, .credential = credential, .admitted = admitted_revision, .lease_epoch = tenure, .expected_columns = request.expected_stream_columns };
         if (plan.compiled().statement == .select) opening.install(&stream_backend);
         const opened = try Pull.Stream.openOwned(try @import("../execution/memory_owner.zig").create(adapter.server.alloc, alloc, adapter.server.shared_resource_manager orelse &adapter.server.local_resource_manager), stream_backend, plan.compiled(), parameters, .{ .result_rows = if (plan.compiled().statement == .copy_to) std.math.maxInt(usize) else request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
@@ -2949,6 +2951,7 @@ const CursorAdmission = struct {
     credential: *Credential,
     admitted: ReadRevision,
     lease_epoch: ?u128,
+    expected_columns: ?[]const wire.Column = null,
     previous: @FieldType(catalog.Backend, "execution_binding_validator") = null,
     captured: ?RetainedRead = null,
 
@@ -2960,6 +2963,22 @@ const CursorAdmission = struct {
     fn capture(raw: *anyopaque, scratch: std.mem.Allocator, binding: describe_sql.BoundStatement) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.previous) |validator| try validator.validate(validator.ptr, scratch, binding);
+        if (self.expected_columns) |expected| {
+            if (expected.len != binding.columns.len) return error.CachedPlanResultTypeChanged;
+            for (expected, binding.columns) |column, current| {
+                const actual: wire.Column = .{
+                    .name = current.name,
+                    .type = try wireType(current.type),
+                    .element_type = current.element_type,
+                    .numeric_modifier = current.numeric_modifier,
+                    .enum_view = current.enum_view,
+                    .domain_view = current.domain_view,
+                    .temporal_kind = current.temporal_kind,
+                };
+                if (!wire.sameColumnType(column, actual) or !std.mem.eql(u8, column.name, actual.name))
+                    return error.CachedPlanResultTypeChanged;
+            }
+        }
         self.captured = try RetainedRead.capture(self.out, self.adapter, self.credential, self.native.identity.* orelse return error.Unauthorized, binding, self.native.context, self.native.revision, self.admitted);
         self.captured.?.lease_epoch = self.lease_epoch;
         // A later native operator may mint another owner proof. Bind its role

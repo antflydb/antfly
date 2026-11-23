@@ -744,6 +744,45 @@ pub const Session = struct {
         return current;
     }
 
+    fn openPortalStream(self: *Session, portal: *Portal, expected_columns: ?[]const backend.Column) !void {
+        const open = self.source.vtable.open_stream orelse return;
+        var req = self.request(portal.statement, portal.parameters, portal.types);
+        req.parameter_cells = portal.parameter_cells;
+        req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
+        req.parameter_descriptors = portal.description.parameter_descriptors;
+        req.binding_guard = portal.description.binding_guard;
+        req.setting_epoch = portal.description.setting_epoch;
+        req.expected_stream_columns = expected_columns;
+        portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
+        if (portal.stream) |stream| {
+            if (stream.validate == null or stream.detach == null) return error.UnsupportedSqlExecution;
+            self.snapshot_import_allowed = false;
+        }
+        try req.check();
+    }
+
+    const GuardedSelect = enum { opened, declined, recheck };
+
+    fn tryOpenGuardedSelect(self: *Session, portal: *Portal) !GuardedSelect {
+        const description = portal.description;
+        const stamp = description.stamp orelse return .recheck;
+        if (!self.source.vtable.guarded_select_stream or self.status != .idle or
+            !description.is_select or description.copy_out != null or description.copy_in != null or
+            !stamp.reusable or stamp.catalog == null or description.binding_guard == null or description.setting_epoch == null) return .recheck;
+        self.openPortalStream(portal, description.columns) catch |err| switch (err) {
+            error.CachedPlanResultTypeChanged => return self.cachedPlanChanged(),
+            error.CatalogGenerationChanged, error.SettingCatalogChanged => {
+                self.diagnostic.clearNotices();
+                self.diagnostic = .{ .notice_allocator = self.alloc };
+                return .recheck;
+            },
+            else => return err,
+        };
+        const stream = portal.stream orelse return .declined;
+        if (stream.copy_out != null or !columnsEqual(description.columns, stream.columns)) return self.cachedPlanChanged();
+        return .opened;
+    }
+
     fn checkedPortalDescription(self: *Session, alloc: std.mem.Allocator, portal: *Portal, describe_only: bool) !backend.Description {
         const bound = portal.description;
         var probe = bound;
@@ -1865,7 +1904,9 @@ pub const Session = struct {
                 }
                 if (!portal.stream_opened) {
                     self.read_receipt_budget = .{};
-                    portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal, false);
+                    const guarded = try self.tryOpenGuardedSelect(portal);
+                    if (guarded != .opened)
+                        portal.description = try self.checkedPortalDescription(portal.arena.allocator(), portal, false);
                     portal.describe_stamp = portal.description.stamp;
                     portal.stream_opened = true;
                     if (portal.description.copy_in != null) {
@@ -1880,20 +1921,9 @@ pub const Session = struct {
                         return;
                     }
                     if (self.session_id) |id| portal.session_id = try portal.arena.allocator().dupe(u8, id);
-                    if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
-                        var req = self.request(portal.statement, portal.parameters, portal.types);
-                        req.parameter_cells = portal.parameter_cells;
-                        req.parameter_owner = if (portal.parameter_owner) |owner| owner.lease() else null;
-                        req.parameter_descriptors = portal.description.parameter_descriptors;
-                        req.binding_guard = portal.description.binding_guard;
-                        req.setting_epoch = portal.description.setting_epoch;
-                        portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
-                        if (portal.stream != null) self.snapshot_import_allowed = false;
-                        if (portal.stream) |stream| {
-                            if (stream.validate == null or stream.detach == null) return error.UnsupportedSqlExecution;
-                        }
-                        try req.check();
-                    };
+                    if (guarded == .recheck and self.source.vtable.open_stream != null and
+                        try commands.settingCommand(portal.arena.allocator(), portal.statement) == null)
+                        try self.openPortalStream(portal, null);
                 }
                 if (portal.description.copy_in != null and portal.stream_complete) return error.PortalExecutionFailed;
                 if (portal.stream != null or portal.stream_complete) {

@@ -474,9 +474,17 @@ fn changeTxn(a: A, txn: anytype, id: [32]u8, principal: []const u8, node: u64, a
             const live = (connection orelse return error.SqlConnectionNotFound).value;
             try live.requireOwner(&id, principal, node, input.now_ms);
             if (value.registration.lease.expires_at_ms <= input.now_ms) return error.SqlConnectionNotFound;
-            if (previous != null) return error.SqlConnectionAlreadyExists;
+            if (previous) |owned| {
+                const old = owned.value;
+                const predecessor = value.registration.replaces orelse return error.SqlConnectionAlreadyExists;
+                if (!isDurableIdleHttp(live, input.now_ms) or live.active_txn != null or old.phase != .retired or
+                    !old.temporaryRetirementComplete() or old.registration.lease.expires_at_ms > input.now_ms or
+                    !old.registration.lease.backend.eql(predecessor) or
+                    old.registration.lease.database != value.registration.lease.database or
+                    value.revision != old.revision + 1) return error.SqlConnectionChanged;
+            } else if (value.registration.replaces != null or value.revision != 1) return error.SqlConnectionChanged;
             if (live.state != .idle or value.registration.lease.node != node or
-                !std.mem.eql(u8, &value.registration.connection, &id) or value.phase != .registering or value.revision != 1) return error.InvalidSqlConnection;
+                !std.mem.eql(u8, &value.registration.connection, &id) or value.phase != .registering) return error.InvalidSqlConnection;
             break :blk value;
         },
         .replace => |update| blk: {
@@ -588,8 +596,8 @@ pub fn markTemporaryOwner(store: *transactions.DurableSessionStore, owner: Tempo
     try change(store, owner.connection_id, prior.value.principal, owner.issuer_node_id, .{ .temporary_owner = .{ .owner = owner, .fence = fence, .database = database, .now_ms = now_ms } });
 }
 
-pub fn create(store: *transactions.DurableSessionStore, principal: []const u8, registration: authority.scopes.Registration, actor: authority.prepared.Actor, instance: Id, head: u64, nonce: Id, now_ms: u64) !void {
-    var value: Record = .{ .registration = registration, .actor = actor, .principal = principal, .instance = instance };
+pub fn create(store: *transactions.DurableSessionStore, principal: []const u8, registration: authority.scopes.Registration, actor: authority.prepared.Actor, instance: Id, head: u64, nonce: Id, now_ms: u64, previous_revision: u64) !void {
+    var value: Record = .{ .revision = std.math.add(u64, previous_revision, 1) catch return error.SqlProgramLimitExceeded, .registration = registration, .actor = actor, .principal = principal, .instance = instance };
     value.pending = value.controlRequest(head, nonce, .{ .register = registration });
     try change(store, registration.connection, principal, registration.lease.node, .{ .create = .{ .value = value, .now_ms = now_ms } });
 }
