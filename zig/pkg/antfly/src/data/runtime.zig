@@ -41471,8 +41471,10 @@ fn consumerTests() type {
                         .writes = &.{.{ .key = "old-row", .value = "{\"id\":1}" }},
                         .sync_level = .write,
                     }, fence)) orelse return error.TestUnexpectedResult;
-                    const populated = try owner.inspectUnpublishedNativeImage(scratch, 42, persistence);
-                    try std.testing.expectEqual(@as(?bool, true), populated.has_user_data);
+                    var reads = owner.readSource();
+                    reads.route_fence = fence;
+                    var populated = (try reads.lookupGroupLocal(scratch, 42, "rows", "old-row", .{}, .read_index)) orelse return error.TestUnexpectedResult;
+                    defer populated.deinit(scratch);
                 }
                 // Withhold the actual shutdown transport before deinit: an
                 // orderly native flush is not itself a metadata clean receipt.
