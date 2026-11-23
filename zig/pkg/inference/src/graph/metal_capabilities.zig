@@ -766,6 +766,10 @@ fn metalGqaCausalAttentionHasResidentShape(query: CapabilityQuery) bool {
         .fused_gqa_causal_attention => |attrs| attrs,
         else => return false,
     };
+    if (attrs.functional_kv) {
+        const descriptor = @import("../ops/kernel_descriptor.zig").lower(query.graph, query.node_id) orelse return false;
+        if (descriptor.operation.dense_attention_rows.isGroupedCausalSuffix()) return true;
+    }
     if (attrs.batch == 0 or attrs.seq_len == 0 or attrs.num_heads == 0 or attrs.head_dim == 0) return false;
     const kv_heads = if (attrs.num_kv_heads != 0) attrs.num_kv_heads else attrs.num_heads;
     const kv_len = if (attrs.kv_seq_len != 0) attrs.kv_seq_len else attrs.seq_len;

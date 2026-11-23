@@ -33,7 +33,13 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
     if (descriptor.output_shape.dtype != .f32) return false;
     if (descriptor.output_shape.rank() == 0) return false;
     switch (descriptor.operation) {
-        .paged_attention, .dense_attention_prefix, .dense_attention_rows => return false,
+        .paged_attention, .dense_attention_prefix => return false,
+        .dense_attention_rows => |attention| {
+            if (!attention.isGroupedCausalSuffix() or !attention.valid(descriptor)) return false;
+            for (descriptor.input_shapes[0..3]) |shape| {
+                if (shape.numElements().? > std.math.maxInt(u32)) return false;
+            }
+        },
         .linear => |linear| {
             if (linear.rows == 0 or linear.in_dim == 0 or linear.out_dim == 0 or
                 descriptor.output_shape.rank() != 2 or descriptor.input_shapes[0].rank() != 2 or descriptor.input_shapes[1].rank() != 2 or
@@ -11980,6 +11986,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .rms => !(self.require_f32_linears and norm.dim % 4 == 0 and !audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) or
                     metal_runtime.antfly_metal_norm_clamp_ready(self.provider_impl.raw_decode_runtime) != 0,
             },
+            .dense_attention_rows => !disableRuntimeAttentionF32() and metal_runtime.antfly_metal_dense_suffix_attention_ready(self.provider_impl.raw_decode_runtime) != 0,
             .add_mul_scalar => metal_runtime.assignedAddMulScalarAvailable(self.provider_impl),
             .rope => |r| metal_runtime.regularRopeAvailable(self.provider_impl, r),
             else => true,
@@ -12968,13 +12975,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
-        if ((request.descriptor.operation == .dense_attention_prefix or request.descriptor.operation == .dense_attention_rows)) return false;
         if (request.descriptor.output_shape.dtype != .f32) return false;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (self.audio_capture != null or !self.provider_impl.hasDecoderRuntime()) return false;
         const descriptor = request.descriptor;
         if (!supportsAssignedDescriptor(descriptor)) return false;
         if (descriptor.operation == .add_mul_scalar and !metal_runtime.assignedAddMulScalarAvailable(self.provider_impl)) return false;
+        if (descriptor.operation == .dense_attention_rows) {
+            if (request.auxiliaries.len != 0 or !directRouteSupported(ctx, descriptor)) return false;
+            if (request.attention) |binding| {
+                if (binding.attn_or_mask != null or binding.attention_sink.hasMetadata()) return false;
+                if (binding.dense_attention_rows) |rows| if (rows.mask != null) return false;
+            }
+        }
         if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
         const typed_gather = descriptor.operation == .gather and descriptor.input_shapes[1].dtype != .f32;
         for (request.inputs, 0..) |input, index| {
@@ -13031,7 +13044,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
         const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
         if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
-        if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope) {
+        if (descriptor.operation == .add_mul_scalar or descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather or descriptor.operation == .norm or descriptor.operation == .linear or descriptor.operation == .dot or descriptor.operation == .rope or descriptor.operation == .dense_attention_rows) {
             for (request.inputs) |source| {
                 const tensor = toBuf(source).metal_tensor.?;
                 if (tensor.deviceHandle() == out_tensor.deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(tensor.deviceByteOffset()), tensor.deviceByteLen(), @intCast(out_tensor.deviceByteOffset()), out_tensor.deviceByteLen())) return error.InvalidAssignedAlias;
@@ -13042,7 +13055,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // the general CT adapters; the command/frame layer retains GPU resources.
         const input = toBuf(request.inputs[0]).metal_tensor.?;
         const written: bool = switch (descriptor.operation) {
-            .paged_attention, .dense_attention_prefix, .dense_attention_rows => return false,
+            .paged_attention, .dense_attention_prefix => return false,
+            .dense_attention_rows => |geometry| blk: {
+                try metal_runtime.decoderRuntimeDenseSuffixAttentionInto(
+                    self.provider_impl.raw_decode_runtime.?,
+                    geometry,
+                    input,
+                    toBuf(request.inputs[1]).metal_tensor.?,
+                    toBuf(request.inputs[2]).metal_tensor.?,
+                    out_tensor,
+                );
+                break :blk true;
+            },
             .unary => |unary| switch (unary) {
                 inline .gelu, .gelu_exact, .relu, .silu => |activation| (try metal_runtime.decoderRuntimeApplyActivationDeviceInto(self.provider_impl, input, @backingInt(@field(ops.DecoderRuntimeActivationKind, @tagName(activation))), 1, descriptor.elements(), out_tensor)) != null,
                 inline else => |tag| (try metal_runtime.decoderRuntimeApplyPrimitiveUnaryInto(self.provider_impl, input, primitiveUnaryActivationKind(@field(HostUnaryOp, @tagName(tag))), out_tensor)) != null,
@@ -26716,9 +26740,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return denseBuf(self.allocator, output.?, true, &out_shape);
         }
         if (batch != 1) return error.UnsupportedTensorType;
-        if (bufElemCount(q_buf) != attention.query_sequence_len * h_q) return error.InvalidAttentionShape;
-        if (bufElemCount(k_buf) != attention.query_sequence_len * h_kv) return error.InvalidAttentionShape;
-        if (bufElemCount(v_buf) != attention.query_sequence_len * h_kv) return error.InvalidAttentionShape;
+        if (attention.query_sequence_len > attention.total_sequence_len) return error.InvalidAttentionShape;
+        if (bufElemCount(q_buf) != try std.math.mul(usize, attention.query_sequence_len, h_q)) return error.InvalidAttentionShape;
+        // With a state owner the inputs are the newly computed suffix. The
+        // dense route consumes the complete K/V range from its operands.
+        const stateful = attention.kv_cache != null and (attention.kv_manager != null or attention.kv_storage != null);
+        const key_rows = if (stateful) attention.query_sequence_len else attention.kv_sequence_len;
+        const kv_elements = try std.math.mul(usize, key_rows, h_kv);
+        if (bufElemCount(k_buf) != kv_elements or bufElemCount(v_buf) != kv_elements) return error.InvalidAttentionShape;
 
         const bias_buf = if (attn_bias) |tensor| toBuf(tensor) else null;
         const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
@@ -55047,6 +55076,60 @@ test "Metal canonical owned facade preserves assigned route numerics and rejects
     const actual = try cb.toFloat32(output, a);
     defer a.free(actual);
     try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, actual);
+}
+
+test "Metal assigned suffix attention preserves causal positions and sliding window" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const cb = context.metal_hosted.compute.ownedComputeBackend();
+    const functions = cb.vtable.kernels.?;
+    const q = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&(@as([8]f32, @splat(0))), &.{ 2, 4 }));
+    defer cb.free(q);
+    const k = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&(@as([8]f32, @splat(0))), &.{ 4, 2 }));
+    defer cb.free(k);
+    const v = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 4, 2 }));
+    defer cb.free(v);
+    const bytes = 8 * @sizeOf(f32);
+    const lease = (try ops.physical_storage.Lease.create(a, cb, bytes)).?;
+    defer lease.release();
+    const output = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = &.{ 2, 4 } })).?;
+    defer cb.free(output);
+
+    const route = @import("../execution/kernel_route.zig");
+    const Shape = @import("ml").graph.Shape;
+    const query = Shape.init(.f32, &.{ 2, 4 });
+    const key = Shape.init(.f32, &.{ 4, 2 });
+    const bindings = [_]route.Binding{
+        .{ .imported_host = .{ .logical = query, .target = .metal } },
+        .{ .imported_host = .{ .logical = key, .target = .metal } },
+        .{ .imported_host = .{ .logical = key, .target = .metal } },
+    };
+    const descriptor: ops.kernel_descriptor.Descriptor = .{
+        .operation = .{ .dense_attention_rows = .{ .kind = .causal, .query_rows = 2, .key_rows = 4, .num_heads = 2, .num_kv_heads = 1, .head_dim = 2, .sliding_window = 2 } },
+        .input_count = 3,
+        .input_shapes = .{ query, key, key },
+        .output_shape = query,
+    };
+    var selected = (try functions.prepareKernelRoute.?(cb.ptr, .{
+        .allocator = a,
+        .implementation = .{ .context = cb.ptr, .table = cb.vtable },
+        .descriptor = &descriptor,
+        .inputs = &bindings,
+        .output = .{ .node = 1, .allocation = 0, .epoch = 0, .logical = query, .writable_bytes = bytes },
+    })) orelse return error.MissingOwnedPreparedRoute;
+    defer selected.deinit();
+    try std.testing.expect(try functions.runAssignedKernel.?(cb.ptr, .{
+        .descriptor = &descriptor,
+        .inputs = &.{ q, k, v },
+        .output = output,
+        .prepared_route = &selected,
+    }));
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 4, 5, 6, 7, 6, 7 }, values);
 }
 
 test "Metal assigned fused scalar uses a device scalar for both operation orders" {

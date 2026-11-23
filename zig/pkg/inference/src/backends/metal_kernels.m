@@ -36643,6 +36643,10 @@ int termite_metal_decode_runtime_apply_attention_f32(
     }
 }
 
+int antfly_metal_dense_suffix_attention_ready(termite_metal_decode_runtime *runtime) {
+    return runtime != NULL && runtime->attention_f32_pipeline != nil;
+}
+
 int termite_metal_decode_runtime_apply_attention_f32_device(
     termite_metal_decode_runtime *runtime,
     void *q_handle,

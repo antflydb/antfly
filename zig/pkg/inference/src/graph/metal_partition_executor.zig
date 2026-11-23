@@ -14480,7 +14480,21 @@ fn executeRuntimeGqaCausalAttention(
     const bias = valueFor(values, if (num_inputs > 3) inputs[3] else null_node);
     const kv_heads = if (attrs.num_kv_heads != 0) attrs.num_kv_heads else attrs.num_heads;
 
-    if (exec_state.options.attention) |base_attn| {
+    const key_rows = if (attrs.kv_seq_len == 0) attrs.seq_len else attrs.kv_seq_len;
+    const window = attrs.sliding_window orelse 0;
+    const attention = if (!attrs.functional_kv)
+        exec_state.options.attention
+    else if (key_rows != attrs.seq_len or window != 0)
+        @as(?ops_mod.AttentionContext, .{
+            .total_sequence_len = key_rows,
+            .query_sequence_len = attrs.seq_len,
+            .kv_sequence_len = key_rows,
+            .sliding_window = window,
+        })
+    else
+        null;
+
+    if (attention) |base_attn| {
         var attn = base_attn;
         attn.layer_index = if (attrs.layer_index == std.math.maxInt(u32))
             exec_state.attention_layer
@@ -14501,7 +14515,7 @@ fn executeRuntimeGqaCausalAttention(
             error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch, error.UnsupportedTensorType, error.InvalidAttentionShape => null,
             else => return err,
         };
-        if (out != null) exec_state.attention_layer += 1;
+        if (out != null and !attrs.functional_kv) exec_state.attention_layer += 1;
         return out;
     }
 
@@ -21851,6 +21865,14 @@ test "metal partition executor resident zero tensor materializes without fallbac
 }
 
 test "metal partition executor resident gqa attention uses command path" {
+    try qualifyResidentGqaAttention(false);
+}
+
+test "Metal partition executes functional GQA suffix into the planned output" {
+    try qualifyResidentGqaAttention(true);
+}
+
+fn qualifyResidentGqaAttention(comptime suffix: bool) !void {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -21860,20 +21882,25 @@ test "metal partition executor resident gqa attention uses command path" {
     var b = ml.graph.Builder.init(&g);
 
     const batch: usize = 1;
-    const seq_len: usize = 1;
-    const num_heads: usize = 1;
-    const head_dim: usize = 4;
+    const seq_len: usize = if (suffix) 2 else 1;
+    const key_rows: usize = if (suffix) 4 else seq_len;
+    const num_heads: usize = if (suffix) 2 else 1;
+    const num_kv_heads: usize = 1;
+    const head_dim: usize = if (suffix) 2 else 4;
     const dim: usize = num_heads * head_dim;
+    const kv_dim: usize = num_kv_heads * head_dim;
     const q = try b.parameter("q", ml.graph.Shape.init(.f32, &.{ seq_len, dim }));
-    const k = try b.parameter("k", ml.graph.Shape.init(.f32, &.{ seq_len, dim }));
-    const v = try b.parameter("v", ml.graph.Shape.init(.f32, &.{ seq_len, dim }));
+    const k = try b.parameter("k", ml.graph.Shape.init(.f32, &.{ key_rows, kv_dim }));
+    const v = try b.parameter("v", ml.graph.Shape.init(.f32, &.{ key_rows, kv_dim }));
     const attn = try g.addNode(.{
         .op = .{ .fused_gqa_causal_attention = .{
             .batch = @intCast(batch),
             .seq_len = @intCast(seq_len),
-            .kv_seq_len = @intCast(seq_len),
+            .kv_seq_len = @intCast(key_rows),
+            .functional_kv = suffix,
+            .sliding_window = if (suffix) 2 else null,
             .num_heads = @intCast(num_heads),
-            .num_kv_heads = @intCast(num_heads),
+            .num_kv_heads = @intCast(num_kv_heads),
             .head_dim = @intCast(head_dim),
         } },
         .output_shape = ml.graph.Shape.init(.f32, &.{ seq_len, dim }),
@@ -21905,11 +21932,13 @@ test "metal partition executor resident gqa attention uses command path" {
     defer allocator.free(value_device);
     @memset(value_device, 0);
 
-    const q_ct = try cb.fromFloat32Shape(&.{ 1.0, 0.0, 0.0, 0.0 }, &.{ seq_len, dim });
+    const q_values: [seq_len * dim]f32 = @splat(0);
+    const k_values: [key_rows * kv_dim]f32 = @splat(0);
+    const q_ct = try cb.fromFloat32Shape(&q_values, &.{ seq_len, dim });
     defer cb.free(q_ct);
-    const k_ct = try cb.fromFloat32Shape(&.{ 1.0, 0.0, 0.0, 0.0 }, &.{ seq_len, dim });
+    const k_ct = try cb.fromFloat32Shape(&k_values, &.{ key_rows, kv_dim });
     defer cb.free(k_ct);
-    const v_ct = try cb.fromFloat32Shape(&.{ 5.0, 6.0, 7.0, 8.0 }, &.{ seq_len, dim });
+    const v_ct = try cb.fromFloat32Shape(if (suffix) &.{ 1, 2, 3, 4, 5, 6, 7, 8 } else &.{ 5, 6, 7, 8 }, &.{ key_rows, kv_dim });
     defer cb.free(v_ct);
     const q_dev = (try makeMetalDeviceResident(&cb, q_ct)) orelse return error.SkipZigTest;
     defer cb.free(q_dev);
@@ -21920,6 +21949,24 @@ test "metal partition executor resident gqa attention uses command path" {
     values[@intCast(q)] = q_dev;
     values[@intCast(k)] = k_dev;
     values[@intCast(v)] = v_dev;
+
+    if (suffix) {
+        // An ordinary execution of the same functional node ignores the
+        // caller's unrelated stateful decoder geometry and layer cursor.
+        var state: interpreter.ExecState = .{
+            .attention_layer = 7,
+            .options = .{ .attention = .{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 } },
+        };
+        const node = g.node(attn);
+        const fallback = (try executeRuntimeGqaCausalAttention(&cb, values, node.getInputs(), node.op.fused_gqa_causal_attention, node.num_inputs, &state)) orelse return error.TestUnexpectedResult;
+        defer cb.free(fallback);
+        const result = try cb.toFloat32(fallback, allocator);
+        defer allocator.free(result);
+        for ([_]f32{ 4, 5, 4, 5, 6, 7, 6, 7 }, result) |expected, actual| {
+            try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+        }
+        try std.testing.expectEqual(@as(usize, 7), state.attention_layer);
+    }
 
     const reachable = try interpreter.computeReachable(allocator, &g);
     defer allocator.free(reachable);
@@ -21956,7 +22003,8 @@ test "metal partition executor resident gqa attention uses command path" {
 
     const raw = try cb.toFloat32(values[out_index].?, allocator);
     defer allocator.free(raw);
-    try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, 7.0, 8.0 }, raw);
+    if (suffix) try std.testing.expectEqual(@as(u64, 1), exec_stats.assigned_kernel_dispatches);
+    try std.testing.expectEqualSlices(f32, if (suffix) &.{ 4, 5, 4, 5, 6, 7, 6, 7 } else &.{ 5, 6, 7, 8 }, raw);
 }
 
 fn putTestQuantizedWeight(

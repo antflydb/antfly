@@ -3559,6 +3559,46 @@ pub fn decoderRuntimeApplyAttentionF32DeviceOnly(self: anytype, request: Attenti
     return applyAttentionF32(true, self, request);
 }
 
+/// A strict suffix bypasses the full-prompt F16 KV staging path. The
+/// existing attention dispatcher therefore needs only the four bound buffers.
+pub fn decoderRuntimeDenseSuffixAttentionInto(
+    runtime: *RawMetalDecodeRuntime,
+    geometry: @import("../ops/kernel_descriptor.zig").DenseAttentionRows,
+    q: MetalTensor,
+    k: MetalTensor,
+    v: MetalTensor,
+    out: MetalTensor,
+) !void {
+    for ([_]MetalTensor{ q, k, v, out }) |tensor| {
+        const device = tensor.device orelse return error.InvalidTensorShape;
+        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return error.InvalidTensorShape;
+    }
+    try attentionDeviceCompleted(termite_metal_decode_runtime_apply_attention_f32_device(
+        runtime,
+        q.deviceHandle(),
+        q.deviceByteOffset(),
+        k.deviceHandle(),
+        k.deviceByteOffset(),
+        v.deviceHandle(),
+        v.deviceByteOffset(),
+        geometry.query_rows,
+        geometry.key_rows,
+        geometry.num_heads,
+        geometry.num_kv_heads,
+        geometry.head_dim,
+        geometry.key_rows - geometry.query_rows,
+        0,
+        geometry.sliding_window,
+        null,
+        0,
+        null,
+        null,
+        geometry.key_rows,
+        out.deviceHandle(),
+        out.deviceByteOffset(),
+    ));
+}
+
 fn attentionDeviceCompleted(rc: c_int) !void {
     if (rc != 0) return error.MetalDeviceAttentionFailed;
 }
@@ -21281,6 +21321,7 @@ pub extern fn termite_metal_decode_runtime_apply_attention_f32(
     total_sequence_len: usize,
     output: [*c]f32,
 ) c_int;
+pub extern fn antfly_metal_dense_suffix_attention_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_apply_attention_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
     q_handle: ?*anyopaque,

@@ -215,6 +215,11 @@ pub const DenseAttentionRows = struct {
     /// a functional grouped-query program with an exact static key extent.
     num_kv_heads: u32 = 0,
     sliding_window: u32 = 0,
+
+    pub fn isGroupedCausalSuffix(self: @This()) bool {
+        return self.kind == .causal and self.num_kv_heads != 0 and self.query_rows < self.key_rows;
+    }
+
     pub fn valid(self: @This(), descriptor: *const Descriptor) bool {
         if (self.query_rows == 0 or self.key_rows == 0 or self.num_heads == 0 or self.head_dim == 0 or descriptor.input_count != 3) return false;
         if (self.num_kv_heads == 0) {
