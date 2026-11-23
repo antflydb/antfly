@@ -55,6 +55,11 @@ pub const Owner = struct {
         return true;
     }
 
+    pub fn executableFor(self: *const Owner, input_bytes: usize) ?Executable {
+        const executable = self.executable orelse return null;
+        return if (executable.storage.scratch_offset == input_bytes) executable else null;
+    }
+
     pub fn create(a: std.mem.Allocator) !*Owner {
         const self = try a.create(Owner);
         self.* = .{ .allocator = a };

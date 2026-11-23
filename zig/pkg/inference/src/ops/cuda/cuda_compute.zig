@@ -7939,7 +7939,7 @@ pub const CudaCompute = struct {
         if (base.input_bytes > 128 * 1024 * 1024) return null;
         for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled) {
             const owner = entry.owner orelse return null;
-            return audioArenaRequest(owner.executable orelse return null);
+            return audioArenaRequest(owner.executableFor(base.input_bytes) orelse return null);
         };
         return null;
     }
@@ -20651,7 +20651,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     const owner = entry.owner.?;
     const plan = &owner.plan;
-    const executable = owner.executable orelse return null;
+    const executable = owner.executableFor(input_bytes) orelse return null;
     const storage = executable.storage;
     const output = storage.output orelse return null;
     if (output_bytes == 0 or output_bytes > output.bytes) return null;
@@ -60657,6 +60657,7 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     var updated: Owner = .{ .allocator = std.testing.allocator };
     updated.plan.allocate(1024, 0x2000);
     try std.testing.expect(updated.seal(0x2000, candidate.key, candidate.input_bytes));
+    try std.testing.expect(updated.executableFor(candidate.input_bytes + @import("../../execution/stream_workspace.zig").alignment) == null);
     const old_arena = CudaCompute.audioArenaRequest(learned.executable.?);
     const new_arena = CudaCompute.audioArenaRequest(updated.executable.?);
     try std.testing.expect(old_arena.arena.grid_x != new_arena.arena.grid_x);
