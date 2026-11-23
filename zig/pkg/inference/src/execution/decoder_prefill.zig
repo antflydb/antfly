@@ -223,24 +223,43 @@ pub const PromptEmbeddingRows = struct {
     pub fn init(backend: *const ComputeBackend, allocator: std.mem.Allocator, base: ops.CT, rows: usize, width: usize, scale: f32) !@This() {
         if (rows == 0 or width == 0 or std.math.cast(i32, rows) == null or std.math.cast(i32, width) == null) return error.InvalidEmbeddingAssembly;
         const elements = try std.math.mul(usize, rows, width);
-        // Known packed/opaque bases retain their original host route without
-        // first allocating an unsupported speculative prompt destination.
-        if (std.math.approxEqAbs(f32, scale, 1.0, 1e-6) and try EmbeddingRows.supportsSource(backend, base, rows, width)) {
-            if (try EmbeddingRows.init(backend, allocator, rows, width)) |initial| {
-                var assembly = initial;
-                errdefer assembly.deinit();
-                if (try assembly.acceptsSource(base, rows)) {
-                    try assembly.append(base, 0, rows);
-                    return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .resident = assembly } };
+        const scaled = !std.math.approxEqAbs(f32, scale, 1.0, 1e-6);
+        // Packed/opaque inputs keep their host conversion. A resident F32
+        // multiply produces an independent destination for later row writes.
+        if (try EmbeddingRows.sourceNamespace(backend, base, rows, width)) |base_storage| {
+            if (!scaled) {
+                if (try EmbeddingRows.init(backend, allocator, rows, width)) |initial| {
+                    var assembly = initial;
+                    errdefer assembly.deinit();
+                    if (try assembly.acceptsSource(base, rows)) {
+                        try assembly.append(base, 0, rows);
+                        return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .resident = assembly } };
+                    }
+                    assembly.deinit();
                 }
-                assembly.deinit();
+            } else if (base_storage.kind != .host and backend.supportsCopyRows2D()) {
+                if (try backend.multiplyScalar(base, scale)) |result| {
+                    errdefer backend.free(result);
+                    const result_storage = (try EmbeddingRows.sourceNamespace(backend, result, rows, width)) orelse return error.InvalidEmbeddingAssembly;
+                    if (result_storage.kind != base_storage.kind or result_storage.context != base_storage.context or
+                        result_storage.base == base_storage.base) return error.InvalidEmbeddingAssembly;
+                    return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .resident = .{
+                        .backend = backend,
+                        .allocator = allocator,
+                        .tensor = result,
+                        .rows = rows,
+                        .width = width,
+                        .written = rows,
+                        .namespace = result_storage,
+                    } } };
+                }
             }
         }
         const values = try backend.toFloat32(base, allocator);
         errdefer allocator.free(values);
         if (values.len != elements) return error.InvalidEmbeddingAssembly;
         // Exactly the original host scaling order and approximate-one guard.
-        if (!std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) for (values) |*value| {
+        if (scaled) for (values) |*value| {
             value.* *= scale;
         };
         return .{ .backend = backend, .allocator = allocator, .rows = rows, .width = width, .storage = .{ .host = values } };
@@ -2360,6 +2379,22 @@ fn checkPromptReplacementRows(backend_value: ComputeBackend, _: ComputeBackend) 
     const held = try cb.toFloat32(completed, a);
     defer a.free(held);
     try std.testing.expectEqualSlices(f32, actual, held);
+    if (backend_value.kind() != .native) {
+        const scaled_transfers = helper.Transfers.snapshot(backend_value);
+        var scaled_prompt = try PromptEmbeddingRows.init(cb, a, base, 6, 4, 1.25);
+        defer scaled_prompt.deinit();
+        try std.testing.expect(scaled_prompt.storage == .resident);
+        try scaled_prompt.replace(.{ .offset = 1, .rows = 2, .source = .{ .resident = image } });
+        const scaled_output = try scaled_prompt.finish();
+        defer cb.free(scaled_output);
+        try scaled_transfers.expectUnchanged(backend_value);
+        const scaled_values = try cb.toFloat32(scaled_output, a);
+        defer a.free(scaled_values);
+        var expected = base_values;
+        for (&expected) |*value| value.* *= 1.25;
+        @memcpy(expected[4..12], &.{ 41, 42, 43, 44, 51, 52, 53, 54 });
+        try std.testing.expectEqualSlices(f32, &expected, scaled_values);
+    }
     // Unit-scale host producers still need an explicit current-provider
     // upload before joining an already resident prompt. This exercises the
     // genuine host-chunks ABI shared by all three Gemma entrypoints.
