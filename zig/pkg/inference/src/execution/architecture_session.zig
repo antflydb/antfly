@@ -5834,7 +5834,7 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     if (preparation.cached == null) if (definition.shared) |shared| {
         try shared.sealBeforeExecution();
     };
-    if (scheduled_initial_rows) |query_rows| {
+    if (scheduled_initial_rows) |query_rows| initial_phase: {
         if (domain != null and schedule.sharedBackingSupported(arch.allocator) and initial_preparation.cached == null) initial_preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
         var owned_initial_spec: ?schedule.ProgramSpecStorage = null;
         defer if (owned_initial_spec) |*storage| storage.deinit();
@@ -5843,6 +5843,7 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
             break :create &owned_initial_spec.?.value;
         };
         self.program.?.initInitial(config, self.encoder.?, geometry.encoder_rows, &self.weights.?, &initial_preparation, query_rows, initial_spec, if (owned_initial_spec) |*storage| storage else null) catch |err| {
+            if (cb.kind() == .metal and err == error.UnsupportedDenseSchedule) break :initial_phase;
             if (err == error.OutOfMemory) if (initial_preparation.shared) |shared| return shared.admissionError() orelse err;
             return err;
         };
@@ -11652,10 +11653,10 @@ test "native incremental actual Metal owned provider preserves source lease and 
     defer source.deinit();
     outputs.deinit();
     outputs_open = false;
-    for (0..2) |_| {
+    for ([_]usize{ 2, 1 }) |initial_rows| {
         const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(source_cb);
         var observation = WhisperConstructionObservation{};
-        var decoder = try createResidentIncrementalDecoderObserved(host_session, a, control, try source.retained(), &observation, .{ .expected_initial_query_rows = 2 });
+        var decoder = try createResidentIncrementalDecoderObserved(host_session, a, control, try source.retained(), &observation, .{ .expected_initial_query_rows = initial_rows });
         var decoder_open = true;
         defer if (decoder_open) decoder.deinit();
         const compute: *metal_compute_mod.MetalCompute = @ptrCast(@alignCast(decoder.cb.backend.ptr));
@@ -11669,7 +11670,7 @@ test "native incremental actual Metal owned provider preserves source lease and 
             return error.ExpectedPreparedResidentWhisper;
         }
         try std.testing.expectEqual(.prepared, observation.program.outcome);
-        try std.testing.expect(decoder.cache.native_program.?.initial == null);
+        try std.testing.expectEqual(initial_rows == 1, decoder.cache.native_program.?.initial != null);
         const templates = observation.templates orelse return error.MissingDefinitionLifetimeStatistics;
         try std.testing.expectEqual(.decode_prefix, templates.phase);
         try std.testing.expectEqual(.sampled, templates.availability);
@@ -11679,7 +11680,11 @@ test "native incremental actual Metal owned provider preserves source lease and 
         try std.testing.expect(source_epoch.record == decoder_epoch.record and source_epoch.nonce == decoder_epoch.nonce);
         try std.testing.expectEqual(source.value, decoder.encoder_hidden);
         try before.expectUnchanged(source_cb);
-        const actual_first = try decoder.step(&.{ 0, 1 });
+        const actual_first = if (initial_rows == 1) first_output: {
+            const initial_logits = try decoder.step(&.{0});
+            a.free(initial_logits);
+            break :first_output try decoder.step(&.{1});
+        } else try decoder.step(&.{ 0, 1 });
         defer a.free(actual_first);
         const actual_second = try decoder.step(&.{2});
         defer a.free(actual_second);
