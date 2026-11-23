@@ -45973,6 +45973,10 @@ static int termite_metal_encode_quant_q_plus_kv_pair_descriptors(
     int kv_failure_code
 );
 
+// Distinguish geometry/slot refusals from command failures. An in-place
+// caller cannot replay when a prior encoder may have written its destination.
+enum { TERMITE_METAL_QKV_COMMAND_FAILED = -100 };
+
 int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
     termite_metal_decode_runtime *runtime,
     uint32_t q_format,
@@ -46048,7 +46052,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
         id<MTLCommandBuffer> command_buffer = frame_owned
             ? termite_metal_new_command_buffer(runtime->queue, __func__)
             : runtime->active_frame_cb;
-        if (command_buffer == nil) return -14;
+        if (command_buffer == nil) return TERMITE_METAL_QKV_COMMAND_FAILED;
 
         if (rows == 1 && termite_metal_encode_q8_0_qkv_linear_with_offsets(
                 runtime,
@@ -46071,7 +46075,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
                 in_dim,
                 q_out_dim,
                 kv_out_dim,
-                -15) != 0) return -15;
+                TERMITE_METAL_QKV_COMMAND_FAILED) != 0) return TERMITE_METAL_QKV_COMMAND_FAILED;
 
         if (rows != 1 && termite_metal_encode_q8_0_linear_family_with_offset(
                 runtime,
@@ -46086,7 +46090,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
                 in_dim,
                 q_out_dim,
                 TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
-                -15) != 0) return -15;
+                TERMITE_METAL_QKV_COMMAND_FAILED) != 0) return TERMITE_METAL_QKV_COMMAND_FAILED;
 
         if (rows != 1) {
             if (rows >= 9u && runtime->q8_0_mm_pipeline != nil) {
@@ -46103,7 +46107,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
                         in_dim,
                         kv_out_dim,
                         TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
-                        -16) != 0) return -16;
+                        TERMITE_METAL_QKV_COMMAND_FAILED) != 0) return TERMITE_METAL_QKV_COMMAND_FAILED;
                 if (termite_metal_encode_q8_0_linear_family_with_offset(
                         runtime,
                         command_buffer,
@@ -46117,7 +46121,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
                         in_dim,
                         kv_out_dim,
                         TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
-                        -16) != 0) return -16;
+                        TERMITE_METAL_QKV_COMMAND_FAILED) != 0) return TERMITE_METAL_QKV_COMMAND_FAILED;
             } else {
                 if (termite_metal_encode_q8_0_pair_linear_with_offsets(
                         runtime,
@@ -46135,14 +46139,14 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
                         rows,
                         in_dim,
                         kv_out_dim,
-                        -16) != 0) return -16;
+                        TERMITE_METAL_QKV_COMMAND_FAILED) != 0) return TERMITE_METAL_QKV_COMMAND_FAILED;
             }
         }
 
-	        if (!frame_owned) return 0;
+        if (!frame_owned) return 0;
         antfly_metal_commit(command_buffer);
         antfly_metal_wait(command_buffer);
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -17;
+        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : TERMITE_METAL_QKV_COMMAND_FAILED;
     }
 }
 
@@ -48195,7 +48199,7 @@ static int termite_metal_decode_runtime_apply_quantized_q_kv_pair_linear_qkv_slo
         id<MTLCommandBuffer> command_buffer = frame_owned
             ? termite_metal_new_command_buffer(runtime->queue, __func__)
             : runtime->active_frame_cb;
-        if (command_buffer == nil) return -13;
+        if (command_buffer == nil) return TERMITE_METAL_QKV_COMMAND_FAILED;
         const int rc = termite_metal_encode_quant_q_plus_kv_pair_descriptors(
             runtime,
             command_buffer,
@@ -48219,13 +48223,13 @@ static int termite_metal_decode_runtime_apply_quantized_q_kv_pair_linear_qkv_slo
             k_output_offset,
             v_output_buffer,
             v_output_offset,
-            -14,
-            -15);
-        if (rc != 0) return rc;
+            TERMITE_METAL_QKV_COMMAND_FAILED,
+            TERMITE_METAL_QKV_COMMAND_FAILED);
+        if (rc != 0) return TERMITE_METAL_QKV_COMMAND_FAILED;
         if (!frame_owned) return 0;
         antfly_metal_commit(command_buffer);
         antfly_metal_wait(command_buffer);
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -16;
+        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : TERMITE_METAL_QKV_COMMAND_FAILED;
     }
 }
 

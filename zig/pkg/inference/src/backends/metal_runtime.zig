@@ -29100,6 +29100,8 @@ pub fn tryApplyQuantizedRuntimeLinearQkvInto(
             v_out.deviceHandle(),
             v_out.deviceByteOffset(),
         );
+        // See TERMITE_METAL_QKV_COMMAND_FAILED in metal_kernels.m.
+        if (rc == -100) return error.MetalProjectionIncomplete;
         if (rc == 0) {
             var k_mut = k_out;
             var v_mut = v_out;
