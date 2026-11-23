@@ -615,7 +615,7 @@ pub const DirectoryBuilder = struct {
     }
 
     fn collectTracks(self: *DirectoryBuilder, bytes: []const u8) !void {
-        if (bytes.len > self.limits.max_metadata_bytes) return error.ResourceLimitExceeded;
+        if (bytes.len > self.limits.max_metadata_bytes) return error.AudioTooLarge;
         var parsed = DemuxState{};
         try parseTracks(bytes, &parsed);
         var track = parsed.track orelse return error.UnsupportedAudioFormat;
@@ -640,7 +640,7 @@ pub const DirectoryBuilder = struct {
         var scan = Webm.Scan{ .input = input, .limits = self.limits };
         const before = self.packets.items.len;
         const limit = if (track.codec == .flac) std.math.cast(usize, input.length()) orelse std.math.maxInt(usize) else self.limits.max_packet_bytes;
-        try indexBlock(self.allocator, &scan, elem, track, ticks, scale, &self.packets, limit, prefix);
+        try indexBlock(self.allocator, &scan, elem, track, ticks, scale, &self.packets, limit, prefix, error.AudioTooLarge);
         if (self.packets.items.len != before) if (discard) |field| {
             if (field.end - field.payload > 8) return error.UnsupportedAudioFormat;
             var lease = try input.readSparse(field.payload, @intCast(field.end - field.payload));
@@ -763,7 +763,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
                 defer lease.deinit();
                 ticks = try readUint(lease.bytes);
             },
-            simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets, packet_limit, &.{}),
+            simple_block_id => try indexBlock(a, scan, child, track, ticks, scale, packets, packet_limit, &.{}, error.ResourceLimitExceeded),
             block_group_id => {
                 var discard: ?Webm.Element = null;
                 var nested = child.payload;
@@ -771,7 +771,7 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
                     const field = try scan.rawHeader(nested, child.end);
                     if (field.unknown) return error.UnsupportedAudioFormat;
                     switch (field.id) {
-                        block_id => try indexBlock(a, scan, field, track, ticks, scale, packets, packet_limit, &.{}),
+                        block_id => try indexBlock(a, scan, field, track, ticks, scale, packets, packet_limit, &.{}, error.ResourceLimitExceeded),
                         discard_padding_id => discard = field,
                         else => {},
                     }
@@ -792,18 +792,18 @@ fn scanCluster(a: std.mem.Allocator, scan: *Webm.Scan, cluster: Webm.Element, tr
     return pos;
 }
 
-fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track: TrackInfo, ticks: u64, scale: u64, packets: *std.ArrayList(Packet), packet_limit: usize, prefix: []const u8) !void {
-    const length = std.math.cast(usize, elem.end - elem.payload) orelse return error.ResourceLimitExceeded;
+fn indexBlock(a: std.mem.Allocator, scan: *Webm.Scan, elem: Webm.Element, track: TrackInfo, ticks: u64, scale: u64, packets: *std.ArrayList(Packet), packet_limit: usize, prefix: []const u8, comptime limit_error: anyerror) !void {
+    const length = std.math.cast(usize, elem.end - elem.payload) orelse return limit_error;
     var reader = RangeBlock{ .source = scan.input, .start = elem.payload, .length = length, .initial = prefix };
     defer reader.close();
     const block = try describeBlock(&reader, length, track.number, ticks, scale) orelse return;
     const limit = @min(scan.limits.max_packets, scan.limits.max_index_bytes / @sizeOf(Packet));
     const count = packets.items.len + block.count;
-    if (count > limit) return error.ResourceLimitExceeded;
+    if (count > limit) return limit_error;
     if (count > packets.capacity) try packets.ensureTotalCapacityPrecise(a, @min(limit, @max(count, packets.capacity *| 2)));
     var offset = reader.position;
     for (block.sizes[0..block.count]) |size| {
-        if (size > packet_limit) return error.ResourceLimitExceeded;
+        if (size > packet_limit) return limit_error;
         var packet = Packet{ .offset = elem.payload + offset, .time_ns = block.time_ns, .size = size };
         reader.position = offset;
         for (packet.prefix[0..@min(size, if (track.codec == .flac) packet.prefix.len else 2)]) |*value| value.* = try reader.byte();
@@ -886,7 +886,7 @@ test "WebM joint video and audio index reuses the block prefix" {
     var video_only = try Webm.Reader.initObserved(a, &standalone, .{}, denied.observer());
     defer video_only.deinit();
     try std.testing.expectEqualSlices(Webm.Packet, video.packets, video_only.packets);
-    try std.testing.expectError(error.ResourceLimitExceeded, denied.borrowDirectory());
+    try std.testing.expectError(error.AudioTooLarge, denied.borrowDirectory());
 
     var pool = @import("admission.zig").Pool{ .limits = .{} };
     var constrained = Source{ .allocator = a, .identity = "audio-padding", .storage = .{ .borrowed = &.{0xff} }, .admission_pool = &pool };

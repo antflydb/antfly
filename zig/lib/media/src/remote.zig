@@ -279,6 +279,7 @@ pub const ReadAhead = struct {
     }
 
     fn fillWindow(self: *ReadAhead, offset: u64, out: []u8, minimum: usize, fill_bytes: usize, control: source.Control) !usize {
+        if (self.reads >= self.max_reads) return error.RemoteRequestBudgetExceeded;
         if (self.buffer == null) {
             var reservation = if (self.admission_pool) |pool| try pool.acquire(.{ .host_bytes = self.window_bytes }) else @import("admission.zig").Token{};
             errdefer reservation.deinit();
@@ -895,4 +896,29 @@ test "small cache fill rejects an insufficient wire allowance before fetching" {
     try std.testing.expectError(error.RemoteReadBudgetExceeded, input.readSparse(0, 4));
     try std.testing.expectEqual(@as(usize, 0), cache.reads);
     try std.testing.expect(cache.buffer == null);
+}
+
+test "a miss after request exhaustion preserves the forward window" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            @memcpy(out, "abcdefgh"[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    var marker: u8 = 0;
+    var cache = ReadAhead{
+        .allocator = std.testing.allocator,
+        .upstream = .{ .context = &marker, .read_at = Provider.read, .length = 8 },
+        .window_bytes = 4,
+        .max_reads = 1,
+    };
+    defer cache.deinit();
+    var input = source.Source{ .allocator = std.testing.allocator, .identity = "last-window", .storage = .{ .range = cache.range() } };
+    var initial = try input.read(0, 4);
+    initial.deinit();
+    try std.testing.expectError(error.RemoteRequestBudgetExceeded, input.read(4, 1));
+    var cached = try input.read(1, 3);
+    defer cached.deinit();
+    try std.testing.expectEqualSlices(u8, "bcd", cached.bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.reads);
 }

@@ -1209,7 +1209,7 @@ pub const PinnedRange = struct {
         return self.readAtWithProgress(offset, out, null);
     }
 
-    /// Report a validated local prefix when cancellation interrupts a read.
+    /// Report a validated local prefix when a read fails.
     pub fn readAtWithProgress(self: *PinnedRange, offset: u64, out: []u8, failed_prefix: ?*usize) !usize {
         return self.readAtInternal(offset, out, failed_prefix) catch |err| transportError(&self.transport, err);
     }
@@ -1239,7 +1239,7 @@ pub const PinnedRange = struct {
                 var done: usize = 0;
                 self.readLocalRange(local, offset, out, &done) catch |err| {
                     if (failed_prefix) |prefix| {
-                        if (done != 0 and (err == error.Canceled or err == error.Cancelled or err == error.Timeout or err == error.DeadlineExceeded)) {
+                        if (done != 0 and err != error.SourceVersionChanged) {
                             if (local.check(self.context.io)) |_| {
                                 prefix.* = done;
                             } else |_| {}
@@ -3389,7 +3389,7 @@ test "local source cancellation during hashing releases verification and publish
     defer range.destroy();
 }
 
-test "pinned local range reports a validated prefix when cancelled after a positional read" {
+test "pinned local range reports a validated prefix after cancellation or a later I/O failure" {
     const a = std.testing.allocator;
     const base = std.testing.io;
     var fixture = try LocalSourceFixture.init(a, "0123456789");
@@ -3400,13 +3400,16 @@ test "pinned local range reports a validated prefix when cancelled after a posit
     const cold = try PinnedRange.createWithLocalCache(a, .{ .io = base }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
     cold.destroy();
     const Cancel = struct {
+        var fail_next_read = false;
         var cancelled: std.atomic.Value(bool) = .init(false);
         fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            if (fail_next_read and offset != 0) return error.InputOutput;
             const n = try std.testing.io.vtable.fileReadPositional(raw, file, &.{data[0][0..2]}, offset);
-            cancelled.store(true, .release);
+            if (!fail_next_read) cancelled.store(true, .release);
             return n;
         }
     };
+    Cancel.fail_next_read = false;
     Cancel.cancelled.store(false, .release);
     var table = base.vtable.*;
     table.fileReadPositional = Cancel.read;
@@ -3416,6 +3419,12 @@ test "pinned local range reports a validated prefix when cancelled after a posit
     var bytes: [4]u8 = undefined;
     var prefix: usize = 0;
     try std.testing.expectError(error.Canceled, range.readAtWithProgress(0, &bytes, &prefix));
+    try std.testing.expectEqual(@as(usize, 2), prefix);
+    try std.testing.expectEqualStrings("01", bytes[0..prefix]);
+    Cancel.cancelled.store(false, .release);
+    Cancel.fail_next_read = true;
+    prefix = 0;
+    try std.testing.expectError(error.InputOutput, range.readAtWithProgress(0, &bytes, &prefix));
     try std.testing.expectEqual(@as(usize, 2), prefix);
     try std.testing.expectEqualStrings("01", bytes[0..prefix]);
 }
