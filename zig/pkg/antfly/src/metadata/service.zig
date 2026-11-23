@@ -11499,7 +11499,8 @@ pub const MetadataHttpService = struct {
         if (state.value.artifact_control.?.current) |record| {
             try ensureCdcWorkPermit(self);
             @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), context) catch |err| {
-                try self.recordScopedStreamError(a, table, state.value, err, context);
+                self.recordScopedStreamError(a, table, state.value, err, context) catch |report_err|
+                    std.log.debug("scoped CDC health update deferred table={s} err={s}", .{ table.name, @errorName(report_err) });
                 return err;
             };
             if (record.phase != .reserved or state.value.closing) return;
@@ -11548,7 +11549,8 @@ pub const MetadataHttpService = struct {
         defer if (snapshot) |*captured| captured.deinit(a);
         if (state.value.stream_failure) |failure| if (failure.terminal) return;
         runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, context) catch |err| {
-            try self.recordScopedStreamError(a, table, state.value, err, context);
+            self.recordScopedStreamError(a, table, state.value, err, context) catch |report_err|
+                std.log.debug("scoped CDC health update deferred table={s} err={s}", .{ table.name, @errorName(report_err) });
             return err;
         };
         if (state.value.stream_failure != null) {
@@ -11562,15 +11564,30 @@ pub const MetadataHttpService = struct {
 
     fn recordScopedStreamError(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, err: anyerror, context: api_operation.RequestContext) !void {
         if (state.closing or state.retired or metadata_replication_backfill.replicationErrorEndsRound(err)) return;
+        const control = @import("source_control.zig");
+        const scope = state.scope orelse return;
+        var reporting = context;
+        // Reporting has its own bounded budget, while retaining cancellation.
+        reporting.deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s;
+        reporting.deadline_io = null;
+        try ensureCdcWorkPermit(self);
+        const raw = try control.readOnService(self, a, scope.table_id, scope.source_id, reporting);
+        defer a.free(raw);
+        var parsed = try control.parse(a, raw);
+        defer parsed.deinit();
+        const current = parsed.value;
+        // A revision change can represent successful or superseding work.
+        // Only attribute this failure to the exact observed attempt.
+        if (current.revision != state.revision or !std.meta.eql(current.scope, state.scope) or current.closing or current.retired) return;
         const terminal = std.mem.eql(u8, metadata_replication_backfill.classifyReplicationError(err), "terminal");
-        if (state.stream_failure) |previous| {
+        if (current.stream_failure) |previous| {
             if (previous.terminal or std.mem.eql(u8, previous.code, @errorName(err))) return;
         }
-        try self.observeScopedStreamFailure(a, table, state, .{
+        try self.observeScopedStreamFailure(a, table, current, .{
             .code = @errorName(err),
             .terminal = terminal,
             .observed_at_ms = @max(1, platform_time.realtimeNs() / std.time.ns_per_ms),
-        }, context);
+        }, reporting);
     }
 
     fn observeScopedStreamFailure(self: *MetadataHttpService, a: std.mem.Allocator, table: metadata_table_manager.TableRecord, state: @import("source_control.zig").State, failure: ?@import("source_control.zig").StreamFailure, context: api_operation.RequestContext) !void {

@@ -1063,6 +1063,8 @@ pub const Session = struct {
         var feedback_ceiling = stream.resume_lsn;
         var last_keepalive = self.replicationNow();
         var idle_poll_ms = limits.replication_poll_ms;
+        var deferred_poll_ms = limits.replication_poll_ms;
+        const max_idle_poll_ms = @max(limits.replication_poll_ms, 1000);
         const Outcome = union(enum) { input: anyerror!replication_input.Input, tick: std.Io.Cancelable!void };
         var outcomes: [2]Outcome = undefined;
         var select = std.Io.Select(Outcome).init(self.io, &outcomes);
@@ -1139,13 +1141,15 @@ pub const Session = struct {
                             // no cursor. Require a fresh authorized read before
                             // emitting data or a keepalive for this position.
                             self.replicationDeadline(deadline);
-                            try select.concurrent(.tick, replicationTick, .{ self.io, limits.replication_poll_ms });
+                            try select.concurrent(.tick, replicationTick, .{ self.io, deferred_poll_ms });
+                            deferred_poll_ms = @min(deferred_poll_ms *| 2, max_idle_poll_ms);
                             continue;
                         }
                         std.log.debug("PostgreSQL replication poll failed err={s}", .{@errorName(err)});
                         return err;
                     };
                     defer poll.deinit();
+                    deferred_poll_ms = limits.replication_poll_ms;
                     if (@backingInt(poll.end_lsn) < @backingInt(observed_end)) return error.InvalidResult;
                     observed_end = poll.end_lsn;
                     try owner.authorizeRequest(scratch.allocator(), self.replicationRequest(statement, deadline), command_value);
@@ -1173,7 +1177,7 @@ pub const Session = struct {
                     }
                     const elapsed_ms: u32 = @intCast(@min(@as(i64, limits.replication_keepalive_ms), @divTrunc(@max(0, self.replicationNow() - last_keepalive), std.time.ns_per_ms)));
                     const delay: u32 = if (chunks.len != 0) 0 else @min(idle_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
-                    idle_poll_ms = if (chunks.len != 0) limits.replication_poll_ms else @min(idle_poll_ms *| 2, @max(limits.replication_poll_ms, 1000));
+                    idle_poll_ms = if (chunks.len != 0) limits.replication_poll_ms else @min(idle_poll_ms *| 2, max_idle_poll_ms);
                     try select.concurrent(.tick, replicationTick, .{ self.io, delay });
                 },
             }
