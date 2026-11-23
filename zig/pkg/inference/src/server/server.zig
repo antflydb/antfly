@@ -52426,6 +52426,7 @@ const MediaOutputExecution = struct {
         through: [16]?i64,
         window: chunks.VideoSpeakerWindow,
         provider: ?audio_providers.Provider,
+        optional: bool = false,
         result: *chunks.VideoSpeakerResult,
     };
 
@@ -52452,12 +52453,35 @@ const MediaOutputExecution = struct {
             }
         }
         try self.ensureSpeakerWork(window.start, window.end, false, .{ .through = required, .window = window, .provider = null, .result = result });
-        self.ensureSpeakerWork(window.start, window.end, false, .{ .through = optional, .window = window, .provider = optional_provider, .result = result }) catch |err| {
-            if (!chunks.Runner.optionalAudioPressure(err)) return err;
+        self.ensureSpeakerWork(window.start, window.end, false, .{ .through = optional, .window = window, .provider = optional_provider, .optional = true, .result = result }) catch |err| {
+            if (!speakerExtensionPressure(err)) return err;
             for (wanted, 0..) |goal, index| if (goal) |through| {
-                if (!self.enough(self.speaker_states[index].?, window.start, through, false)) result.failures[index] = err;
+                const state = self.speaker_states[index].?;
+                if (!self.enough(state, window.start, through, false) and result.failures[index] == null)
+                    result.failures[index] = .{ .cause = err, .covered_through_ns = speakerCoverage(state) };
             };
         };
+    }
+
+    fn speakerCoverage(state: *const SpeakerState) i64 {
+        return if (state.timeline.len() == 0) 0 else state.timeline.at(state.timeline.len() - 1).end_ns;
+    }
+
+    fn speakerExtensionPressure(err: anyerror) bool {
+        return chunks.Runner.optionalAudioPressure(err) or err == error.ChunkWorkingBudgetExceeded or
+            err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable or
+            err == error.ConcurrencyUnavailable or err == error.InferenceAdmissionQueueFull or err == error.QueueFull;
+    }
+
+    fn failSpeakerExtension(self: *MediaOutputExecution, work: ?VideoSpeakerWork, index: usize, err: anyerror) !void {
+        if (work) |video_work| if (video_work.optional and (!chunks.abort(err) or speakerExtensionPressure(err))) {
+            const state = self.speaker_states[index].?;
+            for (self.speaker_states, 0..) |candidate, target_index| {
+                if (candidate == state) video_work.result.failures[target_index] = .{ .cause = err, .covered_through_ns = speakerCoverage(state) };
+            }
+            return;
+        };
+        try self.speakerFailure(index, err);
     }
 
     fn ensureSpeakers(raw: *anyopaque, _: std.mem.Allocator, start: i64, end: i64, stop_at_turn: bool) !void {
@@ -52534,34 +52558,52 @@ const MediaOutputExecution = struct {
             const provider = scoped_provider orelse self.speaker_provider.?;
             const first = std.math.cast(usize, @as(u128, next_window) * provider.sample_rate * 3 / 2) orelse return error.TimestampOverflow;
             const requested = @min(provider.samples, try std.math.add(usize, first, try std.math.mul(usize, provider.sample_rate, 3)));
-            var prior: ?audio_providers.Lease = null;
-            if (work) |video_work| {
-                prior = video_work.result.pcm;
-                video_work.result.pcm = null;
-                if (prior) |*held_pcm| {
-                    if (first != video_work.window.first or held_pcm.pcm.samples.len != requested -| first) {
-                        held_pcm.deinit(scratch);
-                        prior = null;
-                    }
+            if (requested <= first) return error.InvalidSpeakerCheckpoint;
+            var prefix: []const f32 = &.{};
+            if (work) |video_work| if (video_work.result.pcm) |*held_pcm| {
+                const held_start = video_work.window.first;
+                const held_end = held_start + held_pcm.pcm.samples.len;
+                if (first >= held_start and first < held_end) {
+                    prefix = held_pcm.pcm.samples[first - held_start .. @min(requested, held_end) - held_start];
                 }
-            }
-            var lease = prior orelse try provider.read(provider.context, scratch, first, requested);
+                // A streaming provider can lend a buffer that its next read mutates.
+                if (held_pcm.owned == null and prefix.len != requested - first) {
+                    held_pcm.deinit(scratch);
+                    video_work.result.pcm = null;
+                    prefix = &.{};
+                }
+            };
+            var lease = if (prefix.len == requested - first)
+                audio_providers.Lease{ .pcm = .{ .samples = &.{}, .sample_rate = provider.sample_rate } }
+            else
+                provider.read(provider.context, scratch, first + prefix.len, requested) catch |err| retry: {
+                    if (err != error.SharedAdmissionExceeded and err != error.AudioTooLarge) return err;
+                    const video_work = work orelse return err;
+                    if (video_work.result.pcm) |*held_pcm| held_pcm.deinit(scratch) else return err;
+                    video_work.result.pcm = null;
+                    prefix = &.{};
+                    break :retry try provider.read(provider.context, scratch, first, requested);
+                };
             var transferred = false;
             defer if (!transferred) lease.deinit(scratch);
+            const sample_count = prefix.len + lease.pcm.samples.len;
             const next = std.math.cast(usize, @as(u128, next_window + 1) * provider.sample_rate * 3 / 2) orelse return error.TimestampOverflow;
-            const step = @min(lease.pcm.samples.len, next - first);
+            const step = @min(sample_count, next - first);
             if (step == 0) return error.InvalidSpeakerCheckpoint;
             const known_total = if (provider.final_samples) |length| length(provider.context) else provider.samples;
-            const total: ?u64 = if (known_total) |samples| samples else if (lease.pcm.samples.len < requested - first) first + lease.pcm.samples.len else null;
-            const final = if (total) |samples| first + step >= samples else step == lease.pcm.samples.len;
+            const total: ?u64 = if (known_total) |samples| samples else if (sample_count < requested - first) first + sample_count else null;
+            const final = if (total) |samples| first + step >= samples else step == sample_count;
             const start_ns = std.math.cast(i64, @as(u128, first) * std.time.ns_per_s / provider.sample_rate) orelse return error.TimestampOverflow;
             const end_ns = std.math.cast(i64, (@as(u128, first + step) * std.time.ns_per_s + (if (final) @as(u128, provider.sample_rate - 1) else 0)) / provider.sample_rate) orelse return error.TimestampOverflow;
             var window: ?[]f32 = null;
             defer if (window) |owned| scratch.free(owned);
             var energy: f64 = 0;
-            for (lease.pcm.samples[0..step]) |sample| {
-                if (!std.math.isFinite(sample)) return error.InvalidAudio;
-                energy += @as(f64, sample) * sample;
+            const prefix_step = @min(step, prefix.len);
+            for ([_][]const f32{ prefix[0..prefix_step], lease.pcm.samples[0 .. step - prefix_step] }) |part| {
+                for (part) |sample| {
+                    if (!std.math.isFinite(sample)) return error.InvalidAudio;
+                    energy += @as(f64, sample) * sample;
+                }
             }
             const rms = @sqrt(energy / @as(f64, @floatFromInt(step)));
             var vectors: [16]?[]f32 = @splat(null);
@@ -52573,9 +52615,9 @@ const MediaOutputExecution = struct {
                 if (!eligible[i] or state.next_window != next_window) continue;
                 const through = if (work) |video_work| video_work.through[i].? else end;
                 if (self.enough(state, start, through, stop_at_turn)) continue;
-                state.valid = false; // Publication excludes a partially applied model result.
                 const config = target.speakerConfig();
-                var label: ?u32 = null;
+                var assignment: speakers.Registry.Assignment = .none;
+                var assigned_embedding: []const f32 = &.{};
                 if (rms >= config.min_rms) {
                     var embedding: ?[]f32 = null;
                     for (vectors[0..vector_count], vector_revisions[0..vector_count]) |vector, revision| if (std.mem.eql(u8, &revision, &self.resolved[i].speaker_revision)) {
@@ -52585,7 +52627,7 @@ const MediaOutputExecution = struct {
                     if (embedding == null) {
                         if (window == null) {
                             _ = self.node.speaker_analysis_preprocess_runs.fetchAdd(1, .monotonic);
-                            const pcm = try audio_mod.copyOrResample(scratch, lease.pcm.samples, provider.sample_rate, speaker_embedding_mod.sample_rate);
+                            const pcm = try audio_mod.copyOrResampleParts(scratch, prefix, lease.pcm.samples, provider.sample_rate, speaker_embedding_mod.sample_rate);
                             defer scratch.free(pcm);
                             if (pcm.len == 0) return error.InvalidSpeakerEmbedding;
                             const owned = try scratch.alloc(f32, speaker_embedding_mod.window_samples);
@@ -52593,27 +52635,33 @@ const MediaOutputExecution = struct {
                             window = owned;
                         }
                         if (state.embedder == null) state.embedder = self.node.pinnedSpeakerEmbedder(scratch, self.resolved[i].speaker_path.?, self.resolved[i].speaker_revision, self.io, self.control) catch |err| {
-                            try self.speakerFailure(i, err);
+                            try self.failSpeakerExtension(work, i, err);
+                            eligible[i] = false;
                             continue;
                         };
                         _ = self.node.speaker_analysis_model_runs.fetchAdd(1, .monotonic);
                         embedding = state.embedder.?.model().embedAlloc(scratch, window.?, self.control) catch |err| {
-                            try self.speakerFailure(i, err);
+                            try self.failSpeakerExtension(work, i, err);
+                            eligible[i] = false;
                             continue;
                         };
                         vectors[vector_count] = embedding;
                         vector_revisions[vector_count] = self.resolved[i].speaker_revision;
                         vector_count += 1;
                     }
-                    label = state.registry.assign(embedding.?, config) catch |err| {
-                        try self.speakerFailure(i, err);
+                    assignment = state.registry.prepareAssignment(embedding.?, config) catch |err| {
+                        try self.failSpeakerExtension(work, i, err);
+                        eligible[i] = false;
                         continue;
                     };
+                    assigned_embedding = embedding.?;
                 }
-                state.timeline.append(self.allocator, .{ .start_ns = start_ns, .end_ns = end_ns, .speaker_index = label }) catch |err| {
-                    try self.speakerFailure(i, err);
+                state.timeline.append(self.allocator, .{ .start_ns = start_ns, .end_ns = end_ns, .speaker_index = assignment.label() }) catch |err| {
+                    try self.failSpeakerExtension(work, i, err);
+                    eligible[i] = false;
                     continue;
                 };
+                state.registry.commitAssignment(assignment, assigned_embedding);
                 state.next_window += 1;
                 state.covered_samples = first + step;
                 state.total_samples = total orelse state.total_samples;
@@ -52621,7 +52669,7 @@ const MediaOutputExecution = struct {
                 state.valid = true;
             }
             if (work) |video_work| {
-                if (first == video_work.window.first and lease.pcm.samples.len == video_work.window.extent.samples) {
+                if (video_work.result.pcm == null and prefix.len == 0 and first == video_work.window.first and lease.pcm.samples.len == video_work.window.extent.samples) {
                     video_work.result.pcm = lease;
                     transferred = true;
                 }
@@ -52920,7 +52968,10 @@ const MediaOutputExecution = struct {
                         const speaker_failure: ?anyerror = if (payload.video.speaker_failure) |err|
                             err
                         else if (payload.video.speaker_failures) |failures|
-                            failures[index]
+                            if (failures[index]) |failure|
+                                (if (value.end_ns.? > failure.covered_through_ns) failure.cause else null)
+                            else
+                                null
                         else
                             null;
                         if (speaker_failure) |err| {
@@ -53216,17 +53267,20 @@ test "model aware media schedules video speaker recipes by priority and mask and
     const Provider = struct {
         reads: usize = 0,
         deny: bool = false,
+        last_first: usize = 0,
 
-        fn read(raw: *anyopaque, _: std.mem.Allocator, first: usize, last: usize) !MediaOutputExecution.audio_providers.Lease {
+        fn read(raw: *anyopaque, a_: std.mem.Allocator, first: usize, last: usize) !MediaOutputExecution.audio_providers.Lease {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.reads += 1;
+            self.last_first = first;
             if (self.deny) return error.OptionalAudioBudgetExceeded;
-            const pcm: []const f32 = &.{ 0, 0, 0 };
-            return .{ .pcm = .{ .samples = pcm[first..last], .sample_rate = 2 } };
+            const pcm = try a_.alloc(f32, last - first);
+            @memset(pcm, 0);
+            return .{ .pcm = .{ .samples = pcm, .sample_rate = 2 }, .owned = pcm };
         }
 
         fn provider(self: *@This()) MediaOutputExecution.audio_providers.Provider {
-            return .{ .context = self, .samples = 3, .sample_rate = 2, .read = read };
+            return .{ .context = self, .samples = 9, .sample_rate = 2, .read = read };
         }
     };
     var main = Provider{};
@@ -53249,8 +53303,8 @@ test "model aware media schedules video speaker recipes by priority and mask and
     const window = MediaOutputExecution.chunks.VideoSpeakerWindow{
         .ordinal = 3,
         .start = 0,
-        .end = 1500 * std.time.ns_per_ms,
-        .extent = .{ .samples = 3, .sample_rate = 2, .start_ns = 0 },
+        .end = 3 * std.time.ns_per_s,
+        .extent = .{ .samples = 6, .sample_rate = 2, .start_ns = 0 },
         .first = 0,
     };
     var result = MediaOutputExecution.chunks.VideoSpeakerResult{};
@@ -53259,16 +53313,29 @@ test "model aware media schedules video speaker recipes by priority and mask and
     try std.testing.expectEqual(@as(usize, 0), main.reads);
     try std.testing.expectEqual(@as(usize, 1), optional.reads);
     try std.testing.expect(result.failures[0] == null);
-    try std.testing.expectEqual(error.OptionalAudioBudgetExceeded, result.failures[1].?);
+    try std.testing.expectEqual(error.OptionalAudioBudgetExceeded, result.failures[1].?.cause);
 
     result = .{};
     targets[1].skip_windows = &.{.{ .ordinal = 3, .sub_index = 0 }};
     required_state.complete = false;
     try MediaOutputExecution.ensureVideoSpeakers(&execution, window, optional.provider(), &result);
-    try std.testing.expectEqual(@as(usize, 1), main.reads);
+    try std.testing.expectEqual(@as(usize, 2), main.reads);
+    try std.testing.expectEqual(@as(usize, 6), main.last_first);
     try std.testing.expectEqual(@as(usize, 1), optional.reads);
     try std.testing.expect(result.failures[1] == null);
-    try std.testing.expectEqual(@as(usize, 3), result.pcm.?.pcm.samples.len);
+    try std.testing.expectEqual(@as(usize, 6), result.pcm.?.pcm.samples.len);
+
+    execution.speaker_states[1] = &required_state;
+    try execution.failSpeakerExtension(.{
+        .through = @splat(window.end),
+        .window = window,
+        .provider = null,
+        .optional = true,
+        .result = &result,
+    }, 0, error.ChunkWorkingBudgetExceeded);
+    try std.testing.expect(required_state.valid);
+    try std.testing.expect(execution.resolved[0].failure == null);
+    try std.testing.expectEqual(window.end, result.failures[0].?.covered_through_ns);
 }
 
 test "model aware media speaker pressure applies only to speaker outputs" {
@@ -53287,6 +53354,13 @@ test "model aware media speaker pressure applies only to speaker outputs" {
     consumers.resolved[1] = resolved;
     consumers.resolved[1].uses_audio = true;
     consumers.resolved[1].speaker_path = "speaker";
+    consumers.resolved[1].max_audio_ns = std.time.ns_per_s;
+    var speaker_state = MediaOutputExecution.SpeakerState{};
+    defer speaker_state.timeline.deinit(a);
+    try speaker_state.timeline.append(a, .{ .start_ns = 0, .end_ns = std.time.ns_per_s, .speaker_index = null });
+    consumers.speaker_states[1] = &speaker_state;
+    var failures: [16]?MediaOutputExecution.chunks.SpeakerCoverageFailure = @splat(null);
+    failures[1] = .{ .cause = error.OptionalAudioBudgetExceeded, .covered_through_ns = std.time.ns_per_s };
     consumers.resolved[2] = resolved;
     consumers.resolved[2].uses_audio = true;
     const values = try MediaOutputExecution.execute(
@@ -53295,19 +53369,20 @@ test "model aware media speaker pressure applies only to speaker outputs" {
         .{ .video = .{
             .bytes = &.{},
             .policy = .{},
-            .audio = .{ .samples = &.{0.25}, .sample_rate = 1 },
+            .audio = .{ .samples = &.{ 0.25, 0.25 }, .sample_rate = 1 },
             .audio_start_ns = 0,
-            .speaker_failure = error.OptionalAudioBudgetExceeded,
+            .speaker_failures = &failures,
         } },
-        .{ .ordinal = 3, .input_tokens = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = std.time.ns_per_s } },
+        .{ .ordinal = 3, .input_tokens = 0, .coordinates = .{ .kind = .video, .start_ns = 0, .end_ns = 2 * std.time.ns_per_s } },
         null,
         null,
         null,
         true,
     );
-    try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .failed), values[1].status);
-    try std.testing.expectEqualStrings("OptionalAudioBudgetExceeded", values[1].code.?);
-    try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .skipped), values[2].status);
+    try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .complete), values[1].status);
+    try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .failed), values[2].status);
+    try std.testing.expectEqualStrings("OptionalAudioBudgetExceeded", values[2].code.?);
+    try std.testing.expectEqual(@as(@FieldType(O.Result, "status"), .skipped), values[3].status);
 }
 
 test "model aware media sparse frame repairs prepare only needed classifier tensors and share equal profiles" {

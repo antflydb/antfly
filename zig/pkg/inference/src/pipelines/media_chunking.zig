@@ -38,7 +38,7 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, masked_audio: ?AudioExtent = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, speaker_failure: ?anyerror = null, speaker_failures: ?*const [16]?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { ordinal: ?u64 = null, replay_required: bool = true, metadata_pictures: []const usize = &.{}, preparation_join: ?struct { context: *anyopaque, join: *const fn (*anyopaque) void } = null, prepared_outputs: ?PreparedVideoOutputs = null, audio: ?audio.PcmAudio = null, masked_audio: ?AudioExtent = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, speaker_failure: ?anyerror = null, speaker_failures: ?*const [16]?SpeakerCoverageFailure = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
 pub const AudioExtent = struct {
     samples: usize,
@@ -75,8 +75,13 @@ pub const VideoSpeakerWindow = struct {
     first: usize,
 };
 
+pub const SpeakerCoverageFailure = struct {
+    cause: anyerror,
+    covered_through_ns: i64,
+};
+
 pub const VideoSpeakerResult = struct {
-    failures: [16]?anyerror = @splat(null),
+    failures: [16]?SpeakerCoverageFailure = @splat(null),
     pcm: ?@import("media_chunking_audio.zig").Lease = null,
 };
 
