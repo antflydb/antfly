@@ -475,6 +475,7 @@ pub fn finishPreparation(owner: *?*Owner, prepared: *local.api_relational_integr
 /// parent-index effects. An uncaptured owner cannot carry any primary, graph,
 /// statement-trigger or maintenance work through this path.
 fn requireIntegrityOnlyParticipant(table: contract.TableCommitRequest) !void {
+    @setEvalBranchQuota(10_000);
     const defaults: contract.TableCommitRequest = .{ .table_name = table.table_name };
     inline for (@typeInfo(contract.TableCommitRequest).@"struct".field_names) |name| {
         const allowed = comptime for (.{ "table_name", "schema_version", "relational_schema_version", "relational_integrity_generation_set", "sql_persistence", "relation_owner_minter", "row_policy_principal_proof", "row_policy_database", "row_policy_admitted_at_seconds", "predicates", "range_guards", "integrity", "integrity_commands" }) |field| {
