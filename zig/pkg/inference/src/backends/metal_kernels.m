@@ -74079,13 +74079,17 @@ void *antfly_metal_standalone_device_retain(termite_metal_decode_runtime *runtim
 void antfly_metal_standalone_device_release(void *device_handle) {
     if (device_handle) { id<MTLDevice> device = (__bridge_transfer id<MTLDevice>)device_handle; (void)device; }
 }
-void *antfly_metal_standalone_buffer_alloc(void *device_handle, size_t bytes) {
+void *antfly_metal_standalone_buffer_alloc_mode(void *device_handle, size_t bytes, int storage_mode) {
     if (!device_handle || !bytes) return NULL;
     @autoreleasepool {
         id<MTLDevice> device = (__bridge id<MTLDevice>)device_handle;
-        id<MTLBuffer> buffer = antfly_observe_metal_buffer([device newBufferWithLength:bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        MTLResourceOptions options = storage_mode == 1 ? MTLResourceStorageModePrivate : MTLResourceStorageModeShared;
+        id<MTLBuffer> buffer = antfly_observe_metal_buffer([device newBufferWithLength:bytes options:options], ANTFLY_BUFFER_OWNED);
         return buffer ? (__bridge_retained void *)buffer : NULL;
     }
+}
+void *antfly_metal_standalone_buffer_alloc(void *device_handle, size_t bytes) {
+    return antfly_metal_standalone_buffer_alloc_mode(device_handle, bytes, 1);
 }
 int antfly_metal_norm_residual_weight(termite_metal_decode_runtime *r,void *input,size_t io,void *weight,size_t wo,void *residual,size_t ro,size_t rows,size_t dim,float eps,float norm_scale,float output_scale,void *out,size_t oo) {
     if(!r || !r->precise_library_safe || !rows || !dim || rows>UINT32_MAX || dim>UINT32_MAX)return -1;
