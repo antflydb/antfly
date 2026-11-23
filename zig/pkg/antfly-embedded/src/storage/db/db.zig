@@ -42982,8 +42982,6 @@ pub const DB = struct {
 
         var rebuilt: usize = 0;
         for (names.items) |name| {
-            var guard = try self.core.index_manager.lockManagedIndexApply(.{ .name = name, .kind = .dense_vector });
-            defer guard.unlock();
             rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
         }
         return rebuilt;
@@ -72026,23 +72024,19 @@ fn rebuildDenseIndexFromPrimaryVectorsContext(
     index_name: []const u8,
     rebuild_chunk_size: usize,
 ) !usize {
-    var result = try rebuildDenseIndexFromPrimaryVectorsSliceContext(ctx, index_name, rebuild_chunk_size, null);
+    var result = try rebuildDenseIndexSlice(ctx, index_name, rebuild_chunk_size, null, .primary);
     defer result.deinit(ctx.alloc);
     std.debug.assert(result.complete());
     return result.rebuilt;
 }
 
-fn rebuildDenseIndexFromPrimaryVectorsSliceContext(
+fn rebuildDenseIndexFromPrimaryVectorsSliceAssumeApplyLocked(
     ctx: *AsyncContext,
     index_name: []const u8,
+    entry: *const index_manager_mod.IndexManager.DenseIndex,
     rebuild_chunk_size: usize,
     resume_key: ?[]const u8,
 ) !DenseRebuildSliceResult {
-    var apply_guard = try ctx.index_manager.lockManagedIndexApply(.{ .name = index_name, .kind = .dense_vector });
-    defer apply_guard.unlock();
-    if (builtin.is_test) if (test_dense_artifact_rebuild_apply_admitted) |hook|
-        try hook.call(hook.ctx, ctx.index_manager, index_name);
-    const entry = ctx.index_manager.denseIndex(index_name) orelse return .{};
     const field_name = entry.field_name;
     const dims = entry.dims;
     // Primary rows and fallback vector payloads must come from one cut, even
@@ -72247,26 +72241,19 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
     index_name: []const u8,
     rebuild_chunk_size: usize,
 ) !usize {
-    var result = try rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(ctx, index_name, rebuild_chunk_size, null);
+    var result = try rebuildDenseIndexSlice(ctx, index_name, rebuild_chunk_size, null, .artifacts);
     defer result.deinit(ctx.alloc);
     std.debug.assert(result.complete());
     return result.rebuilt;
 }
 
-fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
+fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceAssumeApplyLocked(
     ctx: *AsyncContext,
     index_name: []const u8,
+    entry: *const index_manager_mod.IndexManager.DenseIndex,
     rebuild_chunk_size: usize,
     resume_key: ?[]const u8,
 ) !DenseRebuildSliceResult {
-    // A repair slice owns one capture through session retirement, WAL commit
-    // and optional vector publication. Snapshot admission alone does not
-    // exclude maintenance/status writers, even in an unpublished restore DB.
-    var apply_guard = try ctx.index_manager.lockManagedIndexApply(.{ .name = index_name, .kind = .dense_vector });
-    defer apply_guard.unlock();
-    if (builtin.is_test) if (test_dense_artifact_rebuild_apply_admitted) |hook|
-        try hook.call(hook.ctx, ctx.index_manager, index_name);
-    const entry = ctx.index_manager.denseIndex(index_name) orelse return .{};
     const expected_dims = entry.dims;
     var owned_snapshot: ?docstore_mod.DocStore.Txn = if (ctx.snapshot_read_txn == null)
         try ctx.store.beginReadTxnWithBlockCacheAdmission(.transient)
@@ -72441,11 +72428,32 @@ fn rebuildDenseIndexForTargetCoverageSliceContext(
     rebuild_chunk_size: usize,
     resume_key: ?[]const u8,
 ) !DenseRebuildSliceResult {
-    const entry = ctx.index_manager.denseIndex(index_name) orelse return .{};
-    if (!denseIndexIsArtifactBacked(entry)) {
-        return try rebuildDenseIndexFromPrimaryVectorsSliceContext(ctx, index_name, rebuild_chunk_size, resume_key);
-    }
-    return try rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(ctx, index_name, rebuild_chunk_size, resume_key);
+    return rebuildDenseIndexSlice(ctx, index_name, rebuild_chunk_size, resume_key, .automatic);
+}
+
+fn rebuildDenseIndexSlice(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    rebuild_chunk_size: usize,
+    resume_key: ?[]const u8,
+    source: enum { automatic, primary, artifacts },
+) !DenseRebuildSliceResult {
+    // Pin the index before choosing its source, and hold the same admission
+    // through capture, WAL commit, and publication for either rebuild path.
+    var apply_guard = try ctx.index_manager.lockManagedIndexApply(.{ .name = index_name, .kind = .dense_vector });
+    defer apply_guard.unlock();
+    const entry = ctx.index_manager.denseIndex(index_name) orelse return error.IndexNotFound;
+    if (builtin.is_test) if (test_dense_artifact_rebuild_apply_admitted) |hook|
+        try hook.call(hook.ctx, ctx.index_manager, index_name);
+    const artifacts = switch (source) {
+        .automatic => denseIndexIsArtifactBacked(entry),
+        .primary => false,
+        .artifacts => true,
+    };
+    return if (artifacts)
+        rebuildDenseIndexFromStoredEmbeddingArtifactsSliceAssumeApplyLocked(ctx, index_name, entry, rebuild_chunk_size, resume_key)
+    else
+        rebuildDenseIndexFromPrimaryVectorsSliceAssumeApplyLocked(ctx, index_name, entry, rebuild_chunk_size, resume_key);
 }
 
 fn flushSparseArtifactRebuildChunkContext(
