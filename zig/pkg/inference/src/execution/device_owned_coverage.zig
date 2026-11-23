@@ -319,25 +319,15 @@ pub fn assess(pool: *const physical.Pool, target: ops.ComputeBackend, metadata: 
                 const kernel = pool.kernels[id] orelse return operationDeclined(graph, id, "missing descriptor");
                 if (kernel.backend_index >= pool.backends.len) return .{ .compatibility = .backend_region };
                 const backend = pool.backends[kernel.backend_index];
-                if (backend.ptr != target.ptr or backend.vtable != target.vtable or !service.route(target.ptr, &owned) or owned.implementation.context != target.ptr or owned.implementation.table != @as(*const anyopaque, @ptrCast(target.vtable)) or kernel.output_allocation != slot.allocation or !kernel.descriptor.output_shape.eq(slot.desc.shape) or owned.requirements.primary_bytes < size or kernel.descriptor.input_count != node.num_inputs) return operationDeclined(graph, id, "route attestation or output geometry");
-                for (kernel.inputs[0..kernel.descriptor.input_count], node.getInputs(), 0..) |actual, expected, index| {
-                    if (actual != expected or expected >= reachable.len or !reachable[expected] or !kernel.descriptor.input_shapes[index].eq(graph.node(expected).output_shape)) return operationDeclined(graph, id, "input binding or shape");
-                }
+                if (backend.ptr != target.ptr or backend.vtable != target.vtable or !service.route(target.ptr, &owned) or
+                    !coverage.kernelOutputMatches(kernel, owned, backend, slot, size)) return operationDeclined(graph, id, "route attestation or output geometry");
+                if (!coverage.kernelInputsMatch(graph, reachable, @intCast(id), kernel)) return operationDeclined(graph, id, "input binding or shape");
                 if (!resources(pool, kernel, owned)) return .{ .compatibility = .workspace };
                 result.operations += 1;
             },
         }
     }
-    for (graph.outputs.items) |id| {
-        if (id >= reachable.len or !reachable[id]) return .{ .compatibility = .output_publication };
-        if (pool.regionForNode(id)) |installed| {
-            var published = false;
-            for (installed.outputs) |output| published = published or output.slot.node == id;
-            if (!published) return .{ .compatibility = .output_publication };
-        }
-        const slot = pool.plan.slotForNode(id) orelse return .{ .compatibility = .output_publication };
-        if (!slot.roles.graph_output) return .{ .compatibility = .output_publication };
-    }
+    if (!coverage.outputsArePublished(pool, graph, reachable)) return .{ .compatibility = .output_publication };
     if (pinned_inputs) |*pending| {
         if (pinnedInputsCovered(pool, graph, reachable, pending)) |node| return inputDeclined(graph, node, pool.immutable_bindings.?.find(node));
     }

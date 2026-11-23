@@ -3018,6 +3018,32 @@ test "owned payload coverage follows exact Native routes publication aliases and
     const unknown = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .unknown }})) orelse return error.MissingPreparedKernelRoute;
     defer unknown.release();
     try std.testing.expect(unknown.pool.completeOwnedPayload() == null);
+    const ownership = @import("storage_ownership.zig");
+    const PlaneProbe = struct {
+        plane: ?ownership.Plane = null,
+        fn visit(raw: *anyopaque, report: ownership.Report) !void {
+            const probe: *@This() = @ptrCast(@alignCast(raw));
+            if (report == .plane and report.plane.role == .primary) probe.plane = report.plane;
+        }
+    };
+    const resident = try cb.fromFloat32Shape(&.{ 5, 6, 7, 8 }, &.{4});
+    defer cb.free(resident);
+    var probe = PlaneProbe{};
+    const query = cb.vtable.kernels.?.storageOwnership.?;
+    try std.testing.expectEqual(.complete, try query(cb.ptr, resident, .{ .context = &probe, .visit = PlaneProbe.visit }));
+    const planes = [_]ownership.Plane{probe.plane orelse return error.MissingResidentInputPlane};
+    const resident_routes = (try pool.prepareRoutes(&.{.{ .node_id = x, .value = .{ .resident = .{
+        .logical = program.graph.node(x).output_shape,
+        .planes = &planes,
+        .implementation = .{ .context = cb.ptr, .table = cb.vtable },
+    } } }})) orelse return error.MissingPreparedKernelRoute;
+    defer resident_routes.release();
+    try std.testing.expect(resident_routes.pool.completeOwnedPayload() != null);
+    try resident_routes.validateRuntimeInputs(&.{.{ .node_id = x, .value = resident }}, &cb);
+    const replacement = try cb.fromFloat32Shape(&.{ 5, 6, 7, 8 }, &.{4});
+    defer cb.free(replacement);
+    try std.testing.expectError(error.PreparedRegionBindingChanged, resident_routes.validateRuntimeInputs(&.{.{ .node_id = x, .value = replacement }}, &cb));
+
     const Policy = struct {
         fn deny(_: *anyopaque, _: ops.CT) !ops.CT {
             return error.CustomNumericsMustNotBeBypassed;

@@ -182,6 +182,37 @@ fn nativeInputPlan(pool: *const physical.Pool, plan: anytype, target: ops.Comput
     return current.eql(plan.requirements) and backend.vtable.kernels.?.createHostInput != null;
 }
 
+pub fn kernelOutputMatches(kernel: physical.KernelPlan, owned: route.Owned, backend: ops.ComputeBackend, slot: buffers.LogicalSlot, bytes: usize) bool {
+    return owned.implementation.context == backend.ptr and owned.implementation.table == @as(*const anyopaque, @ptrCast(backend.vtable)) and
+        kernel.output_allocation == slot.allocation and kernel.descriptor.output_shape.eq(slot.desc.shape) and owned.requirements.primary_bytes >= bytes;
+}
+
+pub fn kernelInputsMatch(graph: *const ml.graph.Graph, reachable: []const bool, node: ml.graph.NodeId, kernel: physical.KernelPlan) bool {
+    const expected_inputs = graph.node(node).getInputs();
+    if (kernel.descriptor.input_count != expected_inputs.len or expected_inputs.len > kernel.inputs.len) return false;
+    for (kernel.inputs[0..expected_inputs.len], expected_inputs, 0..) |actual, expected, index| {
+        if (actual != expected or expected >= reachable.len or !reachable[expected] or !kernel.descriptor.input_shapes[index].eq(graph.node(expected).output_shape)) return false;
+    }
+    return true;
+}
+
+/// Every requested output must survive the selected schedule. Region
+/// intermediates have logical graph slots but only declared publications
+/// escape the region's storage.
+pub fn outputsArePublished(pool: *const physical.Pool, graph: *const ml.graph.Graph, reachable: []const bool) bool {
+    for (graph.outputs.items) |id| {
+        if (id >= reachable.len or !reachable[id]) return false;
+        if (pool.regionForNode(id)) |region| {
+            for (region.outputs) |output| {
+                if (output.slot.node == id) break;
+            } else return false;
+        }
+        const slot = pool.plan.slotForNode(id) orelse return false;
+        if (!slot.roles.graph_output) return false;
+    }
+    return graph.outputs.items.len != 0;
+}
+
 pub fn assess(pool: *const physical.Pool) Coverage {
     const selected = if (pool.selection) |*value| value else return .{ .compatibility = .no_selected_routes };
     const target_backend = pool.coverage_backend orelse return .{ .compatibility = .execution_path };
@@ -255,20 +286,15 @@ pub fn assess(pool: *const physical.Pool) Coverage {
                 if (borrowed and owned.validation_scope != .prepared_program) return .{ .compatibility = .operation };
                 if (kernel.backend_index >= pool.backends.len) return .{ .compatibility = .backend_region };
                 const backend = pool.backends[kernel.backend_index];
-                if (!canonical(backend) or owned.implementation.context != backend.ptr or owned.implementation.table != @as(*const anyopaque, @ptrCast(backend.vtable)) or kernel.output_allocation != slot.allocation or !kernel.descriptor.output_shape.eq(slot.desc.shape) or owned.requirements.primary_bytes < bytes or kernel.descriptor.input_count != node.num_inputs) return .{ .compatibility = .operation };
-                for (kernel.inputs[0..kernel.descriptor.input_count], node.getInputs(), 0..) |actual, expected, index| {
-                    if (actual != expected or expected >= reachable.len or !reachable[expected] or !kernel.descriptor.input_shapes[index].eq(graph.node(expected).output_shape)) return .{ .compatibility = .operation };
-                }
+                if (backend.ptr != target_backend.ptr or backend.vtable != target_backend.vtable or
+                    !kernelOutputMatches(kernel, owned, backend, slot, bytes) or
+                    !kernelInputsMatch(graph, reachable, @intCast(id), kernel)) return .{ .compatibility = .operation };
                 if (!resources(pool, kernel, owned)) return .{ .compatibility = .workspace };
                 result.operations += 1;
             },
         }
     }
-    for (graph.outputs.items) |id| {
-        if (id >= reachable.len or !reachable[id]) return .{ .compatibility = .output_publication };
-        const slot = pool.plan.slotForNode(id) orelse return .{ .compatibility = .output_publication };
-        if (!slot.roles.graph_output) return .{ .compatibility = .output_publication };
-    }
+    if (!outputsArePublished(pool, graph, reachable)) return .{ .compatibility = .output_publication };
     return .{ .complete = result };
 }
 
