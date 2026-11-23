@@ -108,6 +108,12 @@ test "source plan entry requires activation and binds complete original owner" {
     var applying = try @import("raft_batch.zig").decodeForApply(a, bytes);
     defer applying.deinit(a);
     try std.testing.expect(applying == .source_plan);
+    var with_escape = entry;
+    with_escape.storage_owner.schema_json = "{\"description\":\"\\u0001\"}";
+    const escaped = try encode(a, with_escape, required_protocol_version);
+    defer a.free(escaped);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\u") != null);
+    try std.testing.expect(!try @import("merge_membership_admission.zig").needsObservation(a, &.{.{ .index = 1, .data = escaped }}));
     var wrong = entry;
     wrong.source_owner.table_binding[0] ^= 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, encode(a, wrong, required_protocol_version));
