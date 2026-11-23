@@ -315,6 +315,12 @@ pub const Backend = struct {
             self.rc = null;
         }
 
+        /// Read results borrow the pinned state. Batches acquire no
+        /// independent payload storage or block pins.
+        pub fn releaseResults(self: *@This()) void {
+            std.debug.assert(self.read_only);
+        }
+
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             return try self.rc.?.state.get(self.namespace, key);
         }
@@ -560,7 +566,7 @@ test "memory backend read transactions are snapshot isolated" {
         try txn.commit();
     }
 
-    var read_before = try runtime.beginRead();
+    var read_before = try runtime.beginProbe();
     defer read_before.abort();
 
     {
@@ -569,6 +575,7 @@ test "memory backend read transactions are snapshot isolated" {
         try txn.commit();
     }
 
+    try std.testing.expect(try read_before.releaseResults());
     try std.testing.expectEqualStrings("before", try read_before.get("doc:a"));
 
     {
