@@ -229,9 +229,8 @@ pub const Plan = struct {
             try cb.checkExecutionControl();
             const persistent = self.outputs.len > i and self.outputs[i] != null;
             var hint: ?CT = if (persistent) self.outputs[i] else null;
-            if (!persistent) if (self.arena) |arena| if (node.arena_offset) |offset| {
-                const d = node.outputDimensions().?;
-                if (cb.vtable.audioArenaView) |view| hint = try view(cb.ptr, arena, offset, d.rows, d.out_dim);
+            if (!persistent) if (self.arena) |arena| if (try self.arena_recipe.outputView(node)) |region| {
+                if (cb.vtable.audioArenaView) |view| hint = try view(cb.ptr, arena, region.offset, region.bytes, region.shape);
             };
             const result = node.run(cb, &values, hint, if (self.workspaces.len > i) self.workspaces[i] else null) catch |err| {
                 if (!persistent) if (hint) |ct| cb.free(ct);
@@ -730,6 +729,8 @@ test "audio arena recipe funds one disjoint maximum clipped projection workspace
     try std.testing.expectEqual(combined.shape, separate.shape);
     try std.testing.expect((try recipe.workspaceView(&nodes[2], .combined)) == null);
     try std.testing.expect((try recipe.outputView(&nodes[2])) == null);
+    nodes[1].arena_offset = combined.offset;
+    try std.testing.expectError(error.AudioScheduleInvalid, recipe.outputView(&nodes[1]));
     nodes[1].prepared_slot = null;
     try std.testing.expectEqual(@as(usize, 4096), (try plan.arenaLayout()).input_workspace_bytes);
 }

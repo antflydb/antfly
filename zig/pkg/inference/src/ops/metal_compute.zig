@@ -23068,10 +23068,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         plan.prepared = true;
     }
-    fn audioArenaViewOp(ctx: *anyopaque, arena: CT, offset: usize, rows: usize, dim: usize) anyerror!CT {
+    fn audioArenaViewOp(ctx: *anyopaque, arena: CT, offset: usize, bytes: usize, shape: [2]i32) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const mt = denseDeviceF32(arena) orelse return error.InvalidTensorShape;
-        return self.ownedDeviceView(&mt, offset, rows * dim * 4, &.{ @intCast(rows), @intCast(dim) });
+        return self.ownedDeviceView(&mt, offset, bytes, &shape);
     }
     fn audioNodeIntoOp(ctx: *anyopaque, raw: *const anyopaque, values: []const ?CT, output: CT) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
@@ -53177,7 +53177,8 @@ test "embeddinggemma2 Metal audio prepared slots reuse arenas without mutating r
     try store.tier_cache.?.reserve(.host, @sizeOf(audio_tape.Plan));
     defer store.tier_cache.?.noteRelease(.host, @sizeOf(audio_tape.Plan));
     defer compute.audioUnpreparePlan(plan);
-    const bytes = try plan.layout();
+    plan.arena_recipe = try plan.arenaLayout();
+    const bytes = plan.arena_recipe.outputs_bytes;
     try std.testing.expect(plan.nodes[0].arena_offset != null);
     try std.testing.expect(plan.nodes[1].arena_offset == null);
     plan.arena = try compute.audioPersistentCt(plan, (try compute.audioPlanBuffer(plan, bytes, false)).?);
