@@ -3924,8 +3924,8 @@ pub const DurableSessionStore = struct {
         const scratch = arena.allocator();
         const budget = @min(32 << 10, self.graphRecordLimit() -| (session_bytes +| 256));
         var estimated: usize = 512;
-        var read_snapshots = session.read_snapshots.valueIterator();
-        while (read_snapshots.next()) |snapshot| {
+        const snapshots = session.read_snapshots.values();
+        for (snapshots) |snapshot| {
             const document_bytes = if (snapshot.document_json) |document| document.len else 0;
             estimated +|= 64 +| 6 *| (snapshot.table_name.len +| snapshot.key.len +| document_bytes);
             if (estimated > budget) break;
@@ -3938,9 +3938,6 @@ pub const DurableSessionStore = struct {
             return;
         }
         const tables = try sessionTableDetails(scratch, session.staged, false);
-        const snapshots = try scratch.alloc(SessionReadSnapshot, session.read_snapshots.count());
-        var it = session.read_snapshots.valueIterator();
-        for (snapshots) |*snapshot| snapshot.* = it.next().?.*;
         const value = try std.json.Stringify.valueAlloc(scratch, AuthorizationProjection{
             .principal = session.principal,
             .status = sessionStatusSnapshot(&session, true),
@@ -7414,7 +7411,8 @@ pub const SessionRegistry = struct {
         };
         var parsed = try std.json.parseFromSlice(AuthorizationProjection, alloc, bytes, .{});
         defer parsed.deinit();
-        if (!principalsEqual(parsed.value.principal, principal) or !std.mem.eql(u8, &parsed.value.status.txn_id, &id)) return error.InvalidTransactionSessionRecord;
+        if (!std.mem.eql(u8, &parsed.value.status.txn_id, &id)) return error.InvalidTransactionSessionRecord;
+        if (!principalsEqual(parsed.value.principal, principal)) return null;
         var details: SessionDetails = .{
             .status = parsed.value.status,
             .tables = &.{},

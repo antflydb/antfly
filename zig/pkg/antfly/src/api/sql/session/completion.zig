@@ -345,7 +345,11 @@ fn joinPrepared(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, com
             } else |_| {}
         }
         const joined = store.joinRegistrationControlled(reference, context) catch |err| switch (err) {
-            error.SessionWriteOutcomeUnknown, error.DeadlineExceeded, error.Canceled => false,
+            error.SessionWriteOutcomeUnknown, error.DeadlineExceeded, error.Canceled => {
+                completion.outcomes.items[index].registration_pending = true;
+                index += 1;
+                continue;
+            },
             else => return err,
         };
         if (!joined) {
