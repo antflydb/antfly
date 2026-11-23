@@ -28,6 +28,7 @@ pub const Layout = struct {
     scratch_offset: usize,
     events: usize,
     output: ?struct { offset: usize, bytes: usize },
+    external_output: bool = false,
 };
 const Allocation = struct { bytes: usize, offset: usize, pointer: DevicePointer, live: bool = true };
 const Event = struct { slot: usize, allocate: bool };
@@ -37,6 +38,7 @@ pub const Plan = struct {
     count: usize = 0,
     event_count: usize = 0,
     peak: usize = 0,
+    scratch_peak: usize = 0,
     output: ?usize = null,
     sealed: bool = false,
     valid: bool = true,
@@ -100,19 +102,34 @@ pub const Plan = struct {
             self.output = index;
         }
         self.valid = self.valid and (expected == null) == (self.output == null);
+        if (self.valid) for (self.allocations[0..self.count], 0..) |allocation, index| {
+            if (self.output == index) continue;
+            self.scratch_peak = @max(self.scratch_peak, allocation.offset + std.mem.alignForward(usize, allocation.bytes, alignment));
+        };
         self.sealed = self.valid;
         return self.valid;
     }
 
     pub fn layout(self: *const Plan, prefix_bytes: usize) !Layout {
-        if (!self.sealed or !self.valid or self.peak == 0 or prefix_bytes % alignment != 0 or
-            prefix_bytes > limit or self.peak > limit - prefix_bytes) return error.InvalidExecutionPlan;
+        return self.layoutImpl(prefix_bytes, false);
+    }
+
+    pub fn layoutWithExternalOutput(self: *const Plan, prefix_bytes: usize) !Layout {
+        return self.layoutImpl(prefix_bytes, true);
+    }
+
+    fn layoutImpl(self: *const Plan, prefix_bytes: usize, external: bool) !Layout {
+        if (!self.sealed or !self.valid or self.peak == 0 or prefix_bytes % alignment != 0 or prefix_bytes > limit) return error.InvalidExecutionPlan;
         const output = if (self.output) |index| self.allocations[index] else null;
+        const peak = if (external) self.scratch_peak else self.peak;
+        const external_bytes = if (external) std.mem.alignForward(usize, (output orelse return error.InvalidExecutionPlan).bytes, alignment) else 0;
+        if (peak > limit - prefix_bytes or external_bytes > limit - prefix_bytes - peak) return error.InvalidExecutionPlan;
         return .{
-            .bytes = prefix_bytes + self.peak,
+            .bytes = prefix_bytes + peak,
             .scratch_offset = prefix_bytes,
             .events = self.event_count,
-            .output = if (output) |region| .{ .offset = prefix_bytes + region.offset, .bytes = region.bytes } else null,
+            .output = if (output) |region| .{ .offset = if (external) 0 else prefix_bytes + region.offset, .bytes = region.bytes } else null,
+            .external_output = external,
         };
     }
 };
@@ -122,22 +139,22 @@ pub const Scope = struct {
     cursor: usize = 0,
     valid: bool = true,
     published_ptr: DevicePointer = 0,
+    requires_published_output: bool = false,
     bound_start: DevicePointer = 0,
     bound_end: DevicePointer = 0,
     /// Bind the funded byte range before recording or submitting any kernels.
     pub fn bind(plan: *Plan, layout: Layout, backing: DevicePointer, backing_bytes: usize) !Scope {
         if (backing == 0 or backing % alignment != 0 or layout.bytes > backing_bytes or
             backing > @as(DevicePointer, std.math.maxInt(DevicePointer)) - @as(DevicePointer, backing_bytes) or
-            !std.meta.eql(layout, try plan.layout(layout.scratch_offset))) return error.InvalidExecutionPlan;
-        return .{ .plan = plan, .base = backing + layout.scratch_offset, .bound_start = backing, .bound_end = backing + backing_bytes };
+            !std.meta.eql(layout, try plan.layoutImpl(layout.scratch_offset, layout.external_output))) return error.InvalidExecutionPlan;
+        return .{ .plan = plan, .base = backing + layout.scratch_offset, .bound_start = backing, .bound_end = backing + backing_bytes, .requires_published_output = layout.external_output };
     }
 
     pub fn complete(self: *const Scope) bool {
         return self.base != 0 and self.valid and self.cursor == self.plan.event_count;
     }
 
-    /// Ordinary execution may redirect the sealed output slot to independently
-    /// owned storage. Capture continues to use the stable arena address.
+    /// Bind the terminal write to disjoint storage before execution or capture.
     pub fn bindPublishedOutput(self: *Scope, pointer: DevicePointer, bytes: usize) !void {
         const slot = self.plan.output orelse return error.InvalidExecutionPlan;
         if (!self.valid or self.cursor != 0 or self.published_ptr != 0 or pointer % alignment != 0 or
@@ -152,11 +169,16 @@ pub const Scope = struct {
     }
 
     pub fn owns(self: *const Scope, pointer: DevicePointer) bool {
+        const peak = if (self.requires_published_output) self.plan.scratch_peak else self.plan.peak;
         return self.base != 0 and ((self.published_ptr != 0 and pointer == self.published_ptr) or
-            (pointer >= self.base and pointer - self.base < self.plan.peak));
+            (pointer >= self.base and pointer - self.base < peak));
     }
     pub fn allocate(self: *Scope, bytes: usize) !DevicePointer {
         if (!self.valid or self.cursor == self.plan.event_count) return error.AudioPlanChanged;
+        if (self.requires_published_output and self.published_ptr == 0) {
+            self.valid = false;
+            return error.AudioPlanChanged;
+        }
         const e = self.plan.events[self.cursor];
         if (!e.allocate or self.plan.allocations[e.slot].bytes != bytes) {
             self.valid = false;
@@ -261,4 +283,40 @@ test "stream workspace binds the exact sealed layout and retains its published s
     try std.testing.expectEqual(@as(DevicePointer, 0x1100), try scope.allocate(4));
     plan.release(1000);
     try std.testing.expectEqualDeep(layout, try plan.layout(alignment));
+}
+
+test "stream workspace can exclude its terminal output from the scratch backing" {
+    var plan: Plan = .{};
+    plan.allocate(256, 0x1000);
+    plan.allocate(256, 0x1100);
+    plan.release(0x1000);
+    try std.testing.expect(plan.finish(0x1100));
+    const layout = try plan.layoutWithExternalOutput(alignment);
+    try std.testing.expectEqual(2 * alignment, layout.bytes);
+    try std.testing.expectEqual(@as(usize, 256), layout.output.?.bytes);
+    var unbound = try Scope.bind(&plan, layout, 0x2000, layout.bytes);
+    try std.testing.expectError(error.AudioPlanChanged, unbound.allocate(256));
+    try std.testing.expectEqual(@as(usize, 0), unbound.cursor);
+    var scope = try Scope.bind(&plan, layout, 0x2000, layout.bytes);
+    try std.testing.expectError(error.InvalidExecutionPlan, scope.bindPublishedOutput(0x2100, 256));
+    try scope.bindPublishedOutput(0x3000, 256);
+    const scratch = try scope.allocate(256);
+    try std.testing.expectEqual(@as(DevicePointer, 0x2100), scratch);
+    try std.testing.expectEqual(@as(DevicePointer, 0x3000), try scope.allocate(256));
+    scope.release(scratch);
+    try std.testing.expect(!scope.owns(0x2200));
+    try std.testing.expect(scope.complete());
+}
+
+test "stream workspace keeps the shared layout when a separate output would exceed the limit" {
+    var plan: Plan = .{};
+    plan.allocate(64, 0x1000);
+    plan.release(0x1000);
+    plan.allocate(64, 0x2000);
+    try std.testing.expect(plan.finish(0x2000));
+    const prefix = limit - alignment;
+    try std.testing.expectError(error.InvalidExecutionPlan, plan.layoutWithExternalOutput(prefix));
+    const shared = try plan.layout(prefix);
+    try std.testing.expectEqual(limit, shared.bytes);
+    try std.testing.expectEqual(prefix, shared.output.?.offset);
 }

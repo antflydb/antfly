@@ -7929,7 +7929,8 @@ pub const CudaCompute = struct {
         return .{ .key = hash.final(), .input_bytes = input_bytes };
     }
     fn audioArenaRequest(executable: @import("audio_execution_plan.zig").Owner.Executable) CacheFunding.Request {
-        return .{ .arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .grid_x = @intCast(executable.key), .sizes = .{ executable.storage.bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
+        const storage = executable.storage;
+        return .{ .arena = .{ .kind = .audio, .batch = 1, .sequence = 1, .grid_x = @intCast(executable.key), .sizes = .{ storage.bytes, if (storage.external_output) storage.output.?.bytes else 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
     }
     /// Read the SAME already learned allocation/event layout without creating a
     /// cache entry, touching its LRU, or replaying numerical work for planning.
@@ -20709,7 +20710,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     if (output_bytes == 0 or output_bytes > output.bytes) return null;
     // The same complete event ABI drives preflight and actual arena lookup.
     const cache_request = CudaCompute.audioArenaRequest(executable);
-    const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), storage.bytes)) orelse return null;
+    const arena = (try self.embedding_gemma2_execution.audioArena(&self.ctx, @intCast(cache_request.arena.grid_x), cache_request.arena.sizes)) orelse return null;
     arena.pollTiming(&self.ctx);
     // The sealed allocation plan above is the audio route's capture proof.
     const action = arena.graphAction(true);
@@ -20720,7 +20721,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     for (inputs, spans) |ct, span| {
         if (span.bytes == 0) continue;
         const source: buffer_mod.DeviceBuffer = .{ .ptr = tensorFromCt(ct).buffer.ptr, .len = span.bytes };
-        if (source.ptr == 0 or CudaCompute.stageBufferOverlap(source, arena.buffers[0])) return null;
+        if (source.ptr == 0 or CudaCompute.stageBufferOverlap(source, arena.buffers[0]) or
+            CudaCompute.stageBufferOverlap(source, arena.buffers[1])) return null;
     }
     var execution_scope = if (replay) null else try plan_mod.Scope.bind(plan, storage, arena.buffers[0].ptr, arena.buffers[0].len);
     if (capture) try SourceLinearTemporary.validateArenaCapture(self, &execution_scope.?);
@@ -20728,7 +20730,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     var out_owned = true;
     defer if (out_owned) freeTensor(self, out);
     const published_directly = !replay and !capture and output.bytes == output_bytes;
-    if (published_directly) try execution_scope.?.bindPublishedOutput(tensorFromCt(out).buffer.ptr, output_bytes);
+    const output_bank = if (published_directly) tensorFromCt(out).buffer else if (storage.external_output) arena.buffers[1] else try audioBufferView(arena.buffers[0], output.offset, output.bytes);
+    if (published_directly or storage.external_output) {
+        if (execution_scope) |*scope| try scope.bindPublishedOutput(output_bank.ptr, output.bytes);
+    }
     const input_bank = if (replay or capture) try audioBufferView(arena.buffers[0], 0, storage.scratch_offset) else buffer_mod.DeviceBuffer{};
     defer arena.noteUse(&self.ctx);
     const timing = try arena.beginTiming(&self.ctx);
@@ -20771,7 +20776,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         };
         self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
-        const expected_output = if (published_directly) tensorFromCt(out).buffer.ptr else arena.buffers[0].ptr + output.offset;
+        const expected_output = output_bank.ptr;
         const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and
             scope.complete() and result_tensor.buffer.ptr == expected_output and audioOutputMatches(first_input, result_tensor, output_bytes);
         if (!matches and capture) graph_mod.discardRecording(&self.ctx);
@@ -20798,7 +20803,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         if (replay) self.audio_graph_replays += 1;
     }
     if (!published_directly) {
-        const result = try audioBufferView(arena.buffers[0], output.offset, output_bytes);
+        const result = try audioBufferView(output_bank, 0, output_bytes);
         try copyFromDeviceTracked(self, tensorFromCt(out).buffer, result, output_bytes);
     }
     // Include the publication copy in replay samples. The direct ordinary
@@ -60334,24 +60339,26 @@ test "public source audio linear recreates input bank through actual learning ca
         const expected: [4]f32 = @splat(@floatFromInt(value));
         try std.testing.expectEqualSlices(f32, &expected, held_values);
     }
-    // Both dispatch routes must decline an arena alias before submitting work.
+    // Neither dispatch route may read from its scratch or output bank as input.
     for (&compute.embedding_gemma2_execution.arenas) |*arena| {
         if (arena.kind != .audio or arena.graph == null) continue;
         arena.eager_samples = 0;
         arena.timing_replay = null;
-        var alias: CudaTensor = .{
-            .buffer = try audioBufferView(arena.buffers[0], 0, @sizeOf([4]f32)),
-            .shape = @constCast(&[_]i64{ 2, 2 }),
-            .elem_count = 4,
-            .dtype = .f32,
-            .owns_buffer = false,
-            .owns_shape = false,
-        };
         const copies_before = compute.stats.d2d_bytes;
         const replays_before = compute.audio_graph_replays;
-        for ([_]u8{ 2, 0 }) |replay_samples| {
-            arena.replay_samples = replay_samples;
-            try std.testing.expect(try cb.audioExecution(0x303, &.{ &alias, identity }, &run, Run.call) == null);
+        for (arena.buffers[0..2]) |bank| {
+            var alias: CudaTensor = .{
+                .buffer = try audioBufferView(bank, 0, @sizeOf([4]f32)),
+                .shape = @constCast(&[_]i64{ 2, 2 }),
+                .elem_count = 4,
+                .dtype = .f32,
+                .owns_buffer = false,
+                .owns_shape = false,
+            };
+            for ([_]u8{ 2, 0 }) |replay_samples| {
+                arena.replay_samples = replay_samples;
+                try std.testing.expect(try cb.audioExecution(0x303, &.{ &alias, identity }, &run, Run.call) == null);
+            }
         }
         try std.testing.expectEqual(copies_before, compute.stats.d2d_bytes);
         try std.testing.expectEqual(replays_before, compute.audio_graph_replays);
@@ -60711,6 +60718,8 @@ test "source bias workspace policy isolates audio warm and arena plan identities
     const old_arena = CudaCompute.audioArenaRequest(learned.executable.?);
     const new_arena = CudaCompute.audioArenaRequest(updated.executable.?);
     try std.testing.expect(old_arena.arena.grid_x != new_arena.arena.grid_x);
+    try std.testing.expectEqual(candidate.input_bytes, new_arena.arena.sizes[0]);
+    try std.testing.expectEqual(@as(usize, 1024), new_arena.arena.sizes[1]);
     compute.audio_plans.entries[0] = .{ .key = candidate.key, .stamp = 1, .warmed = true, .owner = &updated };
     try std.testing.expectEqualDeep(new_arena, (try compute.audioCacheRequest(42, &inputs)).?);
 }

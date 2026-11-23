@@ -523,8 +523,8 @@ pub fn Program(comptime Recipe: type) type {
                 return self.arenaFor(ctx, .vision, batch, sequence, 1, grid_x, grid_y, sizes);
             }
 
-            pub fn audioArena(self: *Cache, ctx: *Context, key: u64, bytes: usize) !?*Arena {
-                return self.arenaFor(ctx, .audio, 1, 1, 0, @intCast(key), 0, .{ bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+            pub fn audioArena(self: *Cache, ctx: *Context, key: u64, sizes: [11]usize) !?*Arena {
+                return self.arenaFor(ctx, .audio, 1, 1, 0, @intCast(key), 0, sizes);
             }
             pub const ArenaSelection = struct { index: usize, hit: bool, victims: u8, bytes: usize };
             pub fn selectArena(self: *const Cache, request: prepared.Arena) !?ArenaSelection {
