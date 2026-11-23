@@ -13139,6 +13139,19 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize,
             try std.testing.expectEqual(rows * width * count * @sizeOf(f32), regions.items[0].requirements.dispatch_workspace.byte_size);
             try std.testing.expect(!regions.items[0].requirements.requires_execution_profile);
             try std.testing.expect(target.cb.vtable.kernels.?.ownedPayloadServices.?.region.?(target.cb.ptr, &regions.items[0]));
+            const warm = regions.dependency orelse return error.MissingPreparedProjectionDependency;
+            try std.testing.expect(warm.vtable.matches(warm.context));
+            const saved = compute.packed_projection_entries;
+            compute.packed_projection_entries = null;
+            defer compute.packed_projection_entries = saved;
+            try std.testing.expect(!warm.vtable.matches(warm.context));
+            var cold_regions = (try target.cb.vtable.kernels.?.prepareRegionRoutes.?(target.cb.ptr, query)) orelse return error.MissingPreparedProjectionRegion;
+            defer cold_regions.deinit();
+            try std.testing.expectEqual(@as(usize, 0), cold_regions.items.len);
+            const cold = cold_regions.dependency orelse return error.MissingPreparedProjectionDependency;
+            try std.testing.expect(cold.vtable.matches(cold.context));
+            compute.packed_projection_entries = saved;
+            try std.testing.expect(!cold.vtable.matches(cold.context));
         }
         var operation = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .managed);
         defer operation.deinitChecked() catch platform.inference_process_supervisor.restartWorker();

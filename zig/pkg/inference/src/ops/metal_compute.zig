@@ -11882,7 +11882,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const pack_request = self.packed_request orelse return owned.policy_key == 1 and self.scratch_bytes == 0 and owned.covered_nodes.len == self.count;
         if (self.scratch_bytes == 0 or need.dispatch_workspace.alignment != @alignOf(f32) or pack_request.count != self.count) return false;
         if (self.frame_program != null) {
-            if (owned.policy_key != 1 or !self.hasInstalledPack(pack_request)) return false;
+            if (owned.policy_key != 1 or !self.compute.hasInstalledProjectionPack(pack_request)) return false;
         } else {
             if (owned.policy_key != 2) return false;
             const scope = self.compute.packed_projection_profile orelse return false;
@@ -12687,11 +12687,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             current.validate(.{ .implementation = self.linears[0].implementation, .program = program, .mode = .managed }) catch return false;
             return self.compute.audio_capture == null and metal_runtime.hasActiveFrame(self.compute.provider_impl.raw_decode_runtime);
         }
-        fn hasInstalledPack(self: *const @This(), request: ProjectionPack.Request) bool {
-            platform.sync.lockYielding(&self.compute.packed_projection_mutex);
-            defer self.compute.packed_projection_mutex.unlock();
-            return self.compute.packedProjection(request) != null;
-        }
         fn encodeInFrame(self: *const @This(), request: ProjectionPack.Request, input: MetalTensor, rows: usize, outputs: []const MetalTensor, scratch: MetalTensor) !void {
             platform.sync.lockYielding(&self.compute.packed_projection_mutex);
             defer self.compute.packed_projection_mutex.unlock();
@@ -12707,7 +12702,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!self.scopeValid(request.operation) or !self.slotsSupported() or request.inputs.len != self.input_count or request.outputs.len != self.count) return false;
             if (self.packed_request) |expected| {
                 if (self.frame_program != null) {
-                    if (!self.hasInstalledPack(expected)) return false;
+                    if (!self.compute.hasInstalledProjectionPack(expected)) return false;
                 } else {
                     const profile = self.compute.packed_projection_profile orelse return false;
                     const actual = profile.packed_request orelse return false;
@@ -12870,9 +12865,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const DenseRegionReadiness = struct {
         const region = @import("../execution/region_route.zig");
         const Entry = struct { key: DynamicLinearSlotKey, slot: ?usize, declaration: u64 };
+        const Pack = struct { request: ProjectionPack.Request, available: bool };
         allocator: std.mem.Allocator,
         compute: *MetalCompute,
         entries: []Entry,
+        packs: []Pack,
         fn matches(raw: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!self.compute.projectionScopeValid()) return false;
@@ -12881,6 +12878,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (slot != entry.slot) return false;
                 if (slot) |value| if (self.compute.provider_impl.privateSlotDeclaration(.linear, value) != entry.declaration) return false;
             }
+            for (self.packs) |pack| if (self.compute.hasInstalledProjectionPack(pack.request) != pack.available) return false;
             return true;
         }
         fn validate(raw: *anyopaque) !void {
@@ -12889,6 +12887,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         fn deinit(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.allocator.free(self.entries);
+            self.allocator.free(self.packs);
             self.allocator.destroy(self);
         }
         const table: region.SelectionDependency.VTable = .{ .matches = matches, .validate = validate, .deinit = @This().deinit };
@@ -13000,6 +12999,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer for (result.items) |*owner| owner.deinit();
         var watched: std.ArrayList(DenseRegionReadiness.Entry) = .empty;
         defer watched.deinit(request.allocator);
+        var packs: std.ArrayList(DenseRegionReadiness.Pack) = .empty;
+        defer packs.deinit(request.allocator);
         for (request.partition_nodes) |node| {
             const descriptor = DenseProjectionRegion.candidate(request.graph, node) orelse continue;
             const weight = request.graph.node(node).inputs[1];
@@ -13097,10 +13098,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 continue;
             }
             if (first.operation.linear.rows > 1) {
-                if (count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) {
-                    cursor += 1;
-                    continue;
-                }
                 var pack = ProjectionPack.Request{ .count = @intCast(count), .slots = @splat(0), .generations = @splat(0), .declarations = @splat(0), .width = first.operation.linear.in_dim, .widths = @splat(0) };
                 for (owner.linears[0..count], 0..) |linear, index| {
                     const prepared: *PreparedDenseLinear = @ptrCast(@alignCast(linear.context));
@@ -13109,7 +13106,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     pack.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, prepared.slot);
                     pack.generations[index] = metal_runtime.antfly_metal_prepared_binding_generation(self.provider_impl.raw_decode_runtime, .linear, prepared.slot);
                 }
-                if (!owner.hasInstalledPack(pack)) {
+                const available = self.hasInstalledProjectionPack(pack);
+                try packs.append(request.allocator, .{ .request = pack, .available = available });
+                if (!available) {
                     cursor += 1;
                     continue;
                 }
@@ -13143,8 +13142,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const dependency = try request.allocator.create(DenseRegionReadiness);
         errdefer request.allocator.destroy(dependency);
-        dependency.* = .{ .allocator = request.allocator, .compute = self, .entries = try watched.toOwnedSlice(request.allocator) };
-        errdefer request.allocator.free(dependency.entries);
+        const entries = try watched.toOwnedSlice(request.allocator);
+        errdefer request.allocator.free(entries);
+        const pack_dependencies = try packs.toOwnedSlice(request.allocator);
+        errdefer request.allocator.free(pack_dependencies);
+        dependency.* = .{ .allocator = request.allocator, .compute = self, .entries = entries, .packs = pack_dependencies };
         return .{ .allocator = request.allocator, .items = try result.toOwnedSlice(request.allocator), .dependency = .{ .context = dependency, .vtable = &DenseRegionReadiness.table } };
     }
 
@@ -13391,6 +13393,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try metadata.finish();
         self.data.prefetch.unlock();
         residency_locked = false;
+    }
+
+    fn hasInstalledProjectionPack(self: *MetalCompute, request: ProjectionPack.Request) bool {
+        if (request.count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return false;
+        platform.sync.lockYielding(&self.packed_projection_mutex);
+        defer self.packed_projection_mutex.unlock();
+        return self.packedProjection(request) != null;
     }
 
     fn packedProjection(self: *MetalCompute, request: ProjectionPack.Request) ?*ProjectionPack.Owner {
