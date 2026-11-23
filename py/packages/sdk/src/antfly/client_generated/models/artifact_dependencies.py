@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.artifact_dependencies_freshness_type_0 import ArtifactDependenciesFreshnessType0
+    from ..models.artifact_dependencies_sources_item import ArtifactDependenciesSourcesItem
     from ..models.artifact_dependencies_versions_item import ArtifactDependenciesVersionsItem
 
 
@@ -29,6 +30,8 @@ class ArtifactDependencies:
                 validated-through frontier, input fingerprint, rebuild state, and bounded change reasons.
             versions (list[ArtifactDependenciesVersionsItem]):
             subscriptions (int | Unset): Live subscription tuples registered for this artifact.
+            sources (list[ArtifactDependenciesSourcesItem] | Unset): Each declared context source with its effective
+                tracking. A ranked query (or a source declared `snapshot`) keeps the artifact `unverified`.
             current (bool | Unset): Present when `freshness=require_current` was requested: true when a
                 read barrier observed no undelivered committed change to any of the
                 artifact's source tables and its dependency state is current.
@@ -37,6 +40,7 @@ class ArtifactDependencies:
     freshness: ArtifactDependenciesFreshnessType0 | None
     versions: list[ArtifactDependenciesVersionsItem]
     subscriptions: int | Unset = UNSET
+    sources: list[ArtifactDependenciesSourcesItem] | Unset = UNSET
     current: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -56,6 +60,13 @@ class ArtifactDependencies:
 
         subscriptions = self.subscriptions
 
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
+
         current = self.current
 
         field_dict: dict[str, Any] = {}
@@ -68,6 +79,8 @@ class ArtifactDependencies:
         )
         if subscriptions is not UNSET:
             field_dict["subscriptions"] = subscriptions
+        if sources is not UNSET:
+            field_dict["sources"] = sources
         if current is not UNSET:
             field_dict["current"] = current
 
@@ -76,6 +89,7 @@ class ArtifactDependencies:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.artifact_dependencies_freshness_type_0 import ArtifactDependenciesFreshnessType0
+        from ..models.artifact_dependencies_sources_item import ArtifactDependenciesSourcesItem
         from ..models.artifact_dependencies_versions_item import ArtifactDependenciesVersionsItem
 
         d = dict(src_dict)
@@ -104,12 +118,22 @@ class ArtifactDependencies:
 
         subscriptions = d.pop("subscriptions", UNSET)
 
+        _sources = d.pop("sources", UNSET)
+        sources: list[ArtifactDependenciesSourcesItem] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = ArtifactDependenciesSourcesItem.from_dict(sources_item_data)
+
+                sources.append(sources_item)
+
         current = d.pop("current", UNSET)
 
         artifact_dependencies = cls(
             freshness=freshness,
             versions=versions,
             subscriptions=subscriptions,
+            sources=sources,
             current=current,
         )
 

@@ -59,7 +59,6 @@ pub const EnrichmentConfig = types.EnrichmentConfig;
 pub const EnrichmentContextDocument = types.EnrichmentContextDocument;
 pub const EnrichmentContextGraph = types.EnrichmentContextGraph;
 pub const EnrichmentContextQuery = types.EnrichmentContextQuery;
-pub const EnrichmentContextSearch = types.EnrichmentContextSearch;
 pub const EnrichmentContextSource = types.EnrichmentContextSource;
 pub const EnrichmentKind = types.EnrichmentKind;
 pub const EnrichmentNeighborContextConfig = types.EnrichmentNeighborContextConfig;

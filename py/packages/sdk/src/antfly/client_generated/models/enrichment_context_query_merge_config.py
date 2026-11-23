@@ -6,12 +6,12 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="EnrichmentContextSearchVector")
+T = TypeVar("T", bound="EnrichmentContextQueryMergeConfig")
 
 
 @_attrs_define
-class EnrichmentContextSearchVector:
-    """`{"$source":"/pointer"}` to the query vector in the dependent row."""
+class EnrichmentContextQueryMergeConfig:
+    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -25,10 +25,10 @@ class EnrichmentContextSearchVector:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        enrichment_context_search_vector = cls()
+        enrichment_context_query_merge_config = cls()
 
-        enrichment_context_search_vector.additional_properties = d
-        return enrichment_context_search_vector
+        enrichment_context_query_merge_config.additional_properties = d
+        return enrichment_context_query_merge_config
 
     @property
     def additional_keys(self) -> list[str]:

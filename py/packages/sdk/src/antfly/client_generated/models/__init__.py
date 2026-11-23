@@ -63,6 +63,9 @@ from .apple_generator_config_provider import AppleGeneratorConfigProvider
 from .apple_stt_config import AppleSTTConfig
 from .artifact_dependencies import ArtifactDependencies
 from .artifact_dependencies_freshness_type_0 import ArtifactDependenciesFreshnessType0
+from .artifact_dependencies_sources_item import ArtifactDependenciesSourcesItem
+from .artifact_dependencies_sources_item_kind import ArtifactDependenciesSourcesItemKind
+from .artifact_dependencies_sources_item_tracking import ArtifactDependenciesSourcesItemTracking
 from .artifact_dependencies_versions_item import ArtifactDependenciesVersionsItem
 from .artifact_index_source import ArtifactIndexSource
 from .artifact_not_current import ArtifactNotCurrent
@@ -461,12 +464,16 @@ from .enrichment_context_document import EnrichmentContextDocument
 from .enrichment_context_graph import EnrichmentContextGraph
 from .enrichment_context_graph_direction import EnrichmentContextGraphDirection
 from .enrichment_context_query import EnrichmentContextQuery
+from .enrichment_context_query_embeddings import EnrichmentContextQueryEmbeddings
+from .enrichment_context_query_exclusion_query import EnrichmentContextQueryExclusionQuery
 from .enrichment_context_query_filter_query import EnrichmentContextQueryFilterQuery
+from .enrichment_context_query_full_text_search import EnrichmentContextQueryFullTextSearch
+from .enrichment_context_query_graph_queries import EnrichmentContextQueryGraphQueries
+from .enrichment_context_query_merge_config import EnrichmentContextQueryMergeConfig
 from .enrichment_context_query_order_by import EnrichmentContextQueryOrderBy
 from .enrichment_context_query_order_by_order import EnrichmentContextQueryOrderByOrder
-from .enrichment_context_search import EnrichmentContextSearch
-from .enrichment_context_search_request import EnrichmentContextSearchRequest
-from .enrichment_context_search_vector import EnrichmentContextSearchVector
+from .enrichment_context_query_reranker import EnrichmentContextQueryReranker
+from .enrichment_context_query_vector import EnrichmentContextQueryVector
 from .enrichment_context_source import EnrichmentContextSource
 from .enrichment_context_source_overflow import EnrichmentContextSourceOverflow
 from .enrichment_context_source_tracking import EnrichmentContextSourceTracking
@@ -2189,6 +2196,16 @@ from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from .put_artifact_enrichment_response_201_context_sources import PutArtifactEnrichmentResponse201ContextSources
+from .put_artifact_enrichment_response_201_context_sources_additional_property import (
+    PutArtifactEnrichmentResponse201ContextSourcesAdditionalProperty,
+)
+from .put_artifact_enrichment_response_201_context_sources_additional_property_kind import (
+    PutArtifactEnrichmentResponse201ContextSourcesAdditionalPropertyKind,
+)
+from .put_artifact_enrichment_response_201_context_sources_additional_property_tracking import (
+    PutArtifactEnrichmentResponse201ContextSourcesAdditionalPropertyTracking,
+)
 from .put_namespace_table_privacy_response_403 import PutNamespaceTablePrivacyResponse403
 from .put_namespace_table_privacy_response_412 import PutNamespaceTablePrivacyResponse412
 from .put_namespace_table_privacy_response_422 import PutNamespaceTablePrivacyResponse422
@@ -2796,6 +2813,9 @@ __all__ = (
     "AppleSTTConfig",
     "ArtifactDependencies",
     "ArtifactDependenciesFreshnessType0",
+    "ArtifactDependenciesSourcesItem",
+    "ArtifactDependenciesSourcesItemKind",
+    "ArtifactDependenciesSourcesItemTracking",
     "ArtifactDependenciesVersionsItem",
     "ArtifactIndexSource",
     "ArtifactNotCurrent",
@@ -3192,12 +3212,16 @@ __all__ = (
     "EnrichmentContextGraph",
     "EnrichmentContextGraphDirection",
     "EnrichmentContextQuery",
+    "EnrichmentContextQueryEmbeddings",
+    "EnrichmentContextQueryExclusionQuery",
     "EnrichmentContextQueryFilterQuery",
+    "EnrichmentContextQueryFullTextSearch",
+    "EnrichmentContextQueryGraphQueries",
+    "EnrichmentContextQueryMergeConfig",
     "EnrichmentContextQueryOrderBy",
     "EnrichmentContextQueryOrderByOrder",
-    "EnrichmentContextSearch",
-    "EnrichmentContextSearchRequest",
-    "EnrichmentContextSearchVector",
+    "EnrichmentContextQueryReranker",
+    "EnrichmentContextQueryVector",
     "EnrichmentContextSource",
     "EnrichmentContextSourceOverflow",
     "EnrichmentContextSourceTracking",
@@ -4698,6 +4722,10 @@ __all__ = (
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
+    "PutArtifactEnrichmentResponse201ContextSources",
+    "PutArtifactEnrichmentResponse201ContextSourcesAdditionalProperty",
+    "PutArtifactEnrichmentResponse201ContextSourcesAdditionalPropertyKind",
+    "PutArtifactEnrichmentResponse201ContextSourcesAdditionalPropertyTracking",
     "PutNamespaceTablePrivacyResponse403",
     "PutNamespaceTablePrivacyResponse412",
     "PutNamespaceTablePrivacyResponse422",

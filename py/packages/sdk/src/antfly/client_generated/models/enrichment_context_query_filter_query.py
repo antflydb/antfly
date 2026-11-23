@@ -21,8 +21,8 @@ class EnrichmentContextQueryFilterQuery:
     ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage
     engine's per-row filter and evaluated per changed row. Values are literals or typed bindings
     `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only).
-    Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected for live
-    tracking; use a snapshot `search.request`.
+    Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected in a live
+    filter; express them as a ranking clause (`full_text_search`) instead.
 
     """
 

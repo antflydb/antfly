@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     from ..models.enrichment_context_document import EnrichmentContextDocument
     from ..models.enrichment_context_graph import EnrichmentContextGraph
     from ..models.enrichment_context_query import EnrichmentContextQuery
-    from ..models.enrichment_context_search import EnrichmentContextSearch
 
 
 T = TypeVar("T", bound="EnrichmentContextSource")
@@ -21,11 +20,14 @@ T = TypeVar("T", bound="EnrichmentContextSource")
 
 @_attrs_define
 class EnrichmentContextSource:
-    """One named context source: exactly one of `document` (a referenced row), `query` (the matching set of a parameterized
-    filter, including the empty set), `graph` (bounded traversal over directly written edges), or `search` (ranked
-    retrieval, snapshot only). Live sources are invalidated exactly: every admitted predicate decides a row's membership
-    from that row alone. Ranked retrieval depends on the whole corpus and is only available as an explicitly unverified
-    snapshot.
+    """One named context source: exactly one of `document` (a referenced row), `query` (a filter or a ranked retrieval), or
+    `graph` (bounded traversal over edges). `tracking` decides the freshness guarantee. A query whose every clause
+    decides a row's membership from that row alone (a `filter_query`, optionally a top-N `order_by`) is tracked live:
+    subscriptions invalidate dependents exactly and they can be `current`. A query with any ranking clause
+    (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`,
+    `graph_queries`, `limit`, or the `text`/`vector` shorthands) depends on the whole corpus and is a snapshot: its
+    dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's
+    effective tracking and, for a snapshot, the clause that made it one.
 
         Attributes:
             fields (list[str]): Projected fields consumed by the producer (dotted paths). Only these fields, predicate
@@ -36,15 +38,17 @@ class EnrichmentContextSource:
                 (directly, through artifact streams, through other context sources, or across tables). Other fields starting
                 with `_` are reserved and rejected.
             document (EnrichmentContextDocument | Unset):
-            query (EnrichmentContextQuery | Unset):
+            query (EnrichmentContextQuery | Unset): A filter (tracked live) or a ranked retrieval (a snapshot). Any ranking
+                clause makes the whole query a public QueryRequest executed by the table's query engine, with
+                `{"$source":"/pointer"}` bindings anywhere; `limit` (at most 1000) is then the member count, and paging
+                (`offset`, `search_after`, `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected.
+                Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in
+                `embeddings` instead.
             graph (EnrichmentContextGraph | Unset): Bounded breadth-first traversal over the edges of a graph index. By
                 default only explicitly written edges are traversed; `include_generated` also follows field-derived and
                 enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or
                 removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and
                 direction.
-            search (EnrichmentContextSearch | Unset): Ranked retrieval (requires `tracking: snapshot`): a full `request`, or
-                the shorthands full-text relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`).
-                Members render in rank order.
             required (bool | Unset): Document sources only: a missing referenced document fails the rebuild explicitly
                 instead of rendering null. Default: False.
             max_documents (int | Unset): Query and graph sources: maximum members. Exceeding it fails explicitly; with
@@ -54,10 +58,12 @@ class EnrichmentContextSource:
                 1000.
             max_bytes (int | Unset): Maximum rendered bytes for this source. Default: 1048576.
             overflow (EnrichmentContextSourceOverflow | Unset):  Default: EnrichmentContextSourceOverflow.ERROR.
-            tracking (EnrichmentContextSourceTracking | Unset): `live` registers subscriptions and keeps dependents current.
+            tracking (EnrichmentContextSourceTracking | Unset): Defaults to the strongest guarantee the source supports:
+                `live` for filters, `snapshot` for ranked queries. `live` registers subscriptions and keeps dependents current.
                 `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on
-                `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse them. Required for
-                `search`. Default: EnrichmentContextSourceTracking.LIVE.
+                `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse them. Declaring `live`
+                asserts the guarantee: a query with a ranking clause is then rejected (400 `context_source_requires_snapshot`)
+                instead of silently becoming a snapshot. Declaring `snapshot` opts a filter out of live tracking.
             refresh_interval (str | Unset): Snapshot sources only: rebuild interval (at least 1s).
     """
 
@@ -65,13 +71,12 @@ class EnrichmentContextSource:
     document: EnrichmentContextDocument | Unset = UNSET
     query: EnrichmentContextQuery | Unset = UNSET
     graph: EnrichmentContextGraph | Unset = UNSET
-    search: EnrichmentContextSearch | Unset = UNSET
     required: bool | Unset = False
     max_documents: int | Unset = 100
     max_candidates: int | Unset = 1000
     max_bytes: int | Unset = 1048576
     overflow: EnrichmentContextSourceOverflow | Unset = EnrichmentContextSourceOverflow.ERROR
-    tracking: EnrichmentContextSourceTracking | Unset = EnrichmentContextSourceTracking.LIVE
+    tracking: EnrichmentContextSourceTracking | Unset = UNSET
     refresh_interval: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -88,10 +93,6 @@ class EnrichmentContextSource:
         graph: dict[str, Any] | Unset = UNSET
         if not isinstance(self.graph, Unset):
             graph = self.graph.to_dict()
-
-        search: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.search, Unset):
-            search = self.search.to_dict()
 
         required = self.required
 
@@ -124,8 +125,6 @@ class EnrichmentContextSource:
             field_dict["query"] = query
         if graph is not UNSET:
             field_dict["graph"] = graph
-        if search is not UNSET:
-            field_dict["search"] = search
         if required is not UNSET:
             field_dict["required"] = required
         if max_documents is not UNSET:
@@ -148,7 +147,6 @@ class EnrichmentContextSource:
         from ..models.enrichment_context_document import EnrichmentContextDocument
         from ..models.enrichment_context_graph import EnrichmentContextGraph
         from ..models.enrichment_context_query import EnrichmentContextQuery
-        from ..models.enrichment_context_search import EnrichmentContextSearch
 
         d = dict(src_dict)
         fields = cast(list[str], d.pop("fields"))
@@ -173,13 +171,6 @@ class EnrichmentContextSource:
             graph = UNSET
         else:
             graph = EnrichmentContextGraph.from_dict(_graph)
-
-        _search = d.pop("search", UNSET)
-        search: EnrichmentContextSearch | Unset
-        if isinstance(_search, Unset):
-            search = UNSET
-        else:
-            search = EnrichmentContextSearch.from_dict(_search)
 
         required = d.pop("required", UNSET)
 
@@ -210,7 +201,6 @@ class EnrichmentContextSource:
             document=document,
             query=query,
             graph=graph,
-            search=search,
             required=required,
             max_documents=max_documents,
             max_candidates=max_candidates,

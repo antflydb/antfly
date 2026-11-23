@@ -3990,7 +3990,7 @@ pub const Client = struct {
 
     /// Register or replace an artifact enrichment
     /// PUT /db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment
-    pub fn putArtifactEnrichment(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.EnrichmentConfig) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+    pub fn putArtifactEnrichment(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.EnrichmentConfig) !ApiResponse(std.json.Value) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
@@ -4000,7 +4000,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
     /// Delete an artifact enrichment

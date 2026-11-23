@@ -9233,6 +9233,15 @@ export interface components {
             versions: {
                 [key: string]: unknown;
             }[];
+            /** @description Each declared context source with its effective tracking. A ranked query (or a source declared `snapshot`) keeps the artifact `unverified`. */
+            sources?: {
+                name?: string;
+                /** @enum {string} */
+                kind?: "document" | "query" | "graph";
+                /** @enum {string} */
+                tracking?: "live" | "snapshot";
+                ranked?: boolean;
+            }[];
             /**
              * @description Present when `freshness=require_current` was requested: true when a
              *     read barrier observed no undelivered committed change to any of the
@@ -18505,12 +18514,13 @@ export interface components {
             /** @description JSON pointer into the source document yielding the referenced key. */
             key_from: string;
         };
+        /** @description A filter (tracked live) or a ranked retrieval (a snapshot). Any ranking clause makes the whole query a public QueryRequest executed by the table's query engine, with `{"$source":"/pointer"}` bindings anywhere; `limit` (at most 1000) is then the member count, and paging (`offset`, `search_after`, `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected. Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in `embeddings` instead. */
         EnrichmentContextQuery: {
             /** @description Table queried; omitted means the enrichment's own table. */
             table?: string;
-            /** @description An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions, at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage engine's per-row filter and evaluated per changed row. Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected for live tracking; use a snapshot `search.request`. */
-            filter_query: Record<string, never>;
-            /** @description Top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary. */
+            /** @description An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions, at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage engine's per-row filter and evaluated per changed row. Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected in a live filter; express them as a ranking clause (`full_text_search`) instead. */
+            filter_query?: Record<string, never>;
+            /** @description Live filters only: top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary. */
             order_by?: {
                 field: string;
                 /**
@@ -18519,6 +18529,27 @@ export interface components {
                  */
                 order?: "asc" | "desc";
             };
+            /** @description Ranking clause: full-text relevance (QueryRequest shape). */
+            full_text_search?: Record<string, never>;
+            /** @description Ranking clause: query text embedded for vector search (QueryRequest shape). */
+            semantic_search?: unknown;
+            /** @description Ranking clause: precomputed query vectors by index (QueryRequest shape). */
+            embeddings?: Record<string, never>;
+            indexes?: string[];
+            merge_config?: Record<string, never>;
+            reranker?: Record<string, never>;
+            exclusion_query?: Record<string, never>;
+            graph_queries?: Record<string, never>;
+            /** @description Ranked queries: member count. */
+            limit?: number;
+            /** @description Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with `text_field`. */
+            text?: unknown;
+            text_field?: string;
+            /** @description Shorthand ranking clause: `{"$source":"/pointer"}` to a query vector in the dependent row, with `vector_index`. */
+            vector?: Record<string, never>;
+            vector_index?: string;
+            /** @default 10 */
+            k?: number;
         };
         /** @description Bounded breadth-first traversal over the edges of a graph index. By default only explicitly written edges are traversed; `include_generated` also follows field-derived and enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and direction. */
         EnrichmentContextGraph: {
@@ -18545,26 +18576,11 @@ export interface components {
              */
             include_generated?: boolean;
         };
-        /** @description Ranked retrieval (requires `tracking: snapshot`): a full `request`, or the shorthands full-text relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`). Members render in rank order. */
-        EnrichmentContextSearch: {
-            table?: string;
-            /** @description A full public QueryRequest (`full_text_search`, `semantic_search` with `indexes`, hybrid `merge_config`, `reranker`, `filter_query`, `exclusion_query`, `order_by`, `graph_queries`, ...) with `{"$source":"/pointer"}` bindings anywhere, executed by the table's query engine. `limit` (at most 1000) is the member count. `table`, paging (`offset`, `search_after`, `search_before`), `count`, and `aggregations` are rejected. Distributed tables refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in `embeddings` instead. */
-            request?: Record<string, never>;
-            /** @description Query text literal or `{"$source":"/pointer"}`. */
-            text?: unknown;
-            text_field?: string;
-            /** @description `{"$source":"/pointer"}` to the query vector in the dependent row. */
-            vector?: Record<string, never>;
-            vector_index?: string;
-            /** @default 10 */
-            k?: number;
-        };
-        /** @description One named context source: exactly one of `document` (a referenced row), `query` (the matching set of a parameterized filter, including the empty set), `graph` (bounded traversal over directly written edges), or `search` (ranked retrieval, snapshot only). Live sources are invalidated exactly: every admitted predicate decides a row's membership from that row alone. Ranked retrieval depends on the whole corpus and is only available as an explicitly unverified snapshot. */
+        /** @description One named context source: exactly one of `document` (a referenced row), `query` (a filter or a ranked retrieval), or `graph` (bounded traversal over edges). `tracking` decides the freshness guarantee. A query whose every clause decides a row's membership from that row alone (a `filter_query`, optionally a top-N `order_by`) is tracked live: subscriptions invalidate dependents exactly and they can be `current`. A query with any ranking clause (`full_text_search`, `semantic_search`, `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `graph_queries`, `limit`, or the `text`/`vector` shorthands) depends on the whole corpus and is a snapshot: its dependents are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source's effective tracking and, for a snapshot, the clause that made it one. */
         EnrichmentContextSource: {
             document?: components["schemas"]["EnrichmentContextDocument"];
             query?: components["schemas"]["EnrichmentContextQuery"];
             graph?: components["schemas"]["EnrichmentContextGraph"];
-            search?: components["schemas"]["EnrichmentContextSearch"];
             /** @description Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected. */
             fields: string[];
             /**
@@ -18596,8 +18612,7 @@ export interface components {
              */
             overflow?: "error";
             /**
-             * @description `live` registers subscriptions and keeps dependents current. `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse them. Required for `search`.
-             * @default live
+             * @description Defaults to the strongest guarantee the source supports: `live` for filters, `snapshot` for ranked queries. `live` registers subscriptions and keeps dependents current. `snapshot` registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse them. Declaring `live` asserts the guarantee: a query with a ranking clause is then rejected (400 `context_source_requires_snapshot`) instead of silently becoming a snapshot. Declaring `snapshot` opts a filter out of live tracking.
              * @enum {string}
              */
             tracking?: "live" | "snapshot";
@@ -18741,7 +18756,7 @@ export interface components {
             producer_json?: string;
             /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
             neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
-            /** @description Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query and search sources at declaration (document and graph sources are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies. */
+            /** @description Named cross-document context consumed by this asset producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table creation) and admission resolves table names and rejects cross-table generated-input cycles. Context reads execute as the declaring principal: it must be able to read every source table, and its row filter on each is conjoined into query sources (filters and ranked queries) at declaration (document and graph sources, and the `text`/`vector` shorthands, are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies. */
             context_sources?: {
                 [key: string]: components["schemas"]["EnrichmentContextSource"];
             };
@@ -37560,13 +37575,27 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Artifact enrichment registered */
+            /**
+             * @description Artifact enrichment registered. With `context_sources`, reports each
+             *     source's effective tracking (`live` or `snapshot`) and, for a
+             *     snapshot, the ranking clause that made it one (or `declared`).
+             */
             201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        context_sources?: {
+                            [key: string]: {
+                                /** @enum {string} */
+                                kind?: "document" | "query" | "graph";
+                                /** @enum {string} */
+                                tracking?: "live" | "snapshot";
+                                reason?: string;
+                            };
+                        };
+                    };
                 };
             };
             400: components["responses"]["BadRequest"];

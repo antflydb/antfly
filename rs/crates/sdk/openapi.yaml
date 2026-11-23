@@ -7567,11 +7567,35 @@ paths:
               $ref: '#/components/schemas/EnrichmentConfig'
       responses:
         '201':
-          description: Artifact enrichment registered
+          description: >
+            Artifact enrichment registered. With `context_sources`, reports each
+
+            source's effective tracking (`live` or `snapshot`) and, for a
+
+            snapshot, the ranking clause that made it one (or `declared`).
           content:
             application/json:
               schema:
                 type: object
+                properties:
+                  context_sources:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        kind:
+                          type: string
+                          enum:
+                            - document
+                            - query
+                            - graph
+                        tracking:
+                          type: string
+                          enum:
+                            - live
+                            - snapshot
+                        reason:
+                          type: string
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -28323,6 +28347,28 @@ components:
           items:
             type: object
             additionalProperties: true
+        sources:
+          type: array
+          description: Each declared context source with its effective tracking. A ranked query (or a
+            source declared `snapshot`) keeps the artifact `unverified`.
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              kind:
+                type: string
+                enum:
+                  - document
+                  - query
+                  - graph
+              tracking:
+                type: string
+                enum:
+                  - live
+                  - snapshot
+              ranked:
+                type: boolean
         current:
           type: boolean
           description: >
@@ -43933,8 +43979,12 @@ components:
     EnrichmentContextQuery:
       type: object
       additionalProperties: false
-      required:
-        - filter_query
+      description: A filter (tracked live) or a ranked retrieval (a snapshot). Any ranking clause makes
+        the whole query a public QueryRequest executed by the table's query engine, with `{"$source":"/pointer"}`
+        bindings anywhere; `limit` (at most 1000) is then the member count, and paging (`offset`, `search_after`,
+        `search_before`), `count`, `aggregations`, and a top-N `order_by` are rejected. Distributed tables
+        refuse `semantic_search` (data servers have no query embedder); pass precomputed vectors in `embeddings`
+        instead.
       properties:
         table:
           type: string
@@ -43953,15 +44003,15 @@ components:
             is lowered at admission into the storage engine''s per-row filter and evaluated per changed
             row. Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document
             (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries
-            (`query_string`, `multi_match`, analyzer-specific `match`) are rejected for live tracking;
-            use a snapshot `search.request`.'
+            (`query_string`, `multi_match`, analyzer-specific `match`) are rejected in a live filter;
+            express them as a ranking clause (`full_text_search`) instead.'
         order_by:
           type: object
           additionalProperties: false
           required:
             - field
-          description: Top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current
-            boundary.
+          description: 'Live filters only: top-N by a field (ties by key); `max_documents` is N. Invalidation
+            tracks the current boundary.'
           properties:
             field:
               type: string
@@ -43971,6 +44021,47 @@ components:
                 - asc
                 - desc
               default: asc
+        full_text_search:
+          type: object
+          description: 'Ranking clause: full-text relevance (QueryRequest shape).'
+        semantic_search:
+          description: 'Ranking clause: query text embedded for vector search (QueryRequest shape).'
+        embeddings:
+          type: object
+          description: 'Ranking clause: precomputed query vectors by index (QueryRequest shape).'
+        indexes:
+          type: array
+          items:
+            type: string
+        merge_config:
+          type: object
+        reranker:
+          type: object
+        exclusion_query:
+          type: object
+        graph_queries:
+          type: object
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: 'Ranked queries: member count.'
+        text:
+          description: 'Shorthand ranking clause: query text literal or `{"$source":"/pointer"}`, with
+            `text_field`.'
+        text_field:
+          type: string
+        vector:
+          type: object
+          description: 'Shorthand ranking clause: `{"$source":"/pointer"}` to a query vector in the dependent
+            row, with `vector_index`.'
+        vector_index:
+          type: string
+        k:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 10
     EnrichmentContextGraph:
       type: object
       additionalProperties: false
@@ -44015,47 +44106,20 @@ components:
           type: boolean
           default: false
           description: Also traverse field-derived and enrichment-generated edges.
-    EnrichmentContextSearch:
-      type: object
-      additionalProperties: false
-      description: 'Ranked retrieval (requires `tracking: snapshot`): a full `request`, or the shorthands
-        full-text relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`).
-        Members render in rank order.'
-      properties:
-        table:
-          type: string
-        request:
-          type: object
-          description: A full public QueryRequest (`full_text_search`, `semantic_search` with `indexes`,
-            hybrid `merge_config`, `reranker`, `filter_query`, `exclusion_query`, `order_by`, `graph_queries`,
-            ...) with `{"$source":"/pointer"}` bindings anywhere, executed by the table's query engine.
-            `limit` (at most 1000) is the member count. `table`, paging (`offset`, `search_after`, `search_before`),
-            `count`, and `aggregations` are rejected. Distributed tables refuse `semantic_search` (data
-            servers have no query embedder); pass precomputed vectors in `embeddings` instead.
-        text:
-          description: Query text literal or `{"$source":"/pointer"}`.
-        text_field:
-          type: string
-        vector:
-          type: object
-          description: '`{"$source":"/pointer"}` to the query vector in the dependent row.'
-        vector_index:
-          type: string
-        k:
-          type: integer
-          minimum: 1
-          maximum: 1000
-          default: 10
     EnrichmentContextSource:
       type: object
       additionalProperties: false
       required:
         - fields
-      description: 'One named context source: exactly one of `document` (a referenced row), `query` (the
-        matching set of a parameterized filter, including the empty set), `graph` (bounded traversal over
-        directly written edges), or `search` (ranked retrieval, snapshot only). Live sources are invalidated
-        exactly: every admitted predicate decides a row''s membership from that row alone. Ranked retrieval
-        depends on the whole corpus and is only available as an explicitly unverified snapshot.'
+      description: 'One named context source: exactly one of `document` (a referenced row), `query` (a
+        filter or a ranked retrieval), or `graph` (bounded traversal over edges). `tracking` decides the
+        freshness guarantee. A query whose every clause decides a row''s membership from that row alone
+        (a `filter_query`, optionally a top-N `order_by`) is tracked live: subscriptions invalidate dependents
+        exactly and they can be `current`. A query with any ranking clause (`full_text_search`, `semantic_search`,
+        `embeddings`, `indexes`, `merge_config`, `reranker`, `exclusion_query`, `graph_queries`, `limit`,
+        or the `text`/`vector` shorthands) depends on the whole corpus and is a snapshot: its dependents
+        are `unverified` and rebuild on `refresh_interval` or manually. Registration reports each source''s
+        effective tracking and, for a snapshot, the clause that made it one.'
       properties:
         document:
           $ref: '#/components/schemas/EnrichmentContextDocument'
@@ -44063,8 +44127,6 @@ components:
           $ref: '#/components/schemas/EnrichmentContextQuery'
         graph:
           $ref: '#/components/schemas/EnrichmentContextGraph'
-        search:
-          $ref: '#/components/schemas/EnrichmentContextSearch'
         fields:
           type: array
           minItems: 1
@@ -44117,10 +44179,13 @@ components:
           enum:
             - live
             - snapshot
-          default: live
-          description: '`live` registers subscriptions and keeps dependents current. `snapshot` registers
-            nothing: dependents publish with freshness `unverified` (never `current`), rebuild on `refresh_interval`
-            or manually, and `freshness=require_current` dependency reads refuse them. Required for `search`.'
+          description: 'Defaults to the strongest guarantee the source supports: `live` for filters, `snapshot`
+            for ranked queries. `live` registers subscriptions and keeps dependents current. `snapshot`
+            registers nothing: dependents publish with freshness `unverified` (never `current`), rebuild
+            on `refresh_interval` or manually, and `freshness=require_current` dependency reads refuse
+            them. Declaring `live` asserts the guarantee: a query with a ranking clause is then rejected
+            (400 `context_source_requires_snapshot`) instead of silently becoming a snapshot. Declaring
+            `snapshot` opts a filter out of live tracking.'
         refresh_interval:
           type: string
           pattern: ^[0-9]+(ms|s|m|h)$
@@ -44391,9 +44456,9 @@ components:
             Lite) and by distributed tables, where context sources are declared through the artifact enrichment
             endpoint (not inline at table creation) and admission resolves table names and rejects cross-table
             generated-input cycles. Context reads execute as the declaring principal: it must be able
-            to read every source table, and its row filter on each is conjoined into query and search
-            sources at declaration (document and graph sources are refused where a row filter applies).
-            Re-declare the enrichment to re-capture changed policies.'
+            to read every source table, and its row filter on each is conjoined into query sources (filters
+            and ranked queries) at declaration (document and graph sources, and the `text`/`vector` shorthands,
+            are refused where a row filter applies). Re-declare the enrichment to re-capture changed policies.'
         refresh:
           $ref: '#/components/schemas/EnrichmentRefreshConfig'
         execution:

@@ -1528,6 +1528,8 @@ pub const ArtifactDependencies = struct {
     /// Live subscription tuples registered for this artifact.
     subscriptions: ?i64 = null,
     versions: []const std.json.ArrayHashMap(std.json.Value),
+    /// Each declared context source with its effective tracking. A ranked query (or a source declared `snapshot`) keeps the artifact `unverified`.
+    sources: ?[]const std.json.Value = null,
     /// Present when `freshness=require_current` was requested: true when a read barrier observed no undelivered committed change to any of the artifact's source tables and its dependency state is current.
     current: ?bool = null,
 
@@ -1536,6 +1538,7 @@ pub const ArtifactDependencies = struct {
         .{ "freshness", "freshness", false },
         .{ "subscriptions", "subscriptions", true },
         .{ "versions", "versions", false },
+        .{ "sources", "sources", true },
         .{ "current", "current", true },
     };
 
@@ -1557,6 +1560,10 @@ pub const ArtifactDependencies = struct {
         }
         try jw.objectField("versions");
         try jw.write(self.versions);
+        if (self.sources) |value| {
+            try jw.objectField("sources");
+            try jw.write(value);
+        }
         if (self.current) |value| {
             try jw.objectField("current");
             try jw.write(value);

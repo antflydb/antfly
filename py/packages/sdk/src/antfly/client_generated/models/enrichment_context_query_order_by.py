@@ -13,7 +13,7 @@ T = TypeVar("T", bound="EnrichmentContextQueryOrderBy")
 
 @_attrs_define
 class EnrichmentContextQueryOrderBy:
-    """Top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary.
+    """Live filters only: top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary.
 
     Attributes:
         field (str):
