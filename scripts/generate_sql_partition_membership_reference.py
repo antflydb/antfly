@@ -15,6 +15,7 @@
 # limitations under the License.
 
 """Owned PostgreSQL witnesses for the unchanged partition membership cases."""
+
 import argparse
 import json
 from pathlib import Path
@@ -24,7 +25,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def reference():
-    inventory = json.loads((ROOT / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_parity_inventory.json").read_text())
+    inventory = json.loads(
+        (
+            ROOT / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_parity_inventory.json"
+        ).read_text()
+    )
     cases = {case["id"]: case for case in inventory["entries"]}
     # The original CREATE parent has an invalid PK (sql-0421 is a rejection).
     # Membership cases therefore get an independent valid parent fixture;
@@ -34,12 +39,20 @@ def reference():
 
     steps = []
     with postgres() as db:
+
         def execute(sql, case=None):
             cursor = db.execute(sql)
-            result = {"sql": sql, "rows": cursor.fetchall() if cursor.description else None, "command_tag": cursor.statusmessage}
+            result = {
+                "sql": sql,
+                "rows": cursor.fetchall() if cursor.description else None,
+                "command_tag": cursor.statusmessage,
+            }
             if case:
-                result.update(id=case["id"], source_entry_sha256=case["source_entry_sha256"])
+                result.update(
+                    id=case["id"], source_entry_sha256=case["source_entry_sha256"]
+                )
             steps.append(result)
+
         invalid = cases["sql-0421"]
         try:
             db.execute(invalid["sql"])
@@ -56,10 +69,14 @@ def reference():
                 "message": exc.diag.message_primary,
             }
         else:
-            raise AssertionError("PostgreSQL accepted a unique key omitting the partition column")
+            raise AssertionError(
+                "PostgreSQL accepted a unique key omitting the partition column"
+            )
         execute(setup)
         execute(cases["sql-0422"]["sql"], cases["sql-0422"])
-        execute("INSERT INTO usage_events VALUES('tenant','00000000-0000-0000-0000-000000000001','2026-06-01')")
+        execute(
+            "INSERT INTO usage_events VALUES('tenant','00000000-0000-0000-0000-000000000001','2026-06-01')"
+        )
         execute("SELECT count(*) FROM usage_events")
         execute(cases["sql-0424"]["sql"], cases["sql-0424"])
         execute("SELECT count(*) FROM usage_events")
@@ -67,15 +84,32 @@ def reference():
         execute(cases["sql-0423"]["sql"], cases["sql-0423"])
         execute("SELECT count(*) FROM usage_events")
         execute("SELECT count(*) FROM usage_events_2026")
-        assert [step["rows"] for step in steps if step["rows"] is not None] == [[(1,)], [(0,)], [(1,)], [(1,)], [(1,)]]
+        assert [step["rows"] for step in steps if step["rows"] is not None] == [
+            [(1,)],
+            [(0,)],
+            [(1,)],
+            [(1,)],
+            [(1,)],
+        ]
         try:
-            db.execute("INSERT INTO usage_events VALUES('tenant','00000000-0000-0000-0000-000000000002','2027-01-01')")
+            db.execute(
+                "INSERT INTO usage_events VALUES('tenant','00000000-0000-0000-0000-000000000002','2027-01-01')"
+            )
         except psycopg.errors.CheckViolation as exc:
             assert exc.sqlstate == "23514"
         else:
             raise AssertionError("PostgreSQL routed a row at the exclusive upper bound")
         assert db.execute("SELECT count(*) FROM usage_events").fetchone() == (1,)
-    return json.loads(json.dumps({"format": 1, "reference": "PostgreSQL original partition membership", "rejection": rejection, "steps": steps}))
+    return json.loads(
+        json.dumps(
+            {
+                "format": 1,
+                "reference": "PostgreSQL original partition membership",
+                "rejection": rejection,
+                "steps": steps,
+            }
+        )
+    )
 
 
 def main():
@@ -88,8 +122,12 @@ def main():
     if args.output:
         args.output.write_text(json.dumps(value, indent=2) + "\n")
     else:
-        assert json.loads(args.check.read_text()) == value, "PostgreSQL partition membership reference drift"
-        print("verified PostgreSQL partition declaration, child birth, attach and detach witnesses")
+        assert json.loads(args.check.read_text()) == value, (
+            "PostgreSQL partition membership reference drift"
+        )
+        print(
+            "verified PostgreSQL partition declaration, child birth, attach and detach witnesses"
+        )
 
 
 if __name__ == "__main__":

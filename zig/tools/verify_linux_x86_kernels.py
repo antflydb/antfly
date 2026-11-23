@@ -57,7 +57,8 @@ def main():
         out = Path(tmp)
         cache = ["--cache-dir", out / "cache", "--global-cache-dir", out / "global"]
         linalg_modules = [
-            "--dep", "antfly_tile",
+            "--dep",
+            "antfly_tile",
             f"-Mroot={source / 'mod.zig'}",
             f"-Mantfly_tile={root / 'lib/tile/src/mod.zig'}",
         ]

@@ -145,8 +145,10 @@ def post_record(url, body, content_type):
             raw = response.read()
         if not 200 <= status < 300:
             raise RuntimeError(f"HTTP {status}")
+
         def reject_constant(value):
             raise ValueError("nonfinite JSON constant: " + value)
+
         result = json.loads(raw, parse_constant=reject_constant)
     except Exception as failure:
         if isinstance(failure, http.client.IncompleteRead):
@@ -155,7 +157,9 @@ def post_record(url, body, content_type):
     return {
         "seconds": time.perf_counter() - started,
         "http_status": status,
-        "response_bytes_base64": base64.b64encode(raw).decode() if raw is not None else None,
+        "response_bytes_base64": base64.b64encode(raw).decode()
+        if raw is not None
+        else None,
         "response": result,
         "error": error,
     }
@@ -229,7 +233,10 @@ def antfly_baseline(args, body, audio, audio_seconds, reference):
                         raise ValueError("nonpositive or nonfinite HTTP duration")
                     row["state"] = "complete"
                 except (ValueError, TypeError, KeyError) as failure:
-                    row["error"] = {"type": type(failure).__name__, "message": str(failure)}
+                    row["error"] = {
+                        "type": type(failure).__name__,
+                        "message": str(failure),
+                    }
             save()
             if row["error"] is not None:
                 report["aborted"] = {
@@ -248,7 +255,8 @@ def antfly_baseline(args, body, audio, audio_seconds, reference):
     )
     measured = {
         target: [
-            row for row in rows
+            row
+            for row in rows
             if row["phase"] == "measurement" and row["state"] == "complete"
         ]
         for target, rows in results.items()
@@ -283,23 +291,34 @@ def antfly_baseline(args, body, audio, audio_seconds, reference):
         report["regression_passed"] = (
             quality_ok and ratios["median"] <= 1.05 and ratios["p95"] <= 1.10
         )
-        interval = paired_log_ratio_ci([
-            (b["seconds"], a["seconds"])
-            for a, b in zip(measured["antfly"], measured["baseline_antfly"])
-        ])
+        interval = paired_log_ratio_ci(
+            [
+                (b["seconds"], a["seconds"])
+                for a, b in zip(measured["antfly"], measured["baseline_antfly"])
+            ]
+        )
         report["baseline_candidate_speedup_ci"] = interval
         report["faster_passed"] = quality_ok and interval["lower_95"] > 1
         report["performance_passed"] = report["regression_passed"] and (
             not args.require_faster or report["faster_passed"]
         )
     save()
-    print(json.dumps({
-        key: report[key]
-        for key in (
-            "complete", "summary", "quality_passed", "regression_passed",
-            "faster_passed", "performance_passed",
+    print(
+        json.dumps(
+            {
+                key: report[key]
+                for key in (
+                    "complete",
+                    "summary",
+                    "quality_passed",
+                    "regression_passed",
+                    "faster_passed",
+                    "performance_passed",
+                )
+            },
+            indent=2,
         )
-    }, indent=2))
+    )
     return 0 if report["performance_passed"] else 1
 
 
@@ -309,7 +328,11 @@ def main(argv=None):
     comparison = parser.add_mutually_exclusive_group()
     comparison.add_argument("--whisper-url")
     comparison.add_argument("--baseline-antfly-url")
-    parser.add_argument("--require-faster", action="store_true", help="Also require paired speedup CI lower bound > 1 in Antfly baseline mode")
+    parser.add_argument(
+        "--require-faster",
+        action="store_true",
+        help="Also require paired speedup CI lower bound > 1 in Antfly baseline mode",
+    )
     parser.add_argument("--model", default="openai/whisper-small")
     parser.add_argument("--audio", required=True, type=Path)
     parser.add_argument("--reference", required=True, type=Path)
@@ -324,7 +347,9 @@ def main(argv=None):
         parser.error("at least three measured trials and one warmup are required")
     if args.require_faster and not args.baseline_antfly_url:
         parser.error("--require-faster requires --baseline-antfly-url")
-    if args.baseline_antfly_url and (not math.isfinite(args.max_wer) or args.max_wer < 0):
+    if args.baseline_antfly_url and (
+        not math.isfinite(args.max_wer) or args.max_wer < 0
+    ):
         parser.error("--max-wer must be finite and nonnegative")
     audio = args.audio.read_bytes()
     with wave.open(str(args.audio)) as wav:

@@ -15,12 +15,15 @@
 # limitations under the License.
 
 """Offline regeneration rejects stale exports before modifying installed images."""
+
 import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
 
-module_spec = importlib.util.spec_from_file_location("regen_cuda_standalone", Path(__file__).with_name("regen_cuda_standalone.py"))
+module_spec = importlib.util.spec_from_file_location(
+    "regen_cuda_standalone", Path(__file__).with_name("regen_cuda_standalone.py")
+)
 module = importlib.util.module_from_spec(module_spec)
 module_spec.loader.exec_module(module)
 
@@ -36,10 +39,14 @@ class StandaloneImagesTest(unittest.TestCase):
             data = b".visible .entry op() {}\n"
             (generated / "op.ptx").write_bytes(data)
             spec = dict(file="op.ptx", entry="op", family="test")
-            self.assertFalse(module.check_images([spec], generated, installed)[0]["identical"])
+            self.assertFalse(
+                module.check_images([spec], generated, installed)[0]["identical"]
+            )
             self.assertFalse((installed / "op.ptx").exists())
             module.check_images([spec], generated, installed, write=True)
-            self.assertTrue(module.check_images([spec], generated, installed)[0]["identical"])
+            self.assertTrue(
+                module.check_images([spec], generated, installed)[0]["identical"]
+            )
             self.assertEqual((installed / "op.ptx").read_bytes(), data)
 
     def test_bad_later_export_does_not_partially_publish(self):
@@ -57,11 +64,17 @@ class StandaloneImagesTest(unittest.TestCase):
     def test_extra_exports_and_path_escape_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "op.ptx").write_bytes(b".visible .entry op() {}\n.visible .entry extra() {}\n")
+            (root / "op.ptx").write_bytes(
+                b".visible .entry op() {}\n.visible .entry extra() {}\n"
+            )
             with self.assertRaisesRegex(ValueError, "exports changed"):
-                module.check_images([dict(file="op.ptx", entry="op", family="test")], root, root)
+                module.check_images(
+                    [dict(file="op.ptx", entry="op", family="test")], root, root
+                )
             with self.assertRaisesRegex(ValueError, "image path"):
-                module.check_images([dict(file="../op.ptx", entry="op", family="test")], root, root)
+                module.check_images(
+                    [dict(file="../op.ptx", entry="op", family="test")], root, root
+                )
 
 
 if __name__ == "__main__":
