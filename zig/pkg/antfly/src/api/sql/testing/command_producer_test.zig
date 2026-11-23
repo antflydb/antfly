@@ -361,7 +361,11 @@ test "SQL command producer native connection GC retains uncertain owners and nat
         defer a.free(empty.ids);
         try std.testing.expectEqual(@as(usize, 0), empty.ids.len);
     }
+    try native.until(&source, .idle, 2);
     try native.until(&source, .retired, 2000);
+    var registry = transactions.SessionRegistry.init(&source);
+    defer registry.deinit(a);
+    try connections.reconcileExpired(&source, &registry, a, 2001);
     _ = try connections.mutate(&source, .{ .create = .{ .id = @splat('c'), .principal = "alice", .owner_node_id = 0, .expires_at_ms = 3000, .database = "main", .namespace = "public" } }, "alice", 0, 2001);
     try std.testing.expectError(error.SqlConnectionNotFound, connections.load(&source, a, connection, "alice", 0, 0));
     try std.testing.expect((try producer.load(&source, a, connection)) == null);
@@ -421,13 +425,19 @@ test "SQL command producer native supervisor uses existing authenticated transpo
     defer a.free(bytes);
     try std.testing.expect(!sql_submitted);
     for (0..32) |_| {
-        if (try phase(&source) == .retired) break;
+        if (try producer.load(&source, a, connection)) |value| {
+            var owned = value;
+            defer owned.deinit();
+            if (owned.value.phase == .retired) break;
+        } else break;
         // The supervisor interval is a scheduling policy, not part of source
         // correctness. Drive its real callback without wall-clock sleeps.
         server.sql_command_work_due_ns = 0;
         try server.runSessionMaintenanceOnce();
     }
-    try std.testing.expectEqual(.retired, try phase(&source));
+    var retired = try nativeCut(&native, .{ .incarnation = @splat(0x11), .id = id(2), .fence = 1 }, null);
+    defer retired.deinit();
+    try std.testing.expectEqual(.retired, retired.value.scope.?.state);
     try std.testing.expect(native.calls < 32);
 }
 
