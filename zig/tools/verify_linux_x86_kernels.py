@@ -56,6 +56,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="antfly-x86-kernels-") as tmp:
         out = Path(tmp)
         cache = ["--cache-dir", out / "cache", "--global-cache-dir", out / "global"]
+        linalg_modules = [
+            "--dep", "antfly_tile",
+            f"-Mroot={source / 'mod.zig'}",
+            f"-Mantfly_tile={root / 'lib/tile/src/mod.zig'}",
+        ]
         for abi in ("gnu", "musl"):
             target = f"x86_64-linux-{abi}"
             obj = out / f"avx2-{abi}.o"
@@ -104,7 +109,6 @@ def main():
                 [
                     args.zig,
                     "test",
-                    source / "mod.zig",
                     obj,
                     "-target",
                     target,
@@ -114,6 +118,7 @@ def main():
                     "--test-no-exec",
                     f"-femit-bin={no_libc}",
                     *cache,
+                    *linalg_modules,
                 ]
             )
             result = run([no_libc])
@@ -126,7 +131,6 @@ def main():
                 [
                     args.zig,
                     "test",
-                    source / "mod.zig",
                     obj,
                     "-lc",
                     "-target",
@@ -137,6 +141,7 @@ def main():
                     "--test-no-exec",
                     f"-femit-bin={binary}",
                     *cache,
+                    *linalg_modules,
                 ]
             )
             for kernel in ("auto", "portable"):
