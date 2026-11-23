@@ -2658,7 +2658,11 @@ pub const Owner = struct {
             // saw those commits (`writer_reopen_pending`).
             if (fast_only and !self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and
                 !needsOutcomeReconciliation(current) and file.redo != null and
-                try refreshInPlace(current, file, probe))
+                (refreshInPlace(current, file, probe) catch |err| {
+                    // An earlier scope may already have installed its delta.
+                    self.foreground_runtime_stale = true;
+                    return err;
+                }))
             {
                 if (comptime h.builtin.is_test) _ = self.test_in_place_refresh_count.fetchAdd(1, .release);
                 self.writer_reopen_pending = true;
@@ -2956,16 +2960,25 @@ pub const Owner = struct {
             defer freeKeys(changed);
             for (changed) |key| if (!routineDocumentKey(key)) return false;
         }
-        var scopes = std.StringArrayHashMapUnmanaged(void).empty;
-        defer scopes.deinit(alloc);
-        const changed = try shared.changedKeysAfterAlloc(alloc, io, @backingInt(Root.index), since, origin);
-        defer freeKeys(changed);
+        const Catalog = @import("../storage/native_catalog_backend.zig");
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var scopes = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(Catalog.Mutation)).empty;
+        const changed = try shared.changedKeysAfterAlloc(scratch, io, @backingInt(Root.index), since, origin);
         for (changed) |key| {
             const scope = nativeCatalogScopeOf(key) orelse return false;
-            try scopes.put(alloc, scope, {});
+            const record = key["\x00ncat/".len + scope.len + 1 ..];
+            const separator = std.mem.indexOfScalar(u8, record, 0) orelse return false;
+            const slot = try scopes.getOrPut(scratch, scope);
+            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            try slot.value_ptr.append(scratch, .{
+                .namespace = if (separator == 0) null else record[0..separator],
+                .key = record[separator + 1 ..],
+            });
         }
-        for (scopes.keys()) |scope| {
-            var refreshed = switch (try root.db.core.index_manager.refreshIndexScopeFromTip(scope)) {
+        for (scopes.keys(), scopes.values()) |scope, scope_keys| {
+            var refreshed = switch (try root.db.core.index_manager.refreshIndexScopeFromTip(scope, scope_keys.items)) {
                 .refreshed => true,
                 .reopen => return false,
                 .not_loaded => false,
@@ -2973,7 +2986,7 @@ pub const Owner = struct {
             var tables = root.embedded_tables.valueIterator();
             while (!refreshed) {
                 const table = tables.next() orelse break;
-                refreshed = switch (try table.*.db.core.index_manager.refreshIndexScopeFromTip(scope)) {
+                refreshed = switch (try table.*.db.core.index_manager.refreshIndexScopeFromTip(scope, scope_keys.items)) {
                     .refreshed => true,
                     .reopen => return false,
                     .not_loaded => false,

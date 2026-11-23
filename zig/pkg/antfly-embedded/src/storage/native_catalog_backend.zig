@@ -741,6 +741,21 @@ pub const Backend = struct {
         }
     }
 
+    /// Replace only the mirror records named by the caller's complete delta.
+    pub fn refreshCommittedKeys(self: *Backend, keys: []const Mutation) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const mutations = try alloc.dupe(Mutation, keys);
+        const values = try alloc.alloc(?[]const u8, keys.len);
+        try self.loadCommittedValues(alloc, keys, values);
+        for (mutations, values) |*mutation, value| {
+            mutation.value = value orelse "";
+            mutation.is_delete = value == null;
+        }
+        try self.applyExternallyCommittedMutations(mutations);
+    }
+
     pub fn freeEntries(allocator: Allocator, entries: []Entry) void {
         ScopeDeletes.freeLoaded(allocator, entries);
     }

@@ -2193,6 +2193,88 @@ pub const PersistentIndex = struct {
         }
     }
 
+    /// Ordinary peer publications touch only level-0 segments and their
+    /// version records. Structural changes use the complete refresh path.
+    pub fn refreshChangedFromTip(self: *PersistentIndex, changed: []const native_catalog_backend.Mutation) !void {
+        if (!self.versioned or self.inline_in_flight.load(.acquire) != 0) return error.UnsupportedRefresh;
+        if (self.read_only) return self.refreshFromTip();
+        const backend = switch (self.main_store_owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var keys = std.ArrayListUnmanaged(native_catalog_backend.Mutation).empty;
+        for (changed) |key| {
+            const namespace = key.namespace orelse return self.refreshFromTip();
+            if (std.mem.eql(u8, namespace, native_catalog_backend.tip_namespace)) continue;
+            if (!std.mem.eql(u8, namespace, dead_namespace) and
+                !std.mem.eql(u8, namespace, l0_namespace) and
+                !(std.mem.eql(u8, namespace, runtimeNamespace(.meta).name.?) and std.mem.eql(u8, key.key, projection_seal.metadata_key)))
+                return self.refreshFromTip();
+            try keys.append(alloc, key);
+        }
+        if (keys.items.len == 0) return;
+
+        const values = try alloc.alloc(?[]const u8, keys.items.len);
+        try backend.loadCommittedValues(alloc, keys.items, values);
+        for (keys.items, values) |*key, value| {
+            if (value == null) return self.refreshFromTip();
+            key.value = value.?;
+        }
+
+        self.lockStorage();
+        defer self.unlockStorage();
+        var read = try self.beginReadMainTxn();
+        defer read.abort();
+        var newly_dead = std.ArrayListUnmanaged(u64).empty;
+        for (keys.items) |key| {
+            if (!std.mem.eql(u8, key.namespace.?, dead_namespace)) continue;
+            if (key.key.len != 4) return error.InvalidDeadVersions;
+            const high = @as(u64, std.mem.readInt(u32, key.key[0..4], .big)) << 32;
+            const previous = read.get(.dead, key.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            var before = if (previous) |bytes| try roaring.RoaringBitmap.fromBytes(alloc, bytes) else roaring.RoaringBitmap.init(alloc);
+            defer before.deinit();
+            var after = try roaring.RoaringBitmap.fromBytes(alloc, key.value);
+            defer after.deinit();
+            after.andNotWith(&before);
+            var it = after.iterator();
+            while (it.next()) |low| try newly_dead.append(alloc, high | low);
+        }
+
+        for (keys.items) |key| {
+            if (!std.mem.eql(u8, key.namespace.?, l0_namespace)) continue;
+            if (key.key.len != 8) return error.InvalidLevel0Segment;
+            const expected_id = l0SegmentId(std.mem.readInt(u64, key.key[0..8], .big));
+            const present = present: {
+                const current_snapshot = self.writer.acquireSnapshot();
+                defer current_snapshot.release();
+                for (current_snapshot.segments) |segment| {
+                    if (segment.id == expected_id) break :present true;
+                }
+                break :present false;
+            };
+            if (present) continue;
+
+            const bytes = try self.alloc.dupe(u8, key.value);
+            var publication = self.prepareInlineSegmentPublication(bytes) catch |err| {
+                self.alloc.free(bytes);
+                return err;
+            };
+            if (publication.seg_id != expected_id) {
+                publication.abort(self.alloc);
+                return error.InvalidLevel0Segment;
+            }
+            try self.installInlineSegmentPublication(&publication);
+        }
+        if (newly_dead.items.len != 0) try self.installDeadVersionsOrError(newly_dead.items);
+        try backend.applyExternallyCommittedMutations(keys.items);
+    }
+
     /// Brings this process's view up to the index as committed, after
     /// another process committed under its scope: reloads the
     /// native-catalog mirror, publishes the segments and level-0 records
@@ -9363,4 +9445,46 @@ test "persistent index refreshes another writer's segments, rewrites and merges 
     try std.testing.expectEqual(@as(usize, 1), snap.segments.len);
     try std.testing.expect(std.mem.indexOfScalar(u64, ids.items, snap.segments[0].id) == null);
     try std.testing.expectEqual(@as(u32, 1), snap.liveDocCount());
+}
+
+test "persistent index applies peer level-0 and dead bucket deltas" {
+    const alloc = std.testing.allocator;
+    var sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer sink.deinit(alloc);
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    var index = try openVersionedTestIndex(alloc, &sink, path);
+    defer index.close();
+
+    const older = try DocVersion.of(1, 0);
+    const newer = try DocVersion.of(2, 0);
+    const old_key = l0Key(l0SegmentId(older));
+    const new_key = l0Key(l0SegmentId(newer));
+    const first = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:a", .term = "alpha", .version = older }});
+    defer alloc.free(first);
+    const second = try buildVersionedSegment(alloc, &.{.{ .doc_id = "doc:a", .term = "beta", .version = newer }});
+    defer alloc.free(second);
+
+    try sink.foreignPut(l0_namespace, &old_key, first);
+    try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(older));
+    try index.refreshChangedFromTip(&.{.{ .namespace = l0_namespace, .key = &old_key }});
+
+    var dead = roaring.RoaringBitmap.init(alloc);
+    defer dead.deinit();
+    try dead.add(@truncate(older));
+    const dead_bytes = try dead.toBytes(alloc);
+    defer alloc.free(dead_bytes);
+    const dead_key = deadKey(@intCast(older >> 32));
+    try sink.foreignPut(dead_namespace, &dead_key, dead_bytes);
+    try sink.foreignPut(l0_namespace, &new_key, second);
+    try sink.foreignPut(native_catalog_backend.tip_namespace, "doc:a", &DocVersion.encode(newer));
+    try index.refreshChangedFromTip(&.{
+        .{ .namespace = dead_namespace, .key = &dead_key },
+        .{ .namespace = l0_namespace, .key = &new_key },
+    });
+    const snapshot = index.writer.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.segments.len);
+    try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
 }

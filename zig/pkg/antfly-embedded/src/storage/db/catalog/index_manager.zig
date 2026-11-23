@@ -17296,7 +17296,7 @@ pub const IndexManager = struct {
     /// Refreshes the loaded index whose native-catalog scope is `scope`
     /// from the file, under that index's apply guard. Versioned full-text
     /// and sparse indexes refresh in place; other kinds reopen.
-    pub fn refreshIndexScopeFromTip(self: *IndexManager, scope: []const u8) !ScopeRefresh {
+    pub fn refreshIndexScopeFromTip(self: *IndexManager, scope: []const u8, keys: []const @import("../../native_catalog_backend.zig").Mutation) !ScopeRefresh {
         const name = name: {
             self.catalog_mutex.lockShared();
             defer self.catalog_mutex.unlockShared();
@@ -17311,7 +17311,7 @@ pub const IndexManager = struct {
                 if (!std.mem.eql(u8, owned, scope)) continue;
                 const name = try self.alloc.dupe(u8, entry.config.name);
                 defer self.alloc.free(name);
-                return self.refreshSparseIndexFromTipCatalogLocked(name);
+                return self.refreshSparseIndexFromTipCatalogLocked(name, keys);
             }
             return .not_loaded;
         };
@@ -17319,7 +17319,7 @@ pub const IndexManager = struct {
         var guard = try self.lockManagedIndexApply(.{ .name = name, .kind = .full_text });
         defer guard.unlock();
         const entry = self.textIndexEntry(name) orelse return .reopen;
-        entry.persistent.refreshFromTip() catch |err| switch (err) {
+        entry.persistent.refreshChangedFromTip(keys) catch |err| switch (err) {
             error.UnsupportedRefresh => return .reopen,
             else => return err,
         };
@@ -17327,11 +17327,11 @@ pub const IndexManager = struct {
     }
 
     /// Caller holds the catalog shared; this takes the index's own mutex.
-    fn refreshSparseIndexFromTipCatalogLocked(self: *IndexManager, name: []const u8) !ScopeRefresh {
+    fn refreshSparseIndexFromTipCatalogLocked(self: *IndexManager, name: []const u8, keys: []const @import("../../native_catalog_backend.zig").Mutation) !ScopeRefresh {
         const entry = self.sparseIndex(name) orelse return .reopen;
         self.lockAtomicWithBackoff(entry.apply_mutex);
         defer entry.apply_mutex.unlock();
-        entry.index.refreshFromTip() catch |err| switch (err) {
+        entry.index.refreshChangedFromTip(keys) catch |err| switch (err) {
             error.UnsupportedRefresh => return .reopen,
             else => return err,
         };

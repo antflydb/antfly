@@ -2773,6 +2773,19 @@ pub const SparseIndex = struct {
             else => return error.UnsupportedRefresh,
         };
         try backend.reloadMirror();
+        try self.refreshCounters();
+    }
+
+    pub fn refreshChangedFromTip(self: *SparseIndex, keys: []const native_catalog_backend.Mutation) !void {
+        const backend = switch (self.owner) {
+            .native_catalog => |backend| backend,
+            else => return error.UnsupportedRefresh,
+        };
+        try backend.refreshCommittedKeys(keys);
+        try self.refreshCounters();
+    }
+
+    fn refreshCounters(self: *SparseIndex) !void {
         var txn = try self.store.beginRead();
         defer txn.abort();
         const Counter = struct {
