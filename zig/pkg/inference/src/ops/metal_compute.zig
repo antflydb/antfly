@@ -22918,10 +22918,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         // Quote every wrapper before touching the SDK. A denied host
         // reservation leaves both the old arena and the driver untouched.
-        var wrapper_bytes = persistentTensorBytes(1);
-        for (plan.nodes[0..plan.count]) |*node| if (try plan.arena_recipe.workspaceView(node, .separate)) |view| {
-            wrapper_bytes = try std.math.add(usize, wrapper_bytes, persistentTensorBytes(view.shape.len));
-        };
+        const counts = try plan.arenaViewCounts(plan.arena_recipe, false, .separate);
+        const wrapper_bytes = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, counts.workspaces, persistentTensorBytes(2)));
         const bank = (try self.metalAudioArenaBank(&staged, bytes, wrapper_bytes)) orelse return error.AudioScheduleAdmission;
         staged_bank = try wrapOwnedMetalPersistentTensor(bank);
         for (plan.nodes[0..plan.count], 0..) |*node, i| if (try plan.arena_recipe.workspaceView(node, .separate)) |region| {
@@ -23063,17 +23061,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Preserve the previous output-bank eligibility and admission fallback.
         // Optional clamp scratch must not evict an otherwise fitting bank.
         if (recipe.initialBank(plan.workspaces.len, plan.count, audio_schedule_bank_limit)) |request| {
-            var output_headers = persistentTensorBytes(1);
-            var scratch_headers: usize = 0;
-            for (plan.nodes[0..plan.count]) |*node| {
-                if (try recipe.outputView(node)) |region| {
-                    if (plan.storage.outputs.len != 0 and !plan.linear_only)
-                        output_headers = try std.math.add(usize, output_headers, persistentTensorBytes(region.shape.len));
-                }
-                if (request.workspace_bytes != 0) if (try recipe.workspaceView(node, .combined)) |region| {
-                    scratch_headers = try std.math.add(usize, scratch_headers, persistentTensorBytes(region.shape.len));
-                };
-            }
+            const view_counts = try plan.arenaViewCounts(recipe, true, if (request.workspace_bytes == 0) null else .combined);
+            const view_bytes = persistentTensorBytes(2);
+            const output_headers = try std.math.add(usize, persistentTensorBytes(1), try std.math.mul(usize, view_counts.outputs, view_bytes));
+            const scratch_headers = try std.math.mul(usize, view_counts.workspaces, view_bytes);
             var workspace_bytes = request.workspace_bytes;
             var bytes = request.bytes;
             const headers = try std.math.add(usize, output_headers, scratch_headers);

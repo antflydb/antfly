@@ -462,14 +462,15 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub fn dropAudioSchedule(self: *MetalNativeProvider, index: usize) usize {
         const entry = &self.audio_schedules[index];
         const plan = entry.* orelse return 0;
-        const bytes = plan.storage.host_bytes + plan.storage.backend_bytes;
-        plan.deinit();
-        if (self.embeddinggemma2_cache_admission) |cache| {
-            plan.storage.refundLocked(cache);
-        }
-        std.heap.c_allocator.destroy(plan);
+        const charges = @import("../execution/prepared_tensor_storage.zig").Storage{
+            .host_bytes = plan.storage.host_bytes,
+            .backend_bytes = plan.storage.backend_bytes,
+        };
         entry.* = null;
-        return bytes;
+        plan.deinit();
+        std.heap.c_allocator.destroy(plan);
+        if (self.embeddinggemma2_cache_admission) |cache| charges.refundLocked(cache);
+        return charges.host_bytes + charges.backend_bytes;
     }
 
     fn clearAudioSchedules(self: *MetalNativeProvider) usize {

@@ -238,6 +238,13 @@ pub const Plan = struct {
             std.heap.c_allocator.free(self.nodes);
             std.heap.c_allocator.free(self.constants);
             std.heap.c_allocator.free(views);
+            self.nodes = &.{};
+            self.constants = &.{};
+            self.storage.outputs = &.{};
+            self.workspaces = &.{};
+            self.metadata_views = null;
+            self.count = 0;
+            self.constant_count = 0;
         }
     }
     pub fn dropPrepared(self: *Plan) void {
@@ -367,7 +374,9 @@ pub const Plan = struct {
             return try view(offset, self.outputs_bytes, dims.rows, dims.out_dim);
         }
 
-        pub fn workspaceView(self: ArenaLayout, node: *const Node, placement: enum { combined, separate }) !?View {
+        pub const WorkspacePlacement = enum { combined, separate };
+
+        pub fn workspaceView(self: ArenaLayout, node: *const Node, placement: WorkspacePlacement) !?View {
             const shape = node.inputWorkspaceShape() orelse return null;
             return switch (placement) {
                 .combined => try view(self.outputs_bytes, self.total_bytes, shape.rows, shape.width),
@@ -375,6 +384,26 @@ pub const Plan = struct {
             };
         }
     };
+
+    pub const ArenaViewCounts = struct {
+        outputs: usize = 0,
+        workspaces: usize = 0,
+    };
+
+    /// Quote host headers using the same verified layout as publication.
+    /// A separate upgrade never reserves the existing output views again.
+    pub fn arenaViewCounts(self: *const Plan, recipe: ArenaLayout, outputs: bool, workspace: ?ArenaLayout.WorkspacePlacement) !ArenaViewCounts {
+        if (self.count > self.nodes.len) return error.AudioScheduleInvalid;
+        var counts: ArenaViewCounts = .{};
+        for (self.nodes[0..self.count]) |*node| {
+            if (outputs and self.storage.outputs.len != 0 and !self.linear_only and (try recipe.outputView(node)) != null)
+                counts.outputs += 1;
+            if (workspace) |placement| {
+                if ((try recipe.workspaceView(node, placement)) != null) counts.workspaces += 1;
+            }
+        }
+        return counts;
+    }
 
     /// Serialized projections share one disjoint scratch tail. Both fused and
     /// unfused paths are funded before replay; no clamp temporary is implicit.
@@ -852,6 +881,8 @@ test "learned audio metadata requires the exact reservation before publishing vi
     try std.testing.expectEqual(@as(usize, 1), plan.workspaces.len);
     try std.testing.expect(plan.storage.outputs[0] == null and plan.workspaces[0] == null);
     try std.testing.expectError(error.AudioScheduleInvalid, plan.freezeLearnedMetadata(bytes));
+    plan.deinit();
+    try std.testing.expect(plan.metadata_views == null and plan.nodes.len == 0 and plan.workspaces.len == 0);
 }
 
 test "embeddinggemma2 audio arena randomized lifetimes never overlap live outputs" {
