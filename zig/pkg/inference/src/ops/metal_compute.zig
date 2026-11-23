@@ -934,6 +934,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn ownsMetadataIndex(self: *MetalCompute) bool {
         const scope = current_metadata_index_scope orelse return false;
         const token = scope.token orelse return false;
+        if (token.vtable == &decoder_metadata_vtable) {
+            token.validate(.{ .implementation = .{ .context = self, .table = &vtable_impl }, .program = null, .mode = .metadata }) catch return false;
+            return true;
+        }
         if (token.vtable != &operation_vtable or token.mode != .metadata) return false;
         const snapshot = operationRecord(token.context, token.nonce) catch return false;
         if (!snapshot.entered or snapshot.source.context != @as(*anyopaque, @ptrCast(self)) or
@@ -1179,36 +1183,76 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try lease.begin(.{ .implementation = lease.implementation, .program = null, .mode = .managed });
         self.engine_operation = lease;
     }
-    /// Cold planning holds the request's provider lease, but needs a separate
-    /// metadata operation to acquire the slot index. Reopen the numerical
-    /// operation before returning to the same request with its pinned slots.
-    pub const ColdEnginePause = struct {
-        compute: ?*MetalCompute = null,
+    fn validateDecoderMetadata(raw: *anyopaque, nonce: u64, request: operation_mod.Request) !void {
+        const active = current_metadata_index_scope orelse return error.BackendOperationInactive;
+        const expected = active.token orelse return error.BackendOperationInactive;
+        if (raw != expected.context or nonce != expected.nonce or expected.vtable != &decoder_metadata_vtable) return error.BackendOperationInactive;
+        if (request.mode != .metadata or request.implementation.context != raw or
+            (request.program != null and request.program != active.program)) return error.BackendOperationChanged;
+        const parent = active.parent orelse return error.BackendOperationInactive;
+        try parent.validate(.{ .implementation = request.implementation, .program = active.program, .mode = .managed });
+    }
 
-        pub fn begin(cb: *const ops.ComputeBackend) !ColdEnginePause {
-            if (!operationAccepts(cb.vtable)) return error.UnsupportedDenseSchedule;
-            const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-            if (self.engine_borrowed_operation != null or self.engine_cleanup_finish != null or self.audio_capture != null)
-                return error.UnsupportedDenseSchedule;
-            var owned = self.engine_operation orelse return .{};
-            if (!self.owned_native_provider and self.shared_provider_lease_io == null) return error.UnsupportedDenseSchedule;
-            const token = owned.borrow() orelse return error.UnsupportedDenseSchedule;
-            if (try token.retainCleanupEpoch()) |epoch| {
-                var held = epoch;
-                held.release();
-                return error.UnsupportedDenseSchedule;
+    const decoder_metadata_vtable: operation_mod.Lease.VTable = .{
+        .validate = validateDecoderMetadata,
+        .validate_active = validateDecoderMetadata,
+        .begin = struct {
+            fn reject(_: *anyopaque, _: u64, _: operation_mod.Request) !void {
+                return error.BackendOperationChanged;
             }
-            const runtime = self.provider_impl.raw_decode_runtime;
-            if (metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime)) return error.UnsupportedDenseSchedule;
-            self.engine_operation = null;
-            try owned.finish();
-            return .{ .compute = self };
+        }.reject,
+        .finish = rejectMetadataLease,
+        .drain = rejectMetadataLease,
+        .release = struct {
+            fn reject(_: *anyopaque, _: u64) void {
+                unreachable;
+            }
+        }.reject,
+    };
+    fn rejectMetadataLease(_: *anyopaque, _: u64) !void {
+        return error.BackendOperationChanged;
+    }
+
+    /// Same-thread metadata authority over an independently locked slot index.
+    /// The parent operation stays live through planning and keeps its original
+    /// gate, cleanup epoch and provider identity.
+    pub const DecoderMetadataScope = struct {
+        held: ?operation_mod.Borrowed = null,
+        standalone: operation_mod.Scope = .{},
+
+        pub fn beginInto(self: *DecoderMetadataScope, cb: *const ops.ComputeBackend, graph: *const ml.graph.Graph) !void {
+            if (!operationAccepts(cb.vtable)) return error.UnsupportedDenseSchedule;
+            const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            const parent = cb.operationToken() orelse {
+                try operation_mod.enterInto(cb, graph, null, .metadata, &self.standalone);
+                return;
+            };
+            const request = operation_mod.Request{ .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph, .mode = .managed };
+            try parent.validate(request);
+            if (!DenseProjectionProfile.noFrame(compute) or compute.metadata_index_scope.token != null) return error.UnsupportedDenseSchedule;
+            if (!compute.provider_impl.linear_slot_index_mutex.tryLock()) return error.QueueFull;
+            compute.metadata_index_scope = .{
+                .token = .{ .context = cb.ptr, .nonce = nextPreparedValueIdentity(), .mode = .metadata, .vtable = &decoder_metadata_vtable },
+                .parent = parent,
+                .program = graph,
+                .previous = current_metadata_index_scope,
+            };
+            current_metadata_index_scope = &compute.metadata_index_scope;
+            self.held = compute.metadata_index_scope.token;
         }
 
-        pub fn reopen(self: *ColdEnginePause) !void {
-            const compute = self.compute orelse return;
-            self.compute = null;
-            try compute.beginEngineOperation();
+        pub fn token(self: *const DecoderMetadataScope) ?operation_mod.Borrowed {
+            return self.held orelse self.standalone.token();
+        }
+
+        pub fn deinitChecked(self: *DecoderMetadataScope) !void {
+            if (self.held) |held| {
+                const compute: *MetalCompute = @ptrCast(@alignCast(held.context));
+                try compute.leaveMetadataIndexScope(held.context, held.nonce);
+                compute.provider_impl.linear_slot_index_mutex.unlock();
+                self.held = null;
+            }
+            try self.standalone.deinitChecked();
         }
     };
 
@@ -56089,7 +56133,8 @@ const PreparedDenseRegionFixture = struct {
                 var scope: operation.Scope = .{};
                 defer scope.deinitChecked() catch unreachable;
                 const engine = cb.operationToken() orelse return error.ExpectedExplicitEngineOperation;
-                try std.testing.expect(prior_engine.context != engine.context or prior_engine.nonce != engine.nonce);
+                try std.testing.expectEqual(prior_engine.context, engine.context);
+                try std.testing.expectEqual(prior_engine.nonce, engine.nonce);
                 try operation.enterInto(&cb, graph, engine, .managed, &scope);
                 const cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = scope.token() };
                 const frame = (try private.pool.acquirePrivateDecoderFrame(null, scope.token())) orelse return error.MissingPhysicalPool;
@@ -57675,6 +57720,20 @@ test "Metal operation borrow proves shared provider across cached computes and r
     defer foreign.deinit(a);
     const foreign_cb = foreign.computeBackend();
     try std.testing.expectError(error.BackendOperationChanged, operation.enter(foreign_cb, null, token, .managed));
+    try cached.adoptEngineBorrowedOperation(token);
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var metadata: MetalCompute.DecoderMetadataScope = .{};
+    defer metadata.deinitChecked() catch unreachable;
+    try metadata.beginInto(&cached_cb, &graph);
+    const view = metadata.token() orelse return error.BackendOperationUnavailable;
+    try std.testing.expect(cached.ownsMetadataIndex());
+    try std.testing.expect(!compute.ownsMetadataIndex());
+    try std.testing.expectError(error.BackendOperationChanged, operation.enter(foreign_cb, &graph, view, .metadata));
+    try std.testing.expectError(error.BackendOperationChanged, operation.call(cached_cb, view, ops.ComputeBackend.add, .{ &cached_cb, input, input }));
+    try metadata.deinitChecked();
+    try std.testing.expectError(error.BackendOperationInactive, operation.enter(cached_cb, &graph, view, .metadata));
+    try std.testing.expect(!cached.ownsMetadataIndex());
     cached_cb.free(result);
     result_owned = false;
     cached.deinit();
