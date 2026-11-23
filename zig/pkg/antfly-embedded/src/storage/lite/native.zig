@@ -1385,7 +1385,8 @@ test "lite reader failed full snapshot capture preserves another pin at the same
     writer.reader_coordinator = &coordinator;
     try writer.putDocument("keep", "value");
     var snapshot = try writer.captureFullReadSnapshot();
-    defer snapshot.close();
+    var snapshot_live = true;
+    defer if (snapshot_live) snapshot.close();
 
     const entry = writer.inode_lock_ref.load(.acquire).?;
     const sequence = writer.activeCheckpoint().commit_sequence;
@@ -1393,6 +1394,16 @@ test "lite reader failed full snapshot capture preserves another pin at the same
     try std.testing.expectError(error.OutOfMemory, writer.captureFullReadSnapshot());
     try std.testing.expectEqual(@as(?u64, sequence), inode_lock.minimumReaderSequence(entry, io));
     try std.testing.expectEqual(@as(?u64, sequence), inode_lock.minimumMetadataReaderSequence(entry, io));
+
+    snapshot.close();
+    snapshot_live = false;
+    try std.testing.expectError(error.OutOfMemory, NativeFile.openWithIo(allocator, io, path, .{
+        .read_only = true,
+        .reader_coordinator = &coordinator,
+        .pin_read_checkpoint = true,
+    }));
+    try std.testing.expectEqual(@as(?u64, null), inode_lock.minimumReaderSequence(entry, io));
+    try std.testing.expectEqual(@as(?u64, null), inode_lock.minimumMetadataReaderSequence(entry, io));
 }
 
 test "issue1362 full snapshots retain allocator metadata while same-owner writers reuse pages" {
@@ -7647,19 +7658,30 @@ pub const NativeFile = struct {
         // entirely -- exactly the error `restore_staging.zig`'s own
         // reopen-and-retry loop (and any other caller that already
         // handles a stale-snapshot reopen) already expects.
+        errdefer {
+            if (result.reader_pin_entry) |entry| {
+                const sequence = result.reader_pin_sequence;
+                inode_lock.unpinReader(entry, io, .{ .data = sequence, .metadata = sequence });
+            }
+            if (result.open_time_overlay_pin_mark) |mark| {
+                if (result.redo) |*redo| redo.shared.unpin(io, mark);
+            }
+        }
         if (opts.pin_read_checkpoint) {
             std.debug.assert(opts.read_only);
             const checkpoint = result.activeCheckpoint();
             const mark = result.readMark(checkpoint);
-            if (result.redo) |*redo| try redo.shared.pinUnlessReclaimed(std.heap.page_allocator, io, mark, checkpoint.commit_sequence);
-            errdefer if (result.redo) |*redo| redo.shared.unpin(io, mark);
+            if (result.redo) |*redo| {
+                try redo.shared.pinUnlessReclaimed(std.heap.page_allocator, io, mark, checkpoint.commit_sequence);
+                result.open_time_overlay_pin_mark = mark;
+            }
             if (result.inode_lock_ref.load(.acquire)) |entry| {
                 try inode_lock.pinReader(entry, io, .{ .data = checkpoint.commit_sequence, .metadata = checkpoint.commit_sequence });
+                result.reader_pin_entry = entry;
+                result.reader_pin_sequence = checkpoint.commit_sequence;
             }
-            result.reader_pin_entry = result.inode_lock_ref.load(.acquire);
-            result.reader_pin_sequence = checkpoint.commit_sequence;
-            result.open_time_overlay_pin_mark = mark;
         }
+        errdefer if (result.reader_fence) |fence| opts.reader_coordinator.?.unregister(fence);
         if (plain_reader) {
             // Register with the coordinator *before* acquiring the
             // registry grant below, so `blocks_exclusive` reflects whether
@@ -7679,7 +7701,6 @@ pub const NativeFile = struct {
                 const region = try result.regionForInode();
                 result.reader_fence = try coordinator.registerFull(file, region, result.dataIdentity() orelse return error.InvalidTransactionState, result.metadataReuseFrontier(), result.headerFingerprint());
             }
-            errdefer if (result.reader_fence) |fence| opts.reader_coordinator.?.unregister(fence);
             const blocks_exclusive = if (result.reader_fence) |fence| fence.slot == null else true;
             // Preserves the kernel-level protection a plain reader held
             // for its whole lifetime before (`openDataFile`'s old atomic
