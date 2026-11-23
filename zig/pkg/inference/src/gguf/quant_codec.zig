@@ -1183,6 +1183,15 @@ pub fn quantizeQ4_KFromF32(allocator: std.mem.Allocator, input: []const f32) ![]
 }
 
 pub fn quantizeQ4_KBlock(input: []const f32, output: []u8) void {
+    encodeQ4KBlock(input, output, true);
+}
+
+/// Range fit for latency-sensitive model loading.
+pub fn quantizeQ4_KBlockFast(input: []const f32, output: []u8) void {
+    encodeQ4KBlock(input, output, false);
+}
+
+fn encodeQ4KBlock(input: []const f32, output: []u8, comptime weighted_fit: bool) void {
     std.debug.assert(input.len == tensor_types.valuesPerBlock(.{ .known = .Q4_K }).?);
     std.debug.assert(output.len == tensor_types.bytesPerBlock(.{ .known = .Q4_K }).?);
 
@@ -1190,7 +1199,7 @@ pub fn quantizeQ4_KBlock(input: []const f32, output: []u8) void {
     var max_scale: f32 = 0;
     var max_offset: f32 = 0;
     for (&fits, 0..) |*fit, sub| {
-        fit.* = fitQ4KGroup(input[sub * 32 ..][0..32]);
+        fit.* = fitQ4KGroup(input[sub * 32 ..][0..32], weighted_fit);
         max_scale = @max(max_scale, fit.scale);
         max_offset = @max(max_offset, -fit.minimum);
     }
@@ -1218,10 +1227,14 @@ pub fn quantizeQ4_KBlock(input: []const f32, output: []u8) void {
         const high_scale = block_scale * @as(f32, @floatFromInt(scales[high]));
         const low_offset = block_offset * @as(f32, @floatFromInt(offsets[low]));
         const high_offset = block_offset * @as(f32, @floatFromInt(offsets[high]));
+        const low_inverse = if (low_scale > 0) 1.0 / low_scale else 0;
+        const high_inverse = if (high_scale > 0) 1.0 / high_scale else 0;
         for (output[16 + pair * 32 ..][0..32], 0..) |*byte, i| {
-            const lo = if (low_scale > 0) roundQ4KCode((input[low * 32 + i] + low_offset) / low_scale, 15) else 0;
-            const hi = if (high_scale > 0) roundQ4KCode((input[high * 32 + i] + high_offset) / high_scale, 15) else 0;
-            byte.* = lo | (hi << 4);
+            const low_value = input[low * 32 + i] + low_offset;
+            const high_value = input[high * 32 + i] + high_offset;
+            const lo = if (weighted_fit and low_scale > 0) low_value / low_scale else low_value * low_inverse;
+            const hi = if (weighted_fit and high_scale > 0) high_value / high_scale else high_value * high_inverse;
+            byte.* = roundQ4KCode(lo, 15) | (roundQ4KCode(hi, 15) << 4);
         }
     }
 }
@@ -1239,18 +1252,18 @@ fn roundQ4KCode(value: f32, comptime limit: u8) u8 {
 
 // Use the unweighted-quantization reference strategy from ggml: weight each
 // sample by its magnitude plus the group's RMS, then fit legal affine grids.
-fn fitQ4KGroup(input: *const [32]f32) Q4KFit {
+fn fitQ4KGroup(input: *const [32]f32, comptime weighted_fit: bool) Q4KFit {
     var squared_sum: f32 = 0;
     var minimum = input[0];
     var maximum = input[0];
     for (input) |value| {
-        squared_sum += value * value;
+        if (weighted_fit) squared_sum += value * value;
         minimum = @min(minimum, value);
         maximum = @max(maximum, value);
     }
     minimum = @min(minimum, 0);
     const range = maximum - minimum;
-    if (range == 0) return .{ .scale = 0, .minimum = minimum };
+    if (!weighted_fit or range == 0) return .{ .scale = range / 15.0, .minimum = minimum };
 
     const rms = @sqrt(squared_sum / 32.0);
     var weights: [32]f32 = undefined;
