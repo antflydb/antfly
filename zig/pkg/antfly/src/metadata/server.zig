@@ -1558,11 +1558,7 @@ fn metadataStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, gr
 
 fn metadataStoreRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const stores = try svc.listProjectedStores(svc.alloc);
-    defer svc.freeProjectedStores(svc.alloc, stores);
-    const store = storeForNode(stores, node_id) orelse return null;
-    if (store.api_url.len == 0) return null;
-    return try alloc.dupe(u8, store.api_url);
+    return svc.projectedStoreEndpoint(alloc, node_id);
 }
 
 fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: api_table_router.RouteBudget) !?[]u8 {

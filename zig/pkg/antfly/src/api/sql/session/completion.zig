@@ -16,6 +16,7 @@
 // Consumer-owned completion references. Receipts preserve uncertain registration
 // identities; acknowledgements follow the consumer's durable decision.
 const std = @import("std");
+const http_common = @import("../../../raft/transport/http_common.zig");
 const wire = @import("../../../pgwire/completion.zig");
 const server_mod = @import("../../http_server.zig");
 const operation = @import("antfly_local_sources").api_operation;
@@ -105,7 +106,11 @@ pub fn reserveJoined(server: *server_mod.ApiHttpServer, completion: *wire.Comple
 // Persist the issuer intent and the target proof before the coordinator may
 // seal its plan. A failed/ambiguous preparation never admits the mutation.
 pub fn prepareTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
-    try registerTransaction(server, alloc, completion, id, false, null);
+    try prepareTransactionControlled(server, alloc, completion, id, .{});
+}
+
+pub fn prepareTransactionControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8, context: operation.RequestContext) !void {
+    try registerTransaction(server, alloc, completion, id, false, context);
 }
 
 pub fn observeTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, completion: *wire.Completion, id: [16]u8) !void {
@@ -123,7 +128,7 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
     const store = try registrationStoreControlled(server, context);
     for (completion.outcomes.items) |outcome| if (outcome.transaction_id) |old| {
         if (!std.mem.eql(u8, old, &encoded_id) or outcome.registration_node_id == null) continue;
-        var record = (try store.loadRegistration(alloc, try parseId(outcome.reference_id.?))) orelse continue;
+        var record = (try store.loadRegistrationControlled(alloc, try parseId(outcome.reference_id.?), context)) orelse continue;
         defer record.deinit();
         if (record.value.prepared and !record.value.joined) {
             if (!record.value.execution_admitted) return error.CompletionUnavailable;
@@ -145,7 +150,7 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
     errdefer if (outcome.reference_id == null) alloc.free(encoded);
     const local_node = if (server.cfg.session_router) |router| router.localNodeId() else 0;
     const existing = if (observe_only) try store.existingObservationReferenceControlled(id, context, control != null) else null;
-    var local = true;
+    var owner_node = local_node;
     const reference = existing orelse fresh: {
         var read = if (observe_only)
             server.acquireSqlExecution(false) catch |err| {
@@ -155,28 +160,30 @@ fn registerTransaction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocat
         else
             null;
         defer if (read) |*lease| lease.release();
-        local = server.txn_sessions.durable_scope == .cluster_shared or
-            ((try server.txn_sessions.getOwnerNodeId(alloc, id)) orelse @import("../../transactions.zig").sessionOwnerNodeId(id)) == local_node;
+        if (server.txn_sessions.durable_scope != .cluster_shared)
+            owner_node = (try server.txn_sessions.probeOwnerNodeId(id, &server.query_admission, context)) orelse @import("../../transactions.zig").sessionOwnerNodeId(id);
+        const local = owner_node == local_node;
         if (observe_only and !local) return error.CompletionWrongOwner;
         var seed: [8]u8 = undefined;
         try server.inferenceIo().randomSecure(&seed);
-        if (!local) break :fresh try store.createPreparedRegistration(seed, outcome.*);
+        if (!local) break :fresh try store.createPreparedRegistrationControlled(seed, outcome.*, context);
         if (observe_only) {
             if (control != null) break :fresh try store.publishObservedRegistration(seed, outcome.*, id, context);
             break :fresh try store.createLocalObservedRegistration(seed, outcome.*, id);
         }
-        break :fresh try store.createLocalPreparedRegistration(seed, outcome.*, id);
+        break :fresh try store.createLocalPreparedRegistrationControlled(seed, outcome.*, id, context);
     };
     if (!observe_only) completion.capacity.remaining -= 1;
     completion.execution_owned = true;
     @memcpy(encoded, &std.fmt.bytesToHex(reference, .lower));
     outcome.reference_id = encoded;
     outcome.registration_node_id = if (server.cfg.session_router) |router| router.localNodeId() else 0;
-    if (control == null and completion.join_begin == null) completion.join_begin = completion.outcomes.items.len - 1;
-    if (local) return;
-    const floor = try store.registrationFloor();
-    if (!try ownerAction(server, alloc, .{ .transaction_id = id, .reference_id = reference, .action = .prepare, .managed = true, .retired_through = floor }, true)) return error.CompletionUnavailable;
-    try store.putRegistration(reference, .{ .outcome = .{ .transaction_id = outcome.transaction_id }, .phase = .registered, .prepared = true, .execution_admitted = true });
+    if ((!observe_only or control == null) and completion.join_begin == null) completion.join_begin = completion.outcomes.items.len - 1;
+    if (owner_node == local_node) return;
+    try context.ensureActive();
+    const floor = try store.registrationFloorControlled(@splat(0), context);
+    if (!try forwardOwnerControlled(server, alloc, .{ .transaction_id = id, .reference_id = reference, .action = .prepare, .managed = true, .retired_through = floor }, owner_node, true, context)) return error.CompletionUnavailable;
+    try store.putRegistrationControlled(reference, .{ .outcome = .{ .transaction_id = outcome.transaction_id }, .phase = .registered, .prepared = true, .execution_admitted = true }, context);
 }
 fn metadataTarget(input: operation.SQLCompletionOwner) refs.Owner {
     return .{ .table_id = input.id, .schema_version = input.schema_version, .kind = switch (input.kind) {
@@ -587,6 +594,12 @@ fn consumerAction(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, r
     return complete;
 }
 fn forwardOwner(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, node: u64, forward: bool) !bool {
+    return forwardOwnerControlled(server, alloc, request, node, forward, .{});
+}
+
+fn forwardOwnerControlled(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, request: OwnerRequest, node: u64, forward: bool, context: operation.RequestContext) !bool {
+    const budget = try context.platformDeadline();
+    try budget.ensureActive();
     if (!forward) return error.CompletionWrongOwner;
     const router = server.cfg.session_router orelse return error.CompletionOwnerUnavailable;
     const executor = server.cfg.session_executor orelse return error.CompletionOwnerUnavailable;
@@ -599,7 +612,10 @@ fn forwardOwner(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, req
     const auth = @import("../../internal_service_auth.zig");
     const token = try auth.tokenAlloc(alloc, .{ .secret = server.cfg.internal_service_secret orelse return error.CompletionOwnerUnavailable, .issuer = server.cfg.internal_service_issuer orelse return error.CompletionOwnerUnavailable }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     defer alloc.free(token);
-    var response = try executor.execute(alloc, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = 1500, .headers = &.{ .{ .name = auth.header_name, .value = token }, .{ .name = "X-Antfly-SQL-Settlement", .value = "owner-v12" } } });
+    try budget.ensureActive();
+    const timeout = if (budget.deadline_ns) |deadline| @min(1500, @max(1, (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms)) else 1500;
+    const cancellation: http_common.RequestCancellation = .{ .borrowed_token = budget.cancellation };
+    var response = try executor.execute(alloc, .{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = @intCast(timeout), .cancellation = &cancellation, .headers = &.{ .{ .name = auth.header_name, .value = token }, .{ .name = "X-Antfly-SQL-Settlement", .value = "owner-v12" } } });
     defer response.deinit(alloc);
     if (response.status != 200) return error.CompletionOwnerUnavailable;
     var result = try std.json.parseFromSlice(struct { complete: bool }, alloc, response.body, .{});

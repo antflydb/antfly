@@ -6365,6 +6365,7 @@ const StoreProjectionLease = struct {
 const ProjectedCoreSnapshot = struct {
     store_leases: std.ArrayListUnmanaged(*StoreProjectionLease) = .empty,
     store_positions: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    first_store_by_node: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     // Capability identity, not a separately maintained ordinal count, owns
     // the storage shape. New (or sparse) enum tags cannot overrun this map.
     capability_counts: std.enums.EnumArray(StoreCapabilities.Kind, usize) = .initFill(0),
@@ -6404,16 +6405,27 @@ const ProjectedCoreSnapshot = struct {
             self.adjustCapabilities(lease.capabilities, true);
         }
     }
+    fn rebuildNodeStoreIndex(self: *@This(), alloc: std.mem.Allocator) !void {
+        try self.first_store_by_node.ensureTotalCapacity(alloc, @intCast(self.stores.len));
+        self.first_store_by_node.clearRetainingCapacity();
+        for (self.stores) |record| {
+            const entry = self.first_store_by_node.getOrPutAssumeCapacity(record.node_id);
+            if (!entry.found_existing) entry.value_ptr.* = record.store_id;
+        }
+    }
+
     fn deinitStores(self: *@This(), alloc: std.mem.Allocator) void {
         // During initialization, only the prefix has transferred ownership.
         for (self.stores[self.store_leases.items.len..]) |record| metadata_table_manager.freeStore(alloc, record);
         for (self.store_leases.items) |lease| lease.release(alloc);
         self.store_leases.deinit(alloc);
         self.store_positions.deinit(alloc);
+        self.first_store_by_node.deinit(alloc);
         if (self.stores.len > 0) alloc.free(self.stores);
         self.stores = &.{};
         self.store_leases = .empty;
         self.store_positions = .empty;
+        self.first_store_by_node = .empty;
         self.capability_counts = .initFill(0);
     }
 
@@ -10878,7 +10890,7 @@ pub const MetadataHttpService = struct {
         activation_admission: ?CoordinatedDecoderAdmission,
         submitted: ?*bool,
     ) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInContext(command, expected_term, activation_admission, submitted, .{});
+        return self.proposeTransitionCommandWithReceiptInContext(command, expected_term, activation_admission, submitted, .{}, true);
     }
 
     fn proposeTransitionCommandWithReceiptInContext(
@@ -10888,6 +10900,7 @@ pub const MetadataHttpService = struct {
         activation_admission: ?CoordinatedDecoderAdmission,
         submitted: ?*bool,
         request: api_operation.RequestContext,
+        track_receipt: bool,
     ) !MetadataProposalReceipt {
         try request.ensureActive();
         const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmissionWithContext(self, &.{command}, request);
@@ -10913,7 +10926,7 @@ pub const MetadataHttpService = struct {
             return error.MetadataTopologyCommandTooLarge;
         // Reserve proof storage before Raft accepts the entry. This keeps the
         // accepted-but-untrackable state impossible under allocator pressure.
-        try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
+        if (track_receipt) try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
         var accepted_index: ?u64 = null;
         var dispatch_error: ?anyerror = null;
         try request.ensureActive();
@@ -10924,7 +10937,7 @@ pub const MetadataHttpService = struct {
             observed.* = true;
         };
         const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
-        try self.raft.host.http_host.host.trackProposalReceipt(
+        if (track_receipt) try self.raft.host.http_host.host.trackProposalReceipt(
             self.metadata_group_id,
             raft_status.hard.current_term,
             index,
@@ -11059,7 +11072,7 @@ pub const MetadataHttpService = struct {
         const controlled = hasRequestControl(context);
         const local_deadline = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
         if (controlled) request.deadline_ns = @min(request.deadline_ns orelse local_deadline, local_deadline);
-        const receipt = try self.proposeTransitionCommandWithReceiptInContext(.{ .apply_transaction_sessions = bytes }, term, null, submitted, request);
+        const receipt = try self.proposeTransitionCommandWithReceiptInContext(.{ .apply_transaction_sessions = bytes }, term, null, submitted, request, !controlled);
         if (!controlled) try self.waitForTransitionApplied(receipt);
         const projected = self.projectedStore() orelse return error.MissingMetadataStore;
         while (true) {
@@ -15025,7 +15038,7 @@ pub const MetadataHttpService = struct {
         return self.reconcile_lease.stats();
     }
 
-    fn refreshProjectedStoreLocked(self: *MetadataHttpService, snapshot: *ProjectedCoreSnapshot, change: CoreProjectionChanges.StoreChange, selected_ids: ?[]const u64) !void {
+    fn refreshProjectedStoreLocked(self: *MetadataHttpService, snapshot: *ProjectedCoreSnapshot, change: CoreProjectionChanges.StoreChange, selected_ids: ?[]const u64) !bool {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const position = snapshot.store_positions.get(change.id);
         const reports = change.reports or position == null;
@@ -15050,7 +15063,9 @@ pub const MetadataHttpService = struct {
                 snapshot.adjustCapabilities(lease.capabilities, true);
                 snapshot.store_leases.items[i] = lease;
                 snapshot.stores[i] = lease.record;
+                const node_changed = prior.record.node_id != record.node_id;
                 prior.release(self.alloc);
+                return node_changed;
             } else {
                 const next = try self.alloc.alloc(metadata_table_manager.StoreRecord, snapshot.stores.len - 1);
                 @memcpy(next[0..i], snapshot.stores[0..i]);
@@ -15062,6 +15077,7 @@ pub const MetadataHttpService = struct {
                 prior.release(self.alloc);
                 self.alloc.free(snapshot.stores);
                 snapshot.stores = next;
+                return true;
             }
         } else if (replacement) |record| {
             try snapshot.store_leases.ensureUnusedCapacity(self.alloc, 1);
@@ -15077,7 +15093,9 @@ pub const MetadataHttpService = struct {
             snapshot.adjustCapabilities(lease.capabilities, true);
             self.alloc.free(snapshot.stores);
             snapshot.stores = next;
+            return true;
         }
+        return false;
     }
 
     fn projectedCoreComponentsLocked(self: *MetadataHttpService, kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind)) !*const ProjectedCoreSnapshot {
@@ -15101,15 +15119,21 @@ pub const MetadataHttpService = struct {
                     errdefer fresh.deinit(self.alloc);
                     fresh.stores = try store.listStores(self.alloc, self.metadata_group_id);
                     try fresh.initializeStoreLeases(self.alloc);
+                    try fresh.rebuildNodeStoreIndex(self.alloc);
                     snapshot.deinitStores(self.alloc);
                     snapshot.stores = fresh.stores;
                     snapshot.store_leases = fresh.store_leases;
                     snapshot.store_positions = fresh.store_positions;
+                    snapshot.first_store_by_node = fresh.first_store_by_node;
                     snapshot.capability_counts = fresh.capability_counts;
-                } else for (changes.stores[0..changes.store_count]) |change| {
-                    const ids = try changes.groupIds(self.alloc, change);
-                    defer if (ids) |owned| self.alloc.free(owned);
-                    try self.refreshProjectedStoreLocked(snapshot, change, ids);
+                } else {
+                    var rebuild_index = false;
+                    for (changes.stores[0..changes.store_count]) |change| {
+                        const ids = try changes.groupIds(self.alloc, change);
+                        defer if (ids) |owned| self.alloc.free(owned);
+                        rebuild_index = (try self.refreshProjectedStoreLocked(snapshot, change, ids)) or rebuild_index;
+                    }
+                    if (rebuild_index) try snapshot.rebuildNodeStoreIndex(self.alloc);
                 }
             }
             if (changes.kinds.contains(.placement_intent)) {
@@ -15360,6 +15384,16 @@ pub const MetadataHttpService = struct {
     pub fn freeProjectedNodes(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.NodeRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeNodes(alloc, records);
+    }
+
+    pub fn projectedStoreEndpoint(self: *MetadataHttpService, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+        self.lockProjection();
+        defer self.unlockProjection();
+        const snapshot = try self.projectedCoreComponentsLocked(.initMany(&.{.store}));
+        const store_id = snapshot.first_store_by_node.get(node_id) orelse return null;
+        const record = snapshot.stores[snapshot.store_positions.get(store_id).?];
+        if (record.api_url.len == 0) return null;
+        return try alloc.dupe(u8, record.api_url);
     }
 
     pub fn listProjectedStores(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.StoreRecord {

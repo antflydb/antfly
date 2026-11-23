@@ -15462,7 +15462,7 @@ pub const ApiHttpServer = struct {
         deadline_ns: ?u64,
         cancellation: *const http_common.RequestCancellation,
 
-        fn timeoutMs(self: SQLForwardControl) !u32 {
+        pub fn timeoutMs(self: SQLForwardControl) !u32 {
             if (self.deadline_ns) |deadline| {
                 const remaining = deadline -| platform_time.monotonicNs();
                 if (remaining == 0) return error.DeadlineExceeded;
@@ -15479,6 +15479,8 @@ pub const ApiHttpServer = struct {
         propagate_execution_deadline: bool = false,
         attempted: bool = false,
         needs_adoption: bool = false,
+        endpoint_resolved: bool = false,
+        endpoint: ?[]const u8 = null,
     };
 
     pub const sql_peer_hop_header = "X-Antfly-SQL-Resource-Hop";
@@ -15583,9 +15585,22 @@ pub const ApiHttpServer = struct {
     pub fn forwardSQLResourceToOwner(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest, forwarded: *bool, control: ?*const SQLForwardControl) !?contextual_operations.OwnedResponse {
         const router = self.cfg.session_router orelse return null;
         if (owner == 0 or owner == router.localNodeId()) return null;
-        const executor = (if (control) |value| value.executor else null) orelse self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
-        const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return error.SqlPeerUnavailable;
+        const base = (try self.resolveSqlPeerEndpoint(owner, .{})) orelse return error.SqlPeerUnavailable;
         defer self.alloc.free(base);
+        return self.forwardSQLResourceToEndpoint(base, request, forwarded, control);
+    }
+
+    pub fn resolveSqlPeerEndpoint(self: *ApiHttpServer, owner: u64, context: api_operation.RequestContext) !?[]u8 {
+        try context.ensureActive();
+        const router = self.cfg.session_router orelse return null;
+        const result = try router.nodeBaseUri(self.alloc, owner);
+        errdefer if (result) |uri| self.alloc.free(uri);
+        try context.ensureActive();
+        return result;
+    }
+
+    pub fn forwardSQLResourceToEndpoint(self: *ApiHttpServer, base: []const u8, request: http_common.HttpRequest, forwarded: *bool, control: ?*const SQLForwardControl) !?contextual_operations.OwnedResponse {
+        const executor = (if (control) |value| value.executor else null) orelse self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
         for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, sql_peer_hop_header) and std.mem.eql(u8, header.value, sql_peer_hop_value)) return error.SqlConnectionWrongOwner;
         var headers: std.ArrayList(http_common.RequestHeader) = .empty;
         defer headers.deinit(self.alloc);
@@ -15651,7 +15666,10 @@ pub const ApiHttpServer = struct {
                 transactions_api.sessionOwnerNodeId(txn_id);
         if (owner_node_id == 0) return null;
         if (owner_node_id == router.localNodeId()) return null;
-        const base_uri = (try router.nodeBaseUri(self.alloc, owner_node_id)) orelse {
+        const lookup = sql == null or !sql.?.endpoint_resolved;
+        const allocated_base = if (lookup) try router.nodeBaseUri(self.alloc, owner_node_id) else null;
+        defer if (allocated_base) |base| self.alloc.free(base);
+        const base_uri = (if (lookup) allocated_base else sql.?.endpoint) orelse {
             if (sql) |state| {
                 state.needs_adoption = true;
                 return error.SqlPeerUnavailable;
@@ -15659,7 +15677,6 @@ pub const ApiHttpServer = struct {
             _ = try self.tryAdoptSession(txn_id);
             return null;
         };
-        defer self.alloc.free(base_uri);
         const uri = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ base_uri, req.uri });
         defer self.alloc.free(uri);
         var outgoing = req;

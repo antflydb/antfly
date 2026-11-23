@@ -1315,7 +1315,7 @@ pub const AntflyApiHandler = struct {
             const server = self.server orelse return error.DurabilityUnavailable;
             const protocol = @import("sql/session/completion.zig");
             if (self.reserve_on_prepare) try protocol.reserveOnOwnerControlled(server, &self.value, self.control);
-            try protocol.prepareTransaction(server, self.alloc, &self.value, id);
+            try protocol.prepareTransactionControlled(server, self.alloc, &self.value, id, self.control);
         }
         fn prepareMetadata(raw: *anyopaque, owner: operation_contract.SQLCompletionOwner) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -1348,9 +1348,9 @@ pub const AntflyApiHandler = struct {
         const completion = try requestCompletion(ctx);
         const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
         owned.server = self.api_server;
+        owned.control = operationContext(ctx, null);
         if (routes.matchTransactionSessionCommit(path) != null) {
             owned.reserve_on_prepare = true;
-            owned.control = operationContext(ctx, null);
             return null;
         }
         @import("sql/session/completion.zig").reserveJoined(self.api_server, completion, 3, ctx.io) catch {
@@ -2343,8 +2343,13 @@ pub const AntflyApiHandler = struct {
                 .control = .{ .deadline_ns = deadline, .cancellation = &cancellation },
                 .propagate_execution_deadline = deadline != null and std.mem.startsWith(u8, http_server_mod.stripApiPrefix(ctx.request.uri.path), "/transactions/"),
             };
+            const endpoint = try self.runDurableSQLRouting(ctx.io, ApiHttpServer.resolveSqlPeerEndpoint, .{ self.api_server, node, operationContext(ctx, null) });
+            defer if (endpoint) |uri| self.api_server.alloc.free(uri);
+            state.endpoint_resolved = true;
+            state.endpoint = endpoint;
             request.sql = &state;
-            const result = self.runSQLForwarding(ctx.io, preparation, &state.control, http_server_mod.ApiHttpServer.forwardSessionOperation, .{ self.api_server, txn_id, request });
+            state.needs_adoption = endpoint == null;
+            const result: anyerror!?contextual_operations.OwnedResponse = if (endpoint == null) error.SqlPeerUnavailable else self.runSQLForwarding(ctx.io, preparation, &state.control, http_server_mod.ApiHttpServer.forwardSessionOperation, .{ self.api_server, txn_id, request });
             if (state.needs_adoption and !cancellation.isCancelled()) {
                 const adopted = self.runDurableSQLRouting(ctx.io, http_server_mod.ApiHttpServer.adoptRoutedSQLSession, .{ self.api_server, txn_id, operationContext(ctx, null) }) catch |err| {
                     if (state.attempted) {
@@ -2405,7 +2410,13 @@ pub const AntflyApiHandler = struct {
             .deadline_ns = @import("../request_deadline.zig").platformDeadline(ctx),
             .cancellation = &cancellation,
         };
-        var response = self.runSQLForwarding(ctx.io, preparation, &control, http_server_mod.ApiHttpServer.forwardSQLResourceToOwner, .{ self.api_server, owner, request, &forwarded, &control }) catch |err| {
+        const endpoint = (self.runDurableSQLRouting(ctx.io, ApiHttpServer.resolveSqlPeerEndpoint, .{ self.api_server, owner, operationContext(ctx, null) }) catch |err| switch (err) {
+            error.SqlWriteCapacityUnavailable => return try sqlRoutingOverloadedResponse(ctx),
+            error.DeadlineExceeded => return try sqlForwardDeadlineResponse(ctx),
+            else => return err,
+        }) orelse return try sqlPeerUnavailableResponse(ctx);
+        defer self.api_server.alloc.free(endpoint);
+        var response = self.runSQLForwarding(ctx.io, preparation, &control, ApiHttpServer.forwardSQLResourceToEndpoint, .{ self.api_server, endpoint, request, &forwarded, &control }) catch |err| {
             if (forwarded) {
                 completion.unknown = true;
                 return try sqlForwardOutcomeUnknownResponse(ctx);
@@ -7695,6 +7706,8 @@ pub const AntflyApiHandler = struct {
 
     fn sessionInspectionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
+            error.DeadlineExceeded => textResponse(ctx, 504, "transaction request deadline exceeded"),
+            error.TransactionCommitRequestMismatch => textResponse(ctx, 409, "transaction commit retry body does not match the sealed request"),
             error.SessionLeaseLost => textResponse(ctx, 503, "transaction ownership or execution changed; reconcile this transaction id"),
             error.SessionWriteOutcomeUnknown => textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying"),
             error.StorageReadTemporarilyUnavailable, error.ReadIndexUnavailable, error.ReadIndexTimeout, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.Timeout, error.ConcurrencyUnavailable => blk: {
@@ -7710,6 +7723,61 @@ pub const AntflyApiHandler = struct {
         defer arena.deinit();
         const response = try transactions_api.buildSessionCommitResponse(arena.allocator(), id, "aborted", null, null);
         _ = ctx.status(409);
+        return ctx.openApiJson(response);
+    }
+
+    fn respondTerminalHttpCommit(self: *AntflyApiHandler, ctx: *httpx.Context, source: table_writes.TableWriteSource, guard: transactions_api.Mutation, terminal: transactions_api.TerminalCommit, commit_req: transactions_api.OwnedTransactionCommitRequest, identity: ?AuthenticatedIdentity, commit_request: operation_contract.RequestContext, execution_held: bool) !httpx.Response {
+        const alloc = self.api_server.alloc;
+        const txn_id = guard.id;
+        if (!(try self.api_server.transactionRequestAuthorized(identity, commit_req))) return textResponse(ctx, 403, "forbidden");
+        var status = terminal.status;
+        // A complete terminal response is durable before the coordinator
+        // self-participant is released. Retrying that final ACK is safe;
+        // pending terminal states must instead replay phase two under the
+        // same transaction ID through session maintenance.
+        if (execution_held and status == .committed and !terminal.coordinator_acknowledged) {
+            if (terminal.coordinator_group_id) |coordinator_group_id| {
+                if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
+                defer self.releasePublicOperation("commitTransactionSession");
+                const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
+                const acknowledged = source.acknowledgeTransactionCommit(
+                    alloc,
+                    txn_id,
+                    coordinator_group_id,
+                    coordinator_table_name,
+                ) catch |err| blk: {
+                    std.log.warn("stable transaction coordinator acknowledgement retry deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    break :blk null;
+                };
+                if (acknowledged == null) {
+                    status = .committed_recovery_pending;
+                } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledgedForMutation(alloc, guard) catch |err| blk: {
+                    std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
+                    break :blk null;
+                }) == null) {
+                    status = .committed_recovery_pending;
+                }
+            }
+        }
+        if (ctx.header("X-Antfly-SQL-Fence") != null) {
+            const completion = try requestCompletion(ctx);
+            const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
+            owned.reports_existing_commit = true;
+            if (status != .committed or terminal.repair_required)
+                self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransactionControlled, .{ self.api_server, ctx.allocator, completion, txn_id, commit_request }) catch {
+                    completion.unknown = true;
+                };
+        }
+        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena_impl.deinit();
+        const response = try transactions_api.buildSessionCommitResponse(
+            arena_impl.allocator(),
+            txn_id,
+            transactions_api.terminalCommitResponseStatus(status, terminal.repair_required),
+            null,
+            commit_req.tables,
+        );
+        _ = ctx.status(if (status == .committed and !terminal.repair_required) 200 else 202);
         return ctx.openApiJson(response);
     }
 
@@ -7730,16 +7798,7 @@ pub const AntflyApiHandler = struct {
         if (self.forwardTransactionSession(ctx, txn_id, body_data) catch |err| return sessionInspectionFailure(ctx, err)) |response| return response;
         const guard = (self.api_server.authorizedTransactionMutation(txn_id, authenticated_identity) catch |err|
             return sessionInspectionFailure(ctx, err)) orelse return textResponse(ctx, 404, "not found");
-        const execution = try self.api_server.txn_sessions.acquireCommitExecution(txn_id, ctx.io);
-        defer execution.release();
         const alloc = self.api_server.alloc;
-        const owner = self.api_server.localSessionNodeId();
-        const session = (self.api_server.txn_sessions.readMutationInfo(guard) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
-        if (session.version.owner != owner) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
-        if (session.terminal_abort) return abortedSessionResponse(ctx, txn_id);
         var parsed_req: ?transactions_api.OwnedTransactionCommitRequest = null;
         defer if (parsed_req) |*commit_req| commit_req.deinit(alloc);
         if (!transactions_api.isEmptySessionCommitBody(body_data)) {
@@ -7756,6 +7815,25 @@ pub const AntflyApiHandler = struct {
             if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
         }
         const commit_request = tableMutationContext(ctx, &authenticated_identity);
+        var terminal_on_cut: ?transactions_api.TerminalCommit = null;
+        defer if (terminal_on_cut) |*terminal| terminal.deinit(alloc);
+        const extra_request = if (parsed_req) |*value| value else null;
+        if (self.api_server.txn_sessions.inspectTerminalHttpCommit(alloc, guard, extra_request, &terminal_on_cut, commit_request) catch |err|
+            return sessionInspectionFailure(ctx, err)) |value|
+        {
+            var replay = value;
+            defer replay.deinit(alloc);
+            return self.respondTerminalHttpCommit(ctx, source, guard, terminal_on_cut.?, replay, authenticated_identity, commit_request, false);
+        }
+        const execution = self.api_server.txn_sessions.acquireCommitExecutionControlled(txn_id, ctx.io, commit_request) catch |err| return sessionInspectionFailure(ctx, err);
+        defer execution.release();
+        const owner = self.api_server.localSessionNodeId();
+        const session = (self.api_server.txn_sessions.readMutationInfo(guard) catch |err| return sessionInspectionFailure(ctx, err)) orelse {
+            _ = ctx.status(404);
+            return ctx.text("not found");
+        };
+        if (session.version.owner != owner) return textResponse(ctx, 503, "transaction ownership changed; retry this transaction id");
+        if (session.terminal_abort) return abortedSessionResponse(ctx, txn_id);
         // The first clone seals the body and prevents further staging.
         // Reserve before that durable transition, but let terminal replays
         // and already executing sessions reach their outcome first.
@@ -7767,10 +7845,8 @@ pub const AntflyApiHandler = struct {
                 else => return err,
             };
         }
-        var terminal_on_cut: ?transactions_api.TerminalCommit = null;
-        defer if (terminal_on_cut) |*terminal| terminal.deinit(alloc);
-        var commit_req = (self.api_server.txn_sessions.inspectOrSealHttpCommit(alloc, guard, if (parsed_req) |*value| value else null, &terminal_on_cut) catch |err| switch (err) {
-            error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
+        var commit_req = (self.api_server.txn_sessions.inspectOrSealHttpCommit(alloc, guard, extra_request, &terminal_on_cut, commit_request) catch |err| switch (err) {
+            error.SessionWriteOutcomeUnknown, error.DeadlineExceeded => return sessionInspectionFailure(ctx, err),
             error.CatalogGenerationChanged => return textResponse(ctx, 409, "transaction table identity changed"),
             error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
             error.TransactionCommitRequestMismatch => {
@@ -7784,62 +7860,13 @@ pub const AntflyApiHandler = struct {
             return ctx.text("transaction has no staged writes");
         };
         defer commit_req.deinit(alloc);
-        if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
+        if (terminal_on_cut == null and !(try self.api_server.transactionRequestAuthorized(authenticated_identity, commit_req))) {
             _ = ctx.status(403);
             return ctx.text("forbidden");
         }
 
-        if (terminal_on_cut) |terminal| {
-            var status = terminal.status;
-            // A complete terminal response is durable before the coordinator
-            // self-participant is released. Retrying that final ACK is safe;
-            // pending terminal states must instead replay phase two under the
-            // same transaction ID through session maintenance.
-            if (status == .committed and !terminal.coordinator_acknowledged) {
-                if (terminal.coordinator_group_id) |coordinator_group_id| {
-                    if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
-                    defer self.releasePublicOperation("commitTransactionSession");
-                    const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
-                    const acknowledged = source.acknowledgeTransactionCommit(
-                        alloc,
-                        txn_id,
-                        coordinator_group_id,
-                        coordinator_table_name,
-                    ) catch |err| blk: {
-                        std.log.warn("stable transaction coordinator acknowledgement retry deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        break :blk null;
-                    };
-                    if (acknowledged == null) {
-                        status = .committed_recovery_pending;
-                    } else if ((self.api_server.txn_sessions.markTerminalCoordinatorAcknowledgedForMutation(alloc, guard) catch |err| blk: {
-                        std.log.warn("failed to persist stable transaction coordinator acknowledgement txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        break :blk null;
-                    }) == null) {
-                        status = .committed_recovery_pending;
-                    }
-                }
-            }
-            if (ctx.header("X-Antfly-SQL-Fence") != null) {
-                const completion = try requestCompletion(ctx);
-                const owned: *RequestCompletion = @ptrCast(@alignCast(ctx.getData("antfly-sql-completion-admission").?));
-                owned.reports_existing_commit = true;
-                if (status != .committed or terminal.repair_required)
-                    self.runDurableSQLRouting(ctx.io, @import("sql/session/completion.zig").observeTransactionControlled, .{ self.api_server, ctx.allocator, completion, txn_id, commit_request }) catch {
-                        completion.unknown = true;
-                    };
-            }
-            var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-            defer arena_impl.deinit();
-            const response = try transactions_api.buildSessionCommitResponse(
-                arena_impl.allocator(),
-                txn_id,
-                transactions_api.terminalCommitResponseStatus(status, terminal.repair_required),
-                null,
-                commit_req.tables,
-            );
-            _ = ctx.status(if (status == .committed and !terminal.repair_required) 200 else 202);
-            return ctx.openApiJson(response);
-        }
+        if (terminal_on_cut) |terminal|
+            return self.respondTerminalHttpCommit(ctx, source, guard, terminal, commit_req, authenticated_identity, commit_request, true);
 
         var execution_plan = self.api_server.txn_sessions.getExecutionPlan(alloc, guard) catch |err| switch (err) {
             error.TransactionAlreadyAborted => return abortedSessionResponse(ctx, txn_id),
@@ -8806,6 +8833,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn runSQLForwarding(self: *AntflyApiHandler, network: std.Io, preparation: ?*http_server_mod.RequestAdmission.Lease, control: *http_server_mod.ApiHttpServer.SQLForwardControl, comptime task: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(task)).@"fn".return_type.?).error_union.payload {
+        _ = try control.timeoutMs();
         if (self.api_server.cfg.imported_runtime_io) |views| {
             const source = views.request_forward orelse return error.SqlWriteCapacityUnavailable;
             const Call = struct {
@@ -18184,6 +18212,8 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         _ = (try server.txn_sessions.recordTerminalCommitForMutation(alloc, generic_guard, .committed, false, null, null)).?;
         durable.fail_writes_for_test = true;
         defer durable.fail_writes_for_test = false;
+        const held_execution = server.txn_sessions.tryAcquireCommitExecution(generic.txn_id).?;
+        defer held_execution.release();
         var replay_ctx = httpx.Context.init(alloc, std.testing.io, &request);
         defer replay_ctx.deinit();
         var replayed = try handler.commitTransactionSession(&replay_ctx, &generic_hex);
