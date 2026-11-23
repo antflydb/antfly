@@ -5355,7 +5355,7 @@ test "Native to Metal partition transfer uses its assigned Shared destination" {
     try std.testing.expectEqual(@as(u64, @sizeOf(@TypeOf(values))), stats.transfer_bytes);
     try std.testing.expectEqual(@as(devices.DeviceId, 1), executed.output_devices[0]);
 
-    const negated = try host.neg(source);
+    const negated = try host.fromFloat32Shape(&.{ 2, -3, 5, -7 }, &.{4});
     defer host.free(negated);
     const expected_tensor = try host.gelu(negated);
     defer host.free(expected_tensor);
