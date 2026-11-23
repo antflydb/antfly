@@ -46,10 +46,10 @@ pub fn read(a: A, committed: ingestion.CommittedWalGroup, metadata: CatalogTable
         const entry = try seen.getOrPut(identity);
         if (entry.found_existing) continue;
         const before = if (interval.parent) |parent|
-            try lookup(a, before_table.?, parent, metadata, batch.key_fields, change.row, context, options)
+            try lookup(a, before_table.?, parent, metadata, batch.key_fields, change.row, false, context, options)
         else
             null;
-        const after = try lookup(a, after_table, interval.snapshot, metadata, batch.key_fields, change.row, context, options);
+        const after = try lookup(a, after_table, interval.snapshot, metadata, batch.key_fields, change.row, false, context, options);
         if (before == null and after == null) continue;
         try output.append(a, .{ .key = try a.dupe(u8, identity), .before = before, .after = after });
     }
