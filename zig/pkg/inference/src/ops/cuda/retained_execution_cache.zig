@@ -73,6 +73,7 @@ pub fn Program(comptime Recipe: type) type {
             weight_generation: usize = 0,
             buffers: [11]Buffer = @splat(.{}),
             quota: CacheQuota = .none,
+            output_quota: CacheQuota = .none,
             graph: driver.CUgraphExec = null,
             warm: bool = false,
             disabled: bool = false,
@@ -158,7 +159,7 @@ pub fn Program(comptime Recipe: type) type {
                 return true;
             }
             pub fn hasBacking(self: *const Arena) bool {
-                return self.bytes() != 0 or self.logical_upload != null or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease();
+                return self.bytes() != 0 or self.logical_upload != null or self.graph != null or self.completion != null or self.timing != null or self.quota.hasLease() or self.output_quota.hasLease();
             }
             pub fn attentionWorkspacesMatch(self: *const Arena, attention: usize, global_attention: usize, global_generation: u64, blas: usize) bool {
                 return self.attention_workspace == attention and self.global_attention_workspace == global_attention and self.global_attention_generation == global_generation and self.blas_workspace == blas;
@@ -252,6 +253,7 @@ pub fn Program(comptime Recipe: type) type {
             }
             fn deinit(self: *Arena, ctx: *Context) void {
                 self.quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker(); // BEFORE graph/event/buffer SDK destruction
+                self.output_quota.validateLegacyRaw() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 if (self.timing) |*pair| {
                     ctx.destroyEventChecked(&pair.start) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                     ctx.destroyEventChecked(&pair.end) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
@@ -262,6 +264,7 @@ pub fn Program(comptime Recipe: type) type {
                 for (&self.buffers) |*buffer| _ = buffer.freeChecked(ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 if (self.logical_upload) |upload| std.heap.smp_allocator.destroy(upload);
                 self.quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                self.output_quota.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
                 self.* = .{};
             }
         };
@@ -385,18 +388,27 @@ pub fn Program(comptime Recipe: type) type {
             pub fn retirementLeaseCount(self: *const Cache, controller: *?*memory.AdmissionController) !usize {
                 const quotas = @import("cache_retirement.zig");
                 var count: usize = 0;
-                for (self.arenas) |arena_value| count += try quotas.scanLease(arena_value.quota.peek(), controller);
+                for (self.arenas) |arena_value| {
+                    count += try quotas.scanLease(arena_value.quota.peek(), controller);
+                    count += try quotas.scanLease(arena_value.output_quota.peek(), controller);
+                }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| count += try quotas.scanLease(entry.value_ptr.quota.peek(), controller);
                 return count;
             }
             pub fn parkRetirementLeases(self: *Cache, quotas: *@import("cache_retirement.zig").PreparedQuotas) void {
-                for (&self.arenas) |*entry| entry.quota.park(quotas);
+                for (&self.arenas) |*entry| {
+                    entry.quota.park(quotas);
+                    entry.output_quota.park(quotas);
+                }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| entry.value_ptr.quota.park(quotas);
             }
             pub fn validateCleanup(self: *const Cache, current: Cleanup) !void {
-                for (self.arenas) |entry| try entry.quota.validateCleanup(current);
+                for (self.arenas) |entry| {
+                    try entry.quota.validateCleanup(current);
+                    try entry.output_quota.validateCleanup(current);
+                }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| try entry.value_ptr.quota.validateCleanup(current);
             }
@@ -430,6 +442,7 @@ pub fn Program(comptime Recipe: type) type {
                         entry.logical_upload = null;
                     }
                     try entry.quota.releaseAfterSdkDeath(current);
+                    try entry.output_quota.releaseAfterSdkDeath(current);
                     entry.* = .{};
                 }
                 var iterator = self.weights.iterator();
@@ -452,6 +465,7 @@ pub fn Program(comptime Recipe: type) type {
                 for (&self.arenas) |*entry| {
                     if (entry.logical_upload) |upload| std.heap.smp_allocator.destroy(upload);
                     entry.quota.releaseOutsideExecution();
+                    entry.output_quota.releaseOutsideExecution();
                 }
                 var iterator = self.weights.iterator();
                 while (iterator.next()) |entry| {
@@ -540,7 +554,7 @@ pub fn Program(comptime Recipe: type) type {
                 self.clock +|= 1;
                 const selected = preview orelse return null;
                 if (!selected.hit and ctx.prepared_cache_funding == null) {
-                    for (self.arenas, 0..) |value, index| if (selected.victims & (@as(u8, 1) << @intCast(index)) != 0 and value.quota == .prepared) return null;
+                    for (self.arenas, 0..) |value, index| if (selected.victims & (@as(u8, 1) << @intCast(index)) != 0 and (value.quota == .prepared or value.output_quota == .prepared)) return null;
                 }
                 if (!selected.hit and selected.victims != 0 and ctx.prepared_cache_funding != null) return null;
                 const entry = &self.arenas[selected.index];
@@ -586,7 +600,9 @@ pub fn Program(comptime Recipe: type) type {
                 }
                 candidate.last_used = self.clock;
                 candidate.uses = 1;
-                candidate.quota = lease.publishQuota();
+                const quotas = lease.publishArenaQuotas();
+                candidate.quota = quotas[0];
+                candidate.output_quota = quotas[1];
                 entry.* = candidate;
                 self.next_arena += 1;
                 return entry;

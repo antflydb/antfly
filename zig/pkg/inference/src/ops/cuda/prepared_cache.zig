@@ -426,6 +426,8 @@ pub const Funding = struct {
         raw_snapshot: ?memory.AdmissionLease = null,
         upgrade: retirement.PreparedCharge = .{ .owner = null },
         lease: ?memory.AdmissionLease = null,
+        audio_output_lease: ?memory.AdmissionLease = null,
+        audio_output_charge: retirement.PreparedCharge = .{ .owner = null },
         temporary: ?memory.AdmissionLease = null,
         failure: retirement.PreparedCharge = .{ .owner = null },
         state: enum { unavailable, ready, taken, published, failed } = .unavailable,
@@ -516,7 +518,18 @@ pub const Funding = struct {
         errdefer self.releaseFundedOutside();
         for (self.entries) |*entry| if (entry.miss) {
             entry.failure = try retirement.PreparedCharge.prepare(0);
-            var prepared = try source.?.preparePartition(self.allocator, entry.amounts);
+            var scratch_amounts = entry.amounts;
+            if (entry.request == .arena and entry.request.arena.kind == .audio) {
+                const bytes = entry.request.arena.sizes[1];
+                if (bytes != 0) {
+                    if (bytes >= scratch_amounts.backend_scratch_bytes) return error.InvalidPreparedCacheAmount;
+                    scratch_amounts.backend_scratch_bytes -= bytes;
+                    entry.audio_output_charge = try retirement.PreparedCharge.prepare(0);
+                    var publication = try source.?.preparePartition(self.allocator, .{ .backend_scratch_bytes = bytes });
+                    entry.audio_output_lease = publication.commit();
+                }
+            }
+            var prepared = try source.?.preparePartition(self.allocator, scratch_amounts);
             entry.lease = prepared.commit();
             if (entry.temporary_host_bytes != 0) {
                 var scratch = try source.?.preparePartition(self.allocator, .{ .host_scratch_bytes = entry.temporary_host_bytes });
@@ -729,6 +742,9 @@ pub const Funding = struct {
             if (unused_learning) |owner| owner.destroyUnusedOutsideExecution();
             if (entry.lease) |*lease| lease.release();
             entry.lease = null;
+            if (entry.audio_output_lease) |*lease| lease.release();
+            entry.audio_output_lease = null;
+            entry.audio_output_charge.destroyUnused();
             if (entry.temporary) |*lease| lease.release();
             entry.temporary = null;
             entry.failure.destroyUnused();
@@ -799,6 +815,17 @@ pub const Lease = struct {
         self.entry = null;
         return quota;
     }
+    pub fn publishArenaQuotas(self: *Lease) [2]CacheQuota {
+        var output: CacheQuota = .none;
+        if (self.entry) |entry| {
+            std.debug.assert(entry.request == .arena);
+            if (entry.audio_output_lease != null) {
+                var pin: ?domain.Pin = self.owner.?.domain_pin.?.retain();
+                output = CacheQuota.arm(&entry.audio_output_charge, &entry.audio_output_lease, &pin) catch platform.inference_process_supervisor.restartWorker();
+            }
+        }
+        return .{ self.publishQuota(), output };
+    }
     pub fn publish(self: *Lease) ?memory.AdmissionLease {
         const value = self.value;
         self.value = null;
@@ -843,6 +870,11 @@ pub const Lease = struct {
                 const charge = entry.failure.arm(&self.value, &optional_pin) catch platform.inference_process_supervisor.restartWorker();
                 charge.holdUntilBoundary(boundary) catch platform.inference_process_supervisor.restartWorker();
                 charge.release();
+            }
+            if (entry.audio_output_lease != null) {
+                var pin: ?domain.Pin = owner.domain_pin.?.retain();
+                var output = CacheQuota.arm(&entry.audio_output_charge, &entry.audio_output_lease, &pin) catch platform.inference_process_supervisor.restartWorker();
+                output.releaseAfterSdkDeath(.{ .boundary = epoch }) catch platform.inference_process_supervisor.restartWorker();
             }
             entry.state = .failed;
         } else if (self.value) |*lease| lease.release();
@@ -1035,6 +1067,51 @@ pub fn acquireRaw(ctx: anytype, amounts: memory.AdmissionAmounts) !Lease {
     std.debug.assert(ctx.prepared_cache_funding == null);
     const admission = ctx.video_cache_budget.admission orelse return .{};
     return .{ .value = try admission.controller.tryAcquire(.gpu, admission.limits, amounts, admission.check_live_memory) };
+}
+
+test "CUDA prepared audio arena retains its exact output charge after scratch retirement" {
+    const actual = try domain.Domain.create();
+    defer actual.release();
+    const pin = actual.pin();
+    defer pin.release();
+    const request: Request = .{ .arena = .{
+        .kind = .audio,
+        .batch = 1,
+        .sequence = 1,
+        .sizes = .{ 256, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    } };
+    const funding = try Funding.createWithAllocator(std.testing.allocator, .{ .requests = &.{request} });
+    defer {
+        if (funding.state == .bound) funding.unbind();
+        funding.finishOutsideExecution();
+    }
+    funding.admission = .{ .controller = &actual.controller, .limits = .{}, .check_live_memory = false };
+    const amounts = memory.AdmissionAmounts{ .backend_scratch_bytes = 320 };
+    try funding.noteMiss(0, amounts, 0);
+    funding.state = .snapped;
+    try funding.fundOutsideExecution(&pin);
+    var reference = try sink.Ref.create();
+    defer reference.release();
+    var guard = try reference.enter();
+    var guard_open = true;
+    defer if (guard_open) guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    try funding.bind(&epoch);
+    var token = try funding.take(request, amounts);
+    var quotas = token.publishArenaQuotas();
+    defer for (&quotas) |*quota| quota.releaseOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 256), quotas[0].peek().?.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 64), quotas[1].peek().?.amounts.backend_scratch_bytes);
+    try quotas[0].releaseAfterSdkDeath(.{ .boundary = &epoch });
+    try std.testing.expectEqual(@as(usize, 320), actual.controller.snapshot().backend_scratch_bytes);
+    funding.unbind();
+    guard.finish();
+    guard_open = false;
+    _ = retirement.poll();
+    try std.testing.expectEqual(@as(usize, 64), actual.controller.snapshot().backend_scratch_bytes);
+    quotas[1].releaseOutsideExecution();
+    try std.testing.expectEqual(@as(usize, 0), actual.controller.snapshot().backend_scratch_bytes);
 }
 
 test "CUDA prepared cache builder copies exact keys coalesces repeated requests and refuses conflicting spans" {

@@ -7265,6 +7265,7 @@ pub const CudaCompute = struct {
                 CacheRetirement.word(&hash, @intFromPtr(pair.end));
             }
             leases += try CacheRetirement.leaseWord(&hash, arena.quota.peek(), &controller);
+            leases += try CacheRetirement.leaseWord(&hash, arena.output_quota.peek(), &controller);
         }
         if (selection.full()) {
             CacheRetirement.word(&hash, expected.audio_plans.clock);
