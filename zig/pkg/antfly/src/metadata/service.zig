@@ -12103,7 +12103,7 @@ pub const MetadataHttpService = struct {
         const admission = hosted.sourceAdmission();
         const completion = @import("../api/source_destination_completion.zig");
         if (state.artifact_control.?.current) |artifact| {
-            try completion.recover(self, admission, a, scope, catalog_digest, context);
+            try completion.recover(self, admission, a, state, catalog_digest, context);
             if (artifact.phase != .reserved) return false;
         }
         var snapshot = try @import("source_scope_capture.zig").readOnService(self, a, .{
