@@ -12064,6 +12064,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         descriptor: ops.kernel_descriptor.Descriptor,
         output_slot: route.OutputSlot,
         slot: usize,
+        key: DynamicLinearSlotKey,
         payload: ?@import("../backends/prepared_slot_owner.zig").Owner.Pin,
         declaration: if (build_options.enable_metal) MetalNativeProvider.PrivateLinearPin else void,
 
@@ -12077,7 +12078,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (descriptor.operation != .linear or !supportsAssignedDescriptor(descriptor)) return false;
             return if (descriptor.operation.linear.rows == 1) DenseProjectionProfile.noFrame(self) and supported(raw, descriptor) else self.packed_projection_profile != null and self.projectionScopeValid();
         }
-        fn selectedSlot(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding) ?usize {
+        fn bindingKey(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding) ?DynamicLinearSlotKey {
             // Activation inputs may be planned, but the prepared immutable
             // weight/bias must be concrete source tensors, never guessed planes.
             if (bindings.len != descriptor.input_count or bindings.len < 2 or bindings[1] != .tensor or (descriptor.operation.linear.bias and bindings[2] != .tensor)) return null;
@@ -12085,10 +12086,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const known = binding.tensor;
                 if (known.implementation.context != @as(*anyopaque, @ptrCast(compute)) or !acceptsPhysicalImplementation(known.implementation.table)) return null;
             }
-            var inputs: [3]CT = undefined;
-            inputs[1] = bindings[1].tensor.value;
-            if (descriptor.operation.linear.bias) inputs[2] = bindings[2].tensor.value;
-            return compute.assignedLinearSlot(.{ .descriptor = descriptor, .inputs = inputs[0..descriptor.input_count], .output = null });
+            const linear = descriptor.operation.linear;
+            return compute.assignedDenseLinearKey(linear, bindings[1].tensor.value, if (linear.bias) bindings[2].tensor.value else null);
         }
         fn prepare(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable) !?route.Owned {
             return prepareWith(compute, request, table, supported);
@@ -12098,7 +12097,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         fn prepareWith(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable, comptime supported_fn: *const fn (*anyopaque, *const ops.kernel_descriptor.Descriptor) bool) !?route.Owned {
             if (comptime !build_options.enable_metal) return null;
-            const slot = selectedSlot(compute, request.descriptor, request.inputs) orelse return null;
+            const key = bindingKey(compute, request.descriptor, request.inputs) orelse return null;
+            const slot = compute.assignedDenseLinearSlot(key) orelse return null;
             var direct = (try @import("../execution/assigned_kernel_route.zig").prepare(.{ .ptr = compute, .vtable = table }, request, supported_fn)) orelse return null;
             var committed = false;
             defer if (!committed) direct.deinit();
@@ -12124,16 +12124,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 error.QueueFull, error.PreparedSlotUnavailable, error.ForeignPreparedSlotOwner => return null,
                 else => return err,
             };
-            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = request.output, .slot = slot, .payload = payload, .declaration = declaration };
+            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = request.output, .slot = slot, .key = key, .payload = payload, .declaration = declaration };
             committed = true;
             return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .vtable = &vtable };
         }
         fn matches(raw: *anyopaque, request: route.Validate) bool {
             const self: *PreparedDenseLinear = @ptrCast(@alignCast(raw));
+            if (!self.pinValid() or !self.direct.vtable.matches(self.direct.context, request)) return false;
+            const key = bindingKey(self.compute, &self.descriptor, request.inputs) orelse return false;
+            return std.meta.eql(key, self.key);
+        }
+        fn pinValid(self: *const PreparedDenseLinear) bool {
             if (comptime !build_options.enable_metal) return false;
-            if (!self.declaration.valid()) return false;
-            if (self.payload) |pin| if (!pin.valid()) return false;
-            return self.direct.vtable.matches(self.direct.context, request) and selectedSlot(self.compute, &self.descriptor, request.inputs) == self.slot;
+            return self.declaration.valid() and (if (self.payload) |pin| pin.valid() else true);
+        }
+        fn slotForInvocation(compute: *MetalCompute, owned: *const route.Owned, request: ops.kernel_descriptor.Invocation) !usize {
+            if (owned.implementation.context != @as(*anyopaque, @ptrCast(compute)) or
+                !acceptsPhysicalImplementation(owned.implementation.table)) return error.PreparedKernelBindingChanged;
+            const self: *const PreparedDenseLinear = @ptrCast(@alignCast(owned.context));
+            if (self.compute != compute or !self.pinValid()) return error.PreparedKernelBindingChanged;
+            try @import("../execution/assigned_kernel_route.zig").validateDescriptor(&self.direct, request.descriptor);
+            const linear = request.descriptor.operation.linear;
+            const key = compute.assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return error.PreparedKernelBindingChanged;
+            if (!std.meta.eql(key, self.key) or request.auxiliaries.len != 0) return error.PreparedKernelBindingChanged;
+            return self.slot;
         }
         fn matchesInputs(self: *PreparedDenseLinear, inputs: []const route.Binding) bool {
             return matches(self, .{ .inputs = inputs, .output = self.output_slot });
@@ -13131,10 +13145,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         if (descriptor.operation == .rope and request.auxiliaries.len != 0) return false;
-        const linear_slot: ?usize = if (descriptor.operation == .linear)
-            self.assignedLinearSlot(request) orelse return false
-        else
-            null;
+        const linear_slot: ?usize = if (descriptor.operation == .linear) linear: {
+            if (request.prepared_route) |prepared| {
+                if (prepared.vtable != &PreparedDenseLinear.vtable) return error.PreparedKernelBindingChanged;
+                break :linear try PreparedDenseLinear.slotForInvocation(self, prepared, request);
+            }
+            break :linear self.assignedLinearSlot(request) orelse return false;
+        } else null;
         const output = request.output orelse return true;
         const out_buf = toBuf(output);
         if (out_buf.metal_tensor) |*tensor| if (tensor.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
@@ -55835,6 +55852,18 @@ const PreparedDenseRegionFixture = struct {
                 var assigned = (try prepare_route(cb.ptr, request)) orelse return error.MissingPreparedKernelRoute;
                 defer assigned.deinit();
                 try assigned.validate(.{ .inputs = &facts, .output = request.output });
+                try scope.finish();
+                const destination = (try cb.allocUninitF32Shape(&.{ 1, 64 })) orelse return error.MissingPhysicalStorage;
+                defer cb.free(destination);
+                const run = cb.vtable.kernels.?.runAssignedKernel.?;
+                var invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .inputs = values[0..3], .output = destination, .prepared_route = &assigned };
+                invocation.inputs = &.{ values[0], values[3], values[2] };
+                try std.testing.expectError(error.PreparedKernelBindingChanged, run(cb.ptr, invocation));
+                invocation.inputs = values[0..3];
+                try std.testing.expect(try run(cb.ptr, invocation));
+                const actual = try cb.toFloat32(destination, a);
+                defer a.free(actual);
+                for (actual, expected[0]) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
             }
             if (count == 3) {
                 const slab = (try cb.allocUninitF32Shape(&.{ 2, 64 })) orelse return error.MissingPhysicalStorage;
