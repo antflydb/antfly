@@ -36,7 +36,7 @@ every index type's write path:
   rewrites global counters and a read-generation key; algebraic rewrites
   aggregate rows, whole HLL sketches and an `applied_generation` key. Each is
   serialized, and several are hot keys every writer contends on.
-- **A full reopen per foreign commit.** `lite_connection.zig` `refreshImpl`
+- **A full reopen per foreign commit** (writes until stage 4). `lite_connection.zig` `refreshImpl`
   reopens the runtime whenever another process committed; every index is then
   rebuilt from the catalog (the native-catalog backend mirrors whole scopes in
   memory: HBC nodes, sparse postings, graph adjacency). In process mode this
@@ -232,19 +232,21 @@ doc map, as full-text has) before it pays.
    flusher; per-transaction hot-key writes removed. Full-text level-0
    records are folded by ordinary merges, which check each input at the
    tip (`l0/` present) rather than in this process's mirror.
-4. Incremental cross-process refresh. Done for reads of document rows,
-   full-text and sparse indexes, so a read no longer needs the writer lease
-   after another process commits; `refreshCrossProcessRedoOverlay` adopts
-   the page bound other writers raised (`SharedRedoOverlay.pageBoundThrough`).
-   A write still reopens after one (`Owner.writer_reopen_pending`): the
-   runtime's free-page allocator and replay-sequence caches did not see those
-   commits. Next: reconcile those two in place, then let writes reuse it.
-   Releasing the writer lease before the durability wait stays off: it
-   measured no gain across processes (67 vs 65 writes/s, Debug) and a loss
-   across threads (about 250 vs 380, with stale results), where the writer
-   lane already hands the lease between writers. Letting writes refresh in
-   place gained little (65 to 86) and left stale results across processes,
-   so writes still reopen.
+4. Incremental cross-process refresh. Done for reads and writes of document
+   rows, full-text and sparse indexes: after another process commits, a
+   runtime catches up in place instead of reopening.
+   `refreshCrossProcessRedoOverlay` adopts the page bound other writers raised
+   (`SharedRedoOverlay.pageBoundThrough`). A write needs nothing more from the
+   allocator, which rebuilds from the checkpoint's free map, and only a fold
+   (which reopens) changes that. The replay sequence and redo tail resync from
+   the file once its adoption epoch moves. Index workers are raised to the
+   durable progress other processes recorded (`raiseWorkersToDurableProgress`),
+   as a reopen would start them. Without that, a worker replayed another
+   process's already-applied records and revived versions they had
+   overwritten: the stale results an earlier attempt saw.
+   Releasing the writer lease before the durability wait is not possible as
+   built: the group leader stages commit participants (full-text `stage`)
+   inside `Ticket.wait`, so the waiting writer can be the one publishing.
 5. Delete-marker cleanup and the remaining per-type folds.
 
 Each stage keeps the crash sweeps, the multi-process capi tests and the
