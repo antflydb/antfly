@@ -868,6 +868,7 @@ pub const StageDeleteRequest = struct {
 
 pub const SessionInfo = struct {
     terminal_abort: bool,
+    terminal_commit: bool = false,
     version: DurableSessionStore.Version,
     // Captured before dispatch under the session lock. A later retry rejection
     // cannot prove that an earlier execution of this ID had no durable effect.
@@ -1518,6 +1519,7 @@ pub const Session = struct {
         return .{
             .version = DurableSessionStore.Version.of(self),
             .terminal_abort = self.terminal_abort,
+            .terminal_commit = self.terminal_commit != null,
             .txn_id = self.txn_id,
             .commit_execution_started = self.commit_execution_started,
             .begin_timestamp = self.begin_timestamp,
@@ -1991,7 +1993,10 @@ pub const DurableSessionStore = struct {
         context: RoutingContext,
     ) !bool {
         const mutation = self.mutationMutex();
-        platform_sync.lockYielding(mutation);
+        while (!mutation.tryLock()) {
+            try context.ensureActive();
+            platform_time.yieldBriefly();
+        }
         defer mutation.unlock();
         try context.ensureActive();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
@@ -7271,7 +7276,10 @@ pub const SessionRegistry = struct {
         context: RoutingContext,
     ) !bool {
         const session_lock = self.sessionLock(txn_id);
-        session_lock.lock();
+        while (!session_lock.inner.tryLock()) {
+            try context.ensureActive();
+            platform_time.yieldBriefly();
+        }
         defer session_lock.unlock();
         try context.ensureActive();
         const durable = self.durable orelse return false;

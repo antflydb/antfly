@@ -10871,6 +10871,18 @@ pub const MetadataHttpService = struct {
         activation_admission: ?CoordinatedDecoderAdmission,
         submitted: ?*bool,
     ) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInContext(command, expected_term, activation_admission, submitted, .{});
+    }
+
+    fn proposeTransitionCommandWithReceiptInContext(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: ?u64,
+        activation_admission: ?CoordinatedDecoderAdmission,
+        submitted: ?*bool,
+        request: api_operation.RequestContext,
+    ) !MetadataProposalReceipt {
+        try request.ensureActive();
         const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
@@ -10897,6 +10909,7 @@ pub const MetadataHttpService = struct {
         try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
         var accepted_index: ?u64 = null;
         var dispatch_error: ?anyerror = null;
+        try request.ensureActive();
         self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
             dispatch_error = err;
         };
@@ -11033,10 +11046,11 @@ pub const MetadataHttpService = struct {
         return receipt;
     }
 
-    pub fn proposeSessionCommandObserved(self: *MetadataHttpService, bytes: []const u8, term: u64, submitted: *bool) !MetadataProposalReceipt {
+    pub fn proposeSessionCommandObserved(self: *MetadataHttpService, bytes: []const u8, term: u64, submitted: *bool, context: api_operation.RequestContext) !MetadataProposalReceipt {
         if (term == 0) return error.NotLeader;
-        const receipt = try self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .apply_transaction_sessions = bytes }, term, null, submitted);
-        try self.waitForTransitionApplied(receipt);
+        const request = try context.platformDeadline();
+        const receipt = try self.proposeTransitionCommandWithReceiptInContext(.{ .apply_transaction_sessions = bytes }, term, null, submitted, request);
+        try self.waitForTransitionAppliedWithContext(receipt, request);
         return receipt;
     }
 

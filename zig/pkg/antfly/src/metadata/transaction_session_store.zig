@@ -27,7 +27,7 @@ pub const Host = struct {
     read: *const fn (*anyopaque, A) anyerror!erased.ReadTxn,
     controlled_read: ?*const fn (*anyopaque, A, RoutingContext) anyerror!erased.ReadTxn = null,
     term: *const fn (*anyopaque) ?u64,
-    propose: *const fn (*anyopaque, []const u8, u64, *bool) anyerror!bool,
+    propose: *const fn (*anyopaque, []const u8, u64, *bool, RoutingContext) anyerror!bool,
 };
 pub const Store = struct {
     host: Host,
@@ -61,7 +61,10 @@ pub const Store = struct {
 
     pub fn writeControlled(ptr: *anyopaque, a: A, context: RoutingContext) !erased.WriteTxn {
         const self = cast(ptr);
-        @import("antfly_platform").sync.lockYielding(&self.gate);
+        while (!self.gate.tryLock()) {
+            try context.ensureActive();
+            @import("antfly_platform").time.yieldBriefly();
+        }
         errdefer self.gate.unlock();
         var txn = try beginWriteControlled(a, self, context);
         txn.write_gate = &self.gate;
@@ -355,7 +358,7 @@ const Write = struct {
             };
             try self.context.ensureActive();
             var submitted = false;
-            const applied = store.host.propose(store.host.ptr, bytes, self.term, &submitted) catch |err| {
+            const applied = store.host.propose(store.host.ptr, bytes, self.term, &submitted, self.context) catch |err| {
                 if (submitted) {
                     std.log.warn("transaction session proposal outcome unavailable err={s}", .{@errorName(err)});
                     return error.SessionWriteOutcomeUnknown;
@@ -363,7 +366,7 @@ const Write = struct {
                 return switch (err) {
                     error.NotLeader => error.SessionWriteNotLeaderBeforeProposal,
                     error.OutOfMemory => error.SessionWriteOutOfMemoryBeforeProposal,
-                    error.TransactionTooLarge => err,
+                    error.TransactionTooLarge, error.DeadlineExceeded, error.Canceled => err,
                     else => error.SessionWriteUnavailableBeforeProposal,
                 };
             };
@@ -497,7 +500,7 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
         fn term(ptr: *anyopaque) ?u64 {
             return cast(ptr).current_term;
         }
-        fn propose(ptr: *anyopaque, bytes: []const u8, expected: u64, submitted: *bool) !bool {
+        fn propose(ptr: *anyopaque, bytes: []const u8, expected: u64, submitted: *bool, _: RoutingContext) !bool {
             const self = cast(ptr);
             if (self.current_term != expected) return error.NotLeader;
             if (self.reject_before_proposal) |err| return err;
@@ -569,7 +572,7 @@ test "replicated session adapter retains cuts, merges cursors, fences terms and 
     {
         var txn = try logical.beginWrite();
         try txn.put("receipt", "acknowledgement lost");
-        fixture.lose_ack = error.TransactionTooLarge;
+        fixture.lose_ack = error.DeadlineExceeded;
         try std.testing.expectError(error.SessionWriteOutcomeUnknown, txn.commit());
         txn.abort();
         fixture.lose_ack = null;

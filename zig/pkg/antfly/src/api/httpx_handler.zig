@@ -7681,6 +7681,11 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn reserveFencedTransaction(context: operation_contract.RequestContext, server: *ApiHttpServer, completion: *@import("../pgwire/completion.zig").Completion) !void {
+        try context.ensureActive();
+        try @import("sql/session/completion.zig").reserveOnOwner(server, completion);
+    }
+
     fn prepareFencedTransaction(context: operation_contract.RequestContext, txn_id: db_mod.types.TxnId) !void {
         try context.ensureActive();
         if (context.sql_completion) |completion| try completion.prepare_transaction(completion.ptr, txn_id);
@@ -7747,6 +7752,18 @@ pub const AntflyApiHandler = struct {
         if (parsed_req) |*request| {
             self.api_server.bindCatalogTransaction(alloc, operationContext(ctx, authenticated_identity), request, &authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
             if (!(try self.api_server.transactionRequestAuthorized(authenticated_identity, request.*))) return textResponse(ctx, 403, "forbidden");
+        }
+        const commit_request = tableMutationContext(ctx, &authenticated_identity);
+        // The first clone seals the body and prevents further staging.
+        // Reserve before that durable transition, but let terminal replays
+        // and already executing sessions reach their outcome first.
+        if (commit_request.sql_completion != null and !session.commit_execution_started and !session.terminal_commit) {
+            const completion = try requestCompletion(ctx);
+            self.runDurableSQLRouting(ctx.io, reserveFencedTransaction, .{ commit_request, self.api_server, completion }) catch |err| switch (err) {
+                error.SqlWriteCapacityUnavailable => return rejectBeforeSQLExecution(ctx, try textResponse(ctx, 429, "SQL completion capacity unavailable; retry after existing work completes")),
+                error.DeadlineExceeded => return sqlForwardDeadlineResponse(ctx),
+                else => return err,
+            };
         }
         var commit_req = (self.api_server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, if (parsed_req) |*value| value else null) catch |err| switch (err) {
             error.SessionWriteOutcomeUnknown => return sessionInspectionFailure(ctx, err),
@@ -7876,7 +7893,6 @@ pub const AntflyApiHandler = struct {
         if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
         defer self.releasePublicOperation("commitTransactionSession");
 
-        const commit_request = tableMutationContext(ctx, &authenticated_identity);
         if (commit_request.sql_completion != null) self.runDurableSQLRouting(ctx.io, prepareFencedTransaction, .{ commit_request, txn_id }) catch |err| {
             if (err == error.SqlWriteCapacityUnavailable and execution_plan == null)
                 return rejectBeforeSQLExecution(ctx, try textResponse(ctx, 429, "SQL completion capacity unavailable; retry after existing work completes"));
@@ -8275,6 +8291,7 @@ pub const AntflyApiHandler = struct {
         limit: usize,
         execution_limits: sql_runtime.Limits = .{},
         has_execution_budget: bool = false,
+        routed_commit_checked: bool = false,
         completion_io: std.Io,
         completion: *@import("../pgwire/completion.zig").Completion,
         completion_alloc: std.mem.Allocator,
@@ -8731,7 +8748,7 @@ pub const AntflyApiHandler = struct {
                 return;
             }
             var legacy_replay: ?*transactions_api.DurableSessionStore = null;
-            if (compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
+            if (!self.routed_commit_checked and compiled.statement == .commit and self.parameters.len == 0 and self.adapter.connection_id == null) {
                 if (self.adapter.server.txn_sessions.durable) |store| if (self.adapter.session_id) |supplied| {
                     const id = distributed_txn.parseTxnIdHex(supplied) catch return error.SqlTransactionNotActive;
                     const probe = try store.probeSqlCommitDecision(std.heap.page_allocator, id, null, resource_principal);
@@ -9432,6 +9449,8 @@ pub const AntflyApiHandler = struct {
         const prepared_id = if (mode == .execute or mode == .close) resource_id orelse return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "prepared_id is required" }) else null;
         if (prepared_id) |id| _ = distributed_txn.parseTxnIdHex(id) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid prepared_id" });
         if (request.parameters) |parameters| if (parameters.len > 1024) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL parameter count exceeds 1024" });
+        const limit = request.limit orelse 128;
+        if (limit < 1 or limit > 4096) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL result limit must be between 1 and 4096" });
         // Bind all node-owned handles before any transaction forwarding. A
         // conflicting set must never bounce between issuers or execute twice.
         const connection_handle = if (mode == .close) ctx.header("x-antfly-sql-connection-id") else request.connection_id;
@@ -9439,6 +9458,7 @@ pub const AntflyApiHandler = struct {
         var owners: SQLRouteOwners = .{ .handles = @splat(null) };
         const local = self.api_server.localSessionNodeId();
         var resolve = false;
+        var routed_commit_checked = false;
         for (handles, 0..) |handle, i| if (handle) |encoded| {
             const owner = @import("sql/execution/resource_routing.zig").owner(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL handle" });
             owners.handles[i] = owner;
@@ -9454,6 +9474,7 @@ pub const AntflyApiHandler = struct {
             if (request.session_id) |encoded| {
                 const id = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL handle" });
                 if (try self.replaySharedCommit(ctx, id, http_server_mod.transactionPrincipal(identity) orelse "", completion, &owners)) |response| return response;
+                routed_commit_checked = true;
                 resolve = false;
             }
         }
@@ -9492,8 +9513,6 @@ pub const AntflyApiHandler = struct {
             const decoded = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL connection_id must be a 32-character hex id" });
             break :blk std.fmt.bytesToHex(decoded, .lower);
         } else null;
-        const limit = request.limit orelse 128;
-        if (limit < 1 or limit > 4096) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL result limit must be between 1 and 4096" });
         // Preparation has an independent bounded lane. The worker transfers
         // admission to exactly one execution class after classification.
         try self.api_server.reachRequestLifecycle(.admission_acquired, "executeSQL");
@@ -9532,6 +9551,7 @@ pub const AntflyApiHandler = struct {
             .limit = @intCast(limit),
             .execution_limits = execution_limits,
             .has_execution_budget = has_execution_budget,
+            .routed_commit_checked = routed_commit_checked,
             .completion_io = ctx.io,
             .completion = completion,
             .completion_alloc = ctx.allocator,
@@ -18126,6 +18146,33 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var staged = try transactions_api.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"one\":{}}}}}");
     defer staged.deinit(alloc);
     _ = (try server.txn_sessions.stage(alloc, guard, &staged)).?;
+    {
+        const generic = try server.txn_sessions.beginForPrincipal(alloc, .{}, node, principal);
+        const generic_guard = try server.txn_sessions.mutation(alloc, generic.txn_id, node);
+        _ = (try server.txn_sessions.stage(alloc, generic_guard, &staged)).?;
+        const generic_hex = std.fmt.bytesToHex(generic.txn_id, .lower);
+        const url = try std.fmt.allocPrint(alloc, "http://localhost/db/v1/transactions/{s}/commit", .{&generic_hex});
+        defer alloc.free(url);
+        var request = try httpx.Request.init(alloc, .POST, url);
+        defer request.deinit();
+        try request.headers.set("Authorization", alice_auth);
+        try request.headers.set("X-Antfly-SQL-Fence", "capacity-fence");
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        const prior_source = server.table_writes;
+        server.table_writes = .{ .ptr = undefined, .vtable = undefined };
+        defer server.table_writes = prior_source;
+        const capacity = @import("completion_outbox.zig").max_window;
+        try durable.reserveRegistrations(capacity);
+        defer durable.releaseRegistrations(capacity);
+        var rejected = try handler.commitTransactionSession(&ctx, &generic_hex);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
+        var persisted = (try durable.load(generic.txn_id)).?;
+        defer persisted.deinit(alloc);
+        try std.testing.expect(persisted.commit_body_digest == null);
+        _ = (try server.txn_sessions.stage(alloc, generic_guard, &staged)).?;
+    }
     var sealed_request = (try server.txn_sessions.cloneOwnedCommitRequest(alloc, guard, null)).?;
     defer sealed_request.deinit(alloc);
     const tables = try sealed_request.distributedTables(alloc);
@@ -27228,6 +27275,17 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var replay_request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql");
     defer replay_request.deinit();
     replay_request.body = body;
+    {
+        const invalid_body = try std.json.Stringify.valueAlloc(a, .{ .statement = "COMMIT", .session_id = &encoded, .limit = 4097 }, .{});
+        defer a.free(invalid_body);
+        replay_request.body = invalid_body;
+        defer replay_request.body = body;
+        var invalid_ctx = httpx.Context.init(a, std.testing.io, &replay_request);
+        defer invalid_ctx.deinit();
+        var rejected = try handler.executeSQL(&invalid_ctx);
+        defer rejected.deinit();
+        try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+    }
     var replay_ctx = httpx.Context.init(a, std.testing.io, &replay_request);
     defer replay_ctx.deinit();
     var replayed = try handler.executeSQL(&replay_ctx);

@@ -131,9 +131,9 @@ const MetadataSessions = struct {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return svc.localMetadataLeadershipTerm();
     }
-    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64, submitted: *bool) !bool {
+    fn propose(ptr: *anyopaque, bytes: []const u8, expected_term: u64, submitted: *bool, context: @import("antfly_local_sources").api_operation.RequestContext) !bool {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        const receipt = try svc.proposeSessionCommandObserved(bytes, expected_term, submitted);
+        const receipt = try svc.proposeSessionCommandObserved(bytes, expected_term, submitted, context);
         const projected = svc.projectedStore() orelse return error.MissingMetadataStore;
         var txn = try projected.openSessionRead(svc.alloc, svc.metadata_group_id);
         defer txn.abort();
