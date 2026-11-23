@@ -60532,7 +60532,12 @@ test "public source audio linear recreates input bank through actual learning ca
     try std.testing.expectEqual(output_bytes, domain.controller.snapshot().backend_scratch_bytes);
     guard.finish();
     guard_open = false;
-    _ = @import("../../execution/resource_retirement.zig").poll();
+    // The domain worker may already own the ready refund when poll runs.
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(2));
+    while (domain.controller.snapshot().backend_scratch_bytes != 0 and std.Io.Clock.awake.now(std.testing.io).nanoseconds < deadline.nanoseconds) {
+        _ = @import("../../execution/resource_retirement.zig").poll();
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
     try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().backend_scratch_bytes);
 }
 
