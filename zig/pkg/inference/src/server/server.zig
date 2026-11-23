@@ -52916,13 +52916,21 @@ const MediaOutputExecution = struct {
                         try results.append(a, value);
                         continue;
                     }
-                    if (payload == .video and resolved.speaker_path != null) if (payload.video.speaker_failure orelse (if (payload.video.speaker_failures) |failures| failures[index] else null)) |err| {
-                        if (!allow_partial and target.required) return err;
-                        value.status = .failed;
-                        value.code = @errorName(err);
-                        try results.append(a, value);
-                        continue;
-                    };
+                    if (payload == .video and resolved.speaker_path != null) {
+                        const speaker_failure: ?anyerror = if (payload.video.speaker_failure) |err|
+                            err
+                        else if (payload.video.speaker_failures) |failures|
+                            failures[index]
+                        else
+                            null;
+                        if (speaker_failure) |err| {
+                            if (!allow_partial and target.required) return err;
+                            value.status = .failed;
+                            value.code = @errorName(err);
+                            try results.append(a, value);
+                            continue;
+                        }
+                    }
                     if (masked_audio != null) return error.InvalidChunkOutput;
                     self.run(a, target, resolved, .{ .pcm = .{ .samples = selected_payload.pcm.samples[window.first..window.last], .sample_rate = selected_payload.pcm.sample_rate } }, &value) catch |err| {
                         if (chunks.abort(err) or (!allow_partial and target.required)) return err;
