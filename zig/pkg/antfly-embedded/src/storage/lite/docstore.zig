@@ -4280,7 +4280,7 @@ pub const Store = struct {
         try std.testing.expect(!store.file.header.indexed_reclamation);
         try store.file.putDocument("alpha", "one");
 
-        const inode = (try store.file.file.stat(std.testing.io)).inode;
+        const identity = store.file.dataIdentity().?;
         const region = (try store.file.regionForInode()).?;
         try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
 
@@ -4292,7 +4292,7 @@ pub const Store = struct {
         // two live fences on the one inode -- the open-time one
         // (never released) and the window one `acquireReaderFence`
         // installed over it.
-        try std.testing.expectEqual(@as(u64, 1), coordinator.readerStats(inode, region).count);
+        try std.testing.expectEqual(@as(u64, 1), coordinator.readerStats(identity, region).count);
         read.abort();
         aborted = true;
         // The bug: before the fix, the leaked open-time fence kept this
@@ -5007,7 +5007,7 @@ pub const Store = struct {
         }
         status.allocator_work = self.file.allocator_work;
         if (self.file.reader_coordinator) |coordinator| {
-            const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode, try self.file.regionForInode());
+            const readers = coordinator.readerStats(self.file.dataIdentity() orelse return error.InvalidTransactionState, try self.file.regionForInode());
             status.coordinated_reader_count = readers.count;
             status.poisoned_coordinated_readers = readers.poisoned;
             status.oldest_coordinated_reader_age_ms = readers.oldest_age_ms;
@@ -5138,7 +5138,7 @@ pub const Store = struct {
     /// reopen on the next access still has to do the work later.
     fn reopenRegionAfterGenerationSwap(self: *Store) void {
         const io = self.file.runtime();
-        if (self.file.inode_lock_ref.load(.acquire)) |entry| _ = inode_lock.ensureRegion(entry, io) catch {};
+        if (self.file.inode_lock_ref.load(.acquire)) |entry| inode_lock.warmRegion(entry, io) catch {};
     }
 
     /// `from_background_worker`: see `maintainOnceWithCancel`'s own doc
@@ -5545,6 +5545,10 @@ pub const Store = struct {
     /// all live readers and writers. The prepared store remains valid only so
     /// its retired descriptor can be closed by normal teardown.
     pub fn replaceWithPreparedGeneration(self: *Store, prepared: *Store) !native.GenerationPublicationOutcome {
+        return self.replaceWithPreparedGenerationAt(prepared, null);
+    }
+
+    pub fn replaceWithPreparedGenerationAt(self: *Store, prepared: *Store, canonical_destination: ?[]const u8) !native.GenerationPublicationOutcome {
         if (self == prepared) return error.InvalidArgument;
         // The finalized disposable owner is about to surrender its descriptor.
         // Join before taking its mutex: maintenance can need that mutex while
@@ -5594,7 +5598,7 @@ pub const Store = struct {
             self.requestReassessment();
             self.maintenance_policy.assessed_retirement_bytes = self.file.retirement_activity_bytes;
         };
-        return try self.file.replaceWithPreparedGeneration(&prepared.file);
+        return self.file.replaceWithPreparedGenerationAt(&prepared.file, canonical_destination);
     }
 
     /// Refuse a predictably inadmissible rewrite before allocating/copying its
@@ -7385,8 +7389,7 @@ const RuntimeStore = struct {
         errdefer file.close();
         // An independently restored path can reuse a replay generation. Its
         // checkpoint cannot certify visibility for the retained namespace.
-        if ((try file.file.stat(io)).inode != (try store.file.file.stat(io)).inode)
-            return error.EnrichmentSourceChanged;
+        if (!file.sameDataFile(&store.file)) return error.EnrichmentSourceChanged;
         file.page_cache_policy = .metadata_only;
         return .{ .file = file, .prefix = self.prefix, .arena = .init(store.allocator) };
     }
