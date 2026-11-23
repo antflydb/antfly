@@ -877,7 +877,6 @@ pub const Aggregate = struct {
                 if (self.selected) |*old| old.deinit();
                 self.selected = selected;
             },
-            .array_agg => unreachable,
             .pattern_set => {
                 // DISTINCT owns the string; the JSON array borrows that stable
                 // copy until the grouped operator releases both together.
