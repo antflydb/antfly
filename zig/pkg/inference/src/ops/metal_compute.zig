@@ -40555,7 +40555,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // This is a source witness for a warmed projection slot. It grants no
     // device residency or allocation credit to the borrowed host span.
     fn heldHostProjectionPlane(self: *MetalCompute, buffer: *const Buf, shape: ml.graph.Shape) !@import("../execution/storage_ownership.zig").Plane {
-        if (buffer.owned or !buffer.owns_lazy_pin or buffer.mutable_state or buffer.integer_storage or
+        if (buffer.owned or buffer.mutable_state or buffer.integer_storage or
             buffer.lazy_multiply != null or bufHasAnyQuantizedStorage(buffer) or buffer.native_dense_bytes != null or
             buffer.native_dense_dtype != null or hasHostView(buffer)) return error.UnsupportedDenseSchedule;
         const entry = buffer.lazy_entry orelse return error.UnsupportedDenseSchedule;
@@ -40563,8 +40563,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer self.data.prefetch.unlock();
         const loaded = if (entry.host_loaded) |*value| value else return error.DenseWeightPreparationChanged;
         if (entry.pin_count == 0 or loaded.tensor.dtype != .f32 or !std.mem.eql(i64, loaded.tensor.shape, shape.dims[0..shape.rank()])) return error.DenseWeightPreparationChanged;
-        const root = loaded.tensor.asFloat32IfAligned() orelse return error.UnsupportedDenseSchedule;
-        if (root.len == 0 or root.len != buffer.data.len or root.ptr != buffer.data.ptr) return error.DenseWeightPreparationChanged;
+        const root = if (buffer.owns_lazy_pin)
+            loaded.tensor.asFloat32IfAligned() orelse return error.UnsupportedDenseSchedule
+        else cached: {
+            const cached = self.dense_weight_cache.get(buffer.weight_handle_name orelse return error.DenseWeightPreparationChanged) orelse return error.DenseWeightPreparationChanged;
+            if (!buffer.immutable_cached_source or cached.lazy_entry != entry or cached.prepared_value_identity != buffer.cache_identity or
+                !std.mem.eql(i64, cached.logical_shape, loaded.tensor.shape)) return error.DenseWeightPreparationChanged;
+            break :cached cached.data;
+        };
+        if (root.len == 0 or root.len != loaded.tensor.elementCount() or root.len != buffer.data.len or root.ptr != buffer.data.ptr) return error.DenseWeightPreparationChanged;
         const bytes = try std.math.mul(usize, root.len, @sizeOf(f32));
         var desc = @import("../graph/backend_contracts.zig").TensorDesc.init(shape, .host_f32);
         desc.current_backend = .metal;
@@ -56235,6 +56242,15 @@ const PreparedDenseRegionFixture = struct {
         const shape = ml.graph.Shape.init(.f32, &.{ 1, 64 });
         const weight_shape = ml.graph.Shape.init(.f32, &.{ 64, 64 });
         const bias_shape = ml.graph.Shape.init(.f32, &.{64});
+        {
+            const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            const cached = try cb.getWeight("k");
+            defer cb.free(cached);
+            try std.testing.expect(!MetalCompute.toBuf(cached).owns_lazy_pin);
+            const plane = try @import("../execution/dense_decoder_backend.zig").heldWeight(&cb, compute.data, cached, "k");
+            try std.testing.expectEqual(.native, plane.descriptor.resident_backend);
+            try std.testing.expectEqual(@intFromPtr(MetalCompute.toBuf(cached).data.ptr), plane.backing.?.base);
+        }
         {
             const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
             const previous = compute.data.f32_weight_borrow;
