@@ -1214,6 +1214,9 @@ pub const magic = "AFLITE\x0cP";
 pub const format_version: u32 = 11;
 pub const protected_redo_format_version: u32 = 12;
 pub const segmented_redo_format_version: u32 = 13;
+/// Part of the version word so binaries predating the fence reject the file
+/// before reading its checkpoint or catalog. The lower bits encode the layout.
+const versioned_text_format_bit: u32 = 1 << 31;
 const redo_frontier_page_count = 2;
 pub const default_page_size: u32 = 4096;
 
@@ -5378,6 +5381,7 @@ pub const Header = struct {
     protected_redo: bool = false,
 
     segmented_redo: bool = false,
+    versioned_text_required: bool = false,
 
     fn redoOffset(self: Header) u64 {
         if (!self.segmented_redo) return self.redo_log_offset;
@@ -5390,8 +5394,8 @@ pub const Header = struct {
     }
 
     pub fn diskFormatVersion(self: Header) u32 {
-        if (self.segmented_redo) return segmented_redo_format_version;
-        return if (self.protected_redo) protected_redo_format_version else format_version;
+        const layout = if (self.segmented_redo) segmented_redo_format_version else if (self.protected_redo) protected_redo_format_version else format_version;
+        return layout | (if (self.versioned_text_required) versioned_text_format_bit else 0);
     }
 };
 
@@ -18506,6 +18510,17 @@ pub const NativeFile = struct {
     }
 
     pub fn vacuumWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !VacuumReport {
+        return self.vacuumWithFormat(cancel, false);
+    }
+
+    /// Upgrade under writer path authority by publishing a replacement inode.
+    /// A failed preparation leaves the original header and checkpoints intact.
+    pub fn requireVersionedTextFormat(self: *NativeFile) !void {
+        if (self.header.versioned_text_required) return;
+        _ = try self.vacuumWithFormat(null, true);
+    }
+
+    fn vacuumWithFormat(self: *NativeFile, cancel: ?*const maintenance.CancelToken, versioned_text_required: bool) !VacuumReport {
         if (self.read_only) return error.ReadOnly;
         // Through the registry, like every other exclusive grant on this
         // inode: a raw `acquireDataRewriteLock` here would self-conflict
@@ -18522,6 +18537,7 @@ pub const NativeFile = struct {
         if (try self.regionForInode()) |region| if (region.minimumPinnedSequence() != null) return error.WouldBlock;
         var image = try self.prepareVacuum(cancel);
         defer image.deinit();
+        image.prepared.header.versioned_text_required = image.prepared.header.versioned_text_required or versioned_text_required;
         try self.publishVacuum(&image);
         return image.report;
     }
@@ -18898,6 +18914,7 @@ pub const NativeFile = struct {
             // lock region, which is keyed by inode, not a path-resolved
             // namespace). Left zeroed, same as every other new write path.
             .indexed_reclamation = indexed,
+            .versioned_text_required = self.header.versioned_text_required,
             .page_size = self.header.page_size,
             .active_checkpoint = 0,
             .checkpoints = .{ checkpoint, .{} },
@@ -23673,6 +23690,7 @@ pub const NativeFile = struct {
         const prepared_entry = prepared.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
         var binding: ?[]u8 = try inode_lock.prepareRebind(prepared_entry, io, prepared.file, destination);
         defer if (binding) |owned| std.heap.page_allocator.free(owned);
+        prepared.header.versioned_text_required = prepared.header.versioned_text_required or self.header.versioned_text_required;
         try prepared.preparePrivatePublication(destination);
         var adopted_redo: ?RedoCommitState = null;
         if (prepared.header.redo_log_capacity != 0) {
@@ -24984,7 +25002,8 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const header_raw = raw[0..header_size];
     if (!std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic)) return error.InvalidNativeMagic;
 
-    const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
+    const version_word = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
+    const version = version_word & ~versioned_text_format_bit;
     if (version != format_version and version != protected_redo_format_version and version != segmented_redo_format_version) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
@@ -25021,6 +25040,7 @@ pub fn decodeHeader(raw: []const u8) !Header {
         .redo_log_capacity = redo_capacity,
         .protected_redo = protected_redo,
         .segmented_redo = segmented_redo,
+        .versioned_text_required = version_word & versioned_text_format_bit != 0,
     };
 }
 
@@ -42570,4 +42590,40 @@ test "lite redo log a failed takeover barrier is retried before publishing the s
     try writer.commitTransaction();
     try expectRedoDocument(&writer, "beta", "two");
     try expectRedoDocument(&writer, "gamma", "three");
+}
+
+test "lite header format fence uses a version rejected by legacy readers" {
+    var encoded: [header_size]u8 = undefined;
+    const header: Header = .{ .versioned_text_required = true };
+    encodeHeader(&encoded, header);
+    const raw_version = std.mem.readInt(u32, encoded[version_offset..][0..4], .little);
+    try std.testing.expect(raw_version != format_version);
+    try std.testing.expect(raw_version != protected_redo_format_version);
+    try std.testing.expect(raw_version != segmented_redo_format_version);
+    try std.testing.expect((try decodeHeader(&encoded)).versioned_text_required);
+    encodeHeader(&encoded, .{});
+    try std.testing.expect(!(try decodeHeader(&encoded)).versioned_text_required);
+}
+
+test "lite header format fence migrates and survives a generation rewrite" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "text-format.aflite");
+    defer alloc.free(path);
+    {
+        var writer = try NativeFile.createWithIo(alloc, io, path, .{});
+        defer writer.close();
+        try writer.putDocument("doc", "retained");
+        try writer.requireVersionedTextFormat();
+        try std.testing.expect(writer.header.versioned_text_required);
+        _ = try writer.vacuum();
+    }
+    var reader = try NativeFile.openWithIo(alloc, io, path, .{ .read_only = true });
+    defer reader.close();
+    try std.testing.expect(reader.header.versioned_text_required);
+    const value = (try reader.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("retained", value);
 }
