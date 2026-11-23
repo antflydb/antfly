@@ -551,6 +551,12 @@ fn effectiveK(request: SearchRequest, snap: *const index_mod.IndexSnapshot) u32 
     return request.k + request.offset;
 }
 
+pub const TestExecutionProbe = struct {
+    ctx: *anyopaque,
+    entered: *const fn (*anyopaque) anyerror!void,
+};
+pub threadlocal var test_execution_probe: ?TestExecutionProbe = null;
+
 /// Execute a search request against an index snapshot.
 pub fn execute(
     alloc: Allocator,
@@ -561,6 +567,10 @@ pub fn execute(
     defer programs.deinit();
     var request = unprepared;
     if (request.control.pattern_programs == null) request.control.pattern_programs = &programs;
+    if (@import("builtin").is_test) if (test_execution_probe) |probe| {
+        try probe.entered(probe.ctx);
+    };
+
     // Pure patterns have constant scores and a dedicated bounded bitmap
     // collector. Cursor/preparation metadata must not route them through the
     // general Boolean arena; mixed Boolean trees still use streaming lowering.
