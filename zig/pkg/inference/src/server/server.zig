@@ -52131,6 +52131,8 @@ const MediaOutputExecution = struct {
     speaker_timeline_leases: [16]?runtime.tier.memory.AdmissionLease = @splat(null),
     parked_speakers: [16]?speaker_checkpoint.timeline.Timeline = @splat(null),
     parked_frontiers: [16]?ParkedFrontier = @splat(null),
+    cached_speaker_outputs: [16]?*@import("../pipelines/media_index_cache.zig").Cache.Entry = @splat(null),
+    speaker_output_disk_checked: [16]bool = @splat(false),
     parked_speaker_leases: [16]?runtime.tier.memory.AdmissionLease = @splat(null),
     parked_aliases: [16]?usize = @splat(null),
     video_speaker_keys: [16]?[32]u8 = @splat(null),
@@ -52671,7 +52673,7 @@ const MediaOutputExecution = struct {
         self.parked_aliases[index] = self.parkedSpeakerIndex(identity);
     }
 
-    fn reclaimOptionalSpeakers(self: *MediaOutputExecution, result: *chunks.VideoSpeakerResult) bool {
+    fn reclaimOptionalSpeakers(self: *MediaOutputExecution, result: *chunks.VideoSpeakerResult, keep_parked: ?usize) bool {
         if (self.speaker_video == null) return false;
         var victim: ?usize = null;
         for (self.speaker_states, 0..) |candidate, i| {
@@ -52713,7 +52715,7 @@ const MediaOutputExecution = struct {
         // If freeing mutable state was insufficient, release one retained
         // timeline. Other recipes can still serve their committed coverage.
         for (self.parked_speakers, 0..) |timeline, index| {
-            if (timeline == null or self.protected_parked[index]) continue;
+            if (timeline == null or self.protected_parked[index] or keep_parked == index) continue;
             for (self.parked_aliases, 0..) |alias, i| {
                 if (alias == index and self.speaker_states[i] == null)
                     result.failures[i] = .{ .cause = error.ChunkWorkingBudgetExceeded, .covered_through_ns = 0 };
@@ -52730,16 +52732,56 @@ const MediaOutputExecution = struct {
         return if (timeline.len() == 0) 0 else timeline.at(timeline.len() - 1).end_ns;
     }
 
-    fn speakerOutputTimeline(self: *MediaOutputExecution, name: []const u8) !speaker_checkpoint.timeline.Timeline {
+    fn checkpointReadView(snapshot: speaker_checkpoint.Snapshot) speaker_checkpoint.timeline.ReadView {
+        return if (snapshot.shared) |view| .{ .shared = view } else .{ .flat = snapshot.spans };
+    }
+
+    fn releaseSpeakerOutputCoverage(self: *MediaOutputExecution) void {
+        for (&self.cached_speaker_outputs) |*maybe| {
+            const entry = maybe.* orelse continue;
+            self.node.host_caches.media_index_cache.release(entry);
+            maybe.* = null;
+        }
+    }
+
+    fn pinSpeakerOutputCoverage(self: *MediaOutputExecution, index: usize, through: i64) !bool {
+        const video = self.speaker_video orelse return false;
+        if (!video.cacheable) return false;
+        if (self.speaker_states[index]) |state| if (speakerCoverage(state) >= through) return false;
+        if (self.parkedCoverage(index) >= through) return false;
+        const key = try self.videoSpeakerIdentity(index);
+        const cache = &self.node.host_caches.media_index_cache;
+        var candidate = cache.get(key);
+        if (candidate == null and !self.speaker_output_disk_checked[index] and self.speaker_states[index] == null) {
+            self.speaker_output_disk_checked[index] = true;
+            const scratch = self.speaker_scratch;
+            if (speaker_checkpoint.Store.loadWithCursor(self.speakerContext(), scratch, key)) |saved| {
+                defer saved.snapshot.deinit(scratch);
+                cache.remember(std.heap.smp_allocator, key, .{ .speaker_analysis = saved.snapshot }, self.speaker_cache_admission.?);
+                cache.recordSpeakerDisk(key, saved.cursor);
+                candidate = cache.get(key);
+            } else |_| {}
+        }
+        const entry = candidate orelse return false;
+        if (entry.data != .speaker_analysis or checkpointReadView(entry.data.speaker_analysis).coverage() < through) {
+            cache.release(entry);
+            return false;
+        }
+        self.cached_speaker_outputs[index] = entry;
+        return true;
+    }
+
+    fn speakerOutputTimeline(self: *MediaOutputExecution, name: []const u8) !speaker_checkpoint.timeline.ReadView {
         for (self.config.targets, 0..) |target, i| {
             if (!std.mem.eql(u8, target.name, name)) continue;
+            if (self.cached_speaker_outputs[i]) |entry| return checkpointReadView(entry.data.speaker_analysis);
             const state = self.speaker_states[i];
             if (self.parked_aliases[i]) |alias| {
                 if (self.parked_speakers[alias]) |timeline| {
-                    if (state == null or self.parkedCoverage(i) > speakerCoverage(state.?)) return timeline;
+                    if (state == null or self.parkedCoverage(i) > speakerCoverage(state.?)) return .{ .shared = timeline.view() };
                 }
             }
-            if (state) |active| return active.timeline;
+            if (state) |active| return .{ .shared = active.timeline.view() };
             return error.SpeakerAnalysisUnavailable;
         }
         return error.InvalidChunkOutputs;
@@ -52811,6 +52853,7 @@ const MediaOutputExecution = struct {
     const VideoSpeakerWork = struct {
         through: [16]?i64,
         piggyback: ?[16]?i64 = null,
+        wanted: ?[16]?i64 = null,
         window: chunks.VideoSpeakerWindow,
         provider: ?audio_providers.Provider,
         optional: bool = false,
@@ -52840,6 +52883,7 @@ const MediaOutputExecution = struct {
 
     fn ensureVideoSpeakers(raw: *anyopaque, window: chunks.VideoSpeakerWindow, optional_provider: ?audio_providers.Provider, result: *chunks.VideoSpeakerResult) !void {
         const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+        self.releaseSpeakerOutputCoverage();
         if (self.speaker_provider == null) return;
         var wanted: [16]?i64 = @splat(null);
         @memset(&self.protected_parked, false);
@@ -52858,6 +52902,7 @@ const MediaOutputExecution = struct {
             const is_required = !self.allow_partial and target.required;
             var active_coverage: i64 = 0;
             var parked_coverage: i64 = 0;
+            var needs_parked = false;
             var windows = window.extent.windows(self.resolved[index].max_audio_ns);
             while (try windows.next()) |span| {
                 if (!target.wantsWithMask(self.mask(index), window.ordinal, span.sub_index)) continue;
@@ -52873,14 +52918,22 @@ const MediaOutputExecution = struct {
                 const end = @min(window.end, span.end_ns);
                 wanted[index] = end;
                 if (is_required and active_coverage < end and parked_coverage >= end) {
-                    if (self.parked_aliases[index]) |parked| self.protected_parked[parked] = true;
+                    needs_parked = true;
                 }
             }
-            if (is_required) if (wanted[index]) |through| {
-                if (parked_coverage < through or active_coverage >= through) {
+            if (wanted[index]) |through| {
+                if (try self.pinSpeakerOutputCoverage(index, through)) {
+                    wanted[index] = null;
+                    result.failures[index] = null;
+                    continue;
+                }
+                if (needs_parked) if (self.parked_aliases[index]) |parked| {
+                    self.protected_parked[parked] = true;
+                };
+                if (is_required and (parked_coverage < through or active_coverage >= through)) {
                     if (self.speaker_states[index]) |state| state.required_video = true;
                 }
-            };
+            }
         }
         for ([_]bool{ true, false }) |required_phase| {
             for (self.config.targets, 0..) |target, index| {
@@ -52891,10 +52944,11 @@ const MediaOutputExecution = struct {
                 const reserve = if (is_required) try self.pendingRequiredSpeakerBytes(wanted, index) else 0;
                 self.admitVideoSpeaker(index, is_required, reserve, through) catch |err| {
                     if (is_required) {
-                        if (!speakerExtensionPressure(err) or !self.reclaimOptionalSpeakers(result)) return err;
+                        const keep_parked = self.parkedSpeakerIndex(try self.videoSpeakerIdentity(index));
+                        if (!speakerExtensionPressure(err) or !self.reclaimOptionalSpeakers(result, keep_parked)) return err;
                         while (true) {
                             self.admitVideoSpeaker(index, true, reserve, through) catch |retry_err| {
-                                if (!speakerExtensionPressure(retry_err) or !self.reclaimOptionalSpeakers(result)) return retry_err;
+                                if (!speakerExtensionPressure(retry_err) or !self.reclaimOptionalSpeakers(result, keep_parked)) return retry_err;
                                 continue;
                             };
                             break;
@@ -52918,8 +52972,8 @@ const MediaOutputExecution = struct {
             goals[leader_index] = @max(goals[leader_index] orelse through, through);
         }
         var failed_recipes: [16]bool = @splat(false);
-        try self.ensureSpeakerWork(window.start, window.end, false, .{ .through = required, .piggyback = optional, .window = window, .provider = null, .result = result, .failed_recipes = &failed_recipes });
-        self.ensureSpeakerWork(window.start, window.end, false, .{ .through = optional, .window = window, .provider = optional_provider, .optional = true, .result = result, .failed_recipes = &failed_recipes }) catch |err| {
+        try self.ensureSpeakerWork(window.start, window.end, false, .{ .through = required, .piggyback = optional, .wanted = wanted, .window = window, .provider = null, .result = result, .failed_recipes = &failed_recipes });
+        self.ensureSpeakerWork(window.start, window.end, false, .{ .through = optional, .wanted = wanted, .window = window, .provider = optional_provider, .optional = true, .result = result, .failed_recipes = &failed_recipes }) catch |err| {
             if (!speakerExtensionPressure(err)) return err;
             for (wanted, 0..) |goal, index| if (goal) |through| {
                 const state = self.speaker_states[index] orelse continue;
@@ -52929,7 +52983,7 @@ const MediaOutputExecution = struct {
         };
         for (wanted, 0..) |goal, index| if (goal) |through| {
             const state = self.speaker_states[index] orelse continue;
-            if (self.enough(state, window.start, through, false) or self.parkedCoverage(index) >= through) {
+            if (self.cached_speaker_outputs[index] != null or self.enough(state, window.start, through, false) or self.parkedCoverage(index) >= through) {
                 result.failures[index] = null;
             } else if (result.failures[index]) |*failure| {
                 failure.covered_through_ns = @max(speakerCoverage(state), self.parkedCoverage(index));
@@ -52961,7 +53015,7 @@ const MediaOutputExecution = struct {
 
     fn reclaimForRequiredSpeaker(self: *MediaOutputExecution, work: ?VideoSpeakerWork, err: anyerror) bool {
         const video_work = work orelse return false;
-        return !video_work.optional and speakerExtensionPressure(err) and self.reclaimOptionalSpeakers(video_work.result);
+        return !video_work.optional and speakerExtensionPressure(err) and self.reclaimOptionalSpeakers(video_work.result, null);
     }
 
     fn ensureSpeakers(raw: *anyopaque, _: std.mem.Allocator, start: i64, end: i64, stop_at_turn: bool) !void {
@@ -53061,8 +53115,29 @@ const MediaOutputExecution = struct {
                 defer self.node.host_caches.media_index_cache.release(entry);
                 if (entry.data == .speaker_analysis and entry.data.speaker_analysis.next_window > state.next_window) {
                     if (work) |video_work| {
+                        const snapshot = entry.data.speaker_analysis;
+                        const coverage = checkpointReadView(snapshot).coverage();
+                        if (video_work.wanted) |wanted| {
+                            // A flight owner may have published after the
+                            // window's initial cache probe. Keep its geometry
+                            // even when the mutable checkpoint would be large.
+                            for (wanted, 0..) |goal, alias| {
+                                const through = goal orelse continue;
+                                if (self.speaker_states[alias] != state or through > coverage or self.cached_speaker_outputs[alias] != null) continue;
+                                self.cached_speaker_outputs[alias] = self.node.host_caches.media_index_cache.get(state.identity).?;
+                                video_work.result.failures[alias] = null;
+                            }
+                            if (video_work.through[i]) |through| {
+                                if (through <= coverage) eligible[i] = false;
+                            }
+                            const shared = if (video_work.piggyback) |goals| goals[i] else video_work.through[i];
+                            if (shared) |through| {
+                                if (through <= coverage) sharing[i] = false;
+                            }
+                            if (!eligible[i] and !sharing[i]) continue;
+                        }
                         const through = if (eligible[i]) video_work.through[i] else if (video_work.piggyback) |goals| goals[i] else video_work.through[i];
-                        if (!usefulVideoCheckpoint(entry.data.speaker_analysis, through)) continue;
+                        if (!usefulVideoCheckpoint(snapshot, through)) continue;
                     }
                     const optional = work != null and (work.?.optional or !eligible[i]);
                     self.refreshSpeakerState(state, entry.data.speaker_analysis) catch |err| {
@@ -53418,6 +53493,7 @@ const MediaOutputExecution = struct {
     }
 
     fn deinit(self: *MediaOutputExecution, a: std.mem.Allocator) void {
+        self.releaseSpeakerOutputCoverage();
         if (self.frame_cache) |cache| {
             cache.deinit();
             a.destroy(cache);
@@ -53446,6 +53522,7 @@ const MediaOutputExecution = struct {
     fn execute(raw: *anyopaque, a: std.mem.Allocator, payload: chunks.Payload, descriptor: lib_chunker.planning.Descriptor, boundary_context: ?chunks.EmbeddingContext, primary: ?chunks.Output, primary_error: ?anyerror, allow_partial: bool) anyerror![]const outputs.Result {
         const self: *MediaOutputExecution = @ptrCast(@alignCast(raw));
         defer self.endVideo();
+        defer if (payload == .video) self.releaseSpeakerOutputCoverage();
         if (payload == .video) if (payload.video.prepared_outputs) |prepared| {
             self.endVideo();
             const window: *FrameWindow = @ptrCast(@alignCast(prepared.context));
@@ -53716,7 +53793,7 @@ const MediaOutputExecution = struct {
         const after = std.fmt.bytesToHex(try self.node.model_manager.modelIdentityForManifest(resolved.path, manifest), .lower);
         if (!std.mem.eql(u8, &after, &resolved.revision)) return error.ModelConfigurationChanged;
     }
-    fn appendSpeakerTranscript(a: std.mem.Allocator, out: *std.ArrayList(outputs.Span), timeline: speaker_checkpoint.timeline.Timeline, segment: transcribing_api.Segment, origin: i64, start: i64, end: i64) !void {
+    fn appendSpeakerTranscript(a: std.mem.Allocator, out: *std.ArrayList(outputs.Span), timeline: speaker_checkpoint.timeline.ReadView, segment: transcribing_api.Segment, origin: i64, start: i64, end: i64) !void {
         const text = segment.text orelse "";
         const words = segment.words orelse &.{};
         if (words.len != 0) {
@@ -53947,13 +54024,13 @@ test "model aware media reclaims optional speaker state for required timeline gr
     try std.testing.expectEqual(@as(u64, 1), execution.parked_frontiers[1].?.next_window);
     try std.testing.expectEqual(@as(u64, 3), execution.parked_frontiers[1].?.covered_samples);
     execution.protected_parked[1] = true;
-    try std.testing.expect(!execution.reclaimOptionalSpeakers(&result));
+    try std.testing.expect(!execution.reclaimOptionalSpeakers(&result, null));
 
     const rebuilt = try a.create(MediaOutputExecution.SpeakerState);
     rebuilt.* = .{ .identity = @splat(2) };
     execution.speaker_states[1] = rebuilt;
     try rebuilt.timeline.append(a, .{ .start_ns = 0, .end_ns = 2, .speaker_index = null });
-    try std.testing.expect(execution.reclaimOptionalSpeakers(&result));
+    try std.testing.expect(execution.reclaimOptionalSpeakers(&result, null));
     const aliased = try execution.speakerOutputTimeline("alias");
     try std.testing.expectEqual(@as(i64, 2), aliased.at(0).end_ns);
     try std.testing.expect(execution.protected_parked[1]);
@@ -53962,10 +54039,10 @@ test "model aware media reclaims optional speaker state for required timeline gr
     resumed.* = .{ .identity = @splat(2), .video_owner = 2 };
     execution.speaker_states[2] = resumed;
     try resumed.timeline.append(a, .{ .start_ns = 0, .end_ns = 3, .speaker_index = null });
-    try std.testing.expect(!MediaOutputExecution.checkpointMatchesParked(aliased, resumed.snapshot(1)));
-    try std.testing.expect(MediaOutputExecution.checkpointMatchesParked(aliased, .{
+    try std.testing.expect(!MediaOutputExecution.checkpointMatchesParked(execution.parked_speakers[1].?, resumed.snapshot(1)));
+    try std.testing.expect(MediaOutputExecution.checkpointMatchesParked(execution.parked_speakers[1].?, .{
         .registry = &resumed.registry,
-        .shared = aliased.view(),
+        .shared = aliased.shared,
         .sample_rate = 1,
     }));
     execution.retireSupersededParked(resumed);
@@ -53982,6 +54059,50 @@ test "model aware media reclaims optional speaker state for required timeline gr
     const snapshot = required.snapshot(1);
     try std.testing.expectError(error.ChunkWorkingBudgetExceeded, execution.refreshSpeakerState(&required, snapshot));
     try std.testing.expectEqual(@as(usize, block_size + 1), required.timeline.len());
+}
+
+test "model aware media serves covered video windows from a read-only checkpoint" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    const Provider = struct {
+        fn read(_: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !MediaOutputExecution.audio_providers.Lease {
+            return error.UnexpectedAudioReplay;
+        }
+    };
+    var marker: u8 = 0;
+    const targets = [_]lib_chunker.outputs.Target{.{ .name = "voices", .kind = .diarize, .model = "speaker", .required = true }};
+    var execution = MediaOutputExecution{ .node = &node, .io = std.testing.io, .control = .{}, .config = .{ .boundary_model = "voices", .targets = &targets }, .allocator = a };
+    defer execution.deinit(a);
+    execution.resolved[0] = .{ .path = "", .identity = @splat(0), .revision = @splat(0), .recipe_id = @splat(0) };
+    try MediaOutputExecution.prepareVideoSpeakers(&execution, a, .{ .context = &marker, .samples = 1200, .sample_rate = 2, .read = Provider.read }, 0, @splat(1), "v1", true);
+    const key = try execution.videoSpeakerIdentity(0);
+    var registry: MediaOutputExecution.speakers.Registry = .{};
+    const spans = try a.alloc(MediaOutputExecution.speakers.Span, MediaOutputExecution.speaker_checkpoint.timeline.block_size + 1);
+    defer a.free(spans);
+    for (spans, 0..) |*span, index| {
+        const start: i64 = @intCast(index);
+        span.* = .{ .start_ns = start * 1500 * std.time.ns_per_ms, .end_ns = (start + 1) * 1500 * std.time.ns_per_ms, .speaker_index = null };
+    }
+    node.host_caches.media_index_cache.remember(a, key, .{ .speaker_analysis = .{
+        .registry = &registry,
+        .spans = spans,
+        .sample_rate = 2,
+        .next_window = spans.len,
+        .covered_samples = spans.len * 3,
+    } }, execution.speaker_cache_admission.?);
+    var result: MediaOutputExecution.chunks.VideoSpeakerResult = .{};
+    try MediaOutputExecution.ensureVideoSpeakers(&execution, .{
+        .ordinal = 1,
+        .start = 0,
+        .end = std.time.ns_per_s,
+        .extent = .{ .samples = 2, .sample_rate = 2, .start_ns = 0 },
+        .first = 0,
+    }, null, &result);
+    try std.testing.expect(execution.speaker_states[0] == null);
+    try std.testing.expect(result.failures[0] == null);
+    const timeline = try execution.speakerOutputTimeline("voices");
+    try std.testing.expectEqual(spans[0], timeline.at(0));
 }
 
 test "model aware media schedules video speaker recipes by priority and mask and reuses PCM" {
@@ -54392,7 +54513,7 @@ test "model aware media source diarization emits standalone turns and splits tra
     try receipt.validate(target);
     try std.testing.expectEqual(@as(usize, 2), receipt.speaker_spans.?.len);
     var spans: std.ArrayList(O.Span) = .empty;
-    try MediaOutputExecution.appendSpeakerTranscript(alloc, &spans, state.timeline, .{ .text = "Hello, world!", .start_ms = 0, .end_ms = 2000, .words = &.{ .{ .word = "Hello,", .start_ms = 0, .end_ms = 900 }, .{ .word = "world!", .start_ms = 1000, .end_ms = 2000 } } }, 0, 0, 2 * std.time.ns_per_s);
+    try MediaOutputExecution.appendSpeakerTranscript(alloc, &spans, .{ .shared = state.timeline.view() }, .{ .text = "Hello, world!", .start_ms = 0, .end_ms = 2000, .words = &.{ .{ .word = "Hello,", .start_ms = 0, .end_ms = 900 }, .{ .word = "world!", .start_ms = 1000, .end_ms = 2000 } } }, 0, 0, 2 * std.time.ns_per_s);
     try std.testing.expectEqual(@as(usize, 2), spans.items.len);
     try std.testing.expectEqualStrings("Hello, ", spans.items[0].text);
     try std.testing.expectEqualStrings("world!", spans.items[1].text);
@@ -54400,7 +54521,7 @@ test "model aware media source diarization emits standalone turns and splits tra
     try std.testing.expectEqual(@as(?u32, 1), spans.items[1].speaker_index);
     try std.testing.expectEqual(@as(i64, std.time.ns_per_s), spans.items[1].start_ns);
     spans.clearRetainingCapacity();
-    try MediaOutputExecution.appendSpeakerTranscript(alloc, &spans, state.timeline, .{ .text = "No word clocks.", .start_ms = 0, .end_ms = 2000 }, 0, 0, 2 * std.time.ns_per_s);
+    try MediaOutputExecution.appendSpeakerTranscript(alloc, &spans, .{ .shared = state.timeline.view() }, .{ .text = "No word clocks.", .start_ms = 0, .end_ms = 2000 }, 0, 0, 2 * std.time.ns_per_s);
     try std.testing.expectEqual(@as(?u32, null), spans.items[0].speaker_index);
 }
 

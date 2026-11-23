@@ -1298,9 +1298,6 @@ pub const Runner = struct {
                         }
                     }
                 }
-                // Seal required geometry before video picture planning and
-                // decoder reservations can force a second container scan.
-                if (required_audio) try self.prepareVideoAudio();
                 return self.webmWindowsCached(&reader, identity, &build);
             }
         }
