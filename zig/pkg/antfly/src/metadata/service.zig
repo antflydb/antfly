@@ -11495,34 +11495,42 @@ pub const MetadataHttpService = struct {
         defer state.deinit();
         if (!std.meta.eql(state.value.scope, @as(?control.Scope, scope)) or !state.value.scope_fencing)
             return error.SourceBindingConflict;
+        const work = try scopedWorkContext(context);
+        self.advanceScopedReplicationSource(a, runner, table, ordinal, state.value, catalog, &hosted, work) catch |err| {
+            self.recordScopedStreamError(a, table, state.value, err, context) catch |report_err|
+                std.log.debug("scoped CDC health update deferred table={s} err={s}", .{ table.name, @errorName(report_err) });
+            return err;
+        };
+    }
+
+    fn advanceScopedReplicationSource(self: *MetadataHttpService, a: std.mem.Allocator, runner: *metadata_replication_backfill.StreamingReplicationRunner, table: metadata_table_manager.TableRecord, ordinal: u32, state: @import("source_control.zig").State, catalog: api_table_catalog.CatalogSource, hosted: *@import("../api/hosted_completion.zig").Hosted, context: api_operation.RequestContext) !void {
+        const control = @import("source_control.zig");
+        const scope = state.scope orelse return error.SourceBindingConflict;
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const admission = hosted.sourceAdmission();
-        if (state.value.artifact_control.?.current) |record| {
+        if (state.artifact_control.?.current) |record| {
             try ensureCdcWorkPermit(self);
-            @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), try scopedWorkContext(context)) catch |err| {
-                self.recordScopedStreamError(a, table, state.value, err, context) catch |report_err|
-                    std.log.debug("scoped CDC health update deferred table={s} err={s}", .{ table.name, @errorName(report_err) });
-                return err;
-            };
-            if (record.phase != .reserved or state.value.closing) return;
+            try @import("../api/source_destination_completion.zig").recover(self, admission, a, scope, control.digest(table.replication_sources_json), context);
+            if (record.phase != .reserved or state.closing) return;
             const after = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
             defer a.free(after);
             var latest = try control.parse(a, after);
             defer latest.deinit();
-            if (latest.value.revision != state.value.revision) return;
-        } else if (state.value.pending != null or state.value.outstanding.len != 0) return;
-        if (state.value.closing) {
-            try self.retireNativeReplicationSourceRoots(a, catalog, admission, table, state.value, context);
+            if (latest.value.revision != state.revision) return;
+        } else if (state.pending != null or state.outstanding.len != 0) return;
+        if (state.closing) {
+            try self.retireNativeReplicationSourceRoots(a, catalog, admission, table, state, context);
             return;
         }
         const source_status = (try store.getReplicationSourceStatus(a, self.metadata_group_id, scope.table_id, ordinal)) orelse return;
         defer metadata_table_manager.freeReplicationSourceStatus(a, source_status);
         try ensureCdcWorkPermit(self);
-        if (state.value.native_bootstrap_checkpoint != null and state.value.accepted.sequence == 0) {
+        if (state.native_bootstrap_checkpoint != null and state.accepted.sequence == 0) {
             try self.ensureLinearizableReadWithContext(context);
-            if (!try store.nativeRootProducerCohortReady(a, self.metadata_group_id, state.value.checkpoint_authority.?.table_name))
+            if (!try store.nativeRootProducerCohortReady(a, self.metadata_group_id, state.checkpoint_authority.?.table_name))
                 return error.SourcePendingWork;
         }
-        if (state.value.native_bootstrap_checkpoint == null and
+        if (state.native_bootstrap_checkpoint == null and
             std.mem.eql(u8, source_status.phase, control.native_bootstrap_prepared_phase))
         {
             if (!std.meta.eql(scope.provider, try control.nativeSourceProviderBinding(source_status)))
@@ -11530,14 +11538,14 @@ pub const MetadataHttpService = struct {
             return control.mutateOnService(self, a, .{
                 .table_id = scope.table_id,
                 .source_id = scope.source_id,
-                .expected_revision = state.value.revision,
+                .expected_revision = state.revision,
                 .expected_binding = scope.identity(),
                 .expected_catalog_digest = control.digest(table.replication_sources_json),
                 .mutation = .{ .certify_native_bootstrap = source_status.prepared_checkpoint },
             }, context);
         }
-        var snapshot = if (state.value.native_bootstrap_checkpoint != null) blk: {
-            const authority = state.value.checkpoint_authority.?;
+        var snapshot = if (state.native_bootstrap_checkpoint != null) blk: {
+            const authority = state.checkpoint_authority.?;
             break :blk try @import("source_scope_capture.zig").readOnService(self, a, .{
                 .metadata_group_id = authority.owner.metadata_group_id,
                 .metadata_incarnation = authority.owner.metadata_incarnation,
@@ -11547,13 +11555,9 @@ pub const MetadataHttpService = struct {
             }, context);
         } else null;
         defer if (snapshot) |*captured| captured.deinit(a);
-        if (state.value.stream_failure) |failure| if (failure.terminal) return;
-        runner.stageScopedStream(self, admission, table, source_status, state.value, snapshot, try scopedWorkContext(context)) catch |err| {
-            self.recordScopedStreamError(a, table, state.value, err, context) catch |report_err|
-                std.log.debug("scoped CDC health update deferred table={s} err={s}", .{ table.name, @errorName(report_err) });
-            return err;
-        };
-        if (state.value.stream_failure != null) {
+        if (state.stream_failure) |failure| if (failure.terminal) return;
+        try runner.stageScopedStream(self, admission, table, source_status, state, snapshot, context);
+        if (state.stream_failure != null) {
             const latest_raw = try control.readOnService(self, a, scope.table_id, scope.source_id, context);
             defer a.free(latest_raw);
             var latest = try control.parse(a, latest_raw);

@@ -112,7 +112,7 @@ pub fn recover(
                 if (now -| since < source.completion_wait_timeout_ms) return;
                 if (current.completion_stalled_at_ms != null) return;
             }
-            mutate(svc, a, binding, catalog_digest, current, .{ .observe_completion_stall = now }, context) catch |err| switch (err) {
+            mutate(svc, a, binding, catalog_digest, current, .{ .observe_qualified_completion_stall = now }, context) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => {},
                 else => return err,
             };

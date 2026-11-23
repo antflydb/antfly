@@ -549,10 +549,12 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 @min(batch.changes.len, @as(usize, from) + @min(limits.events, 64));
             if (from > stop or stop > batch.changes.len or stop - from > 64)
                 return error.ChangefeedResynchronizationRequired;
-            if (bound == null) {
-                if (next.cached) |cached|
-                    stop = @min(stop, from + cached.image_window_hint.load(.monotonic));
-            }
+            const hint = if (bound == null and next.cached != null)
+                next.cached.?.image_window_hint.load(.monotonic)
+            else
+                64;
+            stop = @min(stop, from + hint);
+            var reduced = false;
             while (true) {
                 const rendered = self.boundedPageWindow(a, state, selector, next, start, from, stop, bound != null, limits, request) catch |err| switch (err) {
                     error.IcebergChangefeedImageBudgetExceeded => {
@@ -560,10 +562,17 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                         const smaller = (stop - from) / 2;
                         if (next.cached) |cached| _ = cached.image_window_hint.fetchMin(smaller, .monotonic);
                         stop = from + smaller;
+                        reduced = true;
                         continue;
                     },
                     else => return err,
                 };
+                if (bound == null and !reduced and hint < 64 and stop - from == hint) {
+                    if (next.cached) |cached| {
+                        const wider = @min(64, hint + @max(1, hint / 8));
+                        _ = cached.image_window_hint.cmpxchgStrong(hint, wider, .monotonic, .monotonic);
+                    }
+                }
                 return rendered;
             }
         }
@@ -586,14 +595,19 @@ pub fn Provider(comptime Schemas: type, comptime Policy: type) type {
                 index.* = if (entry != null) keys.items.len else null;
                 if (entry) |key| try keys.append(scratch, key);
             }
+            const keys_only = if (comptime @hasDecl(Policy, "requiresRowImages"))
+                mode == .keys_and_versions and selector.predicates.len == 0 and
+                    !try self.policy.requiresRowImages(selector.table_id)
+            else
+                false;
             const prior_images = if (next.indexed.committed.interval.parent) |parent|
-                cursor.lookupSnapshotRows(scratch, next.before_table.?, parent, self.metadata, batch.key_fields, keys.items, request, self.options) catch |err| switch (err) {
+                cursor.lookupSnapshotRows(scratch, next.before_table.?, parent, self.metadata, batch.key_fields, keys.items, keys_only, request, self.options) catch |err| switch (err) {
                     error.IcebergChangefeedImageBudgetExceeded => if (replaying or stop - from == 1) null else return err,
                     else => return err,
                 }
             else
                 null;
-            const committed_images = cursor.lookupSnapshotRows(scratch, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, keys.items, request, self.options) catch |err| switch (err) {
+            const committed_images = cursor.lookupSnapshotRows(scratch, next.after_table, next.indexed.committed.interval.snapshot, self.metadata, batch.key_fields, keys.items, keys_only, request, self.options) catch |err| switch (err) {
                 error.IcebergChangefeedImageBudgetExceeded => if (replaying or stop - from == 1) null else return err,
                 else => return err,
             };

@@ -2849,6 +2849,7 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
 
         feed = None
         filtered_feeds = []
+        keys_feed = None
         if deployment != "standalone":
             if mixed:
                 call("POST", f"/tables/{native_table}", {"num_shards": 1})
@@ -2873,6 +2874,18 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
             ).json()
             feed = f"{feeds}/{created['id']}"
             if deployment == "distributed":
+                keys_created = _changefeed_call(
+                    client,
+                    "POST",
+                    feeds,
+                    headers={"Idempotency-Key": "keys-only-key-move"},
+                    json={
+                        "tables": ["cdc_iceberg"],
+                        "start": "now",
+                        "include": "keys_and_versions",
+                    },
+                ).json()
+                keys_feed = (f"{feeds}/{keys_created['id']}", keys_created["cursor"])
                 # One of the filtered feeds advances past an invisible suffix
                 # in the same committed key-move transaction.
                 for key in ("user-1", "user-2"):
@@ -2939,6 +2952,26 @@ def test_postgres_bootstraps_and_streams_to_writable_iceberg(
         assert resumed["antfly.cdc.checkpoint"] != cut
         assert rows() == [["user-2", "Bob"]]
         check_row_count()
+        if keys_feed is not None:
+            key_feed_url, key_cursor = keys_feed
+            response = _changefeed_call(
+                client, "GET", f"{key_feed_url}/events", params={"after": key_cursor}
+            )
+            key_page = response.json()
+            assert key_page["transaction"]["complete"]
+            assert {event["operation"] for event in key_page["events"]} == {
+                "delete",
+                "insert",
+            }
+            assert all(
+                event.get("before") is None and event.get("after") is None
+                for event in key_page["events"]
+            )
+            replay = _changefeed_call(
+                client, "GET", f"{key_feed_url}/events", params={"after": key_cursor}
+            )
+            assert replay.content == response.content
+            _changefeed_call(client, "DELETE", key_feed_url)
         for filtered_feed, cursor in filtered_feeds:
             page = _changefeed_call(
                 client, "GET", f"{filtered_feed}/events", params={"after": cursor}

@@ -192,7 +192,8 @@ pub const iceberg_acceptance_status_version: u16 = 132;
 /// Version 138 persists scoped PostgreSQL stream health within the actor revision.
 /// Version 139 tracks scoped completion wait independently of plan creation.
 /// Version 140 tracks completion stalls separately from operation errors.
-pub const current_version: u16 = @import("source_control.zig").independent_completion_stall_protocol_version;
+/// Version 141 qualifies completion health cleanup by observation provenance.
+pub const current_version: u16 = @import("source_control.zig").qualified_completion_stall_protocol_version;
 pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;

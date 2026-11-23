@@ -92,6 +92,7 @@ pub fn lookupSnapshotRows(
     metadata: @FieldType(configured.BindingObjectStoreOpenOptions, "retained_catalog_metadata"),
     keys: []const []const u8,
     requested: []const LookupKey,
+    keys_only: bool,
     context: operation.RequestContext,
     options: configured.BindingObjectStoreOpenOptions,
 ) !?[]?std.json.Value {
@@ -133,8 +134,11 @@ pub fn lookupSnapshotRows(
     if (!filter.exact_complete) return null;
     filter.sealed = true;
 
-    const fields = try scratch.alloc([]const u8, table.columns.len);
-    for (table.columns, fields) |column, *field| field.* = column.name;
+    const fields = if (keys_only) keys else columns: {
+        const all = try scratch.alloc([]const u8, table.columns.len);
+        for (table.columns, all) |column, *field| field.* = column.name;
+        break :columns all;
+    };
     const cursor = try openSnapshot(scratch, table, snapshot_id, metadata, .{ .fields = fields, .limit = 4 }, context, options);
     defer cursor.close(cursor.ptr);
     const apply = cursor.set_dynamic_filter orelse return null;
