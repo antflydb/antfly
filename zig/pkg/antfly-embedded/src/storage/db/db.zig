@@ -52618,7 +52618,7 @@ pub const DB = struct {
         const scratch = if (can_overlap) HybridComponents.Budget.reclaimingAllocator(alloc) else alloc;
         // Only recognized allocator chains can cross threads and refund
         // discarded speculation. Unknown caller allocators stay on the caller.
-        const reusable = can_overlap and
+        const reusable = can_overlap and HybridComponents.ownerAllocatorCanOverlap(self.alloc) and
             (HybridComponents.Budget.reusableHeadroom(scratch) orelse 0) >= HybridComponents.workspace_bytes;
         const io = if (can_overlap and reusable) exec_ctx.io orelse self.backend_runtime.io() else null;
         const probe = if (builtin.is_test) test_hybrid_probe else null;
@@ -52638,6 +52638,12 @@ pub const DB = struct {
         };
         if (io != null) hybrid.cut = hybrid.readCut();
         hybrid.lexical_budget = .{ .backing = hybrid.component_alloc.allocator(), .limit = if (probe) |test_probe| test_probe.workspace_bytes else HybridComponents.workspace_bytes };
+        defer if (has_text and has_dense and benchQueryProfileEnabled()) {
+            std.log.info("antfly_bench_hybrid launched={} accepted={} replay={s}", .{
+                hybrid.launched,                                            hybrid.accepted_batch and hybrid.retry_reason == null,
+                if (hybrid.retry_reason) |err| @errorName(err) else "none",
+            });
+        };
         const metric_name = composedQueryMetricIndexName(req);
         const start_ns = platform_time.monotonicNs();
         errdefer if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
@@ -52670,6 +52676,7 @@ pub const DB = struct {
         }
         const result = attempt catch |err| switch (err) {
             error.HybridReadCutChanged, error.HybridSerialRetry => retry: {
+                hybrid.retry_reason = err;
                 if (probe) |test_probe| test_probe.retry = err;
                 // Resolve visibility again after discarding speculative work.
                 executor.search_components = null;
@@ -52692,6 +52699,16 @@ pub const DB = struct {
         cancellation: ?*std.atomic.Value(bool) = null,
         overlapped: bool = false,
         retry: ?anyerror = null,
+        meet_in_retrieval: bool = false,
+        dense_entered: Io.Event = .unset,
+        lexical_entered: Io.Event = .unset,
+
+        fn meet(probe: *@This(), io: Io, lexical: bool) !void {
+            const own = if (lexical) &probe.lexical_entered else &probe.dense_entered;
+            const other = if (lexical) &probe.dense_entered else &probe.lexical_entered;
+            own.set(io);
+            try other.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        }
     };
     threadlocal var test_hybrid_probe: ?*HybridTestProbe = null;
 
@@ -52720,8 +52737,16 @@ pub const DB = struct {
         sources: Sources,
         probe: ?*HybridTestProbe,
         component_alloc: scheduler.LockedAllocator,
+        launched: bool = false,
         accepted_batch: bool = false,
+        retry_reason: ?anyerror = null,
         lexical_budget: Budget = undefined,
+
+        fn ownerAllocatorCanOverlap(owner: Allocator) bool {
+            const scratch = Budget.reclaimingAllocator(owner);
+            return owner.ptr == scratch.ptr and owner.vtable == scratch.vtable and
+                Budget.reusableHeadroom(owner) != null;
+        }
 
         fn textEpoch(entry: ?*index_manager_mod.IndexManager.TextIndex) ?u64 {
             return (entry orelse return null).persistent.writer.snapshotEpoch();
@@ -52761,7 +52786,7 @@ pub const DB = struct {
 
             fn searchDefault(raw: ?*anyopaque, a: Allocator, req: types.SearchRequest, query: types.TextQuery) anyerror!types.SearchResult {
                 const worker: *Lexical = @ptrCast(@alignCast(raw.?));
-                return worker.owner.db.searchTextQueryControlled(a, req, query, &worker.cancelled);
+                return worker.owner.db.searchTextQueryControlled(a, req, query, &worker.cancelled, worker.owner.probe);
             }
 
             fn run(worker: *@This()) anyerror!types.SearchResult {
@@ -52779,14 +52804,14 @@ pub const DB = struct {
                 if (worker.owner.probe) |probe| {
                     const io = worker.owner.io.?;
                     probe.started.set(io);
-                    try probe.release.wait(io);
+                    if (!probe.meet_in_retrieval) try probe.release.wait(io);
                 }
                 const req = worker.component.request;
                 const db = worker.owner.db;
                 const a = worker.owner.lexical_budget.allocator();
                 try db_query_search.checkSearchRequestDeadline(req);
                 return switch (worker.component.query) {
-                    .text => |query| db.searchTextQueryControlled(a, req, query, &worker.cancelled),
+                    .text => |query| db.searchTextQueryControlled(a, req, query, &worker.cancelled, worker.owner.probe),
                     .default_text => db_query_search.searchText(a, req, .{ .ctx = worker, .func = searchDefault }),
                     else => unreachable,
                 };
@@ -52797,10 +52822,16 @@ pub const DB = struct {
             const self: *HybridComponents = @ptrCast(@alignCast(raw.?));
             const io = self.io orelse return null;
             if (components.len != 2 or components[1].query != .dense) return null;
-            switch (components[0].query) {
-                .text, .default_text => {},
+            const text = components[0];
+            switch (text.query) {
+                .text => |query| if (query == .match_all) return null,
+                .default_text => {},
                 else => return null,
             }
+            // Chunk hydration and aggregation can perform long postprocessing
+            // outside the stoppable ranker. Keep those shapes on the caller.
+            if (text.request.include_stored or text.request.aggregations_json.len != 0 or
+                (self.db.core.textIndexIsChunkBacked(a, text.request.index_name) catch return null)) return null;
 
             const dense = components[1];
             const entry = self.db.core.denseIndex(dense.request.index_name) orelse return null;
@@ -52813,6 +52844,7 @@ pub const DB = struct {
             var lexical: Lexical = .{ .owner = self, .component = components[0] };
             const admission = if (self.probe) |probe| &probe.scheduler else scheduler.global();
             var task = admission.submit(io, workspace_bytes, Lexical.run, .{&lexical}) orelse return null;
+            self.launched = true;
             var joined = false;
             defer if (!joined) {
                 lexical.cancelled.store(true, .release);
@@ -52871,13 +52903,11 @@ pub const DB = struct {
             };
             try db_query_search.checkSearchRequestDeadline(dense.request);
 
-            const results = try a.alloc(?types.SearchResult, 2);
-            errdefer a.free(results);
-            const execution_ns = try a.dupe(u64, &.{ lexical.elapsed_ns, dense_ns });
-            results[0] = text_owned.?;
-            results[1] = dense_result;
             self.accepted_batch = true;
-            return .{ .alloc = a, .results = results, .execution_ns = execution_ns };
+            return .{ .alloc = a, .pair = .{
+                .results = .{ text_owned.?, dense_result },
+                .execution_ns = .{ lexical.elapsed_ns, dense_ns },
+            } };
         }
     };
 
@@ -53296,10 +53326,10 @@ pub const DB = struct {
     }
 
     fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
-        return self.searchTextQueryControlled(alloc, req, text_query, null);
+        return self.searchTextQueryControlled(alloc, req, text_query, null, null);
     }
 
-    fn searchTextQueryControlled(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery, worker_stop: ?*const std.atomic.Value(bool)) !types.SearchResult {
+    fn searchTextQueryControlled(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery, worker_stop: ?*const std.atomic.Value(bool), probe: ?*HybridTestProbe) !types.SearchResult {
         if (self.core.textIndexEntry(req.index_name) == null and (textQueryHasLogicalValues(text_query) or (if (req.filter_text) |filter| textQueryHasLogicalValues(filter) else false) or (if (req.exclusion_text) |filter| textQueryHasLogicalValues(filter) else false))) {
             return self.searchLogicalValuesWithoutTextIndex(alloc, req, text_query);
         }
@@ -53417,7 +53447,10 @@ pub const DB = struct {
             execution_req.filter_query_json = "";
             execution_req.exclusion_query_json = "";
         }
-        try self.proveTextQueryAccessPaths(execution_req.index_name, text_query);
+        try self.proveTextQueryAccessPaths(if (worker_stop != null) alloc else self.alloc, execution_req.index_name, text_query);
+        if (builtin.is_test) if (probe) |test_probe| {
+            if (test_probe.meet_in_retrieval) try test_probe.meet(std.testing.io, true);
+        };
         const metric_name = self.textQueryMetricIndexName(execution_req);
         const start_ns = platform_time.monotonicNs();
         errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
@@ -53451,6 +53484,7 @@ pub const DB = struct {
             .requires_full_candidate_visibility_filter = requiresFullCandidateVisibilityFilterCallback,
             .nonvisible_doc_set = nonVisibleDocSetCallback,
             .postprocess = postprocessTextSearchResultCallback,
+            .postprocess_controlled = postprocessControlledTextSearchResultCallback,
         });
         db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
         return result;
@@ -53467,58 +53501,58 @@ pub const DB = struct {
         return artifact_ids.internalKeyForArtifactRefAlloc(alloc, ref);
     }
 
-    fn proveTextQueryAccessPaths(self: *DB, index_name: ?[]const u8, text_query: types.TextQuery) !void {
+    fn proveTextQueryAccessPaths(self: *DB, alloc: Allocator, index_name: ?[]const u8, text_query: types.TextQuery) !void {
         switch (text_query) {
-            .term => |term| try self.proveTextFieldAccessPath(index_name, term.field, null, .slice),
-            .match => |match| try self.proveTextFieldAccessPath(index_name, match.field, match.analyzer, .slice),
+            .term => |term| try self.proveTextFieldAccessPath(alloc, index_name, term.field, null, .slice),
+            .match => |match| try self.proveTextFieldAccessPath(alloc, index_name, match.field, match.analyzer, .slice),
             .multi_match_bool_prefix => |multi_match| {
-                for (multi_match.fields) |field| try self.proveMultiMatchBoolPrefixAccessPaths(index_name, field.field);
+                for (multi_match.fields) |field| try self.proveMultiMatchBoolPrefixAccessPaths(alloc, index_name, field.field);
             },
-            .prefix => |prefix| try self.proveTextFieldAccessPath(index_name, prefix.field, null, .automaton_select),
-            .wildcard => |wildcard| try self.proveTextFieldAccessPath(index_name, wildcard.field, null, .automaton_select),
-            .regexp => |regexp| try self.proveTextFieldAccessPath(index_name, regexp.field, null, .automaton_select),
-            .fuzzy => |fuzzy| try self.proveTextFieldAccessPath(index_name, fuzzy.field, null, .automaton_select),
+            .prefix => |prefix| try self.proveTextFieldAccessPath(alloc, index_name, prefix.field, null, .automaton_select),
+            .wildcard => |wildcard| try self.proveTextFieldAccessPath(alloc, index_name, wildcard.field, null, .automaton_select),
+            .regexp => |regexp| try self.proveTextFieldAccessPath(alloc, index_name, regexp.field, null, .automaton_select),
+            .fuzzy => |fuzzy| try self.proveTextFieldAccessPath(alloc, index_name, fuzzy.field, null, .automaton_select),
             .bool_query => |bool_query| {
-                for (bool_query.must) |child| try self.proveTextQueryAccessPaths(index_name, child);
-                for (bool_query.should) |child| try self.proveTextQueryAccessPaths(index_name, child);
-                for (bool_query.must_not) |child| try self.proveTextQueryAccessPaths(index_name, child);
+                for (bool_query.must) |child| try self.proveTextQueryAccessPaths(alloc, index_name, child);
+                for (bool_query.should) |child| try self.proveTextQueryAccessPaths(alloc, index_name, child);
+                for (bool_query.must_not) |child| try self.proveTextQueryAccessPaths(alloc, index_name, child);
             },
             else => {},
         }
     }
 
-    fn proveTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, analyzer: ?[]const u8, fragment: algebraic_mod.ir.TensorFragment) !void {
-        _ = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, analyzer, fragment) orelse return error.IndexNotFound;
+    fn proveTextFieldAccessPath(self: *DB, alloc: Allocator, index_name: ?[]const u8, field: []const u8, analyzer: ?[]const u8, fragment: algebraic_mod.ir.TensorFragment) !void {
+        _ = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(alloc, index_name, field, analyzer, fragment) orelse return error.IndexNotFound;
     }
 
-    fn proveOptionalTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, fragment: algebraic_mod.ir.TensorFragment) !bool {
-        const plan = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, null, fragment);
+    fn proveOptionalTextFieldAccessPath(self: *DB, alloc: Allocator, index_name: ?[]const u8, field: []const u8, fragment: algebraic_mod.ir.TensorFragment) !bool {
+        const plan = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(alloc, index_name, field, null, fragment);
         return plan != null;
     }
 
-    fn proveMultiMatchBoolPrefixAccessPaths(self: *DB, index_name: ?[]const u8, field: []const u8) !void {
+    fn proveMultiMatchBoolPrefixAccessPaths(self: *DB, alloc: Allocator, index_name: ?[]const u8, field: []const u8) !void {
         if (std.mem.endsWith(u8, field, "._index_prefix")) {
-            try self.proveTextFieldAccessPath(index_name, field, null, .slice);
+            try self.proveTextFieldAccessPath(alloc, index_name, field, null, .slice);
             return;
         }
 
-        try self.proveTextFieldAccessPath(index_name, field, null, .slice);
-        try self.proveTextFieldAccessPath(index_name, field, null, .automaton_select);
+        try self.proveTextFieldAccessPath(alloc, index_name, field, null, .slice);
+        try self.proveTextFieldAccessPath(alloc, index_name, field, null, .automaton_select);
         if (isSearchAsYouTypeGeneratedFieldName(field)) return;
 
-        const two_gram = try std.fmt.allocPrint(self.alloc, "{s}._2gram", .{field});
-        defer self.alloc.free(two_gram);
-        const has_two_gram = try self.proveOptionalTextFieldAccessPath(index_name, two_gram, .slice);
-        if (has_two_gram) _ = try self.proveOptionalTextFieldAccessPath(index_name, two_gram, .automaton_select);
+        const two_gram = try std.fmt.allocPrint(alloc, "{s}._2gram", .{field});
+        defer alloc.free(two_gram);
+        const has_two_gram = try self.proveOptionalTextFieldAccessPath(alloc, index_name, two_gram, .slice);
+        if (has_two_gram) _ = try self.proveOptionalTextFieldAccessPath(alloc, index_name, two_gram, .automaton_select);
 
-        const three_gram = try std.fmt.allocPrint(self.alloc, "{s}._3gram", .{field});
-        defer self.alloc.free(three_gram);
-        const has_three_gram = try self.proveOptionalTextFieldAccessPath(index_name, three_gram, .slice);
-        if (has_three_gram) _ = try self.proveOptionalTextFieldAccessPath(index_name, three_gram, .automaton_select);
+        const three_gram = try std.fmt.allocPrint(alloc, "{s}._3gram", .{field});
+        defer alloc.free(three_gram);
+        const has_three_gram = try self.proveOptionalTextFieldAccessPath(alloc, index_name, three_gram, .slice);
+        if (has_three_gram) _ = try self.proveOptionalTextFieldAccessPath(alloc, index_name, three_gram, .automaton_select);
 
-        const index_prefix = try std.fmt.allocPrint(self.alloc, "{s}._index_prefix", .{field});
-        defer self.alloc.free(index_prefix);
-        _ = try self.proveOptionalTextFieldAccessPath(index_name, index_prefix, .slice);
+        const index_prefix = try std.fmt.allocPrint(alloc, "{s}._index_prefix", .{field});
+        defer alloc.free(index_prefix);
+        _ = try self.proveOptionalTextFieldAccessPath(alloc, index_name, index_prefix, .slice);
     }
 
     fn isSearchAsYouTypeGeneratedFieldName(field: []const u8) bool {
@@ -53773,8 +53807,17 @@ pub const DB = struct {
         raw: types.SearchResult,
         chunk_backed: bool,
     ) anyerror!types.SearchResult {
+        return postprocessControlledTextSearchResult(ctx, alloc, req, raw, chunk_backed, null);
+    }
+
+    fn postprocessControlledTextSearchResultCallback(ctx: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, raw: types.SearchResult, chunk_backed: bool, stop: *const std.atomic.Value(bool)) anyerror!types.SearchResult {
+        return postprocessControlledTextSearchResult(ctx, alloc, req, raw, chunk_backed, stop);
+    }
+
+    fn postprocessControlledTextSearchResult(ctx: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, raw: types.SearchResult, chunk_backed: bool, stop: ?*const std.atomic.Value(bool)) !types.SearchResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try db_query_result_shape.postprocessTextSearchResult(alloc, req, raw, chunk_backed, .{
+            .worker_stop = stop,
             .ctx = self,
             .is_visible = isVisibleSearchHitCallback,
             .filter_visible_many = if (chunk_backed) filterStoredArtifactCandidatesManyCallback else filterStoredSearchCandidatesManyCallback,
@@ -54627,6 +54670,9 @@ pub const DB = struct {
         const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
+        if (builtin.is_test and speculative) if (test_hybrid_probe) |probe| {
+            if (probe.meet_in_retrieval) try probe.meet(std.testing.io, false);
+        };
         const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const result = try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
             .filter_candidate_presence = true,
@@ -132804,7 +132850,7 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     var serial = try db.searchWithExecutionContext(alloc, filtered, .{ .max_parallelism = 1 });
     defer serial.deinit();
     const parallel_context: types.ExecutionContext = .{ .io = std.testing.io, .max_parallelism = 2 };
-    var probe: DB.HybridTestProbe = .{};
+    var probe: DB.HybridTestProbe = .{ .meet_in_retrieval = true };
     DB.test_hybrid_probe = &probe;
     defer DB.test_hybrid_probe = null;
     var parallel = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
@@ -132845,6 +132891,17 @@ test "db hybrid search does not hard-filter dense leg with scoring full_text" {
     defer opaque_result.deinit();
     try std.testing.expect(!probe.overlapped);
     try std.testing.expectEqualDeep(after_publication.hits, opaque_result.hits);
+
+    {
+        const owner = db.alloc;
+        db.alloc = opaque_allocator.allocator();
+        defer db.alloc = owner;
+        probe = .{};
+        var caller_only = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
+        defer caller_only.deinit();
+        try std.testing.expect(!probe.overlapped);
+        try std.testing.expectEqualDeep(after_publication.hits, caller_only.hits);
+    }
 
     probe = .{ .workspace_bytes = 1 };
     var memory_fallback = try db.searchWithExecutionContext(alloc, filtered, parallel_context);
